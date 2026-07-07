@@ -1258,6 +1258,12 @@ pub fn decode_proto_by_kind_and_version(
         }
         "PersistentVolume" => crate::core_gen_adapter::decode_persistentvolume_proto_gen(raw),
         "Lease" => crate::coord_gen_adapter::decode_lease_proto_gen_a(raw),
+        "IPAddress" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ipaddress_proto_gen(raw)
+        }
+        "ServiceCIDR" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_servicecidr_proto_gen(raw)
+        }
         "CSINode" => crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen(raw),
         "CSIDriver" => crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen(raw),
         "CSIStorageCapacity" => {
@@ -8213,6 +8219,72 @@ mod tests {
         assert_eq!(
             result["spec"]["defaultBackend"]["service"]["port"]["number"], 80,
             "defaultBackend.service.port.number must survive decode — port is required for routing"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_proto_by_kind_and_version IPAddress / ServiceCIDR
+    // ---------------------------------------------------------------------------
+
+    /// decode_proto_by_kind_and_version must dispatch IPAddress proto. Before adding this
+    /// dispatch arm, the "IPAddress" kind had no decoder, so extract_body fell through to
+    /// raw bytes and serde_json failed with "invalid JSON: expected value at line 1 column
+    /// 1" — every typed-client Create() got 400 instead of 201.
+    #[test]
+    fn decode_proto_by_kind_and_version_dispatches_ipaddress() {
+        let obj_meta = encode_length_delimited(1, b"192.168.1.5"); // ObjectMeta.name
+
+        // ParentReference (networking.k8s.io/v1/generated.proto): field 2 = resource, field 4 = name
+        let mut parent_ref = encode_length_delimited(2, b"services");
+        parent_ref.extend_from_slice(&encode_length_delimited(4, b"my-svc"));
+
+        // IPAddressSpec: field 1 = parentRef
+        let spec = encode_length_delimited(1, &parent_ref);
+
+        // IPAddress: field 1 = metadata, field 2 = spec
+        let mut ip_proto = encode_length_delimited(1, &obj_meta);
+        ip_proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result =
+            decode_proto_by_kind_and_version("IPAddress", "networking.k8s.io/v1", &ip_proto)
+                .expect(
+                    "IPAddress must decode via decode_proto_by_kind_and_version — without this, \
+                 client-go POST returns 400 on IPAddress create",
+                );
+
+        assert_eq!(result["kind"], "IPAddress");
+        assert_eq!(result["metadata"]["name"], "192.168.1.5");
+        assert_eq!(
+            result["spec"]["parentRef"]["resource"], "services",
+            "spec.parentRef.resource must survive dispatch decode"
+        );
+    }
+
+    /// decode_proto_by_kind_and_version must dispatch ServiceCIDR proto — same root cause
+    /// as IPAddress: no dispatch arm meant every protobuf Create() returned 400.
+    #[test]
+    fn decode_proto_by_kind_and_version_dispatches_servicecidr() {
+        let obj_meta = encode_length_delimited(1, b"my-cidr"); // ObjectMeta.name
+
+        // ServiceCIDRSpec: field 1 = cidrs (repeated string)
+        let spec = encode_length_delimited(1, b"10.0.0.0/24");
+
+        // ServiceCIDR: field 1 = metadata, field 2 = spec
+        let mut cidr_proto = encode_length_delimited(1, &obj_meta);
+        cidr_proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result =
+            decode_proto_by_kind_and_version("ServiceCIDR", "networking.k8s.io/v1", &cidr_proto)
+                .expect(
+                    "ServiceCIDR must decode via decode_proto_by_kind_and_version — without \
+                     this, client-go POST returns 400 on ServiceCIDR create",
+                );
+
+        assert_eq!(result["kind"], "ServiceCIDR");
+        assert_eq!(result["metadata"]["name"], "my-cidr");
+        assert_eq!(
+            result["spec"]["cidrs"][0], "10.0.0.0/24",
+            "spec.cidrs must survive dispatch decode"
         );
     }
 

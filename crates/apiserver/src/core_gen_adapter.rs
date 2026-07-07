@@ -339,6 +339,150 @@ fn gen_lifecycle_to_json(lc: core_v1::Lifecycle) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+fn gen_capabilities_to_json(caps: core_v1::Capabilities) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !caps.add.is_empty() {
+        m.insert(
+            "add".to_string(),
+            serde_json::Value::Array(
+                caps.add
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !caps.drop.is_empty() {
+        m.insert(
+            "drop".to_string(),
+            serde_json::Value::Array(
+                caps.drop
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_seccomp_profile_to_json(sp: core_v1::SeccompProfile) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sp.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = sp.localhost_profile.filter(|s| !s.is_empty()) {
+        m.insert("localhostProfile".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Container-level SecurityContext (Container.securityContext, proto field 15).
+///
+/// Without this, containers run as whatever UID/GID the image defaults to regardless of
+/// runAsUser/runAsGroup, allowPrivilegeEscalation=false is silently ignored (containers can
+/// escalate privileges even when the pod spec explicitly forbids it), and
+/// readOnlyRootFilesystem is dropped (containers get a writable root fs against the spec).
+fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(caps) = sc.capabilities {
+        m.insert("capabilities".to_string(), gen_capabilities_to_json(caps));
+    }
+    if let Some(v) = sc.privileged {
+        m.insert("privileged".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = sc.run_as_user {
+        m.insert("runAsUser".to_string(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = sc.run_as_group {
+        m.insert(
+            "runAsGroup".to_string(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    if let Some(v) = sc.run_as_non_root {
+        m.insert("runAsNonRoot".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = sc.read_only_root_filesystem {
+        m.insert(
+            "readOnlyRootFilesystem".to_string(),
+            serde_json::Value::Bool(v),
+        );
+    }
+    if let Some(v) = sc.allow_privilege_escalation {
+        m.insert(
+            "allowPrivilegeEscalation".to_string(),
+            serde_json::Value::Bool(v),
+        );
+    }
+    if let Some(sp) = sc.seccomp_profile {
+        m.insert(
+            "seccompProfile".to_string(),
+            gen_seccomp_profile_to_json(sp),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Pod-level SecurityContext (PodSpec.securityContext, proto field 14), including sysctls.
+///
+/// Without this, pod.Spec.SecurityContext.RunAsUser/RunAsGroup are silently dropped for every
+/// protobuf-created pod, and sysctls never reach validate_pod_sysctls or the kubelet — a pod
+/// requesting `kernel.shm_rmid_forced=1` boots with the node default instead.
+fn gen_pod_security_context_to_json(sc: core_v1::PodSecurityContext) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sc.run_as_user {
+        m.insert("runAsUser".to_string(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = sc.run_as_group {
+        m.insert(
+            "runAsGroup".to_string(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    if let Some(v) = sc.run_as_non_root {
+        m.insert("runAsNonRoot".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = sc.fs_group {
+        m.insert("fsGroup".to_string(), serde_json::Value::Number(v.into()));
+    }
+    if !sc.supplemental_groups.is_empty() {
+        m.insert(
+            "supplementalGroups".to_string(),
+            serde_json::Value::Array(
+                sc.supplemental_groups
+                    .into_iter()
+                    .map(|g| serde_json::Value::Number(g.into()))
+                    .collect(),
+            ),
+        );
+    }
+    if !sc.sysctls.is_empty() {
+        let sysctls: Vec<serde_json::Value> = sc
+            .sysctls
+            .into_iter()
+            .map(|s| {
+                let mut sm = serde_json::Map::new();
+                if let Some(n) = s.name.filter(|s| !s.is_empty()) {
+                    sm.insert("name".to_string(), serde_json::Value::String(n));
+                }
+                if let Some(v) = s.value.filter(|s| !s.is_empty()) {
+                    sm.insert("value".to_string(), serde_json::Value::String(v));
+                }
+                serde_json::Value::Object(sm)
+            })
+            .collect();
+        m.insert("sysctls".to_string(), serde_json::Value::Array(sysctls));
+    }
+    if let Some(sp) = sc.seccomp_profile {
+        m.insert(
+            "seccompProfile".to_string(),
+            gen_seccomp_profile_to_json(sp),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     let mut cm = serde_json::Map::with_capacity(18);
     if let Some(v) = c.name.filter(|s| !s.is_empty()) {
@@ -559,6 +703,12 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     if let Some(lc) = c.lifecycle {
         cm.insert("lifecycle".to_string(), gen_lifecycle_to_json(lc));
     }
+    if let Some(sc) = c.security_context {
+        cm.insert(
+            "securityContext".to_string(),
+            gen_security_context_to_json(sc),
+        );
+    }
     if !c.resize_policy.is_empty() {
         let rp_json: Vec<serde_json::Value> = c
             .resize_policy
@@ -609,6 +759,95 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
         cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
     }
     serde_json::Value::Object(cm)
+}
+
+/// EphemeralContainer (PodSpec.ephemeralContainers, proto field 34) — decoded so that
+/// UpdateEphemeralContainers (which client-go sends as protobuf) round-trips the debug
+/// container a user attaches via `kubectl debug`/the ephemeralcontainers subresource.
+/// apply_ephemeral_containers_patch (pods.rs) merges on "name", so name/image/command are
+/// the fields conformance actually asserts on; env/volumeMounts are included for parity
+/// with the regular container decode.
+fn gen_ephemeral_container_to_json(ec: core_v1::EphemeralContainer) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(tcn) = ec.target_container_name.filter(|s| !s.is_empty()) {
+        m.insert(
+            "targetContainerName".to_string(),
+            serde_json::Value::String(tcn),
+        );
+    }
+    let Some(c) = ec.ephemeral_container_common else {
+        return serde_json::Value::Object(m);
+    };
+    if let Some(v) = c.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = c.image.filter(|s| !s.is_empty()) {
+        m.insert("image".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = c.image_pull_policy.filter(|s| !s.is_empty()) {
+        m.insert("imagePullPolicy".to_string(), serde_json::Value::String(v));
+    }
+    if !c.command.is_empty() {
+        m.insert(
+            "command".to_string(),
+            serde_json::Value::Array(
+                c.command
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !c.args.is_empty() {
+        m.insert(
+            "args".to_string(),
+            serde_json::Value::Array(c.args.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    if !c.env.is_empty() {
+        let env_json: Vec<serde_json::Value> = c
+            .env
+            .into_iter()
+            .map(|ev| {
+                let mut em = serde_json::Map::new();
+                if let Some(v) = ev.name.filter(|s| !s.is_empty()) {
+                    em.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = ev.value.filter(|s| !s.is_empty()) {
+                    em.insert("value".to_string(), serde_json::Value::String(v));
+                }
+                serde_json::Value::Object(em)
+            })
+            .collect();
+        m.insert("env".to_string(), serde_json::Value::Array(env_json));
+    }
+    if !c.volume_mounts.is_empty() {
+        let mounts: Vec<serde_json::Value> = c
+            .volume_mounts
+            .into_iter()
+            .map(|vm| {
+                let mut vmm = serde_json::Map::new();
+                if let Some(v) = vm.name.filter(|s| !s.is_empty()) {
+                    vmm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = vm.mount_path.filter(|s| !s.is_empty()) {
+                    vmm.insert("mountPath".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(true) = vm.read_only {
+                    vmm.insert("readOnly".to_string(), serde_json::Value::Bool(true));
+                }
+                serde_json::Value::Object(vmm)
+            })
+            .collect();
+        m.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
+    }
+    if let Some(sc) = c.security_context {
+        m.insert(
+            "securityContext".to_string(),
+            gen_security_context_to_json(sc),
+        );
+    }
+    serde_json::Value::Object(m)
 }
 
 pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value {
@@ -761,6 +1000,14 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     if let Some(rp) = spec.restart_policy.filter(|s| !s.is_empty()) {
         spec_map.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
     }
+    // dnsPolicy — without this, an explicit "None" (required to make dnsConfig authoritative
+    // instead of merged/appended) is silently dropped, create-defaulting stamps "ClusterFirst"
+    // instead, and the kubelet ignores dnsConfig.nameservers because ClusterFirst's own
+    // resolv.conf generation takes precedence — live-verified: "should support configurable
+    // pod DNS nameservers" fails this way even though dnsConfig itself decodes correctly.
+    if let Some(dp) = spec.dns_policy.filter(|s| !s.is_empty()) {
+        spec_map.insert("dnsPolicy".to_string(), serde_json::Value::String(dp));
+    }
     if let Some(ads) = spec.active_deadline_seconds {
         if ads > 0 {
             spec_map.insert(
@@ -852,6 +1099,114 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     // Without this field, the scheduler cannot perform preemption ordering correctly.
     if let Some(p) = spec.priority.filter(|&v| v != 0) {
         spec_map.insert("priority".to_string(), serde_json::Value::Number(p.into()));
+    }
+    // hostNetwork — the kubelet reads this to decide whether to share the host network
+    // namespace; dropping it makes KubeletManagedEtcHosts and hostPort-on-hostNetwork
+    // behavior silently wrong for every protobuf-created pod.
+    if let Some(hn) = spec.host_network {
+        spec_map.insert("hostNetwork".to_string(), serde_json::Value::Bool(hn));
+    }
+    // automountServiceAccountToken — pod-level override of the ServiceAccount default;
+    // dropping it means a pod that explicitly opted out of token automount gets one anyway.
+    if let Some(v) = spec.automount_service_account_token {
+        spec_map.insert(
+            "automountServiceAccountToken".to_string(),
+            serde_json::Value::Bool(v),
+        );
+    }
+    // hostAliases — injected into the pod's /etc/hosts by the kubelet; dropping this means
+    // the extra host entries a pod asked for silently never appear.
+    if !spec.host_aliases.is_empty() {
+        let aliases: Vec<serde_json::Value> = spec
+            .host_aliases
+            .into_iter()
+            .map(|ha| {
+                let mut m = serde_json::Map::new();
+                if let Some(ip) = ha.ip.filter(|s| !s.is_empty()) {
+                    m.insert("ip".to_string(), serde_json::Value::String(ip));
+                }
+                if !ha.hostnames.is_empty() {
+                    m.insert(
+                        "hostnames".to_string(),
+                        serde_json::Value::Array(
+                            ha.hostnames
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        spec_map.insert("hostAliases".to_string(), serde_json::Value::Array(aliases));
+    }
+    // dnsConfig — merged with dnsPolicy by the kubelet to build the pod's resolv.conf;
+    // dropping this silently discards user-specified nameservers/search/options.
+    if let Some(dc) = spec.dns_config {
+        let mut m = serde_json::Map::new();
+        if !dc.nameservers.is_empty() {
+            m.insert(
+                "nameservers".to_string(),
+                serde_json::Value::Array(
+                    dc.nameservers
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !dc.searches.is_empty() {
+            m.insert(
+                "searches".to_string(),
+                serde_json::Value::Array(
+                    dc.searches
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !dc.options.is_empty() {
+            let opts: Vec<serde_json::Value> = dc
+                .options
+                .into_iter()
+                .map(|o| {
+                    let mut om = serde_json::Map::new();
+                    if let Some(n) = o.name.filter(|s| !s.is_empty()) {
+                        om.insert("name".to_string(), serde_json::Value::String(n));
+                    }
+                    if let Some(v) = o.value.filter(|s| !s.is_empty()) {
+                        om.insert("value".to_string(), serde_json::Value::String(v));
+                    }
+                    serde_json::Value::Object(om)
+                })
+                .collect();
+            m.insert("options".to_string(), serde_json::Value::Array(opts));
+        }
+        spec_map.insert("dnsConfig".to_string(), serde_json::Value::Object(m));
+    }
+    // ephemeralContainers — needed so UpdateEphemeralContainers (protobuf by default in
+    // client-go) round-trips the debug container through apply_ephemeral_containers_patch.
+    if !spec.ephemeral_containers.is_empty() {
+        let ecs: Vec<serde_json::Value> = spec
+            .ephemeral_containers
+            .into_iter()
+            .map(gen_ephemeral_container_to_json)
+            .collect();
+        spec_map.insert(
+            "ephemeralContainers".to_string(),
+            serde_json::Value::Array(ecs),
+        );
+    }
+    // securityContext — pod-level RunAsUser/RunAsGroup/fsGroup/sysctls; dropping this is a
+    // P1 data-loss bug (containers run as whatever the image defaults to, sysctls never
+    // reach the kubelet or validate_pod_sysctls).
+    if let Some(sc) = spec.security_context {
+        spec_map.insert(
+            "securityContext".to_string(),
+            gen_pod_security_context_to_json(sc),
+        );
     }
     serde_json::Value::Object(spec_map)
 }
@@ -1085,6 +1440,11 @@ pub fn decode_configmap_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         "kind": "ConfigMap",
         "metadata": meta
     });
+    // immutable — the PATCH/PUT checks (resource.rs) that reject mutating an immutable
+    // ConfigMap are correct but never fire if this field is dropped on decode.
+    if let Some(v) = cm.immutable {
+        obj["immutable"] = serde_json::Value::Bool(v);
+    }
     if !cm.data.is_empty() {
         let data_map: serde_json::Map<String, serde_json::Value> = cm
             .data
@@ -1304,6 +1664,11 @@ pub fn decode_secret_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         "kind": "Secret",
         "metadata": meta
     });
+    // immutable — same data-integrity gap as ConfigMap: the checks are correct but never
+    // fire if this field is dropped on decode.
+    if let Some(v) = secret.immutable {
+        obj["immutable"] = serde_json::Value::Bool(v);
+    }
     if let Some(v) = secret.r#type.filter(|s| !s.is_empty()) {
         obj["type"] = serde_json::Value::String(v);
     }
@@ -2292,6 +2657,301 @@ mod tests {
         assert_eq!(
             volumes[0]["image"]["pullPolicy"], "Always",
             "spec.volumes[].image.pullPolicy must survive decode"
+        );
+    }
+
+    /// PodSpec hostNetwork/hostAliases/dnsConfig/dnsPolicy/ephemeralContainers/
+    /// automountServiceAccountToken all survive protobuf decode, and enableServiceLinks
+    /// (field 30) does not collide with dnsConfig (field 26) — both must decode correctly
+    /// when set together.
+    ///
+    /// Without this, DNS 'configurable pod DNS nameservers', hostAliases '/etc/hosts entries',
+    /// KubeletManagedEtcHosts (hostNetwork), ephemeral-containers update, and ServiceAccount
+    /// 'opting out of API token automount' all silently fail for every protobuf client
+    /// (client-go typed clientsets + the e2e suite), even though kubectl (JSON) looks fine.
+    #[test]
+    fn generated_pod_spec_preserves_dns_hostaliases_ephemeral_and_automount_fields() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("full-spec-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_network: Some(true),
+                automount_service_account_token: Some(false),
+                enable_service_links: Some(false),
+                dns_policy: Some("None".to_string()),
+                host_aliases: vec![core_v1::HostAlias {
+                    ip: Some("127.0.0.1".to_string()),
+                    hostnames: vec!["foo.local".to_string(), "bar.local".to_string()],
+                }],
+                dns_config: Some(core_v1::PodDnsConfig {
+                    nameservers: vec!["1.2.3.4".to_string()],
+                    searches: vec!["ns1.svc.cluster.local".to_string()],
+                    options: vec![core_v1::PodDnsConfigOption {
+                        name: Some("ndots".to_string()),
+                        value: Some("2".to_string()),
+                    }],
+                }),
+                ephemeral_containers: vec![core_v1::EphemeralContainer {
+                    ephemeral_container_common: Some(core_v1::EphemeralContainerCommon {
+                        name: Some("debugger".to_string()),
+                        image: Some("busybox".to_string()),
+                        ..Default::default()
+                    }),
+                    target_container_name: Some("c".to_string()),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with full spec must decode");
+
+        assert_eq!(
+            result["spec"]["hostNetwork"], true,
+            "hostNetwork must survive decode — without it KubeletManagedEtcHosts and \
+             hostPort-on-hostNetwork behavior is silently wrong"
+        );
+        assert_eq!(
+            result["spec"]["automountServiceAccountToken"], false,
+            "pod-level automountServiceAccountToken=false must survive decode — otherwise a \
+             pod that explicitly opted out of token automount gets one anyway"
+        );
+        assert_eq!(
+            result["spec"]["enableServiceLinks"], false,
+            "enableServiceLinks must survive decode unaffected by dnsConfig sharing no tag \
+             with it (26 vs 30) — a regression here would mean either field corrupts the other"
+        );
+        assert_eq!(
+            result["spec"]["dnsPolicy"], "None",
+            "dnsPolicy=\"None\" must survive decode — without it, create-defaulting stamps \
+             \"ClusterFirst\" instead, and the kubelet then ignores dnsConfig.nameservers \
+             entirely because ClusterFirst's own resolv.conf generation takes precedence \
+             (live-verified: this is why 'configurable pod DNS nameservers' fails even when \
+             dnsConfig itself decodes correctly)"
+        );
+        assert_eq!(
+            result["spec"]["hostAliases"][0]["ip"], "127.0.0.1",
+            "hostAliases[].ip must survive decode — otherwise requested /etc/hosts entries \
+             never reach the kubelet"
+        );
+        assert_eq!(
+            result["spec"]["hostAliases"][0]["hostnames"][1], "bar.local",
+            "hostAliases[].hostnames must survive decode in full"
+        );
+        assert_eq!(
+            result["spec"]["dnsConfig"]["nameservers"][0], "1.2.3.4",
+            "dnsConfig.nameservers must survive decode — without it, user-specified DNS \
+             nameservers are silently dropped and the kubelet falls back to cluster defaults"
+        );
+        assert_eq!(
+            result["spec"]["dnsConfig"]["searches"][0], "ns1.svc.cluster.local",
+            "dnsConfig.searches must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["dnsConfig"]["options"][0]["name"], "ndots",
+            "dnsConfig.options must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["ephemeralContainers"][0]["name"], "debugger",
+            "ephemeralContainers must survive decode — apply_ephemeral_containers_patch's \
+             merge logic is correct but never runs if the field is dropped on decode"
+        );
+        assert_eq!(
+            result["spec"]["ephemeralContainers"][0]["image"], "busybox",
+            "ephemeralContainers[].image must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["ephemeralContainers"][0]["targetContainerName"], "c",
+            "ephemeralContainers[].targetContainerName must survive decode"
+        );
+    }
+
+    /// Container-level securityContext survives protobuf decode.
+    ///
+    /// P1 security bug: without this, gen_container_to_json silently drops the entire
+    /// securityContext, so every protobuf-created container runs as whatever UID the image
+    /// defaults to (usually root) regardless of runAsUser, and allowPrivilegeEscalation=false
+    /// / readOnlyRootFilesystem=true are both ignored — a container that explicitly asked to
+    /// be locked down runs unlocked.
+    #[test]
+    fn generated_container_preserves_security_context() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("sc-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    security_context: Some(core_v1::SecurityContext {
+                        run_as_user: Some(1002),
+                        run_as_group: Some(2000),
+                        allow_privilege_escalation: Some(false),
+                        read_only_root_filesystem: Some(true),
+                        capabilities: Some(core_v1::Capabilities {
+                            add: vec!["NET_ADMIN".to_string()],
+                            drop: vec!["ALL".to_string()],
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with container securityContext must decode");
+        let sc = &result["spec"]["containers"][0]["securityContext"];
+
+        assert_eq!(
+            sc["runAsUser"], 1002,
+            "container securityContext.runAsUser must survive decode — reverting this fix \
+             means containers run as root (uid 0) regardless of the requested UID"
+        );
+        assert_eq!(
+            sc["runAsGroup"], 2000,
+            "container securityContext.runAsGroup must survive decode"
+        );
+        assert_eq!(
+            sc["allowPrivilegeEscalation"], false,
+            "allowPrivilegeEscalation=false must survive decode — otherwise a container that \
+             explicitly forbade privilege escalation can still escalate"
+        );
+        assert_eq!(
+            sc["readOnlyRootFilesystem"], true,
+            "readOnlyRootFilesystem=true must survive decode (sig-node 'read only busybox')"
+        );
+        assert_eq!(
+            sc["capabilities"]["add"][0], "NET_ADMIN",
+            "capabilities.add must survive decode"
+        );
+        assert_eq!(
+            sc["capabilities"]["drop"][0], "ALL",
+            "capabilities.drop must survive decode"
+        );
+    }
+
+    /// Pod-level securityContext, including sysctls, survives protobuf decode.
+    ///
+    /// P1 security bug: without this, pod.Spec.SecurityContext.RunAsUser/RunAsGroup are
+    /// dropped for every protobuf-created pod, and sysctls never reach the kubelet or
+    /// validate_pod_sysctls — making sysctl validation a no-op on the protobuf path even
+    /// after it's implemented, because the validator never sees the field it should reject.
+    #[test]
+    fn generated_pod_spec_preserves_security_context_and_sysctls() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("pod-sc-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                security_context: Some(core_v1::PodSecurityContext {
+                    run_as_user: Some(1001),
+                    run_as_group: Some(3000),
+                    fs_group: Some(4000),
+                    sysctls: vec![core_v1::Sysctl {
+                        name: Some("kernel.shm_rmid_forced".to_string()),
+                        value: Some("1".to_string()),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with pod-level securityContext must decode");
+        let sc = &result["spec"]["securityContext"];
+
+        assert_eq!(
+            sc["runAsUser"], 1001,
+            "pod.Spec.SecurityContext.RunAsUser must survive decode"
+        );
+        assert_eq!(
+            sc["runAsGroup"], 3000,
+            "pod.Spec.SecurityContext.RunAsGroup must survive decode"
+        );
+        assert_eq!(
+            sc["fsGroup"], 4000,
+            "pod.Spec.SecurityContext.FSGroup must survive decode"
+        );
+        assert_eq!(
+            sc["sysctls"][0]["name"], "kernel.shm_rmid_forced",
+            "sysctls must survive decode — without it, 'should support sysctls' fails because \
+             the kubelet never receives the sysctl, and 'should reject invalid sysctls' is a \
+             no-op because validate_pod_sysctls never sees the field to reject"
+        );
+        assert_eq!(
+            sc["sysctls"][0]["value"], "1",
+            "sysctl value must survive decode"
+        );
+    }
+
+    /// ConfigMap/Secret immutable:true survives protobuf decode.
+    ///
+    /// The immutability enforcement checks (resource.rs PATCH/PUT) are correct but never
+    /// fire if decode drops the field first — a protobuf Update() that sets immutable:true
+    /// would otherwise leave the stored object mutable forever, defeating the guarantee.
+    #[test]
+    fn generated_configmap_and_secret_preserve_immutable_flag() {
+        let cm = core_v1::ConfigMap {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("immutable-cm".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            immutable: Some(true),
+            ..Default::default()
+        };
+        let mut cm_buf = Vec::new();
+        cm.encode(&mut cm_buf).unwrap();
+        let cm_result = decode_configmap_proto_gen(&cm_buf).expect("ConfigMap must decode");
+        assert_eq!(
+            cm_result["immutable"], true,
+            "ConfigMap.immutable must survive decode — without it, an immutable ConfigMap can \
+             still be mutated because the stored object never has immutable:true set"
+        );
+
+        let secret = core_v1::Secret {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("immutable-secret".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            immutable: Some(true),
+            ..Default::default()
+        };
+        let mut secret_buf = Vec::new();
+        secret.encode(&mut secret_buf).unwrap();
+        let secret_result = decode_secret_proto_gen(&secret_buf).expect("Secret must decode");
+        assert_eq!(
+            secret_result["immutable"], true,
+            "Secret.immutable must survive decode — same data-integrity gap as ConfigMap"
         );
     }
 }
