@@ -3844,40 +3844,33 @@ pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
     pod["metadata"]["generation"] = serde_json::json!(1i64);
 }
 
-/// Set `target[key]` to match `source`'s value for `key`, including source's
-/// *absence* of the key.
+/// Reject a pod-spec update that rewrites `containers[*].resources` /
+/// `initContainers[*].resources`, or that adds/removes containers, or that
+/// violates the narrow upstream rules on `activeDeadlineSeconds` (decrease/set
+/// only) and `tolerations` (additions only) — mirrors the relevant parts of
+/// `ValidatePodUpdate` in `pkg/apis/core/validation`.
 ///
-/// `target[key] = source[key].clone()` looks equivalent but is not: indexing a
-/// missing key on `source` yields `Value::Null`, and assigning that via
-/// `IndexMut` autovivifies a brand-new `"key": null` entry on `target` even
-/// when `target` never had the key either — corrupting an otherwise-equal
-/// comparison against a `source` object that genuinely omits the key.
-fn sync_field(target: &mut serde_json::Value, source: &serde_json::Value, key: &str) {
-    match source.get(key) {
-        Some(v) => target[key] = v.clone(),
-        None => {
-            if let Some(m) = target.as_object_mut() {
-                m.remove(key);
-            }
-        }
-    }
-}
-
-/// Reject a pod-spec update to any field other than the narrow set upstream
-/// Kubernetes allows to change outside of a subresource (mirrors
-/// `ValidatePodUpdate` in `pkg/apis/core/validation`): `containers[*].image`,
-/// `initContainers[*].image`, `activeDeadlineSeconds` (decrease/set only),
-/// `tolerations` (additions only), and `terminationGracePeriodSeconds` (only
-/// to recover from a previously-negative value).
-///
-/// Everything else in spec — notably `containers[*].resources` — is immutable
-/// via the generic PUT/PATCH pod update. Resource resizing is only permitted
-/// through the `/resize` subresource (`validate_resize_patch` /
-/// `apply_resize_patch`), which additionally enforces QoS-class stability and
+/// Resource changes are immutable via the generic PUT/PATCH pod update; they
+/// are only permitted through the `/resize` subresource (`validate_resize_patch`
+/// / `apply_resize_patch`), which additionally enforces QoS-class stability and
 /// resource-removal rules. Without this guard a client can rewrite
 /// containers[].resources via a plain PUT, bypassing those rules entirely and
 /// letting ResourceQuota's captured pod-creation totals go stale (the pod's
 /// resources on disk no longer match what quota admission accounted for).
+///
+/// Unlike upstream's approach of munging every allowed-mutable field and then
+/// requiring the *whole* remaining spec to be byte-identical, this diffs only
+/// the fields it actually polices. A whole-spec comparison is fragile here:
+/// GC/RC/Job controllers (and the conformance tests that exercise them)
+/// legitimately PUT a pod back with only `metadata.ownerReferences` or
+/// `metadata.labels` changed — spec byte-for-byte unchanged from the server's
+/// point of view — but the object round-trips through client-go's protobuf
+/// encoder and our proto decoder on the way back in. Any decode asymmetry on a
+/// field this function doesn't care about (dnsPolicy, probe defaults, port
+/// protocol, ...) would then read as a spec change and 422 a metadata-only
+/// update, breaking pod adoption/release/orphaning cluster-wide. Scoping the
+/// diff to the fields upstream actually restricts avoids that false positive
+/// while still blocking the one thing this guard exists for.
 ///
 /// Both sides are spec-defaulted the same way `increment_pod_generation_if_spec_changed`
 /// does, so a client PUT that omits already-defaulted fields (dnsPolicy,
@@ -3929,22 +3922,8 @@ pub fn validate_pod_spec_immutable(
         );
     }
 
-    // Munge the allowed-mutable fields to their old values, then require the
-    // remaining spec to be byte-for-byte identical — same strategy upstream uses.
-    let mut munged = new_spec.clone();
-    if let Some(arr) = munged["containers"].as_array_mut() {
-        for (i, c) in arr.iter_mut().enumerate() {
-            c["image"] = old_containers[i]["image"].clone();
-        }
-    }
-    if let Some(arr) = munged["initContainers"].as_array_mut() {
-        for (i, c) in arr.iter_mut().enumerate() {
-            c["image"] = old_init[i]["image"].clone();
-        }
-    }
-
     let old_ads = old_spec["activeDeadlineSeconds"].as_i64();
-    let new_ads = munged["activeDeadlineSeconds"].as_i64();
+    let new_ads = new_spec["activeDeadlineSeconds"].as_i64();
     match (old_ads, new_ads) {
         (Some(old), Some(new)) if new > old => {
             return Err("spec.activeDeadlineSeconds: Forbidden: must be less than \
@@ -3960,13 +3939,12 @@ pub fn validate_pod_spec_immutable(
         }
         _ => {}
     }
-    sync_field(&mut munged, old_spec, "activeDeadlineSeconds");
 
     let old_tolerations = old_spec["tolerations"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let new_tolerations = munged["tolerations"]
+    let new_tolerations = new_spec["tolerations"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -3979,25 +3957,24 @@ pub fn validate_pod_spec_immutable(
             );
         }
     }
-    sync_field(&mut munged, old_spec, "tolerations");
 
-    if old_spec["terminationGracePeriodSeconds"]
-        .as_i64()
-        .is_some_and(|v| v < 0)
-        && munged["terminationGracePeriodSeconds"].as_i64() == Some(1)
-    {
-        sync_field(&mut munged, old_spec, "terminationGracePeriodSeconds");
+    for (i, (old_c, new_c)) in old_containers.iter().zip(new_containers.iter()).enumerate() {
+        if old_c["resources"] != new_c["resources"] {
+            return Err(format!(
+                "spec.containers[{i}].resources: Forbidden: pod updates may not change \
+                 container resources — resize the pod via the /resize subresource instead"
+            ));
+        }
+    }
+    for (i, (old_c, new_c)) in old_init.iter().zip(new_init.iter()).enumerate() {
+        if old_c["resources"] != new_c["resources"] {
+            return Err(format!(
+                "spec.initContainers[{i}].resources: Forbidden: pod updates may not change \
+                 container resources — resize the pod via the /resize subresource instead"
+            ));
+        }
     }
 
-    if munged != *old_spec {
-        return Err(
-            "spec: Forbidden: pod updates may not change fields other than \
-             `spec.containers[*].image`, `spec.initContainers[*].image`, \
-             `spec.activeDeadlineSeconds`, `spec.tolerations` (only additions), \
-             `spec.terminationGracePeriodSeconds`"
-                .into(),
-        );
-    }
     Ok(())
 }
 
@@ -9312,6 +9289,161 @@ mod handler_tests {
         assert_eq!(
             v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
             "resize must actually apply the new resources"
+        );
+    }
+
+    /// A PUT that changes only `metadata.ownerReferences` (spec unchanged) must succeed.
+    ///
+    /// The GC, RC, and Job controllers adopt/release/orphan pods by fetching a pod,
+    /// changing only its ownerReferences, and PUTting it back — spec is never touched.
+    /// A prior version of the immutability guard compared the *whole* spec byte-for-byte
+    /// after re-running spec defaulting on both sides, which is not resilient to protobuf
+    /// encode/decode asymmetry on fields the guard doesn't even care about (dnsPolicy,
+    /// probe defaults, ...). That false positive rejected every metadata-only controller
+    /// PUT with a 422, breaking pod adoption/release/orphaning across GC, RC and Job
+    /// conformance tests.
+    #[tokio::test]
+    async fn replace_pod_allows_owner_references_only_change() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/adoptable-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "adoptable-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "adoptable-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string(),
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "adopter",
+                    "uid": "11111111-1111-1111-1111-111111111111",
+                    "controller": true
+                }]
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/adoptable-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a PUT changing only metadata.ownerReferences (spec unchanged) must succeed — \
+             otherwise the GC/RC/Job controllers can never adopt an orphaned pod"
+        );
+    }
+
+    /// A PUT that changes only `metadata.labels` (spec unchanged) must succeed.
+    ///
+    /// The RC controller releases a pod it no longer selects by re-labeling it via a
+    /// generic PUT (see rc.go testRCReleaseControlledNotMatching). Spec is untouched;
+    /// only labels change. This must not be mistaken for a spec change by the
+    /// immutability guard.
+    #[tokio::test]
+    async fn replace_pod_allows_labels_only_change() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/releasable-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "releasable-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"name": "pod-release"}
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "releasable-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string(),
+                "labels": {"name": "not-matching-name"}
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/releasable-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a PUT changing only metadata.labels (spec unchanged) must succeed — \
+             otherwise the RC controller can never release a pod it no longer selects"
         );
     }
 
