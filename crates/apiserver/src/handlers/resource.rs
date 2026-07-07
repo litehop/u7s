@@ -1660,7 +1660,7 @@ pub async fn replace_namespaced_resource<S: Store>(
     let needs_stored_read = super::defaults::is_workload_resource(&group, &plural)
         || meta.has_status_subresource
         || (group.is_empty() && (plural == "secrets" || plural == "configmaps"));
-    let (spec_before_replace, stored_status) = if needs_stored_read {
+    let (spec_before_replace, stored_status, stored_generation) = if needs_stored_read {
         let parsed = state
             .store
             .get(&key)
@@ -1703,10 +1703,27 @@ pub async fn replace_namespaced_resource<S: Store>(
         } else {
             None
         };
-        (spec, status)
+        let generation = if super::defaults::is_workload_resource(&group, &plural) {
+            parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
+        } else {
+            None
+        };
+        (spec, status, generation)
     } else {
-        (None, None)
+        (None, None, None)
     };
+
+    // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
+    // omits metadata.generation. Restamp the stored value onto the incoming body before
+    // apply_defaults runs, or initialize_workload_generation treats the omission as "new
+    // object" and resets generation to 1 — silently erasing however many spec changes the
+    // Deployment has actually undergone and desyncing status.observedGeneration from the
+    // real generation history the Deployment controller expects to see increase monotonically.
+    if let Some(ref g) = stored_generation {
+        if !g.is_null() {
+            obj.body["metadata"]["generation"] = g.clone();
+        }
+    }
 
     // Allocate a clusterIP when a Service transitions away from ExternalName to a
     // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
@@ -10935,6 +10952,114 @@ mod tests {
         assert_eq!(
             v["spec"]["replicas"], 0,
             "spec.replicas must be updated by the PUT"
+        );
+    }
+
+    /// A blind PUT (dynamic/typed client round-tripping a locally-held object, as the
+    /// '[sig-apps] Deployment should run the lifecycle of a Deployment' conformance test
+    /// does) commonly omits metadata.generation entirely. The server must treat generation
+    /// as system-managed: preserve the stored value and increment it if spec changed, never
+    /// reset it to 1 just because the client didn't echo it back.
+    ///
+    /// Before this fix, apply_defaults's initialize_workload_generation saw a null
+    /// generation on the incoming body and set it to 1 (its "this must be a create" branch),
+    /// so a Deployment already at generation 3 landed at generation 2 after a spec-changing
+    /// PUT — losing all history and desyncing status.observedGeneration from what the
+    /// Deployment controller (and the conformance test's watch assertions) expect to see
+    /// monotonically increase.
+    #[tokio::test]
+    async fn put_deployment_without_generation_increments_from_stored_value_not_reset_to_1() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Deployment already at generation 3 (two prior spec-changing patches).
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "test-deployment",
+                "namespace": "default",
+                "generation": 3
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "pause:3.10.1" }] }
+                }
+            },
+            "status": { "observedGeneration": 3, "replicas": 1 }
+        });
+        let key = "/registry/apps/deployments/default/test-deployment";
+        let stored_rv = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Dynamic client PUT: full-object replace with a changed image, but no
+        // metadata.generation field at all — exactly what runtime.DefaultUnstructuredConverter
+        // produces when the caller never fetched the object back after prior mutations.
+        let put_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "test-deployment",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {
+                "replicas": 2,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "httpd:2.4.38-4" }] }
+                }
+            }
+        });
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "deployments".to_string(),
+                "test-deployment".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PUT Deployment must succeed, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["generation"], 4,
+            "generation must increment from the true stored value (3 -> 4) when the spec \
+             changes via a PUT that omits metadata.generation — resetting to 1-based counting \
+             (e.g. landing at 2) desyncs status.observedGeneration from the real change history"
         );
     }
 
