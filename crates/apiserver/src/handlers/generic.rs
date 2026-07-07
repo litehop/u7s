@@ -1018,6 +1018,39 @@ mod tests {
     }
 
     #[test]
+    fn json_patch_test_op_passes_and_lets_subsequent_ops_apply() {
+        // 'test' is an optimistic-concurrency guard: clients chain it before a write to
+        // assert the server has the value they expect. A passing test must not block the
+        // rest of the patch.
+        let mut obj = serde_json::json!({"spec": {"replicas": 1}});
+        let patch = serde_json::json!([
+            {"op": "test", "path": "/spec/replicas", "value": 1},
+            {"op": "replace", "path": "/spec/replicas", "value": 3}
+        ]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj["spec"]["replicas"], 3);
+    }
+
+    #[test]
+    fn json_patch_test_op_failure_rejects_whole_patch_atomically() {
+        // If 'test' rejected only the failing op but let earlier ops in the same patch
+        // stick, a test-and-set client would silently observe a half-applied write instead
+        // of the atomic failure it asked for.
+        let mut obj = serde_json::json!({"spec": {"replicas": 1}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "replace", "path": "/spec/replicas", "value": 99},
+            {"op": "test", "path": "/spec/replicas", "value": 1}
+        ]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            obj, before,
+            "a failing 'test' op must leave the object untouched, not half-patched"
+        );
+    }
+
+    #[test]
     fn detect_patch_type_accepts_json_patch() {
         // application/json-patch+json must now be accepted instead of 415
         let h = headers_with_content_type("application/json-patch+json");
