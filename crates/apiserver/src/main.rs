@@ -600,7 +600,9 @@ fn build_router(state: AppState) -> Router {
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
             "/api/v1/{resource}",
-            get(handlers::core::core_list_resource).post(handlers::core::core_create_resource),
+            get(handlers::core::core_list_resource)
+                .post(handlers::core::core_create_resource)
+                .delete(handlers::core::core_delete_collection_resource),
         )
         // Core group — cluster-scoped named resource
         .route(
@@ -6224,6 +6226,115 @@ mod tests {
         assert!(
             stored.is_none(),
             "pod 'sonobuoy/sonobuoy-worker' must be deleted after collection DELETE with matching labelSelector"
+        );
+    }
+
+    /// DELETE /api/v1/persistentvolumes (collection) must return 200, not 405.
+    ///
+    /// Regression test for mayor-yssp: the CSI PV lifecycle conformance test creates and
+    /// deletes individual PVs, then calls DeleteCollection to bulk-clean. The cluster-scoped
+    /// core/v1 collection route (`/api/v1/{resource}`) registered only GET+POST, unlike its
+    /// namespaced sibling which already has DELETE wired — so PersistentVolumes (and every
+    /// other cluster-scoped core resource) returned 405 MethodNotAllowed, blocking the test's
+    /// cleanup step. The test verifies: 1) the route accepts DELETE (not 405), 2) matching PVs
+    /// are actually removed, 3) labelSelector filtering is honored.
+    #[tokio::test]
+    async fn delete_collection_persistentvolumes_returns_200_not_405() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let matching_key = keys::group_object_key("", "persistentvolumes", None, "pv-match");
+        let matching_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "pv-match", "labels": { "e2e": "abc123" } },
+            "spec": { "capacity": { "storage": "1Gi" }, "accessModes": ["ReadWriteOnce"] }
+        });
+        store
+            .put(
+                &matching_key,
+                bytes::Bytes::from(matching_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed matching PersistentVolume must succeed");
+
+        let other_key = keys::group_object_key("", "persistentvolumes", None, "pv-other");
+        let other_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "pv-other" },
+            "spec": { "capacity": { "storage": "1Gi" }, "accessModes": ["ReadWriteOnce"] }
+        });
+        store
+            .put(
+                &other_key,
+                bytes::Bytes::from(other_body.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed unrelated PersistentVolume must succeed");
+
+        let mut router = build_router(state);
+
+        let mut req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/persistentvolumes?labelSelector=e2e%3Dabc123")
+            .body(axum::body::Body::empty())
+            .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE /api/v1/persistentvolumes must not return 405 — the CSI PV lifecycle \
+             conformance test calls DeleteCollection to bulk-clean PVs it created"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "collection DELETE on persistentvolumes must return 200 Success"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+        assert_eq!(val["kind"], "Status");
+        assert_eq!(val["status"], "Success");
+
+        let stored = store
+            .get(&matching_key)
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            stored.is_none(),
+            "PersistentVolume 'pv-match' must be deleted after collection DELETE with matching labelSelector"
+        );
+        let stored = store
+            .get(&other_key)
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            stored.is_some(),
+            "PersistentVolume 'pv-other' must survive — it does not match the labelSelector"
         );
     }
 

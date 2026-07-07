@@ -23,9 +23,9 @@ use super::generic::{
 use super::json_patch::{CreateQuery, PatchQuery, ReplaceQuery};
 use super::resource::{
     create_namespaced_resource, create_resource, delete_collection_namespaced_resource,
-    delete_namespaced_resource, delete_resource, get_namespaced_resource, get_resource,
-    list_namespaced_resource, list_resource, patch_namespaced_resource, patch_resource,
-    replace_namespaced_resource, replace_resource,
+    delete_collection_resource, delete_namespaced_resource, delete_resource,
+    get_namespaced_resource, get_resource, list_namespaced_resource, list_resource,
+    patch_namespaced_resource, patch_resource, replace_namespaced_resource, replace_resource,
 };
 use super::status::{
     get_namespaced_resource_status, get_resource_status, patch_namespaced_resource_status,
@@ -237,6 +237,21 @@ pub async fn core_patch_resource<S: Store>(
         Extension(user),
         headers,
         body,
+    )
+    .await
+}
+
+pub async fn core_delete_collection_resource<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(plural): Path<String>,
+    Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    delete_collection_resource(
+        State(state),
+        Path(("".into(), "v1".into(), plural)),
+        Query(query),
+        Extension(user),
     )
     .await
 }
