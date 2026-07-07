@@ -28,6 +28,14 @@ use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 /// a peer controller just removed, causing livelock where the object stays Terminating
 /// forever.
 ///
+/// `labels` is also protected: labels drive policy decisions elsewhere (Namespace's
+/// `pod-security.kubernetes.io/enforce`, selector-based webhook/NetworkPolicy matching),
+/// so a caller with only `<resource>/status` rights must not be able to rewrite them via
+/// a merge/strategic-merge-patch or PUT to /status — the same RBAC-isolation rule that
+/// `validate_status_json_patch_paths` already enforces for JSON Patch. `annotations` stays
+/// unprotected: CronJob and other controllers rely on setting annotations via /status, and
+/// annotations do not gate policy the way labels do.
+///
 /// Restore semantics: if the field was absent (null) in the stored object, the field is
 /// removed after merge even if the incoming body added it. If it was present, it is
 /// restored to its stored value unconditionally.
@@ -48,6 +56,7 @@ pub(crate) fn merge_incoming_metadata(
         "generation",
         "finalizers",
         "deletionTimestamp",
+        "labels",
     ];
     let saved: Vec<(&str, serde_json::Value)> = PROTECTED
         .iter()
@@ -2218,6 +2227,79 @@ mod tests {
         assert_eq!(
             v["metadata"]["uid"], "def-456",
             "uid must not change via /status PATCH"
+        );
+    }
+
+    /// A merge-patch to a generic resource's /status must NOT change `metadata.labels`,
+    /// even though (per the test above) it IS allowed to change `metadata.annotations`.
+    /// Labels drive policy decisions elsewhere (Namespace's PSA enforce label, selector-based
+    /// webhook/NetworkPolicy matching) while annotations do not, so the merge/strategic-merge
+    /// path — used generically by every resource's /status endpoint, not just Namespace/CRD —
+    /// must block label writes the same way `validate_status_json_patch_paths` already blocks
+    /// them for JSON Patch.
+    #[tokio::test]
+    async fn patch_namespaced_status_merge_patch_rejects_metadata_labels() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let cronjob = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "label-cj",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": { "schedule": "* * * * *" },
+            "status": {}
+        });
+        let key = "/registry/batch/cronjobs/default/label-cj";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&cronjob).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "metadata": { "labels": { "attacker": "true" } },
+            "status": { "lastScheduleTime": "2024-01-01T00:00:00Z" }
+        });
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "batch".into(),
+                "v1".into(),
+                "default".into(),
+                "cronjobs".into(),
+                "label-cj".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a merge-patch to /status must still succeed — the label change is dropped, \
+             not rejected"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["labels"]["attacker"].is_null(),
+            "a merge-patch on /status must NOT be able to set arbitrary labels"
+        );
+        assert_eq!(
+            v["status"]["lastScheduleTime"], "2024-01-01T00:00:00Z",
+            "the legitimate status change in the same patch must still apply"
         );
     }
 
