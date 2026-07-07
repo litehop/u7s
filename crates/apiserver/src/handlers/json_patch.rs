@@ -621,8 +621,13 @@ pub(crate) fn detect_patch_type(
 }
 
 /// Apply a JSON Patch (RFC 6902) to `obj`.
-/// Supports `add`, `remove`, and `replace` operations.
-/// Returns Err(422) for unsupported operations or invalid paths.
+/// Supports `add`, `remove`, `replace`, and `test` operations.
+/// Returns Err(422) for unsupported operations, invalid paths, or a failing `test`.
+///
+/// Applies atomically: operations run against a clone of `obj` and are only written back
+/// once every operation succeeds, so a failing `test` (or any other op) leaves `obj`
+/// untouched rather than half-patched — `test` is used by clients as an optimistic-
+/// concurrency guard, and a partial apply on failure would defeat that guarantee.
 pub(crate) fn apply_json_patch(
     obj: &mut serde_json::Value,
     patch: &serde_json::Value,
@@ -631,6 +636,7 @@ pub(crate) fn apply_json_patch(
         Status::unprocessable_entity("JSON patch must be an array of operations".into())
     })?;
 
+    let mut working = obj.clone();
     for op in ops {
         let op_str = op["op"].as_str().ok_or_else(|| {
             Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
@@ -652,7 +658,7 @@ pub(crate) fn apply_json_patch(
                     })?
                     .clone();
                 // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
-                json_patch_add(obj, path, value)?;
+                json_patch_add(&mut working, path, value)?;
             }
             "replace" => {
                 let value = op
@@ -664,18 +670,30 @@ pub(crate) fn apply_json_patch(
                     })?
                     .clone();
                 // 'replace' is strict: 422 if path does not exist.
-                json_patch_set(obj, path, value)?;
+                json_patch_set(&mut working, path, value)?;
             }
             "remove" => {
-                json_patch_remove(obj, path)?;
+                json_patch_remove(&mut working, path)?;
+            }
+            "test" => {
+                let expected = op.get("value").ok_or_else(|| {
+                    Status::unprocessable_entity("'test' operation requires a 'value' field".into())
+                })?;
+                let actual = json_patch_get(&working, path)?;
+                if actual != expected {
+                    return Err(Status::unprocessable_entity(format!(
+                        "'test' operation failed: value at path '{path}' does not match expected value"
+                    )));
+                }
             }
             other => {
                 return Err(Status::unprocessable_entity(format!(
-                    "unsupported JSON patch operation '{other}'; supported: add, remove, replace"
+                    "unsupported JSON patch operation '{other}'; supported: add, remove, replace, test"
                 )));
             }
         }
     }
+    *obj = working;
     Ok(())
 }
 
@@ -732,6 +750,39 @@ pub(crate) fn json_navigate_one<'a>(
             "cannot traverse into non-object/array at segment '{seg}'"
         ))),
     }
+}
+
+/// Read the value at `pointer` for RFC 6902 'test'. Unlike `json_patch_navigate_mut`, this
+/// resolves the full path (not just its parent) and never mutates `obj`.
+pub(crate) fn json_patch_get<'a>(
+    obj: &'a serde_json::Value,
+    pointer: &str,
+) -> Result<&'a serde_json::Value, crate::status::StatusError> {
+    let segs = json_pointer_segments(pointer);
+    let mut cur = obj;
+    for seg in &segs {
+        cur = match cur {
+            serde_json::Value::Object(map) => map.get(seg).ok_or_else(|| {
+                Status::unprocessable_entity(format!("path segment '{seg}' not found"))
+            })?,
+            serde_json::Value::Array(arr) => {
+                let idx: usize = seg.parse().map_err(|_| {
+                    Status::unprocessable_entity(format!(
+                        "path segment '{seg}' is not a valid array index"
+                    ))
+                })?;
+                arr.get(idx).ok_or_else(|| {
+                    Status::unprocessable_entity(format!("array index {idx} out of bounds"))
+                })?
+            }
+            _ => {
+                return Err(Status::unprocessable_entity(format!(
+                    "cannot traverse into non-object/array at segment '{seg}'"
+                )))
+            }
+        };
+    }
+    Ok(cur)
 }
 
 /// Navigate to a child, creating an empty object if the key is absent.

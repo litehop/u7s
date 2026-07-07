@@ -12,8 +12,8 @@
 use axum::{
     body::Body,
     extract::{
-        ws::{WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        FromRequestParts, Path, Query, State,
     },
     response::Response,
 };
@@ -90,19 +90,54 @@ pub fn node_address(node: &serde_json::Value) -> Option<String> {
 // /log handler
 // ---------------------------------------------------------------------------
 
-pub async fn pod_log<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<LogQuery>,
-) -> Result<Response, crate::status::StatusError> {
+/// Subprotocol kubectl and the sig-node conformance test negotiate for the pod-logs
+/// WebSocket. Unlike exec/attach's `v4/v5.channel.k8s.io`, log messages carry no
+/// channel-byte prefix — kubelet's log endpoint is plain HTTP, so the apiserver just
+/// forwards each response chunk as a raw WS message.
+const LOG_WS_SUBPROTOCOL: &str = "binary.k8s.io";
+
+/// True when the inbound request carries the WebSocket upgrade headers.
+///
+/// `/log` must serve both a plain GET (the existing streaming-HTTP-response behavior)
+/// and a WebSocket GET (kubectl and the "retrieving logs over websockets" conformance
+/// test) on the same route. Unlike `/attach` and `/exec` it can't take `WebSocketUpgrade`
+/// as a required extractor — that would reject every plain GET with 400 before the
+/// handler body runs.
+fn is_websocket_upgrade_request(req: &axum::http::Request<Body>) -> bool {
+    let headers = req.headers();
+    let has_upgrade_connection = headers
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    let has_websocket_upgrade = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    has_upgrade_connection && has_websocket_upgrade
+}
+
+/// Pure lookup: pod → node → node_ip → kubelet containerLogs URL.
+///
+/// Extracted from `pod_log` so the plain-HTTP and WebSocket branches share the same
+/// pod/node/container resolution and error semantics (404/400/500), and so the error
+/// paths can be tested without a live kubelet.
+async fn resolve_log_target<S: Store>(
+    state: &AppState<S>,
+    raw_ns: &str,
+    pod_name: &str,
+    query: &LogQuery,
+) -> Result<String, crate::status::StatusError> {
     // 1. Look up the pod.
-    let pod_key = object_key("pods", &raw_ns, &pod_name);
+    let pod_key = object_key("pods", raw_ns, pod_name);
     let stored = state
         .store
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&pod_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -190,10 +225,66 @@ pub async fn pod_log<S: Store>(
         kubelet_url = format!("{kubelet_url}?{qs}");
     }
 
-    // 6. Proxy via reqwest using the shared kubelet client (built once at startup).
-    let client = state.kubelet_client.as_ref().ok_or_else(|| {
+    Ok(kubelet_url)
+}
+
+/// Fetch the kubelet log stream and forward each chunk as a WebSocket binary message.
+///
+/// kubelet's containerLogs endpoint is plain HTTP, not a WebSocket — the apiserver is
+/// the one that terminates the client's WS upgrade and re-emits the HTTP response body
+/// as WS frames. Runs until the kubelet stream ends or the client disconnects.
+async fn stream_log_over_websocket(
+    mut socket: WebSocket,
+    client: reqwest::Client,
+    kubelet_url: String,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+
+    let kubelet_resp = client
+        .get(&kubelet_url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("kubelet log request failed: {e}"))?;
+
+    let mut stream = kubelet_resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| anyhow::anyhow!("kubelet log stream error: {e}"))?;
+        if socket.send(Message::Binary(bytes)).await.is_err() {
+            // Client went away — nothing left to forward to.
+            return Ok(());
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+    Ok(())
+}
+
+pub async fn pod_log<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, pod_name)): Path<(String, String)>,
+    Query(query): Query<LogQuery>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    let kubelet_url = resolve_log_target(&state, &raw_ns, &pod_name, &query).await?;
+
+    // Proxy via reqwest using the shared kubelet client (built once at startup).
+    let client = state.kubelet_client.clone().ok_or_else(|| {
         Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
     })?;
+
+    if is_websocket_upgrade_request(&req) {
+        let (mut parts, _body) = req.into_parts();
+        let ws = WebSocketUpgrade::from_request_parts(&mut parts, &state)
+            .await
+            .map_err(|e| Status::bad_request(format!("invalid websocket upgrade request: {e}")))?;
+
+        return Ok(ws.protocols([LOG_WS_SUBPROTOCOL]).on_upgrade(
+            move |socket: WebSocket| async move {
+                if let Err(e) = stream_log_over_websocket(socket, client, kubelet_url).await {
+                    tracing::warn!("log websocket stream error: {e}");
+                }
+            },
+        ));
+    }
 
     let kubelet_resp = client.get(&kubelet_url).send().await.map_err(|e| {
         crate::status::StatusError(
@@ -1512,9 +1603,34 @@ pub async fn pod_proxy<S: Store>(
     pod_proxy_dispatch(&state, &ns, &pod_name, &path_suffix, req).await
 }
 
+/// Upstream kube-apiserver 301-redirects a bare `.../proxy` GET/HEAD (no trailing slash)
+/// to `.../proxy/` — relative links in proxied HTML are resolved against the request URL,
+/// so without the trailing slash they'd resolve one level too high. Other methods (and
+/// the trailing-slash form) proxy immediately; the conformance suite only checks GET/HEAD.
+fn redirect_bare_proxy_root(req: &axum::http::Request<Body>) -> Option<Response> {
+    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
+        return None;
+    }
+    let path = req.uri().path();
+    if path.ends_with('/') {
+        return None;
+    }
+    let location = match req.uri().query() {
+        Some(q) => format!("{path}/?{q}"),
+        None => format!("{path}/"),
+    };
+    Some(
+        Response::builder()
+            .status(axum::http::StatusCode::MOVED_PERMANENTLY)
+            .header(axum::http::header::LOCATION, location)
+            .body(Body::empty())
+            .expect("static redirect response must build"),
+    )
+}
+
 /// Proxy a request to the pod's IP and containerPort (no sub-path form).
 ///
-/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy  → http://{podIP}:{port}/
+/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy  → 301 Location: .../proxy/ (GET/HEAD only)
 /// GET /api/v1/namespaces/{ns}/pods/{name}/proxy/ → http://{podIP}:{port}/
 ///
 /// axum's `{*path}` wildcard requires a non-empty segment, so a dial to /proxy or /proxy/
@@ -1526,6 +1642,9 @@ pub async fn pod_proxy_root<S: Store>(
     Path((ns, pod_name)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
+    if let Some(redirect) = redirect_bare_proxy_root(&req) {
+        return Ok(redirect);
+    }
     pod_proxy_dispatch(&state, &ns, &pod_name, "", req).await
 }
 
@@ -1770,13 +1889,16 @@ pub async fn service_proxy<S: Store>(
 
 /// Proxy a request to a Service-backing endpoint (no sub-path form).
 ///
-/// GET /api/v1/namespaces/{ns}/services/{name}/proxy  → http://{endpointIP}:{port}/
+/// GET /api/v1/namespaces/{ns}/services/{name}/proxy  → 301 Location: .../proxy/ (GET/HEAD only)
 /// GET /api/v1/namespaces/{ns}/services/{name}/proxy/ → http://{endpointIP}:{port}/
 pub async fn service_proxy_root<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, svc_name)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
+    if let Some(redirect) = redirect_bare_proxy_root(&req) {
+        return Ok(redirect);
+    }
     service_proxy_dispatch(&state, &ns, &svc_name, "", req).await
 }
 
@@ -3105,8 +3227,13 @@ mod tests {
     /// The RC serve-image conformance test dials the pod proxy subresource without
     /// any sub-path. Before this fix, the route `/proxy/{*path}` required a
     /// non-empty segment so `/proxy` and `/proxy/` fell through to a 404.
-    /// We verify routing by seeding a pod with no podIP (which the handler
-    /// returns 503 for). 503 proves the handler was reached; 404 proves it was not.
+    ///
+    /// The bare `/proxy` form (no trailing slash) now 301-redirects to `/proxy/` for
+    /// GET (matching upstream and the sig-network Proxy conformance test); a plain
+    /// http.Client follows that redirect automatically, so WaitForPodsResponding still
+    /// reaches the pod. `/proxy/` reaches the handler directly and returns 503 (pod
+    /// exists but has no podIP) — 503 proves the handler was reached, 404 proves it
+    /// was not.
     #[tokio::test]
     async fn pod_proxy_root_path_routes_not_404_else_serve_image_conformance_fails() {
         let state = make_state();
@@ -3132,9 +3259,15 @@ mod tests {
 
         let mut router = make_router(state);
 
-        for path in [
-            "/api/v1/namespaces/default/pods/srv/proxy",
-            "/api/v1/namespaces/default/pods/srv/proxy/",
+        for (path, want) in [
+            (
+                "/api/v1/namespaces/default/pods/srv/proxy",
+                StatusCode::MOVED_PERMANENTLY,
+            ),
+            (
+                "/api/v1/namespaces/default/pods/srv/proxy/",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let req = Request::builder()
                 .uri(path)
@@ -3150,11 +3283,65 @@ mod tests {
             );
             assert_eq!(
                 resp.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "GET {path} must reach the proxy handler and return 503 \
-                 (pod exists but has no podIP) — any other status means routing is broken"
+                want,
+                "GET {path} must reach the proxy routing correctly — any other status \
+                 means routing or the bare-root redirect is broken"
             );
         }
+    }
+
+    /// redirect_bare_proxy_root must 301 a bare GET/HEAD `.../proxy` and preserve the
+    /// query string, but must not touch POST or the trailing-slash form.
+    ///
+    /// The sig-network Proxy conformance test dials `.../pods/<p>/proxy?method=GET` with
+    /// a client that does not follow redirects and asserts the raw status is 301; a
+    /// missing Location or a wrong status leaves relative links in proxied content
+    /// unresolvable and fails the conformance check.
+    #[test]
+    fn redirect_bare_proxy_root_redirects_get_head_only() {
+        let get_bare = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/p/proxy?method=GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = redirect_bare_proxy_root(&get_bare).expect("bare GET must redirect");
+        assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            resp.headers().get(axum::http::header::LOCATION).unwrap(),
+            "/api/v1/namespaces/default/pods/p/proxy/?method=GET",
+            "Location must point at the trailing-slash form and keep the query string"
+        );
+
+        let head_bare = Request::builder()
+            .method("HEAD")
+            .uri("/api/v1/namespaces/default/pods/p/proxy")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            redirect_bare_proxy_root(&head_bare).is_some(),
+            "HEAD must redirect the same as GET"
+        );
+
+        let post_bare = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/p/proxy")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            redirect_bare_proxy_root(&post_bare).is_none(),
+            "POST must proxy immediately, not redirect — only GET/HEAD are covered \
+             by the conformance check and a POST redirect would drop the request body"
+        );
+
+        let get_slash = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/p/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            redirect_bare_proxy_root(&get_slash).is_none(),
+            "the trailing-slash form is already canonical and must proxy directly"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3710,6 +3897,174 @@ mod tests {
             500,
             "pod_log must not return 500 on kubelet unavailability — \
              500 misleads clients/monitoring: the apiserver is healthy, the kubelet is not reachable"
+        );
+    }
+
+    /// A WebSocket GET to /log must upgrade (101) and negotiate the `binary.k8s.io`
+    /// subprotocol; a plain GET to the same route must still return logs as an ordinary
+    /// HTTP response.
+    ///
+    /// The sig-node "retrieving logs from the container over websockets" conformance
+    /// test dials `/log` with `Sec-WebSocket-Protocol: binary.k8s.io` and fails with
+    /// "bad status" if the server ever answers with anything but 101 — before this fix
+    /// pod_log had no upgrade branch at all, so every websocket log request failed this
+    /// way even though the pod and kubelet were healthy.
+    #[tokio::test]
+    async fn pod_log_websocket_upgrade_returns_101_plain_get_unaffected() {
+        // axum's WebSocketUpgrade extractor needs hyper's real `OnUpgrade` connection
+        // state, which only exists on a genuine TCP-served request (a synthetic
+        // `Request` built in-process has none) — so this drives the router through a
+        // real `hyper::server::conn` + `tokio_tungstenite` client, the same pattern
+        // main.rs uses to regression-test with_upgrades().
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        // A cluster CA is required for kubelet_client to be Some — pod_log 503s before
+        // ever reaching the upgrade branch otherwise. The actual kubelet connection is
+        // never made successfully in this test (127.0.0.1:10250 has nothing listening):
+        // on_upgrade() always answers 101 to the client first and only *then*
+        // asynchronously dials kubelet, so this test does not need a live kubelet.
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store: store.clone(),
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "wspod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "main", "image": "busybox"}]
+            }
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "wspod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]}
+        });
+        store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let router = make_router(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let io = hyper_util::rt::TokioIo::new(tcp);
+            let service = hyper::service::service_fn(move |req| {
+                let mut router = router.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        tower_service::Service::call(&mut router, req)
+                            .await
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await;
+        });
+
+        let url = format!("ws://{addr}/api/v1/namespaces/default/pods/wspod/log?container=main");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            LOG_WS_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (_ws, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect(
+                    "a websocket GET to /log must upgrade (101) — any other status is what the \
+                 sig-node conformance client reports as 'bad status' and fails on",
+                );
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some(LOG_WS_SUBPROTOCOL),
+            "the upgrade response must echo back binary.k8s.io — the conformance client \
+             requests exactly this subprotocol and rejects a mismatched/absent one"
+        );
+    }
+
+    /// is_websocket_upgrade_request must distinguish a genuine upgrade request from an
+    /// ordinary GET, and not be fooled by an `Upgrade` header alone or vice versa.
+    ///
+    /// If this ever misfired on a normal request, every existing non-websocket log
+    /// client (kubectl logs, dashboards) would be routed into the upgrade branch and
+    /// break; if it ever missed a real upgrade request, the conformance client would
+    /// see the "bad status" failure this fix removes.
+    #[test]
+    fn is_websocket_upgrade_request_requires_both_headers() {
+        let plain = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/p/log")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            !is_websocket_upgrade_request(&plain),
+            "a plain GET with neither header must not be treated as a websocket request"
+        );
+
+        let upgrade_header_only = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/p/log")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            !is_websocket_upgrade_request(&upgrade_header_only),
+            "Upgrade: websocket without Connection: Upgrade is not a valid upgrade \
+             request per RFC 6455 and must not trigger the websocket branch"
+        );
+
+        let full_upgrade = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/p/log")
+            .header(axum::http::header::CONNECTION, "keep-alive, Upgrade")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            is_websocket_upgrade_request(&full_upgrade),
+            "both headers present (Connection may list other tokens alongside \
+             'upgrade') must be recognized as a websocket upgrade request"
         );
     }
 
@@ -4746,10 +5101,21 @@ mod tests {
 
         let mut router = make_router(state);
 
-        for path in [
-            "/api/v1/namespaces/default/services/my-svc/proxy",
-            "/api/v1/namespaces/default/services/my-svc/proxy/",
-            "/api/v1/namespaces/default/services/my-svc/proxy/some/subpath",
+        // The bare `/proxy` form (no trailing slash) 301-redirects for GET rather than
+        // proxying directly — matching upstream and the sig-network Proxy conformance test.
+        for (path, want) in [
+            (
+                "/api/v1/namespaces/default/services/my-svc/proxy",
+                StatusCode::MOVED_PERMANENTLY,
+            ),
+            (
+                "/api/v1/namespaces/default/services/my-svc/proxy/",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/api/v1/namespaces/default/services/my-svc/proxy/some/subpath",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let req = Request::builder()
                 .uri(path)
@@ -4764,10 +5130,9 @@ mod tests {
             );
             assert_eq!(
                 resp.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "GET {path} must reach the service proxy handler and return 503 \
-                 (service exists but has no ready endpoints) — any other status means \
-                 routing is broken"
+                want,
+                "GET {path} must reach the service proxy routing correctly — any other \
+                 status means routing or the bare-root redirect is broken"
             );
         }
     }

@@ -619,6 +619,24 @@ fn apply_cr_field_validation(
 // JSON because JSON is valid YAML, so kubelet-style JSON bodies work too.
 // ---------------------------------------------------------------------------
 
+/// yaml_rust2 reports duplicate mapping keys as `info() == "<Debug of Yaml key>: duplicated
+/// key in mapping"` (e.g. `String("foo"): duplicated key in mapping`). Upstream k8s's
+/// conformance suite greps the error body for `line N: key "X" already set in map`, so
+/// reformat to that phrasing rather than leaking the raw yaml-rust2 Debug output.
+fn dup_key_message(e: &yaml_rust2::ScanError) -> String {
+    let Some(key_debug) = e.info().strip_suffix(": duplicated key in mapping") else {
+        return format!("invalid SSA body: {e}");
+    };
+    let key = key_debug
+        .strip_prefix("String(\"")
+        .and_then(|s| s.strip_suffix("\")"))
+        .unwrap_or(key_debug);
+    format!(
+        "line {}: key \"{key}\" already set in map",
+        e.marker().line()
+    )
+}
+
 /// Parse `apply-patch+yaml` body bytes (YAML or JSON) into a serde_json::Value.
 ///
 /// Returns 400 Bad Request on any parse or encoding error so the caller does not
@@ -627,7 +645,7 @@ fn ssa_body_to_json(body: &[u8]) -> Result<serde_json::Value, crate::status::Sta
     let s = std::str::from_utf8(body)
         .map_err(|e| Status::bad_request(format!("SSA body is not valid UTF-8: {e}")))?;
     let docs = yaml_rust2::YamlLoader::load_from_str(s)
-        .map_err(|e| Status::bad_request(format!("invalid SSA body: {e}")))?;
+        .map_err(|e| Status::bad_request(dup_key_message(&e)))?;
     let doc = docs
         .into_iter()
         .next()
@@ -2320,6 +2338,23 @@ mod tests {
         assert!(
             result.is_err(),
             "non-finite float (.inf) in YAML must return Err (400) — JSON has no Infinity"
+        );
+    }
+
+    /// Upstream's FieldValidation conformance test greps the CR create/patch error body for
+    /// the literal phrase `line N: key "X" already set in map`; the raw yaml-rust2 Debug
+    /// output (`String("foo"): duplicated key in mapping`) does not contain that phrase, so
+    /// a passthrough would keep failing conformance even though the duplicate is rejected.
+    #[test]
+    fn ssa_body_to_json_dup_key_error_matches_upstream_wording() {
+        let yaml = b"spec:\n  unknown: uk1\n  foo: foo1\n  foo: foo2\n";
+        let err = ssa_body_to_json(yaml).expect_err("duplicate mapping key must be rejected");
+        assert!(
+            err.1
+                .message
+                .contains("line 4: key \"foo\" already set in map"),
+            "error message must match upstream's expected phrasing, got: {}",
+            err.1.message
         );
     }
 
