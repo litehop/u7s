@@ -895,3 +895,575 @@ pub fn decode_prioritylevelconfiguration_proto_gen(data: &[u8]) -> Option<serde_
 
     Some(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quantity(
+        s: &str,
+    ) -> crate::storage_node_flow_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        crate::storage_node_flow_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            string: Some(s.to_string()),
+        }
+    }
+
+    #[test]
+    fn generated_csinode_preserves_driver_topology_and_allocatable_by_construction() {
+        let obj = storage_v1::CsiNode {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("node-1".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(storage_v1::CsiNodeSpec {
+                drivers: vec![storage_v1::CsiNodeDriver {
+                    name: Some("csi.example.com".to_string()),
+                    node_id: Some("node-1-id".to_string()),
+                    topology_keys: vec!["topology.example.com/zone".to_string()],
+                    allocatable: Some(storage_v1::VolumeNodeResources { count: Some(8) }),
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_csinode_proto_gen(&buf).expect("CSINode must decode");
+        assert_eq!(
+            result["metadata"]["name"], "node-1",
+            "metadata.name must survive — CSINode name must match the node it describes"
+        );
+        let driver = &result["spec"]["drivers"][0];
+        assert_eq!(
+            driver["nodeID"], "node-1-id",
+            "nodeID must survive — attach/detach controller uses it to address the node in the \
+             storage backend's own naming scheme"
+        );
+        assert_eq!(
+            driver["topologyKeys"][0], "topology.example.com/zone",
+            "topologyKeys must survive — topology-aware provisioning reads them to place PVs \
+             near the pods that will use them"
+        );
+        assert_eq!(
+            driver["allocatable"]["count"], 8,
+            "allocatable.count must survive — the scheduler uses it to cap volumes per node"
+        );
+    }
+
+    #[test]
+    fn generated_csidriver_preserves_all_spec_fields_by_construction() {
+        let obj = storage_v1::CsiDriver {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("csi.example.com".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(storage_v1::CsiDriverSpec {
+                attach_required: Some(true),
+                pod_info_on_mount: Some(true),
+                volume_lifecycle_modes: vec!["Persistent".to_string(), "Ephemeral".to_string()],
+                storage_capacity: Some(true),
+                fs_group_policy: Some("File".to_string()),
+                token_requests: vec![storage_v1::TokenRequest {
+                    audience: Some("gcp".to_string()),
+                    expiration_seconds: Some(3600),
+                }],
+                requires_republish: Some(true),
+                se_linux_mount: Some(true),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_csidriver_proto_gen(&buf).expect("CSIDriver must decode");
+        assert_eq!(
+            result["spec"]["attachRequired"], true,
+            "attachRequired must survive — a dropped false-to-true flip silently skips the attach \
+             step the driver actually requires"
+        );
+        assert_eq!(
+            result["spec"]["podInfoOnMount"], true,
+            "podInfoOnMount must survive — kubelet decides whether to pass pod identity into \
+             NodePublishVolume based on this"
+        );
+        assert_eq!(
+            result["spec"]["volumeLifecycleModes"][1], "Ephemeral",
+            "volumeLifecycleModes must survive — it gates whether inline ephemeral volumes are \
+             accepted for this driver"
+        );
+        assert_eq!(
+            result["spec"]["storageCapacity"], true,
+            "storageCapacity must survive — the scheduler only consults CSIStorageCapacity when \
+             this is true"
+        );
+        assert_eq!(
+            result["spec"]["fsGroupPolicy"], "File",
+            "fsGroupPolicy must survive — it controls whether kubelet chowns/chmods the volume"
+        );
+        assert_eq!(
+            result["spec"]["tokenRequests"][0]["audience"], "gcp",
+            "tokenRequests must survive — a dropped audience breaks driver-requested service \
+             account token exchange"
+        );
+        assert_eq!(
+            result["spec"]["tokenRequests"][0]["expirationSeconds"], 3600,
+            "tokenRequests[].expirationSeconds must survive — it bounds token lifetime"
+        );
+        assert_eq!(
+            result["spec"]["requiresRepublish"], true,
+            "requiresRepublish must survive — dropping it stops kubelet from periodically \
+             refreshing the mount for drivers that need it"
+        );
+        assert_eq!(
+            result["spec"]["seLinuxMount"], true,
+            "seLinuxMount must survive — it decides whether kubelet passes -o context to the driver"
+        );
+    }
+
+    #[test]
+    fn generated_csistoragecapacity_preserves_topology_and_quantities_by_construction() {
+        let obj = storage_v1::CsiStorageCapacity {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("cap-1".to_string()),
+                namespace: Some("kube-system".to_string()),
+                ..Default::default()
+            }),
+            node_topology: Some(meta_v1::LabelSelector {
+                match_labels: [(
+                    "topology.example.com/zone".to_string(),
+                    "us-east1".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            storage_class_name: Some("standard".to_string()),
+            capacity: Some(quantity("100Gi")),
+            maximum_volume_size: Some(quantity("50Gi")),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result =
+            decode_csistoragecapacity_proto_gen(&buf).expect("CSIStorageCapacity must decode");
+        assert_eq!(
+            result["storageClassName"], "standard",
+            "storageClassName must survive — it ties this capacity report to a specific \
+             StorageClass the scheduler compares against"
+        );
+        assert_eq!(
+            result["nodeTopology"]["matchLabels"]["topology.example.com/zone"], "us-east1",
+            "nodeTopology must survive — dropping it makes the scheduler treat the capacity as \
+             available on the wrong nodes"
+        );
+        assert_eq!(
+            result["capacity"], "100Gi",
+            "capacity must survive — the scheduler falls back to it when maximumVolumeSize is unset"
+        );
+        assert_eq!(
+            result["maximumVolumeSize"], "50Gi",
+            "maximumVolumeSize must survive — it is the primary value the scheduler filters \
+             candidate nodes against"
+        );
+    }
+
+    #[test]
+    fn generated_volumeattachment_preserves_spec_and_status_by_construction() {
+        let obj = storage_v1::VolumeAttachment {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("va-1".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(storage_v1::VolumeAttachmentSpec {
+                attacher: Some("csi.example.com".to_string()),
+                node_name: Some("node-1".to_string()),
+                source: Some(storage_v1::VolumeAttachmentSource {
+                    persistent_volume_name: Some("pv-1".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            status: Some(storage_v1::VolumeAttachmentStatus {
+                attached: Some(true),
+                attachment_metadata: [("device".to_string(), "/dev/sdb".to_string())]
+                    .into_iter()
+                    .collect(),
+                attach_error: Some(storage_v1::VolumeError {
+                    message: Some("timed out".to_string()),
+                    time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_000),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }),
+                detach_error: Some(storage_v1::VolumeError {
+                    message: Some("device busy".to_string()),
+                    time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_100),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }),
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_volumeattachment_proto_gen(&buf).expect("VolumeAttachment must decode");
+        assert_eq!(
+            result["spec"]["attacher"], "csi.example.com",
+            "spec.attacher must survive — it names which driver MUST handle this attach/detach"
+        );
+        assert_eq!(
+            result["spec"]["source"]["persistentVolumeName"], "pv-1",
+            "spec.source.persistentVolumeName must survive — dropping it leaves the \
+             external-attacher with nothing to attach"
+        );
+        assert_eq!(
+            result["status"]["attached"], true,
+            "status.attached must survive — the attach/detach controller and kubelet's mount \
+             wait on this flag"
+        );
+        assert_eq!(
+            result["status"]["attachmentMetadata"]["device"], "/dev/sdb",
+            "attachmentMetadata must survive — kubelet needs it for the subsequent mount call"
+        );
+        assert_eq!(
+            result["status"]["attachError"]["message"], "timed out",
+            "attachError must survive — losing it hides a failed attach from the controller \
+             and from kubectl describe"
+        );
+        assert_eq!(
+            result["status"]["detachError"]["message"], "device busy",
+            "detachError must survive — losing it hides a failed detach that blocks pod deletion"
+        );
+    }
+
+    #[test]
+    fn generated_storageclass_preserves_provisioner_and_binding_fields_by_construction() {
+        let obj = storage_v1::StorageClass {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("standard".to_string()),
+                ..Default::default()
+            }),
+            provisioner: Some("csi.example.com".to_string()),
+            parameters: [("type".to_string(), "gp3".to_string())]
+                .into_iter()
+                .collect(),
+            reclaim_policy: Some("Retain".to_string()),
+            mount_options: vec!["noatime".to_string()],
+            allow_volume_expansion: Some(true),
+            volume_binding_mode: Some("WaitForFirstConsumer".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_storageclass_proto_gen(&buf).expect("StorageClass must decode");
+        assert_eq!(
+            result["provisioner"], "csi.example.com",
+            "provisioner must survive — it selects which CSI driver services PVCs of this class"
+        );
+        assert_eq!(
+            result["parameters"]["type"], "gp3",
+            "parameters must survive — they are opaque driver config passed straight through \
+             to CreateVolume"
+        );
+        assert_eq!(
+            result["reclaimPolicy"], "Retain",
+            "reclaimPolicy must survive — Retain vs Delete decides whether data is destroyed \
+             when a PVC is removed"
+        );
+        assert_eq!(
+            result["mountOptions"][0], "noatime",
+            "mountOptions must survive — they are passed to the actual mount(8) call"
+        );
+        assert_eq!(
+            result["allowVolumeExpansion"], true,
+            "allowVolumeExpansion must survive — dropping it silently blocks online PVC resize"
+        );
+        assert_eq!(
+            result["volumeBindingMode"], "WaitForFirstConsumer",
+            "volumeBindingMode must survive — Immediate vs WaitForFirstConsumer changes when \
+             the scheduler and provisioner interact"
+        );
+    }
+
+    #[test]
+    fn generated_volumeattributesclass_preserves_driver_and_parameters_by_construction() {
+        let obj = storage_v1::VolumeAttributesClass {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("silver".to_string()),
+                ..Default::default()
+            }),
+            driver_name: Some("csi.example.com".to_string()),
+            parameters: [("iops".to_string(), "3000".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_volumeattributesclass_proto_gen(&buf)
+            .expect("VolumeAttributesClass must decode");
+        assert_eq!(
+            result["driverName"], "csi.example.com",
+            "driverName must survive — it is immutable and identifies which CSI driver applies \
+             these attributes"
+        );
+        assert_eq!(
+            result["parameters"]["iops"], "3000",
+            "parameters must survive — this is the only content of a mutable-attributes request; \
+             dropping it makes ModifyVolume a no-op"
+        );
+    }
+
+    #[test]
+    fn generated_runtimeclass_preserves_overhead_and_scheduling_by_construction() {
+        let obj = node_v1::RuntimeClass {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("gvisor".to_string()),
+                ..Default::default()
+            }),
+            handler: Some("runsc".to_string()),
+            overhead: Some(node_v1::Overhead {
+                pod_fixed: [("memory".to_string(), quantity("128Mi"))]
+                    .into_iter()
+                    .collect(),
+            }),
+            scheduling: Some(node_v1::Scheduling {
+                node_selector: [("runtime".to_string(), "gvisor".to_string())]
+                    .into_iter()
+                    .collect(),
+                tolerations: vec![
+                    crate::storage_node_flow_gen::k8s::io::api::core::v1::Toleration {
+                        key: Some("sandbox".to_string()),
+                        operator: Some("Exists".to_string()),
+                        effect: Some("NoSchedule".to_string()),
+                        ..Default::default()
+                    },
+                ],
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_runtimeclass_proto_gen(&buf).expect("RuntimeClass must decode");
+        assert_eq!(
+            result["handler"], "runsc",
+            "handler must survive — it is required and selects the CRI shim the kubelet invokes"
+        );
+        assert_eq!(
+            result["overhead"]["podFixed"]["memory"], "128Mi",
+            "overhead.podFixed must survive — dropping it under-reports node capacity used by \
+             pods of this RuntimeClass, over-committing the node"
+        );
+        assert_eq!(
+            result["scheduling"]["nodeSelector"]["runtime"], "gvisor",
+            "scheduling.nodeSelector must survive — it is merged into the pod's nodeSelector \
+             to keep pods off nodes lacking this runtime"
+        );
+        assert_eq!(
+            result["scheduling"]["tolerations"][0]["key"], "sandbox",
+            "scheduling.tolerations must survive — they are unioned into the pod's tolerations \
+             at admission"
+        );
+    }
+
+    #[test]
+    fn generated_priorityclass_preserves_value_and_preemption_policy_by_construction() {
+        let obj = scheduling_v1::PriorityClass {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("high".to_string()),
+                ..Default::default()
+            }),
+            value: Some(1_000_000),
+            global_default: Some(true),
+            description: Some("critical workloads".to_string()),
+            preemption_policy: Some("Never".to_string()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_priorityclass_proto_gen(&buf).expect("PriorityClass must decode");
+        assert_eq!(
+            result["value"], 1_000_000,
+            "value must survive — the scheduler compares this integer directly to rank \
+             preemption candidates"
+        );
+        assert_eq!(
+            result["globalDefault"], true,
+            "globalDefault must survive — losing it silently strips priority from every pod \
+             that doesn't name a class explicitly"
+        );
+        assert_eq!(
+            result["preemptionPolicy"], "Never",
+            "preemptionPolicy must survive — Never vs PreemptLowerPriority changes whether this \
+             class can evict other pods to schedule"
+        );
+    }
+
+    #[test]
+    fn generated_flowschema_preserves_rules_subjects_and_status_by_construction() {
+        let obj = flowcontrol_v1::FlowSchema {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("workload-low".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(flowcontrol_v1::FlowSchemaSpec {
+                matching_precedence: Some(500),
+                priority_level_configuration: Some(
+                    flowcontrol_v1::PriorityLevelConfigurationReference {
+                        name: Some("workload-low".to_string()),
+                    },
+                ),
+                distinguisher_method: Some(flowcontrol_v1::FlowDistinguisherMethod {
+                    r#type: Some("ByUser".to_string()),
+                }),
+                rules: vec![flowcontrol_v1::PolicyRulesWithSubjects {
+                    subjects: vec![
+                        flowcontrol_v1::Subject {
+                            kind: Some("ServiceAccount".to_string()),
+                            service_account: Some(flowcontrol_v1::ServiceAccountSubject {
+                                namespace: Some("kube-system".to_string()),
+                                name: Some("controller".to_string()),
+                            }),
+                            ..Default::default()
+                        },
+                        flowcontrol_v1::Subject {
+                            kind: Some("Group".to_string()),
+                            group: Some(flowcontrol_v1::GroupSubject {
+                                name: Some("system:authenticated".to_string()),
+                            }),
+                            ..Default::default()
+                        },
+                    ],
+                    resource_rules: vec![flowcontrol_v1::ResourcePolicyRule {
+                        verbs: vec!["get".to_string(), "list".to_string()],
+                        api_groups: vec!["".to_string()],
+                        resources: vec!["pods".to_string()],
+                        cluster_scope: Some(true),
+                        namespaces: vec!["*".to_string()],
+                    }],
+                    non_resource_rules: vec![flowcontrol_v1::NonResourcePolicyRule {
+                        verbs: vec!["get".to_string()],
+                        non_resource_ur_ls: vec!["/healthz".to_string()],
+                    }],
+                }],
+            }),
+            status: Some(flowcontrol_v1::FlowSchemaStatus {
+                conditions: vec![flowcontrol_v1::FlowSchemaCondition {
+                    r#type: Some("Dangling".to_string()),
+                    status: Some("False".to_string()),
+                    reason: Some("Found".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_flowschema_proto_gen(&buf).expect("FlowSchema must decode");
+        assert_eq!(
+            result["spec"]["matchingPrecedence"], 500,
+            "matchingPrecedence must survive — it decides which FlowSchema wins when several match"
+        );
+        assert_eq!(
+            result["spec"]["priorityLevelConfiguration"]["name"], "workload-low",
+            "priorityLevelConfiguration reference must survive — a dropped reference makes the \
+             FlowSchema invalid and it gets ignored"
+        );
+        assert_eq!(
+            result["spec"]["distinguisherMethod"]["type"], "ByUser",
+            "distinguisherMethod must survive — dropping it silently disables per-user \
+             shuffle-sharding for this schema"
+        );
+        let rule = &result["spec"]["rules"][0];
+        assert_eq!(
+            rule["subjects"][0]["serviceAccount"]["name"], "controller",
+            "subjects[].serviceAccount must survive — it is who this rule actually matches"
+        );
+        assert_eq!(
+            rule["subjects"][1]["group"]["name"], "system:authenticated",
+            "subjects[].group must survive — dropping it would match zero or the wrong requesters"
+        );
+        assert_eq!(
+            rule["resourceRules"][0]["resources"][0], "pods",
+            "resourceRules must survive — this is the actual request-matching predicate"
+        );
+        assert_eq!(
+            rule["resourceRules"][0]["clusterScope"], true,
+            "clusterScope must survive — flips which requests without a namespace match"
+        );
+        assert_eq!(
+            rule["nonResourceRules"][0]["nonResourceURLs"][0], "/healthz",
+            "nonResourceRules must survive — health/metrics endpoint matching depends on it"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Dangling",
+            "status.conditions must survive — it is how APF reports a FlowSchema referencing a \
+             missing PriorityLevelConfiguration"
+        );
+    }
+
+    #[test]
+    fn generated_prioritylevelconfiguration_preserves_limited_and_exempt_by_construction() {
+        let obj = flowcontrol_v1::PriorityLevelConfiguration {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("workload-low".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(flowcontrol_v1::PriorityLevelConfigurationSpec {
+                r#type: Some("Limited".to_string()),
+                limited: Some(flowcontrol_v1::LimitedPriorityLevelConfiguration {
+                    nominal_concurrency_shares: Some(30),
+                    lendable_percent: Some(50),
+                    borrowing_limit_percent: Some(10),
+                    limit_response: Some(flowcontrol_v1::LimitResponse {
+                        r#type: Some("Queue".to_string()),
+                        queuing: Some(flowcontrol_v1::QueuingConfiguration {
+                            queues: Some(64),
+                            hand_size: Some(6),
+                            queue_length_limit: Some(50),
+                        }),
+                    }),
+                }),
+                exempt: None,
+            }),
+            status: Some(flowcontrol_v1::PriorityLevelConfigurationStatus {
+                conditions: vec![flowcontrol_v1::PriorityLevelConfigurationCondition {
+                    r#type: Some("Concurrency".to_string()),
+                    status: Some("True".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_prioritylevelconfiguration_proto_gen(&buf)
+            .expect("PriorityLevelConfiguration must decode");
+        assert_eq!(
+            result["spec"]["type"], "Limited",
+            "spec.type must survive — it is the union discriminator; losing it makes the \
+             concurrency-limiting fields ambiguous"
+        );
+        assert_eq!(
+            result["spec"]["limited"]["nominalConcurrencyShares"], 30,
+            "nominalConcurrencyShares must survive — it directly sets this level's slice of \
+             server concurrency"
+        );
+        assert_eq!(
+            result["spec"]["limited"]["borrowingLimitPercent"], 10,
+            "borrowingLimitPercent must survive — dropping it silently makes borrowing unbounded"
+        );
+        assert_eq!(
+            result["spec"]["limited"]["limitResponse"]["queuing"]["handSize"], 6,
+            "limitResponse.queuing.handSize must survive — it controls shuffle-sharding fairness \
+             across requests queued at this level"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Concurrency",
+            "status.conditions must survive — this is how APF reports concurrency-limit health \
+             for the level"
+        );
+    }
+}
