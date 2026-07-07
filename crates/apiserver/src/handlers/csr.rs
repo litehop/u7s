@@ -1,13 +1,15 @@
 //! Dedicated CSR POST handler with strict validation.
 //!
-//! The CSR POST path is security-critical: spec.request contains a DER PKCS#10
-//! CertificationRequest. We validate it here before storing — a signer that blindly
-//! issues a cert from unchecked bytes could be tricked into signing arbitrary requests.
+//! The CSR POST path is security-critical: spec.request contains a base64-encoded
+//! PEM-armored PKCS#10 CertificationRequest (this is the upstream Kubernetes wire
+//! format — kubectl/client-go always base64-encode the PEM text, not raw DER). We
+//! validate it here before storing — a signer that blindly issues a cert from
+//! unchecked bytes could be tricked into signing arbitrary requests.
 //!
 //! Validation rules:
 //!   1. spec.request must be present and non-empty (base64 string).
 //!   2. spec.request must decode as valid standard base64.
-//!   3. Decoded bytes must parse as a valid DER-encoded PKCS#10 CertificationRequest.
+//!   3. Decoded bytes must parse as a valid PEM-encoded PKCS#10 CertificationRequest.
 //!   4. spec.signerName must be present and non-empty.
 //!
 //! Returns 422 Unprocessable Entity on any violation.
@@ -20,7 +22,7 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
-use x509_cert::der::Decode as _;
+use x509_cert::der::DecodePem as _;
 use x509_cert::request::CertReq;
 
 use u7s_store::{ListOptions, Store};
@@ -62,22 +64,22 @@ pub(crate) fn validate_csr_spec(
             ))
         })?;
 
-    // spec.request: required, must be non-empty base64, decoded bytes must be valid DER PKCS#10.
+    // spec.request: required, must be non-empty base64, decoded bytes must be valid PEM PKCS#10.
     if spec.request.is_empty() {
         return Err(Status::unprocessable_entity(
             "spec.request is required and must be a non-empty base64-encoded string".into(),
         ));
     }
 
-    let der_bytes = base64::engine::general_purpose::STANDARD
+    let pem_bytes = base64::engine::general_purpose::STANDARD
         .decode(&spec.request)
         .map_err(|e| {
             Status::unprocessable_entity(format!("spec.request is not valid base64: {e}"))
         })?;
 
-    CertReq::from_der(&der_bytes).map_err(|e| {
+    CertReq::from_pem(&pem_bytes).map_err(|e| {
         Status::unprocessable_entity(format!(
-            "spec.request does not contain a valid DER-encoded PKCS#10 CertificationRequest: {e}"
+            "spec.request does not contain a valid PEM-encoded PKCS#10 CertificationRequest: {e}"
         ))
     })?;
 
@@ -219,7 +221,7 @@ pub async fn get_csr<S: Store>(
 
 /// POST /apis/certificates.k8s.io/v1/certificatesigningrequests
 ///
-/// Validates spec.request (base64 + DER PKCS#10) and spec.signerName before
+/// Validates spec.request (base64 + PEM PKCS#10) and spec.signerName before
 /// storing. Returns 422 on validation failure, 201 on success.
 pub async fn create_csr<S: Store>(
     State(state): State<AppState<S>>,
@@ -273,11 +275,15 @@ pub async fn create_csr<S: Store>(
 mod tests {
     use super::*;
 
-    /// Generate a minimal valid DER-encoded PKCS#10 CSR as base64 using rcgen.
+    /// Generate a minimal valid base64(PEM)-encoded PKCS#10 CSR using rcgen.
     ///
     /// rcgen is already a workspace dependency (used for TLS cert generation).
     /// Generating the CSR in the test avoids a hardcoded byte string that would
     /// be opaque and potentially stale — the test self-documents its own inputs.
+    ///
+    /// kubectl/client-go always submit spec.request as base64(PEM), never base64(DER)
+    /// directly — this fixture mirrors the real wire format so the test can't pass
+    /// against a handler that (incorrectly) expects raw DER.
     fn valid_csr_b64() -> String {
         use rcgen::{CertificateParams, KeyPair};
         let key_pair = KeyPair::generate().expect("key generation must succeed");
@@ -285,7 +291,8 @@ mod tests {
         let csr = params
             .serialize_request(&key_pair)
             .expect("CSR generation must succeed");
-        base64::engine::general_purpose::STANDARD.encode(csr.der())
+        let pem = csr.pem().expect("CSR PEM serialization must succeed");
+        base64::engine::general_purpose::STANDARD.encode(pem)
     }
 
     /// Missing spec.request → 422.
@@ -340,13 +347,13 @@ mod tests {
             "invalid base64 in spec.request must return 422 — a signer that accepts this could be fed arbitrary bytes");
     }
 
-    /// Valid base64 but not a DER PKCS#10 → 422.
+    /// Valid base64 but not a PEM PKCS#10 → 422.
     ///
-    /// base64("hello world") is valid base64 but not a PKCS#10 CSR. The DER parser
+    /// base64("hello world") is valid base64 but not a PKCS#10 CSR. The PEM parser
     /// must catch this to prevent a signer from issuing a cert based on garbage data.
     #[test]
-    fn validate_valid_base64_invalid_der_returns_422() {
-        // "hello world" is valid base64 (aGVsbG8gd29ybGQ=) but not a PKCS#10 DER.
+    fn validate_valid_base64_invalid_pem_returns_422() {
+        // "hello world" is valid base64 (aGVsbG8gd29ybGQ=) but not PEM-armored PKCS#10.
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello world");
         let body = serde_json::json!({
             "spec": {
@@ -354,9 +361,36 @@ mod tests {
                 "signerName": "kubernetes.io/kube-apiserver-client"
             }
         });
-        let err = validate_csr_spec(&body).expect_err("must reject non-DER bytes");
+        let err = validate_csr_spec(&body).expect_err("must reject non-PEM bytes");
         assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "valid base64 but invalid PKCS#10 DER must return 422 — a signer must not process malformed CSRs");
+            "valid base64 but invalid PKCS#10 PEM must return 422 — a signer must not process malformed CSRs");
+    }
+
+    /// A raw DER-encoded CSR (not PEM-armored) in spec.request → 422.
+    ///
+    /// Pins the handler to the PEM decode path: raw base64(DER) is not the
+    /// upstream Kubernetes wire format (kubectl/client-go always send
+    /// base64(PEM)) and must be rejected even though it is well-formed PKCS#10.
+    #[test]
+    fn validate_raw_der_without_pem_armor_returns_422() {
+        use rcgen::{CertificateParams, KeyPair};
+        let key_pair = KeyPair::generate().expect("key generation must succeed");
+        let params = CertificateParams::default();
+        let csr = params
+            .serialize_request(&key_pair)
+            .expect("CSR generation must succeed");
+        let der_b64 = base64::engine::general_purpose::STANDARD.encode(csr.der());
+
+        let body = serde_json::json!({
+            "spec": {
+                "request": der_b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            }
+        });
+        let err = validate_csr_spec(&body)
+            .expect_err("raw DER without PEM armor must be rejected by the PEM decoder");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "spec.request must be base64(PEM) per the upstream Kubernetes CSR wire format — raw base64(DER) is not the same wire format and must not be silently accepted");
     }
 
     /// Missing spec.signerName → 422.
@@ -395,7 +429,7 @@ mod tests {
 
     /// Valid CSR with all required fields → Ok.
     ///
-    /// The happy path: a real PKCS#10 DER CSR encoded as base64 with a signerName.
+    /// The happy path: a real PKCS#10 PEM CSR encoded as base64 with a signerName.
     /// If this test fails, we've broken something in the validation logic.
     #[test]
     fn validate_valid_csr_returns_ok() {
