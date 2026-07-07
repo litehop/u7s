@@ -29,6 +29,7 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_service(obj);
     }
     if plural == "events" && (group.is_empty() || group == "events.k8s.io") {
+        translate_event_shape(obj);
         normalize_event_timestamps(obj);
     }
     if let ("", "persistentvolumeclaims") = (group, plural) {
@@ -331,6 +332,47 @@ pub fn normalize_event_timestamps(obj: &mut serde_json::Value) {
     if let Some(s) = obj["series"]["lastObservedTime"].as_str() {
         let normalized = crate::util::normalize_rfc3339_to_micro(s);
         obj["series"]["lastObservedTime"] = serde_json::Value::String(normalized);
+    }
+}
+
+/// Translate an Event's fields between the core/v1 shape (`involvedObject`,
+/// `message`, `source`, `firstTimestamp`, `lastTimestamp`, `count`) and the
+/// events.k8s.io/v1 shape (`regarding`, `note`, `deprecatedSource`,
+/// `deprecatedFirstTimestamp`, `deprecatedLastTimestamp`, `deprecatedCount`).
+///
+/// Matches upstream's `Convert_v1_Event_To_core_Event` /
+/// `Convert_core_Event_To_v1_Event` (pkg/apis/events/v1/conversion.go), which
+/// rename these fields unconditionally on every read/write regardless of which
+/// group the request came through — `reportingController`, `reportingInstance`,
+/// `eventTime`, and `series` are NOT renamed by that conversion (both group's
+/// Event types carry them under the same names already) and `source` is never
+/// backfilled from `reportingController` in the object body (only in field
+/// selector matching, see `event_matches_field_selector`) — inventing that
+/// mapping here would fabricate data upstream does not produce.
+///
+/// Each pair is a straight alias: whichever side is set wins and is copied to
+/// the side that is absent. Never overwrites a value the client set.
+pub fn translate_event_shape(obj: &mut serde_json::Value) {
+    alias_event_field(obj, "involvedObject", "regarding");
+    alias_event_field(obj, "message", "note");
+    alias_event_field(obj, "source", "deprecatedSource");
+    alias_event_field(obj, "firstTimestamp", "deprecatedFirstTimestamp");
+    alias_event_field(obj, "lastTimestamp", "deprecatedLastTimestamp");
+    alias_event_field(obj, "count", "deprecatedCount");
+}
+
+fn alias_event_field(obj: &mut serde_json::Value, core_field: &str, events_v1_field: &str) {
+    match (
+        obj.get(core_field).cloned(),
+        obj.get(events_v1_field).cloned(),
+    ) {
+        (None, Some(v)) => {
+            obj[core_field] = v;
+        }
+        (Some(v), None) => {
+            obj[events_v1_field] = v;
+        }
+        _ => {}
     }
 }
 
@@ -1778,16 +1820,16 @@ mod tests {
         );
     }
 
-    /// Events without timestamp fields must not be modified.
-    ///
-    /// Prevents panics when optional fields are absent.
+    /// Events with no dual-shape fields at all (no timestamps, message/note,
+    /// involvedObject/regarding, source/deprecatedSource, count/deprecatedCount) must not be
+    /// modified. Prevents panics when optional fields are absent.
     #[test]
     fn event_without_timestamps_is_unchanged() {
         let mut obj = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Event",
             "metadata": { "name": "my-event", "namespace": "default" },
-            "message": "something happened"
+            "reason": "Started"
         });
         let original = obj.clone();
 
@@ -1797,6 +1839,126 @@ mod tests {
             obj, original,
             "Event without timestamp fields must not be modified"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Event core/v1 <-> events.k8s.io/v1 field-shape translation (mayor-1wey)
+    // ---------------------------------------------------------------------------
+
+    /// An Event created via events.k8s.io/v1 (which sets `regarding`/`note`, never the
+    /// core/v1-only `involvedObject`/`message`) must be readable via core/v1 with the
+    /// core/v1 field names populated — matching upstream's Convert_v1_Event_To_core_Event.
+    ///
+    /// Without this, a core/v1 client (e.g. `kubectl get events`, or the sig-instrumentation
+    /// Events API conformance test's coreClient) sees an empty involvedObject/message for
+    /// any Event written via client-go's newer EventsV1 recorder.
+    #[test]
+    fn events_k8s_io_event_readable_via_core_v1_shape() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "regarding": { "kind": "Pod", "namespace": "default", "name": "my-pod" },
+            "note": "This is my-event",
+            "reportingController": "test-controller",
+            "reportingInstance": "test-node"
+        });
+
+        apply_defaults("events.k8s.io", "events", &mut obj);
+
+        assert_eq!(
+            obj["involvedObject"]["name"], "my-pod",
+            "involvedObject must be populated from regarding — a core/v1 client reading an \
+             events.k8s.io/v1-written Event must still see which object the event is about"
+        );
+        assert_eq!(
+            obj["message"], "This is my-event",
+            "message must be populated from note — a core/v1 client must see the same \
+             human-readable description an events.k8s.io/v1 client wrote"
+        );
+    }
+
+    /// The reverse direction: an Event created via core/v1 (which sets `involvedObject`/
+    /// `message`, never `regarding`/`note`) must be readable via events.k8s.io/v1 with its
+    /// field names populated — matching upstream's Convert_core_Event_To_v1_Event.
+    #[test]
+    fn core_v1_event_readable_via_events_k8s_io_shape() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "involvedObject": { "kind": "Pod", "namespace": "default", "name": "my-pod" },
+            "message": "This is my-event"
+        });
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj["regarding"]["name"], "my-pod",
+            "regarding must be populated from involvedObject — an events.k8s.io/v1 client \
+             reading a core/v1-written Event must still see which object the event is about"
+        );
+        assert_eq!(
+            obj["note"], "This is my-event",
+            "note must be populated from message — an events.k8s.io/v1 client must see the \
+             same human-readable description a core/v1 client wrote"
+        );
+    }
+
+    /// translate_event_shape must never invent a `source` from `reportingController` in the
+    /// object body — upstream's Convert_v1_Event_To_core_Event maps `source` from the
+    /// separate `deprecatedSource` field only, never from `reportingController`. Fabricating
+    /// that mapping here would make an Event's `source` differ from what real kube-apiserver
+    /// would ever produce for the same input.
+    ///
+    /// (The `source=` field *selector* still matches via `reportingController` as a
+    /// selector-only fallback — see `event_matches_field_selector` in handlers/pods.rs — but
+    /// that must not be confused with populating the field in the served object body.)
+    #[test]
+    fn translate_event_shape_does_not_fabricate_source_from_reporting_controller() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "reportingController": "test-controller",
+            "reportingInstance": "test-node"
+        });
+
+        apply_defaults("events.k8s.io", "events", &mut obj);
+
+        assert!(
+            obj.get("source").is_none(),
+            "source must stay absent unless deprecatedSource was explicitly set — upstream \
+             never backfills source from reportingController in the object body"
+        );
+    }
+
+    /// Existing dual-shape values must never be overwritten by translation — idempotent
+    /// across repeated apply_defaults calls (e.g. GET then PATCH then GET again).
+    #[test]
+    fn translate_event_shape_does_not_overwrite_existing_values() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "involvedObject": { "name": "core-pod" },
+            "regarding": { "name": "events-pod" },
+            "message": "core message",
+            "note": "events note"
+        });
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj["involvedObject"]["name"], "core-pod",
+            "an explicitly-set involvedObject must not be overwritten by regarding"
+        );
+        assert_eq!(
+            obj["regarding"]["name"], "events-pod",
+            "an explicitly-set regarding must not be overwritten by involvedObject"
+        );
+        assert_eq!(obj["message"], "core message");
+        assert_eq!(obj["note"], "events note");
     }
 
     // ---------------------------------------------------------------------------

@@ -115,9 +115,14 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
 ///   involvedObject.name, involvedObject.kind, involvedObject.namespace,
 ///   involvedObject.uid, reason, source, reportingController
 ///
-/// `source` reads core/v1 Event's `source.component` and `reportingController`
-/// reads events.k8s.io/v1 Event's top-level `reportingController` — the two
-/// dual-grouped Event kinds use different field names for "who reported this".
+/// `source` reads core/v1 Event's `source.component`, falling back to
+/// events.k8s.io/v1's `reportingController` when `source.component` is empty —
+/// matching upstream's `ToSelectableFields` (pkg/registry/core/event/strategy.go),
+/// which applies the identical fallback so a core/v1 `fieldSelector=source=X`
+/// query still matches an Event whose only reporter identity was set via the
+/// events.k8s.io/v1 API (client-go's EventsV1 recorder never sets `source`).
+/// `reportingController` reads events.k8s.io/v1 Event's top-level field
+/// directly (no fallback — that field is defined only in that group).
 ///
 /// All supplied terms are AND-evaluated: an event must match every term.
 /// An unknown field is ignored (pass-through). An event missing a constrained
@@ -150,7 +155,14 @@ fn event_matches_field_selector(ev: &serde_json::Value, selector: &str) -> bool 
                 }
                 "involvedObject.uid" => ev["involvedObject"]["uid"].as_str().unwrap_or(""),
                 "reason" => ev["reason"].as_str().unwrap_or(""),
-                "source" => ev["source"]["component"].as_str().unwrap_or(""),
+                "source" => {
+                    let component = ev["source"]["component"].as_str().unwrap_or("");
+                    if component.is_empty() {
+                        ev["reportingController"].as_str().unwrap_or("")
+                    } else {
+                        component
+                    }
+                }
                 "reportingController" => ev["reportingController"].as_str().unwrap_or(""),
                 _ => continue,
             };
@@ -1536,6 +1548,34 @@ mod event_field_selector_tests {
              reportingController=X returns all events"
         );
         assert_eq!(result[0]["reportingController"], "kubelet");
+    }
+
+    /// source= field selector must fall back to reportingController when source.component
+    /// is absent — matching upstream's ToSelectableFields fallback
+    /// (pkg/registry/core/event/strategy.go).
+    ///
+    /// An Event created via the events.k8s.io/v1 API (client-go's EventsV1 recorder) never
+    /// sets `source`, only `reportingController`. The sig-instrumentation Events API
+    /// conformance test creates such an event, then queries the CORE/v1 events endpoint with
+    /// `fieldSelector=source=<controller>`. Without this fallback the query matches nothing
+    /// even though the event's reporter identity is present under a different field name,
+    /// so "should ensure that an event can be fetched, patched, deleted, and listed" fails
+    /// with "expected single event, got []v1.Event{}".
+    #[test]
+    fn source_field_selector_falls_back_to_reporting_controller() {
+        let mut ev = event("pod-a", "Pod", "default", "uid-1", "Test");
+        ev["reportingController"] = serde_json::json!("test-controller");
+        // No "source" key at all — this is what an events.k8s.io/v1-only Event looks like.
+
+        let result = filter_events_by_field_selector(vec![ev], "source=test-controller");
+
+        assert_eq!(
+            result.len(),
+            1,
+            "source= selector must fall back to reportingController when source.component \
+             is absent, or an event reported only via events.k8s.io/v1 is invisible to a \
+             core/v1 fieldSelector=source query"
+        );
     }
 }
 
