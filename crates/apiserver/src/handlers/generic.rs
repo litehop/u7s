@@ -206,6 +206,7 @@ pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::statu
                     reason: "InternalError",
                     code: status.as_u16(),
                     metadata: None,
+                    details: None,
                 },
             )
         }

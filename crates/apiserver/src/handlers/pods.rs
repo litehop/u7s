@@ -9,9 +9,12 @@ use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
-    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
+    admission::{
+        label_selector_matches, run_mutating_webhooks, run_validating_webhooks, AdmissionContext,
+        LabelSelector,
+    },
     auth::UserInfo,
-    keys::{cluster_object_key, group_object_key, list_prefix, object_key},
+    keys::{cluster_object_key, group_list_prefix, group_object_key, list_prefix, object_key},
     limit_range::parse_quantity,
     state::AppState,
     status::Status,
@@ -853,7 +856,15 @@ pub async fn evict_pod<S: Store>(
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
     } else if !already_terminating {
+        check_pdb_allows_eviction(&state, ns.as_str(), &obj.body).await?;
+
         obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+        set_disruption_target_condition(
+            &mut obj.body,
+            &utc_now_rfc3339(),
+            "EvictionByEvictionAPI",
+            "Eviction API: evicting pod",
+        );
         let expected_rv = parse_resource_version(obj.resource_version())?;
         state
             .store
@@ -870,6 +881,117 @@ pub async fn evict_pod<S: Store>(
         })
     });
     Ok((StatusCode::CREATED, Json(eviction)))
+}
+
+/// Reject the eviction with 429 if the pod is covered by a PodDisruptionBudget that has no
+/// disruptions left to give.
+///
+/// PDBs are the primary safety mechanism against voluntary disruption (drain, descheduler,
+/// cluster-autoscaler): a Deployment/StatefulSet relies on `disruptionsAllowed` staying above
+/// zero to guarantee availability during rolling changes. u7s does not compute
+/// `disruptionsAllowed` itself — KCM's DisruptionController owns that reconciliation and
+/// writes it to `status.disruptionsAllowed` — this function only enforces what's already there.
+/// Without this check, `kubectl drain` and the descheduler can evict every pod backing a
+/// service simultaneously, taking it fully down.
+async fn check_pdb_allows_eviction<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    pod: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let pod_labels: std::collections::BTreeMap<String, String> = pod["metadata"]["labels"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let prefix = group_list_prefix("policy", "poddisruptionbudgets", Some(ns));
+    let items = match state.store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(e) => {
+            // Fail-open: a transient store error listing PDBs must not block every eviction
+            // in the namespace, since that would be worse for availability than the disruption
+            // this check exists to prevent.
+            tracing::warn!("evict_pod: failed to list PodDisruptionBudgets in {ns}: {e}");
+            return Ok(());
+        }
+    };
+
+    let matching: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter_map(|item| serde_json::from_slice::<serde_json::Value>(&item.value).ok())
+        .filter(|pdb| {
+            // Upstream semantics: "A null selector will match no pods, while an empty ({})
+            // selector will select all pods within the namespace." `label_selector_matches`
+            // treats `None` as match-all, so a null/missing selector must be special-cased
+            // to match-none here rather than passed through.
+            let selector_value = &pdb["spec"]["selector"];
+            if selector_value.is_null() {
+                return false;
+            }
+            let selector: LabelSelector =
+                serde_json::from_value(selector_value.clone()).unwrap_or_default();
+            label_selector_matches(Some(&selector), &pod_labels)
+        })
+        .collect();
+
+    if matching.len() > 1 {
+        return Err(Status::internal(
+            "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.".to_string(),
+        ));
+    }
+
+    if let Some(pdb) = matching.first() {
+        let disruptions_allowed = pdb["status"]["disruptionsAllowed"].as_i64().unwrap_or(0);
+        if disruptions_allowed <= 0 {
+            let message =
+                "Cannot evict pod as it would violate the pod's disruption budget.".to_string();
+            return Err(Status::too_many_requests_with_cause(
+                message.clone(),
+                "DisruptionBudget",
+                message,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Set (or refresh) the pod's `DisruptionTarget` condition so pod-failure-policy consumers
+/// (the Job controller matching on `onPodConditions`) can distinguish a voluntary disruption
+/// (eviction/preemption) from an application-caused failure. Without this condition, a Job's
+/// `podFailurePolicy` rule that ignores DisruptionTarget failures never matches, and the pod
+/// failure counts against `backoffLimit` even though it wasn't the workload's fault.
+fn set_disruption_target_condition(
+    pod: &mut serde_json::Value,
+    now: &str,
+    reason: &str,
+    message: &str,
+) {
+    if !pod["status"].is_object() {
+        pod["status"] = serde_json::json!({});
+    }
+    let cond = serde_json::json!({
+        "type": "DisruptionTarget",
+        "status": "True",
+        "reason": reason,
+        "message": message,
+        "lastTransitionTime": now
+    });
+    if let Some(conditions) = pod["status"]["conditions"].as_array_mut() {
+        if let Some(existing) = conditions
+            .iter_mut()
+            .find(|c| c["type"] == "DisruptionTarget")
+        {
+            *existing = cond;
+        } else {
+            conditions.push(cond);
+        }
+    } else {
+        pod["status"]["conditions"] = serde_json::json!([cond]);
+    }
 }
 
 #[cfg(test)]
@@ -7835,6 +7957,151 @@ mod handler_tests {
             "eviction must stamp deletionTimestamp so the kubelet sends SIGTERM and the \
              StatefulSet controller sees the pod as terminating — without this the orphan \
              pod runs forever and the 'Should recreate evicted statefulset' test hangs"
+        );
+    }
+
+    /// POST /pods/{name}/eviction on a pod covered by a PodDisruptionBudget with
+    /// `disruptionsAllowed: 0` must return 429, not 201.
+    ///
+    /// PDBs are the primary safety mechanism against voluntary disruption: a Deployment
+    /// relies on `disruptionsAllowed` staying above zero to guarantee availability during a
+    /// drain or rolling change. If eviction ignores the PDB, `kubectl drain` (and the
+    /// descheduler) can take down every pod backing a service at once — exactly what the
+    /// budget exists to prevent. This test fails on revert: before this fix, evict_pod had
+    /// zero PDB awareness and always returned 201.
+    #[tokio::test]
+    async fn evict_pod_blocked_by_pdb_returns_429() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "web-0",
+            serde_json::json!({"metadata": {"name": "web-0", "namespace": "default", "resourceVersion": "1", "labels": {"app": "web"}}}),
+        )
+        .await;
+
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "web-pdb", "namespace": "default" },
+            "spec": { "selector": { "matchLabels": { "app": "web" } } },
+            "status": { "disruptionsAllowed": 0 }
+        });
+        store
+            .put(
+                "/registry/policy/poddisruptionbudgets/default/web-pdb",
+                Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "web-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "eviction of a pod covered by a PDB with disruptionsAllowed:0 must return 429 — \
+             returning 201 lets kubectl drain violate the pod's disruption budget"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            status_body["details"]["causes"][0]["reason"], "DisruptionBudget",
+            "the 429 body must carry a DisruptionBudget status cause so client-go's \
+             apierrors.HasStatusCause(err, policyv1.DisruptionBudgetCause) — what the \
+             conformance test asserts on — returns true"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/web-0")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_null(),
+            "a PDB-blocked eviction must not stamp deletionTimestamp — the pod was never \
+             actually terminated"
+        );
+    }
+
+    /// POST /pods/{name}/eviction that proceeds (PDB allows it, or no PDB covers the pod)
+    /// must set the pod's `DisruptionTarget` condition.
+    ///
+    /// The Job controller's pod-failure-policy matches failed pods against
+    /// `onPodConditions: [{type: DisruptionTarget}]` to distinguish a voluntary disruption from
+    /// an application bug. Without this condition, an evicted pod's failure always counts
+    /// against the Job's backoffLimit even when the policy says to ignore disruptions. This
+    /// test fails on revert: before this fix, evict_pod never touched status.conditions.
+    #[tokio::test]
+    async fn evict_pod_sets_disruption_target_condition() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "ss-0", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "ss-0", "namespace": "default" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/ss-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&eviction_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/ss-0")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let conditions = v["status"]["conditions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let disruption_target = conditions
+            .iter()
+            .find(|c| c["type"] == "DisruptionTarget")
+            .expect("evicted pod must carry a DisruptionTarget condition");
+        assert_eq!(
+            disruption_target["status"], "True",
+            "DisruptionTarget condition must be status=True — the Job controller's \
+             podFailurePolicy onPodConditions match checks the condition's status"
         );
     }
 
