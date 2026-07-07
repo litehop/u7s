@@ -370,6 +370,91 @@ pub fn decode_ingressclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     Some(out)
 }
 
+// ---- Decoder A: IPAddress (networking.k8s.io/v1) -----------------------------
+//
+// Without a dispatch arm + decoder for this kind, extract_body cannot decode a
+// protobuf-encoded IPAddress body, falls through to raw bytes, and serde_json fails with
+// "invalid JSON: expected value at line 1 column 1" — every typed-client Create() returns
+// 400 instead of 201. client-go's typed clientsets (and the e2e suite) POST protobuf by
+// default, so this is a hard failure for every IPAddress/ServiceCIDR API operation.
+
+pub fn decode_ipaddress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = networking_v1::IpAddress::decode(data).ok()?;
+    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "IPAddress",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        if let Some(pr) = spec.parent_ref {
+            let mut pr_json = serde_json::Map::new();
+            if let Some(v) = pr.group.filter(|s| !s.is_empty()) {
+                pr_json.insert("group".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = pr.resource.filter(|s| !s.is_empty()) {
+                pr_json.insert("resource".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = pr.namespace.filter(|s| !s.is_empty()) {
+                pr_json.insert("namespace".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = pr.name.filter(|s| !s.is_empty()) {
+                pr_json.insert("name".to_string(), serde_json::Value::String(v));
+            }
+            out["spec"] = serde_json::json!({ "parentRef": serde_json::Value::Object(pr_json) });
+        }
+    }
+    Some(out)
+}
+
+// ---- Decoder A: ServiceCIDR (networking.k8s.io/v1) ---------------------------
+
+pub fn decode_servicecidr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = networking_v1::ServiceCidr::decode(data).ok()?;
+    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "ServiceCIDR",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        if !spec.cidrs.is_empty() {
+            out["spec"] = serde_json::json!({
+                "cidrs": spec.cidrs,
+            });
+        }
+    }
+    if let Some(status) = obj.status {
+        if !status.conditions.is_empty() {
+            let conditions: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cm = serde_json::json!({
+                        "type": c.r#type.unwrap_or_default(),
+                        "status": c.status.unwrap_or_default(),
+                    });
+                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                        cm["reason"] = v.into();
+                    }
+                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                        cm["message"] = v.into();
+                    }
+                    if let Some(t) = c.last_transition_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                        }
+                    }
+                    cm
+                })
+                .collect();
+            out["status"] = serde_json::json!({ "conditions": conditions });
+        }
+    }
+    Some(out)
+}
+
 // ---- Decoder A: EndpointSlice (discovery.k8s.io/v1) --------------------------
 
 pub fn decode_endpointslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -784,6 +869,80 @@ mod tests {
         assert_eq!(
             result["status"]["loadBalancer"]["ingress"][0]["ports"][0]["port"], 443,
             "status.loadBalancer.ingress[0].ports[0].port must survive decode"
+        );
+    }
+
+    /// decode_ipaddress_proto_gen must decode a protobuf-encoded IPAddress.
+    ///
+    /// Before adding this decoder + its proto.rs dispatch arm, extract_body had no way to
+    /// turn the protobuf body client-go's typed IPAddress clientset sends into JSON, so
+    /// every Create() fell through to "invalid JSON: expected value at line 1 column 1" and
+    /// the apiserver returned 400 instead of 201.
+    #[test]
+    fn decode_ipaddress_proto_gen_preserves_parent_ref() {
+        let obj = networking_v1::IpAddress {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("192.168.1.5".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(networking_v1::IpAddressSpec {
+                parent_ref: Some(networking_v1::ParentReference {
+                    group: Some("".to_string()),
+                    resource: Some("services".to_string()),
+                    namespace: Some("default".to_string()),
+                    name: Some("my-svc".to_string()),
+                }),
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_ipaddress_proto_gen(&buf).expect("IPAddress must decode via proto");
+
+        assert_eq!(result["kind"], "IPAddress");
+        assert_eq!(
+            result["spec"]["parentRef"]["resource"], "services",
+            "spec.parentRef.resource must survive decode — an IPAddress without its parent \
+             reference cannot be traced back to the Service that owns it"
+        );
+        assert_eq!(result["spec"]["parentRef"]["name"], "my-svc");
+    }
+
+    /// decode_servicecidr_proto_gen must decode a protobuf-encoded ServiceCIDR, including
+    /// spec.cidrs and status.conditions.
+    ///
+    /// Same root cause as IPAddress: a missing dispatch arm/decoder means every protobuf
+    /// Create() for ServiceCIDR returns 400 instead of 201.
+    #[test]
+    fn decode_servicecidr_proto_gen_preserves_cidrs_and_conditions() {
+        let obj = networking_v1::ServiceCidr {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-cidr".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(networking_v1::ServiceCidrSpec {
+                cidrs: vec!["10.0.0.0/24".to_string()],
+            }),
+            status: Some(networking_v1::ServiceCidrStatus {
+                conditions: vec![meta_v1::Condition {
+                    r#type: Some("Ready".to_string()),
+                    status: Some("True".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_servicecidr_proto_gen(&buf).expect("ServiceCIDR must decode via proto");
+
+        assert_eq!(result["kind"], "ServiceCIDR");
+        assert_eq!(
+            result["spec"]["cidrs"][0], "10.0.0.0/24",
+            "spec.cidrs must survive decode — without it, no IP range exists to allocate \
+             ClusterIPs from"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Ready",
+            "status.conditions must survive decode"
         );
     }
 }
