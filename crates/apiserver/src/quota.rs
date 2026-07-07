@@ -290,6 +290,73 @@ async fn fetch_resource_quotas<S: Store>(state: &AppState<S>, namespace: &str) -
     }
 }
 
+/// Returns true if `resource` is a service-type count quota (services.nodeports,
+/// services.loadbalancers). These require filtering services by `spec.type` and
+/// summing a per-service contribution, unlike a plain `services` count which
+/// counts every service equally — so they cannot go through `count_objects`.
+fn is_service_type_quota(resource: &str) -> bool {
+    matches!(
+        resource,
+        "services.nodeports"
+            | "count/services.nodeports"
+            | "services.loadbalancers"
+            | "count/services.loadbalancers"
+    )
+}
+
+/// Units a single Service object contributes to a services.nodeports or
+/// services.loadbalancers quota.
+///
+/// Mirrors upstream Kubernetes ResourceQuota service accounting: a NodePort
+/// service consumes one nodeport per `spec.ports` entry; a LoadBalancer
+/// service consumes the same (it gets allocated NodePorts too, unless
+/// `allocateLoadBalancerNodePorts` is explicitly `false`) and separately
+/// counts as 1 against services.loadbalancers. Without this split, a
+/// NodePort service exhausting services.nodeports would not block a
+/// subsequent LoadBalancer service from allocating more nodeports.
+fn service_quota_units(service: &Value, resource: &str) -> u64 {
+    let svc_type = service["spec"]["type"].as_str().unwrap_or("ClusterIP");
+    let num_ports = service["spec"]["ports"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0) as u64;
+    match resource {
+        "services.nodeports" | "count/services.nodeports" => match svc_type {
+            "NodePort" => num_ports,
+            "LoadBalancer" => {
+                let allocates_node_ports = service["spec"]["allocateLoadBalancerNodePorts"]
+                    .as_bool()
+                    .unwrap_or(true);
+                if allocates_node_ports {
+                    num_ports
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        },
+        "services.loadbalancers" | "count/services.loadbalancers" => {
+            u64::from(svc_type == "LoadBalancer")
+        }
+        _ => 0,
+    }
+}
+
+/// Sum `service_quota_units` across all existing Services in `namespace` for the
+/// given services.* quota resource.
+async fn sum_service_quota_units<S: Store>(store: &S, namespace: &str, resource: &str) -> u64 {
+    let prefix = group_list_prefix("", "services", Some(namespace));
+    let items = match store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(_) => return 0,
+    };
+    items
+        .iter()
+        .filter_map(|item| serde_json::from_slice::<Value>(&item.value).ok())
+        .map(|svc| service_quota_units(&svc, resource))
+        .sum()
+}
+
 /// Count the current number of objects of a given resource kind in a namespace.
 async fn count_objects<S: Store>(
     state: &AppState<S>,
@@ -477,7 +544,10 @@ pub async fn count_quota_usage<S: Store>(
 
     let mut used = std::collections::BTreeMap::new();
     for (resource_name, _) in hard {
-        if let Some((group, plural)) = quota_resource_to_group_plural(resource_name) {
+        if is_service_type_quota(resource_name) {
+            let count = sum_service_quota_units(store, namespace, resource_name).await;
+            used.insert(resource_name.clone(), count.to_string());
+        } else if let Some((group, plural)) = quota_resource_to_group_plural(resource_name) {
             // Pod resources respect scope filtering; other resource types are always counted.
             let count = if has_pod_scopes && group.is_empty() && plural == "pods" {
                 count_scope_filtered_pods(store, namespace, quota).await
@@ -617,6 +687,32 @@ pub async fn check_resource_quota<S: Store>(
         if let Some(map) = hard.as_object() {
             for (quota_resource, limit_val) in map {
                 let limit_str = limit_val.as_str().unwrap_or("");
+
+                // Path 0: service-type quotas (services.nodeports, services.loadbalancers).
+                // These sum a per-port/per-type contribution rather than a flat 1-per-object
+                // count, so they bypass the generic count-based path below.
+                if resource == "services"
+                    && group.is_empty()
+                    && is_service_type_quota(quota_resource)
+                {
+                    let hard_limit = match parse_count(limit_str) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    let existing =
+                        sum_service_quota_units(&*state.store, namespace, quota_resource).await;
+                    let incoming = object
+                        .map(|o| service_quota_units(o, quota_resource))
+                        .unwrap_or(0);
+                    if existing + incoming > hard_limit {
+                        return Err(Status::forbidden(format!(
+                            "exceeded quota: {quota_name}, requested: \
+                             {quota_resource}={incoming}, used: {existing}, \
+                             limited: {hard_limit}"
+                        )));
+                    }
+                    continue;
+                }
 
                 // Path 1: count-based quota — covers the API resource type being created.
                 if quota_resource_covers(quota_resource, group, resource) {
@@ -1312,6 +1408,178 @@ mod tests {
         assert!(
             result.is_ok(),
             "pod within remaining CPU quota must be allowed"
+        );
+    }
+
+    // -- services.nodeports / services.loadbalancers quotas --
+
+    fn nodeport_service(name: &str, ns: &str) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": { "type": "NodePort", "ports": [{"port": 80}] }
+        })
+    }
+
+    fn loadbalancer_service(name: &str, ns: &str) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{"port": 80}],
+                "allocateLoadBalancerNodePorts": true
+            }
+        })
+    }
+
+    /// A quota capping services.nodeports=1 must deny a 2nd NodePort service once the
+    /// first has claimed the only allowed nodeport. Cluster nodeports are a finite,
+    /// shared resource (30000-32767 range) — without this check a namespace could
+    /// exhaust the whole cluster's nodeport range unbounded.
+    #[tokio::test]
+    async fn check_quota_second_nodeport_service_denied_when_nodeports_quota_at_limit() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "np-quota", "namespace": "default" },
+            "spec": { "hard": { "services.nodeports": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/np-quota", quota).await;
+        seed(
+            &state,
+            "/registry/services/default/svc-np-1",
+            nodeport_service("svc-np-1", "default"),
+        )
+        .await;
+
+        let incoming = nodeport_service("svc-np-2", "default");
+        let result = check_resource_quota(&state, "default", "", "services", Some(&incoming)).await;
+        assert!(
+            result.is_err(),
+            "2nd NodePort service must be denied once services.nodeports=1 is already claimed"
+        );
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::FORBIDDEN,
+            "services.nodeports exceeded must return 403 Forbidden"
+        );
+    }
+
+    /// Matches the upstream conformance scenario directly: a NodePort service exhausts
+    /// services.nodeports=1; a subsequent LoadBalancer service (which also allocates a
+    /// nodeport by default) must then be denied even though services.loadbalancers=1
+    /// alone would allow it. If u7s only checked services.loadbalancers and ignored
+    /// that LoadBalancer services also consume nodeports, this would wrongly succeed.
+    #[tokio::test]
+    async fn check_quota_loadbalancer_service_denied_when_nodeports_exhausted_by_nodeport_service()
+    {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "svc-quota", "namespace": "default" },
+            "spec": { "hard": { "services.nodeports": "1", "services.loadbalancers": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/svc-quota", quota).await;
+        seed(
+            &state,
+            "/registry/services/default/svc-np",
+            nodeport_service("svc-np", "default"),
+        )
+        .await;
+
+        let incoming = loadbalancer_service("svc-lb", "default");
+        let result = check_resource_quota(&state, "default", "", "services", Some(&incoming)).await;
+        assert!(
+            result.is_err(),
+            "LoadBalancer service creation must be denied when it would exceed the \
+             remaining services.nodeports quota, even though services.loadbalancers alone \
+             would allow it — matches k8s conformance 'capture the life of a service'"
+        );
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::FORBIDDEN,
+            "services.nodeports exceeded via a LoadBalancer service must return 403 Forbidden"
+        );
+    }
+
+    /// A LoadBalancer service must be allowed and counted when the loadbalancers quota
+    /// has room — verifies the check is not overly strict (no false denials for the
+    /// first LoadBalancer service in a namespace).
+    #[tokio::test]
+    async fn check_quota_loadbalancer_service_within_limit_allows() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "lb-quota", "namespace": "default" },
+            "spec": { "hard": { "services.loadbalancers": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/lb-quota", quota).await;
+
+        let incoming = loadbalancer_service("svc-lb", "default");
+        let result = check_resource_quota(&state, "default", "", "services", Some(&incoming)).await;
+        assert!(
+            result.is_ok(),
+            "first LoadBalancer service must be allowed when services.loadbalancers quota has room"
+        );
+    }
+
+    /// status.used must report services.nodeports and services.loadbalancers correctly
+    /// split by service type — a NodePort service must not be counted against
+    /// services.loadbalancers and vice versa. `kubectl get resourcequota` and the
+    /// conformance test poll these exact fields.
+    #[tokio::test]
+    async fn update_quota_status_reflects_nodeport_and_loadbalancer_counts_separately() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "svc-quota", "namespace": "default" },
+            "spec": { "hard": { "services.nodeports": "10", "services.loadbalancers": "10" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/svc-quota", quota).await;
+        seed(
+            &state,
+            "/registry/services/default/svc-np",
+            nodeport_service("svc-np", "default"),
+        )
+        .await;
+        seed(
+            &state,
+            "/registry/services/default/svc-lb",
+            loadbalancer_service("svc-lb", "default"),
+        )
+        .await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/svc-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["services.nodeports"].as_str(),
+            Some("2"),
+            "services.nodeports must count both the NodePort service's port AND the \
+             LoadBalancer service's port (LB services also allocate nodeports by default) — \
+             dropping this leaves nodeports unbounded"
+        );
+        assert_eq!(
+            obj["status"]["used"]["services.loadbalancers"].as_str(),
+            Some("1"),
+            "services.loadbalancers must count only the LoadBalancer-type service, not \
+             the NodePort-type one"
         );
     }
 }

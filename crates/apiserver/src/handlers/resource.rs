@@ -238,6 +238,18 @@ pub async fn create_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            // cr::create_cr is called directly (not dispatched by axum), so it has no Query
+            // extractor of its own; forward the already-parsed ?fieldValidation= value via a
+            // header rather than adding a parameter to its ~60 existing call sites.
+            let mut headers = headers;
+            if let Some(fv) = create_query.field_validation.as_deref() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
+                    headers.insert(
+                        axum::http::HeaderName::from_static("x-u7s-field-validation"),
+                        hv,
+                    );
+                }
+            }
             return super::cr::create_cr(
                 State(state),
                 Path((group, version, plural)),
@@ -996,6 +1008,17 @@ pub async fn patch_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            // See create_resource: cr::patch_cr has no Query extractor of its own, so
+            // forward ?fieldValidation= via a header instead of a new parameter.
+            let mut headers = headers;
+            if let Some(fv) = patch_query._field_validation.as_deref() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
+                    headers.insert(
+                        axum::http::HeaderName::from_static("x-u7s-field-validation"),
+                        hv,
+                    );
+                }
+            }
             return super::cr::patch_cr(
                 State(state),
                 Path((group, version, plural, name)),
@@ -1254,6 +1277,17 @@ pub async fn create_namespaced_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            // See create_resource: cr::create_cr_namespaced has no Query extractor of its
+            // own, so forward ?fieldValidation= via a header instead of a new parameter.
+            let mut headers = headers;
+            if let Some(fv) = create_query.field_validation.as_deref() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
+                    headers.insert(
+                        axum::http::HeaderName::from_static("x-u7s-field-validation"),
+                        hv,
+                    );
+                }
+            }
             return super::cr::create_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural)),
@@ -1965,6 +1999,17 @@ pub async fn patch_namespaced_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            // See create_resource: cr::patch_cr_namespaced has no Query extractor of its
+            // own, so forward ?fieldValidation= via a header instead of a new parameter.
+            let mut headers = headers;
+            if let Some(fv) = patch_query._field_validation.as_deref() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(fv) {
+                    headers.insert(
+                        axum::http::HeaderName::from_static("x-u7s-field-validation"),
+                        hv,
+                    );
+                }
+            }
             return super::cr::patch_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
