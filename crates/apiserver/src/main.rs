@@ -5503,7 +5503,7 @@ mod tests {
     /// Full CSR lifecycle: POST → GET → PUT /approval (Approved) → PUT /status (cert) → GET confirms cert.
     ///
     /// This test exercises the entire CertificateSigningRequest flow end-to-end:
-    ///   1. Client submits a CSR (POST) — only signerName + valid DER spec.request allowed.
+    ///   1. Client submits a CSR (POST) — only signerName + valid base64(PEM) spec.request allowed.
     ///   2. GET confirms the CSR is stored and spec is immutable (no status yet).
     ///   3. Approver writes Approved condition via PUT /approval — certificate must NOT appear.
     ///   4. Signer writes status.certificate via PUT /status — certificate appears.
@@ -5517,13 +5517,15 @@ mod tests {
         use rcgen::{CertificateParams, KeyPair};
         use std::sync::Arc;
 
-        // Generate a real DER PKCS#10 CSR — same approach used in csr.rs unit tests.
+        // Generate a real base64(PEM) PKCS#10 CSR — same approach used in csr.rs unit tests.
+        // kubectl/client-go submit spec.request as base64(PEM), not base64(DER).
         let key_pair = KeyPair::generate().expect("key generation must succeed");
         let params = CertificateParams::default();
         let csr = params
             .serialize_request(&key_pair)
             .expect("CSR generation must succeed");
-        let csr_b64 = base64::engine::general_purpose::STANDARD.encode(csr.der());
+        let csr_pem = csr.pem().expect("CSR PEM serialization must succeed");
+        let csr_b64 = base64::engine::general_purpose::STANDARD.encode(csr_pem);
 
         let store = Arc::new(make_store());
         let state = state::AppState::new(
