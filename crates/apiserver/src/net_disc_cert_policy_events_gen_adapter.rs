@@ -619,6 +619,56 @@ pub fn decode_csr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             out["spec"] = serde_json::Value::Object(spec_json);
         }
     }
+    // status must be decoded too: kubectl certificate approve/deny and the sig-auth
+    // "CSR API operations" conformance test PUT/PATCH the /approval and /status
+    // subresources using the protobuf content-type. Dropping status here silently
+    // discarded every condition and certificate written via those subresources.
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::Map::new();
+        if !status.conditions.is_empty() {
+            let conditions: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cm = serde_json::json!({
+                        "type": c.r#type.unwrap_or_default(),
+                        "status": c.status.unwrap_or_default(),
+                    });
+                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                        cm["reason"] = v.into();
+                    }
+                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                        cm["message"] = v.into();
+                    }
+                    if let Some(t) = c.last_update_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastUpdateTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                        }
+                    }
+                    if let Some(t) = c.last_transition_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                        }
+                    }
+                    cm
+                })
+                .collect();
+            status_json.insert(
+                "conditions".to_string(),
+                serde_json::Value::Array(conditions),
+            );
+        }
+        if let Some(cert) = status.certificate.filter(|c| !c.is_empty()) {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&cert);
+            status_json.insert("certificate".to_string(), serde_json::Value::String(b64));
+        }
+        if !status_json.is_empty() {
+            out["status"] = serde_json::Value::Object(status_json);
+        }
+    }
     Some(out)
 }
 

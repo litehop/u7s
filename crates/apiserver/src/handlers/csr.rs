@@ -271,6 +271,28 @@ pub async fn create_csr<S: Store>(
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
+/// DELETE /apis/certificates.k8s.io/v1/certificatesigningrequests
+///
+/// The CSR collection route is registered as a literal path (not the generic
+/// `{group}/{version}/{resource}` template) so create/list can run CSR-specific
+/// validation. That means axum never falls back to the templated route's DELETE
+/// handler — without this wrapper the route only has GET/POST registered and axum
+/// returns 405 on DELETE, breaking `kubectl delete csr --all` and the sig-auth
+/// "CSR API operations" conformance test's DeleteCollection call.
+pub async fn delete_collection_csr<S: Store>(
+    State(state): State<AppState<S>>,
+    Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    crate::handlers::resource::delete_collection_resource(
+        State(state),
+        Path((GROUP.to_string(), VERSION.to_string(), PLURAL.to_string())),
+        Query(query),
+        Extension(user),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +613,58 @@ mod tests {
             state.store.get(key).await.unwrap().is_some(),
             "created CSR must be persisted in the store"
         );
+    }
+
+    /// DELETE on the CSR collection route must actually remove the stored CSRs.
+    ///
+    /// The CSR collection route is a literal path (not the generic
+    /// `{group}/{version}/{resource}` template), so before this fix only GET/POST were
+    /// registered on it and axum answered DELETE with 405 "the server does not allow
+    /// this method on the requested resource". `kubectl delete csr --all` and the
+    /// sig-auth "CSR API operations" conformance test's DeleteCollection step both
+    /// depend on this route accepting DELETE.
+    #[tokio::test]
+    async fn delete_collection_csr_removes_stored_csrs() {
+        let state = make_state();
+        seed_csr_for_get(&state, "csr-one").await;
+        seed_csr_for_get(&state, "csr-two").await;
+
+        let result = delete_collection_csr(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+                extra: Default::default(),
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "delete_collection_csr must succeed instead of 405 — without the DELETE \
+             route registration this call never reaches the handler at all"
+        );
+
+        for name in ["csr-one", "csr-two"] {
+            let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+            assert!(
+                state.store.get(&key).await.unwrap().is_none(),
+                "DeleteCollection must remove CSR '{name}' — a leftover CSR fails the \
+                 conformance test's final 'filtered list should have 0 items' assertion"
+            );
+        }
     }
 
     /// create_csr with duplicate name must return 409 Conflict.

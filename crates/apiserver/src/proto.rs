@@ -8679,6 +8679,56 @@ mod tests {
         );
     }
 
+    /// CSR status.conditions and status.certificate were entirely absent from
+    /// decode_csr_proto_gen — the decoder only read metadata and spec. The sig-auth
+    /// "CSR API operations" conformance test PUTs/PATCHes the /approval and /status
+    /// subresources with a protobuf-encoded body (client-go's default content-type for
+    /// built-in types); with status dropped, the approver's and signer's writes were
+    /// silently discarded and the object round-tripped with its *old* conditions.
+    #[test]
+    fn decode_csr_status_conditions_previously_dropped_now_preserved() {
+        // CertificateSigningRequestCondition: field 1 = type, field 6 = status, field 2 = reason
+        let mut cond = encode_length_delimited(1, b"Approved");
+        cond.extend_from_slice(&encode_length_delimited(6, b"True"));
+        cond.extend_from_slice(&encode_length_delimited(2, b"KubectlApprove"));
+
+        // CertificateSigningRequestStatus: field 1 = conditions (repeated), field 2 = certificate (bytes)
+        let mut status = encode_length_delimited(1, &cond);
+        status.extend_from_slice(&encode_length_delimited(2, b"fake-cert-bytes"));
+
+        // CertificateSigningRequest: field 1 = metadata, field 3 = status
+        let meta = encode_length_delimited(1, b"my-csr");
+        let mut csr = encode_length_delimited(1, &meta);
+        csr.extend_from_slice(&encode_length_delimited(3, &status));
+
+        let result = crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen(&csr)
+            .expect("CSR with status must decode");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Approved",
+            "status.conditions[0].type must survive decode — the /approval subresource writes \
+             this field, and dropping it silently un-approves the request on every proto write"
+        );
+        assert_eq!(result["status"]["conditions"][0]["status"], "True");
+        assert_eq!(
+            result["status"]["conditions"][0]["reason"], "KubectlApprove",
+            "status.conditions[0].reason must survive decode"
+        );
+
+        use base64::Engine as _;
+        let cert_b64 = result["status"]["certificate"]
+            .as_str()
+            .expect("status.certificate must be a base64 string in JSON");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64)
+            .expect("status.certificate must be valid base64");
+        assert_eq!(
+            decoded, b"fake-cert-bytes",
+            "status.certificate must survive decode — the /status subresource writes the \
+             issued certificate, and dropping it forces every signer write to be silently lost"
+        );
+    }
+
     /// events.k8s.io/v1 Event.series was absent from the hand decoder and therefore silently
     /// dropped. The generated decoder must preserve series.count and series.lastObservedTime
     /// so that event aggregation metadata survives the round-trip.

@@ -5,6 +5,8 @@
 //!
 //! Semantics:
 //!   - Merges incoming `status.conditions` into the stored object's conditions list.
+//!   - Merges incoming `metadata` (labels/annotations) — same isolation rules as
+//!     the /status subresource (identity fields and finalizers are protected).
 //!   - MUST NOT touch `spec` or `status.certificate` — those are controlled by
 //!     the signer, not the approver.
 //!   - Honours `resourceVersion` in incoming body for OCC (returns 409 on conflict).
@@ -20,6 +22,7 @@ use bytes::Bytes;
 use crate::{
     handlers::generic::{store_err, validate_name},
     handlers::json_patch::{apply_json_patch, detect_patch_type, PatchType},
+    handlers::status::merge_incoming_metadata,
     keys::group_object_key,
     state::AppState,
     status::Status,
@@ -34,8 +37,8 @@ const KIND: &str = "CertificateSigningRequest";
 
 /// PUT /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval
 ///
-/// Merges `status.conditions` from the incoming body into the stored object.
-/// Never modifies `spec` or `status.certificate`.
+/// Merges `status.conditions` and `metadata` (labels/annotations) from the
+/// incoming body into the stored object. Never modifies `spec` or `status.certificate`.
 pub async fn put_approval<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -61,8 +64,11 @@ pub async fn put_approval<S: Store>(
     // OCC: if incoming has a resourceVersion, it must match the stored one.
     let expected_rv = parse_resource_version(incoming.resource_version())?;
 
-    // Merge only status.conditions — never touch spec or status.certificate.
+    // Merge status.conditions and metadata (labels/annotations) — never touch spec or
+    // status.certificate. kubectl certificate approve/deny sends the whole object back,
+    // and clients (e.g. this conformance test) also PATCH/PUT annotations via /approval.
     merge_approval_conditions(&mut current, &incoming);
+    merge_incoming_metadata(&mut current.body, &incoming.body);
 
     let new_rv = state
         .store
@@ -127,6 +133,9 @@ pub async fn patch_approval<S: Store>(
                         serde_json::to_value(conditions).unwrap_or(serde_json::Value::Null);
                 }
             }
+            // Merge metadata (labels/annotations) from the patch — kubectl certificate
+            // approve/deny and this conformance test also patch annotations via /approval.
+            merge_incoming_metadata(&mut current.body, &patch);
         }
     }
 
@@ -462,6 +471,80 @@ mod tests {
             v["status"]["certificate"].is_null() || v["status"].get("certificate").is_none(),
             "patch_approval must not write certificate field — that belongs to the signer"
         );
+    }
+
+    /// PATCH /approval with a merge-patch carrying both `metadata.annotations` and
+    /// `status.conditions` must apply both — not just the conditions.
+    ///
+    /// The sig-auth "CSR API operations" conformance test sends exactly this shape
+    /// (`{"metadata":{"annotations":{"patchedapproval":"true"}},"status":{"conditions":[...]}}`)
+    /// and asserts the returned object has the annotation. If patch_approval only merged
+    /// status.conditions and silently dropped the metadata half, the response reflects the
+    /// object's annotations from *before* this patch — which breaks any client (including
+    /// this test) that patches metadata and status together via /approval.
+    #[tokio::test]
+    async fn patch_approval_merge_patch_applies_annotations_and_conditions_together() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "patch-approval-annotation-csr";
+        seed_csr(&store, name, None).await;
+
+        let patch_body = json!({
+            "metadata": {"annotations": {"patchedapproval": "true"}},
+            "status": {
+                "conditions": [{
+                    "type": "ApprovalPatch",
+                    "status": "True",
+                    "reason": "e2e",
+                    "message": ""
+                }]
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => panic!("PATCH /approval with annotations+conditions must succeed: {e:?}"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let returned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            returned["metadata"]["annotations"]["patchedapproval"], "true",
+            "patched object should have the applied annotation — the response must reflect \
+             the metadata half of the merge patch, not just status.conditions"
+        );
+        let conds = returned["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            conds.len(),
+            1,
+            "patched object should have the applied condition"
+        );
+        assert_eq!(conds[0]["type"], "ApprovalPatch");
     }
 
     /// PATCH /approval with json-patch+json must apply the patch (JSON Patch path).

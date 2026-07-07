@@ -702,7 +702,9 @@ fn build_router(state: AppState) -> Router {
         // Must be registered before the generic cluster-scoped catch-all.
         .route(
             "/apis/certificates.k8s.io/v1/certificatesigningrequests",
-            get(handlers::csr::list_csr).post(handlers::csr::create_csr),
+            get(handlers::csr::list_csr)
+                .post(handlers::csr::create_csr)
+                .delete(handlers::csr::delete_collection_csr),
         )
         // CSR /approval subresource — PUT and PATCH only merge status.conditions;
         // spec and status.certificate are never touched. Must be before the named
