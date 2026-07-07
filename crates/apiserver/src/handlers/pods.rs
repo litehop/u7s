@@ -2345,11 +2345,64 @@ fn merge_resize_for_qos(
     result
 }
 
+/// Merge one requests/limits `section` of a container's resources. `stored_section` is
+/// the current value at `resources[section]` (`None` if absent); `incoming` is the value
+/// found at `resources[section]` in the patch (`None` when the section key is absent
+/// from the patch entirely). Returns `None` when the section should end up absent.
+///
+/// `incoming == None` means the patch never mentions this section at all — preserve
+/// `stored_section` exactly as-is. This is only reachable for a resize patch that
+/// `validate_resize_patch` already accepted: Rule 3 rejects an absent section whenever
+/// the stored pod has a cpu/memory value there, so by the time this runs an absent
+/// section can only mean the stored section already had nothing worth losing.
+/// `incoming == Some(null)` or `Some({})` means "remove the whole section" (same
+/// validated-safe reasoning). A non-empty incoming object is merged key-by-key: a key
+/// present in the patch overwrites (or, if explicitly `null`, removes) that single
+/// key, while a key never mentioned by the patch keeps its stored value — this is the
+/// behavior `strategicpatch.CreateTwoWayMergePatch` requires, since it omits any
+/// cpu/memory key that didn't change.
+fn merge_resize_section(
+    stored_section: Option<&serde_json::Value>,
+    incoming: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match incoming {
+        None => stored_section.cloned(),
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(map)) if map.is_empty() => None,
+        Some(serde_json::Value::Object(map)) => {
+            let mut merged = stored_section
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            for (key, value) in map {
+                if value.is_null() {
+                    merged.remove(key);
+                } else {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+            if merged.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(merged))
+            }
+        }
+        Some(_) => stored_section.cloned(),
+    }
+}
+
 /// Merge incoming container resources onto the stored pod (match by container name),
 /// then set status.resize = "Proposed".
 ///
-/// Only spec.containers[].resources is updated; all other fields are preserved.
-/// This is the pure logic extracted for testability.
+/// Merges `resources.requests`/`resources.limits` key-by-key via `merge_resize_section`
+/// rather than replacing the whole `resources` object. A resize patch built by
+/// `strategicpatch.CreateTwoWayMergePatch` (as real kubectl/e2e clients do) omits any
+/// cpu/memory key that didn't change — a CPU-only resize of a container with existing
+/// memory requests/limits never mentions memory at all. Replacing `resources` wholesale
+/// with that partial patch silently deletes the untouched resource, corrupting
+/// multi-container resizes where different containers (or different dimensions of the
+/// same container) change independently. Only spec.containers[].resources is updated;
+/// all other fields are preserved. This is the pure logic extracted for testability.
 pub fn apply_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
@@ -2359,12 +2412,28 @@ pub fn apply_resize_patch(
         if let Some(stored_containers) = result["spec"]["containers"].as_array_mut() {
             for stored_container in stored_containers.iter_mut() {
                 let stored_name = stored_container["name"].as_str().unwrap_or("");
-                if let Some(incoming_container) = incoming_containers
+                let Some(incoming_container) = incoming_containers
                     .iter()
                     .find(|c| c["name"].as_str().unwrap_or("") == stored_name)
-                {
-                    if !incoming_container["resources"].is_null() {
-                        stored_container["resources"] = incoming_container["resources"].clone();
+                else {
+                    continue;
+                };
+                let incoming_resources = &incoming_container["resources"];
+                if incoming_resources.is_null() {
+                    continue;
+                }
+                for section in ["requests", "limits"] {
+                    let merged = merge_resize_section(
+                        stored_container["resources"].get(section),
+                        incoming_resources.get(section),
+                    );
+                    match merged {
+                        Some(v) => stored_container["resources"][section] = v,
+                        None => {
+                            if let Some(obj) = stored_container["resources"].as_object_mut() {
+                                obj.remove(section);
+                            }
+                        }
                     }
                 }
             }
@@ -10796,6 +10865,115 @@ mod resize_tests {
         assert_eq!(
             result["spec"]["containers"][1]["resources"]["limits"]["cpu"], "50m",
             "sidecar container must be unchanged — resize only targets named containers"
+        );
+    }
+
+    /// apply_resize_patch must preserve a resource dimension the patch never mentions,
+    /// even when the surrounding requests/limits section IS present and non-empty.
+    ///
+    /// Reproduces the "guaranteed pods with multiple containers, 3 containers" and
+    /// "burstable pods - extended 6 containers" InPlace Resize conformance failures:
+    /// `strategicpatch.CreateTwoWayMergePatch` omits any cpu/memory key that didn't
+    /// change, so a CPU-only resize of a container that also has memory requests/limits
+    /// never mentions memory at all. Before this fix, apply_resize_patch replaced the
+    /// whole `resources` object with the patch's partial one, silently deleting the
+    /// container's memory requests/limits — verified live via kubectl --subresource=resize
+    /// against a guaranteed 3-container pod, where container c1 (CPU-only change) lost
+    /// its stored memory entirely.
+    #[test]
+    fn apply_resize_patch_preserves_untouched_resource_key_within_touched_section() {
+        let stored = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "100Mi"},
+                        "limits": {"cpu": "100m", "memory": "100Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Only CPU changes for c1; memory is entirely absent (unchanged, per
+        // CreateTwoWayMergePatch semantics), matching the real patch this repro sent.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {
+                        "requests": {"cpu": "150m"},
+                        "limits": {"cpu": "150m"}
+                    }
+                }]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["cpu"], "150m",
+            "the touched resource (cpu) must be updated"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["memory"], "100Mi",
+            "memory requests must survive a CPU-only resize — losing them silently \
+             shrinks the container to a fraction of its declared memory, a real \
+             vertical-scaling regression, not just a cosmetic field drop"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["memory"], "100Mi",
+            "memory limits must survive a CPU-only resize for the same reason"
+        );
+    }
+
+    /// apply_resize_patch must let independent containers each keep the resource
+    /// dimension they didn't touch, when a single resize patch changes several
+    /// containers with different cpu/memory combinations at once.
+    ///
+    /// Mirrors the exact per-container shapes used by the "burstable pods - extended 6
+    /// containers" conformance test: one container adds a limit where only a request
+    /// existed, another decreases a request while its other dimension (never set before)
+    /// stays absent. Both must be applied independently without cross-contaminating or
+    /// dropping data — reproduced live via kubectl --subresource=resize.
+    #[test]
+    fn apply_resize_patch_multi_container_independent_dimensions() {
+        let stored = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {"name": "c1", "resources": {"requests": {"cpu": "100m"}}},
+                    {"name": "c3", "resources": {"requests": {"cpu": "100m", "memory": "100Mi"}}}
+                ]
+            },
+            "status": {}
+        });
+        // c1: add a CPU limit (memory never existed, still absent — not mentioned).
+        // c3: decrease memory only; cpu is untouched and must be preserved.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {"name": "c1", "resources": {"limits": {"cpu": "200m"}}},
+                    {"name": "c3", "resources": {"requests": {"memory": "50Mi"}}}
+                ]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
+            "c1's new CPU limit must be applied"
+        );
+        assert!(
+            result["spec"]["containers"][0]["resources"]["requests"]["memory"].is_null(),
+            "c1 never had memory requests and the patch never adds any — it must stay absent"
+        );
+        assert_eq!(
+            result["spec"]["containers"][1]["resources"]["requests"]["cpu"], "100m",
+            "c3's untouched CPU request must survive a memory-only resize of c3"
+        );
+        assert_eq!(
+            result["spec"]["containers"][1]["resources"]["requests"]["memory"], "50Mi",
+            "c3's memory request must reflect the decrease"
         );
     }
 
