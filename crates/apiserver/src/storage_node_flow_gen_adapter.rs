@@ -947,6 +947,11 @@ mod tests {
             driver["allocatable"]["count"], 8,
             "allocatable.count must survive — the scheduler uses it to cap volumes per node"
         );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — CSINode is cluster-scoped; a leaked namespace \
+             key would make namespace-scoped watchers believe it belongs to a namespace"
+        );
     }
 
     #[test]
@@ -1017,6 +1022,11 @@ mod tests {
             result["spec"]["seLinuxMount"], true,
             "seLinuxMount must survive — it decides whether kubelet passes -o context to the driver"
         );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — CSIDriver is cluster-scoped, so a leaked \
+             namespace key would misrepresent its scope to clients"
+        );
     }
 
     #[test]
@@ -1063,6 +1073,11 @@ mod tests {
             result["maximumVolumeSize"], "50Gi",
             "maximumVolumeSize must survive — it is the primary value the scheduler filters \
              candidate nodes against"
+        );
+        assert!(
+            result["nodeTopology"]["matchExpressions"].is_null(),
+            "nodeTopology.matchExpressions must stay absent when unset — a spuriously emitted \
+             empty array would look like an always-false selector instead of no selector at all"
         );
     }
 
@@ -1135,6 +1150,10 @@ mod tests {
             result["status"]["detachError"]["message"], "device busy",
             "detachError must survive — losing it hides a failed detach that blocks pod deletion"
         );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — VolumeAttachment is cluster-scoped"
+        );
     }
 
     #[test]
@@ -1185,6 +1204,10 @@ mod tests {
             "volumeBindingMode must survive — Immediate vs WaitForFirstConsumer changes when \
              the scheduler and provisioner interact"
         );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — StorageClass is cluster-scoped"
+        );
     }
 
     #[test]
@@ -1213,6 +1236,10 @@ mod tests {
             result["parameters"]["iops"], "3000",
             "parameters must survive — this is the only content of a mutable-attributes request; \
              dropping it makes ModifyVolume a no-op"
+        );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — VolumeAttributesClass is cluster-scoped"
         );
     }
 
@@ -1266,6 +1293,10 @@ mod tests {
             "scheduling.tolerations must survive — they are unioned into the pod's tolerations \
              at admission"
         );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — RuntimeClass is cluster-scoped"
+        );
     }
 
     #[test]
@@ -1298,6 +1329,10 @@ mod tests {
             result["preemptionPolicy"], "Never",
             "preemptionPolicy must survive — Never vs PreemptLowerPriority changes whether this \
              class can evict other pods to schedule"
+        );
+        assert!(
+            result["metadata"]["namespace"].is_null(),
+            "metadata.namespace must stay absent — PriorityClass is cluster-scoped"
         );
     }
 
@@ -1385,6 +1420,16 @@ mod tests {
             rule["subjects"][1]["group"]["name"], "system:authenticated",
             "subjects[].group must survive — dropping it would match zero or the wrong requesters"
         );
+        assert!(
+            rule["subjects"][0]["group"].is_null(),
+            "subjects[0].group must stay absent — this subject is a ServiceAccount kind; \
+             emitting an empty group would make it match by group as well as by identity"
+        );
+        assert!(
+            rule["subjects"][1]["serviceAccount"].is_null(),
+            "subjects[1].serviceAccount must stay absent — this subject is a Group kind; \
+             a spuriously emitted serviceAccount would widen who the rule matches"
+        );
         assert_eq!(
             rule["resourceRules"][0]["resources"][0], "pods",
             "resourceRules must survive — this is the actual request-matching predicate"
@@ -1464,6 +1509,11 @@ mod tests {
             result["status"]["conditions"][0]["type"], "Concurrency",
             "status.conditions must survive — this is how APF reports concurrency-limit health \
              for the level"
+        );
+        assert!(
+            result["spec"]["exempt"].is_null(),
+            "spec.exempt must stay absent when type is Limited — spuriously emitting it would \
+             suggest this level ignores concurrency limits when it does not"
         );
     }
 }

@@ -908,13 +908,23 @@ mod tests {
             result["status"]["storedVersions"][0], "v1",
             "status.storedVersions must survive — it drives the etcd storage-migration path"
         );
+        assert!(
+            result["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["nullable"].is_null(),
+            "nullable must stay absent when unset — a spurious false would make clients treat a \
+             field as explicitly non-nullable when the schema author never said so"
+        );
+        assert!(
+            result["spec"]["versions"][0]["additionalPrinterColumns"][0]["priority"].is_null(),
+            "printer column priority must stay absent when unset — emitting a spurious 0 is \
+             indistinguishable from an explicit priority=0 column"
+        );
     }
 
     #[test]
     fn decode_delete_options_proto_gen_preserves_propagation_and_dry_run_by_construction() {
         let opts = meta_v1::DeleteOptions {
             propagation_policy: Some("Foreground".to_string()),
-            orphan_dependents: Some(false),
+            orphan_dependents: None,
             grace_period_seconds: Some(30),
             dry_run: vec!["All".to_string()],
             ..Default::default()
@@ -937,6 +947,12 @@ mod tests {
         assert_eq!(
             result["dryRun"][0], "All",
             "dryRun must survive — dropping it would let a dry-run delete actually persist"
+        );
+        assert!(
+            result["orphanDependents"].is_null(),
+            "orphanDependents must stay absent when the caller never set it — a spurious false \
+             is indistinguishable from an explicit opt-out of orphaning, corrupting garbage \
+             collection intent"
         );
     }
 }
