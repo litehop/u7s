@@ -2845,6 +2845,16 @@ mod tests {
             sc["capabilities"]["drop"][0], "ALL",
             "capabilities.drop must survive decode"
         );
+        assert!(
+            sc["runAsNonRoot"].is_null(),
+            "runAsNonRoot must stay absent when the client never set it — emitting a spurious \
+             false would mask an unset field as an explicit opt-out of the non-root check"
+        );
+        assert!(
+            sc["privileged"].is_null(),
+            "privileged must stay absent when unset — a spurious false looks identical to an \
+             explicit non-privileged request, hiding the decode-drop bug this field is prone to"
+        );
     }
 
     /// Pod-level securityContext, including sysctls, survives protobuf decode.

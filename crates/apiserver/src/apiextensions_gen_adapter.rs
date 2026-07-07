@@ -742,3 +742,217 @@ pub fn decode_delete_options_proto_gen(data: &[u8]) -> Option<serde_json::Value>
     }
     Some(obj)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_crd_preserves_spec_schema_and_status_by_construction() {
+        let crd = apiext_v1::CustomResourceDefinition {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("widgets.example.com".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apiext_v1::CustomResourceDefinitionSpec {
+                group: Some("example.com".to_string()),
+                scope: Some("Namespaced".to_string()),
+                names: Some(apiext_v1::CustomResourceDefinitionNames {
+                    plural: Some("widgets".to_string()),
+                    singular: Some("widget".to_string()),
+                    kind: Some("Widget".to_string()),
+                    list_kind: Some("WidgetList".to_string()),
+                    short_names: vec!["wg".to_string()],
+                    categories: vec!["all".to_string()],
+                }),
+                versions: vec![apiext_v1::CustomResourceDefinitionVersion {
+                    name: Some("v1".to_string()),
+                    served: Some(true),
+                    storage: Some(true),
+                    deprecated: Some(true),
+                    deprecation_warning: Some("use v2".to_string()),
+                    schema: Some(apiext_v1::CustomResourceValidation {
+                        open_apiv3_schema: Some(apiext_v1::JsonSchemaProps {
+                            r#type: Some("object".to_string()),
+                            description: Some("a widget".to_string()),
+                            required: vec!["size".to_string()],
+                            properties: [(
+                                "size".to_string(),
+                                apiext_v1::JsonSchemaProps {
+                                    r#type: Some("string".to_string()),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                            x_kubernetes_preserve_unknown_fields: Some(true),
+                            x_kubernetes_validations: vec![apiext_v1::ValidationRule {
+                                rule: Some("self.size != ''".to_string()),
+                                message: Some("size must not be empty".to_string()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                    }),
+                    subresources: Some(apiext_v1::CustomResourceSubresources {
+                        status: Some(apiext_v1::CustomResourceSubresourceStatus {}),
+                        scale: Some(apiext_v1::CustomResourceSubresourceScale {
+                            spec_replicas_path: Some(".spec.replicas".to_string()),
+                            status_replicas_path: Some(".status.replicas".to_string()),
+                            label_selector_path: Some(".status.selector".to_string()),
+                        }),
+                    }),
+                    additional_printer_columns: vec![apiext_v1::CustomResourceColumnDefinition {
+                        name: Some("Size".to_string()),
+                        r#type: Some("string".to_string()),
+                        json_path: Some(".spec.size".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                preserve_unknown_fields: Some(true),
+                conversion: Some(apiext_v1::CustomResourceConversion {
+                    strategy: Some("Webhook".to_string()),
+                    webhook: Some(apiext_v1::WebhookConversion {
+                        conversion_review_versions: vec!["v1".to_string()],
+                        client_config: Some(apiext_v1::WebhookClientConfig {
+                            url: Some("https://example.com/convert".to_string()),
+                            service: Some(apiext_v1::ServiceReference {
+                                namespace: Some("default".to_string()),
+                                name: Some("convert-svc".to_string()),
+                                path: Some("/convert".to_string()),
+                                port: Some(443),
+                            }),
+                            ..Default::default()
+                        }),
+                    }),
+                }),
+            }),
+            status: Some(apiext_v1::CustomResourceDefinitionStatus {
+                conditions: vec![apiext_v1::CustomResourceDefinitionCondition {
+                    r#type: Some("Established".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("InitialNamesAccepted".to_string()),
+                    ..Default::default()
+                }],
+                accepted_names: Some(apiext_v1::CustomResourceDefinitionNames {
+                    plural: Some("widgets".to_string()),
+                    kind: Some("Widget".to_string()),
+                    ..Default::default()
+                }),
+                stored_versions: vec!["v1".to_string()],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).unwrap();
+
+        let result = decode_crd_proto_gen(&buf).expect("CRD must decode");
+
+        assert_eq!(
+            result["spec"]["group"], "example.com",
+            "spec.group must survive — it is half of the CRD's identity (name = <plural>.<group>)"
+        );
+        assert_eq!(
+            result["spec"]["names"]["plural"], "widgets",
+            "spec.names.plural must survive — it determines the REST path clients hit"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["name"], "v1",
+            "version name must survive — kubectl/clients pin to a specific served version"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["deprecated"], true,
+            "deprecated must survive — dropping it silently removes the client warning header"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["size"]
+                ["type"],
+            "string",
+            "nested schema properties must survive — this is the validation contract for custom resources"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["required"][0], "size",
+            "required must survive — dropping it silently makes a mandatory field optional"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+                ["x-kubernetes-validations"][0]["rule"],
+            "self.size != ''",
+            "CEL validation rules must survive — dropping them silently disables admission validation"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["subresources"]["scale"]["specReplicasPath"],
+            ".spec.replicas",
+            "scale subresource paths must survive — HPA reads/writes through them"
+        );
+        assert_eq!(
+            result["spec"]["versions"][0]["additionalPrinterColumns"][0]["name"], "Size",
+            "printer columns must survive — kubectl get output depends on them"
+        );
+        assert_eq!(
+            result["spec"]["conversion"]["webhook"]["clientConfig"]["service"]["name"],
+            "convert-svc",
+            "webhook service reference must survive — a dropped conversion webhook breaks multi-version CRDs"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Established",
+            "status.conditions must survive a protobuf PUT — otherwise the Established/NamesAccepted \
+             controller reads back an empty list and never converges"
+        );
+        assert_eq!(
+            result["status"]["acceptedNames"]["plural"], "widgets",
+            "status.acceptedNames must survive — clients discover CRD names from here"
+        );
+        assert_eq!(
+            result["status"]["storedVersions"][0], "v1",
+            "status.storedVersions must survive — it drives the etcd storage-migration path"
+        );
+        assert!(
+            result["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["nullable"].is_null(),
+            "nullable must stay absent when unset — a spurious false would make clients treat a \
+             field as explicitly non-nullable when the schema author never said so"
+        );
+        assert!(
+            result["spec"]["versions"][0]["additionalPrinterColumns"][0]["priority"].is_null(),
+            "printer column priority must stay absent when unset — emitting a spurious 0 is \
+             indistinguishable from an explicit priority=0 column"
+        );
+    }
+
+    #[test]
+    fn decode_delete_options_proto_gen_preserves_propagation_and_dry_run_by_construction() {
+        let opts = meta_v1::DeleteOptions {
+            propagation_policy: Some("Foreground".to_string()),
+            orphan_dependents: None,
+            grace_period_seconds: Some(30),
+            dry_run: vec!["All".to_string()],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        opts.encode(&mut buf).unwrap();
+
+        let result = decode_delete_options_proto_gen(&buf).expect("DeleteOptions must decode");
+
+        assert_eq!(
+            result["propagationPolicy"], "Foreground",
+            "propagationPolicy must survive — Foreground vs Background changes deletion ordering \
+             semantics for dependents"
+        );
+        assert_eq!(
+            result["gracePeriodSeconds"], 30,
+            "gracePeriodSeconds must survive — a dropped grace period forces immediate deletion \
+             instead of the client-requested delay"
+        );
+        assert_eq!(
+            result["dryRun"][0], "All",
+            "dryRun must survive — dropping it would let a dry-run delete actually persist"
+        );
+        assert!(
+            result["orphanDependents"].is_null(),
+            "orphanDependents must stay absent when the caller never set it — a spurious false \
+             is indistinguishable from an explicit opt-out of orphaning, corrupting garbage \
+             collection intent"
+        );
+    }
+}

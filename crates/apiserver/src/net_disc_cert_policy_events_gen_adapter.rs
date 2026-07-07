@@ -994,5 +994,11 @@ mod tests {
             result["status"]["conditions"][0]["type"], "Ready",
             "status.conditions must survive decode"
         );
+        assert!(
+            result["status"]["conditions"][0]["reason"].is_null(),
+            "condition.reason must stay absent when unset — a spurious empty-string reason \
+             would make clients that check for reason's presence misread an unexplained condition \
+             as an explained one"
+        );
     }
 }

@@ -395,6 +395,11 @@ mod tests {
         );
         assert_eq!(result["spec"]["user"], "alice");
         assert_eq!(result["spec"]["resourceAttributes"]["verb"], "get");
+        assert!(
+            result["spec"]["resourceAttributes"]["namespace"].is_null(),
+            "resourceAttributes.namespace must stay absent when unset — a spurious empty string \
+             would make the authorizer evaluate this as a namespaced check instead of cluster-wide"
+        );
     }
 
     /// ClusterRole nonResourceURLs are preserved end-to-end via the generated struct.
