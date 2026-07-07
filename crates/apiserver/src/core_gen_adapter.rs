@@ -424,6 +424,65 @@ fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Val
     serde_json::Value::Object(m)
 }
 
+/// Pod-level SecurityContext (PodSpec.securityContext, proto field 14), including sysctls.
+///
+/// Without this, pod.Spec.SecurityContext.RunAsUser/RunAsGroup are silently dropped for every
+/// protobuf-created pod, and sysctls never reach validate_pod_sysctls or the kubelet — a pod
+/// requesting `kernel.shm_rmid_forced=1` boots with the node default instead.
+fn gen_pod_security_context_to_json(sc: core_v1::PodSecurityContext) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sc.run_as_user {
+        m.insert("runAsUser".to_string(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = sc.run_as_group {
+        m.insert(
+            "runAsGroup".to_string(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    if let Some(v) = sc.run_as_non_root {
+        m.insert("runAsNonRoot".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = sc.fs_group {
+        m.insert("fsGroup".to_string(), serde_json::Value::Number(v.into()));
+    }
+    if !sc.supplemental_groups.is_empty() {
+        m.insert(
+            "supplementalGroups".to_string(),
+            serde_json::Value::Array(
+                sc.supplemental_groups
+                    .into_iter()
+                    .map(|g| serde_json::Value::Number(g.into()))
+                    .collect(),
+            ),
+        );
+    }
+    if !sc.sysctls.is_empty() {
+        let sysctls: Vec<serde_json::Value> = sc
+            .sysctls
+            .into_iter()
+            .map(|s| {
+                let mut sm = serde_json::Map::new();
+                if let Some(n) = s.name.filter(|s| !s.is_empty()) {
+                    sm.insert("name".to_string(), serde_json::Value::String(n));
+                }
+                if let Some(v) = s.value.filter(|s| !s.is_empty()) {
+                    sm.insert("value".to_string(), serde_json::Value::String(v));
+                }
+                serde_json::Value::Object(sm)
+            })
+            .collect();
+        m.insert("sysctls".to_string(), serde_json::Value::Array(sysctls));
+    }
+    if let Some(sp) = sc.seccomp_profile {
+        m.insert(
+            "seccompProfile".to_string(),
+            gen_seccomp_profile_to_json(sp),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     let mut cm = serde_json::Map::with_capacity(18);
     if let Some(v) = c.name.filter(|s| !s.is_empty()) {
@@ -1138,6 +1197,15 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         spec_map.insert(
             "ephemeralContainers".to_string(),
             serde_json::Value::Array(ecs),
+        );
+    }
+    // securityContext — pod-level RunAsUser/RunAsGroup/fsGroup/sysctls; dropping this is a
+    // P1 data-loss bug (containers run as whatever the image defaults to, sysctls never
+    // reach the kubelet or validate_pod_sysctls).
+    if let Some(sc) = spec.security_context {
+        spec_map.insert(
+            "securityContext".to_string(),
+            gen_pod_security_context_to_json(sc),
         );
     }
     serde_json::Value::Object(spec_map)
@@ -2766,6 +2834,71 @@ mod tests {
         assert_eq!(
             sc["capabilities"]["drop"][0], "ALL",
             "capabilities.drop must survive decode"
+        );
+    }
+
+    /// Pod-level securityContext, including sysctls, survives protobuf decode.
+    ///
+    /// P1 security bug: without this, pod.Spec.SecurityContext.RunAsUser/RunAsGroup are
+    /// dropped for every protobuf-created pod, and sysctls never reach the kubelet or
+    /// validate_pod_sysctls — making sysctl validation a no-op on the protobuf path even
+    /// after it's implemented, because the validator never sees the field it should reject.
+    #[test]
+    fn generated_pod_spec_preserves_security_context_and_sysctls() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("pod-sc-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                security_context: Some(core_v1::PodSecurityContext {
+                    run_as_user: Some(1001),
+                    run_as_group: Some(3000),
+                    fs_group: Some(4000),
+                    sysctls: vec![core_v1::Sysctl {
+                        name: Some("kernel.shm_rmid_forced".to_string()),
+                        value: Some("1".to_string()),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with pod-level securityContext must decode");
+        let sc = &result["spec"]["securityContext"];
+
+        assert_eq!(
+            sc["runAsUser"], 1001,
+            "pod.Spec.SecurityContext.RunAsUser must survive decode"
+        );
+        assert_eq!(
+            sc["runAsGroup"], 3000,
+            "pod.Spec.SecurityContext.RunAsGroup must survive decode"
+        );
+        assert_eq!(
+            sc["fsGroup"], 4000,
+            "pod.Spec.SecurityContext.FSGroup must survive decode"
+        );
+        assert_eq!(
+            sc["sysctls"][0]["name"], "kernel.shm_rmid_forced",
+            "sysctls must survive decode — without it, 'should support sysctls' fails because \
+             the kubelet never receives the sysctl, and 'should reject invalid sysctls' is a \
+             no-op because validate_pod_sysctls never sees the field to reject"
+        );
+        assert_eq!(
+            sc["sysctls"][0]["value"], "1",
+            "sysctl value must survive decode"
         );
     }
 }
