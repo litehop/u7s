@@ -451,9 +451,66 @@ fn validate_cr_schema(
     let idx = compiler
         .compile("schema.json", &mut schemas)
         .map_err(|e| Status::internal(e.to_string()))?;
-    schemas
-        .validate(obj, idx)
-        .map_err(|e| Status::unprocessable_entity(format!("CR schema validation failed: {e}")))
+    schemas.validate(obj, idx).map_err(|e| {
+        Status::unprocessable_entity(format!(
+            "CR schema validation failed: {}",
+            enum_violation_message(&e, obj).unwrap_or_else(|| e.to_string())
+        ))
+    })
+}
+
+/// Depth-first search for an `enum` keyword violation in a boon validation-error tree,
+/// rendered in the k8s `field.Error` "Unsupported value" phrasing
+/// (`Unsupported value: "<bad>": supported values: "<a>", "<b>"`) instead of boon's own
+/// wording (`value must be one of 'a', 'b'`). kubectl and the upstream CRD-with-validation
+/// conformance test match on this exact phrasing, so a differently-worded rejection is
+/// treated as "did not reject" even though the CR was in fact rejected.
+///
+/// boon's `ErrorKind::Enum` carries only the allowed set, not the offending value, so the
+/// value is recovered by walking `instance_location` back into the original `obj`.
+fn enum_violation_message(e: &boon::ValidationError, obj: &serde_json::Value) -> Option<String> {
+    if let boon::ErrorKind::Enum { want } = &e.kind {
+        let got = resolve_instance_location(obj, &e.instance_location)
+            .map(json_value_as_display_string)
+            .unwrap_or_else(|| "<value>".to_string());
+        let supported = want
+            .iter()
+            .map(|v| format!("\"{}\"", json_value_as_display_string(v)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "Unsupported value: \"{got}\": supported values: {supported}"
+        ));
+    }
+    e.causes
+        .iter()
+        .find_map(|cause| enum_violation_message(cause, obj))
+}
+
+/// Follows a boon `InstanceLocation`'s JSON-pointer tokens into `obj` to recover the value
+/// that failed validation at that location.
+fn resolve_instance_location<'a>(
+    obj: &'a serde_json::Value,
+    loc: &boon::InstanceLocation,
+) -> Option<&'a serde_json::Value> {
+    let mut cur = obj;
+    for tok in &loc.tokens {
+        cur = match tok {
+            boon::InstanceToken::Prop(p) => cur.get(p.as_ref())?,
+            boon::InstanceToken::Item(i) => cur.get(i)?,
+        };
+    }
+    Some(cur)
+}
+
+/// Renders a JSON value the way k8s's `field.Error` does for its `%q`/`%v` BadValue
+/// formatting: strings unquoted here (the caller adds the surrounding quotes), everything
+/// else via its normal JSON representation.
+fn json_value_as_display_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4161,6 +4218,32 @@ mod tests {
         assert!(
             check_schema(&value, schema).is_err(),
             "enum violation must be rejected by boon"
+        );
+    }
+
+    // enum violation must render in the k8s field.Error "Unsupported value" phrasing, not
+    // boon's own wording. kubectl and the upstream CRD-with-validation-schema conformance
+    // test match the rejection error string against `Unsupported value: "<bad>"` — a
+    // differently-worded (even if equally-rejecting) message makes those checks treat the
+    // CR as accepted.
+    #[test]
+    fn schema_enum_violation_uses_upstream_unsupported_value_phrasing() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "feeling": { "type": "string", "enum": ["Great", "Down"] }
+            }
+        });
+        let value = serde_json::json!({ "feeling": "NonExistentValue" });
+        let err = check_schema(&value, schema).unwrap_err();
+        let msg = &err.1.message;
+        assert!(
+            msg.contains(r#"Unsupported value: "NonExistentValue""#),
+            "message must use upstream's field.Error phrasing so kubectl/conformance error-string matches succeed (got: {msg})"
+        );
+        assert!(
+            msg.contains(r#""Great""#) && msg.contains(r#""Down""#),
+            "message must list the supported values so clients can see what was expected (got: {msg})"
         );
     }
 
