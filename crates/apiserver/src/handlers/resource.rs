@@ -489,6 +489,29 @@ pub async fn replace_resource<S: Store>(
     }
 
     let key = group_object_key(&group, &plural, None, &name);
+
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
+    // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
+    // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
+    // update, or the object stays stuck Terminating forever.
+    if finalizer_drain_complete(&obj.body) {
+        complete_finalizer_drain(
+            &state,
+            FinalizerDrainCtx {
+                key: &key,
+                meta: &meta,
+                group: &group,
+                version: &version,
+                plural: &plural,
+                ns: None,
+                name: &name,
+            },
+        )
+        .await?;
+        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+        return Ok(Json(obj.body).into_response());
+    }
+
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
@@ -632,6 +655,79 @@ pub async fn delete_resource<S: Store>(
         "code": 200
     }))
     .into_response())
+}
+
+/// True when an update (PATCH or PUT) has itself completed the finalizer drain:
+/// `deletionTimestamp` is set and `finalizers` is now empty. Real KCM protection controllers
+/// (pvc-protection, vac-protection, ...) remove their finalizer via a PUT, not a PATCH; the
+/// handler that applies that update must notice this and hard-delete instead of storing the
+/// update, or the object stays stuck Terminating forever.
+fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
+    let meta: ObjectMeta = serde_json::from_value(body["metadata"].clone()).unwrap_or_default();
+    let deletion_ts_set = meta.deletion_timestamp.is_some();
+    let finalizers_empty = meta
+        .finalizers
+        .as_deref()
+        .map(|f| f.is_empty())
+        .unwrap_or(true);
+    deletion_ts_set && finalizers_empty
+}
+
+/// Arguments for `complete_finalizer_drain`.
+///
+/// Groups the arguments that previously caused a `clippy::too_many_arguments` warning,
+/// matching the `PatchConfig` convention already used for `do_patch` below.
+struct FinalizerDrainCtx<'a> {
+    key: &'a str,
+    meta: &'a crate::types::ResourceMeta,
+    group: &'a str,
+    version: &'a str,
+    plural: &'a str,
+    /// `None` for cluster-scoped resources, `Some(namespace)` for namespaced ones.
+    ns: Option<&'a str>,
+    name: &'a str,
+}
+
+/// Hard-delete an object whose finalizer drain just completed, replicating the same side
+/// effects as `delete_resource`'s hard-delete branch: RBAC-index eviction, admission-config
+/// refresh, and checking whether the object's namespace can now complete its own Terminating
+/// deletion. The store delete itself is what emits the watch DELETE/tombstone event, so callers
+/// don't need to do anything further for watchers to observe the deletion.
+async fn complete_finalizer_drain<S: Store>(
+    state: &AppState<S>,
+    ctx: FinalizerDrainCtx<'_>,
+) -> Result<(), crate::status::StatusError> {
+    let FinalizerDrainCtx {
+        key,
+        meta,
+        group,
+        version,
+        plural,
+        ns,
+        name,
+    } = ctx;
+    state
+        .store
+        .delete(key, None)
+        .await
+        .map_err(|e| store_err(e, name, &meta.kind))?;
+    if group == RBAC_GROUP {
+        let rbac_key = match ns {
+            None => rbac_cluster_key(group, version, plural, name),
+            Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+        };
+        state.rbac_index.remove_object(&rbac_key);
+    }
+    if group == ADMISSION_GROUP {
+        state.refresh_admission_config(plural).await;
+    }
+    // If this object lived in a namespace, check whether its namespace is now ready to
+    // complete deletion. This handles the OrderedNamespaceDeletion flow: after all
+    // finalizer'd objects are cleared, the Terminating namespace hard-deletes.
+    if let Some(namespace) = ns {
+        super::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
+    }
+    Ok(())
 }
 
 /// Parameters for `do_patch`.
@@ -845,37 +941,20 @@ pub(crate) async fn do_patch<S: Store>(
     }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    let current_meta: ObjectMeta =
-        serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
-    let deletion_ts_set = current_meta.deletion_timestamp.is_some();
-    let finalizers_empty = current_meta
-        .finalizers
-        .as_deref()
-        .map(|f| f.is_empty())
-        .unwrap_or(true);
-
-    if deletion_ts_set && finalizers_empty {
-        state
-            .store
-            .delete(key, None)
-            .await
-            .map_err(|e| store_err(e, name, &meta.kind))?;
-        if group == RBAC_GROUP {
-            let rbac_key = match ns {
-                None => rbac_cluster_key(group, version, plural, name),
-                Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
-            };
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        if group == ADMISSION_GROUP {
-            state.refresh_admission_config(plural).await;
-        }
-        // If this object lived in a namespace, check whether its namespace is now ready
-        // to complete deletion. This handles the OrderedNamespaceDeletion flow: after all
-        // finalizer'd objects are cleared, the Terminating namespace hard-deletes.
-        if let Some(namespace) = ns {
-            super::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
-        }
+    if finalizer_drain_complete(&current.body) {
+        complete_finalizer_drain(
+            state,
+            FinalizerDrainCtx {
+                key,
+                meta,
+                group,
+                version,
+                plural,
+                ns,
+                name,
+            },
+        )
+        .await?;
         return Ok(Json(current.body).into_response());
     }
 
@@ -1681,6 +1760,28 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
+        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+        return Ok(Json(obj.body).into_response());
+    }
+
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
+    // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
+    // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
+    // update, or the object stays stuck Terminating forever.
+    if finalizer_drain_complete(&obj.body) {
+        complete_finalizer_drain(
+            &state,
+            FinalizerDrainCtx {
+                key: &key,
+                meta: &meta,
+                group: &group,
+                version: &version,
+                plural: &plural,
+                ns: Some(&ns),
+                name: &name,
+            },
+        )
+        .await?;
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         return Ok(Json(obj.body).into_response());
     }
@@ -6373,6 +6474,178 @@ mod tests {
         assert!(
             store.get(key).await.unwrap().is_none(),
             "object with deletionTimestamp and empty finalizers must be hard-deleted after patch"
+        );
+    }
+
+    /// replace_resource (PUT): the namespaced counterpart of do_patch's finalizer-drain
+    /// hard-delete above, but exercised via a full PUT instead of a PATCH.
+    ///
+    /// Real KCM protection controllers (pvc-protection, vac-protection, ...) remove their
+    /// own finalizer via a PUT of the whole object, not a merge-patch. Before this fix, only
+    /// do_patch checked for finalizer-drain completion; replace_resource did a literal
+    /// store.put, so the PUT re-persisted the object with deletionTimestamp still set and a
+    /// subsequent GET still found it — every finalizer-protected cluster-scoped object (and,
+    /// via the namespaced variant below, every PVC/VAC) stayed stuck Terminating forever.
+    #[tokio::test]
+    async fn replace_resource_hard_deletes_when_finalizers_drained_via_put() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed an object that is already soft-deleted (deletionTimestamp set) with one
+        // finalizer — mirrors a protection-finalizer'd object mid-delete.
+        let obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "put-gc-node",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["kubernetes.io/pvc-protection"]
+            },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/put-gc-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // PUT the object with finalizers now empty — exactly what a protection controller
+        // does when it removes its finalizer. No resourceVersion is supplied (unconditional
+        // PUT); optimistic-concurrency handling is not what's under test here.
+        let put_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "put-gc-node",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": []
+            },
+            "spec": { "drivers": [] }
+        });
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "put-gc-node".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PUT draining the last finalizer off a soft-deleted object must succeed"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "object with deletionTimestamp set and finalizers emptied via PUT must be \
+             hard-deleted immediately, exactly like the PATCH path — otherwise a protection \
+             controller can never complete a delete via PUT and the object stays stuck \
+             Terminating forever"
+        );
+    }
+
+    /// replace_namespaced_resource (PUT): same regression as
+    /// replace_resource_hard_deletes_when_finalizers_drained_via_put above, but for
+    /// namespaced resources — this is the exact mechanism that stuck PVC and VAC deletes
+    /// (kubernetes.io/pvc-protection and kubernetes.io/vac-protection are both removed via
+    /// PUT by KCM's protection controllers).
+    #[tokio::test]
+    async fn replace_namespaced_resource_hard_deletes_when_finalizers_drained_via_put() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let obj = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "put-gc-lease",
+                "namespace": "default",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["kubernetes.io/pvc-protection"]
+            },
+            "spec": { "holderIdentity": "test-holder" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/default/put-gc-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let put_body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "put-gc-lease",
+                "namespace": "default",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": []
+            },
+            "spec": { "holderIdentity": "test-holder" }
+        });
+
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "leases".into(),
+                "put-gc-lease".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "namespaced PUT draining the last finalizer off a soft-deleted object must succeed"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "namespaced object with deletionTimestamp set and finalizers emptied via PUT must \
+             be hard-deleted immediately — this is the exact PVC/VAC finalizer-drain path used \
+             by KCM's protection controllers; without it a PVC or VAC delete never completes \
+             and stays stuck Terminating forever"
         );
     }
 
