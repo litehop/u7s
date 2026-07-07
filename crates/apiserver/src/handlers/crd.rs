@@ -1667,6 +1667,73 @@ mod tests {
         );
     }
 
+    /// A MERGE patch to .../customresourcedefinitions/{name}/status setting
+    /// `metadata.labels` must not change the stored labels — same PSA-bypass class as
+    /// #733's JSON-Patch fix, but merge-patch reaches /status through
+    /// `merge_incoming_metadata` rather than `validate_status_json_patch_paths`, so
+    /// closing only the JSON-Patch vector left this one open. CRD labels can gate policy
+    /// elsewhere (e.g. namespace/webhook selectors), so a `customresourcedefinitions/status`
+    /// grant must not be able to rewrite them via a plain merge-patch.
+    #[tokio::test]
+    async fn patch_crd_status_merge_patch_rejects_metadata_labels() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!({
+            "metadata": { "labels": { "attacker": "true" } },
+            "status": { "conditions": [{ "type": "NamesAccepted", "status": "True" }] }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let resp = patch_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect(
+            "a merge-patch to /status must still succeed — the label change is \
+                     dropped, not rejected",
+        )
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["metadata"]["labels"]["attacker"].is_null(),
+            "a merge-patch on /status must NOT be able to set arbitrary labels — \
+             otherwise a status-only grant can rewrite labels used for policy elsewhere"
+        );
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "NamesAccepted",
+            "the legitimate status change in the same patch must still apply"
+        );
+
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        assert!(
+            v2["metadata"]["labels"]["attacker"].is_null(),
+            "the dropped label must not have been persisted to the store either"
+        );
+    }
+
     /// A JSON Patch to .../customresourcedefinitions/{name}/status targeting /spec must be
     /// REJECTED — /status is a separate RBAC subresource from the main CRD endpoint. A
     /// caller with only `customresourcedefinitions/status` rights must not be able to

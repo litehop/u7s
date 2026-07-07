@@ -3252,6 +3252,140 @@ mod tests {
         );
     }
 
+    /// A MERGE patch to .../namespaces/{ns}/status setting `metadata.labels` must not
+    /// change the stored labels — same PSA-bypass class as #733's JSON-Patch fix, but a
+    /// different content-type: merge-patch (and strategic-merge-patch) reach /status
+    /// through `merge_incoming_metadata`, not `validate_status_json_patch_paths`, so
+    /// closing only the JSON-Patch vector left this one open. A caller with only
+    /// `namespaces/status` rights could otherwise rewrite
+    /// `pod-security.kubernetes.io/enforce` via a plain merge-patch and bypass PSA.
+    #[tokio::test]
+    async fn patch_namespace_status_merge_patch_rejects_metadata_labels() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("psa-merge-bypass-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "metadata": {
+                    "labels": { "pod-security.kubernetes.io/enforce": "privileged" }
+                },
+                "status": { "phase": "Active" }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_namespace_status(
+            State(state.clone()),
+            Path("psa-merge-bypass-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a merge-patch to /status must still succeed — the label change is dropped, \
+             not rejected, mirroring how finalizers/deletionTimestamp are already restored"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "psa-merge-bypass-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            body["metadata"]["labels"]["pod-security.kubernetes.io/enforce"].is_null(),
+            "a merge-patch on /status must NOT be able to set the PSA enforce label — \
+             otherwise a status-only grant can silently weaken Pod Security Admission"
+        );
+        assert_eq!(
+            body["status"]["phase"], "Active",
+            "the legitimate status change in the same patch must still apply"
+        );
+    }
+
+    /// A merge-patch to .../namespaces/{ns}/status must ignore `/spec` even when the
+    /// patch body includes it — spec is never read by the merge/strategic-merge branch
+    /// of patch_namespace_status, but this locks that in as an explicit regression test
+    /// rather than relying on it being an accidental side effect of what the handler reads.
+    #[tokio::test]
+    async fn patch_namespace_status_merge_patch_ignores_spec() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("spec-merge-bypass-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "spec": { "finalizers": ["attacker.io/blocker"] },
+                "status": { "phase": "Active" }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_namespace_status(
+            State(state.clone()),
+            Path("spec-merge-bypass-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(result.is_ok(), "a merge-patch to /status must succeed");
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "spec-merge-bypass-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            body["spec"]["finalizers"]
+                .as_array()
+                .map(|a| !a.iter().any(|v| v == "attacker.io/blocker"))
+                .unwrap_or(true),
+            "spec must not be modified by a merge-patch to /status — \
+             a status-only grant must not be able to add a spec.finalizer"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Regression: PUT /status with Content-Type: application/vnd.kubernetes.protobuf
     // must persist status.conditions (mayor-ftkl PANIC-1)
