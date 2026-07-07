@@ -457,6 +457,53 @@ fn validate_cr_schema(
 }
 
 // ---------------------------------------------------------------------------
+// CRD structural-schema defaulting (openAPIV3Schema `default:` values)
+// ---------------------------------------------------------------------------
+
+/// Apply `default:` values declared in `schema` to `obj`, in place.
+///
+/// Matches upstream structural-schema defaulting
+/// (apiextensions-apiserver/pkg/apiserver/schema/defaulting): a key is only filled in when
+/// it is entirely absent from its parent object — an explicit `null` or any client-supplied
+/// value is left untouched. Recursion follows the schema shape rather than a flat path:
+///   - `type: object` (has `properties`): for each declared property missing from the
+///     object, insert its `default`; for each property present, recurse into it.
+///   - `type: array` (has `items`): recurse into every element already present in the
+///     array, using the `items` schema. A default nested under an array item (e.g.
+///     `list.items.properties.color.default`) must be applied per-element — the array
+///     index is a position in an existing slice, never a key to create.
+///
+/// Called on every write (defaults are baked into what gets stored, matching upstream) and
+/// on every read (a default added to the schema after an object was created must still show
+/// up on GET/LIST against the *current* schema, since it was never persisted for that object).
+pub(crate) fn apply_crd_schema_defaults(schema: &serde_json::Value, obj: &mut serde_json::Value) {
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        let Some(map) = obj.as_object_mut() else {
+            return;
+        };
+        for (key, sub_schema) in props {
+            match map.get_mut(key) {
+                Some(existing) => apply_crd_schema_defaults(sub_schema, existing),
+                None => {
+                    if let Some(default) = sub_schema.get("default") {
+                        map.insert(key.clone(), default.clone());
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if let Some(items_schema) = schema.get("items") {
+        let Some(arr) = obj.as_array_mut() else {
+            return;
+        };
+        for item in arr.iter_mut() {
+            apply_crd_schema_defaults(items_schema, item);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CR field validation (?fieldValidation=Strict/Warn/Ignore)
 //
 // Built-in resources get this from `json_patch::apply_field_validation`, which checks
@@ -869,6 +916,12 @@ pub async fn list_cr<S: Store>(
         }
     }
 
+    if let Some(schema) = ctx.schema.as_ref() {
+        for item in items.iter_mut() {
+            apply_crd_schema_defaults(schema, item);
+        }
+    }
+
     if pom {
         let pom_items: Vec<serde_json::Value> =
             items.iter().map(to_partial_object_metadata).collect();
@@ -939,6 +992,9 @@ pub async fn get_cr<S: Store>(
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
             converted_obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
             converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+            if let Some(schema) = ctx.schema.as_ref() {
+                apply_crd_schema_defaults(schema, &mut converted_obj);
+            }
             let bytes =
                 serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
             return Ok((
@@ -954,6 +1010,9 @@ pub async fn get_cr<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
+    }
     Ok(Json(obj).into_response())
 }
 
@@ -991,6 +1050,10 @@ pub async fn create_cr<S: Store>(
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
     )?;
+
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
+    }
 
     validate_cr_schema(&obj, &ctx)?;
 
@@ -1083,6 +1146,10 @@ pub async fn replace_cr<S: Store>(
         if let Some(map) = obj.as_object_mut() {
             map.remove("status");
         }
+    }
+
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
     }
 
     validate_cr_schema(&obj, &ctx)?;
@@ -1450,6 +1517,12 @@ pub async fn list_cr_namespaced<S: Store>(
         }
     }
 
+    if let Some(schema) = ctx.schema.as_ref() {
+        for item in items.iter_mut() {
+            apply_crd_schema_defaults(schema, item);
+        }
+    }
+
     if pom {
         let pom_items: Vec<serde_json::Value> =
             items.iter().map(to_partial_object_metadata).collect();
@@ -1518,6 +1591,9 @@ pub async fn get_cr_namespaced<S: Store>(
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
             converted_obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
             converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+            if let Some(schema) = ctx.schema.as_ref() {
+                apply_crd_schema_defaults(schema, &mut converted_obj);
+            }
             let bytes =
                 serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
             return Ok((
@@ -1533,6 +1609,9 @@ pub async fn get_cr_namespaced<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
+    }
     Ok(Json(obj).into_response())
 }
 
@@ -1584,6 +1663,10 @@ pub async fn create_cr_namespaced<S: Store>(
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
     )?;
+
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
+    }
 
     validate_cr_schema(&obj, &ctx)?;
 
@@ -1680,6 +1763,10 @@ pub async fn replace_cr_namespaced<S: Store>(
         if let Some(map) = obj.as_object_mut() {
             map.remove("status");
         }
+    }
+
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
     }
 
     validate_cr_schema(&obj, &ctx)?;
@@ -1850,6 +1937,9 @@ pub async fn patch_cr<S: Store>(
         let warn_header =
             apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
+        if let Some(schema) = ctx.schema.as_ref() {
+            apply_crd_schema_defaults(schema, &mut obj);
+        }
         validate_cr_schema(&obj, &ctx)?;
         let admission_ctx = AdmissionContext {
             group: &group,
@@ -1919,6 +2009,10 @@ pub async fn patch_cr<S: Store>(
 
     let warn_header =
         apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
+    }
 
     validate_cr_schema(&obj, &ctx)?;
 
@@ -1998,6 +2092,9 @@ pub async fn patch_cr_namespaced<S: Store>(
             meta.namespace = Some(ns.clone());
             obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
         }
+        if let Some(schema) = ctx.schema.as_ref() {
+            apply_crd_schema_defaults(schema, &mut obj);
+        }
         validate_cr_schema(&obj, &ctx)?;
         let admission_ctx = AdmissionContext {
             group: &group,
@@ -2067,6 +2164,10 @@ pub async fn patch_cr_namespaced<S: Store>(
 
     let warn_header =
         apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+
+    if let Some(schema) = ctx.schema.as_ref() {
+        apply_crd_schema_defaults(schema, &mut obj);
+    }
 
     validate_cr_schema(&obj, &ctx)?;
 
@@ -9337,6 +9438,310 @@ mod tests {
             result.is_ok(),
             "an unknown field under an x-kubernetes-preserve-unknown-fields subtree must \
              not be rejected by fieldValidation=Strict"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CRD structural-schema defaulting (apply_crd_schema_defaults)
+    //
+    // Conformance test "custom resource defaulting for requests and from storage works"
+    // (test/e2e/apimachinery/custom_resource_definition.go) sets a `default:` on a CRD's
+    // openAPIV3Schema property and expects every CR of that kind to have it filled in —
+    // both in the CREATE response and on every subsequent GET, including for objects
+    // created before the default existed. The walker must apply defaults at any schema
+    // depth, including array items: a naive path-based implementation that treats an
+    // array index like an object key (e.g. building the JSON pointer "/list/0/field" and
+    // creating an intermediate object at "0") breaks with "cannot create intermediate
+    // key '0' in non-object" the moment a default is nested under an array item.
+    // ---------------------------------------------------------------------------
+
+    /// A top-level property's `default` must be filled in when the CR omits the field.
+    /// This is the exact scenario the conformance test exercises for field "a".
+    #[test]
+    fn schema_default_applied_to_missing_object_level_property() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string", "default": "A" }
+            }
+        });
+        let mut obj = serde_json::json!({ "metadata": { "name": "cr-1" } });
+
+        apply_crd_schema_defaults(&schema, &mut obj);
+
+        assert_eq!(
+            obj["a"], "A",
+            "a property's default must be applied when the CR body omits it — without this \
+             a CR created before the schema default existed never picks it up on read"
+        );
+    }
+
+    /// A client-supplied value must never be overwritten by the schema default.
+    #[test]
+    fn schema_default_does_not_overwrite_existing_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string", "default": "A" }
+            }
+        });
+        let mut obj = serde_json::json!({ "a": "client-value" });
+
+        apply_crd_schema_defaults(&schema, &mut obj);
+
+        assert_eq!(
+            obj["a"], "client-value",
+            "an explicit client value must never be clobbered by the schema default"
+        );
+    }
+
+    /// A default nested two levels deep under object properties must be applied.
+    #[test]
+    fn schema_default_applied_to_nested_object_property() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "replicas": { "type": "integer", "default": 1 }
+                    }
+                }
+            }
+        });
+        let mut obj = serde_json::json!({ "spec": {} });
+
+        apply_crd_schema_defaults(&schema, &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"], 1,
+            "defaults nested under an existing object property must be applied recursively"
+        );
+    }
+
+    /// REGRESSION: a default nested under an array item must be applied to every element
+    /// already present in the array, not treated as a single object path containing a
+    /// literal "0" key. Before this fix there was no array-aware recursion at all, so a
+    /// schema shaped like this would either silently skip the default or (in a path-based
+    /// implementation) panic/error trying to create an object key named "0".
+    #[test]
+    fn schema_default_applied_under_array_item() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "color": { "type": "string", "default": "blue" }
+                        }
+                    }
+                }
+            }
+        });
+        let mut obj = serde_json::json!({
+            "items": [
+                { "name": "first" },
+                { "name": "second", "color": "red" }
+            ]
+        });
+
+        apply_crd_schema_defaults(&schema, &mut obj);
+
+        assert_eq!(
+            obj["items"][0]["color"], "blue",
+            "an array element missing the field must get the item schema's default — this is \
+             the array-index defaulting path that previously errored with \
+             'cannot create intermediate key \"0\" in non-object'"
+        );
+        assert_eq!(
+            obj["items"][1]["color"], "red",
+            "an array element that already has the field must keep its own value, not the default"
+        );
+    }
+
+    /// An empty array with a default nested under `items` must be a no-op — there is
+    /// nothing to default into, and this must not panic or fabricate an element.
+    #[test]
+    fn schema_default_under_array_item_noop_on_empty_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "color": { "type": "string", "default": "blue" } }
+                    }
+                }
+            }
+        });
+        let mut obj = serde_json::json!({ "items": [] });
+
+        apply_crd_schema_defaults(&schema, &mut obj);
+
+        assert_eq!(
+            obj["items"],
+            serde_json::json!([]),
+            "an empty array must stay empty — defaulting must never insert a synthetic element"
+        );
+    }
+
+    /// End-to-end: create_cr must apply the schema default to the CREATE response, and the
+    /// defaulted value must be persisted (still present after the schema default is later
+    /// removed) — matching the second phase of the conformance test where CR "cr-2" keeps
+    /// its baked-in "a":"A" even after the CRD schema default for "a" is deleted.
+    #[tokio::test]
+    async fn create_cr_bakes_in_schema_default_at_write_time() {
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "default": "A" }
+                }
+            }),
+        )
+        .await;
+
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "cr-2" }
+            })
+            .to_string(),
+        );
+
+        let resp = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await
+        .expect("create with schema default must succeed")
+        .into_response();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["a"], "A",
+            "the CREATE response must already reflect the schema default — the conformance \
+             test reads this directly off the Create() call, not a subsequent Get()"
+        );
+    }
+
+    /// End-to-end: GET must apply the *current* schema's defaults even to a CR that was
+    /// created before the default existed — the default is never persisted for that
+    /// object, so it must be computed fresh on every read. This is the "cr-1" phase of the
+    /// conformance test: the CRD schema gains a default only after the CR is created, and
+    /// the test polls GET until the field appears.
+    #[tokio::test]
+    async fn get_cr_applies_default_added_to_schema_after_creation() {
+        let state = make_state();
+        // Install with no default yet, matching the conformance test's initial CRD.
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string" }
+                }
+            }),
+        )
+        .await;
+
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "cr-1" }
+            })
+            .to_string(),
+        );
+        create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await
+        .expect("create without default must succeed");
+
+        // Patch the CRD (as the conformance test does via JSONPatch) to add a default for
+        // "a" after the CR already exists — mirrors the real PATCH .../customresourcedefinitions.
+        {
+            use crate::handlers::crd;
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/merge-patch+json".parse().unwrap(),
+            );
+            let patch = serde_json::json!({
+                "spec": {
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "a": { "type": "string", "default": "A" }
+                                }
+                            }
+                        }
+                    }]
+                }
+            });
+            crd::patch_crd(
+                State(state.clone()),
+                Path("widgets.example.io".to_string()),
+                test_user(),
+                headers,
+                Bytes::from(patch.to_string()),
+            )
+            .await
+            .expect("patching the CRD schema to add a default must succeed");
+        }
+
+        let resp = get_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "cr-1".to_string(),
+            )),
+        )
+        .await
+        .expect("get must succeed")
+        .into_response();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["a"], "A",
+            "GET must apply the current schema's default even though the CR predates it — \
+             without read-time defaulting, informers waiting on this field would hang forever"
         );
     }
 }
