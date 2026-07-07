@@ -113,7 +113,11 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
 ///
 /// Supported fields (all equality, no negation):
 ///   involvedObject.name, involvedObject.kind, involvedObject.namespace,
-///   involvedObject.uid, reason
+///   involvedObject.uid, reason, source, reportingController
+///
+/// `source` reads core/v1 Event's `source.component` and `reportingController`
+/// reads events.k8s.io/v1 Event's top-level `reportingController` — the two
+/// dual-grouped Event kinds use different field names for "who reported this".
 ///
 /// All supplied terms are AND-evaluated: an event must match every term.
 /// An unknown field is ignored (pass-through). An event missing a constrained
@@ -146,6 +150,8 @@ fn event_matches_field_selector(ev: &serde_json::Value, selector: &str) -> bool 
                 }
                 "involvedObject.uid" => ev["involvedObject"]["uid"].as_str().unwrap_or(""),
                 "reason" => ev["reason"].as_str().unwrap_or(""),
+                "source" => ev["source"]["component"].as_str().unwrap_or(""),
+                "reportingController" => ev["reportingController"].as_str().unwrap_or(""),
                 _ => continue,
             };
             if actual != expected {
@@ -1479,6 +1485,55 @@ mod event_field_selector_tests {
              without this, kubectl get events --field-selector reason=X returns unrelated events"
         );
         assert_eq!(result[0]["reason"], "Pulled");
+    }
+
+    /// source= field selector filters by core/v1 Event's source.component.
+    ///
+    /// Without this, `kubectl get events --field-selector source=kubelet` (used to isolate
+    /// events emitted by a specific controller) silently returns every event instead of
+    /// just the kubelet's, because the field was previously unrecognized and ignored.
+    #[test]
+    fn source_field_selector_filters_by_source_component() {
+        let mut ev1 = event("pod-a", "Pod", "default", "uid-1", "Pulled");
+        ev1["source"] = serde_json::json!({"component": "kubelet"});
+        let mut ev2 = event("pod-b", "Pod", "default", "uid-2", "Scheduled");
+        ev2["source"] = serde_json::json!({"component": "default-scheduler"});
+        let events = vec![ev1, ev2];
+
+        let result = filter_events_by_field_selector(events, "source=kubelet");
+        assert_eq!(
+            result.len(),
+            1,
+            "source= selector must filter by source.component; without this, \
+             kubectl get events --field-selector source=X returns all events"
+        );
+        assert_eq!(result[0]["source"]["component"], "kubelet");
+    }
+
+    /// reportingController= field selector filters by events.k8s.io/v1 Event's top-level
+    /// reportingController field.
+    ///
+    /// events.k8s.io/v1 Event has no `source` object — reporting identity moved to
+    /// `reportingController`. Without this selector, clients using the newer events/v1
+    /// event recorder (client-go's EventBroadcaster) cannot filter events by reporter,
+    /// silently getting every event back.
+    #[test]
+    fn reporting_controller_field_selector_filters_events_k8s_io_events() {
+        let mut ev1 = event("pod-a", "Pod", "default", "uid-1", "Pulled");
+        ev1["reportingController"] = serde_json::json!("kubelet");
+        let mut ev2 = event("pod-b", "Pod", "default", "uid-2", "Scheduled");
+        ev2["reportingController"] = serde_json::json!("default-scheduler");
+        let events = vec![ev1, ev2];
+
+        let result = filter_events_by_field_selector(events, "reportingController=kubelet");
+        assert_eq!(
+            result.len(),
+            1,
+            "reportingController= selector must filter events.k8s.io/v1 events by reporter; \
+             without this, kubectl get events.events.k8s.io --field-selector \
+             reportingController=X returns all events"
+        );
+        assert_eq!(result[0]["reportingController"], "kubelet");
     }
 }
 

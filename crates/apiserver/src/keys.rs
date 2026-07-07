@@ -20,12 +20,20 @@ pub fn cluster_list_prefix(resource: &str) -> String {
     format!("/registry/{}/", resource)
 }
 
+/// Kubernetes dual-groups the Event kind: core/v1 Event and events.k8s.io/v1 Event
+/// are the same underlying object, both backed by one etcd keyspace
+/// (/registry/events/<namespace>/<name>). Treat events.k8s.io as the core group
+/// for key derivation so an Event created via one group is visible via the other.
+fn is_dual_grouped_events(group: &str, plural: &str) -> bool {
+    group == "events.k8s.io" && plural == "events"
+}
+
 /// Derives the store key for a resource in a non-core group.
 /// For core group (group == ""), falls back to existing key layout.
 /// Namespaced: /registry/<group>/<plural>/<namespace>/<name>
 /// Cluster:    /registry/<group>/<plural>/<name>
 pub fn group_object_key(group: &str, plural: &str, namespace: Option<&str>, name: &str) -> String {
-    if group.is_empty() {
+    if group.is_empty() || is_dual_grouped_events(group, plural) {
         match namespace {
             Some(ns) => object_key(plural, ns, name),
             None => cluster_object_key(plural, name),
@@ -40,7 +48,7 @@ pub fn group_object_key(group: &str, plural: &str, namespace: Option<&str>, name
 
 /// Derives the list prefix for a resource in a non-core group.
 pub fn group_list_prefix(group: &str, plural: &str, namespace: Option<&str>) -> String {
-    if group.is_empty() {
+    if group.is_empty() || is_dual_grouped_events(group, plural) {
         match namespace {
             Some(ns) => list_prefix(plural, ns),
             None => cluster_list_prefix(plural),
@@ -153,6 +161,32 @@ mod tests {
         assert_eq!(
             group_list_prefix("rbac.authorization.k8s.io", "clusterroles", None),
             "/registry/rbac.authorization.k8s.io/clusterroles/"
+        );
+    }
+
+    // events.k8s.io/v1 Event and core/v1 Event are the same underlying object in
+    // Kubernetes, dual-grouped for client compatibility. If group_object_key kept
+    // them in separate keyspaces, an Event created via events.k8s.io/v1 (used by
+    // client-go's newer event recorder) would be invisible to core/v1 GET/LIST
+    // callers (e.g. `kubectl get events`), and vice versa.
+    #[test]
+    fn group_object_key_events_k8s_io_matches_core_event_key() {
+        assert_eq!(
+            group_object_key("events.k8s.io", "events", Some("default"), "my-event"),
+            group_object_key("", "events", Some("default"), "my-event"),
+            "events.k8s.io/v1 Event must resolve to the same storage key as core/v1 Event"
+        );
+    }
+
+    // Same rationale as above, but for LIST/WATCH prefix scans: if the prefixes
+    // diverged, a `kubectl get events` (core/v1) would miss events written via
+    // the events.k8s.io/v1 API, silently dropping event history from `describe`.
+    #[test]
+    fn group_list_prefix_events_k8s_io_matches_core_event_prefix() {
+        assert_eq!(
+            group_list_prefix("events.k8s.io", "events", Some("default")),
+            group_list_prefix("", "events", Some("default")),
+            "events.k8s.io/v1 Event list prefix must match core/v1 Event list prefix"
         );
     }
 }
