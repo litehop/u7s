@@ -8,6 +8,7 @@
 /// - Reject on failurePolicy: Fail if webhook is unreachable or returns denied
 /// - Re-run mutating webhooks marked reinvocationPolicy: IfNeeded if any patch was applied
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store};
@@ -643,19 +644,22 @@ pub struct AdmissionContext<'a> {
 // Store helpers: fetch webhook configurations
 // ---------------------------------------------------------------------------
 
-async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
+async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_json::Value>> {
     // Hot path: read from the in-memory cache when warm (None = cold, falls back to store).
     // Cache is warmed at startup by init_admission_cache() and kept current by
     // refresh_admission_config() called write-through in handlers/resource.rs.
+    // Arc::clone is O(1) (bumps a refcount) — do NOT deep-clone the Vec here. This runs
+    // on every write; a per-call deep clone of all webhook configs (incl. CA bundles)
+    // would scale allocation with (#configs x write-rate).
     {
         let guard = state.admission_cache.mutating_webhooks.read().unwrap();
         if let Some(cached) = guard.as_ref() {
-            return cached.as_ref().clone();
+            return Arc::clone(cached);
         }
     }
     // Cache cold (first use or test without init): fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/";
-    match state.store.list(prefix, ListOptions::default()).await {
+    let configs = match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
             .items
             .into_iter()
@@ -665,20 +669,22 @@ async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Vec<serde_json
             tracing::warn!("admission: failed to list MutatingWebhookConfigurations: {e}");
             vec![]
         }
-    }
+    };
+    Arc::new(configs)
 }
 
-async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
-    // Hot path: read from the in-memory cache when warm.
+async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_json::Value>> {
+    // Hot path: read from the in-memory cache when warm. See fetch_mutating_configs for why
+    // this must be an Arc::clone, not a deep clone of the Vec.
     {
         let guard = state.admission_cache.validating_webhooks.read().unwrap();
         if let Some(cached) = guard.as_ref() {
-            return cached.as_ref().clone();
+            return Arc::clone(cached);
         }
     }
     // Cache cold: fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/";
-    match state.store.list(prefix, ListOptions::default()).await {
+    let configs = match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
             .items
             .into_iter()
@@ -688,7 +694,8 @@ async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Vec<serde_js
             tracing::warn!("admission: failed to list ValidatingWebhookConfigurations: {e}");
             vec![]
         }
-    }
+    };
+    Arc::new(configs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,17 +1099,18 @@ async fn invoke_mutating_webhook<S: Store>(
 // ---------------------------------------------------------------------------
 
 /// Fetch all MutatingAdmissionPolicy objects from the in-memory cache (or store if cold).
-async fn fetch_mutating_policies<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
-    // Hot path: read from the in-memory cache when warm.
+async fn fetch_mutating_policies<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_json::Value>> {
+    // Hot path: read from the in-memory cache when warm. See fetch_mutating_configs for why
+    // this must be an Arc::clone, not a deep clone of the Vec.
     {
         let guard = state.admission_cache.mutating_policies.read().unwrap();
         if let Some(cached) = guard.as_ref() {
-            return cached.as_ref().clone();
+            return Arc::clone(cached);
         }
     }
     // Cache cold: fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/mutatingadmissionpolicies/";
-    match state.store.list(prefix, ListOptions::default()).await {
+    let policies = match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
             .items
             .into_iter()
@@ -1112,7 +1120,8 @@ async fn fetch_mutating_policies<S: Store>(state: &AppState<S>) -> Vec<serde_jso
             tracing::warn!("admission: failed to list MutatingAdmissionPolicies: {e}");
             vec![]
         }
-    }
+    };
+    Arc::new(policies)
 }
 
 /// Returns true if the given resource matches the policy's matchConstraints.
@@ -2328,7 +2337,7 @@ pub async fn run_cel_mutating_policies<S: Store>(
         return object;
     }
 
-    for policy in &policies {
+    for policy in policies.iter() {
         // Check matchConstraints.
         if !matches_match_constraints(policy, ctx.group, ctx.version, ctx.resource, ctx.operation) {
             continue;
@@ -2434,7 +2443,7 @@ pub async fn run_mutating_webhooks<S: Store>(
 
     // Collect all webhook entries from all configurations.
     let mut all_webhooks: Vec<WebhookEntry> = Vec::new();
-    for config in &configs {
+    for config in configs.iter() {
         if let Ok(wc) = serde_json::from_value::<WebhookConfig>(config.clone()) {
             all_webhooks.extend(wc.webhooks);
         }
@@ -2472,17 +2481,18 @@ pub async fn run_mutating_webhooks<S: Store>(
 // ---------------------------------------------------------------------------
 
 /// Fetch all ValidatingAdmissionPolicy objects from the in-memory cache (or store if cold).
-async fn fetch_validating_policies<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
-    // Hot path: read from the in-memory cache when warm.
+async fn fetch_validating_policies<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_json::Value>> {
+    // Hot path: read from the in-memory cache when warm. See fetch_mutating_configs for why
+    // this must be an Arc::clone, not a deep clone of the Vec.
     {
         let guard = state.admission_cache.validating_policies.read().unwrap();
         if let Some(cached) = guard.as_ref() {
-            return cached.as_ref().clone();
+            return Arc::clone(cached);
         }
     }
     // Cache cold: fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/";
-    match state.store.list(prefix, ListOptions::default()).await {
+    let policies = match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
             .items
             .into_iter()
@@ -2492,12 +2502,16 @@ async fn fetch_validating_policies<S: Store>(state: &AppState<S>) -> Vec<serde_j
             tracing::warn!("admission: failed to list ValidatingAdmissionPolicies: {e}");
             vec![]
         }
-    }
+    };
+    Arc::new(policies)
 }
 
 /// Fetch all ValidatingAdmissionPolicyBinding objects from the in-memory cache (or store if cold).
-async fn fetch_validating_policy_bindings<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
-    // Hot path: read from the in-memory cache when warm.
+async fn fetch_validating_policy_bindings<S: Store>(
+    state: &AppState<S>,
+) -> Arc<Vec<serde_json::Value>> {
+    // Hot path: read from the in-memory cache when warm. See fetch_mutating_configs for why
+    // this must be an Arc::clone, not a deep clone of the Vec.
     {
         let guard = state
             .admission_cache
@@ -2505,12 +2519,12 @@ async fn fetch_validating_policy_bindings<S: Store>(state: &AppState<S>) -> Vec<
             .read()
             .unwrap();
         if let Some(cached) = guard.as_ref() {
-            return cached.as_ref().clone();
+            return Arc::clone(cached);
         }
     }
     // Cache cold: fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/";
-    match state.store.list(prefix, ListOptions::default()).await {
+    let bindings = match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
             .items
             .into_iter()
@@ -2520,7 +2534,8 @@ async fn fetch_validating_policy_bindings<S: Store>(state: &AppState<S>) -> Vec<
             tracing::warn!("admission: failed to list ValidatingAdmissionPolicyBindings: {e}");
             vec![]
         }
-    }
+    };
+    Arc::new(bindings)
 }
 
 /// Run all ValidatingAdmissionPolicy + Binding pairs for a given resource.
@@ -2561,7 +2576,7 @@ async fn run_validating_admission_policies<S: Store>(
         None => serde_json::Value::Null,
     };
 
-    for binding in &bindings {
+    for binding in bindings.iter() {
         let policy_name = binding["spec"]["policyName"].as_str().unwrap_or("");
         if policy_name.is_empty() {
             continue;
@@ -2828,7 +2843,7 @@ pub async fn run_validating_webhooks<S: Store>(
 
     let configs = fetch_validating_configs(state).await;
     let mut all_webhooks: Vec<WebhookEntry> = Vec::new();
-    for config in &configs {
+    for config in configs.iter() {
         if let Ok(wc) = serde_json::from_value::<WebhookConfig>(config.clone()) {
             all_webhooks.extend(wc.webhooks);
         }
@@ -9166,6 +9181,52 @@ mod tests {
             cached[0]["metadata"]["name"].as_str(),
             Some("fake-from-cache"),
             "cache must serve the injected config, proving the fetch read from cache not store"
+        );
+    }
+
+    /// Regression test for the admission hot path: fetching the cached config set must
+    /// clone the `Arc` (O(1) refcount bump), not deep-clone the underlying `Vec<Value>`.
+    ///
+    /// Why this matters: admission runs on nearly every write (resource.rs, pods.rs,
+    /// namespaces.rs, cr.rs, crd.rs, csr.rs, proxy.rs). A deep clone here re-allocates every
+    /// webhook/policy config — including CA-bundle strings — on every single write, scaling
+    /// allocation cost with (#configs x config-size x write-rate). This test fails if the
+    /// fetch helper regresses to `cached.as_ref().clone()`: that call returns a fresh `Vec`
+    /// backed by a new allocation, so the cached `Arc`'s strong count stays at 1 and the two
+    /// values do not share a pointer.
+    #[tokio::test]
+    async fn fetch_mutating_configs_shares_arc_not_deep_clone() {
+        let state = make_state();
+
+        let fake_config = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "shared-arc-test"},
+            "webhooks": []
+        });
+        let cached_arc = Arc::new(vec![fake_config]);
+        *state.admission_cache.mutating_webhooks.write().unwrap() = Some(cached_arc.clone());
+
+        // Two owners so far: `cached_arc` (this test's local handle) and the cache slot.
+        let baseline_count = Arc::strong_count(&cached_arc);
+        assert_eq!(
+            baseline_count, 2,
+            "test setup must have exactly two owners (local handle + cache slot) before fetch"
+        );
+
+        let fetched = fetch_mutating_configs(&state).await;
+
+        assert_eq!(
+            Arc::strong_count(&cached_arc),
+            baseline_count + 1,
+            "fetch must share the cached Arc (bump the refcount by exactly one), not \
+             allocate a fresh Vec — an unchanged strong_count here means the config Vec was \
+             deep-cloned on this call, the exact per-write regression this test guards against"
+        );
+        assert!(
+            Arc::ptr_eq(&cached_arc, &fetched),
+            "fetched Arc must point at the same allocation as the cache slot — a different \
+             allocation means fetch deep-cloned the Vec instead of cloning the Arc"
         );
     }
 }
