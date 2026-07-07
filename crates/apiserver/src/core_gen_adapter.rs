@@ -339,6 +339,91 @@ fn gen_lifecycle_to_json(lc: core_v1::Lifecycle) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+fn gen_capabilities_to_json(caps: core_v1::Capabilities) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !caps.add.is_empty() {
+        m.insert(
+            "add".to_string(),
+            serde_json::Value::Array(
+                caps.add
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !caps.drop.is_empty() {
+        m.insert(
+            "drop".to_string(),
+            serde_json::Value::Array(
+                caps.drop
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_seccomp_profile_to_json(sp: core_v1::SeccompProfile) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sp.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = sp.localhost_profile.filter(|s| !s.is_empty()) {
+        m.insert("localhostProfile".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Container-level SecurityContext (Container.securityContext, proto field 15).
+///
+/// Without this, containers run as whatever UID/GID the image defaults to regardless of
+/// runAsUser/runAsGroup, allowPrivilegeEscalation=false is silently ignored (containers can
+/// escalate privileges even when the pod spec explicitly forbids it), and
+/// readOnlyRootFilesystem is dropped (containers get a writable root fs against the spec).
+fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(caps) = sc.capabilities {
+        m.insert("capabilities".to_string(), gen_capabilities_to_json(caps));
+    }
+    if let Some(v) = sc.privileged {
+        m.insert("privileged".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = sc.run_as_user {
+        m.insert("runAsUser".to_string(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(v) = sc.run_as_group {
+        m.insert(
+            "runAsGroup".to_string(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    if let Some(v) = sc.run_as_non_root {
+        m.insert("runAsNonRoot".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = sc.read_only_root_filesystem {
+        m.insert(
+            "readOnlyRootFilesystem".to_string(),
+            serde_json::Value::Bool(v),
+        );
+    }
+    if let Some(v) = sc.allow_privilege_escalation {
+        m.insert(
+            "allowPrivilegeEscalation".to_string(),
+            serde_json::Value::Bool(v),
+        );
+    }
+    if let Some(sp) = sc.seccomp_profile {
+        m.insert(
+            "seccompProfile".to_string(),
+            gen_seccomp_profile_to_json(sp),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     let mut cm = serde_json::Map::with_capacity(18);
     if let Some(v) = c.name.filter(|s| !s.is_empty()) {
@@ -559,6 +644,12 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     if let Some(lc) = c.lifecycle {
         cm.insert("lifecycle".to_string(), gen_lifecycle_to_json(lc));
     }
+    if let Some(sc) = c.security_context {
+        cm.insert(
+            "securityContext".to_string(),
+            gen_security_context_to_json(sc),
+        );
+    }
     if !c.resize_policy.is_empty() {
         let rp_json: Vec<serde_json::Value> = c
             .resize_policy
@@ -690,6 +781,12 @@ fn gen_ephemeral_container_to_json(ec: core_v1::EphemeralContainer) -> serde_jso
             })
             .collect();
         m.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
+    }
+    if let Some(sc) = c.security_context {
+        m.insert(
+            "securityContext".to_string(),
+            gen_security_context_to_json(sc),
+        );
     }
     serde_json::Value::Object(m)
 }
@@ -2598,6 +2695,77 @@ mod tests {
         assert_eq!(
             result["spec"]["ephemeralContainers"][0]["targetContainerName"], "c",
             "ephemeralContainers[].targetContainerName must survive decode"
+        );
+    }
+
+    /// Container-level securityContext survives protobuf decode.
+    ///
+    /// P1 security bug: without this, gen_container_to_json silently drops the entire
+    /// securityContext, so every protobuf-created container runs as whatever UID the image
+    /// defaults to (usually root) regardless of runAsUser, and allowPrivilegeEscalation=false
+    /// / readOnlyRootFilesystem=true are both ignored — a container that explicitly asked to
+    /// be locked down runs unlocked.
+    #[test]
+    fn generated_container_preserves_security_context() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("sc-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    security_context: Some(core_v1::SecurityContext {
+                        run_as_user: Some(1002),
+                        run_as_group: Some(2000),
+                        allow_privilege_escalation: Some(false),
+                        read_only_root_filesystem: Some(true),
+                        capabilities: Some(core_v1::Capabilities {
+                            add: vec!["NET_ADMIN".to_string()],
+                            drop: vec!["ALL".to_string()],
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with container securityContext must decode");
+        let sc = &result["spec"]["containers"][0]["securityContext"];
+
+        assert_eq!(
+            sc["runAsUser"], 1002,
+            "container securityContext.runAsUser must survive decode — reverting this fix \
+             means containers run as root (uid 0) regardless of the requested UID"
+        );
+        assert_eq!(
+            sc["runAsGroup"], 2000,
+            "container securityContext.runAsGroup must survive decode"
+        );
+        assert_eq!(
+            sc["allowPrivilegeEscalation"], false,
+            "allowPrivilegeEscalation=false must survive decode — otherwise a container that \
+             explicitly forbade privilege escalation can still escalate"
+        );
+        assert_eq!(
+            sc["readOnlyRootFilesystem"], true,
+            "readOnlyRootFilesystem=true must survive decode (sig-node 'read only busybox')"
+        );
+        assert_eq!(
+            sc["capabilities"]["add"][0], "NET_ADMIN",
+            "capabilities.add must survive decode"
+        );
+        assert_eq!(
+            sc["capabilities"]["drop"][0], "ALL",
+            "capabilities.drop must survive decode"
         );
     }
 }
