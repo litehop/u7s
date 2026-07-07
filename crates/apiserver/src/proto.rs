@@ -988,6 +988,9 @@ struct ServiceAccount {
 
 /// PersistentVolumeClaimSpec — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PersistentVolumeClaimSpec
+/// Test-only encoder: builds wire-format-correct bytes for decode tests; the live
+/// decode path is `core_gen_adapter::decode_persistentvolumeclaim_proto_gen`.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolumeClaimSpec {
     /// accessModes (field 1, repeated string)
@@ -1010,6 +1013,7 @@ struct PersistentVolumeClaimSpec {
 /// PersistentVolumeClaimCondition — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PersistentVolumeClaimCondition
 /// Fields: type(1), status(2), lastProbeTime(3), lastTransitionTime(4), reason(5), message(6)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolumeClaimCondition {
     /// type (field 1, string)
@@ -1035,6 +1039,7 @@ struct PersistentVolumeClaimCondition {
 /// PersistentVolumeClaimStatus — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PersistentVolumeClaimStatus
 /// Fields: phase(1), accessModes(2), capacity(3), conditions(4), ...
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolumeClaimStatus {
     /// phase (field 1, string — PersistentVolumeClaimPhase)
@@ -1053,6 +1058,7 @@ struct PersistentVolumeClaimStatus {
 
 /// PersistentVolumeClaim — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PersistentVolumeClaim
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolumeClaim {
     /// metadata (field 1, message ObjectMeta)
