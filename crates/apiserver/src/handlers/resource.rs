@@ -903,12 +903,15 @@ pub(crate) async fn do_patch<S: Store>(
         strip_managed_fields(&mut patch);
     }
 
-    // Strip status from the patch on the main endpoint for resources with a status subresource.
-    if meta.has_status_subresource {
-        if let Some(map) = patch.as_object_mut() {
-            map.remove("status");
-        }
-    }
+    // Snapshot .status before applying the patch: status is a separate RBAC subresource,
+    // so a patch on the main endpoint (merge, strategic-merge, or JSON Patch — a JSON Patch
+    // is an array and would otherwise slip past an object-shaped "status" key strip) must
+    // never change it, restored below after the patch is applied.
+    let stored_status = if meta.has_status_subresource {
+        Some(current.body["status"].clone())
+    } else {
+        None
+    };
 
     match patch_type {
         PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
@@ -918,6 +921,17 @@ pub(crate) async fn do_patch<S: Store>(
         }
         PatchType::Json => {
             apply_json_patch(&mut current.body, &patch)?;
+        }
+    }
+
+    if meta.has_status_subresource {
+        match stored_status {
+            Some(ref s) if !s.is_null() => {
+                current.body["status"] = s.clone();
+            }
+            _ => {
+                current.body.as_object_mut().map(|m| m.remove("status"));
+            }
         }
     }
 
@@ -11015,6 +11029,92 @@ mod tests {
             v["status"]["replicas"], 5,
             "body status (replicas=0) must be ignored; stored status (replicas=5) \
              must be preserved — the main endpoint must not let clients reset status"
+        );
+    }
+
+    /// A JSON Patch sent to the MAIN StatefulSet endpoint that targets `/status/...`
+    /// must not change status — `patch statefulsets` and `patch statefulsets/status`
+    /// are separate RBAC grants, and JSON Patch is an array so it slips past an
+    /// object-shaped "status" key strip. This test fails if do_patch's JSON-Patch
+    /// branch stops restoring the pre-patch status snapshot.
+    #[tokio::test]
+    async fn patch_statefulset_json_patch_cannot_forge_status_on_main_endpoint() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": { "replicas": 3, "readyReplicas": 3 }
+        });
+        let key = "/registry/apps/statefulsets/default/web";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        // A caller with only `patch statefulsets` (no /status grant) forges readyReplicas.
+        let patch = serde_json::json!([
+            { "op": "replace", "path": "/status/readyReplicas", "value": 99 }
+        ]);
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "statefulsets".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("main-endpoint JSON Patch must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["readyReplicas"], 3,
+            "a JSON Patch on the main endpoint must not forge status — status is a \
+             separate RBAC subresource, letting a main-patch-only caller set \
+             readyReplicas would let it lie to schedulers/controllers about readiness"
         );
     }
 
