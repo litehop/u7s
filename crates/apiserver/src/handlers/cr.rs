@@ -1,6 +1,6 @@
 use axum::{
     extract::{Extension, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -457,6 +457,159 @@ fn validate_cr_schema(
 }
 
 // ---------------------------------------------------------------------------
+// CR field validation (?fieldValidation=Strict/Warn/Ignore)
+//
+// Built-in resources get this from `json_patch::apply_field_validation`, which checks
+// unknown fields against small hardcoded field lists per type. CRs have no fixed schema of
+// their own — unknown-field detection must instead walk the CRD's openAPIV3Schema, honoring
+// the structural-schema extensions x-kubernetes-preserve-unknown-fields (don't reject unknown
+// fields under that subtree) and x-kubernetes-embedded-resource (the object carries its own
+// implicit TypeMeta/ObjectMeta, so apiVersion/kind/metadata are allowed there even when the
+// schema doesn't declare them). Without this, CRs silently accept typo'd/unknown fields and
+// schema drift goes undetected — the whole point of fieldValidation=Strict.
+// ---------------------------------------------------------------------------
+
+/// The standard ObjectMeta JSON field names. Fixed regardless of what (if anything) the CRD
+/// schema declares under `metadata`: CRD authors constrain existing ObjectMeta fields (e.g. a
+/// `pattern` on `name`), they never add new ones, so schema-declared `metadata.properties`
+/// are not consulted here.
+const CR_KNOWN_METADATA_FIELDS: &[&str] = &[
+    "name",
+    "generateName",
+    "namespace",
+    "selfLink",
+    "uid",
+    "resourceVersion",
+    "generation",
+    "creationTimestamp",
+    "deletionTimestamp",
+    "deletionGracePeriodSeconds",
+    "labels",
+    "annotations",
+    "ownerReferences",
+    "finalizers",
+    "managedFields",
+    "clusterName",
+];
+
+/// Internal header used to thread the already-parsed `?fieldValidation=` query value from
+/// resource.rs's CR-routing fallback (create_resource/patch_resource and their namespaced
+/// variants) into this module. create_cr/patch_cr and their namespaced siblings are invoked
+/// directly by resource.rs rather than dispatched by axum, so they have no `Query` extractor
+/// of their own; resource.rs already parses the query string as `CreateQuery`/`PatchQuery`
+/// for the built-in-resource path and forwards the value here instead of adding a parameter
+/// to every one of these functions' dozens of existing call sites.
+const FIELD_VALIDATION_HEADER: &str = "x-u7s-field-validation";
+
+fn field_validation_mode(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(FIELD_VALIDATION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Walk `value` against `schema`, collecting field.Path-style paths (e.g.
+/// ".spec.template.metadata.unknownSubMeta") for object keys the schema does not declare.
+///
+/// `allow_type_meta` is true at the CR root and at any `x-kubernetes-embedded-resource`
+/// object: both carry an implicit apiVersion/kind/metadata that the CRD author never
+/// declares in `properties`, so those keys (and metadata's own fixed ObjectMeta fields)
+/// must never be flagged as unknown there.
+fn walk_cr_unknown_fields(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+    allow_type_meta: bool,
+    out: &mut Vec<String>,
+) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    let preserve_unknown = schema
+        .get("x-kubernetes-preserve-unknown-fields")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let props = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+
+    for (key, val) in map {
+        if allow_type_meta && (key == "apiVersion" || key == "kind") {
+            continue;
+        }
+        if allow_type_meta && key == "metadata" {
+            if let Some(meta) = val.as_object() {
+                for mkey in meta.keys() {
+                    if !CR_KNOWN_METADATA_FIELDS.contains(&mkey.as_str()) {
+                        out.push(format!("{path}.metadata.{mkey}"));
+                    }
+                }
+            }
+            continue;
+        }
+        match props.and_then(|p| p.get(key)) {
+            Some(sub_schema) => {
+                let embedded = sub_schema
+                    .get("x-kubernetes-embedded-resource")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                walk_cr_unknown_fields(val, sub_schema, &format!("{path}.{key}"), embedded, out);
+            }
+            None if !preserve_unknown => out.push(format!("{path}.{key}")),
+            None => {}
+        }
+    }
+}
+
+/// Apply `?fieldValidation=` semantics against the CRD's structural schema.
+///
+/// Mirrors `json_patch::apply_field_validation`'s Strict/Warn/Ignore contract, but detects
+/// unknown fields by walking the CRD's own openAPIV3Schema instead of a hardcoded field
+/// list. Returns `Ok(None)` when the CRD has no schema at all — without one there is nothing
+/// to validate field names against, matching upstream's behaviour for schemaless CRDs.
+fn apply_cr_field_validation(
+    body: &serde_json::Value,
+    schema: Option<&serde_json::Value>,
+    mode: Option<&str>,
+) -> Result<Option<HeaderValue>, crate::status::StatusError> {
+    let mode = mode.unwrap_or("Ignore");
+    if mode == "Ignore" {
+        return Ok(None);
+    }
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+
+    let mut unknown = Vec::new();
+    walk_cr_unknown_fields(body, schema, "", true, &mut unknown);
+    if unknown.is_empty() {
+        return Ok(None);
+    }
+
+    // Matches upstream's CR structural-schema pruning error format, e.g.:
+    //   strict decoding error: .unknownField: field not declared in schema
+    let joined = unknown
+        .iter()
+        .map(|f| format!("{f}: field not declared in schema"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match mode {
+        "Strict" => Err(Status::unprocessable_entity(format!(
+            "strict decoding error: {joined}"
+        ))),
+        "Warn" => {
+            let msg = format!("299 - \"{joined}\"");
+            let hv = HeaderValue::from_str(&msg).unwrap_or_else(|_| {
+                HeaderValue::from_static("299 - \"unknown field(s) detected\"")
+            });
+            Ok(Some(hv))
+        }
+        _ => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SSA body parser: YAML-or-JSON → serde_json::Value
 //
 // The k8s conformance client sends genuine YAML block-mapping bytes (not JSON)
@@ -815,6 +968,12 @@ pub async fn create_cr<S: Store>(
     let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
+    let warn_header = apply_cr_field_validation(
+        &obj,
+        ctx.schema.as_ref(),
+        field_validation_mode(&headers).as_deref(),
+    )?;
+
     validate_cr_schema(&obj, &ctx)?;
 
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -848,7 +1007,11 @@ pub async fn create_cr<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    Ok((StatusCode::CREATED, Json(obj)))
+    let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+    if let Some(hv) = warn_header {
+        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+    }
+    Ok(resp)
 }
 
 pub async fn replace_cr<S: Store>(
@@ -1398,6 +1561,12 @@ pub async fn create_cr_namespaced<S: Store>(
     let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
+    let warn_header = apply_cr_field_validation(
+        &obj,
+        ctx.schema.as_ref(),
+        field_validation_mode(&headers).as_deref(),
+    )?;
+
     validate_cr_schema(&obj, &ctx)?;
 
     {
@@ -1437,7 +1606,11 @@ pub async fn create_cr_namespaced<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    Ok((StatusCode::CREATED, Json(obj)))
+    let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+    if let Some(hv) = warn_header {
+        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+    }
+    Ok(resp)
 }
 
 pub async fn replace_cr_namespaced<S: Store>(
@@ -1630,6 +1803,7 @@ pub async fn patch_cr<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    let field_validation = field_validation_mode(&headers);
 
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1655,6 +1829,8 @@ pub async fn patch_cr<S: Store>(
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = ssa_body_to_json(&body)?;
+        let warn_header =
+            apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         validate_cr_schema(&obj, &ctx)?;
         let admission_ctx = AdmissionContext {
@@ -1683,7 +1859,11 @@ pub async fn patch_cr<S: Store>(
             serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
         meta.resource_version = Some(rv.to_string());
         obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-        return Ok((StatusCode::CREATED, Json(obj)).into_response());
+        let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
     }
 
     let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
@@ -1719,6 +1899,9 @@ pub async fn patch_cr<S: Store>(
         }
     }
 
+    let warn_header =
+        apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+
     validate_cr_schema(&obj, &ctx)?;
 
     let admission_ctx = AdmissionContext {
@@ -1749,7 +1932,11 @@ pub async fn patch_cr<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(new_rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    Ok(Json(obj).into_response())
+    let mut resp = Json(obj).into_response();
+    if let Some(hv) = warn_header {
+        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1765,6 +1952,7 @@ pub async fn patch_cr_namespaced<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    let field_validation = field_validation_mode(&headers);
 
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1783,6 +1971,8 @@ pub async fn patch_cr_namespaced<S: Store>(
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = ssa_body_to_json(&body)?;
+        let warn_header =
+            apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         {
             let mut meta: crate::types::ObjectMeta =
@@ -1817,7 +2007,11 @@ pub async fn patch_cr_namespaced<S: Store>(
             serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
         meta.resource_version = Some(rv.to_string());
         obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-        return Ok((StatusCode::CREATED, Json(obj)).into_response());
+        let mut resp = (StatusCode::CREATED, Json(obj)).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
     }
 
     let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
@@ -1853,6 +2047,9 @@ pub async fn patch_cr_namespaced<S: Store>(
         }
     }
 
+    let warn_header =
+        apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+
     validate_cr_schema(&obj, &ctx)?;
 
     let admission_ctx = AdmissionContext {
@@ -1883,7 +2080,11 @@ pub async fn patch_cr_namespaced<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(new_rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    Ok(Json(obj).into_response())
+    let mut resp = Json(obj).into_response();
+    if let Some(hv) = warn_header {
+        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -8792,6 +8993,315 @@ mod tests {
             resp_obj["spec"]["foo"].as_str(),
             Some("bar"),
             "the created CR must have spec.foo='bar' as sent in the patch body"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CR fieldValidation regression tests (mayor-ago8)
+    //
+    // Root cause: resource.rs routes any CR request to cr.rs BEFORE its own
+    // apply_field_validation runs, and cr.rs never checked ?fieldValidation= at all — so
+    // CRs silently accepted unknown/typo'd fields regardless of the CRD's schema. These
+    // tests exercise the real handler entry points (create_cr / patch_cr's SSA-upsert
+    // path) with the internal x-u7s-field-validation header that resource.rs sets from
+    // the query string, so a regression that drops the wiring (not just the detection
+    // algorithm) also fails these tests.
+    // ---------------------------------------------------------------------------
+
+    fn strict_field_validation_headers() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static(FIELD_VALIDATION_HEADER),
+            axum::http::HeaderValue::from_static("Strict"),
+        );
+        headers
+    }
+
+    async fn install_cluster_crd_with_schema(state: &AppState, schema: serde_json::Value) {
+        use crate::handlers::crd;
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": { "openAPIV3Schema": schema }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_bytes,
+        )
+        .await
+        .expect("install CRD with schema");
+    }
+
+    /// create_cr with fieldValidation=Strict must reject a top-level property the CRD
+    /// schema does not declare, naming the offending field.
+    ///
+    /// WHY: this is how kubectl create/apply --validate=strict catches a typo'd field
+    /// name in a CR. Before this fix, cr.rs never checked fieldValidation at all — the
+    /// CR was silently stored with the typo'd field, so schema drift went undetected
+    /// (k8s conformance "should create/apply an invalid CR with extra properties").
+    #[tokio::test]
+    async fn create_cr_strict_field_validation_rejects_unknown_top_level_property() {
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "properties": { "foo": { "type": "string" } }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "mytest" },
+                "spec": { "foo": "foo1" },
+                "unknownField": "unknown"
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                test_user(),
+                strict_field_validation_headers(),
+                cr_body,
+            )
+            .await,
+            "CR with an unknown top-level property must be rejected under fieldValidation=Strict",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422, "must return 422 Unprocessable Entity");
+        let msg = err.1.message;
+        assert!(
+            msg.contains(".unknownField: field not declared in schema"),
+            "error message must name the offending field so the client can fix its typo (got: {msg})"
+        );
+    }
+
+    /// A schema-valid CR must be accepted under fieldValidation=Strict — the detector
+    /// must not produce false positives on properties the schema actually declares.
+    #[tokio::test]
+    async fn create_cr_strict_field_validation_accepts_valid_body() {
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "properties": { "foo": { "type": "string" } }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "mytest" },
+                "spec": { "foo": "foo1" }
+            })
+            .to_string(),
+        );
+
+        let result = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            strict_field_validation_headers(),
+            cr_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a CR with only schema-declared fields must not be rejected by fieldValidation=Strict"
+        );
+    }
+
+    /// Schema for the two tests below: mirrors the k8s conformance test "should detect
+    /// unknown metadata fields in both the root and embedded object of a CR" — `spec` has
+    /// x-kubernetes-preserve-unknown-fields, and `spec.template` is an
+    /// x-kubernetes-embedded-resource whose own `metadata` only declares `name`.
+    fn preserve_unknown_and_embedded_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true,
+                    "properties": {
+                        "template": {
+                            "type": "object",
+                            "x-kubernetes-embedded-resource": true,
+                            "properties": {
+                                "metadata": {
+                                    "type": "object",
+                                    "properties": { "name": { "type": "string" } }
+                                },
+                                "spec": { "type": "object" }
+                            }
+                        },
+                        "foo": { "type": "string" }
+                    }
+                }
+            }
+        })
+    }
+
+    /// patch_cr's SSA-upsert path with fieldValidation=Strict must reject unknown metadata
+    /// fields both at the CR root and inside an x-kubernetes-embedded-resource object.
+    ///
+    /// WHY: ObjectMeta is a fixed structure; a CRD schema never enumerates its fields, so
+    /// unknown-field detection cannot rely on `properties` alone here — it must fall back
+    /// to the fixed ObjectMeta field list at the root AND inside embedded resources.
+    /// Missing either one would let typo'd metadata (e.g. `unknownMeta`) slip through
+    /// undetected (k8s conformance "should detect unknown metadata fields in both the
+    /// root and embedded object of a CR").
+    #[tokio::test]
+    async fn patch_cr_ssa_strict_rejects_unknown_metadata_at_root_and_in_embedded_object() {
+        let state = make_state();
+        install_cluster_crd_with_schema(&state, preserve_unknown_and_embedded_schema()).await;
+
+        let mut headers = strict_field_validation_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "mytest", "unknownMeta": "unknown" },
+                "spec": {
+                    "template": {
+                        "apiVersion": "foo/v1",
+                        "kind": "Sub",
+                        "metadata": { "name": "subobject", "unknownSubMeta": "unknown" }
+                    },
+                    "foo": "foo1"
+                }
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            patch_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "mytest".to_string(),
+                )),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await,
+            "unknown metadata fields at the root and in an embedded object must be rejected",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422, "must return 422 Unprocessable Entity");
+        let msg = err.1.message;
+        assert!(
+            msg.contains(".metadata.unknownMeta: field not declared in schema"),
+            "must flag the unknown field on the CR's own (root) metadata (got: {msg})"
+        );
+        assert!(
+            msg.contains(".spec.template.metadata.unknownSubMeta: field not declared in schema"),
+            "must also flag the unknown field on the embedded object's metadata (got: {msg})"
+        );
+    }
+
+    /// A subtree marked x-kubernetes-preserve-unknown-fields must NOT be rejected for
+    /// carrying fields the schema doesn't declare — that is the entire purpose of the
+    /// annotation, and CRDs like cert-manager and Argo rely on it for free-form spec
+    /// fields. Only the always-fixed ObjectMeta and embedded-resource TypeMeta rules stay
+    /// unaffected.
+    #[tokio::test]
+    async fn patch_cr_ssa_strict_allows_unknown_fields_under_preserve_unknown_fields_subtree() {
+        let state = make_state();
+        install_cluster_crd_with_schema(&state, preserve_unknown_and_embedded_schema()).await;
+
+        let mut headers = strict_field_validation_headers();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // `spec` has x-kubernetes-preserve-unknown-fields: true, so `spec.freeform` (not
+        // declared anywhere in the schema) must be preserved, not rejected.
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "mytest" },
+                "spec": { "foo": "foo1", "freeform": { "anything": "goes" } }
+            })
+            .to_string(),
+        );
+
+        let result = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "mytest".to_string(),
+            )),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an unknown field under an x-kubernetes-preserve-unknown-fields subtree must \
+             not be rejected by fieldValidation=Strict"
         );
     }
 }
