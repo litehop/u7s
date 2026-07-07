@@ -411,6 +411,27 @@ pub async fn replace_resource<S: Store>(
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
+    // Immutability check: PriorityClass.value drives scheduling/preemption ordering
+    // cluster-wide; allowing it to change post-create would silently reorder
+    // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
+    if group == "scheduling.k8s.io" && plural == "priorityclasses" {
+        let key = group_object_key(&group, &plural, None, &name);
+        if let Some(stored) = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            if let Ok(stored_val) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                if obj.body["value"] != stored_val["value"] {
+                    return Err(Status::unprocessable_entity(format!(
+                        "{plural}/{name} .value is immutable and cannot be updated"
+                    )));
+                }
+            }
+        }
+    }
+
     // Read the stored status so we can restore it after the PUT — controllers write
     // status via /status; a full PUT on the main endpoint must not wipe it out.
     let stored_status = if meta.has_status_subresource {
@@ -857,6 +878,16 @@ pub(crate) async fn do_patch<S: Store>(
         )));
     }
 
+    // Capture PriorityClass.value before patch: it drives scheduling/preemption
+    // ordering cluster-wide and is immutable after create. Real kube-apiserver
+    // returns 422 "Invalid" if a patch changes it.
+    let priorityclass_value_before_patch =
+        if group == "scheduling.k8s.io" && plural == "priorityclasses" {
+            Some(current.body["value"].clone())
+        } else {
+            None
+        };
+
     // Capture spec before patch for generation tracking on workload resources.
     let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
         Some(current.body["spec"].clone())
@@ -889,6 +920,15 @@ pub(crate) async fn do_patch<S: Store>(
             apply_json_patch(&mut current.body, &patch)?;
         }
     }
+
+    if let Some(ref old_value) = priorityclass_value_before_patch {
+        if &current.body["value"] != old_value {
+            return Err(Status::unprocessable_entity(format!(
+                "{plural}/{name} .value is immutable and cannot be updated"
+            )));
+        }
+    }
+
     super::defaults::apply_defaults(group, plural, &mut current.body);
     super::defaults::validate_resource(group, plural, &current.body)
         .map_err(Status::unprocessable_entity)?;
@@ -12117,6 +12157,212 @@ mod tests {
                  from do_patch"
             ),
         }
+    }
+
+    /// PUT on a PriorityClass that changes `.value` must return 422 Invalid; PUT that only
+    /// changes a mutable field (description) must succeed.
+    ///
+    /// The conformance test "verify PriorityClass endpoints can be operated with different
+    /// HTTP methods" (scheduling/preemption.go) creates a PriorityClass then Updates it with
+    /// `.value` multiplied by 10, expecting an error. `.value` drives scheduling/preemption
+    /// ordering cluster-wide — allowing it to change post-create would silently reorder
+    /// priorities for every pod referencing this class.
+    ///
+    /// This test fails if the immutability check is removed from replace_resource.
+    #[tokio::test]
+    async fn replace_priorityclass_value_is_immutable() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let pc_v1 = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": { "name": "my-pc" },
+            "value": 1000,
+            "description": "original"
+        });
+        let result = replace_resource(
+            State(state.clone()),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+                "my-pc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pc_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial priorityclass create must succeed")
+            .into_response();
+
+        // Changing .value must be rejected with 422.
+        let pc_changed_value = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": { "name": "my-pc" },
+            "value": 10000,
+            "description": "original"
+        });
+        let result = replace_resource(
+            State(state.clone()),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+                "my-pc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pc_changed_value).unwrap()),
+        )
+        .await;
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing PriorityClass.value must return 422 Invalid — without this check \
+                 u7s silently reorders cluster-wide scheduling priority and the conformance test \
+                 'verify PriorityClass endpoints can be operated with different HTTP methods' \
+                 fails with 'expected an update error on an immutable field, got nil'"
+            ),
+            Ok(_) => panic!(
+                "PUT changing PriorityClass.value must return 422, not 200 — immutability \
+                 enforcement is missing from replace_resource"
+            ),
+        }
+
+        // Changing only description (a mutable field) must succeed.
+        let pc_changed_desc = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": { "name": "my-pc" },
+            "value": 1000,
+            "description": "updated description"
+        });
+        let result = replace_resource(
+            State(state),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+                "my-pc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pc_changed_desc).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT changing only PriorityClass.description must succeed — the conformance test \
+             requires mutable fields to remain patchable even though .value is locked",
+        );
+    }
+
+    /// PATCH on a PriorityClass that changes `.value` must return 422 Invalid.
+    ///
+    /// Mirrors the PUT test above but for PATCH (strategic-merge, the patch type the
+    /// conformance test actually uses via `patchPriorityClass`).
+    ///
+    /// This test fails if the immutability check is removed from do_patch.
+    #[tokio::test]
+    async fn patch_priorityclass_value_is_immutable() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let pc_v1 = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": { "name": "patched-pc" },
+            "value": 500,
+            "description": "original"
+        });
+        let result = replace_resource(
+            State(state.clone()),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+                "patched-pc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pc_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial priorityclass create must succeed")
+            .into_response();
+
+        let patch = serde_json::json!({ "value": 5000 });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state.clone()),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+                "patched-pc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing PriorityClass.value must return 422 Invalid — immutability must \
+                 be enforced for all write methods, matching the PUT check"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing PriorityClass.value must return 422 — immutability check is \
+                 missing from do_patch"
+            ),
+        }
+
+        // Patching a mutable field (description) must still succeed.
+        let mutable_patch = serde_json::json!({ "description": "patched description" });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+                "patched-pc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&mutable_patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH changing only PriorityClass.description must succeed — mutable fields must \
+             remain patchable even though .value is locked",
+        );
     }
 
     /// Deleting a Job must remove the `batch.kubernetes.io/job-tracking` finalizer from
