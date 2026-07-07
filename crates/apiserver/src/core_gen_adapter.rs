@@ -1440,6 +1440,11 @@ pub fn decode_configmap_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         "kind": "ConfigMap",
         "metadata": meta
     });
+    // immutable — the PATCH/PUT checks (resource.rs) that reject mutating an immutable
+    // ConfigMap are correct but never fire if this field is dropped on decode.
+    if let Some(v) = cm.immutable {
+        obj["immutable"] = serde_json::Value::Bool(v);
+    }
     if !cm.data.is_empty() {
         let data_map: serde_json::Map<String, serde_json::Value> = cm
             .data
@@ -1659,6 +1664,11 @@ pub fn decode_secret_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         "kind": "Secret",
         "metadata": meta
     });
+    // immutable — same data-integrity gap as ConfigMap: the checks are correct but never
+    // fire if this field is dropped on decode.
+    if let Some(v) = secret.immutable {
+        obj["immutable"] = serde_json::Value::Bool(v);
+    }
     if let Some(v) = secret.r#type.filter(|s| !s.is_empty()) {
         obj["type"] = serde_json::Value::String(v);
     }
@@ -2899,6 +2909,49 @@ mod tests {
         assert_eq!(
             sc["sysctls"][0]["value"], "1",
             "sysctl value must survive decode"
+        );
+    }
+
+    /// ConfigMap/Secret immutable:true survives protobuf decode.
+    ///
+    /// The immutability enforcement checks (resource.rs PATCH/PUT) are correct but never
+    /// fire if decode drops the field first — a protobuf Update() that sets immutable:true
+    /// would otherwise leave the stored object mutable forever, defeating the guarantee.
+    #[test]
+    fn generated_configmap_and_secret_preserve_immutable_flag() {
+        let cm = core_v1::ConfigMap {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("immutable-cm".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            immutable: Some(true),
+            ..Default::default()
+        };
+        let mut cm_buf = Vec::new();
+        cm.encode(&mut cm_buf).unwrap();
+        let cm_result = decode_configmap_proto_gen(&cm_buf).expect("ConfigMap must decode");
+        assert_eq!(
+            cm_result["immutable"], true,
+            "ConfigMap.immutable must survive decode — without it, an immutable ConfigMap can \
+             still be mutated because the stored object never has immutable:true set"
+        );
+
+        let secret = core_v1::Secret {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("immutable-secret".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            immutable: Some(true),
+            ..Default::default()
+        };
+        let mut secret_buf = Vec::new();
+        secret.encode(&mut secret_buf).unwrap();
+        let secret_result = decode_secret_proto_gen(&secret_buf).expect("Secret must decode");
+        assert_eq!(
+            secret_result["immutable"], true,
+            "Secret.immutable must survive decode — same data-integrity gap as ConfigMap"
         );
     }
 }
