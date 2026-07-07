@@ -793,6 +793,10 @@ pub async fn patch_crd_status<S: Store>(
 
     match patch_type {
         PatchType::Json => {
+            // /status is a separate RBAC subresource from the main CRD endpoint — a
+            // caller with only `customresourcedefinitions/status` must not be able to
+            // write /spec or /metadata via a JSON Patch on this endpoint.
+            crate::handlers::status::validate_status_json_patch_paths(&patch)?;
             apply_json_patch(&mut current.body, &patch)?;
         }
         _ => {
@@ -1661,6 +1665,123 @@ mod tests {
             v["spec"]["group"], "example.io",
             "PATCH on the status subresource must not touch spec"
         );
+    }
+
+    /// A JSON Patch to .../customresourcedefinitions/{name}/status targeting /spec must be
+    /// REJECTED — /status is a separate RBAC subresource from the main CRD endpoint. A
+    /// caller with only `customresourcedefinitions/status` rights must not be able to
+    /// rewrite spec.versions/spec.group via the status endpoint (this would let it
+    /// redefine served versions or schema validation without the main-resource grant).
+    #[tokio::test]
+    async fn patch_crd_status_json_patch_rejects_spec() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!([
+            { "op": "replace", "path": "/spec/group", "value": "attacker.io" }
+        ]);
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        let err = match patch_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a JSON Patch on /status targeting /spec must be rejected — a status-only \
+                 grant must not be able to redefine spec.group/spec.versions"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(serde_json::to_value(&err.1).unwrap()["code"], 422);
+
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        assert_eq!(
+            v["spec"]["group"], "example.io",
+            "spec.group must not be changed by the rejected status JSON Patch"
+        );
+    }
+
+    /// A JSON Patch to .../customresourcedefinitions/{name}/status targeting
+    /// /metadata/labels must be REJECTED — same RBAC-isolation rule as /spec. Metadata
+    /// labels can gate policy elsewhere (e.g. namespace selectors), so a status-only
+    /// grant must not be able to rewrite them via this endpoint.
+    #[tokio::test]
+    async fn patch_crd_status_json_patch_rejects_metadata_labels() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!([
+            { "op": "add", "path": "/metadata/labels", "value": { "attacker": "true" } }
+        ]);
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        let err = match patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
+            .await
+        {
+            Ok(_) => panic!("a JSON Patch on /status targeting /metadata/labels must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(serde_json::to_value(&err.1).unwrap()["code"], 422);
+    }
+
+    /// A JSON Patch touching only /status must still be accepted on the CRD /status
+    /// endpoint — the path guard must not block legitimate status-only JSON Patches.
+    #[tokio::test]
+    async fn patch_crd_status_json_patch_touching_only_status_succeeds() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!([
+            {
+                "op": "add",
+                "path": "/status/conditions",
+                "value": [{ "type": "NamesAccepted", "status": "True" }]
+            }
+        ]);
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        let resp = patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
+            .await
+            .expect("a JSON Patch touching only /status must be accepted")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// GET/PUT/PATCH .../{name}/status on a missing CRD must return 404, not fall through
