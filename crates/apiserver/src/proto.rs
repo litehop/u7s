@@ -126,9 +126,26 @@ struct ObjectMeta {
     finalizers: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Dead-in-production, test-only wire-format fixture structs.
+//
+// Every struct from here down to `Quantity` is reachable only from
+// `#[cfg(test)]` code. Real production decoding for these Kubernetes
+// resources goes through the protoc-compiled *_gen.rs types and their
+// *_gen_adapter.rs decode_*_proto_gen() functions (e.g.
+// core_gen_adapter::decode_pod_proto_gen for Pod/Container/PodSpec/Probe/
+// VolumeSource/EnvVar). These hand-rolled structs exist only so tests can
+// hand-assemble wire-format bytes without depending on the protoc-generated
+// types. `#[derive(Message)]` self-constructs each type inside its
+// Default/Message impls, so rustc's dead_code lint cannot see that nothing
+// else ever builds one — gating them documents the truth explicitly (see
+// PersistentVolumeClaim* below for the original precedent).
+// ---------------------------------------------------------------------------
+
 /// OwnerReference — one entry in ObjectMeta.ownerReferences.
 /// Source: apimachinery-meta-v1-generated.proto message OwnerReference
 /// Field numbers match the official proto definition exactly.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct OwnerReference {
     /// kind (field 1, string)
@@ -156,6 +173,7 @@ struct OwnerReference {
 /// ResourceRequirements — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ResourceRequirements
 /// limits (field 1) and requests (field 2) are both map<string, Quantity>.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ResourceRequirements {
     /// limits (field 1, map<string, Quantity>)
@@ -168,6 +186,7 @@ struct ResourceRequirements {
 
 /// ExecAction — api-core-v1-generated.proto message ExecAction
 /// field 1 = command (repeated string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct LifecycleExecAction {
     /// command (field 1, repeated string)
@@ -177,6 +196,7 @@ struct LifecycleExecAction {
 
 /// SleepAction — api-core-v1-generated.proto message SleepAction
 /// field 1 = seconds (int64)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct SleepAction {
     /// seconds (field 1, int64)
@@ -187,6 +207,7 @@ struct SleepAction {
 /// LifecycleHandler — api-core-v1-generated.proto message LifecycleHandler
 /// field 1 = exec (ExecAction), field 2 = httpGet (HTTPGetAction),
 /// field 3 = tcpSocket (TCPSocketAction), field 4 = sleep (SleepAction)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct LifecycleHandler {
     /// exec (field 1, message LifecycleExecAction)
@@ -205,6 +226,7 @@ struct LifecycleHandler {
 
 /// Lifecycle — api-core-v1-generated.proto message Lifecycle
 /// field 1 = postStart (LifecycleHandler), field 2 = preStop (LifecycleHandler)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct Lifecycle {
     /// postStart (field 1, message LifecycleHandler)
@@ -217,6 +239,7 @@ struct Lifecycle {
 
 /// ExecProbeAction — api-core-v1-generated.proto message ExecAction (used inside ProbeHandler)
 /// field 1 = command (repeated string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ExecProbeAction {
     /// command (field 1, repeated string)
@@ -226,6 +249,7 @@ struct ExecProbeAction {
 
 /// IntOrString — k8s.io/apimachinery IntOrString
 /// field 1 = type (int64: 0=int, 1=string), field 2 = intVal (int32), field 3 = strVal (string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct IntOrString {
     #[prost(int64, tag = "1")]
@@ -238,6 +262,7 @@ struct IntOrString {
 
 /// HttpGetProbeAction — api-core-v1-generated.proto message HTTPGetAction
 /// field 1 = path (string), field 2 = port (IntOrString), field 3 = host (string), field 4 = scheme (string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct HttpGetProbeAction {
     /// path (field 1, string)
@@ -256,6 +281,7 @@ struct HttpGetProbeAction {
 
 /// TcpSocketProbeAction — api-core-v1-generated.proto message TCPSocketAction
 /// field 1 = port (IntOrString), field 2 = host (string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct TcpSocketProbeAction {
     /// port (field 1, IntOrString message)
@@ -268,6 +294,7 @@ struct TcpSocketProbeAction {
 
 /// GrpcProbeAction — api-core-v1-generated.proto message GRPCAction
 /// field 1 = port (int32), field 2 = service (string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct GrpcProbeAction {
     /// port (field 1, int32)
@@ -281,6 +308,7 @@ struct GrpcProbeAction {
 /// ProbeHandler — api-core-v1-generated.proto message ProbeHandler
 /// field 1 = exec (ExecAction), field 2 = httpGet (HTTPGetAction),
 /// field 3 = tcpSocket (TCPSocketAction), field 4 = grpc (GRPCAction)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ProbeHandler {
     /// exec (field 1, message ExecProbeAction)
@@ -300,6 +328,7 @@ struct ProbeHandler {
 /// Probe — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Probe
 /// field 7 = terminationGracePeriodSeconds (int64) — not declared; not needed for conformance
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct Probe {
     /// handler (field 1, message ProbeHandler) — contains exec/httpGet/tcpSocket/grpc
@@ -325,6 +354,7 @@ struct Probe {
 /// KeyToPath — api-core-v1-generated.proto message KeyToPath
 /// Maps a ConfigMap or Secret key to a file path within a volume.
 /// field 1 = key (string), field 2 = path (string), field 3 = mode (int32, optional)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct KeyToPath {
     /// key (field 1, string) — key in the ConfigMap or Secret to project
@@ -341,6 +371,7 @@ struct KeyToPath {
 /// SecretVolumeSource — api-core-v1-generated.proto message SecretVolumeSource
 /// field 1 = secretName (string), field 2 = items (repeated KeyToPath),
 /// field 3 = defaultMode (int32)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct SecretVolumeSource {
     /// secretName (field 1, string) — name of the Secret in the pod's namespace
@@ -356,6 +387,7 @@ struct SecretVolumeSource {
 
 /// LocalObjectReference — api-core-v1-generated.proto message LocalObjectReference
 /// Used inside ConfigMapVolumeSource (embedded, not a separate JSON field).
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct LocalObjectReference {
     /// name (field 1, string) — name of the referent
@@ -366,6 +398,7 @@ struct LocalObjectReference {
 /// ConfigMapVolumeSource — api-core-v1-generated.proto message ConfigMapVolumeSource
 /// field 1 = localObjectReference (message, name), field 2 = items (repeated KeyToPath),
 /// field 3 = defaultMode (int32)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapVolumeSource {
     /// localObjectReference (field 1, message) — contains the configMap name
@@ -382,6 +415,7 @@ struct ConfigMapVolumeSource {
 /// EmptyDirVolumeSource — api-core-v1-generated.proto message EmptyDirVolumeSource
 /// medium (field 1, string): "" = node default, "Memory" = tmpfs.
 /// sizeLimit (field 2, bytes/Quantity) is skipped — kubelet defaults to node capacity.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct EmptyDirVolumeSource {
     /// medium (field 1, string)
@@ -392,6 +426,7 @@ struct EmptyDirVolumeSource {
 /// HostPathVolumeSource — api-core-v1-generated.proto message HostPathVolumeSource
 /// path (field 1, string): host filesystem path to expose.
 /// type (field 2, string): optional HostPathType hint (e.g. "Directory", "File").
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct HostPathVolumeSource {
     /// path (field 1, string)
@@ -405,6 +440,7 @@ struct HostPathVolumeSource {
 /// PersistentVolumeClaimVolumeSource — api-core-v1-generated.proto
 /// claimName (field 1, string): name of the PVC in the same namespace.
 /// readOnly (field 2, bool): force read-only mount (default false).
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct PvcVolumeSource {
     /// claimName (field 1, string)
@@ -417,6 +453,7 @@ struct PvcVolumeSource {
 
 /// ObjectFieldSelector — api-core-v1-generated.proto message ObjectFieldSelector
 /// Used in DownwardAPIVolumeFile to select a pod-level field.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ObjectFieldSelector {
     /// apiVersion (field 1, string) — defaults to "v1"
@@ -429,6 +466,7 @@ struct ObjectFieldSelector {
 
 /// ResourceFieldSelector — api-core-v1-generated.proto message ResourceFieldSelector
 /// Used in DownwardAPIVolumeFile to select a container resource field.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ResourceFieldSelector {
     /// containerName (field 1, string)
@@ -444,6 +482,7 @@ struct ResourceFieldSelector {
 
 /// DownwardAPIVolumeFile — api-core-v1-generated.proto message DownwardAPIVolumeFile
 /// One item in a downwardAPI or projected/downwardAPI volume.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct DownwardAPIVolumeFile {
     /// path (field 1, string) — relative path for the projected file
@@ -463,6 +502,7 @@ struct DownwardAPIVolumeFile {
 /// DownwardAPIVolumeSource — api-core-v1-generated.proto message DownwardAPIVolumeSource
 /// items (field 1, repeated DownwardAPIVolumeFile): files to project.
 /// defaultMode (field 2, int32): default permission bits for projected files.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct DownwardAPIVolumeSource {
     /// items (field 1, repeated DownwardAPIVolumeFile)
@@ -475,6 +515,7 @@ struct DownwardAPIVolumeSource {
 
 /// DownwardAPIProjection — api-core-v1-generated.proto message DownwardAPIProjection
 /// Identical to DownwardAPIVolumeSource but without defaultMode; used inside ProjectedVolumeSource.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct DownwardAPIProjection {
     /// items (field 1, repeated DownwardAPIVolumeFile)
@@ -484,6 +525,7 @@ struct DownwardAPIProjection {
 
 /// ServiceAccountTokenProjection — api-core-v1-generated.proto
 /// Projects a bound service-account token into the volume.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ServiceAccountTokenProjection {
     /// audience (field 1, string) — intended audience of the token
@@ -500,6 +542,7 @@ struct ServiceAccountTokenProjection {
 /// SecretProjection — api-core-v1-generated.proto message SecretProjection
 /// Projects a Secret into a projected volume.
 /// field 1 = localObjectReference (name), field 2 = items (repeated KeyToPath)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct SecretProjection {
     /// localObjectReference (field 1, message) — secret name
@@ -513,6 +556,7 @@ struct SecretProjection {
 /// ConfigMapProjection — api-core-v1-generated.proto message ConfigMapProjection
 /// Projects a ConfigMap into a projected volume.
 /// field 1 = localObjectReference (name), field 2 = items (repeated KeyToPath)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapProjection {
     /// localObjectReference (field 1, message) — configMap name
@@ -525,6 +569,7 @@ struct ConfigMapProjection {
 
 /// VolumeProjection — api-core-v1-generated.proto message VolumeProjection
 /// One source within a ProjectedVolumeSource.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct VolumeProjectionEntry {
     /// secret (field 1, message SecretProjection)
@@ -544,6 +589,7 @@ struct VolumeProjectionEntry {
 /// ProjectedVolumeSource — api-core-v1-generated.proto message ProjectedVolumeSource
 /// Aggregates multiple volume sources (secret, configMap, downwardAPI, serviceAccountToken)
 /// into a single directory.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ProjectedVolumeSource {
     /// sources (field 1, repeated VolumeProjection)
@@ -557,6 +603,7 @@ struct ProjectedVolumeSource {
 /// VolumeSource — api-core-v1-generated.proto message VolumeSource
 /// All volume source types used by Kubernetes conformance tests are decoded.
 /// Deprecated/cloud-specific sources (gcePersistentDisk, awsElasticBlockStore, etc.) are skipped.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct VolumeSource {
     /// hostPath (field 1, message HostPathVolumeSource)
@@ -585,6 +632,7 @@ struct VolumeSource {
 /// Volume — api-core-v1-generated.proto message Volume
 /// Field numbers match api-core-v1-generated.proto exactly:
 ///   field 1 = name (string), field 2 = volumeSource (message VolumeSource)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct Volume {
     /// name (field 1, string) — must match volumeMount.name in containers
@@ -600,6 +648,7 @@ struct Volume {
 ///   field 1 = name (string), field 2 = readOnly (bool), field 3 = mountPath (string),
 ///   field 4 = subPath (string), field 5 = mountPropagation (string, skipped),
 ///   field 6 = subPathExpr (string), field 7 = recursiveReadOnly (string, skipped)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct VolumeMount {
     /// name (field 1, string) — matches a volume name in spec.volumes
@@ -624,6 +673,7 @@ struct VolumeMount {
 /// field 1 = LocalObjectReference (embedded message, field 1 = name string)
 /// field 2 = key (string)
 /// field 3 = optional (bool)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapKeySelector {
     /// localObjectReference.name (field 1, embedded message — inner field 1 = string)
@@ -642,6 +692,7 @@ struct ConfigMapKeySelector {
 /// field 1 = LocalObjectReference (embedded message, field 1 = name string)
 /// field 2 = key (string)
 /// field 3 = optional (bool)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct SecretKeySelector {
     /// localObjectReference.name (field 1, embedded message — inner field 1 = string)
@@ -657,6 +708,7 @@ struct SecretKeySelector {
 
 /// EnvVarSource — api-core-v1-generated.proto message EnvVarSource
 /// Exactly one of the four fields should be set; others are empty/None.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct EnvVarSource {
     /// fieldRef (field 1, message ObjectFieldSelector)
@@ -676,6 +728,7 @@ struct EnvVarSource {
 /// EnvVar — api-core-v1-generated.proto message EnvVar
 /// One environment variable to set in a container.
 /// field 1 = name (string), field 2 = value (string), field 3 = valueFrom (EnvVarSource)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct EnvVar {
     /// name (field 1, string) — name of the environment variable
@@ -693,6 +746,7 @@ struct EnvVar {
 /// Selects a ConfigMap to populate environment variables from.
 /// field 1 = localObjectReference (embedded message, inner field 1 = name string)
 /// field 2 = optional (bool) — whether the ConfigMap must exist
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapEnvSource {
     /// localObjectReference (field 1, embedded message) — ConfigMap name
@@ -707,6 +761,7 @@ struct ConfigMapEnvSource {
 /// Selects a Secret to populate environment variables from.
 /// field 1 = localObjectReference (embedded message, inner field 1 = name string)
 /// field 2 = optional (bool) — whether the Secret must exist
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct SecretEnvSource {
     /// localObjectReference (field 1, embedded message) — Secret name
@@ -722,6 +777,7 @@ struct SecretEnvSource {
 /// field 1 = prefix (string) — optional prefix for each env var key
 /// field 2 = configMapRef (message ConfigMapEnvSource)
 /// field 3 = secretRef (message SecretEnvSource)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct EnvFromSource {
     /// prefix (field 1, string) — optional prefix prepended to each key
@@ -738,6 +794,7 @@ struct EnvFromSource {
 /// ContainerResizePolicy — k8s.io/api/core/v1/generated.proto message ContainerResizePolicy
 /// Specifies the resize policy for a resource (cpu/memory) in a container.
 /// Field numbers: resourceName (field 1), restartPolicy (field 2).
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ContainerResizePolicy {
     /// resourceName (field 1, string) — "cpu" or "memory"
@@ -750,6 +807,7 @@ struct ContainerResizePolicy {
 
 /// ContainerPort — k8s.io/api/core/v1/generated.proto message ContainerPort
 /// Represents a network port in a single container.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ContainerPort {
     /// name (field 1, optional string)
@@ -771,6 +829,7 @@ struct ContainerPort {
 
 /// Container — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Container
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct Container {
     /// name (field 1, string)
@@ -852,6 +911,7 @@ struct Container {
 ///   field 17 = subdomain (string)
 ///   field 20 = initContainers (repeated Container)
 ///   field 29 = runtimeClassName (optional string)
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct PodSpec {
     /// volumes (field 1, repeated Volume) — backing volumes for container volumeMounts
@@ -903,6 +963,7 @@ struct PodSpec {
 
 /// ObjectReference — used in ServiceAccount.secrets
 /// Source: api-core-v1-generated.proto message ObjectReference
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ObjectReference {
     /// kind (field 1, string)
@@ -970,6 +1031,7 @@ struct TokenRequestProto {
 
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ServiceAccount
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct ServiceAccount {
     /// metadata (field 1, message ObjectMeta)
@@ -1078,6 +1140,7 @@ struct PersistentVolumeClaim {
 /// Only field 1 (string representation) is decoded; binary/decimal forms are ignored.
 /// This is sufficient for LimitRange admission: we only need the human-readable value
 /// (e.g. "500m", "128Mi") to pass through to JSON.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 struct Quantity {
     /// string representation (field 1, e.g. "500m", "128Mi", "1")
