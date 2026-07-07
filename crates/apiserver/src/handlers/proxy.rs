@@ -1512,9 +1512,34 @@ pub async fn pod_proxy<S: Store>(
     pod_proxy_dispatch(&state, &ns, &pod_name, &path_suffix, req).await
 }
 
+/// Upstream kube-apiserver 301-redirects a bare `.../proxy` GET/HEAD (no trailing slash)
+/// to `.../proxy/` — relative links in proxied HTML are resolved against the request URL,
+/// so without the trailing slash they'd resolve one level too high. Other methods (and
+/// the trailing-slash form) proxy immediately; the conformance suite only checks GET/HEAD.
+fn redirect_bare_proxy_root(req: &axum::http::Request<Body>) -> Option<Response> {
+    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
+        return None;
+    }
+    let path = req.uri().path();
+    if path.ends_with('/') {
+        return None;
+    }
+    let location = match req.uri().query() {
+        Some(q) => format!("{path}/?{q}"),
+        None => format!("{path}/"),
+    };
+    Some(
+        Response::builder()
+            .status(axum::http::StatusCode::MOVED_PERMANENTLY)
+            .header(axum::http::header::LOCATION, location)
+            .body(Body::empty())
+            .expect("static redirect response must build"),
+    )
+}
+
 /// Proxy a request to the pod's IP and containerPort (no sub-path form).
 ///
-/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy  → http://{podIP}:{port}/
+/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy  → 301 Location: .../proxy/ (GET/HEAD only)
 /// GET /api/v1/namespaces/{ns}/pods/{name}/proxy/ → http://{podIP}:{port}/
 ///
 /// axum's `{*path}` wildcard requires a non-empty segment, so a dial to /proxy or /proxy/
@@ -1526,6 +1551,9 @@ pub async fn pod_proxy_root<S: Store>(
     Path((ns, pod_name)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
+    if let Some(redirect) = redirect_bare_proxy_root(&req) {
+        return Ok(redirect);
+    }
     pod_proxy_dispatch(&state, &ns, &pod_name, "", req).await
 }
 
@@ -1770,13 +1798,16 @@ pub async fn service_proxy<S: Store>(
 
 /// Proxy a request to a Service-backing endpoint (no sub-path form).
 ///
-/// GET /api/v1/namespaces/{ns}/services/{name}/proxy  → http://{endpointIP}:{port}/
+/// GET /api/v1/namespaces/{ns}/services/{name}/proxy  → 301 Location: .../proxy/ (GET/HEAD only)
 /// GET /api/v1/namespaces/{ns}/services/{name}/proxy/ → http://{endpointIP}:{port}/
 pub async fn service_proxy_root<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, svc_name)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
+    if let Some(redirect) = redirect_bare_proxy_root(&req) {
+        return Ok(redirect);
+    }
     service_proxy_dispatch(&state, &ns, &svc_name, "", req).await
 }
 
@@ -3105,8 +3136,13 @@ mod tests {
     /// The RC serve-image conformance test dials the pod proxy subresource without
     /// any sub-path. Before this fix, the route `/proxy/{*path}` required a
     /// non-empty segment so `/proxy` and `/proxy/` fell through to a 404.
-    /// We verify routing by seeding a pod with no podIP (which the handler
-    /// returns 503 for). 503 proves the handler was reached; 404 proves it was not.
+    ///
+    /// The bare `/proxy` form (no trailing slash) now 301-redirects to `/proxy/` for
+    /// GET (matching upstream and the sig-network Proxy conformance test); a plain
+    /// http.Client follows that redirect automatically, so WaitForPodsResponding still
+    /// reaches the pod. `/proxy/` reaches the handler directly and returns 503 (pod
+    /// exists but has no podIP) — 503 proves the handler was reached, 404 proves it
+    /// was not.
     #[tokio::test]
     async fn pod_proxy_root_path_routes_not_404_else_serve_image_conformance_fails() {
         let state = make_state();
@@ -3132,9 +3168,15 @@ mod tests {
 
         let mut router = make_router(state);
 
-        for path in [
-            "/api/v1/namespaces/default/pods/srv/proxy",
-            "/api/v1/namespaces/default/pods/srv/proxy/",
+        for (path, want) in [
+            (
+                "/api/v1/namespaces/default/pods/srv/proxy",
+                StatusCode::MOVED_PERMANENTLY,
+            ),
+            (
+                "/api/v1/namespaces/default/pods/srv/proxy/",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let req = Request::builder()
                 .uri(path)
@@ -3150,11 +3192,65 @@ mod tests {
             );
             assert_eq!(
                 resp.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "GET {path} must reach the proxy handler and return 503 \
-                 (pod exists but has no podIP) — any other status means routing is broken"
+                want,
+                "GET {path} must reach the proxy routing correctly — any other status \
+                 means routing or the bare-root redirect is broken"
             );
         }
+    }
+
+    /// redirect_bare_proxy_root must 301 a bare GET/HEAD `.../proxy` and preserve the
+    /// query string, but must not touch POST or the trailing-slash form.
+    ///
+    /// The sig-network Proxy conformance test dials `.../pods/<p>/proxy?method=GET` with
+    /// a client that does not follow redirects and asserts the raw status is 301; a
+    /// missing Location or a wrong status leaves relative links in proxied content
+    /// unresolvable and fails the conformance check.
+    #[test]
+    fn redirect_bare_proxy_root_redirects_get_head_only() {
+        let get_bare = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/p/proxy?method=GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = redirect_bare_proxy_root(&get_bare).expect("bare GET must redirect");
+        assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            resp.headers().get(axum::http::header::LOCATION).unwrap(),
+            "/api/v1/namespaces/default/pods/p/proxy/?method=GET",
+            "Location must point at the trailing-slash form and keep the query string"
+        );
+
+        let head_bare = Request::builder()
+            .method("HEAD")
+            .uri("/api/v1/namespaces/default/pods/p/proxy")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            redirect_bare_proxy_root(&head_bare).is_some(),
+            "HEAD must redirect the same as GET"
+        );
+
+        let post_bare = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/p/proxy")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            redirect_bare_proxy_root(&post_bare).is_none(),
+            "POST must proxy immediately, not redirect — only GET/HEAD are covered \
+             by the conformance check and a POST redirect would drop the request body"
+        );
+
+        let get_slash = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/p/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            redirect_bare_proxy_root(&get_slash).is_none(),
+            "the trailing-slash form is already canonical and must proxy directly"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4746,10 +4842,21 @@ mod tests {
 
         let mut router = make_router(state);
 
-        for path in [
-            "/api/v1/namespaces/default/services/my-svc/proxy",
-            "/api/v1/namespaces/default/services/my-svc/proxy/",
-            "/api/v1/namespaces/default/services/my-svc/proxy/some/subpath",
+        // The bare `/proxy` form (no trailing slash) 301-redirects for GET rather than
+        // proxying directly — matching upstream and the sig-network Proxy conformance test.
+        for (path, want) in [
+            (
+                "/api/v1/namespaces/default/services/my-svc/proxy",
+                StatusCode::MOVED_PERMANENTLY,
+            ),
+            (
+                "/api/v1/namespaces/default/services/my-svc/proxy/",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/api/v1/namespaces/default/services/my-svc/proxy/some/subpath",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ] {
             let req = Request::builder()
                 .uri(path)
@@ -4764,10 +4871,9 @@ mod tests {
             );
             assert_eq!(
                 resp.status(),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "GET {path} must reach the service proxy handler and return 503 \
-                 (service exists but has no ready endpoints) — any other status means \
-                 routing is broken"
+                want,
+                "GET {path} must reach the service proxy routing correctly — any other \
+                 status means routing or the bare-root redirect is broken"
             );
         }
     }

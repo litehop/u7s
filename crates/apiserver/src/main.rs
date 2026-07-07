@@ -6644,6 +6644,15 @@ mod tests {
             "/api/v1/namespaces/default/services/ghost/proxy/x",
         ];
 
+        // Bare `.../proxy` (no trailing slash, no sub-path) 301-redirects for HEAD (like
+        // GET) before the store lookup ever runs — the redirect is a URL-normalization
+        // step, not a proxy-target check, so it fires even for a target that doesn't
+        // exist. Every other path/verb combination still reaches the handler and 404s.
+        let bare_root_paths = [
+            "/api/v1/namespaces/default/pods/ghost/proxy",
+            "/api/v1/namespaces/default/services/ghost/proxy",
+        ];
+
         for method in [Method::PATCH, Method::OPTIONS, Method::HEAD] {
             for path in paths {
                 let req = Request::builder()
@@ -6659,11 +6668,17 @@ mod tests {
                      issues this verb and wait.PollImmediate()s on it for up to 1 minute \
                      before giving up, which is the wall-clock sink this fix removes"
                 );
+                let want = if method == Method::HEAD && bare_root_paths.contains(&path) {
+                    StatusCode::MOVED_PERMANENTLY
+                } else {
+                    StatusCode::NOT_FOUND
+                };
                 assert_eq!(
                     resp.status(),
-                    StatusCode::NOT_FOUND,
+                    want,
                     "{method} {path} must reach the proxy handler and 404 (target does \
-                     not exist) — any other status means the route never dispatched"
+                     not exist), or 301 for a bare-root HEAD — any other status means \
+                     the route never dispatched"
                 );
             }
         }
