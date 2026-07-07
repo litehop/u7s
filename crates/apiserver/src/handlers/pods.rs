@@ -562,6 +562,8 @@ pub async fn replace_pod<S: Store>(
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
+        .map_err(Status::unprocessable_entity)?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
@@ -3840,6 +3842,163 @@ pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
 /// wait for 99 phantom generations that will never arrive.
 pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
     pod["metadata"]["generation"] = serde_json::json!(1i64);
+}
+
+/// Set `target[key]` to match `source`'s value for `key`, including source's
+/// *absence* of the key.
+///
+/// `target[key] = source[key].clone()` looks equivalent but is not: indexing a
+/// missing key on `source` yields `Value::Null`, and assigning that via
+/// `IndexMut` autovivifies a brand-new `"key": null` entry on `target` even
+/// when `target` never had the key either — corrupting an otherwise-equal
+/// comparison against a `source` object that genuinely omits the key.
+fn sync_field(target: &mut serde_json::Value, source: &serde_json::Value, key: &str) {
+    match source.get(key) {
+        Some(v) => target[key] = v.clone(),
+        None => {
+            if let Some(m) = target.as_object_mut() {
+                m.remove(key);
+            }
+        }
+    }
+}
+
+/// Reject a pod-spec update to any field other than the narrow set upstream
+/// Kubernetes allows to change outside of a subresource (mirrors
+/// `ValidatePodUpdate` in `pkg/apis/core/validation`): `containers[*].image`,
+/// `initContainers[*].image`, `activeDeadlineSeconds` (decrease/set only),
+/// `tolerations` (additions only), and `terminationGracePeriodSeconds` (only
+/// to recover from a previously-negative value).
+///
+/// Everything else in spec — notably `containers[*].resources` — is immutable
+/// via the generic PUT/PATCH pod update. Resource resizing is only permitted
+/// through the `/resize` subresource (`validate_resize_patch` /
+/// `apply_resize_patch`), which additionally enforces QoS-class stability and
+/// resource-removal rules. Without this guard a client can rewrite
+/// containers[].resources via a plain PUT, bypassing those rules entirely and
+/// letting ResourceQuota's captured pod-creation totals go stale (the pod's
+/// resources on disk no longer match what quota admission accounted for).
+///
+/// Both sides are spec-defaulted the same way `increment_pod_generation_if_spec_changed`
+/// does, so a client PUT that omits already-defaulted fields (dnsPolicy,
+/// serviceAccountName, ...) isn't mistaken for an illegal spec change.
+pub fn validate_pod_spec_immutable(
+    spec_before: &serde_json::Value,
+    spec_after: &serde_json::Value,
+) -> Result<(), String> {
+    let mut old_pod = serde_json::json!({ "spec": spec_before.clone() });
+    apply_pod_spec_defaults(&mut old_pod);
+    let mut new_pod = serde_json::json!({ "spec": spec_after.clone() });
+    apply_pod_spec_defaults(&mut new_pod);
+    for spec in [&mut old_pod["spec"], &mut new_pod["spec"]] {
+        if let Some(m) = spec.as_object_mut() {
+            m.remove("automountServiceAccountToken");
+        }
+    }
+    let old_spec = &old_pod["spec"];
+    let new_spec = &new_pod["spec"];
+
+    if old_spec == new_spec {
+        return Ok(());
+    }
+
+    let old_containers = old_spec["containers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let new_containers = new_spec["containers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if old_containers.len() != new_containers.len() {
+        return Err(
+            "spec.containers: Forbidden: pod updates may not add or remove containers".into(),
+        );
+    }
+    let old_init = old_spec["initContainers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let new_init = new_spec["initContainers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if old_init.len() != new_init.len() {
+        return Err(
+            "spec.initContainers: Forbidden: pod updates may not add or remove containers".into(),
+        );
+    }
+
+    // Munge the allowed-mutable fields to their old values, then require the
+    // remaining spec to be byte-for-byte identical — same strategy upstream uses.
+    let mut munged = new_spec.clone();
+    if let Some(arr) = munged["containers"].as_array_mut() {
+        for (i, c) in arr.iter_mut().enumerate() {
+            c["image"] = old_containers[i]["image"].clone();
+        }
+    }
+    if let Some(arr) = munged["initContainers"].as_array_mut() {
+        for (i, c) in arr.iter_mut().enumerate() {
+            c["image"] = old_init[i]["image"].clone();
+        }
+    }
+
+    let old_ads = old_spec["activeDeadlineSeconds"].as_i64();
+    let new_ads = munged["activeDeadlineSeconds"].as_i64();
+    match (old_ads, new_ads) {
+        (Some(old), Some(new)) if new > old => {
+            return Err("spec.activeDeadlineSeconds: Forbidden: must be less than \
+                         or equal to previous value"
+                .into());
+        }
+        (Some(_), None) => {
+            return Err(
+                "spec.activeDeadlineSeconds: Forbidden: must not update from \
+                         a positive integer to nil value"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    sync_field(&mut munged, old_spec, "activeDeadlineSeconds");
+
+    let old_tolerations = old_spec["tolerations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let new_tolerations = munged["tolerations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for t in &old_tolerations {
+        if !new_tolerations.contains(t) {
+            return Err(
+                "spec.tolerations: Forbidden: existing tolerations may not be \
+                         removed or modified"
+                    .into(),
+            );
+        }
+    }
+    sync_field(&mut munged, old_spec, "tolerations");
+
+    if old_spec["terminationGracePeriodSeconds"]
+        .as_i64()
+        .is_some_and(|v| v < 0)
+        && munged["terminationGracePeriodSeconds"].as_i64() == Some(1)
+    {
+        sync_field(&mut munged, old_spec, "terminationGracePeriodSeconds");
+    }
+
+    if munged != *old_spec {
+        return Err(
+            "spec: Forbidden: pod updates may not change fields other than \
+             `spec.containers[*].image`, `spec.initContainers[*].image`, \
+             `spec.activeDeadlineSeconds`, `spec.tolerations` (only additions), \
+             `spec.terminationGracePeriodSeconds`"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Increment `metadata.generation` by 1 when the pod spec has changed.
@@ -8939,6 +9098,221 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod — pod-spec immutability guard (resources only via /resize)
+    // -----------------------------------------------------------------------
+
+    /// PUT that rewrites containers[].resources via the generic pod update must be
+    /// rejected with 422, not silently accepted.
+    ///
+    /// Resource changes are only allowed through the /resize subresource, which
+    /// additionally enforces QoS-class stability and forbids removing resource
+    /// quantities. Accepting resource rewrites here would let a client bypass those
+    /// rules and desync ResourceQuota's captured totals from the pod actually stored
+    /// (ResourceQuota conformance: "a pod cannot update its resource requirements").
+    #[tokio::test]
+    async fn replace_pod_rejects_resource_changes() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/resourceful-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resourceful-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "resourceful-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "200m"}, "requests": {"cpu": "200m"}}
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/resourceful-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a generic PUT rewriting containers[].resources must be rejected — \
+             resources may only change via the /resize subresource"
+        );
+
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "100m",
+            "rejected PUT must not have mutated the stored pod's resources"
+        );
+    }
+
+    /// PUT that changes only the container image (resources unchanged) must succeed.
+    ///
+    /// The immutability guard must not reject legitimate updates — image is the
+    /// canonical "rolling restart" field clients update via a generic PUT/PATCH.
+    #[tokio::test]
+    async fn replace_pod_allows_image_only_change() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/resourceful-pod2";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resourceful-pod2", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "resourceful-pod2",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx:latest",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/resourceful-pod2")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an image-only change must succeed — the immutability guard must not \
+             reject updates to fields upstream explicitly allows"
+        );
+    }
+
+    /// The /resize subresource must still accept resource changes after the generic
+    /// PUT immutability guard is added — the guard lives in replace_pod only and must
+    /// not leak into patch_pod_resize, which is the one sanctioned path for resizing.
+    #[tokio::test]
+    async fn resize_subresource_still_allows_resource_changes() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/resourceful-pod3";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resourceful-pod3", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                patch(patch_pod_resize).put(patch_pod_resize),
+            )
+            .with_state(state);
+
+        let resize_body = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {"limits": {"cpu": "200m"}, "requests": {"cpu": "200m"}}
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/resourceful-pod3/resize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&resize_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /resize must still succeed — the generic-PUT immutability guard \
+             must not block the one endpoint that is supposed to allow resizing"
+        );
+
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
+            "resize must actually apply the new resources"
+        );
     }
 
     // -----------------------------------------------------------------------
