@@ -1331,6 +1331,9 @@ pub async fn openapi_v2<S: Store>(
             let kind = &crd.spec.names.kind;
             let reversed: String = group.split('.').rev().collect::<Vec<_>>().join(".");
             for ver in &crd.spec.versions {
+                if !ver.served {
+                    continue;
+                }
                 let key = format!("{}.{}.{}", reversed, ver.name, kind);
                 let mut def = serde_json::json!({
                     "type": "object",
@@ -1443,6 +1446,7 @@ pub async fn openapi_v3_group<S: Store>(
     };
 
     let mut schemas = serde_json::Map::new();
+    let mut paths = serde_json::Map::new();
 
     for obj in &resp.items {
         let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
@@ -1455,14 +1459,47 @@ pub async fn openapi_v3_group<S: Store>(
             if ver.name != version || !ver.served {
                 continue;
             }
-            let schema = ver
+            let mut schema = ver
                 .schema
                 .as_ref()
                 .and_then(|s| s.get("openAPIV3Schema"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
             let kind = &crd.spec.names.kind;
+            let gvk = serde_json::json!({
+                "group": group,
+                "version": version,
+                "kind": kind
+            });
+            // kubectl explain's OpenAPI v3 plaintext template filters
+            // components.schemas by this extension to find the schema for a
+            // resolved GVK; without it the schema is unreachable even though
+            // it is present in the document.
+            if let Some(schema_obj) = schema.as_object_mut() {
+                schema_obj.insert(
+                    "x-kubernetes-group-version-kind".to_string(),
+                    serde_json::json!([gvk.clone()]),
+                );
+            }
             schemas.insert(kind.clone(), schema);
+
+            // kubectl explain resolves the GVK for a GVR by scanning `paths`
+            // for the resource's REST path before ever looking at
+            // components.schemas; an empty `paths` document makes explain
+            // fail with "GVR (...) not found in OpenAPI schema" even when
+            // the schema itself is fully populated.
+            let plural = &crd.spec.names.plural;
+            let path_key = if crd.spec.scope == "Namespaced" {
+                format!("/apis/{group}/{version}/namespaces/{{namespace}}/{plural}")
+            } else {
+                format!("/apis/{group}/{version}/{plural}")
+            };
+            paths.insert(
+                path_key,
+                serde_json::json!({
+                    "get": { "x-kubernetes-group-version-kind": gvk }
+                }),
+            );
         }
     }
 
@@ -1473,7 +1510,7 @@ pub async fn openapi_v3_group<S: Store>(
     Json(serde_json::json!({
         "openapi": "3.0.0",
         "info": { "title": format!("{}/{}", group, version), "version": "v1" },
-        "paths": {},
+        "paths": paths,
         "components": { "schemas": schemas }
     }))
     .into_response()
@@ -3177,6 +3214,61 @@ mod tests {
         );
     }
 
+    // /openapi/v2 must omit definitions for CRD versions that are not served.
+    // The CustomResourcePublishOpenAPI conformance test flips a version's
+    // `served` to false and polls /openapi/v2 waiting for that version's
+    // definition to disappear; a handler that includes every version
+    // unconditionally never satisfies that wait and the test times out.
+    #[tokio::test]
+    async fn openapi_v2_omits_definition_for_unserved_crd_version() {
+        let state = make_state();
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "multis.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "multis", "singular": "multi", "kind": "Multi" },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v5", "served": true, "storage": true },
+                        { "name": "v6alpha1", "served": false, "storage": false }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create_crd must succeed");
+
+        let resp = openapi_v2(State(state), axum::http::HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let defs = doc["definitions"].as_object().expect("definitions object");
+
+        assert!(
+            defs.contains_key("io.example.v5.Multi"),
+            "served version v5 must still have a definition; got keys: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !defs.contains_key("io.example.v6alpha1.Multi"),
+            "unserved version v6alpha1 must NOT have a definition — conformance test \
+             polls for its removal once served is set to false; got keys: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
     // create_crd must stamp status.conditions Established=True and NamesAccepted=True
     // so that controllers (e.g. kube-controller-manager CRD controller) do not wait
     // for a separate status update that never comes in u7s's single-process model.
@@ -3458,6 +3550,94 @@ mod tests {
             "Widget.spec.properties.replicas must be type=integer — the CEL type-checker reads \
              this to validate CRD instances; got: {replicas_type:?}"
         );
+    }
+
+    // components.schemas.<Kind> in /openapi/v3/apis/<group>/<version> must carry
+    // x-kubernetes-group-version-kind. kubectl explain's OpenAPI v3 plaintext
+    // template locates a resource's schema by filtering components.schemas for
+    // an entry whose x-kubernetes-group-version-kind matches the resolved GVK —
+    // without this extension the schema is unreachable and `kubectl explain <cr>`
+    // fails with "GVK ... not found in OpenAPI schema" even though the schema
+    // content itself (properties, description, etc.) is present in the document.
+    #[tokio::test]
+    async fn openapi_v3_group_schema_carries_group_version_kind_extension() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("probe.example.com", "widgets", "Widget", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("probe.example.com".to_string(), "v1".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let gvk = &val["components"]["schemas"]["Widget"]["x-kubernetes-group-version-kind"][0];
+        assert_eq!(
+            gvk["group"], "probe.example.com",
+            "Widget schema must carry its group in x-kubernetes-group-version-kind — \
+             kubectl explain cannot resolve the schema without it"
+        );
+        assert_eq!(gvk["version"], "v1");
+        assert_eq!(gvk["kind"], "Widget");
+    }
+
+    // /openapi/v3/apis/<group>/<version> must include a `paths` entry for the CRD's
+    // REST resource whose operation carries x-kubernetes-group-version-kind.
+    // kubectl explain's plaintext template resolves the target GVK by scanning
+    // `paths` for the requested GVR *before* it ever looks at components.schemas —
+    // an empty `paths` object (the prior behavior) makes `kubectl explain <cr>`
+    // fail with "GVR (...) not found in OpenAPI schema" even when the schema
+    // itself is fully populated in components.schemas.
+    #[tokio::test]
+    async fn openapi_v3_group_paths_resolves_gvk_for_resource() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("probe.example.com", "widgets", "Widget", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("probe.example.com".to_string(), "v1".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let paths = val["paths"].as_object().expect("paths must be an object");
+
+        let expected_path = "/apis/probe.example.com/v1/namespaces/{namespace}/widgets";
+        let op = paths.get(expected_path).unwrap_or_else(|| {
+            panic!(
+                "paths must contain '{expected_path}' (widgets CRD is Namespaced) — \
+                 kubectl explain scans this map to resolve the GVK for the requested \
+                 resource before it can look up the schema; got keys: {:?}",
+                paths.keys().collect::<Vec<_>>()
+            )
+        });
+        let gvk = &op["get"]["x-kubernetes-group-version-kind"];
+        assert_eq!(gvk["group"], "probe.example.com");
+        assert_eq!(gvk["version"], "v1");
+        assert_eq!(gvk["kind"], "Widget");
     }
 
     // /openapi/v3/apis/<group>/<version> must return 404 when no CRD matches.
