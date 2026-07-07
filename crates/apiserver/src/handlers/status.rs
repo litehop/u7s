@@ -342,11 +342,14 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 }
 
 /// Validate that every op in a JSON Patch sent to a /status subresource targets
-/// only `/status/...` or `/metadata/...`. A client with `patch <res>/status` must
-/// not be able to write spec — that is privilege escalation.
+/// only `/status/...`. A client with `patch <res>/status` must not be able to write
+/// spec OR metadata via this endpoint — both are privilege escalation: `/spec` lets a
+/// status-only grant control the resource's desired state, and `/metadata` (e.g.
+/// `/metadata/labels`) lets it rewrite labels that drive policy decisions elsewhere
+/// (for Namespace, the pod-security.kubernetes.io/enforce label PSA reads).
 ///
-/// Returns 422 if any op path is outside the allowed prefixes.
-fn validate_status_json_patch_paths(
+/// Returns 422 if any op path is outside `/status`.
+pub(crate) fn validate_status_json_patch_paths(
     patch: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
     let ops = patch
@@ -356,13 +359,9 @@ fn validate_status_json_patch_paths(
         let path = op["path"].as_str().ok_or_else(|| {
             Status::unprocessable_entity("JSON patch op missing 'path' field".into())
         })?;
-        if !path.starts_with("/status/")
-            && path != "/status"
-            && !path.starts_with("/metadata/")
-            && path != "/metadata"
-        {
+        if !path.starts_with("/status/") && path != "/status" {
             return Err(Status::unprocessable_entity(format!(
-                "JSON patch on /status subresource may only target /status or /metadata paths; got '{path}'"
+                "JSON patch on /status subresource may only target /status paths; got '{path}'"
             )));
         }
     }

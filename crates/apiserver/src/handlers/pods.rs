@@ -763,6 +763,12 @@ pub async fn patch_pod<S: Store>(
         // cannot downgrade it. generation is server-managed; only increment
         // (on spec change) is allowed, never client override.
         let stored_generation = current_obj.body["metadata"]["generation"].clone();
+        // Save the stored status: status.phase/podIP/conditions/etc are written via the
+        // /status subresource, a distinct RBAC grant from `patch pods`. Without restoring
+        // it after the patch, a caller with only main-resource patch rights could forge
+        // status through this endpoint (e.g. fake a pod Ready+podIP), for ANY patch type
+        // including JSON Patch, whose array shape can't be caught by an object-key strip.
+        let stored_status = current_obj.body["status"].clone();
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
@@ -776,6 +782,8 @@ pub async fn patch_pod<S: Store>(
                 super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
             }
         }
+
+        current_obj.body["status"] = stored_status;
 
         // Restore the stored generation before computing the increment so that
         // a patch attempting to set generation is ignored.
@@ -8392,6 +8400,100 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A strategic-merge-patch PATCH on the MAIN pod endpoint that sets status.phase
+    /// must not change status — `patch pods` and `patch pods/status` are separate RBAC
+    /// grants. Without a status snapshot/restore, a caller with only main-patch rights
+    /// could forge status.phase (e.g. fake Ready) and mislead schedulers/controllers.
+    #[tokio::test]
+    async fn patch_pod_strategic_merge_cannot_forge_status_on_main_endpoint() {
+        use axum::body::to_bytes;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"status": {"phase": "Pending"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"status": {"phase": "Running"}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Pending",
+            "main-endpoint strategic-merge PATCH must not forge status.phase — a caller \
+             with only `patch pods` (no pods/status grant) must not be able to fake Ready"
+        );
+    }
+
+    /// A JSON Patch on the MAIN pod endpoint targeting /status must not change status.
+    /// JSON Patch is an array, so any object-key "status" strip on the incoming patch
+    /// body would never catch it — the guard must snapshot/restore around the apply.
+    #[tokio::test]
+    async fn patch_pod_json_patch_cannot_forge_status_on_main_endpoint() {
+        use axum::body::to_bytes;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"status": {"phase": "Pending", "podIP": ""}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!([
+            { "op": "replace", "path": "/status/phase", "value": "Running" },
+            { "op": "replace", "path": "/status/podIP", "value": "10.0.0.99" }
+        ]);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/json-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Pending",
+            "main-endpoint JSON Patch must not forge status.phase via the array-shaped \
+             patch that bypasses an object-key strip"
+        );
+        assert_eq!(
+            v["status"]["podIP"], "",
+            "main-endpoint JSON Patch must not forge status.podIP — a fake pod IP could \
+             be used to redirect traffic intended for the real pod"
+        );
     }
 
     /// PATCH with an unsupported content-type must return 415.

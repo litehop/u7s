@@ -1982,28 +1982,33 @@ pub async fn patch_cr<S: Store>(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
+    // Snapshot .status before applying the patch: status is a separate RBAC subresource
+    // (`<crd>/status`), so a main-endpoint patch must never change it — including via
+    // JSON Patch, whose array shape slips past an object-key "status" strip.
+    let stored_status = if ctx.has_status_subresource {
+        Some(obj["status"].clone())
+    } else {
+        None
+    };
+
     match patch_type {
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
         crate::handlers::json_patch::PatchType::StrategicMerge => {
-            let mut patch = patch;
-            if ctx.has_status_subresource {
-                if let Some(map) = patch.as_object_mut() {
-                    map.remove("status");
-                }
-            }
             crate::patch::strategic_merge_patch(&mut obj, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
         crate::handlers::json_patch::PatchType::Merge => {
-            let mut patch = patch;
-            if ctx.has_status_subresource {
-                if let Some(map) = patch.as_object_mut() {
-                    map.remove("status");
-                }
-            }
             crate::patch::merge_patch(&mut obj, &patch);
+        }
+    }
+
+    if let Some(s) = stored_status {
+        if s.is_null() {
+            obj.as_object_mut().map(|m| m.remove("status"));
+        } else {
+            obj["status"] = s;
         }
     }
 
@@ -2137,28 +2142,33 @@ pub async fn patch_cr_namespaced<S: Store>(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
+    // Snapshot .status before applying the patch: status is a separate RBAC subresource
+    // (`<crd>/status`), so a main-endpoint patch must never change it — including via
+    // JSON Patch, whose array shape slips past an object-key "status" strip.
+    let stored_status = if ctx.has_status_subresource {
+        Some(obj["status"].clone())
+    } else {
+        None
+    };
+
     match patch_type {
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
         crate::handlers::json_patch::PatchType::StrategicMerge => {
-            let mut patch = patch;
-            if ctx.has_status_subresource {
-                if let Some(map) = patch.as_object_mut() {
-                    map.remove("status");
-                }
-            }
             crate::patch::strategic_merge_patch(&mut obj, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
         crate::handlers::json_patch::PatchType::Merge => {
-            let mut patch = patch;
-            if ctx.has_status_subresource {
-                if let Some(map) = patch.as_object_mut() {
-                    map.remove("status");
-                }
-            }
             crate::patch::merge_patch(&mut obj, &patch);
+        }
+    }
+
+    if let Some(s) = stored_status {
+        if s.is_null() {
+            obj.as_object_mut().map(|m| m.remove("status"));
+        } else {
+            obj["status"] = s;
         }
     }
 
@@ -5068,6 +5078,87 @@ mod tests {
         assert!(
             obj["status"].is_null() || obj.get("status").is_none(),
             "status must NOT be stored by main PATCH when status subresource is declared"
+        );
+    }
+
+    // A JSON Patch to the MAIN cluster-scoped CR endpoint targeting /status must not
+    // change status — `patch widgets` and `patch widgets/status` are separate RBAC
+    // grants. JSON Patch is an array, so the object-key "status" strip used for
+    // merge/strategic patches never sees it; the guard must snapshot/restore instead.
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_json_patch_cannot_forge_existing_status() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "json-patch-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // A controller legitimately sets status via /status first.
+        assert!(
+            put_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                axum::http::HeaderMap::new(),
+                Bytes::from(serde_json::json!({ "status": { "ready": false } }).to_string()),
+            )
+            .await
+            .is_ok(),
+            "put_cr_status must succeed"
+        );
+
+        // A caller with only `patch widgets` (no widgets/status grant) tries to
+        // forge readiness via a JSON Patch on the main endpoint.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(
+            serde_json::json!([{ "op": "replace", "path": "/status/ready", "value": true }])
+                .to_string(),
+        );
+
+        assert!(
+            patch_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "main-endpoint JSON Patch must succeed"
+        );
+
+        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["status"]["ready"], false,
+            "a JSON Patch on the main CR endpoint must not forge status.ready — status \
+             is a separate RBAC subresource, letting a main-patch-only caller flip it \
+             would let it lie about readiness to consumers watching the CR"
         );
     }
 

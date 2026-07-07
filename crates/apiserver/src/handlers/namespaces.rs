@@ -675,6 +675,11 @@ pub async fn patch_namespace_status<S: Store>(
 
     match patch_type {
         PatchType::Json => {
+            // /status is a separate RBAC subresource from the main Namespace endpoint —
+            // for Namespace this also guards Pod Security Admission: a caller with only
+            // `namespaces/status` must not be able to rewrite the enforce/warn/audit
+            // labels under /metadata/labels via a JSON Patch on this endpoint.
+            crate::handlers::status::validate_status_json_patch_paths(&patch)?;
             apply_json_patch(&mut current.body, &patch)?;
         }
         _ => {
@@ -3079,6 +3084,171 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-patch-ns",
             "metadata must be unchanged after PATCH /status"
+        );
+    }
+
+    /// A JSON Patch targeting only /status must still be accepted on the /status endpoint.
+    ///
+    /// This is the companion happy-path to the rejection tests below: the path guard must
+    /// not be so strict that it blocks legitimate status-only JSON Patches (e.g. KCM
+    /// appending a condition via JSON Patch instead of merge-patch).
+    #[tokio::test]
+    async fn patch_namespace_status_json_patch_touching_only_status_succeeds() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("json-status-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!([
+                { "op": "add", "path": "/status/phase", "value": "Active" }
+            ])
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace_status(
+                State(state.clone()),
+                Path("json-status-ns".to_string()),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "a JSON Patch touching only /status must be accepted on the /status endpoint"
+        );
+    }
+
+    /// A JSON Patch to .../namespaces/{ns}/status targeting /metadata/labels must be
+    /// REJECTED — /status is a separate RBAC subresource from the main Namespace
+    /// endpoint, and for Namespace this is a concrete Pod Security Admission bypass:
+    /// a caller with only `namespaces/status` rights could otherwise rewrite the
+    /// pod-security.kubernetes.io/enforce label to weaken or disable PSA for the
+    /// namespace without ever touching the main PATCH/PUT endpoint.
+    #[tokio::test]
+    async fn patch_namespace_status_json_patch_rejects_metadata_labels() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("psa-bypass-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!([
+                {
+                    "op": "add",
+                    "path": "/metadata/labels",
+                    "value": { "pod-security.kubernetes.io/enforce": "privileged" }
+                }
+            ])
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        let err = match patch_namespace_status(
+            State(state.clone()),
+            Path("psa-bypass-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await
+        {
+            Ok(_) => panic!(
+                "a JSON Patch on /status targeting /metadata/labels must be rejected — \
+                 otherwise a status-only grant lets a caller rewrite the PSA enforce \
+                 label and bypass Pod Security Admission for the namespace"
+            ),
+            Err(e) => e,
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "rejection must be 422 Unprocessable Entity (same as status.rs's generic guard)"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "psa-bypass-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            body["metadata"]["labels"]["pod-security.kubernetes.io/enforce"].is_null(),
+            "the PSA enforce label must NOT have been written by the rejected status patch"
+        );
+    }
+
+    /// A JSON Patch to .../namespaces/{ns}/status targeting /spec must be REJECTED —
+    /// same RBAC-isolation rule as /metadata, generalized: spec is never reachable via
+    /// the status subresource, regardless of whether the resource even has a spec.
+    #[tokio::test]
+    async fn patch_namespace_status_json_patch_rejects_spec() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("spec-bypass-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!([
+                { "op": "add", "path": "/spec/finalizers", "value": [] }
+            ])
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace_status(
+                State(state.clone()),
+                Path("spec-bypass-ns".to_string()),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_err(),
+            "a JSON Patch on /status targeting /spec must be rejected"
         );
     }
 
