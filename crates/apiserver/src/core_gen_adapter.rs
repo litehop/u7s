@@ -611,6 +611,89 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     serde_json::Value::Object(cm)
 }
 
+/// EphemeralContainer (PodSpec.ephemeralContainers, proto field 34) — decoded so that
+/// UpdateEphemeralContainers (which client-go sends as protobuf) round-trips the debug
+/// container a user attaches via `kubectl debug`/the ephemeralcontainers subresource.
+/// apply_ephemeral_containers_patch (pods.rs) merges on "name", so name/image/command are
+/// the fields conformance actually asserts on; env/volumeMounts are included for parity
+/// with the regular container decode.
+fn gen_ephemeral_container_to_json(ec: core_v1::EphemeralContainer) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(tcn) = ec.target_container_name.filter(|s| !s.is_empty()) {
+        m.insert(
+            "targetContainerName".to_string(),
+            serde_json::Value::String(tcn),
+        );
+    }
+    let Some(c) = ec.ephemeral_container_common else {
+        return serde_json::Value::Object(m);
+    };
+    if let Some(v) = c.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = c.image.filter(|s| !s.is_empty()) {
+        m.insert("image".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = c.image_pull_policy.filter(|s| !s.is_empty()) {
+        m.insert("imagePullPolicy".to_string(), serde_json::Value::String(v));
+    }
+    if !c.command.is_empty() {
+        m.insert(
+            "command".to_string(),
+            serde_json::Value::Array(
+                c.command
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !c.args.is_empty() {
+        m.insert(
+            "args".to_string(),
+            serde_json::Value::Array(c.args.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    if !c.env.is_empty() {
+        let env_json: Vec<serde_json::Value> = c
+            .env
+            .into_iter()
+            .map(|ev| {
+                let mut em = serde_json::Map::new();
+                if let Some(v) = ev.name.filter(|s| !s.is_empty()) {
+                    em.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = ev.value.filter(|s| !s.is_empty()) {
+                    em.insert("value".to_string(), serde_json::Value::String(v));
+                }
+                serde_json::Value::Object(em)
+            })
+            .collect();
+        m.insert("env".to_string(), serde_json::Value::Array(env_json));
+    }
+    if !c.volume_mounts.is_empty() {
+        let mounts: Vec<serde_json::Value> = c
+            .volume_mounts
+            .into_iter()
+            .map(|vm| {
+                let mut vmm = serde_json::Map::new();
+                if let Some(v) = vm.name.filter(|s| !s.is_empty()) {
+                    vmm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = vm.mount_path.filter(|s| !s.is_empty()) {
+                    vmm.insert("mountPath".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(true) = vm.read_only {
+                    vmm.insert("readOnly".to_string(), serde_json::Value::Bool(true));
+                }
+                serde_json::Value::Object(vmm)
+            })
+            .collect();
+        m.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
+    }
+    serde_json::Value::Object(m)
+}
+
 pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value {
     let containers: Vec<serde_json::Value> = spec
         .containers
@@ -761,6 +844,14 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     if let Some(rp) = spec.restart_policy.filter(|s| !s.is_empty()) {
         spec_map.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
     }
+    // dnsPolicy — without this, an explicit "None" (required to make dnsConfig authoritative
+    // instead of merged/appended) is silently dropped, create-defaulting stamps "ClusterFirst"
+    // instead, and the kubelet ignores dnsConfig.nameservers because ClusterFirst's own
+    // resolv.conf generation takes precedence — live-verified: "should support configurable
+    // pod DNS nameservers" fails this way even though dnsConfig itself decodes correctly.
+    if let Some(dp) = spec.dns_policy.filter(|s| !s.is_empty()) {
+        spec_map.insert("dnsPolicy".to_string(), serde_json::Value::String(dp));
+    }
     if let Some(ads) = spec.active_deadline_seconds {
         if ads > 0 {
             spec_map.insert(
@@ -852,6 +943,105 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     // Without this field, the scheduler cannot perform preemption ordering correctly.
     if let Some(p) = spec.priority.filter(|&v| v != 0) {
         spec_map.insert("priority".to_string(), serde_json::Value::Number(p.into()));
+    }
+    // hostNetwork — the kubelet reads this to decide whether to share the host network
+    // namespace; dropping it makes KubeletManagedEtcHosts and hostPort-on-hostNetwork
+    // behavior silently wrong for every protobuf-created pod.
+    if let Some(hn) = spec.host_network {
+        spec_map.insert("hostNetwork".to_string(), serde_json::Value::Bool(hn));
+    }
+    // automountServiceAccountToken — pod-level override of the ServiceAccount default;
+    // dropping it means a pod that explicitly opted out of token automount gets one anyway.
+    if let Some(v) = spec.automount_service_account_token {
+        spec_map.insert(
+            "automountServiceAccountToken".to_string(),
+            serde_json::Value::Bool(v),
+        );
+    }
+    // hostAliases — injected into the pod's /etc/hosts by the kubelet; dropping this means
+    // the extra host entries a pod asked for silently never appear.
+    if !spec.host_aliases.is_empty() {
+        let aliases: Vec<serde_json::Value> = spec
+            .host_aliases
+            .into_iter()
+            .map(|ha| {
+                let mut m = serde_json::Map::new();
+                if let Some(ip) = ha.ip.filter(|s| !s.is_empty()) {
+                    m.insert("ip".to_string(), serde_json::Value::String(ip));
+                }
+                if !ha.hostnames.is_empty() {
+                    m.insert(
+                        "hostnames".to_string(),
+                        serde_json::Value::Array(
+                            ha.hostnames
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        spec_map.insert("hostAliases".to_string(), serde_json::Value::Array(aliases));
+    }
+    // dnsConfig — merged with dnsPolicy by the kubelet to build the pod's resolv.conf;
+    // dropping this silently discards user-specified nameservers/search/options.
+    if let Some(dc) = spec.dns_config {
+        let mut m = serde_json::Map::new();
+        if !dc.nameservers.is_empty() {
+            m.insert(
+                "nameservers".to_string(),
+                serde_json::Value::Array(
+                    dc.nameservers
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !dc.searches.is_empty() {
+            m.insert(
+                "searches".to_string(),
+                serde_json::Value::Array(
+                    dc.searches
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !dc.options.is_empty() {
+            let opts: Vec<serde_json::Value> = dc
+                .options
+                .into_iter()
+                .map(|o| {
+                    let mut om = serde_json::Map::new();
+                    if let Some(n) = o.name.filter(|s| !s.is_empty()) {
+                        om.insert("name".to_string(), serde_json::Value::String(n));
+                    }
+                    if let Some(v) = o.value.filter(|s| !s.is_empty()) {
+                        om.insert("value".to_string(), serde_json::Value::String(v));
+                    }
+                    serde_json::Value::Object(om)
+                })
+                .collect();
+            m.insert("options".to_string(), serde_json::Value::Array(opts));
+        }
+        spec_map.insert("dnsConfig".to_string(), serde_json::Value::Object(m));
+    }
+    // ephemeralContainers — needed so UpdateEphemeralContainers (protobuf by default in
+    // client-go) round-trips the debug container through apply_ephemeral_containers_patch.
+    if !spec.ephemeral_containers.is_empty() {
+        let ecs: Vec<serde_json::Value> = spec
+            .ephemeral_containers
+            .into_iter()
+            .map(gen_ephemeral_container_to_json)
+            .collect();
+        spec_map.insert(
+            "ephemeralContainers".to_string(),
+            serde_json::Value::Array(ecs),
+        );
     }
     serde_json::Value::Object(spec_map)
 }
@@ -2292,6 +2482,122 @@ mod tests {
         assert_eq!(
             volumes[0]["image"]["pullPolicy"], "Always",
             "spec.volumes[].image.pullPolicy must survive decode"
+        );
+    }
+
+    /// PodSpec hostNetwork/hostAliases/dnsConfig/dnsPolicy/ephemeralContainers/
+    /// automountServiceAccountToken all survive protobuf decode, and enableServiceLinks
+    /// (field 30) does not collide with dnsConfig (field 26) — both must decode correctly
+    /// when set together.
+    ///
+    /// Without this, DNS 'configurable pod DNS nameservers', hostAliases '/etc/hosts entries',
+    /// KubeletManagedEtcHosts (hostNetwork), ephemeral-containers update, and ServiceAccount
+    /// 'opting out of API token automount' all silently fail for every protobuf client
+    /// (client-go typed clientsets + the e2e suite), even though kubectl (JSON) looks fine.
+    #[test]
+    fn generated_pod_spec_preserves_dns_hostaliases_ephemeral_and_automount_fields() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("full-spec-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_network: Some(true),
+                automount_service_account_token: Some(false),
+                enable_service_links: Some(false),
+                dns_policy: Some("None".to_string()),
+                host_aliases: vec![core_v1::HostAlias {
+                    ip: Some("127.0.0.1".to_string()),
+                    hostnames: vec!["foo.local".to_string(), "bar.local".to_string()],
+                }],
+                dns_config: Some(core_v1::PodDnsConfig {
+                    nameservers: vec!["1.2.3.4".to_string()],
+                    searches: vec!["ns1.svc.cluster.local".to_string()],
+                    options: vec![core_v1::PodDnsConfigOption {
+                        name: Some("ndots".to_string()),
+                        value: Some("2".to_string()),
+                    }],
+                }),
+                ephemeral_containers: vec![core_v1::EphemeralContainer {
+                    ephemeral_container_common: Some(core_v1::EphemeralContainerCommon {
+                        name: Some("debugger".to_string()),
+                        image: Some("busybox".to_string()),
+                        ..Default::default()
+                    }),
+                    target_container_name: Some("c".to_string()),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with full spec must decode");
+
+        assert_eq!(
+            result["spec"]["hostNetwork"], true,
+            "hostNetwork must survive decode — without it KubeletManagedEtcHosts and \
+             hostPort-on-hostNetwork behavior is silently wrong"
+        );
+        assert_eq!(
+            result["spec"]["automountServiceAccountToken"], false,
+            "pod-level automountServiceAccountToken=false must survive decode — otherwise a \
+             pod that explicitly opted out of token automount gets one anyway"
+        );
+        assert_eq!(
+            result["spec"]["enableServiceLinks"], false,
+            "enableServiceLinks must survive decode unaffected by dnsConfig sharing no tag \
+             with it (26 vs 30) — a regression here would mean either field corrupts the other"
+        );
+        assert_eq!(
+            result["spec"]["dnsPolicy"], "None",
+            "dnsPolicy=\"None\" must survive decode — without it, create-defaulting stamps \
+             \"ClusterFirst\" instead, and the kubelet then ignores dnsConfig.nameservers \
+             entirely because ClusterFirst's own resolv.conf generation takes precedence \
+             (live-verified: this is why 'configurable pod DNS nameservers' fails even when \
+             dnsConfig itself decodes correctly)"
+        );
+        assert_eq!(
+            result["spec"]["hostAliases"][0]["ip"], "127.0.0.1",
+            "hostAliases[].ip must survive decode — otherwise requested /etc/hosts entries \
+             never reach the kubelet"
+        );
+        assert_eq!(
+            result["spec"]["hostAliases"][0]["hostnames"][1], "bar.local",
+            "hostAliases[].hostnames must survive decode in full"
+        );
+        assert_eq!(
+            result["spec"]["dnsConfig"]["nameservers"][0], "1.2.3.4",
+            "dnsConfig.nameservers must survive decode — without it, user-specified DNS \
+             nameservers are silently dropped and the kubelet falls back to cluster defaults"
+        );
+        assert_eq!(
+            result["spec"]["dnsConfig"]["searches"][0], "ns1.svc.cluster.local",
+            "dnsConfig.searches must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["dnsConfig"]["options"][0]["name"], "ndots",
+            "dnsConfig.options must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["ephemeralContainers"][0]["name"], "debugger",
+            "ephemeralContainers must survive decode — apply_ephemeral_containers_patch's \
+             merge logic is correct but never runs if the field is dropped on decode"
+        );
+        assert_eq!(
+            result["spec"]["ephemeralContainers"][0]["image"], "busybox",
+            "ephemeralContainers[].image must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["ephemeralContainers"][0]["targetContainerName"], "c",
+            "ephemeralContainers[].targetContainerName must survive decode"
         );
     }
 }
