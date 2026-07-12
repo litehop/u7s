@@ -233,7 +233,7 @@ pub fn extract_client_cert_identity(der: &[u8]) -> Option<UserInfo> {
         .map_err(|e| tracing::debug!("x509 cert parse failed: {e}"))
         .ok()?;
 
-    let subject = &cert.tbs_certificate.subject;
+    let subject = cert.tbs_certificate().subject();
 
     let mut username = None;
     let mut groups = Vec::new();
@@ -244,23 +244,21 @@ pub fn extract_client_cert_identity(der: &[u8]) -> Option<UserInfo> {
     const OID_CN: &str = "2.5.4.3";
     const OID_O: &str = "2.5.4.10";
 
-    for rdn in subject.0.iter() {
-        for atv in rdn.0.iter() {
-            let oid_str = atv.oid.to_string();
-            if oid_str != OID_CN && oid_str != OID_O {
-                continue;
-            }
-            // Decode the Any value as one of the legal string types for subject
-            // attributes.  Try UTF8String first (most common in modern certs),
-            // then PrintableString, then IA5String.
-            let value = atv_string(&atv.value);
-            let Some(value) = value else { continue };
+    for atv in subject.iter() {
+        let oid_str = atv.oid.to_string();
+        if oid_str != OID_CN && oid_str != OID_O {
+            continue;
+        }
+        // Decode the Any value as one of the legal string types for subject
+        // attributes.  Try UTF8String first (most common in modern certs),
+        // then PrintableString, then IA5String.
+        let value = atv_string(&atv.value);
+        let Some(value) = value else { continue };
 
-            if oid_str == OID_CN {
-                username = Some(value);
-            } else {
-                groups.push(value);
-            }
+        if oid_str == OID_CN {
+            username = Some(value);
+        } else {
+            groups.push(value);
         }
     }
 
