@@ -580,4 +580,52 @@ mod tests {
             "lastProbeTime must survive decode; before the fix this field was silently dropped"
         );
     }
+
+    /// decode_job_proto_gen must preserve status.active/succeeded/failed/ready counts.
+    ///
+    /// The Job controller's own reconcile loop (and `kubectl get jobs`) reads these counters to
+    /// decide whether to create more pods or declare the Job complete. Existing status coverage
+    /// for this decoder only asserted on condition timestamps, never on the counts themselves,
+    /// so a regression dropping them would make every Job look like it has never run a pod.
+    #[test]
+    fn decode_job_proto_gen_preserves_status_active_succeeded_failed_counts() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("counting-job".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::JobStatus {
+                active: Some(2),
+                succeeded: Some(3),
+                failed: Some(1),
+                ready: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job with status counts must decode");
+
+        assert_eq!(
+            result["status"]["active"], 2,
+            "status.active must survive decode — without it the Job controller cannot tell how \
+             many pods are already running and creates duplicates past parallelism"
+        );
+        assert_eq!(
+            result["status"]["succeeded"], 3,
+            "status.succeeded must survive decode — without it a Job never reaches its \
+             completions target and runs forever"
+        );
+        assert_eq!(
+            result["status"]["failed"], 1,
+            "status.failed must survive decode — without it backoffLimit accounting is blind \
+             to prior failures"
+        );
+        assert_eq!(
+            result["status"]["ready"], 2,
+            "status.ready must survive decode — readiness-gated Job completion depends on it"
+        );
+    }
 }

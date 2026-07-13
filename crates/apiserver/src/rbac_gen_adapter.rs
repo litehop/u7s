@@ -429,4 +429,185 @@ mod tests {
             "nonResourceURLs must survive round-trip through generated PolicyRule"
         );
     }
+
+    /// decode_clusterrolebinding_proto_gen must preserve roleRef and subjects.
+    ///
+    /// roleRef is what actually grants permissions; a dropped roleRef silently turns a
+    /// ClusterRoleBinding into a binding that grants nothing to anyone.
+    #[test]
+    fn decode_clusterrolebinding_proto_gen_preserves_role_ref_and_subjects() {
+        let crb = rbac_v1::ClusterRoleBinding {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-crb".to_string()),
+                ..Default::default()
+            }),
+            subjects: vec![rbac_v1::Subject {
+                kind: Some("User".to_string()),
+                name: Some("alice".to_string()),
+                api_group: Some("rbac.authorization.k8s.io".to_string()),
+                ..Default::default()
+            }],
+            role_ref: Some(rbac_v1::RoleRef {
+                api_group: Some("rbac.authorization.k8s.io".to_string()),
+                kind: Some("ClusterRole".to_string()),
+                name: Some("cluster-admin".to_string()),
+            }),
+        };
+        let mut buf = Vec::new();
+        crb.encode(&mut buf).unwrap();
+
+        let result =
+            decode_clusterrolebinding_proto_gen(&buf).expect("ClusterRoleBinding must decode");
+
+        assert_eq!(
+            result["roleRef"]["name"], "cluster-admin",
+            "roleRef must survive decode — without it this binding grants no permissions to \
+             anyone even though it appears to exist"
+        );
+        assert_eq!(
+            result["subjects"][0]["name"], "alice",
+            "subjects must survive decode — without them the binding has no one to grant \
+             access to"
+        );
+    }
+
+    /// decode_role_proto_gen must preserve rules.
+    ///
+    /// rules is the entire authorization contract of a Role; dropping it turns a
+    /// least-privilege Role into one that grants nothing, breaking every ServiceAccount that
+    /// depends on it.
+    #[test]
+    fn decode_role_proto_gen_preserves_rules() {
+        let role = rbac_v1::Role {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("pod-reader".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            rules: vec![rbac_v1::PolicyRule {
+                verbs: vec!["get".to_string(), "list".to_string()],
+                api_groups: vec!["".to_string()],
+                resources: vec!["pods".to_string()],
+                ..Default::default()
+            }],
+        };
+        let mut buf = Vec::new();
+        role.encode(&mut buf).unwrap();
+
+        let result = decode_role_proto_gen(&buf).expect("Role must decode");
+
+        assert_eq!(
+            result["rules"][0]["resources"][0], "pods",
+            "rules must survive decode — without them every ServiceAccount bound to this Role \
+             loses all access it was granted"
+        );
+        assert_eq!(
+            result["rules"][0]["verbs"][0], "get",
+            "rules[].verbs must survive decode"
+        );
+    }
+
+    /// decode_rolebinding_proto_gen must preserve roleRef and subjects.
+    ///
+    /// Same failure mode as ClusterRoleBinding but namespace-scoped: a dropped roleRef or
+    /// subject silently revokes access a namespace owner explicitly granted.
+    #[test]
+    fn decode_rolebinding_proto_gen_preserves_role_ref_and_subjects() {
+        let rb = rbac_v1::RoleBinding {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-rb".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            subjects: vec![rbac_v1::Subject {
+                kind: Some("ServiceAccount".to_string()),
+                name: Some("my-sa".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }],
+            role_ref: Some(rbac_v1::RoleRef {
+                api_group: Some("rbac.authorization.k8s.io".to_string()),
+                kind: Some("Role".to_string()),
+                name: Some("pod-reader".to_string()),
+            }),
+        };
+        let mut buf = Vec::new();
+        rb.encode(&mut buf).unwrap();
+
+        let result = decode_rolebinding_proto_gen(&buf).expect("RoleBinding must decode");
+
+        assert_eq!(
+            result["roleRef"]["name"], "pod-reader",
+            "roleRef must survive decode — without it this binding grants no permissions"
+        );
+        assert_eq!(
+            result["subjects"][0]["name"], "my-sa",
+            "subjects must survive decode — without them the bound Role's permissions reach \
+             no one"
+        );
+    }
+
+    /// decode_local_subject_access_review_proto_gen must preserve spec.resourceAttributes.
+    ///
+    /// A namespaced authorization check (e.g. `kubectl auth can-i --namespace=foo`) sends this
+    /// request; dropping resourceAttributes.namespace would make the check evaluate against
+    /// the wrong (or no) namespace scope.
+    #[test]
+    fn decode_local_subject_access_review_proto_gen_preserves_resource_attributes() {
+        let lsar = authz_v1::LocalSubjectAccessReview {
+            spec: Some(authz_v1::SubjectAccessReviewSpec {
+                user: Some("bob".to_string()),
+                resource_attributes: Some(authz_v1::ResourceAttributes {
+                    namespace: Some("dev".to_string()),
+                    verb: Some("delete".to_string()),
+                    resource: Some("pods".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        lsar.encode(&mut buf).unwrap();
+
+        let result = decode_local_subject_access_review_proto_gen(&buf)
+            .expect("LocalSubjectAccessReview must decode");
+
+        assert_eq!(
+            result["spec"]["resourceAttributes"]["namespace"], "dev",
+            "resourceAttributes.namespace must survive decode — without it a namespaced \
+             `kubectl auth can-i` check silently evaluates against the wrong scope"
+        );
+        assert_eq!(
+            result["spec"]["resourceAttributes"]["verb"], "delete",
+            "resourceAttributes.verb must survive decode"
+        );
+    }
+
+    /// decode_token_review_proto_gen must preserve spec.token.
+    ///
+    /// The webhook/OIDC authenticator has only this token to authenticate the caller with; a
+    /// dropped token turns every TokenReview into an unauthenticated request that the
+    /// authenticator must reject, silently locking out an entire auth path.
+    #[test]
+    fn decode_token_review_proto_gen_preserves_token() {
+        let tr = authn_v1::TokenReview {
+            spec: Some(authn_v1::TokenReviewSpec {
+                token: Some("opaque-bearer-token-abc123".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        tr.encode(&mut buf).unwrap();
+
+        let result = decode_token_review_proto_gen(&buf).expect("TokenReview must decode");
+
+        assert_eq!(
+            result["spec"]["token"], "opaque-bearer-token-abc123",
+            "spec.token must survive decode — the authenticator has nothing else to \
+             authenticate the caller with, so a dropped token fails every request behind this \
+             auth path"
+        );
+    }
 }

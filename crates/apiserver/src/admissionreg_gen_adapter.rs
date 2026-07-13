@@ -737,4 +737,237 @@ mod tests {
         assert_eq!(vars[0]["name"], "myVar");
         assert_eq!(vars[0]["expression"], "object.spec.replicas");
     }
+
+    /// ValidatingAdmissionPolicy status.observedGeneration/typeChecking/conditions must
+    /// survive proto decode.
+    ///
+    /// The VAP controller reports CEL compile-time type warnings and policy readiness through
+    /// `.status`; gen_vap_status_to_json existed but no test ever exercised it end-to-end, so a
+    /// regression that broke the status branch (e.g. wiring conditions but not typeChecking)
+    /// would go unnoticed.
+    #[test]
+    fn decode_validatingadmissionpolicy_proto_gen_preserves_status() {
+        let vap = ar_v1::ValidatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-policy.example.com".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(ar_v1::ValidatingAdmissionPolicyStatus {
+                observed_generation: Some(3),
+                type_checking: Some(ar_v1::TypeChecking {
+                    expression_warnings: vec![ar_v1::ExpressionWarning {
+                        field_ref: Some("spec.validations[0].expression".to_string()),
+                        warning: Some("undefined field 'foo'".to_string()),
+                    }],
+                }),
+                conditions: vec![meta_v1::Condition {
+                    r#type: Some("TypeChecked".to_string()),
+                    status: Some("True".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        vap.encode(&mut buf).unwrap();
+
+        let result = decode_validatingadmissionpolicy_proto_gen(&buf)
+            .expect("ValidatingAdmissionPolicy with status must decode");
+
+        assert_eq!(
+            result["status"]["observedGeneration"], 3,
+            "status.observedGeneration must survive decode — without it clients cannot tell \
+             whether the reported status reflects the latest spec edit"
+        );
+        assert_eq!(
+            result["status"]["typeChecking"]["expressionWarnings"][0]["warning"],
+            "undefined field 'foo'",
+            "status.typeChecking must survive decode — dropping it hides CEL compile-time \
+             warnings from kubectl describe"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "TypeChecked",
+            "status.conditions must survive decode alongside typeChecking"
+        );
+    }
+
+    /// decode_mutatingwebhookconfiguration_proto_gen must preserve webhook rules and
+    /// reinvocationPolicy.
+    ///
+    /// reinvocationPolicy controls whether the apiserver re-runs this webhook after another
+    /// mutating webhook changes the object; dropping it silently falls back to "Never",
+    /// breaking webhooks that depend on seeing other webhooks' mutations.
+    #[test]
+    fn decode_mutatingwebhookconfiguration_proto_gen_preserves_webhooks_and_reinvocation_policy() {
+        let mwc = ar_v1::MutatingWebhookConfiguration {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-mwc".to_string()),
+                ..Default::default()
+            }),
+            webhooks: vec![ar_v1::MutatingWebhook {
+                name: Some("mutate.example.com".to_string()),
+                client_config: Some(ar_v1::WebhookClientConfig {
+                    service: Some(ar_v1::ServiceReference {
+                        namespace: Some("default".to_string()),
+                        name: Some("webhook-svc".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                rules: vec![ar_v1::RuleWithOperations {
+                    operations: vec!["CREATE".to_string()],
+                    rule: Some(ar_v1::Rule {
+                        api_groups: vec!["".to_string()],
+                        api_versions: vec!["v1".to_string()],
+                        resources: vec!["pods".to_string()],
+                        ..Default::default()
+                    }),
+                }],
+                reinvocation_policy: Some("IfNeeded".to_string()),
+                ..Default::default()
+            }],
+        };
+        let mut buf = Vec::new();
+        mwc.encode(&mut buf).unwrap();
+
+        let result = decode_mutatingwebhookconfiguration_proto_gen(&buf)
+            .expect("MutatingWebhookConfiguration must decode");
+
+        assert_eq!(
+            result["webhooks"][0]["rules"][0]["resources"][0], "pods",
+            "webhooks[].rules must survive decode — without them the apiserver never invokes \
+             this webhook for any request"
+        );
+        assert_eq!(
+            result["webhooks"][0]["reinvocationPolicy"], "IfNeeded",
+            "reinvocationPolicy must survive decode — dropping it silently falls back to \
+             \"Never\", so this webhook stops seeing other webhooks' mutations"
+        );
+    }
+
+    /// decode_validatingadmissionpolicybinding_proto_gen must preserve policyName and
+    /// validationActions.
+    ///
+    /// validationActions decides whether a policy violation Denies the request, only Audits
+    /// it, or Warns the caller; dropping it silently changes enforcement behavior for every
+    /// request the bound policy matches.
+    #[test]
+    fn decode_validatingadmissionpolicybinding_proto_gen_preserves_policy_name_and_actions() {
+        let binding = ar_v1::ValidatingAdmissionPolicyBinding {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-binding".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(ar_v1::ValidatingAdmissionPolicyBindingSpec {
+                policy_name: Some("my-policy.example.com".to_string()),
+                param_ref: Some(ar_v1::ParamRef {
+                    name: Some("my-params".to_string()),
+                    ..Default::default()
+                }),
+                validation_actions: vec!["Deny".to_string(), "Audit".to_string()],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        binding.encode(&mut buf).unwrap();
+
+        let result = decode_validatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("ValidatingAdmissionPolicyBinding must decode");
+
+        assert_eq!(
+            result["spec"]["policyName"], "my-policy.example.com",
+            "policyName must survive decode — without it the binding does not attach to any \
+             policy and the policy never actually runs"
+        );
+        assert_eq!(
+            result["spec"]["validationActions"][0], "Deny",
+            "validationActions must survive decode — dropping it silently changes whether a \
+             violation denies the request, only audits it, or just warns the caller"
+        );
+        assert_eq!(
+            result["spec"]["paramRef"]["name"], "my-params",
+            "paramRef must survive decode — without it the policy's CEL expressions evaluate \
+             against no params instead of the caller's configured object"
+        );
+    }
+
+    /// decode_mutatingadmissionpolicy_proto_gen must preserve spec.mutations.
+    ///
+    /// mutations is the actual patch/apply-configuration logic this policy runs; dropping it
+    /// makes the policy a no-op that matches requests but changes nothing.
+    #[test]
+    fn decode_mutatingadmissionpolicy_proto_gen_preserves_mutations() {
+        let map_obj = ar_v1::MutatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-map".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(ar_v1::MutatingAdmissionPolicySpec {
+                failure_policy: Some("Fail".to_string()),
+                reinvocation_policy: Some("IfNeeded".to_string()),
+                mutations: vec![ar_v1::Mutation {
+                    patch_type: Some("ApplyConfiguration".to_string()),
+                    apply_configuration: Some(ar_v1::ApplyConfiguration {
+                        expression: Some("Object{spec: Object.spec{replicas: 3}}".to_string()),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        map_obj.encode(&mut buf).unwrap();
+
+        let result = decode_mutatingadmissionpolicy_proto_gen(&buf)
+            .expect("MutatingAdmissionPolicy must decode");
+
+        assert_eq!(
+            result["spec"]["mutations"][0]["applyConfiguration"]["expression"],
+            "Object{spec: Object.spec{replicas: 3}}",
+            "mutations must survive decode — without them this policy matches requests but \
+             changes nothing, silently defeating its purpose"
+        );
+        assert_eq!(
+            result["spec"]["reinvocationPolicy"], "IfNeeded",
+            "reinvocationPolicy must survive decode"
+        );
+    }
+
+    /// decode_mutatingadmissionpolicybinding_proto_gen must preserve policyName and paramRef.
+    ///
+    /// Without policyName the binding never attaches to any MutatingAdmissionPolicy, so the
+    /// mutation the policy author configured silently never runs for any request.
+    #[test]
+    fn decode_mutatingadmissionpolicybinding_proto_gen_preserves_policy_name_and_param_ref() {
+        let binding = ar_v1::MutatingAdmissionPolicyBinding {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-map-binding".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(ar_v1::MutatingAdmissionPolicyBindingSpec {
+                policy_name: Some("my-map.example.com".to_string()),
+                param_ref: Some(ar_v1::ParamRef {
+                    name: Some("my-params".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        binding.encode(&mut buf).unwrap();
+
+        let result = decode_mutatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("MutatingAdmissionPolicyBinding must decode");
+
+        assert_eq!(
+            result["spec"]["policyName"], "my-map.example.com",
+            "policyName must survive decode — without it the binding does not attach to any \
+             MutatingAdmissionPolicy and the configured mutation never runs"
+        );
+        assert_eq!(
+            result["spec"]["paramRef"]["name"], "my-params",
+            "paramRef must survive decode — without it the policy's mutation expression \
+             evaluates against no params"
+        );
+    }
 }

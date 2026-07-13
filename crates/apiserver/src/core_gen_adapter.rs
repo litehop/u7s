@@ -3489,4 +3489,398 @@ mod tests {
             "status.nodeInfo must survive decode — version skew checks depend on it"
         );
     }
+
+    /// Service status.loadBalancer and status.conditions must survive proto decode.
+    ///
+    /// `kubectl get svc` and any client waiting on external connectivity read
+    /// status.loadBalancer.ingress to learn the IP/hostname a cloud provider assigned. The
+    /// service controller's protobuf-content-type UpdateStatus call is the only way that
+    /// value ever reaches the stored object; losing it here would leave every LoadBalancer
+    /// Service looking permanently unprovisioned even after the cloud LB exists.
+    #[test]
+    fn service_status_proto_decode_preserves_load_balancer_and_conditions() {
+        let svc = core_v1::Service {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::ServiceStatus {
+                load_balancer: Some(core_v1::LoadBalancerStatus {
+                    ingress: vec![core_v1::LoadBalancerIngress {
+                        ip: Some("203.0.113.20".to_string()),
+                        hostname: Some("lb.example.com".to_string()),
+                        ..Default::default()
+                    }],
+                }),
+                conditions: vec![meta_v1::Condition {
+                    r#type: Some("LoadBalancerAttached".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("Provisioned".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        svc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_service_proto_gen(&buf).expect("Service with status must decode");
+
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["ip"], "203.0.113.20",
+            "status.loadBalancer.ingress[0].ip must survive decode — without it a protobuf \
+             UpdateStatus call from the service controller makes a provisioned LoadBalancer \
+             Service look permanently pending to every client"
+        );
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["hostname"], "lb.example.com",
+            "status.loadBalancer.ingress[0].hostname must survive decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "LoadBalancerAttached",
+            "status.conditions must survive decode alongside loadBalancer — losing either one \
+             corrupts a caller's GET-modify-PUT round trip through /status"
+        );
+    }
+
+    /// PersistentVolumeClaim status.phase and status.conditions must survive proto decode.
+    ///
+    /// The PV/PVC binding lifecycle and volume-resize workflow are driven entirely by
+    /// status.phase/conditions; the PVC/expansion controllers PUT status updates using
+    /// protobuf content-type by default, so a decoder that drops `.status` here would freeze
+    /// both flows — callers would see a claim stuck at "Pending" forever even once bound.
+    #[test]
+    fn persistentvolumeclaim_status_proto_decode_preserves_phase_and_conditions() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                phase: Some("Bound".to_string()),
+                conditions: vec![core_v1::PersistentVolumeClaimCondition {
+                    r#type: Some("Resizing".to_string()),
+                    status: Some("True".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result =
+            decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC with status must decode");
+
+        assert_eq!(
+            result["status"]["phase"], "Bound",
+            "status.phase must survive decode — without it the PV/PVC binding lifecycle looks \
+             frozen at Pending to every client watching a protobuf UpdateStatus call"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Resizing",
+            "status.conditions must survive decode — without it a caller waiting on the \
+             FileSystemResizePending condition never sees the resize controller's progress"
+        );
+    }
+
+    /// decode_podtemplate_proto_gen must preserve the embedded pod template's spec and
+    /// metadata, not just the PodTemplate's own metadata.
+    ///
+    /// ReplicationControllers and other legacy templating callers create pods straight from
+    /// this decoded value; if template.spec is dropped, every pod created from the template
+    /// has no containers and never reaches Running.
+    #[test]
+    fn decode_podtemplate_proto_gen_preserves_template_pod_spec() {
+        let pt = core_v1::PodTemplate {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-template".to_string()),
+                ..Default::default()
+            }),
+            template: Some(core_v1::PodTemplateSpec {
+                metadata: Some(meta_v1::ObjectMeta {
+                    labels: [("app".to_string(), "demo".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }),
+                spec: Some(core_v1::PodSpec {
+                    containers: vec![core_v1::Container {
+                        name: Some("demo".to_string()),
+                        image: Some("demo:1.0".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }),
+        };
+        let mut buf = Vec::new();
+        pt.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_podtemplate_proto_gen(&buf).expect("PodTemplate must decode");
+
+        assert_eq!(
+            result["template"]["spec"]["containers"][0]["image"], "demo:1.0",
+            "template.spec.containers must survive decode — without it, every workload created \
+             from this PodTemplate gets pods with no containers"
+        );
+        assert_eq!(
+            result["template"]["metadata"]["labels"]["app"], "demo",
+            "template.metadata.labels must survive decode — controllers select pods by these labels"
+        );
+    }
+
+    /// decode_serviceaccount_proto_gen must preserve secrets, imagePullSecrets and the
+    /// automountServiceAccountToken override.
+    ///
+    /// Dropping imagePullSecrets breaks private-registry pulls for every pod using this
+    /// ServiceAccount; dropping an explicit automountServiceAccountToken=false re-enables
+    /// automatic API token mounting the caller opted out of for security reasons.
+    #[test]
+    fn decode_serviceaccount_proto_gen_preserves_secrets_and_automount() {
+        let sa = core_v1::ServiceAccount {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-sa".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            secrets: vec![core_v1::ObjectReference {
+                name: Some("my-sa-token".to_string()),
+                ..Default::default()
+            }],
+            image_pull_secrets: vec![core_v1::LocalObjectReference {
+                name: Some("registry-cred".to_string()),
+            }],
+            automount_service_account_token: Some(false),
+        };
+        let mut buf = Vec::new();
+        sa.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_serviceaccount_proto_gen(&buf).expect("ServiceAccount must decode");
+
+        assert_eq!(
+            result["secrets"][0]["name"], "my-sa-token",
+            "secrets must survive decode — without it, pods using this ServiceAccount lose \
+             access to the mountable secret list"
+        );
+        assert_eq!(
+            result["imagePullSecrets"][0]["name"], "registry-cred",
+            "imagePullSecrets must survive decode — without it the kubelet cannot pull private \
+             registry images for pods using this ServiceAccount"
+        );
+        assert_eq!(
+            result["automountServiceAccountToken"], false,
+            "automountServiceAccountToken=false must survive decode — dropping it re-enables \
+             automatic API token mounting the caller explicitly opted out of"
+        );
+    }
+
+    /// decode_endpoints_proto_gen must preserve subsets[].addresses and subsets[].ports.
+    ///
+    /// kube-proxy programs Service load-balancing rules directly from this data; a dropped
+    /// address or port means traffic to the Service black-holes even though the backing pods
+    /// are healthy.
+    #[test]
+    fn decode_endpoints_proto_gen_preserves_subsets_addresses_and_ports() {
+        let ep = core_v1::Endpoints {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            subsets: vec![core_v1::EndpointSubset {
+                addresses: vec![core_v1::EndpointAddress {
+                    ip: Some("10.0.0.5".to_string()),
+                    hostname: Some("pod-a".to_string()),
+                    ..Default::default()
+                }],
+                not_ready_addresses: vec![],
+                ports: vec![core_v1::EndpointPort {
+                    name: Some("http".to_string()),
+                    port: Some(8080),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }],
+            }],
+        };
+        let mut buf = Vec::new();
+        ep.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_endpoints_proto_gen(&buf).expect("Endpoints must decode");
+
+        assert_eq!(
+            result["subsets"][0]["addresses"][0]["ip"], "10.0.0.5",
+            "subsets[].addresses must survive decode — without it kube-proxy programs no \
+             backend for the Service and traffic black-holes"
+        );
+        assert_eq!(
+            result["subsets"][0]["ports"][0]["port"], 8080,
+            "subsets[].ports must survive decode — without it kube-proxy has no port to forward to"
+        );
+    }
+
+    /// decode_limitrange_proto_gen must preserve spec.limits[].max and spec.limits[].default.
+    ///
+    /// LimitRanger admission reads these to cap and default container resource requests; a
+    /// dropped max/default silently disables the enforcement the namespace owner configured.
+    #[test]
+    fn decode_limitrange_proto_gen_preserves_max_and_default_limits() {
+        fn quantity(
+            s: &str,
+        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                string: Some(s.to_string()),
+            }
+        }
+        let lr = core_v1::LimitRange {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("cpu-limits".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::LimitRangeSpec {
+                limits: vec![core_v1::LimitRangeItem {
+                    r#type: Some("Container".to_string()),
+                    max: [("cpu".to_string(), quantity("2"))].into_iter().collect(),
+                    default: [("cpu".to_string(), quantity("500m"))]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        lr.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_limitrange_proto_gen(&buf).expect("LimitRange must decode");
+
+        assert_eq!(
+            result["spec"]["limits"][0]["max"]["cpu"], "2",
+            "spec.limits[].max must survive decode — without it LimitRanger admission enforces \
+             no per-container CPU ceiling at all"
+        );
+        assert_eq!(
+            result["spec"]["limits"][0]["default"]["cpu"], "500m",
+            "spec.limits[].default must survive decode — without it containers that omit \
+             resources.limits.cpu get no default applied"
+        );
+    }
+
+    /// decode_event_proto_gen must preserve reason/message/involvedObject/series.
+    ///
+    /// `kubectl describe` and event-based alerting read these fields directly; a dropped
+    /// involvedObject makes an event impossible to correlate back to the object it reports on,
+    /// and a dropped series.count hides how many times an event actually recurred.
+    #[test]
+    fn decode_event_proto_gen_preserves_reason_involved_object_and_series() {
+        let ev = core_v1::Event {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pod.17abc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            involved_object: Some(core_v1::ObjectReference {
+                kind: Some("Pod".to_string()),
+                name: Some("my-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            reason: Some("Started".to_string()),
+            message: Some("Started container demo".to_string()),
+            r#type: Some("Normal".to_string()),
+            series: Some(core_v1::EventSeries {
+                count: Some(3),
+                last_observed_time: Some(meta_v1::MicroTime {
+                    seconds: Some(1_700_000_000),
+                    nanos: Some(0),
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ev.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_event_proto_gen(&buf).expect("Event must decode");
+
+        assert_eq!(
+            result["reason"], "Started",
+            "reason must survive decode — without it `kubectl describe` shows a blank reason \
+             for every reported event"
+        );
+        assert_eq!(
+            result["involvedObject"]["name"], "my-pod",
+            "involvedObject must survive decode — without it the event cannot be correlated \
+             back to the pod it describes"
+        );
+        assert_eq!(
+            result["series"]["count"], 3,
+            "series.count must survive decode — without it repeated identical events collapse \
+             to a count of zero instead of the real occurrence count"
+        );
+    }
+
+    /// ConfigMap.data/binaryData and Secret.data/stringData/type must survive proto decode.
+    ///
+    /// The existing immutable-flag test above never populates the actual payload fields; a
+    /// decoder that dropped `.data` here would silently turn every pod's mounted ConfigMap or
+    /// Secret volume into an empty directory, since data/binaryData/stringData are these
+    /// resources' entire reason to exist.
+    #[test]
+    fn decode_configmap_and_secret_proto_gen_preserve_data_payloads() {
+        let cm = core_v1::ConfigMap {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-cm".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            data: [("config.yaml".to_string(), "key: value".to_string())]
+                .into_iter()
+                .collect(),
+            binary_data: [("blob".to_string(), vec![1, 2, 3])].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut cm_buf = Vec::new();
+        cm.encode(&mut cm_buf).unwrap();
+        let cm_result = decode_configmap_proto_gen(&cm_buf).expect("ConfigMap must decode");
+        assert_eq!(
+            cm_result["data"]["config.yaml"], "key: value",
+            "ConfigMap.data must survive decode — without it a mounted ConfigMap volume is \
+             silently empty for every pod using it"
+        );
+        assert!(
+            cm_result["binaryData"]["blob"].is_string(),
+            "ConfigMap.binaryData must survive decode as base64"
+        );
+
+        let secret = core_v1::Secret {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-secret".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            r#type: Some("Opaque".to_string()),
+            data: [("password".to_string(), b"hunter2".to_vec())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let mut secret_buf = Vec::new();
+        secret.encode(&mut secret_buf).unwrap();
+        let secret_result = decode_secret_proto_gen(&secret_buf).expect("Secret must decode");
+        assert_eq!(
+            secret_result["type"], "Opaque",
+            "Secret.type must survive decode — controllers branch on this (e.g. \
+             kubernetes.io/service-account-token vs Opaque)"
+        );
+        use base64::Engine as _;
+        assert_eq!(
+            secret_result["data"]["password"],
+            base64::engine::general_purpose::STANDARD.encode(b"hunter2"),
+            "Secret.data must survive decode — without it a mounted Secret volume or env var \
+             is silently empty for every pod using it"
+        );
+    }
 }
