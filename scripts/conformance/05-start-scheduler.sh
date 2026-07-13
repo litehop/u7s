@@ -20,6 +20,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Resolve to absolute so the pgrep/pkill match below (and the process's own
+# --kubeconfig arg) is worktree-unique — a relative WORKDIR from different
+# worktrees would otherwise produce identical process command lines and let
+# one worker's restart kill another's scheduler.
+mkdir -p "$WORKDIR"
+WORKDIR="$(cd "$WORKDIR" && pwd)"
+
 LOG="$WORKDIR/scheduler.log"
 
 echo "=== [05] Start u7s-scheduler (on host) ==="
@@ -34,8 +41,6 @@ if [ ! -f "$WORKDIR/kubeconfig" ]; then
   echo "Start u7s-apiserver first: scripts/u7s-start.sh" >&2
   exit 1
 fi
-
-mkdir -p "$WORKDIR"
 
 # Scope the kill to a scheduler already bound to THIS kubeconfig so parallel
 # workers on other VMs/ports keep their schedulers. A global `pkill -f
