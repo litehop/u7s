@@ -311,23 +311,25 @@ pub async fn find_crd<S: Store>(
 // Store key helpers
 // ---------------------------------------------------------------------------
 
-fn cr_store_key(
-    group: &str,
-    version: &str,
-    plural: &str,
-    namespace: Option<&str>,
-    name: &str,
-) -> String {
+// A CR's storage location must not depend on which served version a request names —
+// only on its (group, resource, namespace, name) identity, exactly like upstream
+// etcd keys. A CRD's storage-version pointer (`spec.versions[].storage`) can move
+// between served versions over the CRD's lifetime (e.g. a v1 -> v2 storage migration);
+// if the key embedded that pointer's *current* value, every object written before the
+// move would become unreachable the instant it moved, regardless of which version a
+// later request targets. Version-specific behaviour (schema, conversion) is applied
+// on top of this single stored representation, never by relocating it.
+fn cr_store_key(group: &str, plural: &str, namespace: Option<&str>, name: &str) -> String {
     match namespace {
-        Some(ns) => format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}"),
-        None => format!("/registry/cr/{group}/{version}/{plural}/{name}"),
+        Some(ns) => format!("/registry/cr/{group}/{plural}/{ns}/{name}"),
+        None => format!("/registry/cr/{group}/{plural}/{name}"),
     }
 }
 
-fn cr_list_prefix(group: &str, version: &str, plural: &str, namespace: Option<&str>) -> String {
+fn cr_list_prefix(group: &str, plural: &str, namespace: Option<&str>) -> String {
     match namespace {
-        Some(ns) => format!("/registry/cr/{group}/{version}/{plural}/{ns}/"),
-        None => format!("/registry/cr/{group}/{version}/{plural}/"),
+        Some(ns) => format!("/registry/cr/{group}/{plural}/{ns}/"),
+        None => format!("/registry/cr/{group}/{plural}/"),
     }
 }
 
@@ -871,7 +873,7 @@ pub async fn list_cr<S: Store>(
                 } else {
                     (format!("{group}/{version}"), plural.clone())
                 };
-                let prefix = cr_list_prefix(&group, &version, &plural, None);
+                let prefix = cr_list_prefix(&group, &plural, None);
                 return super::watch::watch_generic(
                     state,
                     super::watch::WatchConfig {
@@ -896,21 +898,16 @@ pub async fn list_cr<S: Store>(
         }
     };
 
-    // When version != storage_version, list from the storage version's key prefix.
+    // The key/prefix is version-independent (see cr_store_key); only whether the
+    // response needs webhook conversion depends on the requested version.
     // Watch streams are not converted (watch conversion is out of scope).
-    let (list_version, needs_conversion) = if version != ctx.storage_version {
-        (
-            ctx.storage_version.as_str(),
-            ctx.conversion_webhook_client_config.is_some(),
-        )
-    } else {
-        (version.as_str(), false)
-    };
+    let needs_conversion =
+        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
 
     // For namespaced CRDs, the cluster-wide path lists across all namespaces.
-    // Namespaced CRs are stored as /registry/cr/{group}/{version}/{plural}/{ns}/{name},
+    // Namespaced CRs are stored as /registry/cr/{group}/{plural}/{ns}/{name},
     // so prefix without namespace matches all of them.
-    let prefix = cr_list_prefix(&group, list_version, &plural, None);
+    let prefix = cr_list_prefix(&group, &plural, None);
 
     let pom = wants_partial_object_metadata(accept);
 
@@ -1018,18 +1015,12 @@ pub async fn get_cr<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    // When version != storage_version, fall back to the storage version key.
-    // If a conversion webhook is configured, call it; otherwise return as-is.
-    let (fetch_version, needs_conversion) = if version != ctx.storage_version {
-        (
-            ctx.storage_version.as_str(),
-            ctx.conversion_webhook_client_config.is_some(),
-        )
-    } else {
-        (version.as_str(), false)
-    };
+    // The key is version-independent (see cr_store_key); a conversion webhook is only
+    // consulted when the request targets a version other than the storage version.
+    let needs_conversion =
+        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
 
-    let key = cr_store_key(&group, fetch_version, &plural, None, &name);
+    let key = cr_store_key(&group, &plural, None, &name);
     let stored = state
         .store
         .get(&key)
@@ -1133,7 +1124,7 @@ pub async fn create_cr<S: Store>(
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
+    let key = cr_store_key(&group, &plural, None, &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
@@ -1182,7 +1173,7 @@ pub async fn replace_cr<S: Store>(
         )));
     }
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
+    let key = cr_store_key(&group, &plural, None, &name);
 
     // Must exist before replace.
     let stored = state
@@ -1349,7 +1340,7 @@ pub async fn delete_cr<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
+    let key = cr_store_key(&group, &plural, None, &name);
 
     let stored = state
         .store
@@ -1471,7 +1462,7 @@ pub async fn list_cr_namespaced<S: Store>(
                 } else {
                     (format!("{group}/{version}"), plural.clone())
                 };
-                let prefix = cr_list_prefix(&group, &version, &plural, Some(&ns));
+                let prefix = cr_list_prefix(&group, &plural, Some(&ns));
                 return super::watch::watch_generic(
                     state,
                     super::watch::WatchConfig {
@@ -1503,16 +1494,12 @@ pub async fn list_cr_namespaced<S: Store>(
         ));
     }
 
-    let (list_version, needs_conversion) = if version != ctx.storage_version {
-        (
-            ctx.storage_version.as_str(),
-            ctx.conversion_webhook_client_config.is_some(),
-        )
-    } else {
-        (version.as_str(), false)
-    };
+    // The prefix is version-independent (see cr_store_key); a conversion webhook is only
+    // consulted when the request targets a version other than the storage version.
+    let needs_conversion =
+        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
 
-    let prefix = cr_list_prefix(&group, list_version, &plural, Some(&ns));
+    let prefix = cr_list_prefix(&group, &plural, Some(&ns));
 
     let pom = wants_partial_object_metadata(accept);
 
@@ -1619,16 +1606,12 @@ pub async fn get_cr_namespaced<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let (fetch_version, needs_conversion) = if version != ctx.storage_version {
-        (
-            ctx.storage_version.as_str(),
-            ctx.conversion_webhook_client_config.is_some(),
-        )
-    } else {
-        (version.as_str(), false)
-    };
+    // The key is version-independent (see cr_store_key); a conversion webhook is only
+    // consulted when the request targets a version other than the storage version.
+    let needs_conversion =
+        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
 
-    let key = cr_store_key(&group, fetch_version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let stored = state
         .store
         .get(&key)
@@ -1752,7 +1735,7 @@ pub async fn create_cr_namespaced<S: Store>(
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
@@ -1801,7 +1784,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         )));
     }
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &plural, Some(&ns), &name);
 
     let stored = state
         .store
@@ -1876,7 +1859,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &plural, Some(&ns), &name);
 
     let stored = state
         .store
@@ -1973,7 +1956,7 @@ pub async fn patch_cr<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
+    let key = cr_store_key(&group, &plural, None, &name);
     let stored_opt = state
         .store
         .get(&key)
@@ -2106,6 +2089,10 @@ pub async fn patch_cr<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(new_rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+    // The stored object may still carry the apiVersion it was written under (e.g. the
+    // CRD's storage version changed since); the response must reflect the version this
+    // request actually targeted, same as get_cr already does.
+    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     let mut resp = Json(obj).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
@@ -2134,7 +2121,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let stored_opt = state
         .store
         .get(&key)
@@ -2266,6 +2253,10 @@ pub async fn patch_cr_namespaced<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(new_rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+    // The stored object may still carry the apiVersion it was written under (e.g. the
+    // CRD's storage version changed since); the response must reflect the version this
+    // request actually targeted, same as get_cr_namespaced already does.
+    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     let mut resp = Json(obj).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
@@ -2317,10 +2308,7 @@ pub async fn put_cr_status<S: Store>(
         if ctx.namespaced {
             return Err(Status::not_found(&name, &ctx.kind));
         }
-        (
-            cr_store_key(&group, &ctx.storage_version, &plural, None, &name),
-            ctx.kind,
-        )
+        (cr_store_key(&group, &plural, None, &name), ctx.kind)
     };
 
     let stored = state
@@ -2390,7 +2378,7 @@ pub async fn get_cr_status<S: Store>(
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
     }
-    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
+    let key = cr_store_key(&group, &plural, None, &name);
     let stored = state
         .store
         .get(&key)
@@ -5743,7 +5731,7 @@ mod tests {
         state
             .store
             .put(
-                "/registry/cr/example.com/v1/widgets/my-widget",
+                "/registry/cr/example.com/widgets/my-widget",
                 bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
                 None,
             )
@@ -5819,7 +5807,7 @@ mod tests {
         state
             .store
             .put(
-                "/registry/cr/example.com/v1alpha1/widgets/my-widget",
+                "/registry/cr/example.com/widgets/my-widget",
                 bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
                 None,
             )
@@ -6555,19 +6543,34 @@ mod tests {
     /// retrieves data under an unexpected path.
     #[test]
     fn cr_store_key_namespaced_includes_namespace() {
-        let key = cr_store_key("example.io", "v1", "widgets", Some("default"), "my-widget");
+        let key = cr_store_key("example.io", "widgets", Some("default"), "my-widget");
         assert_eq!(
-            key, "/registry/cr/example.io/v1/widgets/default/my-widget",
+            key, "/registry/cr/example.io/widgets/default/my-widget",
             "namespaced key must include the namespace segment"
         );
     }
 
     #[test]
     fn cr_store_key_cluster_scoped_omits_namespace() {
-        let key = cr_store_key("example.io", "v1", "widgets", None, "my-widget");
+        let key = cr_store_key("example.io", "widgets", None, "my-widget");
         assert_eq!(
-            key, "/registry/cr/example.io/v1/widgets/my-widget",
+            key, "/registry/cr/example.io/widgets/my-widget",
             "cluster-scoped key must omit the namespace segment"
+        );
+    }
+
+    /// cr_store_key must not take a served version at all — a CRD's storage-version
+    /// pointer can move to a different served version after an object is written, and a
+    /// key that embedded it would orphan every object already written under the old
+    /// pointer value the instant it moved (see
+    /// cr_survives_storage_version_change_and_is_reachable_via_new_storage_version for
+    /// the end-to-end regression this would otherwise cause).
+    #[test]
+    fn cr_store_key_has_no_version_parameter() {
+        let key = cr_store_key("example.io", "widgets", Some("default"), "my-widget");
+        assert!(
+            !key.contains("v1") && !key.contains("v2"),
+            "the key must be built from (group, resource, namespace, name) only: {key}"
         );
     }
 
@@ -6576,18 +6579,18 @@ mod tests {
     /// all namespaces or all resource types.
     #[test]
     fn cr_list_prefix_namespaced_ends_with_namespace_slash() {
-        let prefix = cr_list_prefix("example.io", "v1", "widgets", Some("default"));
+        let prefix = cr_list_prefix("example.io", "widgets", Some("default"));
         assert_eq!(
-            prefix, "/registry/cr/example.io/v1/widgets/default/",
+            prefix, "/registry/cr/example.io/widgets/default/",
             "namespaced prefix must end with namespace and slash"
         );
     }
 
     #[test]
     fn cr_list_prefix_cluster_scoped_ends_with_plural_slash() {
-        let prefix = cr_list_prefix("example.io", "v1", "widgets", None);
+        let prefix = cr_list_prefix("example.io", "widgets", None);
         assert_eq!(
-            prefix, "/registry/cr/example.io/v1/widgets/",
+            prefix, "/registry/cr/example.io/widgets/",
             "cluster-scoped prefix must end with plural and slash"
         );
     }
@@ -8153,7 +8156,7 @@ mod tests {
 
         // Directly stamp finalizers and deletionTimestamp into the stored object to simulate
         // a controller having added them.
-        let key = "/registry/cr/example.io/v1/widgets/fin-widget";
+        let key = "/registry/cr/example.io/widgets/fin-widget";
         let stored = state.store.get(key).await.unwrap().unwrap();
         let mut obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         obj["metadata"]["finalizers"] = serde_json::json!(["example.io/protection"]);
@@ -8266,7 +8269,7 @@ mod tests {
         // Read back the owner to get its UID.
         let owner_stored = state
             .store
-            .get(&cr_store_key(group, version, plural, None, "owner-widget"))
+            .get(&cr_store_key(group, plural, None, "owner-widget"))
             .await
             .unwrap()
             .unwrap();
@@ -8275,7 +8278,7 @@ mod tests {
         assert!(!owner_uid.is_empty(), "owner must have a UID");
 
         // Seed a dependent CR directly (with ownerReference → owner).
-        let dependent_key = cr_store_key(group, version, plural, None, "dep-widget");
+        let dependent_key = cr_store_key(group, plural, None, "dep-widget");
         let dependent_body = serde_json::json!({
             "apiVersion": "example.io/v1",
             "kind": "Widget",
@@ -8322,7 +8325,7 @@ mod tests {
         // Owner must be gone.
         let owner_after = state
             .store
-            .get(&cr_store_key(group, version, plural, None, "owner-widget"))
+            .get(&cr_store_key(group, plural, None, "owner-widget"))
             .await
             .unwrap();
         assert!(
@@ -8369,7 +8372,7 @@ mod tests {
 
         let owner_stored = state
             .store
-            .get(&cr_store_key(group, version, plural, Some(ns), "owner-app"))
+            .get(&cr_store_key(group, plural, Some(ns), "owner-app"))
             .await
             .unwrap()
             .unwrap();
@@ -8377,7 +8380,7 @@ mod tests {
         let owner_uid = owner_obj["metadata"]["uid"].as_str().unwrap().to_string();
 
         // Seed dependent app.
-        let dep_key = cr_store_key(group, version, plural, Some(ns), "dep-app");
+        let dep_key = cr_store_key(group, plural, Some(ns), "dep-app");
         let dep_body = serde_json::json!({
             "apiVersion": "argoproj.io/v1alpha1",
             "kind": "Application",
@@ -8463,7 +8466,7 @@ mod tests {
 
         let owner_stored = state
             .store
-            .get(&cr_store_key(group, version, plural, None, "orphan-owner"))
+            .get(&cr_store_key(group, plural, None, "orphan-owner"))
             .await
             .unwrap()
             .unwrap();
@@ -8474,7 +8477,7 @@ mod tests {
             .to_string();
 
         // Seed dependent.
-        let dep_key = cr_store_key(group, version, plural, None, "orphan-dep");
+        let dep_key = cr_store_key(group, plural, None, "orphan-dep");
         let dep_body = serde_json::json!({
             "apiVersion": "example.io/v1",
             "kind": "Widget",
@@ -8556,7 +8559,7 @@ mod tests {
         let plural = "widgets";
 
         // Seed a CR with a finalizer directly (bypassing create handler which stamps UID).
-        let key = cr_store_key(group, version, plural, None, "finalizer-widget");
+        let key = cr_store_key(group, plural, None, "finalizer-widget");
         let cr_body = serde_json::json!({
             "apiVersion": "example.io/v1",
             "kind": "Widget",
@@ -8644,7 +8647,7 @@ mod tests {
         let owner_uid = {
             let s = state
                 .store
-                .get(&cr_store_key(group, version, plural, None, "chain-owner"))
+                .get(&cr_store_key(group, plural, None, "chain-owner"))
                 .await
                 .unwrap()
                 .unwrap();
@@ -8655,7 +8658,7 @@ mod tests {
         };
 
         // Seed intermediate dependent owned by owner.
-        let dep_key = cr_store_key(group, version, plural, None, "chain-dep");
+        let dep_key = cr_store_key(group, plural, None, "chain-dep");
         let dep_uid = "chain-dep-uid";
         let dep_body = serde_json::json!({
             "apiVersion": "example.io/v1",
@@ -8684,7 +8687,7 @@ mod tests {
             .unwrap();
 
         // Seed grand-dependent owned by dep.
-        let grand_key = cr_store_key(group, version, plural, None, "chain-grand");
+        let grand_key = cr_store_key(group, plural, None, "chain-grand");
         let grand_body = serde_json::json!({
             "apiVersion": "example.io/v1",
             "kind": "Widget",
@@ -8776,13 +8779,7 @@ mod tests {
         let owner_uid = {
             let s = state
                 .store
-                .get(&cr_store_key(
-                    group,
-                    version,
-                    plural,
-                    None,
-                    "ownerref-owner",
-                ))
+                .get(&cr_store_key(group, plural, None, "ownerref-owner"))
                 .await
                 .unwrap()
                 .unwrap();
@@ -8824,7 +8821,7 @@ mod tests {
         // Read back the dependent and verify ownerReferences survived the create round-trip.
         let dep_stored = state
             .store
-            .get(&cr_store_key(group, version, plural, None, "ownerref-dep"))
+            .get(&cr_store_key(group, plural, None, "ownerref-dep"))
             .await
             .unwrap()
             .unwrap();
@@ -8860,7 +8857,7 @@ mod tests {
 
         let dep_after = state
             .store
-            .get(&cr_store_key(group, version, plural, None, "ownerref-dep"))
+            .get(&cr_store_key(group, plural, None, "ownerref-dep"))
             .await
             .unwrap();
         assert!(
@@ -8910,7 +8907,7 @@ mod tests {
         );
 
         // Read rv1 from the store.
-        let key = "/registry/cr/example.io/v1/widgets/stale-widget";
+        let key = "/registry/cr/example.io/widgets/stale-widget";
         let stored = state.store.get(key).await.unwrap().unwrap();
         let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         let rv1: u64 = obj["metadata"]["resourceVersion"]
@@ -9190,6 +9187,181 @@ mod tests {
              CR is deleted via that version — without this, the k8s conformance helper \
              isWatchCachePrimed times out and all 5 FieldValidation tests fail with \
              'cannot create crd gave up waiting for watch event'; body={body_str:?}"
+        );
+    }
+
+    /// A CR created while v1 is the CRD's storage version must still be reachable — by
+    /// GET and PATCH, through any served version — after the CRD is later patched to make
+    /// a *different* served version (v2) the storage version. This is the exact
+    /// "AdmissionWebhook ... mutate custom resource with different stored version"
+    /// conformance flow: create via the storage version, flip storage to another served
+    /// version, then patch through the new storage version.
+    ///
+    /// WHY this matters: a CR's stored bytes never move when a CRD's storage-version
+    /// pointer changes — only which version is used to interpret/serve them. If the
+    /// storage key instead embeds whatever find_crd resolves as the *current* storage
+    /// version, then the instant that pointer moves, every already-written object
+    /// becomes unreachable through every version (old and new alike), because the key
+    /// computed at request time never matches the key the object was actually written
+    /// under. Without this fix, every multi-version CRD 404s the moment its storage
+    /// version changes.
+    #[tokio::test]
+    async fn cr_survives_storage_version_change_and_is_reachable_via_new_storage_version() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let group = "multiver.example.com";
+        let plural = "gizmos";
+        let ns = "default";
+
+        // v1 storage, v2 served-not-storage — the shape the conformance test starts from.
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gizmos.multiver.example.com" },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": plural,
+                        "singular": "gizmo",
+                        "kind": "Gizmo",
+                        "listKind": "GizmoList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true },
+                        { "name": "v2", "served": true, "storage": false }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_bytes,
+        )
+        .await
+        .expect("install multi-version CRD");
+
+        // Create the CR while v1 is the storage version.
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "multiver.example.com/v1",
+                "kind": "Gizmo",
+                "metadata": { "name": "cr-instance-1", "namespace": ns },
+                "data": { "mutation-start": "yes" }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await
+        .expect("create CR via v1 (storage version)");
+
+        // Flip the CRD's storage version: v1 no longer storage, v2 becomes storage.
+        // Mirrors the conformance test's StrategicMergePatchType on spec.versions.
+        let storage_flip = Bytes::from(
+            serde_json::json!({
+                "spec": {
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": false },
+                        { "name": "v2", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let mut strategic_headers = axum::http::HeaderMap::new();
+        strategic_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        crd::patch_crd(
+            State(state.clone()),
+            Path("gizmos.multiver.example.com".to_string()),
+            test_user(),
+            strategic_headers,
+            storage_flip,
+        )
+        .await
+        .expect("flip CRD storage version from v1 to v2");
+
+        // The now-non-storage v1 endpoint must still find the object (GET does not 404).
+        get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "cr-instance-1".to_string(),
+            )),
+        )
+        .await
+        .expect(
+            "GET via v1 after the storage version moved to v2 must not 404 — the object's \
+             bytes never moved, only which version is now considered storage",
+        );
+
+        // PATCH through the new storage version (v2) must find and update the same object —
+        // this is the literal conformance assertion that was failing with 404.
+        let dummy_patch = Bytes::from(
+            serde_json::json!([{ "op": "add", "path": "/dummy", "value": "test" }]).to_string(),
+        );
+        let patch_resp = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "cr-instance-1".to_string(),
+            )),
+            test_user(),
+            json_patch_headers(),
+            dummy_patch,
+        )
+        .await
+        .expect(
+            "PATCH via v2 must find the CR written under the v1 storage key — a 404 here \
+             means the storage key still depends on the CRD's *current* storage-version \
+             pointer instead of being version-independent",
+        )
+        .into_response();
+
+        let body = to_bytes(patch_resp.into_body(), usize::MAX)
+            .await
+            .expect("read patch response body");
+        let patched: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse patch response");
+        assert_eq!(
+            patched["data"]["mutation-start"], "yes",
+            "the object patched via v2 must be the same object created via v1, not a fresh \
+             empty one created at a new key"
+        );
+        assert_eq!(
+            patched["dummy"], "test",
+            "the JSON patch applied via the v2 endpoint must be persisted"
+        );
+        assert_eq!(
+            patched["apiVersion"], "multiver.example.com/v2",
+            "the response must reflect the version this request targeted, not whatever \
+             stale version the object happened to be stamped with when first created"
         );
     }
 
