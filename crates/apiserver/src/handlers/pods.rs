@@ -6087,6 +6087,34 @@ mod pure_logic_tests {
         assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// An array index that already has an element must be a valid path intermediate, not
+    /// an error. A CRD's `spec.versions` is an array, and every CRD has at least one
+    /// version, so JSON-Patch 'add' on a path like `/spec/versions/0/schema/...` must
+    /// descend into the existing element at 0 rather than reject it as "non-object" —
+    /// otherwise PATCHing a CRD's schema via RFC 6902 (as kubectl and the conformance
+    /// suite do) 422s even though nothing needed to be fabricated.
+    #[test]
+    fn navigate_one_or_create_existing_array_index_succeeds() {
+        let mut obj = serde_json::json!([{"name": "v1"}]);
+        let result = json_navigate_one_or_create(&mut obj, "0");
+        let node = result.unwrap_or_else(|_| {
+            panic!("an existing array element must be a valid 'add' path intermediate")
+        });
+        assert_eq!(*node, serde_json::json!({"name": "v1"}));
+    }
+
+    /// An out-of-bounds array index must still error — 'add' may create missing object
+    /// keys, but it must never fabricate array elements to satisfy a path.
+    #[test]
+    fn navigate_one_or_create_array_index_out_of_bounds_returns_422() {
+        let mut obj = serde_json::json!([{"name": "v1"}]);
+        let result = json_navigate_one_or_create(&mut obj, "5");
+        assert!(
+            result.is_err(),
+            "an out-of-bounds array index must not be silently created"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // json_patch_add — branches not covered by patch_type_tests
     // -----------------------------------------------------------------------

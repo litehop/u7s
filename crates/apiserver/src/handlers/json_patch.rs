@@ -787,6 +787,11 @@ pub(crate) fn json_patch_get<'a>(
 
 /// Navigate to a child, creating an empty object if the key is absent.
 /// Used by `json_patch_add` to satisfy RFC 6902 §4.1 intermediate-creation semantics.
+///
+/// An array parent is never fabricated — RFC 6902 gives no rule for inventing array
+/// slots — but an index into an array element that already exists (e.g. `versions/0`
+/// on a CRD, which always has at least one version) is a real position to descend into,
+/// not something to create, so it must navigate rather than error.
 pub(crate) fn json_navigate_one_or_create<'a>(
     node: &'a mut serde_json::Value,
     seg: &str,
@@ -796,6 +801,16 @@ pub(crate) fn json_navigate_one_or_create<'a>(
             map.entry(seg)
                 .or_insert_with(|| serde_json::Value::Object(Default::default()));
             Ok(map.get_mut(seg).unwrap())
+        }
+        serde_json::Value::Array(arr) => {
+            let idx: usize = seg.parse().map_err(|_| {
+                Status::unprocessable_entity(format!(
+                    "path segment '{seg}' is not a valid array index"
+                ))
+            })?;
+            arr.get_mut(idx).ok_or_else(|| {
+                Status::unprocessable_entity(format!("array index {idx} out of bounds"))
+            })
         }
         _ => Err(Status::unprocessable_entity(format!(
             "cannot create intermediate key '{seg}' in non-object"
