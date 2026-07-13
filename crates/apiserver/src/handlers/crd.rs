@@ -1506,6 +1506,105 @@ mod tests {
         );
     }
 
+    /// PATCH /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name} must apply a
+    /// JSON Patch (RFC 6902) 'add' whose path traverses an *existing* array element, not
+    /// just an object.
+    ///
+    /// This reproduces the conformance test's literal request: it patches a CRD with
+    /// `types.JSONPatchType` and path `/spec/versions/0/schema/openAPIV3Schema/properties/a/default`
+    /// — `versions` is an array and `0` is an existing element, so nothing needs to be
+    /// fabricated except the final `default` key. Before this fix the server 422'd with
+    /// "cannot create intermediate key '0' in non-object" because the JSON-Patch 'add'
+    /// intermediate-navigation helper only knew how to descend into objects, never arrays,
+    /// even when the indexed element already existed.
+    #[tokio::test]
+    async fn patch_crd_json_patch_add_through_existing_array_index_sets_schema_default() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "widgets.example.io";
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "a": { "type": "string" }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            crd_bytes,
+        )
+        .await
+        .expect("create must succeed");
+
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/spec/versions/0/schema/openAPIV3Schema/properties/a/default", "value": "A"}
+        ]);
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "JSON Patch 'add' through an existing array index must not 422 — a CRD \
+                 always has at least one version, so index 0 always exists: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["a"]["default"],
+            "A",
+            "the schema default added via JSON Patch must round-trip in the response, \
+             matching what the conformance test reads back after this exact PATCH"
+        );
+    }
+
     /// PATCH on a missing CRD must return 404, not 500.
     #[tokio::test]
     async fn patch_crd_missing_returns_404() {
