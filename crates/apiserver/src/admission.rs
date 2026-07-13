@@ -42,6 +42,13 @@ pub struct AdmissionRequest {
     pub uid: String,
     pub kind: GroupVersionKind,
     pub resource: GroupVersionResource,
+    /// The subresource being requested (e.g. "attach", "status"), if any. Kept
+    /// separate from `resource` per the upstream AdmissionRequest contract —
+    /// webhooks that switch on `request.resource` (e.g. deny-attach in the
+    /// conformance suite) require the base resource here, not a joined
+    /// "pods/attach" string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_resource: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
@@ -702,6 +709,27 @@ async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serd
 // Webhook invocation
 // ---------------------------------------------------------------------------
 
+/// Splits a rule-matching resource string like "pods/attach" into the base
+/// resource ("pods") and subresource ("attach"), or `(resource, None)` when
+/// there is no subresource.
+///
+/// `AdmissionContext::resource` intentionally keeps the joined "base/sub" form
+/// because webhook rule matching (`matches_rule`) and VAP `matchConstraints`
+/// compare it directly against `rules[].resources` entries, which use that
+/// same joined convention (e.g. `resources: ["pods/attach"]`) per the
+/// admissionregistration.k8s.io API. But the wire-format AdmissionRequest sent
+/// to webhooks must carry `resource` and `subResource` as separate fields per
+/// k8s.io/api/admission/v1 — conflating them here made every subresource
+/// operation (attach, exec, ...) send `resource: "pods/attach"`, which a
+/// webhook that switches on `request.resource` (like the conformance suite's
+/// deny-attach webhook) rejects as an unrecognized resource.
+fn split_subresource(resource: &str) -> (&str, Option<&str>) {
+    match resource.split_once('/') {
+        Some((base, sub)) => (base, Some(sub)),
+        None => (resource, None),
+    }
+}
+
 fn build_review(
     uid: &str,
     ctx: &AdmissionContext<'_>,
@@ -715,6 +743,7 @@ fn build_review(
         "UPDATE" | "DELETE" => old_object.cloned(),
         _ => None,
     };
+    let (base_resource, sub_resource) = split_subresource(ctx.resource);
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
@@ -731,8 +760,9 @@ fn build_review(
             resource: GroupVersionResource {
                 group: ctx.group.to_string(),
                 version: ctx.version.to_string(),
-                resource: ctx.resource.to_string(),
+                resource: base_resource.to_string(),
             },
+            sub_resource: sub_resource.map(str::to_string),
             name: ctx.name.to_string(),
             namespace: ctx.namespace.map(|s| s.to_string()),
             operation: ctx.operation.to_string(),
@@ -5360,6 +5390,47 @@ mod tests {
         );
     }
 
+    /// build_review must omit subResource entirely (not send Some("")) for a request
+    /// against a plain resource with no subresource.
+    ///
+    /// The vast majority of admission requests (plain CREATE/UPDATE/DELETE on a
+    /// resource) have no subresource. If build_review always split on the first "/"
+    /// unconditionally, or defaulted subResource to Some(""), every ordinary webhook
+    /// call would carry a spurious subResource field that no real Kubernetes request
+    /// would ever have, potentially confusing webhooks that treat any non-null
+    /// subResource as "this is a subresource operation".
+    #[test]
+    fn build_review_sub_resource_absent_for_plain_resource() {
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "my-pod",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let obj = serde_json::json!({"kind": "Pod", "apiVersion": "v1"});
+        let review = build_review("uid-plain-resource", &ctx, &obj, None);
+        let req = review.request.expect("request must be set");
+        assert_eq!(
+            req.resource.resource, "pods",
+            "request.resource must be unchanged for a plain (non-subresource) request"
+        );
+        assert!(
+            req.sub_resource.is_none(),
+            "subResource must be None (omitted from the wire JSON), not Some(\"\"), \
+             for a request that is not against a subresource"
+        );
+        let wire = serde_json::to_value(&req).expect("AdmissionRequest must serialize");
+        assert!(
+            wire.get("subResource").is_none(),
+            "the serialized AdmissionRequest must not contain a subResource key at all \
+             for a plain resource request, matching upstream's `omitempty` wire format: {wire}"
+        );
+    }
+
     /// webhook_url with multiple pod addresses must not always resolve to the first one.
     ///
     /// Always returning index 0 pins all admission calls to one replica. If that pod
@@ -8858,6 +8929,116 @@ mod tests {
             Some("old-value"),
             "request.oldObject must contain the pre-update object data — \
              a blank oldObject cannot be used to detect what changed"
+        );
+    }
+
+    // -- subresource admission encoding tests --
+
+    /// A CONNECT request against a subresource (e.g. pods/attach) must send the wire
+    /// AdmissionRequest with `resource` set to the base resource and `subResource` set
+    /// separately, per k8s.io/api/admission/v1.
+    ///
+    /// A webhook that gates one subresource specifically (e.g. denying attach but
+    /// allowing exec, or allowing status updates but not the pod itself) compares
+    /// `request.resource` against the plain `{group, version, resource}` GroupVersionResource
+    /// and reads `request.subResource` to tell operations apart. Sending a joined
+    /// "pods/attach" string in `resource` makes every such webhook reject the request as
+    /// an unrecognized resource, so it can never distinguish (or even allow) any
+    /// subresource operation — breaking any policy that gates attach/exec/status
+    /// separately from the base resource.
+    #[tokio::test]
+    async fn validating_webhook_receives_split_resource_and_sub_resource_for_connect() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let router = Router::new().route(
+            "/admit",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured_clone = Arc::clone(&captured_clone);
+                async move {
+                    *captured_clone.lock().unwrap() = Some(body.clone());
+                    let uid = body["request"]["uid"].as_str().unwrap_or("").to_string();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": uid, "allowed": true}
+                    }))
+                }
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+        let state = make_state();
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "attach-subresource-test-vwc"},
+            "webhooks": [{
+                "name": "subresource.test.example.com",
+                "clientConfig": { "url": format!("{base_url}/admit") },
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods/attach"], "operations": ["CONNECT"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/attach-subresource-test-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // ctx.resource keeps the joined "pods/attach" form — that's the correct
+        // input for webhook rule matching (rules[].resources uses this convention).
+        // The bug under test is whether build_review re-joins it into the wire
+        // AdmissionRequest instead of splitting it.
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods/attach",
+            name: "to-be-attached-pod",
+            namespace: Some("default"),
+            operation: "CONNECT",
+            user_info: None,
+            dry_run: false,
+        };
+        let attach_options = serde_json::json!({
+            "kind": "PodAttachOptions",
+            "apiVersion": "v1",
+            "stdin": true,
+            "container": "container1"
+        });
+
+        let result = run_validating_webhooks(&state, &attach_options, None, &ctx).await;
+        assert!(result.is_ok(), "validating webhook must allow the CONNECT");
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called");
+
+        assert_eq!(
+            review["request"]["resource"],
+            serde_json::json!({"group": "", "version": "v1", "resource": "pods"}),
+            "request.resource must be the plain GroupVersionResource for \"pods\" — \
+             a webhook comparing it against {{Group:\"\", Version:\"v1\", Resource:\"pods\"}} \
+             (the standard AdmissionRequest.Resource check used by real deny-on-subresource \
+             webhooks) rejects every request when resource is instead \"pods/attach\""
+        );
+        assert_eq!(
+            review["request"]["subResource"].as_str(),
+            Some("attach"),
+            "request.subResource must carry \"attach\" as its own field so a webhook can \
+             gate attach specifically — without it, no webhook can tell attach apart from \
+             any other pod subresource operation"
         );
     }
 

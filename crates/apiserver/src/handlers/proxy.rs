@@ -404,19 +404,25 @@ pub async fn resolve_attach_target<S: Store>(
             .to_owned(),
     };
 
+    let truthy = |v: &Option<String>| matches!(v.as_deref(), Some("true") | Some("1"));
+    let stdin = truthy(&query.stdin);
+    let stdout = truthy(&query.stdout);
+    let stderr = truthy(&query.stderr);
+    let tty = truthy(&query.tty);
+
     // Build kubelet attach URL.
     //   Kubelet attach endpoint: wss://<node-ip>:10250/attach/<ns>/<pod>/<container>
     let mut params: Vec<(&str, &str)> = vec![("container", container.as_str())];
-    if query.stdin.as_deref() == Some("true") || query.stdin.as_deref() == Some("1") {
+    if stdin {
         params.push(("stdin", "1"));
     }
-    if query.stdout.as_deref() == Some("true") || query.stdout.as_deref() == Some("1") {
+    if stdout {
         params.push(("stdout", "1"));
     }
-    if query.stderr.as_deref() == Some("true") || query.stderr.as_deref() == Some("1") {
+    if stderr {
         params.push(("stderr", "1"));
     }
-    if query.tty.as_deref() == Some("true") || query.tty.as_deref() == Some("1") {
+    if tty {
         params.push(("tty", "1"));
     }
     let qs: String = params
@@ -438,7 +444,22 @@ pub async fn resolve_attach_target<S: Store>(
         user_info: None,
         dry_run: false,
     };
-    run_validating_webhooks(state, &pod, None, &admission_ctx).await?;
+    // Admission for a CONNECT subresource reviews the PodAttachOptions the
+    // client requested (stdin/container/...), not the pod itself — matching
+    // upstream's ConnectResource handler, which builds admission attributes
+    // from the decoded connect options. A webhook that inspects the attach
+    // parameters (e.g. denying only `-i -c=container1`) would otherwise never
+    // see them and could not distinguish attach requests from one another.
+    let attach_options = serde_json::json!({
+        "kind": "PodAttachOptions",
+        "apiVersion": "v1",
+        "stdin": stdin,
+        "stdout": stdout,
+        "stderr": stderr,
+        "tty": tty,
+        "container": container,
+    });
+    run_validating_webhooks(state, &attach_options, None, &admission_ctx).await?;
 
     let tls_config = build_kubelet_tls_config(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
@@ -4430,6 +4451,171 @@ mod tests {
             body_json.contains("is not allowed"),
             "the denial message from the webhook must be propagated to the client: {}",
             body_json
+        );
+    }
+
+    /// The attach admission review must send the requested PodAttachOptions (stdin,
+    /// container, ...) as `request.object`, not the pod being attached to.
+    ///
+    /// The conformance suite's deny-attach webhook decodes `request.object` as
+    /// `PodAttachOptions` and only denies when `Stdin` is true and `Container` matches
+    /// a specific name (`kubectl attach -i -c=container1`) — it never inspects the pod
+    /// itself. Sending the Pod object there instead means every field the webhook
+    /// checks (stdin, container) decodes to its zero value, so the webhook can never
+    /// distinguish one attach request from another and the deny logic never fires.
+    #[tokio::test]
+    async fn attach_admission_review_sends_pod_attach_options_not_the_pod() {
+        use axum::routing::post;
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let router = Router::new().route(
+            "/webhook",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured_clone = Arc::clone(&captured_clone);
+                async move {
+                    *captured_clone.lock().unwrap() = Some(body);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "test-uid", "allowed": true}
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let webhook_url = format!("http://{addr}/webhook");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+
+        // resolve_attach_target requires a cluster CA to build the kubelet TLS config
+        // (refuses to connect without one — see resolve_attach_target_returns_503...);
+        // admission runs before that check, but the mock webhook allows the request,
+        // so the CA must be present for resolve_attach_target to reach completion.
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store: store.clone(),
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "capture-attach"},
+            "webhooks": [{
+                "name": "capture-attach.example.com",
+                "clientConfig": {"url": webhook_url},
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods/attach"],
+                    "operations": ["CONNECT"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/capture-attach",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "to-be-attached-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "container1", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "to-be-attached-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Mirrors `kubectl attach to-be-attached-pod -i -c=container1`.
+        let query = AttachQuery {
+            container: Some("container1".to_string()),
+            stdin: Some("true".to_string()),
+            stdout: None,
+            stderr: None,
+            tty: None,
+        };
+        resolve_attach_target(&state, "default", "to-be-attached-pod", &query)
+            .await
+            .expect("resolve_attach_target must succeed — the mock webhook allows the request");
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called");
+        let object = &review["request"]["object"];
+        assert_eq!(
+            object["kind"].as_str(),
+            Some("PodAttachOptions"),
+            "request.object must be a PodAttachOptions, not the Pod, so a webhook \
+             decoding it as PodAttachOptions (as the conformance suite's deny-attach \
+             webhook does) sees the actual attach parameters: {object}"
+        );
+        assert_eq!(
+            object["stdin"].as_bool(),
+            Some(true),
+            "request.object.stdin must reflect the query's stdin=true \
+             (`kubectl attach -i`) — the deny-attach webhook only denies when Stdin \
+             is true: {object}"
+        );
+        assert_eq!(
+            object["container"].as_str(),
+            Some("container1"),
+            "request.object.container must reflect the requested container \
+             (`kubectl attach -c=container1`), not be absent or the pod's default \
+             container: {object}"
         );
     }
 
