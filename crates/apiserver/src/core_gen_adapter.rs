@@ -1801,6 +1801,177 @@ pub fn decode_secret_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Node -------------------------------------------------------
 
+/// Convert a decoded `NodeStatus` protobuf message to the JSON shape stored/served by u7s.
+///
+/// The kubelet (and any other typed client's `Nodes().UpdateStatus(...)`) PUTs the full
+/// Node using protobuf content-type by default, carrying the full `NodeStatus` on the wire.
+/// Without this, `decode_node_proto_gen` silently dropped `.status` entirely, so that PUT
+/// overwrote the stored status with `null` instead of the caller's values — wiping phase,
+/// conditions (Ready/MemoryPressure/DiskPressure/PIDPressure), addresses, capacity,
+/// allocatable and nodeInfo, on which all sig-node conformance depends.
+fn gen_node_status_to_json(status: core_v1::NodeStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !status.capacity.is_empty() {
+        m.insert(
+            "capacity".to_string(),
+            gen_quantity_map_btree_to_json(status.capacity),
+        );
+    }
+    if !status.allocatable.is_empty() {
+        m.insert(
+            "allocatable".to_string(),
+            gen_quantity_map_btree_to_json(status.allocatable),
+        );
+    }
+    if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
+        m.insert("phase".to_string(), serde_json::Value::String(v));
+    }
+    if !status.conditions.is_empty() {
+        let conditions: Vec<serde_json::Value> = status
+            .conditions
+            .into_iter()
+            .map(|c| {
+                let mut cond = serde_json::json!({
+                    "type": c.r#type.unwrap_or_default(),
+                    "status": c.status.unwrap_or_default(),
+                });
+                if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                    cond["reason"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                    cond["message"] = serde_json::Value::String(v);
+                }
+                if let Some(secs) = c.last_heartbeat_time.and_then(|t| t.seconds) {
+                    cond["lastHeartbeatTime"] =
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                }
+                if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds) {
+                    cond["lastTransitionTime"] =
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                }
+                cond
+            })
+            .collect();
+        m.insert(
+            "conditions".to_string(),
+            serde_json::Value::Array(conditions),
+        );
+    }
+    if !status.addresses.is_empty() {
+        let addrs: Vec<serde_json::Value> = status
+            .addresses
+            .into_iter()
+            .map(|a| {
+                serde_json::json!({
+                    "type": a.r#type.unwrap_or_default(),
+                    "address": a.address.unwrap_or_default(),
+                })
+            })
+            .collect();
+        m.insert("addresses".to_string(), serde_json::Value::Array(addrs));
+    }
+    if let Some(port) = status
+        .daemon_endpoints
+        .and_then(|de| de.kubelet_endpoint)
+        .and_then(|ke| ke.port)
+    {
+        m.insert(
+            "daemonEndpoints".to_string(),
+            serde_json::json!({ "kubeletEndpoint": { "Port": port } }),
+        );
+    }
+    if let Some(info) = status.node_info {
+        let mut ni = serde_json::Map::new();
+        if let Some(v) = info.machine_id.filter(|s| !s.is_empty()) {
+            ni.insert("machineID".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.system_uuid.filter(|s| !s.is_empty()) {
+            ni.insert("systemUUID".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.boot_id.filter(|s| !s.is_empty()) {
+            ni.insert("bootID".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.kernel_version.filter(|s| !s.is_empty()) {
+            ni.insert("kernelVersion".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.os_image.filter(|s| !s.is_empty()) {
+            ni.insert("osImage".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.container_runtime_version.filter(|s| !s.is_empty()) {
+            ni.insert(
+                "containerRuntimeVersion".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        if let Some(v) = info.kubelet_version.filter(|s| !s.is_empty()) {
+            ni.insert("kubeletVersion".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.kube_proxy_version.filter(|s| !s.is_empty()) {
+            ni.insert("kubeProxyVersion".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.operating_system.filter(|s| !s.is_empty()) {
+            ni.insert("operatingSystem".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.architecture.filter(|s| !s.is_empty()) {
+            ni.insert("architecture".to_string(), serde_json::Value::String(v));
+        }
+        if !ni.is_empty() {
+            m.insert("nodeInfo".to_string(), serde_json::Value::Object(ni));
+        }
+    }
+    if !status.images.is_empty() {
+        let images: Vec<serde_json::Value> = status
+            .images
+            .into_iter()
+            .map(|img| {
+                let mut o = serde_json::json!({});
+                if !img.names.is_empty() {
+                    o["names"] = serde_json::Value::Array(
+                        img.names
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                }
+                if let Some(v) = img.size_bytes.filter(|&v| v != 0) {
+                    o["sizeBytes"] = v.into();
+                }
+                o
+            })
+            .collect();
+        m.insert("images".to_string(), serde_json::Value::Array(images));
+    }
+    if !status.volumes_in_use.is_empty() {
+        m.insert(
+            "volumesInUse".to_string(),
+            serde_json::Value::Array(
+                status
+                    .volumes_in_use
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !status.volumes_attached.is_empty() {
+        let vols: Vec<serde_json::Value> = status
+            .volumes_attached
+            .into_iter()
+            .map(|v| {
+                serde_json::json!({
+                    "name": v.name.unwrap_or_default(),
+                    "devicePath": v.device_path.unwrap_or_default(),
+                })
+            })
+            .collect();
+        m.insert(
+            "volumesAttached".to_string(),
+            serde_json::Value::Array(vols),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 pub fn decode_node_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let node = core_v1::Node::decode(data).ok()?;
     let meta = gen_object_meta_to_json(node.metadata.unwrap_or_default());
@@ -1831,6 +2002,9 @@ pub fn decode_node_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
         }
+    }
+    if let Some(status) = node.status {
+        obj["status"] = gen_node_status_to_json(status);
     }
     Some(obj)
 }
@@ -3211,6 +3385,108 @@ mod tests {
             "status.used must survive decode — without it, a KCM protobuf UpdateStatus call \
              wipes CPU/memory quota accounting and it reads back permanently empty even \
              though pods consuming the quota exist"
+        );
+    }
+
+    /// Node status (conditions/addresses/capacity/allocatable/nodeInfo) survives the
+    /// generated-path decode.
+    ///
+    /// The kubelet's `Nodes().UpdateStatus(...)` PUTs the full Node using protobuf
+    /// content-type by default. Before this fix, decode_node_proto_gen never read
+    /// `.status` at all, so that PUT overwrote the stored status with `null` — a node
+    /// would read back with no Ready condition and no capacity/allocatable, and every
+    /// sig-node test that waits on node readiness or schedules against capacity would fail.
+    #[test]
+    fn generated_node_preserves_status_for_status_subresource_replace() {
+        fn quantity(
+            s: &str,
+        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                string: Some(s.to_string()),
+            }
+        }
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("node-1".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::NodeStatus {
+                phase: Some("Running".to_string()),
+                capacity: [("cpu".to_string(), quantity("4"))].into_iter().collect(),
+                allocatable: [("cpu".to_string(), quantity("3800m"))]
+                    .into_iter()
+                    .collect(),
+                conditions: vec![
+                    core_v1::NodeCondition {
+                        r#type: Some("Ready".to_string()),
+                        status: Some("True".to_string()),
+                        reason: Some("KubeletReady".to_string()),
+                        ..Default::default()
+                    },
+                    core_v1::NodeCondition {
+                        r#type: Some("MemoryPressure".to_string()),
+                        status: Some("False".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                addresses: vec![core_v1::NodeAddress {
+                    r#type: Some("InternalIP".to_string()),
+                    address: Some("192.168.1.10".to_string()),
+                }],
+                daemon_endpoints: Some(core_v1::NodeDaemonEndpoints {
+                    kubelet_endpoint: Some(core_v1::DaemonEndpoint { port: Some(10250) }),
+                }),
+                node_info: Some(core_v1::NodeSystemInfo {
+                    kubelet_version: Some("v1.36.0".to_string()),
+                    architecture: Some("amd64".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result =
+            decode_node_proto_gen(&buf).expect("Node with status must decode via generated path");
+
+        assert_eq!(
+            result["status"]["capacity"]["cpu"], "4",
+            "status.capacity must survive decode — without it the scheduler sees a node \
+             with no capacity and never schedules pods onto it"
+        );
+        assert_eq!(
+            result["status"]["allocatable"]["cpu"], "3800m",
+            "status.allocatable must survive decode"
+        );
+        let conds = result["status"]["conditions"].as_array().expect(
+            "status.conditions must be present — without it a kubelet's protobuf \
+             UpdateStatus call reports no Ready condition at all, so every sig-node test \
+             that waits for Node Ready hangs forever",
+        );
+        assert_eq!(conds.len(), 2, "both conditions must survive decode");
+        assert_eq!(
+            conds[0]["type"], "Ready",
+            "condition type must survive decode"
+        );
+        assert_eq!(
+            conds[0]["status"], "True",
+            "condition status must survive decode"
+        );
+        assert_eq!(
+            result["status"]["addresses"][0]["address"], "192.168.1.10",
+            "status.addresses must survive decode — without it kubectl get nodes -o wide \
+             and downward-API status.hostIP consumers see no address"
+        );
+        assert_eq!(
+            result["status"]["daemonEndpoints"]["kubeletEndpoint"]["Port"], 10250,
+            "status.daemonEndpoints.kubeletEndpoint.Port must survive decode — the API \
+             server's own log/exec/proxy subresources dial this port to reach the kubelet"
+        );
+        assert_eq!(
+            result["status"]["nodeInfo"]["kubeletVersion"], "v1.36.0",
+            "status.nodeInfo must survive decode — version skew checks depend on it"
         );
     }
 }
