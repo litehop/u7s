@@ -3335,7 +3335,7 @@ mod tests {
         let plural = "applications";
         let ns = "argocd";
         let name = "my-app";
-        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+        let cr_key = format!("/registry/cr/{group}/{plural}/{ns}/{name}");
 
         let initial = serde_json::json!({
             "apiVersion": "argoproj.io/v1alpha1",

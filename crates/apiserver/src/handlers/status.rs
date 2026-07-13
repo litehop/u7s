@@ -226,8 +226,10 @@ pub async fn put_namespaced_resource_status<S: Store>(
             meta.kind.clone(),
         ),
         Err(_) => {
-            // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
-            let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+            // CR fallback: CRs are stored under /registry/cr/<group>/<plural>/<ns>/<name> —
+            // version-independent, matching cr_store_key (a CR's storage location must not
+            // depend on which served version this request names).
+            let cr_key = format!("/registry/cr/{group}/{plural}/{ns}/{name}");
             (cr_key, plural.clone())
         }
     };
@@ -285,9 +287,11 @@ pub async fn patch_namespaced_resource_status<S: Store>(
             meta.kind.clone(),
         ),
         Err(_) => {
-            // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
+            // CR fallback: CRs are stored under /registry/cr/<group>/<plural>/<ns>/<name> —
+            // version-independent, matching cr_store_key (a CR's storage location must not
+            // depend on which served version this request names).
             (
-                format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}"),
+                format!("/registry/cr/{group}/{plural}/{ns}/{name}"),
                 plural.clone(),
             )
         }
@@ -1321,14 +1325,15 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         // Store a CR under the CR fallback key path.
         // "certificates.cert-manager.io" is not in the static registry, so the handler
-        // must fall back to /registry/cr/<group>/<version>/<plural>/<ns>/<name>.
+        // must fall back to /registry/cr/<group>/<plural>/<ns>/<name> (version-independent —
+        // see cr_store_key).
         let cert = serde_json::json!({
             "apiVersion": "cert-manager.io/v1",
             "kind": "Certificate",
             "metadata": { "name": "my-cert", "namespace": "default" },
             "spec": { "secretName": "my-tls" }
         });
-        let cr_key = "/registry/cr/cert-manager.io/v1/certificates/default/my-cert";
+        let cr_key = "/registry/cr/cert-manager.io/certificates/default/my-cert";
         store
             .put(
                 cr_key,
@@ -1395,7 +1400,7 @@ mod tests {
             "spec": { "secretName": "patch-tls" },
             "status": {}
         });
-        let cr_key = "/registry/cr/cert-manager.io/v1/certificates/default/patch-cert";
+        let cr_key = "/registry/cr/cert-manager.io/certificates/default/patch-cert";
         store
             .put(
                 cr_key,
