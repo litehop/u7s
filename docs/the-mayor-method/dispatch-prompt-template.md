@@ -157,6 +157,39 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 
 ## Tooling rules (mandatory)
 
+### Command shaping — PERMISSION-CRITICAL (read first)
+
+The Bash permission allowlist matches on the command's **first token** and the
+**whole compound string**. Violating the shape below makes EVERY such call prompt
+the operator for permission — which stalls the session. This is not style; it is
+how the allowlist works. Three hard rules:
+
+- **One command per Bash call. Never chain unrelated commands with `&&` / `;` / `|`.**
+  A single non-allowlisted sub-command (or an unrecognized chain structure) taints
+  the ENTIRE batch → prompt. Run `git status`, then `git branch`, then `kubectl …`
+  as SEPARATE Bash calls. (Piping into `jq`/`grep` a single allowlisted producer is
+  fine, e.g. `gh pr view … --json … | jq …`; the ban is on chaining multiple
+  independent actions.)
+- **Never use inline env vars or `export`.** Not `export KUBECONFIG=… && kubectl …`,
+  and not the prefix form `KUBECONFIG=… kubectl …`. Both make the first token
+  `export` / a `VAR=value` assignment instead of an allowlisted binary → prompt.
+  The first token of every Bash call MUST be an allowlisted binary: `git`, `cargo`,
+  `gh`, `kubectl`, `bd`, `limactl`, `jq`, `rustc`, `rustup`, or `scripts/…`.
+- **kubeconfig: ALWAYS pass `--kubeconfig <path>` as a flag** — e.g.
+  `kubectl --kubeconfig ./temp/u7s/kubeconfig get pods`. NEVER `export KUBECONFIG`.
+  Same for any tool config: prefer the flag over an env var. If a command genuinely
+  needs an env var (rare), it almost certainly has a flag equivalent — use that, or
+  it belongs inside a script (e.g. `--verbose` sets `RUST_LOG` inside run-all.sh;
+  never `export RUST_LOG=` by hand).
+- Do NOT start a call with `cd` — `cd` is not allowlisted. Use `git -C <path> …`,
+  or rely on your worktree CWD (Step 0 confirms it), and pass paths as arguments.
+
+If a Bash call is denied, that denial is a SIGNAL your command was mis-shaped
+(inline env, a batch, a leading `cd`/`export`, or a non-allowlisted first token) —
+reshape it into single allowlisted commands; do not abandon the task.
+
+### Other tooling
+
 - Use `jq` for JSON parsing in shell — never `python3 -c`.
 - Use the `Read` tool for file reads — never `cat`, `head`, or `tail` via Bash.
 - Use the `Edit` tool for targeted edits — never `sed` or `awk` via Bash.
