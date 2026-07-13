@@ -16,14 +16,36 @@ set -euo pipefail
 WORKDIR="$PWD/temp/u7s"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 PORT="${U7S_PORT:-6443}"
+_KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --workdir) WORKDIR="$2"; shift 2 ;;
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+# Derive the same konnectivity ports u7s-start.sh / lima-start.sh use for this
+# --port slot (server=N, agent=N-3, admin=N-2, health=N-1; default N=8135+offset*100).
+if [ -n "$_KONNECTIVITY_SERVER_PORT_OVERRIDE" ]; then
+  KONNECTIVITY_SERVER_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
+else
+  KONNECTIVITY_SERVER_PORT=$(( 8135 + (PORT - 6443) * 100 ))
+fi
+KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_SERVER_PORT - 3 ))
+KONNECTIVITY_ADMIN_PORT=$(( KONNECTIVITY_SERVER_PORT - 2 ))
+KONNECTIVITY_HEALTH_PORT=$(( KONNECTIVITY_SERVER_PORT - 1 ))
+
+# Resolve to absolute without requiring WORKDIR to exist (a fresh worktree's
+# first --reset targets a WORKDIR that isn't there yet) so the pkill match
+# below is worktree-unique instead of matching another worktree that was
+# invoked with the same relative --workdir.
+case "$WORKDIR" in
+  /*) ;;
+  *) WORKDIR="$PWD/$WORKDIR" ;;
+esac
 
 echo "=== [reset] Conformance teardown ==="
 
@@ -51,6 +73,19 @@ if [ -n "$API_PID" ]; then
   kill "$API_PID" 2>/dev/null || true
 fi
 pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
+
+# konnectivity-server is started via `disown` (scripts/u7s-start.sh), so it survives
+# even after its origin worktree is deleted, still bound to this port slot and still
+# serving its old CA-signed cert. If left running, the next run's fresh CA/agent
+# reject that stale cert with "certificate signed by unknown authority ... ECDSA
+# verification failure" — kill whatever holds these ports before regenerating certs.
+for kp in "$KONNECTIVITY_SERVER_PORT" "$KONNECTIVITY_AGENT_PORT" "$KONNECTIVITY_ADMIN_PORT" "$KONNECTIVITY_HEALTH_PORT"; do
+  KP_PID=$(lsof -ti tcp:"$kp" 2>/dev/null || true)
+  if [ -n "$KP_PID" ]; then
+    echo "[reset]   killing konnectivity-server on port $kp (PID $KP_PID)"
+    kill "$KP_PID" 2>/dev/null || true
+  fi
+done
 
 # ── 2. Wipe host state ────────────────────────────────────────────────────────
 

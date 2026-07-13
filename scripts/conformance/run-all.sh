@@ -116,7 +116,7 @@ _WORKDIR_ARG="--workdir $WORKDIR"
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
   # shellcheck disable=SC2086
-  bash "$DIR/reset.sh" ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG}
+  bash "$DIR/reset.sh" ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG}
 fi
 
 # Step 01: Build — skipped when --binary is supplied (caller provides the binary).

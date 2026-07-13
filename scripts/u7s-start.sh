@@ -66,6 +66,12 @@ if [ -n "$_WORKDIR_OVERRIDE" ]; then
 else
   WORKDIR="$PWD/temp/u7s"
 fi
+# Resolve to absolute so the konnectivity-server pkill match below is
+# worktree-unique — a relative WORKDIR from different worktrees would
+# otherwise produce identical process command lines and let one worker's
+# restart kill another's konnectivity-server.
+mkdir -p "$WORKDIR"
+WORKDIR="$(cd "$WORKDIR" && pwd)"
 BINARY="${U7S_BINARY:-$REPO/target/release/u7s-apiserver}"
 HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
 
