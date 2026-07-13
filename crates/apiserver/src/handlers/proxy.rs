@@ -1204,6 +1204,60 @@ async fn portforward_proxy(
 }
 
 // ---------------------------------------------------------------------------
+// Shared: forward the backend's response headers onto the outgoing proxy
+// response. node_proxy, pod_proxy_dispatch, and service_proxy_dispatch all
+// funnel through proxied_response so header handling stays uniform.
+// ---------------------------------------------------------------------------
+
+/// Headers that describe framing for one hop of a proxied connection (RFC 7230
+/// §6.1 and Go's `httputil.ReverseProxy`, which upstream's `UpgradeAwareHandler`
+/// wraps for node/pod/service proxy). Forwarding these verbatim would misdescribe
+/// the apiserver→client leg using framing that only applied to the kubelet/pod
+/// →apiserver leg.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Copy the backend's response headers (Content-Type, Content-Length, etc.) onto
+/// the outgoing proxy response, skipping hop-by-hop headers.
+///
+/// Per client-go's `Request.transformResponse`, an empty Content-Type makes a
+/// protobuf-preferring typed client fall back to its own default content type
+/// and then fail to decode the (actually JSON) body — the backend's Content-Type
+/// must survive the proxy hop.
+fn forward_proxied_headers(headers: &mut axum::http::HeaderMap, upstream: &axum::http::HeaderMap) {
+    for (name, value) in upstream.iter() {
+        if HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+}
+
+/// Build the outgoing proxy `Response`, carrying the backend's status and
+/// (filtered) headers.
+fn proxied_response(
+    status: axum::http::StatusCode,
+    upstream_headers: &axum::http::HeaderMap,
+    body: Body,
+) -> Result<Response, crate::status::StatusError> {
+    let mut response = Response::builder()
+        .status(status)
+        .body(body)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    forward_proxied_headers(response.headers_mut(), upstream_headers);
+    Ok(response)
+}
+
+// ---------------------------------------------------------------------------
 // /api/v1/nodes/{name}/proxy/{*path} — forward to kubelet
 // ---------------------------------------------------------------------------
 
@@ -1305,12 +1359,10 @@ pub async fn node_proxy<S: Store>(
         })?;
 
     let kubelet_status = kubelet_resp.status();
+    let upstream_headers = kubelet_resp.headers().clone();
     let body = Body::from_stream(kubelet_resp.bytes_stream());
 
-    Response::builder()
-        .status(kubelet_status.as_u16())
-        .body(body)
-        .map_err(|e| Status::internal(e.to_string()))
+    proxied_response(kubelet_status, &upstream_headers, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,7 +1448,7 @@ async fn pod_proxy_via_connect_tunnel(
     body_bytes: bytes::Bytes,
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
-) -> Result<(u16, bytes::Bytes), String> {
+) -> Result<(u16, axum::http::HeaderMap, bytes::Bytes), String> {
     use http_body_util::BodyExt as _;
     use hyper_util::rt::TokioIo;
     use rustls::pki_types::ServerName;
@@ -1499,13 +1551,14 @@ async fn pod_proxy_via_connect_tunnel(
         .map_err(|e| format!("pod request over tunnel: {e}"))?;
 
     let status = hyper_resp.status().as_u16();
+    let headers = hyper_resp.headers().clone();
     let collected = hyper_resp
         .into_body()
         .collect()
         .await
         .map_err(|e| format!("read pod response body: {e}"))?;
 
-    Ok((status, collected.to_bytes()))
+    Ok((status, headers, collected.to_bytes()))
 }
 
 /// Proxy a request to the pod's IP and containerPort.
@@ -1529,7 +1582,7 @@ async fn pod_proxy_dispatch<S: Store>(
     if let Some(addr) = proxy_addr.as_deref() {
         // Route through konnectivity via an explicit CONNECT tunnel.
         // konnectivity-server accepts CONNECT only; a plain forward-proxy GET returns 405.
-        let (status, body) = pod_proxy_via_connect_tunnel(
+        let (status, headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &pod_ip,
             port,
@@ -1559,10 +1612,9 @@ async fn pod_proxy_dispatch<S: Store>(
             )
         })?;
 
-        return Response::builder()
-            .status(status)
-            .body(Body::from(body))
-            .map_err(|e| Status::internal(e.to_string()));
+        let status = axum::http::StatusCode::from_u16(status)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        return proxied_response(status, &headers, Body::from(body));
     }
 
     // No konnectivity proxy — direct connection to pod IP.
@@ -1600,12 +1652,10 @@ async fn pod_proxy_dispatch<S: Store>(
         })?;
 
     let pod_status = pod_resp.status();
+    let upstream_headers = pod_resp.headers().clone();
     let body = Body::from_stream(pod_resp.bytes_stream());
 
-    Response::builder()
-        .status(pod_status.as_u16())
-        .body(body)
-        .map_err(|e| Status::internal(e.to_string()))
+    proxied_response(pod_status, &upstream_headers, body)
 }
 
 /// Proxy a request to the pod's IP and containerPort (with sub-path).
@@ -1816,7 +1866,7 @@ async fn service_proxy_dispatch<S: Store>(
         .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
 
     if let Some(addr) = proxy_addr.as_deref() {
-        let (status, body) = pod_proxy_via_connect_tunnel(
+        let (status, headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &ep_ip,
             port,
@@ -1846,10 +1896,9 @@ async fn service_proxy_dispatch<S: Store>(
             )
         })?;
 
-        return Response::builder()
-            .status(status)
-            .body(Body::from(body))
-            .map_err(|e| Status::internal(e.to_string()));
+        let status = axum::http::StatusCode::from_u16(status)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        return proxied_response(status, &headers, Body::from(body));
     }
 
     let target_url = format!("http://{ep_ip}:{port}/{path_suffix}");
@@ -1886,12 +1935,10 @@ async fn service_proxy_dispatch<S: Store>(
         })?;
 
     let ep_status = ep_resp.status();
+    let upstream_headers = ep_resp.headers().clone();
     let body = Body::from_stream(ep_resp.bytes_stream());
 
-    Response::builder()
-        .status(ep_status.as_u16())
-        .body(body)
-        .map_err(|e| Status::internal(e.to_string()))
+    proxied_response(ep_status, &upstream_headers, body)
 }
 
 /// Proxy a request to a Service-backing endpoint (with sub-path).
@@ -1986,6 +2033,13 @@ mod tests {
                     .post(pod_proxy)
                     .put(pod_proxy)
                     .delete(pod_proxy),
+            )
+            .route(
+                "/api/v1/nodes/{name}/proxy/{*path}",
+                get(node_proxy)
+                    .post(node_proxy)
+                    .put(node_proxy)
+                    .delete(node_proxy),
             )
             .route(
                 "/api/v1/namespaces/{ns}/services/{name}/proxy",
@@ -4269,7 +4323,9 @@ mod tests {
             let mut buf2 = [0u8; 512];
             let _ = stream.read(&mut buf2).await;
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
+                )
                 .await
                 .unwrap();
         });
@@ -4299,12 +4355,238 @@ mod tests {
             "pod_proxy_via_connect_tunnel must succeed when konnectivity accepts CONNECT: {:?}",
             result.err()
         );
-        let (status, body) = result.unwrap();
+        let (status, headers, body) = result.unwrap();
         assert_eq!(
             status, 200,
             "pod response must be 200, not the konnectivity 405 that the old code produced"
         );
         assert_eq!(&body[..], b"hello");
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/plain",
+            "the pod's Content-Type must survive the konnectivity tunnel — a client \
+             that defaults to protobuf when Content-Type is missing would otherwise \
+             try (and fail) to decode this plain-text body as protobuf"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proxy responses must forward the backend's Content-Type
+    //
+    // client-go's typed clients (kubernetes.Clientset) configure protobuf as
+    // their preferred content type. Request.transformResponse falls back to
+    // that default whenever the response Content-Type header is empty. Before
+    // this fix, node_proxy/pod_proxy_dispatch/service_proxy_dispatch built the
+    // outgoing Response with only a status and a body — the backend's headers
+    // were silently dropped, so a JSON body came back with an empty
+    // Content-Type and a protobuf-preferring client failed to decode it.
+    // -----------------------------------------------------------------------
+
+    /// forward_proxied_headers must copy Content-Type but drop hop-by-hop headers.
+    ///
+    /// If Content-Type is dropped, a protobuf-preferring client falls back to its
+    /// own default content type and mis-decodes the (actually JSON) body. If
+    /// hop-by-hop headers are copied verbatim, they describe the kubelet/pod↔
+    /// apiserver hop's framing, not the apiserver↔client hop this response rides on.
+    #[test]
+    fn forward_proxied_headers_keeps_content_type_drops_hop_by_hop() {
+        let mut upstream = axum::http::HeaderMap::new();
+        upstream.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        upstream.insert(
+            axum::http::header::CONNECTION,
+            "keep-alive".parse().unwrap(),
+        );
+        upstream.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let mut out = axum::http::HeaderMap::new();
+        forward_proxied_headers(&mut out, &upstream);
+
+        assert_eq!(
+            out.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/json",
+            "client-go falls back to its default (protobuf) content type when \
+             Content-Type is empty, then fails to decode this JSON body — \
+             Content-Type must survive the proxy hop"
+        );
+        assert!(
+            out.get(axum::http::header::CONNECTION).is_none(),
+            "Connection describes the kubelet/pod↔apiserver hop, not the \
+             apiserver↔client hop — forwarding it verbatim would misdescribe \
+             the outgoing response's framing"
+        );
+        assert!(
+            out.get("transfer-encoding").is_none(),
+            "axum chooses its own Transfer-Encoding for the outgoing response; \
+             forwarding the backend's verbatim risks conflicting framing"
+        );
+    }
+
+    /// node_proxy must forward the kubelet's Content-Type onto the proxied response.
+    ///
+    /// Before this fix, a GET to /api/v1/nodes/{name}/proxy/pods came back with an
+    /// empty Content-Type even though the kubelet's body was JSON. A protobuf-
+    /// preferring client (any typed clientset) then fails with "provided data does
+    /// not appear to be a protobuf message" trying to decode that JSON as protobuf.
+    #[tokio::test]
+    async fn node_proxy_forwards_upstream_content_type() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "mynode", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]}
+        });
+        store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "mynode"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/nodes/mynode/proxy/pods")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the mock kubelet must be reachable over TLS with the generated CA"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json",
+            "node_proxy dropped the kubelet's Content-Type — a protobuf-preferring \
+             client falls back to its own default and fails to decode this JSON body"
+        );
+    }
+
+    /// pod_proxy (direct, no konnectivity) must forward the pod's Content-Type.
+    ///
+    /// Same client-go fallback mechanism as node_proxy, but exercised through the
+    /// plain-HTTP direct-connection branch of pod_proxy_dispatch used when no
+    /// konnectivity proxy is configured.
+    #[tokio::test]
+    async fn pod_proxy_forwards_upstream_content_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pod_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+        });
+
+        let state = make_state();
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
+            },
+            "status": {"podIP": "127.0.0.1"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/mypod/proxy/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the mock pod backend must be reachable over plain HTTP"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain; charset=utf-8",
+            "pod_proxy_dispatch's direct branch dropped the pod's Content-Type — a \
+             protobuf-preferring client falls back to its own default and \
+             mis-decodes this body"
+        );
     }
 
     // -----------------------------------------------------------------------
