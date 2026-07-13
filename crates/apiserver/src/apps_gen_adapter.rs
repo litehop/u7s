@@ -779,4 +779,150 @@ mod tests {
              (e.g. status == \"True\") panic or skip conditions with null status"
         );
     }
+
+    /// Deployment status.replicas/readyReplicas/unavailableReplicas/conditions must survive
+    /// proto decode.
+    ///
+    /// `kubectl rollout status` and the deployment controller's own reconcile loop read these
+    /// fields directly off a protobuf UpdateStatus PUT (client-go and KCM both default to
+    /// protobuf); before this test, decode_deployment_proto_gen had zero status assertions at
+    /// all, so a regression dropping `.status` would make every Deployment look permanently
+    /// unavailable with nothing in the suite to catch it.
+    #[test]
+    fn decode_deployment_proto_gen_preserves_status_replicas_and_conditions() {
+        let deploy = apps_v1::Deployment {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-deploy".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(apps_v1::DeploymentStatus {
+                observed_generation: Some(2),
+                replicas: Some(3),
+                updated_replicas: Some(3),
+                ready_replicas: Some(2),
+                available_replicas: Some(2),
+                unavailable_replicas: Some(1),
+                conditions: vec![apps_v1::DeploymentCondition {
+                    r#type: Some("Available".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("MinimumReplicasAvailable".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        deploy.encode(&mut buf).unwrap();
+
+        let result = decode_deployment_proto_gen(&buf).expect("Deployment with status must decode");
+
+        assert_eq!(
+            result["status"]["replicas"], 3,
+            "status.replicas must survive decode — without it `kubectl rollout status` and the \
+             deployment controller's own reconcile loop see zero replicas and loop forever"
+        );
+        assert_eq!(
+            result["status"]["readyReplicas"], 2,
+            "status.readyReplicas must survive decode — rollout readiness gating depends on it"
+        );
+        assert_eq!(
+            result["status"]["unavailableReplicas"], 1,
+            "status.unavailableReplicas must survive decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Available",
+            "status.conditions must survive decode — without the Available condition, \
+             `kubectl rollout status` never reports the deployment as ready"
+        );
+    }
+
+    /// StatefulSet status.readyReplicas/currentRevision/updateRevision must survive proto
+    /// decode.
+    ///
+    /// The StatefulSet controller compares currentRevision/updateRevision to decide which pods
+    /// still need a rolling update, and readyReplicas gates ordered pod creation/scaling. The
+    /// only existing status coverage for this decoder checked that a None condition
+    /// type/status becomes "" (not null) — it never asserted that the numeric/revision status
+    /// fields actually survive a populated decode.
+    #[test]
+    fn decode_statefulset_proto_gen_preserves_status_replicas_and_revisions() {
+        let sts = apps_v1::StatefulSet {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-sts".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(apps_v1::StatefulSetStatus {
+                observed_generation: Some(4),
+                replicas: Some(3),
+                ready_replicas: Some(3),
+                current_replicas: Some(2),
+                updated_replicas: Some(1),
+                current_revision: Some("my-sts-abc123".to_string()),
+                update_revision: Some("my-sts-def456".to_string()),
+                available_replicas: Some(3),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        sts.encode(&mut buf).unwrap();
+
+        let result =
+            decode_statefulset_proto_gen(&buf).expect("StatefulSet with status must decode");
+
+        assert_eq!(
+            result["status"]["readyReplicas"], 3,
+            "status.readyReplicas must survive decode — ordered pod creation/scaling waits on it"
+        );
+        assert_eq!(
+            result["status"]["currentRevision"], "my-sts-abc123",
+            "status.currentRevision must survive decode — without it the StatefulSet controller \
+             cannot tell which pods are already on the desired revision"
+        );
+        assert_eq!(
+            result["status"]["updateRevision"], "my-sts-def456",
+            "status.updateRevision must survive decode — without it a rolling update never \
+             knows which revision to converge pods toward"
+        );
+    }
+
+    /// decode_controllerrevision_proto_gen must preserve revision and the embedded raw data.
+    ///
+    /// The StatefulSet/DaemonSet history controllers roll back by matching on `revision` and
+    /// replaying `data`; losing either makes a rollback silently replay the wrong (or no) state.
+    #[test]
+    fn decode_controllerrevision_proto_gen_preserves_revision_and_data() {
+        let cr = apps_v1::ControllerRevision {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-sts-5d8f7c9b6".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            data: Some(
+                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                    raw: Some(br#"{"spec":{"replicas":3}}"#.to_vec()),
+                },
+            ),
+            revision: Some(2),
+        };
+        let mut buf = Vec::new();
+        cr.encode(&mut buf).unwrap();
+
+        let result =
+            decode_controllerrevision_proto_gen(&buf).expect("ControllerRevision must decode");
+
+        assert_eq!(
+            result["revision"], 2,
+            "revision must survive decode — rollback controllers match on this to pick the \
+             target revision"
+        );
+        assert_eq!(
+            result["data"]["spec"]["replicas"], 3,
+            "data must survive decode and parse as JSON — without it a rollback replays an \
+             empty state instead of the recorded one"
+        );
+    }
 }

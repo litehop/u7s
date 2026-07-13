@@ -1001,4 +1001,236 @@ mod tests {
              as an explained one"
         );
     }
+
+    /// decode_csr_proto_gen must preserve status.conditions and status.certificate.
+    ///
+    /// `kubectl certificate approve/deny` PATCHes the /approval subresource and the signer
+    /// controller PUTs the issued certificate through /status, both using protobuf
+    /// content-type by default. The status branch here was added specifically to fix a
+    /// silent-drop bug, but had no test coverage — a regression would silently make every CSR
+    /// approval or issued certificate vanish on the next protobuf PUT.
+    #[test]
+    fn decode_csr_proto_gen_preserves_status_conditions_and_certificate() {
+        let csr = certs_v1::CertificateSigningRequest {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-csr".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(certs_v1::CertificateSigningRequestStatus {
+                conditions: vec![certs_v1::CertificateSigningRequestCondition {
+                    r#type: Some("Approved".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("KubectlApprove".to_string()),
+                    ..Default::default()
+                }],
+                certificate: Some(
+                    b"-----BEGIN CERTIFICATE-----abc-----END CERTIFICATE-----".to_vec(),
+                ),
+            }),
+        };
+        let mut buf = Vec::new();
+        csr.encode(&mut buf).unwrap();
+
+        let result = decode_csr_proto_gen(&buf).expect("CSR with status must decode");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Approved",
+            "status.conditions must survive decode — without it `kubectl certificate approve` \
+             looks like it had no effect and the signer never issues a certificate"
+        );
+        use base64::Engine as _;
+        let expected_cert = base64::engine::general_purpose::STANDARD
+            .encode(b"-----BEGIN CERTIFICATE-----abc-----END CERTIFICATE-----");
+        assert_eq!(
+            result["status"]["certificate"], expected_cert,
+            "status.certificate must survive decode — without it the signer's protobuf \
+             UpdateStatus PUT never actually delivers the issued certificate to the requester"
+        );
+    }
+
+    /// decode_poddisruptionbudget_proto_gen must preserve status.disruptionsAllowed/
+    /// currentHealthy/conditions.
+    ///
+    /// The eviction API handler consults status.disruptionsAllowed on every eviction request
+    /// to decide whether to allow it; the disruption controller updates this status using
+    /// protobuf content-type by default, so a dropped field here would either wrongly block
+    /// every eviction (stuck at 0) or leave callers unable to see why evictions are refused.
+    #[test]
+    fn decode_poddisruptionbudget_proto_gen_preserves_status_counts_and_conditions() {
+        let pdb = policy_v1::PodDisruptionBudget {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pdb".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(policy_v1::PodDisruptionBudgetStatus {
+                observed_generation: Some(1),
+                disruptions_allowed: Some(2),
+                current_healthy: Some(5),
+                desired_healthy: Some(3),
+                expected_pods: Some(5),
+                conditions: vec![meta_v1::Condition {
+                    r#type: Some("DisruptionAllowed".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("SufficientPods".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        pdb.encode(&mut buf).unwrap();
+
+        let result =
+            decode_poddisruptionbudget_proto_gen(&buf).expect("PDB with status must decode");
+
+        assert_eq!(
+            result["status"]["disruptionsAllowed"], 2,
+            "status.disruptionsAllowed must survive decode — the eviction API handler reads \
+             this on every eviction request; a dropped value blocks all evictions at 0"
+        );
+        assert_eq!(
+            result["status"]["currentHealthy"], 5,
+            "status.currentHealthy must survive decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "DisruptionAllowed",
+            "status.conditions must survive decode — kubectl and clients read this to explain \
+             why evictions are or are not currently allowed"
+        );
+    }
+
+    /// decode_ingressclass_proto_gen must preserve spec.controller.
+    ///
+    /// The ingress controller selects which IngressClass objects it manages by matching this
+    /// field; a dropped controller value makes every Ingress referencing this class silently
+    /// unmanaged by any controller.
+    #[test]
+    fn decode_ingressclass_proto_gen_preserves_controller() {
+        let ic = networking_v1::IngressClass {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("nginx".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(networking_v1::IngressClassSpec {
+                controller: Some("k8s.io/ingress-nginx".to_string()),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        ic.encode(&mut buf).unwrap();
+
+        let result = decode_ingressclass_proto_gen(&buf).expect("IngressClass must decode");
+
+        assert_eq!(
+            result["spec"]["controller"], "k8s.io/ingress-nginx",
+            "spec.controller must survive decode — without it no controller recognizes this \
+             IngressClass as its own and every Ingress referencing it goes unserved"
+        );
+    }
+
+    /// decode_endpointslice_proto_gen must preserve endpoints[].addresses/conditions and
+    /// ports[].port.
+    ///
+    /// kube-proxy programs Service dataplane rules directly from EndpointSlice; a dropped
+    /// address, readiness condition, or port means traffic silently never reaches a healthy pod.
+    #[test]
+    fn decode_endpointslice_proto_gen_preserves_addresses_conditions_and_ports() {
+        let es = discovery_v1::EndpointSlice {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-svc-abcde".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            address_type: Some("IPv4".to_string()),
+            endpoints: vec![discovery_v1::Endpoint {
+                addresses: vec!["10.0.0.9".to_string()],
+                conditions: Some(discovery_v1::EndpointConditions {
+                    ready: Some(true),
+                    serving: Some(true),
+                    terminating: Some(false),
+                }),
+                hostname: Some("pod-a".to_string()),
+                ..Default::default()
+            }],
+            ports: vec![discovery_v1::EndpointPort {
+                name: Some("http".to_string()),
+                port: Some(8080),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }],
+        };
+        let mut buf = Vec::new();
+        es.encode(&mut buf).unwrap();
+
+        let result = decode_endpointslice_proto_gen(&buf).expect("EndpointSlice must decode");
+
+        assert_eq!(
+            result["endpoints"][0]["addresses"][0], "10.0.0.9",
+            "endpoints[].addresses must survive decode — without it kube-proxy programs no \
+             backend and traffic to the Service black-holes"
+        );
+        assert_eq!(
+            result["endpoints"][0]["conditions"]["ready"], true,
+            "endpoints[].conditions.ready must survive decode — a dropped readiness condition \
+             makes kube-proxy either send traffic to an unready pod or withhold it from a ready \
+             one"
+        );
+        assert_eq!(
+            result["ports"][0]["port"], 8080,
+            "ports[].port must survive decode — without it kube-proxy has no port to forward to"
+        );
+    }
+
+    /// decode_events_v1_event_proto_gen must preserve reason/regarding/series.
+    ///
+    /// This is the events.k8s.io/v1 Event type kubelet and controllers report through
+    /// (distinct from the legacy core/v1 Event); a dropped `regarding` reference makes an
+    /// event impossible to correlate back to the object it describes.
+    #[test]
+    fn decode_events_v1_event_proto_gen_preserves_reason_regarding_and_series() {
+        let ev = events_v1::Event {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pod.17abc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            regarding: Some(
+                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference {
+                    kind: Some("Pod".to_string()),
+                    name: Some("my-pod".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+            ),
+            reason: Some("Started".to_string()),
+            note: Some("Started container demo".to_string()),
+            r#type: Some("Normal".to_string()),
+            action: Some("Started".to_string()),
+            series: Some(events_v1::EventSeries {
+                count: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ev.encode(&mut buf).unwrap();
+
+        let result =
+            decode_events_v1_event_proto_gen(&buf).expect("events.k8s.io/v1 Event must decode");
+
+        assert_eq!(
+            result["regarding"]["name"], "my-pod",
+            "regarding must survive decode — without it the event cannot be correlated back \
+             to the object it describes"
+        );
+        assert_eq!(result["reason"], "Started", "reason must survive decode");
+        assert_eq!(
+            result["series"]["count"], 4,
+            "series.count must survive decode — without it repeated identical events collapse \
+             to a count of zero instead of the real occurrence count"
+        );
+    }
 }
