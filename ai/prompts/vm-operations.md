@@ -229,6 +229,25 @@ then flails against the dead namespace). kubectl answers the same question in
 seconds. Read the failing test's source to learn its exact API sequence, then
 reproduce it here.
 
+### Upstream source — three rules
+
+Upstream Kubernetes source (e2e test bodies, controllers, API types) is NOT in
+this repo. When you need it:
+
+1. **Stay inside the repo.** Never `find /`, never read or write outside the
+   worktree, never stash upstream source in `/tmp`. The only place upstream
+   source belongs is `temp/research/` (see rule 2).
+2. **`temp/research/` is the upstream cache** (gitignored). Read from it, and
+   write any upstream file you fetch INTO it — never elsewhere. It is not
+   present in fresh worker worktrees (gitignored → not checked out); if you are
+   a worker and need a file that lives in the mayor's `temp/research/`, ask the
+   mayor to copy it into your worktree rather than fetching your own divergent
+   copy or reaching into the mayor checkout.
+3. **Pin to the latest Kubernetes version: `1.36.2`** (as of 2026-07). Use
+   branch `release-1.36` for raw GitHub fetches and reference 1.36.2 API/test
+   semantics — not an older minor. Only deviate if a run's `serverversion.json`
+   explicitly shows a different client version for that specific run.
+
 ### Locating the failing test's source (do NOT hunt for it)
 
 Do NOT search the sonobuoy archive, `temp/e2e/`, or the workspace for the test
@@ -240,12 +259,13 @@ Two places only, in this order:
    controllers like `kcm_job_controller.go`). `ls temp/research/` and grep it for
    the test name or a distinctive assertion string. If the file is there, Read it.
 2. **Otherwise fetch it from GitHub** with the `WebFetch` tool against the raw
-   URL. The failure line in `e2e.txt` names the file+line, e.g.
-   `k8s.io/kubernetes/test/e2e/node/pods.go:530` →
-   `https://raw.githubusercontent.com/kubernetes/kubernetes/release-1.34/test/e2e/node/pods.go`
-   (pin the branch to the conformance client version — this repo targets 1.34+;
-   check `serverversion.json` in the run dir if unsure). Read the function around
-   the cited line to get the exact create→update→assert sequence.
+   URL, and save it into `temp/research/`. The failure line in `e2e.txt` names
+   the file+line, e.g. `k8s.io/kubernetes/test/e2e/node/pods.go:530` →
+   `https://raw.githubusercontent.com/kubernetes/kubernetes/release-1.36/test/e2e/node/pods.go`
+   (pin the branch to `release-1.36` per the version rule above; check
+   `serverversion.json` in the run dir only if you suspect that run used a
+   different client). Read the function around the cited line to get the exact
+   create→update→assert sequence.
 
 Never reconstruct the test from the failure message alone — the assertion text
 (`Expected 2 to be equivalent to 1`) is meaningless without the surrounding

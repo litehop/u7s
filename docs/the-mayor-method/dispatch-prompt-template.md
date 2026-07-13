@@ -174,6 +174,23 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
 
+## Upstream source rules (mandatory)
+
+Upstream Kubernetes source (e2e test bodies, controllers, API types) is NOT in
+this repo. When you need it:
+
+- **Stay inside the repo.** Never `find /`, never read or write files outside
+  your worktree, never stash upstream source in `/tmp`.
+- **`temp/research/` is the only upstream cache** (gitignored). Read from it,
+  and write any upstream file you fetch INTO it. It is not checked out into a
+  fresh worktree; if you need a file that lives in the mayor's `temp/research/`,
+  ask the mayor to copy it into your worktree — do not reach into the mayor
+  checkout or fetch a divergent copy elsewhere.
+- **Pin to the latest Kubernetes version: `1.36.2`** (as of 2026-07) — branch
+  `release-1.36` for raw GitHub fetches, and reference 1.36.2 API/test
+  semantics, not an older minor. Deviate only if a run's `serverversion.json`
+  explicitly shows a different client version for that run.
+
 ## Evidence & time discipline (mandatory)
 
 - Before asserting WHEN something happened or what a time gap MEANS, confirm it
