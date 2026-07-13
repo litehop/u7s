@@ -33,6 +33,26 @@ they are editing), then in-flight work, open PRs, recent merges. Short enough
 that a returning operator re-orients in 30 seconds. Update on every signal —
 don't batch. No need to push dashboard update commits (waste of CI time).
 
+The dashboard is a live SNAPSHOT, not an append-only log — REPLACE stale content,
+never accumulate it. Each update must leave a document a fresh reader could
+consume in 30 seconds, so:
+- **Rewrite in place.** When a worker finishes, its `▶ IN PROGRESS` block becomes
+  a one-line entry in a single `✅ merged this session` list — do not leave the
+  full in-progress block behind. When a decision is made, DELETE the
+  `🎯 DECISION POINT` block (capture the outcome in a bead/PR, not the dashboard).
+- **One of each section, always current.** Exactly one in-progress section, one
+  decision-point section, one session-merge list — supersede, don't stack a second
+  copy. If you're adding a block whose header duplicates an existing one, you're
+  warping it: merge them instead.
+- **Hard ceiling ~40 lines / one screen.** If an update pushes past that, it's the
+  signal to compress: collapse finished work to one line each, drop superseded
+  detail (it lives in beads/PRs/memories), and cut resolved decision points.
+- **Detail lives elsewhere.** Root-cause writeups, verification evidence, and
+  lessons go in bead notes, PR bodies, and `bd remember` — the dashboard only
+  POINTS to them. A paragraph of narrative on the dashboard is a smell.
+Full rewrites with the `Write` tool are expected and cheaper than a warped log; do
+not fear replacing the whole file when it has drifted.
+
 **Findings vs extended-context.** `ai/findings/` is gitignored exploratory work
 (audits, drafts, alternatives); always write the finding doc BEFORE filing the
 beads it would spawn. `ai/extended-context/` is committed durable context for
@@ -81,7 +101,9 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 - 30m — cluster review (3+ same-surface beads → one PR; 8–12 sweet spot)
 - 30m — merge PRs (green only; no --admin)
 - 15m — bead dispatch pass (filter out decisions/EPICs/release-coupled/v1.x/hot-zone)
-- 10m — dashboard refresh
+- 10m — dashboard refresh (REPLACE stale content, don't append — see the
+  Dashboard section's snapshot/≤40-line rules; the loop body must say "rewrite
+  in place / collapse finished blocks", not just "update")
 
 The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
