@@ -25,7 +25,13 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 3. **Simplicity first** — minimum code that solves the problem. No abstractions for single-use code.
 4. **Tests verify intent** — unit tests must encode WHY behavior matters, not just WHAT it does.
 5. **Fail loud** — "completed" is wrong if anything was skipped silently.
-6. **Prefer native tooling** — use Bash and Rust, not Python. For shell text processing use `jq`, `grep`, `sed`. Do not introduce Python scripts or dependencies.
+6. **Prefer native tooling** — use Bash and Rust, not Python. Use the `Read`/`Edit`/`Grep`/`Glob` tools for file I/O and search (not shell `cat`/`sed`/`awk`/`grep`/`find`); use `jq` for JSON in shell. Do not introduce Python scripts or dependencies.
+7. **Command shaping is PERMISSION-CRITICAL** — the Bash allowlist matches on the command's FIRST TOKEN and the whole compound string. To avoid stalling the session on permission prompts:
+   - **One command per Bash call.** Never chain unrelated commands with `&&`/`;` (one non-allowlisted sub-command taints the whole batch → prompt). Run each `git`/`kubectl`/`cargo` call separately. (Piping one allowlisted producer into `jq`/`grep` is fine.)
+   - **No inline env vars, no `export`.** Not `export KUBECONFIG=… && kubectl …`, not `KUBECONFIG=… kubectl …`. The first token must be an allowlisted binary (`git`, `cargo`, `gh`, `kubectl`, `bd`, `limactl`, `jq`, `rustc`, `rustup`, `scripts/…`).
+   - **kubeconfig: always `kubectl --kubeconfig <path> …`** (the flag), never the env var. Prefer a flag over an env var for any tool; if debug logging is needed use the script's `--verbose`, never `export RUST_LOG=`.
+   - **Never lead with `cd`** — use `git -C <path>` or your worktree CWD + path args.
+   - A denied Bash call = your command was mis-shaped (inline env, batch, leading `cd`/`export`, non-allowlisted first token). Reshape into single allowlisted commands; don't abandon the task.
 
 ## Workflow
 
