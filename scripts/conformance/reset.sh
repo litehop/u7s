@@ -25,6 +25,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Resolve to absolute without requiring WORKDIR to exist (a fresh worktree's
+# first --reset targets a WORKDIR that isn't there yet) so the pkill match
+# below is worktree-unique instead of matching another worktree that was
+# invoked with the same relative --workdir.
+case "$WORKDIR" in
+  /*) ;;
+  *) WORKDIR="$PWD/$WORKDIR" ;;
+esac
+
 echo "=== [reset] Conformance teardown ==="
 
 # ── 1. Kill host processes ────────────────────────────────────────────────────
