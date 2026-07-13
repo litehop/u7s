@@ -1472,6 +1472,105 @@ pub fn decode_configmap_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Pod --------------------------------------------------------
 
+/// Convert a decoded `PodStatus` protobuf message to the JSON shape stored/served by u7s.
+///
+/// A protobuf-encoded write to the `/status` subresource (e.g. client-go typed clients'
+/// `UpdateStatus`, which defaults to protobuf content-type) carries the full `PodStatus`
+/// on the wire. Without this, `decode_pod_proto_gen` silently dropped `.status` entirely,
+/// so `replace_pod_status` treated the incoming status as absent and overwrote the stored
+/// status with `null` — a protobuf PUT to a pod's status subresource wiped the pod's phase,
+/// conditions and IPs instead of replacing them with the caller's values.
+fn gen_pod_status_to_json(status: core_v1::PodStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
+        m.insert("phase".to_string(), serde_json::Value::String(v));
+    }
+    if !status.conditions.is_empty() {
+        let conditions: Vec<serde_json::Value> = status
+            .conditions
+            .into_iter()
+            .map(|c| {
+                let mut cond = serde_json::json!({
+                    "type": c.r#type.unwrap_or_default(),
+                    "status": c.status.unwrap_or_default(),
+                });
+                if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                    cond["reason"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                    cond["message"] = serde_json::Value::String(v);
+                }
+                if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds) {
+                    cond["lastTransitionTime"] =
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                }
+                if let Some(secs) = c.last_probe_time.and_then(|t| t.seconds) {
+                    cond["lastProbeTime"] =
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                }
+                if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+                    cond["observedGeneration"] = v.into();
+                }
+                cond
+            })
+            .collect();
+        m.insert(
+            "conditions".to_string(),
+            serde_json::Value::Array(conditions),
+        );
+    }
+    if let Some(v) = status.message.filter(|s| !s.is_empty()) {
+        m.insert("message".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = status.reason.filter(|s| !s.is_empty()) {
+        m.insert("reason".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = status.nominated_node_name.filter(|s| !s.is_empty()) {
+        m.insert(
+            "nominatedNodeName".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    if let Some(v) = status.host_ip.filter(|s| !s.is_empty()) {
+        m.insert("hostIP".to_string(), serde_json::Value::String(v));
+    }
+    if !status.host_i_ps.is_empty() {
+        let ips: Vec<serde_json::Value> = status
+            .host_i_ps
+            .into_iter()
+            .filter_map(|h| h.ip.filter(|s| !s.is_empty()))
+            .map(|ip| serde_json::json!({ "ip": ip }))
+            .collect();
+        if !ips.is_empty() {
+            m.insert("hostIPs".to_string(), serde_json::Value::Array(ips));
+        }
+    }
+    if let Some(v) = status.pod_ip.filter(|s| !s.is_empty()) {
+        m.insert("podIP".to_string(), serde_json::Value::String(v));
+    }
+    if !status.pod_i_ps.is_empty() {
+        let ips: Vec<serde_json::Value> = status
+            .pod_i_ps
+            .into_iter()
+            .filter_map(|p| p.ip.filter(|s| !s.is_empty()))
+            .map(|ip| serde_json::json!({ "ip": ip }))
+            .collect();
+        if !ips.is_empty() {
+            m.insert("podIPs".to_string(), serde_json::Value::Array(ips));
+        }
+    }
+    if let Some(secs) = status.start_time.and_then(|t| t.seconds) {
+        m.insert(
+            "startTime".to_string(),
+            serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+        );
+    }
+    if let Some(v) = status.qos_class.filter(|s| !s.is_empty()) {
+        m.insert("qosClass".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 pub fn decode_pod_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let pod = core_v1::Pod::decode(data).ok()?;
     let meta = gen_object_meta_to_json(pod.metadata.unwrap_or_default());
@@ -1481,6 +1580,9 @@ pub fn decode_pod_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     obj["spec"] = gen_pod_spec_to_json(pod.spec.unwrap_or_default());
+    if let Some(status) = pod.status {
+        obj["status"] = gen_pod_status_to_json(status);
+    }
     Some(obj)
 }
 
@@ -2298,6 +2400,76 @@ mod tests {
         assert_eq!(
             result["spec"]["priority"], 2000000000,
             "priority integer must survive decode"
+        );
+    }
+
+    /// Pod status fields, especially conditions, survive the generated-path decode.
+    ///
+    /// client-go typed clients (`CoreV1().Pods(ns).UpdateStatus(...)`) PUT the full Pod,
+    /// including `.status`, using protobuf content-type by default. Before this fix,
+    /// decode_pod_proto_gen never read `pod.status` at all, so replace_pod_status treated
+    /// the incoming status as absent and overwrote the stored status with `null` — a caller
+    /// flipping PodReady/ContainersReady to False via the status subresource got back a
+    /// response with an empty conditions list instead of its own values, exactly the
+    /// "[sig-node] Pods ... PodStatus" conformance failure this guards against.
+    #[test]
+    fn generated_pod_preserves_status_conditions_for_status_subresource_replace() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("pod-test".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::PodStatus {
+                phase: Some("Running".to_string()),
+                pod_ip: Some("10.1.2.3".to_string()),
+                host_ip: Some("192.168.5.15".to_string()),
+                conditions: vec![
+                    core_v1::PodCondition {
+                        r#type: Some("Ready".to_string()),
+                        status: Some("False".to_string()),
+                        ..Default::default()
+                    },
+                    core_v1::PodCondition {
+                        r#type: Some("ContainersReady".to_string()),
+                        status: Some("False".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).expect("prost encode must succeed");
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with status must decode via generated path");
+
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "status.phase must survive decode — without it a protobuf status PUT looks Pending"
+        );
+        assert_eq!(
+            result["status"]["podIP"], "10.1.2.3",
+            "status.podIP must survive decode"
+        );
+        let conds = result["status"]["conditions"].as_array().expect(
+            "status.conditions must be present — without it a protobuf UpdateStatus call \
+             that flips PodReady/ContainersReady to False reports back zero changed \
+             conditions instead of two",
+        );
+        assert_eq!(conds.len(), 2, "both conditions must survive decode");
+        let false_count = conds
+            .iter()
+            .filter(|c| {
+                (c["type"] == "Ready" || c["type"] == "ContainersReady") && c["status"] == "False"
+            })
+            .count();
+        assert_eq!(
+            false_count, 2,
+            "both Ready and ContainersReady must decode with status=False — a caller \
+             replacing pod status via protobuf must see its own write reflected back"
         );
     }
 
