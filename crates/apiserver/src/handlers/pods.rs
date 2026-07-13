@@ -3591,6 +3591,18 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
     }
 
+    // terminationGracePeriodSeconds: default to 30 when absent, mirroring
+    // upstream's unconditional default in SetDefaults_PodSpec. This value is
+    // set once at creation and never touched again, including through a
+    // graceful delete — so a nil default here means it stays nil for the
+    // pod's entire life. The "should be submitted and removed" conformance
+    // test asserts this field is non-zero on the Pod object delivered by the
+    // final watch.Deleted event (pods.go:334); without this default that
+    // object still carries the nil the pod was created with.
+    if pod["spec"]["terminationGracePeriodSeconds"].is_null() {
+        pod["spec"]["terminationGracePeriodSeconds"] = serde_json::json!(30);
+    }
+
     // serviceAccountName: default to "default" when absent or empty, mirroring
     // upstream's ServiceAccount admission plugin. client-go's token-fetch machinery
     // rejects an empty resource name ("failed to fetch token: resource name may not
@@ -4532,6 +4544,64 @@ mod create_defaults_tests {
             serde_json::json!("None"),
             "dnsPolicy=None must be preserved — user-managed DNS pods configure \
              nameservers via dnsConfig; overriding would silently redirect DNS traffic"
+        );
+    }
+
+    // --- terminationGracePeriodSeconds defaulting tests ---
+
+    /// create_pod must default spec.terminationGracePeriodSeconds to 30 when absent.
+    ///
+    /// This field is set once at creation and never touched again, including by a
+    /// later graceful delete — so if it is left nil here, it stays nil for the pod's
+    /// entire life. The "[sig-node] Pods should be submitted and removed" conformance
+    /// test creates a pod with no explicit terminationGracePeriodSeconds, deletes it,
+    /// and asserts the Pod object delivered on the final watch.Deleted event has this
+    /// field non-zero (pods.go:334). Without this default that assertion fails with
+    /// "nil not to be zero-valued" because the field was never populated.
+    #[test]
+    fn termination_grace_period_seconds_defaults_to_30_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["terminationGracePeriodSeconds"],
+            serde_json::json!(30),
+            "terminationGracePeriodSeconds must default to 30 when absent — upstream \
+             SetDefaults_PodSpec stamps this unconditionally, and a client watching \
+             for pod deletion (e.g. the submitted-and-removed conformance test) asserts \
+             it is non-nil on the final Deleted event"
+        );
+    }
+
+    /// create_pod must NOT override an explicit terminationGracePeriodSeconds value.
+    ///
+    /// A pod that needs longer than 30s to flush state on SIGTERM sets this itself;
+    /// silently clamping it back to 30 would cause the kubelet to SIGKILL the
+    /// container before it finishes shutting down cleanly.
+    #[test]
+    fn termination_grace_period_seconds_explicit_value_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "slow-shutdown-pod", "namespace": "default"},
+            "spec": {
+                "terminationGracePeriodSeconds": 120,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["terminationGracePeriodSeconds"],
+            serde_json::json!(120),
+            "an explicit terminationGracePeriodSeconds must not be overridden by the \
+             default — doing so would cause the kubelet to SIGKILL the container \
+             before its intended graceful-shutdown window elapses"
         );
     }
 
