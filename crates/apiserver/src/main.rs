@@ -38,7 +38,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
 use u7s_store::SqliteStore;
@@ -3309,6 +3309,20 @@ async fn seed_servicecidrs(store: &SqliteStore, service_cidr: &str) -> anyhow::R
     Ok(())
 }
 
+/// Disable Nagle's algorithm on an accepted connection.
+///
+/// Watch clients (e.g. KCM's ConsistencyStore) do read-after-write: they check their
+/// informer cache immediately after a write response, and only advance that cache on
+/// the trailing watch BOOKMARK. Nagle buffering can hold the BOOKMARK on the wire long
+/// enough for the client to recheck first, see a stale RV, and retry — which, under a
+/// fast enough round-trip (e.g. protobuf-encoded traffic), can retry before the
+/// BOOKMARK ever lands, causing the client to repeat the same write forever.
+fn configure_accepted_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!("failed to set TCP_NODELAY on accepted connection: {e}");
+    }
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -3319,6 +3333,7 @@ async fn serve_tls(
 
     loop {
         let (tcp_stream, _peer) = listener.accept().await?;
+        configure_accepted_socket(&tcp_stream);
         let acceptor = acceptor.clone();
         let app = app.clone();
 
@@ -3414,6 +3429,35 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    /// Regression: every connection accepted by the apiserver's HTTP(S) listener must have
+    /// TCP_NODELAY enabled. Watch clients (KCM's ConsistencyStore) read-after-write against
+    /// their informer cache, which only advances on the trailing watch BOOKMARK; leaving
+    /// Nagle's algorithm enabled delays that BOOKMARK on the wire long enough for the client
+    /// to recheck first, retry, and — under a fast round-trip — never converge (observed as
+    /// an unbounded ReplicaSet hash-collision storm). This test fails on revert: if
+    /// `configure_accepted_socket` stops calling `set_nodelay(true)`, `nodelay()` on the
+    /// accepted stream returns `false`.
+    #[tokio::test]
+    async fn configure_accepted_socket_enables_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.expect("accept");
+            configure_accepted_socket(&tcp_stream);
+            tcp_stream.nodelay().expect("nodelay query must succeed")
+        });
+
+        let _client = TcpStream::connect(addr).await.expect("client connect");
+        let nodelay_enabled = server.await.expect("server task must not panic");
+
+        assert!(
+            nodelay_enabled,
+            "accepted connections must have TCP_NODELAY enabled so watch BOOKMARKs are not \
+             delayed by Nagle buffering past a controller's read-after-write recheck"
+        );
     }
 
     #[tokio::test]

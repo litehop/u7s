@@ -114,6 +114,11 @@ fn gen_downward_api_volume_source_to_json(
             .collect();
         m.insert("items".to_string(), serde_json::Value::Array(items_json));
     }
+    // Unlike configMap/secret/projected volumes, a top-level DownwardAPIVolumeSource never
+    // gets a later defaulting pass in handlers/pods.rs::apply_pod_spec_defaults — this decode
+    // step is the only place that stamps defaultMode, and the kubelet refuses to mount the
+    // volume at all without one ("no defaultMode used, not even the default value for it").
+    // So always emit a value here, unlike the other volume sources below.
     let dm = match default_mode.unwrap_or(0) {
         0 => 420,
         v => v,
@@ -689,7 +694,13 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
                 gen_quantity_map_to_json(res.requests),
             );
         }
-        cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
+        // Only emit "resources" when non-empty — see gen_downward_api_volume_source_to_json
+        // for why materializing a wire-absent value breaks workload-template hash-collision
+        // equality checks. k8s.io/api's Container.Resources is a value (not pointer) type, so
+        // it is always present after protobuf decode even when the client set nothing.
+        if !res_map.is_empty() {
+            cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
+        }
     }
     if let Some(p) = c.liveness_probe {
         cm.insert("livenessProbe".to_string(), gen_probe_to_json(p));
@@ -897,14 +908,14 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                                 secret_map
                                     .insert("items".to_string(), gen_key_to_path_to_json(s.items));
                             }
-                            let dm = match s.default_mode.unwrap_or(0) {
-                                0 => 420,
-                                v => v,
-                            };
-                            secret_map.insert(
-                                "defaultMode".to_string(),
-                                serde_json::Value::Number(dm.into()),
-                            );
+                            // See gen_downward_api_volume_source_to_json: omit rather than
+                            // default to 420 when unset.
+                            if let Some(dm) = s.default_mode.filter(|&v| v != 0) {
+                                secret_map.insert(
+                                    "defaultMode".to_string(),
+                                    serde_json::Value::Number(dm.into()),
+                                );
+                            }
                             if let Some(true) = optional {
                                 secret_map
                                     .insert("optional".to_string(), serde_json::Value::Bool(true));
@@ -947,14 +958,14 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                                         gen_key_to_path_to_json(cm.items),
                                     );
                                 }
-                                let dm = match cm.default_mode.unwrap_or(0) {
-                                    0 => 420,
-                                    v => v,
-                                };
-                                cm_map.insert(
-                                    "defaultMode".to_string(),
-                                    serde_json::Value::Number(dm.into()),
-                                );
+                                // See gen_downward_api_volume_source_to_json: omit rather
+                                // than default to 420 when unset.
+                                if let Some(dm) = cm.default_mode.filter(|&v| v != 0) {
+                                    cm_map.insert(
+                                        "defaultMode".to_string(),
+                                        serde_json::Value::Number(dm.into()),
+                                    );
+                                }
                                 if let Some(true) = optional {
                                     cm_map.insert(
                                         "optional".to_string(),
@@ -2981,6 +2992,208 @@ mod tests {
         assert_eq!(
             proj_sources[1]["secret"]["optional"], true,
             "projected secret source's optional flag must survive decode"
+        );
+    }
+
+    /// A Container's `resources` must be omitted from decoded JSON when the wire carried no
+    /// limits/requests, not materialized as `resources: {}`.
+    ///
+    /// k8s.io/api's Container.Resources is a Go value (not pointer) field, so upstream's
+    /// protobuf marshaler always writes the sub-message even when the caller set nothing —
+    /// any protobuf-encoded write (e.g. from client-go) decodes to `Some(<empty>)` here. A
+    /// workload controller (e.g. the Deployment controller) compares a freshly-created
+    /// ReplicaSet's pod template against its own cached template using a full structural
+    /// equality check; if this decoder inserts `resources: {}` where the client sent nothing,
+    /// the two templates never match and the controller recreates the ReplicaSet forever.
+    #[test]
+    fn generated_container_omits_empty_resources() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-resources-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    resources: Some(core_v1::ResourceRequirements::default()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"]["containers"][0].get("resources").is_none(),
+            "an empty ResourceRequirements (the wire shape a protobuf client always sends, \
+             even with no limits/requests configured) must be omitted, not materialized as \
+             resources: {{}} — otherwise a protobuf-decoded template never structurally \
+             matches an equivalent JSON-created one"
+        );
+    }
+
+    /// Non-empty container resources must still survive decode — the omit-when-empty fix
+    /// above must not turn into "always drop resources".
+    #[test]
+    fn generated_container_preserves_non_empty_resources() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("with-resources-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    resources: Some(core_v1::ResourceRequirements {
+                        limits: std::collections::HashMap::from([(
+                            "cpu".to_string(),
+                            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                string: Some("100m".to_string()),
+                            },
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "100m",
+            "an explicitly-set resource limit must survive decode unchanged"
+        );
+    }
+
+    /// ConfigMap/Secret volume `defaultMode` must be omitted when the client never set it,
+    /// not stamped to 420 (0644) during decode.
+    ///
+    /// k8s.io/api's DefaultMode is a Go pointer (*int32), so protobuf legitimately omits it
+    /// from the wire when unset — the decoder must preserve that "unset" as an absent JSON
+    /// key, not invent a value. Unlike a real Pod (which gets 420 stamped uniformly for any
+    /// encoding by apply_pod_create_defaults after this decode step), a ReplicaSet/
+    /// Deployment/etc. pod template goes straight from this decoder into storage with no
+    /// further defaulting pass. Stamping 420 here made every protobuf-decoded workload
+    /// template permanently differ from the un-stamped template a controller already has
+    /// cached from watching the owning Deployment, so the Deployment controller's
+    /// hash-collision equality check never matched and it recreated the ReplicaSet forever.
+    #[test]
+    fn generated_pod_spec_omits_default_mode_when_absent_on_configmap_and_secret_volumes() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-default-mode-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![
+                    core_v1::Volume {
+                        name: Some("cm-vol".to_string()),
+                        volume_source: Some(core_v1::VolumeSource {
+                            config_map: Some(core_v1::ConfigMapVolumeSource {
+                                local_object_reference: Some(core_v1::LocalObjectReference {
+                                    name: Some("my-cm".to_string()),
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    },
+                    core_v1::Volume {
+                        name: Some("secret-vol".to_string()),
+                        volume_source: Some(core_v1::VolumeSource {
+                            secret: Some(core_v1::SecretVolumeSource {
+                                secret_name: Some("my-secret".to_string()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with volumes must decode");
+        let volumes = result["spec"]["volumes"].as_array().unwrap();
+
+        assert!(
+            volumes[0]["configMap"].get("defaultMode").is_none(),
+            "configMap volume defaultMode must be omitted when the client never set it, not \
+             stamped to 420 — a workload-template pod spec never goes through Pod-create \
+             defaulting, so stamping it here permanently breaks hash-collision equality \
+             checks against the un-stamped template a controller already has cached"
+        );
+        assert!(
+            volumes[1]["secret"].get("defaultMode").is_none(),
+            "secret volume defaultMode must be omitted when the client never set it, not \
+             stamped to 420, for the same reason as the configMap case"
+        );
+    }
+
+    /// An explicitly-set, non-default defaultMode must survive decode unchanged — the
+    /// omit-when-absent fix above must not turn into "always drop defaultMode".
+    #[test]
+    fn generated_pod_spec_preserves_explicit_non_default_default_mode() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("explicit-default-mode-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("cm-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        config_map: Some(core_v1::ConfigMapVolumeSource {
+                            local_object_reference: Some(core_v1::LocalObjectReference {
+                                name: Some("my-cm".to_string()),
+                            }),
+                            default_mode: Some(256),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with volumes must decode");
+
+        assert_eq!(
+            result["spec"]["volumes"][0]["configMap"]["defaultMode"], 256,
+            "an explicit, non-default defaultMode set by the client must survive decode \
+             unchanged"
         );
     }
 
