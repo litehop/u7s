@@ -163,13 +163,26 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 - Use the `Grep` tool for search — never shell `grep` / `find` for file I/O.
 - For code navigation (callers, usage paths, rename impact, a symbol's type),
   use the `mcp__mcpls__*` LSP tools — they give the compiler's semantic view,
-  not a text match. Workflow is **grep-then-LSP**: grep to find the symbol
-  string + its line, then `get_references` / `get_definition` / `get_hover` at
-  that `file_path` + 1-based `line`/`character` to get true refs/def/type
-  (`prepare_call_hierarchy` + `get_incoming_calls` for multi-hop caller trees).
-  Caveat: `workspace_symbol_search` (whole-workspace search by name) needs a
-  warm rust-analyzer index and returns EMPTY in a fresh worktree even for real
-  symbols — grep to find the anchor, LSP-at-position to analyze it.
+  not a text match. The Rust LSP (rust-analyzer) IS live and warm in this repo —
+  verified working for hover/definition/references at a position. Workflow is
+  **grep-then-LSP**: grep to find the symbol string + its line, then
+  `get_references` / `get_definition` / `get_hover` at that `file_path` + 1-based
+  `line`/`character` to get true refs/def/type (`prepare_call_hierarchy` +
+  `get_incoming_calls` for multi-hop caller trees).
+- **To understand an EXTERNAL / vendored crate's API (the `~/.cargo/registry/...`
+  files): do NOT grep them.** `get_hover` on a call to an external symbol returns
+  its full signature + resolved generics + doc comment + docs.rs link without
+  reading any file; `get_definition` jumps straight to the exact vendored source
+  file+line (e.g. hovering `Certificate::from_der` resolves the trait and jumps
+  into `~/.cargo/.../der-0.8.1/src/decode.rs`). This is the correct tool for
+  adapting to a dependency bump or checking a crate's real API — grepping the
+  cargo registry by hand is slower, misses the resolved types, and triggers
+  permission prompts.
+- The ONE LSP caveat: `workspace_symbol_search` (whole-workspace search by *name*)
+  needs a warm index and can return EMPTY in a fresh worktree. That caveat is
+  SPECIFIC to name-search — it does NOT mean "LSP is unreliable, just grep."
+  Hover/definition/references AT A POSITION work fine; grep only to find the
+  anchor line, then use LSP-at-position for everything semantic.
 - Bash is for runtime commands only: `git`, `cargo`, `gh`, `kubectl`, `bd`.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
@@ -552,6 +565,16 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
   — all trigger permission prompts and slow the session. Always inject the
   common preamble verbatim.
+- **Workers grep `~/.cargo` vendored crate files to understand a dependency's
+  API instead of using the LSP.** The `mcpls` Rust LSP is live and warm here
+  (verified 2026-07-13). `get_hover` on an external symbol returns its signature
+  + resolved generics + doc + docs.rs link without reading a file; `get_definition`
+  jumps to the exact vendored file+line. Grepping the registry by hand is slower,
+  misses resolved types, and triggers permission prompts. Two drivers, both fixed
+  in the preamble: (1) the vendored-crate navigation case wasn't spelled out; (2)
+  the `workspace_symbol_search`-returns-empty caveat got over-generalized into
+  "LSP is unreliable here" — it is specific to name-search; hover/definition/
+  references at a position work fine. See bd memory `mcpls-rust-lsp-works-dont-grep-cargo`.
 - **Agents (and the mayor) fabricate temporal claims instead of checking timestamps.**
   Observed repeatedly: an agent calls a log line "from a previous run" when it was
   20 seconds earlier in the run it just executed; the mayor asserts evidence
