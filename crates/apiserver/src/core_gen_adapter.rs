@@ -2101,6 +2101,31 @@ pub fn decode_endpoints_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: ResourceQuota ----------------------------------------------
 
+/// Convert a decoded `ResourceQuotaStatus` protobuf message to the JSON shape stored/served
+/// by u7s.
+///
+/// Upstream's quota controller (`pkg/controller/resourcequota`) calls
+/// `ResourceQuotas(ns).UpdateStatus(...)` every reconcile, which PUTs the full ResourceQuota
+/// using protobuf content-type by default. Without this, `decode_resourcequota_proto_gen`
+/// silently dropped `.status` entirely, so that PUT wiped `status.hard`/`status.used`
+/// (including CPU/memory accounting) instead of replacing them with the caller's values.
+fn gen_resourcequota_status_to_json(status: core_v1::ResourceQuotaStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !status.hard.is_empty() {
+        m.insert(
+            "hard".to_string(),
+            gen_quantity_map_btree_to_json(status.hard),
+        );
+    }
+    if !status.used.is_empty() {
+        m.insert(
+            "used".to_string(),
+            gen_quantity_map_btree_to_json(status.used),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 pub fn decode_resourcequota_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = core_v1::ResourceQuota::decode(data).ok()?;
     let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
@@ -2142,6 +2167,9 @@ pub fn decode_resourcequota_proto_gen(data: &[u8]) -> Option<serde_json::Value> 
             }
             result["spec"] = spec_json;
         }
+    }
+    if let Some(status) = obj.status {
+        result["status"] = gen_resourcequota_status_to_json(status);
     }
     Some(result)
 }
@@ -3134,6 +3162,55 @@ mod tests {
         assert_eq!(
             secret_result["immutable"], true,
             "Secret.immutable must survive decode — same data-integrity gap as ConfigMap"
+        );
+    }
+
+    /// ResourceQuota status.hard/status.used survive the generated-path decode.
+    ///
+    /// Upstream's quota controller calls `ResourceQuotas(ns).UpdateStatus(...)` every
+    /// reconcile, using protobuf content-type by default. Before this fix,
+    /// decode_resourcequota_proto_gen never read `.status` at all, so that PUT overwrote
+    /// the stored status with `null` — a namespace's CPU/memory quota usage would read back
+    /// permanently empty even while pods consuming the quota exist, because u7s's own
+    /// internal reconciler only heals the count-based subset it computes itself.
+    #[test]
+    fn generated_resourcequota_preserves_status_hard_and_used_for_status_subresource_replace() {
+        fn quantity(
+            s: &str,
+        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                string: Some(s.to_string()),
+            }
+        }
+        let rq = core_v1::ResourceQuota {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("compute-quota".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::ResourceQuotaStatus {
+                hard: [("cpu".to_string(), quantity("4"))].into_iter().collect(),
+                used: [("cpu".to_string(), quantity("1500m"))]
+                    .into_iter()
+                    .collect(),
+            }),
+        };
+        let mut buf = Vec::new();
+        rq.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_resourcequota_proto_gen(&buf)
+            .expect("ResourceQuota with status must decode via generated path");
+
+        assert_eq!(
+            result["status"]["hard"]["cpu"], "4",
+            "status.hard must survive decode"
+        );
+        assert_eq!(
+            result["status"]["used"]["cpu"], "1500m",
+            "status.used must survive decode — without it, a KCM protobuf UpdateStatus call \
+             wipes CPU/memory quota accounting and it reads back permanently empty even \
+             though pods consuming the quota exist"
         );
     }
 }
