@@ -4088,7 +4088,9 @@ pub fn validate_pod_spec_immutable(
     }
 
     for (i, (old_c, new_c)) in old_containers.iter().zip(new_containers.iter()).enumerate() {
-        if old_c["resources"] != new_c["resources"] {
+        if normalize_container_resources(&old_c["resources"])
+            != normalize_container_resources(&new_c["resources"])
+        {
             return Err(format!(
                 "spec.containers[{i}].resources: Forbidden: pod updates may not change \
                  container resources — resize the pod via the /resize subresource instead"
@@ -4096,7 +4098,9 @@ pub fn validate_pod_spec_immutable(
         }
     }
     for (i, (old_c, new_c)) in old_init.iter().zip(new_init.iter()).enumerate() {
-        if old_c["resources"] != new_c["resources"] {
+        if normalize_container_resources(&old_c["resources"])
+            != normalize_container_resources(&new_c["resources"])
+        {
             return Err(format!(
                 "spec.initContainers[{i}].resources: Forbidden: pod updates may not change \
                  container resources — resize the pod via the /resize subresource instead"
@@ -4105,6 +4109,130 @@ pub fn validate_pod_spec_immutable(
     }
 
     Ok(())
+}
+
+/// Normalize a container's `resources` value for the immutability comparison above so
+/// that an absent field, an explicit `null`, and an empty `{}` all compare equal — as do
+/// empty `limits`/`requests`/`claims` sub-maps within a present object.
+///
+/// A pod created via a JSON-writing client (e.g. KCM, which runs with
+/// `--kube-api-content-type=application/json`) stores `resources: {}` for a container
+/// that set no resources, because Go's `encoding/json` always emits a non-pointer struct
+/// field regardless of the `omitempty` tag. A pod updated via a protobuf-writing client
+/// (e.g. client-go's typed clientset, which defaults to protobuf for core/v1 writes)
+/// decodes to a container with the `resources` key omitted entirely, because our
+/// protobuf adapter deliberately drops an empty `ResourceRequirements` (see
+/// `gen_container_to_json` in core_gen_adapter.rs — needed so protobuf-decoded workload
+/// templates structurally match JSON-created ones for the Deployment controller's
+/// hash-collision check). Both representations mean "no resources configured"; comparing
+/// them with raw JSON equality treats a metadata-only PUT/PATCH round-trip through a
+/// protobuf client as an illegal resources change and 422s it, breaking Job/RC pod
+/// adoption, release, and orphaning.
+fn normalize_container_resources(v: &serde_json::Value) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(limits) = v.get("limits").and_then(|x| x.as_object()) {
+        if !limits.is_empty() {
+            m.insert(
+                "limits".to_string(),
+                serde_json::Value::Object(limits.clone()),
+            );
+        }
+    }
+    if let Some(requests) = v.get("requests").and_then(|x| x.as_object()) {
+        if !requests.is_empty() {
+            m.insert(
+                "requests".to_string(),
+                serde_json::Value::Object(requests.clone()),
+            );
+        }
+    }
+    if let Some(claims) = v.get("claims").and_then(|x| x.as_array()) {
+        if !claims.is_empty() {
+            m.insert(
+                "claims".to_string(),
+                serde_json::Value::Array(claims.clone()),
+            );
+        }
+    }
+    if m.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(m)
+    }
+}
+
+#[cfg(test)]
+mod pod_resources_immutability_tests {
+    use super::*;
+
+    /// A pod created by a JSON-writing client (`resources: {}`) followed by a
+    /// metadata-only PUT decoded from a protobuf-writing client (`resources` key
+    /// omitted) must NOT be rejected as a resources change — both mean "no resources
+    /// configured". This is the exact shape KCM (JSON, `--kube-api-content-type=
+    /// application/json`) creates a pod with, followed by the conformance e2e binary's
+    /// (protobuf) orphan/release PUT — without this normalization the guard 422s
+    /// "[sig-apps] Job should adopt matching orphans and release non-matching pods" and
+    /// "[sig-apps] ReplicationController should release no longer matching pods", which
+    /// only ever touch metadata.ownerReferences / metadata.labels, never resources.
+    #[test]
+    fn empty_object_resources_and_omitted_resources_are_not_a_change() {
+        let spec_before = serde_json::json!({
+            "containers": [{"name": "c", "image": "pause", "resources": {}}]
+        });
+        let spec_after = serde_json::json!({
+            "containers": [{"name": "c", "image": "pause"}]
+        });
+        assert_eq!(
+            validate_pod_spec_immutable(&spec_before, &spec_after),
+            Ok(()),
+            "an empty {{}} resources object and an entirely absent resources key both mean \
+             \"no resources configured\" — treating them as a change breaks metadata-only \
+             pod updates from any client whose protobuf encoding omits empty resources"
+        );
+    }
+
+    /// The reverse direction (stored has no `resources` key, incoming PUT has `{}`) must
+    /// also be treated as unchanged — the normalization must be symmetric.
+    #[test]
+    fn omitted_resources_and_empty_object_resources_are_not_a_change() {
+        let spec_before = serde_json::json!({
+            "containers": [{"name": "c", "image": "pause"}]
+        });
+        let spec_after = serde_json::json!({
+            "containers": [{"name": "c", "image": "pause", "resources": {}}]
+        });
+        assert_eq!(
+            validate_pod_spec_immutable(&spec_before, &spec_after),
+            Ok(())
+        );
+    }
+
+    /// A genuine resources change must still be rejected — the normalization fix above
+    /// must not turn into "never enforce the guard". Resource rewrites must go through
+    /// the /resize subresource, not a plain PUT.
+    #[test]
+    fn real_resources_change_is_still_rejected() {
+        let spec_before = serde_json::json!({
+            "containers": [{"name": "c", "image": "pause", "resources": {
+                "requests": {"cpu": "100m"}
+            }}]
+        });
+        let spec_after = serde_json::json!({
+            "containers": [{"name": "c", "image": "pause", "resources": {
+                "requests": {"cpu": "200m"}
+            }}]
+        });
+        let result = validate_pod_spec_immutable(&spec_before, &spec_after);
+        assert!(
+            result.is_err(),
+            "an actual resources change must still be rejected by the plain PUT/PATCH \
+             path — it must go through /resize instead"
+        );
+        assert!(
+            result.unwrap_err().contains("resources"),
+            "the rejection must name resources as the forbidden field"
+        );
+    }
 }
 
 /// Increment `metadata.generation` by 1 when the pod spec has changed.
