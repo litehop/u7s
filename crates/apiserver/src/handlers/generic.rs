@@ -425,19 +425,25 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Encode a store key as a signed continue token.
+/// Encode a store key and its pinned resourceVersion as a signed continue token.
 ///
 /// Token format: `base64url(payload) + "." + base64url(hmac_sha256(signing_key, payload))`
 ///
-/// The payload is a JSON envelope `{"k":"<store_key>","t":<unix_secs>}`.
+/// The payload is a JSON envelope `{"k":"<store_key>","t":<unix_secs>,"rv":<resourceVersion>}`.
 /// The HMAC prevents a client from forging tokens that point to a different
 /// namespace's store prefix (cross-namespace pagination forgery).
-fn encode_continue(key: &str, signing_key: &[u8; 32]) -> String {
+///
+/// `rv` pins the resourceVersion every subsequent page of this listing walk must report.
+/// Kubernetes conformance (chunking.go) asserts `list.ResourceVersion` is IDENTICAL across
+/// every page of one pagination pass — the store's live global revision otherwise drifts
+/// upward between pages (other resources being written concurrently), which would fail
+/// that assertion even though the actual paged items are correct.
+fn encode_continue(key: &str, revision: u64, signing_key: &[u8; 32]) -> String {
     use base64::Engine;
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let payload = serde_json::json!({"k": key, "t": unix_now()}).to_string();
+    let payload = serde_json::json!({"k": key, "t": unix_now(), "rv": revision}).to_string();
     let payload_b64 = b64.encode(payload.as_bytes());
     let mut mac = <Hmac<Sha256>>::new_from_slice(signing_key).expect("HMAC accepts any key size");
     mac.update(payload.as_bytes());
@@ -446,7 +452,15 @@ fn encode_continue(key: &str, signing_key: &[u8; 32]) -> String {
     format!("{payload_b64}.{sig_b64}")
 }
 
-/// Decode and verify a signed continue token, returning the store key.
+/// Decode and verify a signed continue token, returning the store key and the pinned
+/// resourceVersion the caller must report in the resulting list response.
+///
+/// `current_revision` is the store's live global revision at request time (from
+/// `Store::current_revision`, a cheap in-memory read); it is used only to mint the `rv` of a
+/// fresh replacement token when the incoming one is rejected as expired/invalid — that fresh
+/// token starts a new (inconsistent) listing pass, so it must carry a NEW resourceVersion,
+/// matching the upstream chunking conformance expectation that the resumed list's
+/// resourceVersion differs from the one before compaction.
 ///
 /// Returns `Err` with:
 /// - HTTP 410 Gone with `reason: "Expired"` if the HMAC signature is invalid
@@ -458,8 +472,9 @@ fn encode_continue(key: &str, signing_key: &[u8; 32]) -> String {
 /// tokens and prompts clients to re-list from scratch.
 pub(crate) fn decode_continue(
     token: &str,
+    current_revision: u64,
     signing_key: &[u8; 32],
-) -> Result<String, crate::status::StatusError> {
+) -> Result<(String, u64), crate::status::StatusError> {
     use base64::Engine;
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
@@ -483,7 +498,7 @@ pub(crate) fn decode_continue(
     mac.verify_slice(&sig_bytes).map_err(|_| {
         // Return 410 with a fresh start-of-list token so clients can restart pagination.
         // Kubernetes spec requires metadata.continue in the 410 body.
-        let fresh_token = encode_continue("", signing_key);
+        let fresh_token = encode_continue("", current_revision, signing_key);
         Status::expired_with_continue(
             "continue token signature invalid; re-list from the beginning".to_string(),
             fresh_token,
@@ -502,7 +517,7 @@ pub(crate) fn decode_continue(
         // than restarting from the beginning — matching etcd compaction behaviour where the fresh
         // token points to the compaction boundary, not the list head.
         let original_key = payload["k"].as_str().unwrap_or("");
-        let fresh_token = encode_continue(original_key, signing_key);
+        let fresh_token = encode_continue(original_key, current_revision, signing_key);
         return Err(Status::expired_with_continue(
             format!(
                 "continue token expired: issued {age}s ago (TTL is {CONTINUE_TOKEN_TTL_SECS}s); \
@@ -511,10 +526,13 @@ pub(crate) fn decode_continue(
             fresh_token,
         ));
     }
-    payload["k"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| Status::bad_request("invalid continue token: missing key field".to_string()))
+    let key = payload["k"].as_str().map(str::to_string).ok_or_else(|| {
+        Status::bad_request("invalid continue token: missing key field".to_string())
+    })?;
+    let revision = payload["rv"].as_u64().ok_or_else(|| {
+        Status::bad_request("invalid continue token: missing resourceVersion field".to_string())
+    })?;
+    Ok((key, revision))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -535,7 +553,11 @@ pub(crate) fn build_list_response(
     };
     let mut metadata = serde_json::json!({ "resourceVersion": revision.to_string() });
     if let Some(key) = continue_key {
-        metadata["continue"] = serde_json::Value::String(encode_continue(&key, signing_key));
+        // Pin the outgoing token to this same `revision` so every later page of this walk
+        // (which decodes the token to build its own response) reports an identical
+        // resourceVersion — required by chunking conformance (see decode_continue doc).
+        metadata["continue"] =
+            serde_json::Value::String(encode_continue(&key, revision, signing_key));
     }
     if let Some(count) = remaining_count {
         metadata["remainingItemCount"] = serde_json::Value::Number(count.into());
@@ -1203,21 +1225,29 @@ mod tests {
 
     #[test]
     fn encode_decode_continue_roundtrips() {
-        // The continue token is opaque to clients; they must get back the original key after
-        // base64 round-trip. A broken encoding loses the cursor and re-scans from the start.
+        // The continue token is opaque to clients; they must get back the original key AND
+        // the pinned resourceVersion after base64 round-trip. A broken encoding loses the
+        // cursor and re-scans from the start; a lost resourceVersion breaks the chunking
+        // conformance assertion that every page of one pagination pass reports the same rv.
         let key = "/registry/pods/default/my-pod";
-        let token = encode_continue(key, TEST_KEY);
-        let decoded = ok(decode_continue(&token, TEST_KEY));
+        let token = encode_continue(key, 42, TEST_KEY);
+        let (decoded_key, decoded_rv) = ok(decode_continue(&token, 999, TEST_KEY));
         assert_eq!(
-            decoded, key,
+            decoded_key, key,
             "decoded continue token must equal the original store key"
+        );
+        assert_eq!(
+            decoded_rv, 42,
+            "decoded continue token must equal the originally pinned resourceVersion, \
+             not the current_revision passed to decode_continue (that value is only used \
+             to mint a fresh token on expiry, never returned for a valid token)"
         );
     }
 
     #[test]
     fn decode_invalid_continue_token_is_400() {
         // A malformed continue token from a client (no '.' separator) must return 400.
-        let err = decode_continue("!!!not-valid-base64!!!", TEST_KEY).unwrap_err();
+        let err = decode_continue("!!!not-valid-base64!!!", 0, TEST_KEY).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -1243,7 +1273,7 @@ mod tests {
         let sig = mac.finalize().into_bytes();
         let stale_token = format!("{payload_b64}.{}", b64.encode(sig));
 
-        let err = decode_continue(&stale_token, TEST_KEY).unwrap_err();
+        let err = decode_continue(&stale_token, 0, TEST_KEY).unwrap_err();
         assert_eq!(
             err.0,
             axum::http::StatusCode::GONE,
@@ -1280,7 +1310,12 @@ mod tests {
         let sig = mac.finalize().into_bytes();
         let stale_token = format!("{payload_b64}.{}", b64.encode(sig));
 
-        let err = decode_continue(&stale_token, TEST_KEY).unwrap_err();
+        // current_revision simulates the store having advanced past the pinned rv in the
+        // expired token — the fresh token must adopt this NEW revision (see assertion below),
+        // matching chunking.go's expectation that a resumed list after compaction reports a
+        // different resourceVersion than the pre-compaction pages.
+        let current_revision = 777u64;
+        let err = decode_continue(&stale_token, current_revision, TEST_KEY).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::GONE);
 
         // metadata.continue must be present — client-go reads this field to restart pagination.
@@ -1301,11 +1336,17 @@ mod tests {
         // The fresh token must preserve the original cursor key so clients continue from where
         // they left off rather than restarting from the beginning — without this the conformance
         // test (chunking.go:202) accumulates 440 items instead of the expected 400.
-        let decoded_key = ok(decode_continue(cont, TEST_KEY));
+        let (decoded_key, decoded_rv) = ok(decode_continue(cont, current_revision, TEST_KEY));
         assert_eq!(
             decoded_key, original_key,
             "the new continue token in metadata.continue must preserve the original cursor key \
              so clients can continue listing from where they were (not restart from the beginning)"
+        );
+        assert_eq!(
+            decoded_rv, current_revision,
+            "the fresh token must carry the store's CURRENT revision, not the stale pinned rv \
+             from the expired token — otherwise the resumed list reports the same resourceVersion \
+             as before compaction, failing chunking.go's 'ResourceVersion not equal firstRV' check"
         );
     }
 
@@ -1332,7 +1373,7 @@ mod tests {
         let sig = mac.finalize().into_bytes();
         let expired_token = format!("{payload_b64}.{}", b64.encode(sig));
 
-        let err = decode_continue(&expired_token, TEST_KEY).unwrap_err();
+        let err = decode_continue(&expired_token, 0, TEST_KEY).unwrap_err();
         assert_eq!(
             err.0,
             axum::http::StatusCode::GONE,
@@ -1343,7 +1384,7 @@ mod tests {
         let fresh = meta["continue"]
             .as_str()
             .expect("must include metadata.continue");
-        let fresh_key = ok(decode_continue(fresh, TEST_KEY));
+        let (fresh_key, _) = ok(decode_continue(fresh, 0, TEST_KEY));
 
         assert_eq!(
             fresh_key, cursor,
@@ -1358,12 +1399,16 @@ mod tests {
         // A token issued just now must be accepted (not incorrectly rejected as expired).
         // Regressions here would break all pagination immediately after the first page.
         let key = "/registry/podtemplates/default/bar";
-        let token = encode_continue(key, TEST_KEY);
-        let decoded = ok(decode_continue(&token, TEST_KEY));
+        let token = encode_continue(key, 3, TEST_KEY);
+        let (decoded_key, decoded_rv) = ok(decode_continue(&token, 3, TEST_KEY));
         assert_eq!(
-            decoded, key,
+            decoded_key, key,
             "a fresh continue token must decode to the original store key; \
              premature expiry would break all paginated LIST requests"
+        );
+        assert_eq!(
+            decoded_rv, 3,
+            "a fresh continue token must decode to its originally pinned resourceVersion"
         );
     }
 
@@ -1386,8 +1431,15 @@ mod tests {
             !token.is_empty(),
             "metadata.continue must be set when continue_key is Some"
         );
-        let decoded = ok(decode_continue(token, TEST_KEY));
-        assert_eq!(decoded, "/registry/pods/default/foo");
+        let (decoded_key, decoded_rv) = ok(decode_continue(token, 5, TEST_KEY));
+        assert_eq!(decoded_key, "/registry/pods/default/foo");
+        assert_eq!(
+            decoded_rv, 5,
+            "the emitted continue token must be pinned to the SAME resourceVersion as this \
+             response's metadata.resourceVersion (5) — otherwise the next page, which decodes \
+             this token, reports a different rv and fails the chunking conformance assertion \
+             that every page of one pagination pass shares one resourceVersion"
+        );
     }
 
     #[test]
@@ -1448,21 +1500,21 @@ mod tests {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         // Encode a legitimate token for namespace "default".
-        let legit_token = encode_continue("/registry/pods/default/cursor", TEST_KEY);
+        let legit_token = encode_continue("/registry/pods/default/cursor", 1, TEST_KEY);
 
         // Extract the signature from the legitimate token.
         let (_, sig_b64) = legit_token.split_once('.').unwrap();
 
         // Build a forged payload pointing to a different namespace.
         let forged_payload =
-            serde_json::json!({"k": "/registry/pods/kube-system/cursor", "t": unix_now()})
+            serde_json::json!({"k": "/registry/pods/kube-system/cursor", "t": unix_now(), "rv": 1})
                 .to_string();
         let forged_payload_b64 = b64.encode(forged_payload.as_bytes());
 
         // Reassemble with original signature (signature mismatch).
         let forged_token = format!("{forged_payload_b64}.{sig_b64}");
 
-        let err = decode_continue(&forged_token, TEST_KEY).unwrap_err();
+        let err = decode_continue(&forged_token, 1, TEST_KEY).unwrap_err();
         assert_eq!(
             err.0,
             axum::http::StatusCode::GONE,
