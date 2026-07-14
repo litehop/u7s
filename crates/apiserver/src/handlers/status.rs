@@ -2995,6 +2995,66 @@ mod tests {
         );
     }
 
+    /// put_resource_status against an EXISTING object with an explicit `resourceVersion: "0"`
+    /// in the body must succeed, not fail with 409 AlreadyExists.
+    ///
+    /// This is the sig-scheduling node-status conformance scenario: the test's BeforeEach
+    /// does `nodeCopy.ResourceVersion = "0"; cs.CoreV1().Nodes().UpdateStatus(...)` on an
+    /// already-existing node to force the write through regardless of the node's current
+    /// (possibly stale) resourceVersion — real kube-apiserver treats resourceVersion 0 on an
+    /// Update as "unconditional", not as "must not exist". Before the fix,
+    /// parse_resource_version mapped "0" to `Some(0)`, which `Store::put` interprets as
+    /// create-only, so writing status onto an existing node spuriously 409'd with
+    /// "Node already exists" and broke both the BeforeEach and the mirrored AfterEach cleanup.
+    #[tokio::test]
+    async fn put_resource_status_explicit_zero_rv_is_unconditional_write_on_existing_object() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "lima-node-5" },
+            "status": { "capacity": { "cpu": "4" } }
+        });
+        let key = "/registry/nodes/lima-node-5";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Mirrors predicates.go: fetch, set ResourceVersion="0", PUT the full status back
+        // with an extended resource added to capacity.
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "lima-node-5", "resourceVersion": "0" },
+            "status": { "capacity": { "cpu": "4", "example.com/beardsecond": "1000" } }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "lima-node-5".into())),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "resourceVersion \"0\" against an existing node must be treated as an \
+             unconditional update, not rejected with 409 AlreadyExists: {:?}",
+            result.err().map(|e| e.0)
+        );
+    }
+
     /// put_namespaced_resource_status with a stale resourceVersion in the body must return 409.
     ///
     /// This is the PDB conformance scenario: the DisruptionController holds a snapshot at rv=R0,

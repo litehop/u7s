@@ -97,13 +97,23 @@ pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
 
 /// Parse an optional `resourceVersion` string into an optional `u64`.
 ///
-/// - `None` or `""` → `Ok(None)` (unconditional write)
-/// - `"0"`          → `Ok(Some(0))` (write only if key doesn't exist)
-/// - any other      → parse as `u64`, error on failure
+/// - `None`, `""`, or `"0"` → `Ok(None)` (unconditional write)
+/// - any other              → parse as `u64`, error on failure
+///
+/// Only ever called from update/replace/patch handlers (create paths pass a hardcoded
+/// `Some(0)` to `Store::put` directly, bypassing this function entirely). That split
+/// matters: `Store::put`'s `Some(0)` means "create-only, must not exist", but a client
+/// submitting `resourceVersion: "0"` on an Update means the opposite — real kube-apiserver
+/// treats resourceVersion 0 on Update as "unconditional write", used by controllers/tests
+/// that hold a possibly-stale object and want to force the write through regardless of the
+/// current stored revision (e.g. sig-scheduling's node-status BeforeEach/AfterEach, which
+/// sets `nodeCopy.ResourceVersion = "0"` before `UpdateStatus` specifically to bypass
+/// conflict detection). So "0" must map to the same `None` (unconditional) as an absent
+/// resourceVersion, not to `Some(0)` — mapping it to `Some(0)` made every such update
+/// against an already-existing object fail with a spurious 409 AlreadyExists.
 pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
-        None | Some("") => Ok(None),
-        Some("0") => Ok(Some(0)),
+        None | Some("") | Some("0") => Ok(None),
         Some(s) => s
             .parse::<u64>()
             .map(Some)
@@ -246,6 +256,38 @@ mod tests {
             current: 2,
         };
         assert_eq!(store_err_to_status(&e), StatusCode::CONFLICT);
+    }
+
+    // -- parse_resource_version --
+
+    /// Explicit resourceVersion: "0" on an update must mean "unconditional write",
+    /// the same as an absent resourceVersion — NOT `Some(0)`.
+    ///
+    /// `Store::put`'s `Some(0)` sentinel means "create-only, key must not exist". If
+    /// this function mapped "0" to `Some(0)`, then a client update carrying an existing
+    /// node's status with `resourceVersion: "0"` (the real-world pattern used by
+    /// sig-scheduling's node-status e2e test to force a write past a possibly-stale
+    /// local copy) would be rejected with a spurious 409 AlreadyExists against the node
+    /// that plainly already exists.
+    #[test]
+    fn parse_resource_version_zero_is_unconditional_not_create_only() {
+        assert_eq!(
+            parse_resource_version(Some("0")).unwrap(),
+            None,
+            "resourceVersion \"0\" must parse the same as absent (unconditional update), \
+             not as Some(0) (create-only) — else updates to existing objects wrongly 409"
+        );
+        assert_eq!(
+            parse_resource_version(Some("0")).unwrap(),
+            parse_resource_version(None).unwrap(),
+            "\"0\" and absent resourceVersion must produce identical Store::put semantics"
+        );
+    }
+
+    /// A real (non-zero) resourceVersion still enforces optimistic concurrency.
+    #[test]
+    fn parse_resource_version_nonzero_is_conditional() {
+        assert_eq!(parse_resource_version(Some("42")).unwrap(), Some(42));
     }
 
     /// StoreError::NotFound must NOT expose the internal registry key path to clients.
