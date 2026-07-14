@@ -862,190 +862,217 @@ pub(crate) async fn do_patch<S: Store>(
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let stored = stored_opt.ok_or_else(|| Status::not_found(name, &meta.kind))?;
+    let mut stored = stored_opt.ok_or_else(|| Status::not_found(name, &meta.kind))?;
 
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    // A plain PATCH (merge / strategic-merge / JSON Patch) carries no resourceVersion
+    // precondition unless the client's own patch body sets metadata.resourceVersion.
+    // Real kube-apiserver's PATCH handler therefore read-modify-writes against the
+    // LIVE object and retries (bounded) on a conflicting concurrent write instead of
+    // surfacing a 409 for a race the client never asked to guard against — e.g. a
+    // controller reacting to the just-created object (writing a status condition)
+    // bumps the resourceVersion between the client's create response and its very
+    // next PATCH. Without this retry, that PATCH fails with a spurious conflict even
+    // though it never read or depended on the resourceVersion it happened to race
+    // against. If the client's patch DOES pin metadata.resourceVersion to a stale
+    // value, reapplying it against the freshly re-fetched object still yields that
+    // same stale value, so the mismatch reproduces every attempt and correctly
+    // surfaces as 409 once retries are exhausted.
+    const MAX_PATCH_CONFLICT_RETRIES: u32 = 5;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let mut current = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
-    // reject any patch attempt.  Real kube-apiserver returns 422 "Invalid".
-    if group.is_empty()
-        && (plural == "secrets" || plural == "configmaps")
-        && current.body["immutable"] == serde_json::Value::Bool(true)
-    {
-        return Err(Status::unprocessable_entity(format!(
-            "{plural}/{name} is immutable and cannot be updated"
-        )));
-    }
+        // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
+        // reject any patch attempt.  Real kube-apiserver returns 422 "Invalid".
+        if group.is_empty()
+            && (plural == "secrets" || plural == "configmaps")
+            && current.body["immutable"] == serde_json::Value::Bool(true)
+        {
+            return Err(Status::unprocessable_entity(format!(
+                "{plural}/{name} is immutable and cannot be updated"
+            )));
+        }
 
-    // Capture PriorityClass.value before patch: it drives scheduling/preemption
-    // ordering cluster-wide and is immutable after create. Real kube-apiserver
-    // returns 422 "Invalid" if a patch changes it.
-    let priorityclass_value_before_patch =
-        if group == "scheduling.k8s.io" && plural == "priorityclasses" {
-            Some(current.body["value"].clone())
+        // Capture PriorityClass.value before patch: it drives scheduling/preemption
+        // ordering cluster-wide and is immutable after create. Real kube-apiserver
+        // returns 422 "Invalid" if a patch changes it.
+        let priorityclass_value_before_patch =
+            if group == "scheduling.k8s.io" && plural == "priorityclasses" {
+                Some(current.body["value"].clone())
+            } else {
+                None
+            };
+
+        // Capture spec before patch for generation tracking on workload resources.
+        let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
+            Some(current.body["spec"].clone())
         } else {
             None
         };
 
-    // Capture spec before patch for generation tracking on workload resources.
-    let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
-        Some(current.body["spec"].clone())
-    } else {
-        None
-    };
+        let mut patch: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    let mut patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-
-    // Strip managedFields the client sent in the apply body — we don't track field ownership.
-    if is_ssa {
-        strip_managed_fields(&mut patch);
-    }
-
-    // Snapshot .status before applying the patch: status is a separate RBAC subresource,
-    // so a patch on the main endpoint (merge, strategic-merge, or JSON Patch — a JSON Patch
-    // is an array and would otherwise slip past an object-shaped "status" key strip) must
-    // never change it, restored below after the patch is applied.
-    let stored_status = if meta.has_status_subresource {
-        Some(current.body["status"].clone())
-    } else {
-        None
-    };
-
-    match patch_type {
-        PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
-        PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                .map_err(|e| Status::bad_request(e.to_string()))?;
-        }
-        PatchType::Json => {
-            apply_json_patch(&mut current.body, &patch)?;
-        }
-    }
-
-    if meta.has_status_subresource {
-        match stored_status {
-            Some(ref s) if !s.is_null() => {
-                current.body["status"] = s.clone();
-            }
-            _ => {
-                current.body.as_object_mut().map(|m| m.remove("status"));
-            }
-        }
-    }
-
-    if let Some(ref old_value) = priorityclass_value_before_patch {
-        if &current.body["value"] != old_value {
-            return Err(Status::unprocessable_entity(format!(
-                "{plural}/{name} .value is immutable and cannot be updated"
-            )));
-        }
-    }
-
-    super::defaults::apply_defaults(group, plural, &mut current.body);
-    super::defaults::validate_resource(group, plural, &current.body)
-        .map_err(Status::unprocessable_entity)?;
-
-    if let Some(ref spec_before) = spec_before_patch {
-        super::defaults::increment_workload_generation_if_spec_changed(
-            &mut current.body,
-            spec_before,
-        );
-    }
-
-    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    if finalizer_drain_complete(&current.body) {
-        complete_finalizer_drain(
-            state,
-            FinalizerDrainCtx {
-                key,
-                meta,
-                group,
-                version,
-                plural,
-                ns,
-                name,
-            },
-        )
-        .await?;
-        return Ok(Json(current.body).into_response());
-    }
-
-    // Admission webhook pipeline (mutating then validating).
-    let admission_ctx = AdmissionContext {
-        group,
-        version,
-        resource: plural,
-        name,
-        namespace: ns,
-        operation: "UPDATE",
-        user_info,
-        dry_run: false,
-    };
-    current.body = run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
-    run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
-
-    // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
-    // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
-    // skips any Endpoints that carry it, blocking EndpointSliceMirroring.
-    if plural == "endpoints" {
-        let mut patch_meta: ObjectMeta =
-            serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
-        if let Some(ref mut annotations) = patch_meta.annotations {
-            annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
-        }
-        current.body["metadata"] =
-            serde_json::to_value(patch_meta).map_err(|e| Status::internal(e.to_string()))?;
-    }
-
-    // Dry-run: validation and admission passed; return the would-be result without persisting.
-    if dry_run {
+        // Strip managedFields the client sent in the apply body — we don't track field ownership.
         if is_ssa {
-            if let Some(fm) = field_manager {
-                let api_ver = current.body["apiVersion"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let now = crate::util::utc_now_rfc3339();
-                inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+            strip_managed_fields(&mut patch);
+        }
+
+        // Snapshot .status before applying the patch: status is a separate RBAC subresource,
+        // so a patch on the main endpoint (merge, strategic-merge, or JSON Patch — a JSON Patch
+        // is an array and would otherwise slip past an object-shaped "status" key strip) must
+        // never change it, restored below after the patch is applied.
+        let stored_status = if meta.has_status_subresource {
+            Some(current.body["status"].clone())
+        } else {
+            None
+        };
+
+        match patch_type {
+            PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
+            PatchType::StrategicMerge => {
+                crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                    .map_err(|e| Status::bad_request(e.to_string()))?;
+            }
+            PatchType::Json => {
+                apply_json_patch(&mut current.body, &patch)?;
             }
         }
-        inject_type_meta(&mut current.body, group, version, &meta.kind);
-        return Ok(Json(current.body).into_response());
-    }
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, name, &meta.kind))?;
+        if meta.has_status_subresource {
+            match stored_status {
+                Some(ref s) if !s.is_null() => {
+                    current.body["status"] = s.clone();
+                }
+                _ => {
+                    current.body.as_object_mut().map(|m| m.remove("status"));
+                }
+            }
+        }
 
-    current.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = match ns {
-            None => rbac_cluster_key(group, version, plural, name),
-            Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+        if let Some(ref old_value) = priorityclass_value_before_patch {
+            if &current.body["value"] != old_value {
+                return Err(Status::unprocessable_entity(format!(
+                    "{plural}/{name} .value is immutable and cannot be updated"
+                )));
+            }
+        }
+
+        super::defaults::apply_defaults(group, plural, &mut current.body);
+        super::defaults::validate_resource(group, plural, &current.body)
+            .map_err(Status::unprocessable_entity)?;
+
+        if let Some(ref spec_before) = spec_before_patch {
+            super::defaults::increment_workload_generation_if_spec_changed(
+                &mut current.body,
+                spec_before,
+            );
+        }
+
+        // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+        if finalizer_drain_complete(&current.body) {
+            complete_finalizer_drain(
+                state,
+                FinalizerDrainCtx {
+                    key,
+                    meta,
+                    group,
+                    version,
+                    plural,
+                    ns,
+                    name,
+                },
+            )
+            .await?;
+            return Ok(Json(current.body).into_response());
+        }
+
+        // Admission webhook pipeline (mutating then validating).
+        let admission_ctx = AdmissionContext {
+            group,
+            version,
+            resource: plural,
+            name,
+            namespace: ns,
+            operation: "UPDATE",
+            user_info: user_info.clone(),
+            dry_run: false,
         };
-        state.rbac_index.apply_object(&rbac_key, &current.body);
-    }
-    if group == ADMISSION_GROUP {
-        state.refresh_admission_config(plural).await;
-    }
-    // SSA: echo synthetic managedFields so clients (e.g. Argo CD) can track field ownership.
-    if is_ssa {
-        if let Some(fm) = field_manager {
-            let api_ver = current.body["apiVersion"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let now = crate::util::utc_now_rfc3339();
-            inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+        current.body = run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
+        run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
+
+        // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
+        // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
+        // skips any Endpoints that carry it, blocking EndpointSliceMirroring.
+        if plural == "endpoints" {
+            let mut patch_meta: ObjectMeta =
+                serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+            if let Some(ref mut annotations) = patch_meta.annotations {
+                annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
+            }
+            current.body["metadata"] =
+                serde_json::to_value(patch_meta).map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        // Dry-run: validation and admission passed; return the would-be result without persisting.
+        if dry_run {
+            if is_ssa {
+                if let Some(fm) = field_manager {
+                    let api_ver = current.body["apiVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let now = crate::util::utc_now_rfc3339();
+                    inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+                }
+            }
+            inject_type_meta(&mut current.body, group, version, &meta.kind);
+            return Ok(Json(current.body).into_response());
+        }
+
+        let expected_rv = parse_resource_version(current.resource_version())?;
+        match state.store.put(key, current.to_bytes(), expected_rv).await {
+            Ok(new_rv) => {
+                current.set_resource_version(new_rv);
+                if group == RBAC_GROUP {
+                    let rbac_key = match ns {
+                        None => rbac_cluster_key(group, version, plural, name),
+                        Some(namespace) => {
+                            rbac_namespaced_key(group, version, namespace, plural, name)
+                        }
+                    };
+                    state.rbac_index.apply_object(&rbac_key, &current.body);
+                }
+                if group == ADMISSION_GROUP {
+                    state.refresh_admission_config(plural).await;
+                }
+                // SSA: echo synthetic managedFields so clients (e.g. Argo CD) can track field ownership.
+                if is_ssa {
+                    if let Some(fm) = field_manager {
+                        let api_ver = current.body["apiVersion"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let now = crate::util::utc_now_rfc3339();
+                        inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+                    }
+                }
+                inject_type_meta(&mut current.body, group, version, &meta.kind);
+                return Ok(Json(current.body).into_response());
+            }
+            Err(StoreError::RevisionMismatch { .. }) if attempt < MAX_PATCH_CONFLICT_RETRIES => {
+                stored = state
+                    .store
+                    .get(key)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found(name, &meta.kind))?;
+            }
+            Err(e) => return Err(store_err(e, name, &meta.kind)),
         }
     }
-    inject_type_meta(&mut current.body, group, version, &meta.kind);
-    Ok(Json(current.body).into_response())
 }
 
 pub async fn patch_resource<S: Store>(
@@ -6013,6 +6040,120 @@ mod tests {
         let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["metadata"]["labels"]["env"], "prod");
+    }
+
+    /// A plain strategic-merge PATCH (no `resourceVersion` in its body — the shape real
+    /// clients send, e.g. `test/e2e/apps/job.go`'s "Patching the Job" step) must succeed
+    /// even when another writer raced in and bumped the object's resourceVersion between
+    /// this request's internal read and its write. Real kube-apiserver's PATCH handler
+    /// read-modify-writes against the live object and retries silently on exactly this
+    /// kind of conflict; a client's patch was never asked to pin a resourceVersion, so
+    /// it must not be rejected because of one it never named.
+    ///
+    /// Without a retry-on-conflict, do_patch reads the object once, applies the patch,
+    /// and writes back with the resourceVersion it read at the start — so any concurrent
+    /// writer landing in between (e.g. a controller reacting to the object seconds after
+    /// creation) turns an ordinary PATCH into a spurious 409, exactly as seen in
+    /// conformance: "Job ... cannot be updated: resource version mismatch (expected N,
+    /// current N+1)" immediately after "Creating a suspended job".
+    ///
+    /// This test drives many concurrent strategic-merge PATCHes at the same object with
+    /// tokio::spawn: since the store's writes are serialized, only the very first writer
+    /// can satisfy the resourceVersion it read at the start of its own PATCH, forcing
+    /// every other one through the exact do_patch conflict path this fix retries. If the
+    /// retry is removed, at least one of these patches gets rejected with 409 instead of
+    /// succeeding — and this test asserts that none of them are.
+    #[tokio::test]
+    async fn patch_resource_retries_through_concurrent_writer_conflict() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "race-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/race-node",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        const CONCURRENT_PATCHES: usize = 4;
+        let mut handles = Vec::new();
+        for i in 0..CONCURRENT_PATCHES {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                let mut labels = serde_json::Map::new();
+                labels.insert(
+                    format!("racer-{i}"),
+                    serde_json::Value::String("patched".into()),
+                );
+                let patch = serde_json::json!({ "metadata": { "labels": labels } });
+
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+                );
+
+                patch_resource(
+                    State(state),
+                    Path((
+                        "storage.k8s.io".into(),
+                        "v1".into(),
+                        "csinodes".into(),
+                        "race-node".into(),
+                    )),
+                    axum::extract::Query(PatchQuery::default()),
+                    test_user(),
+                    headers,
+                    bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+                .is_ok()
+            }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            assert!(
+                handle.await.expect("task must not panic"),
+                "racer {i}'s PATCH (no resourceVersion in its body) was rejected with a \
+                 conflict instead of retrying against the live object — a client should \
+                 never see a 409 for a resourceVersion it never named"
+            );
+        }
+
+        let stored = store
+            .get("/registry/storage.k8s.io/csinodes/race-node")
+            .await
+            .expect("get must not error")
+            .expect("object must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        for i in 0..CONCURRENT_PATCHES {
+            assert_eq!(
+                v["metadata"]["labels"][format!("racer-{i}")],
+                "patched",
+                "racer {i}'s label is missing from the final object — a retry that re-fetches \
+                 the live object must still apply the ORIGINAL patch body, not silently drop it"
+            );
+        }
     }
 
     /// PATCH response must include kind and apiVersion even when the stored object omits them.
