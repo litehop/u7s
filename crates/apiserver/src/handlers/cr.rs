@@ -614,89 +614,155 @@ fn field_validation_mode(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Walk `value` against `schema`, collecting field.Path-style paths (e.g.
-/// ".spec.template.metadata.unknownSubMeta") for object keys the schema does not declare.
+/// Join a dot-path prefix with the next key, matching upstream `field.Path`'s `.String()`
+/// (no leading dot: a top-level unknown field is reported as `"foo"`, not `".foo"`, so its
+/// wording lines up with `unknown field "foo"`/`unknown field "spec.foo"` exactly as
+/// `json_patch::apply_field_validation` and upstream's own strict-decoding errors do).
+fn join_cr_field_path(path: &str, key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+/// Prune (remove) `value`'s object keys that `schema` does not declare, mirroring upstream
+/// apiextensions-apiserver's `structuralpruning.PruneWithOptions`: for a structural schema,
+/// removing fields the schema doesn't know about is UNCONDITIONAL — it runs regardless of
+/// `?fieldValidation=`, which only controls whether the caller wants to be told what was
+/// removed (`track_paths`), not whether removal happens. Without this, a CRD's schema is
+/// purely advisory: unknown fields survive in storage forever, including ones a mutating
+/// admission webhook added but the schema never declared.
 ///
 /// `allow_type_meta` is true at the CR root and at any `x-kubernetes-embedded-resource`
 /// object: both carry an implicit apiVersion/kind/metadata that the CRD author never
-/// declares in `properties`, so those keys (and metadata's own fixed ObjectMeta fields)
-/// must never be flagged as unknown there.
-fn walk_cr_unknown_fields(
-    value: &serde_json::Value,
+/// declares in `properties`, so those keys (and metadata's own fixed ObjectMeta fields) are
+/// never pruned there. `x-kubernetes-preserve-unknown-fields: true` opts a subtree out of
+/// pruning entirely (its whole point is to let CRDs like cert-manager keep free-form data).
+fn prune_cr_unknown_fields(
+    value: &mut serde_json::Value,
     schema: &serde_json::Value,
     path: &str,
     allow_type_meta: bool,
+    track_paths: bool,
     out: &mut Vec<String>,
 ) {
-    let Some(map) = value.as_object() else {
-        return;
-    };
     let preserve_unknown = schema
         .get("x-kubernetes-preserve-unknown-fields")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let props = schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object);
 
-    for (key, val) in map {
-        if allow_type_meta && (key == "apiVersion" || key == "kind") {
-            continue;
-        }
-        if allow_type_meta && key == "metadata" {
-            if let Some(meta) = val.as_object() {
-                for mkey in meta.keys() {
-                    if !CR_KNOWN_METADATA_FIELDS.contains(&mkey.as_str()) {
-                        out.push(format!("{path}.metadata.{mkey}"));
+    if let Some(map) = value.as_object_mut() {
+        let props = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for key in keys {
+            if allow_type_meta && (key == "apiVersion" || key == "kind") {
+                continue;
+            }
+            if allow_type_meta && key == "metadata" {
+                if let Some(meta) = map.get_mut(&key).and_then(serde_json::Value::as_object_mut) {
+                    let mkeys: Vec<String> = meta.keys().cloned().collect();
+                    for mkey in mkeys {
+                        if !CR_KNOWN_METADATA_FIELDS.contains(&mkey.as_str()) {
+                            if track_paths {
+                                out.push(join_cr_field_path(path, &format!("metadata.{mkey}")));
+                            }
+                            meta.remove(&mkey);
+                        }
                     }
                 }
+                continue;
             }
-            continue;
+            match props.and_then(|p| p.get(&key)) {
+                Some(sub_schema) => {
+                    let embedded = sub_schema
+                        .get("x-kubernetes-embedded-resource")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(sub_val) = map.get_mut(&key) {
+                        prune_cr_unknown_fields(
+                            sub_val,
+                            sub_schema,
+                            &join_cr_field_path(path, &key),
+                            embedded,
+                            track_paths,
+                            out,
+                        );
+                    }
+                }
+                None if !preserve_unknown => {
+                    if track_paths {
+                        out.push(join_cr_field_path(path, &key));
+                    }
+                    map.remove(&key);
+                }
+                None => {}
+            }
         }
-        match props.and_then(|p| p.get(key)) {
-            Some(sub_schema) => {
-                let embedded = sub_schema
-                    .get("x-kubernetes-embedded-resource")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                walk_cr_unknown_fields(val, sub_schema, &format!("{path}.{key}"), embedded, out);
+        return;
+    }
+    if let Some(items_schema) = schema.get("items") {
+        if let Some(arr) = value.as_array_mut() {
+            for item in arr.iter_mut() {
+                prune_cr_unknown_fields(
+                    item,
+                    items_schema,
+                    path,
+                    allow_type_meta,
+                    track_paths,
+                    out,
+                );
             }
-            None if !preserve_unknown => out.push(format!("{path}.{key}")),
-            None => {}
         }
     }
 }
 
-/// Apply `?fieldValidation=` semantics against the CRD's structural schema.
+/// Prune `obj` against the CRD's structural schema with no path tracking, for the
+/// post-admission re-prune every CR write applies right before storage: a mutating webhook
+/// can add fields the schema doesn't declare (it has no notion of the CRD's schema), so the
+/// object must be pruned again after webhooks run, not just once at decode time — matching
+/// upstream's decode-then-mutate-then-convert-to-storage-version pipeline, where the
+/// conversion step re-runs the same structural pruning. A no-op when the CRD has no schema.
+fn prune_cr_for_storage(schema: Option<&serde_json::Value>, obj: &mut serde_json::Value) {
+    if let Some(schema) = schema {
+        prune_cr_unknown_fields(obj, schema, "", true, false, &mut Vec::new());
+    }
+}
+
+/// Apply `?fieldValidation=` semantics against the CRD's structural schema, pruning `body`
+/// in place along the way.
 ///
-/// Mirrors `json_patch::apply_field_validation`'s Strict/Warn/Ignore contract, but detects
-/// unknown fields by walking the CRD's own openAPIV3Schema instead of a hardcoded field
-/// list. Returns `Ok(None)` when the CRD has no schema at all — without one there is nothing
-/// to validate field names against, matching upstream's behaviour for schemaless CRDs.
+/// Mirrors `json_patch::apply_field_validation`'s Strict/Warn/Ignore contract and exact
+/// wording (`unknown field "<path>"`), but detects unknown fields by walking the CRD's own
+/// openAPIV3Schema instead of a hardcoded field list. Pruning itself happens regardless of
+/// `mode` (including `Ignore`/absent) — only whether the removed paths are surfaced as a
+/// 422 (`Strict`) or a `Warning` header (`Warn`) depends on `mode`. Returns `Ok(None)`
+/// without pruning when the CRD has no schema at all — without one there is nothing to prune
+/// or validate field names against, matching upstream's behaviour for schemaless CRDs.
 fn apply_cr_field_validation(
-    body: &serde_json::Value,
+    body: &mut serde_json::Value,
     schema: Option<&serde_json::Value>,
     mode: Option<&str>,
 ) -> Result<Option<HeaderValue>, crate::status::StatusError> {
-    let mode = mode.unwrap_or("Ignore");
-    if mode == "Ignore" {
-        return Ok(None);
-    }
     let Some(schema) = schema else {
         return Ok(None);
     };
+    let mode = mode.unwrap_or("Ignore");
+    let track_paths = mode != "Ignore";
 
     let mut unknown = Vec::new();
-    walk_cr_unknown_fields(body, schema, "", true, &mut unknown);
+    prune_cr_unknown_fields(body, schema, "", true, track_paths, &mut unknown);
     if unknown.is_empty() {
         return Ok(None);
     }
 
-    // Matches upstream's CR structural-schema pruning error format, e.g.:
-    //   strict decoding error: .unknownField: field not declared in schema
+    // Matches upstream's CR structural-schema strict-decoding error format, e.g.:
+    //   strict decoding error: unknown field "spec.foo"
     let joined = unknown
         .iter()
-        .map(|f| format!("{f}: field not declared in schema"))
+        .map(|f| format!("unknown field \"{f}\""))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1094,7 +1160,7 @@ pub async fn create_cr<S: Store>(
     validate_cr_name(&name)?;
 
     let warn_header = apply_cr_field_validation(
-        &obj,
+        &mut obj,
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
     )?;
@@ -1123,6 +1189,7 @@ pub async fn create_cr<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let key = cr_store_key(&group, &plural, None, &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -1218,6 +1285,7 @@ pub async fn replace_cr<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
@@ -1699,7 +1767,7 @@ pub async fn create_cr_namespaced<S: Store>(
     validate_cr_name(&name)?;
 
     let warn_header = apply_cr_field_validation(
-        &obj,
+        &mut obj,
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
     )?;
@@ -1734,6 +1802,7 @@ pub async fn create_cr_namespaced<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -1827,6 +1896,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
@@ -1975,7 +2045,7 @@ pub async fn patch_cr<S: Store>(
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = ssa_body_to_json(&body)?;
         let warn_header =
-            apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+            apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
@@ -1997,6 +2067,7 @@ pub async fn patch_cr<S: Store>(
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+        prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
         let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
         let rv = state
             .store
@@ -2053,7 +2124,7 @@ pub async fn patch_cr<S: Store>(
     }
 
     let warn_header =
-        apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+        apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -2077,6 +2148,7 @@ pub async fn patch_cr<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -2133,7 +2205,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = ssa_body_to_json(&body)?;
         let warn_header =
-            apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+            apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         {
             let mut meta: crate::types::ObjectMeta =
@@ -2161,6 +2233,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+        prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
         let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
         let rv = state
             .store
@@ -2217,7 +2290,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     }
 
     let warn_header =
-        apply_cr_field_validation(&obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+        apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -2241,6 +2314,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -9590,8 +9664,10 @@ mod tests {
         assert_eq!(json["code"], 422, "must return 422 Unprocessable Entity");
         let msg = err.1.message;
         assert!(
-            msg.contains(".unknownField: field not declared in schema"),
-            "error message must name the offending field so the client can fix its typo (got: {msg})"
+            msg.contains("unknown field \"unknownField\""),
+            "error message must name the offending field, in upstream's exact \
+             `unknown field \"<path>\"` wording (kubectl/conformance grep on that phrase, \
+             not ours) so the client can fix its typo (got: {msg})"
         );
     }
 
@@ -9730,12 +9806,14 @@ mod tests {
         assert_eq!(json["code"], 422, "must return 422 Unprocessable Entity");
         let msg = err.1.message;
         assert!(
-            msg.contains(".metadata.unknownMeta: field not declared in schema"),
-            "must flag the unknown field on the CR's own (root) metadata (got: {msg})"
+            msg.contains("unknown field \"metadata.unknownMeta\""),
+            "must flag the unknown field on the CR's own (root) metadata, in upstream's \
+             exact wording (got: {msg})"
         );
         assert!(
-            msg.contains(".spec.template.metadata.unknownSubMeta: field not declared in schema"),
-            "must also flag the unknown field on the embedded object's metadata (got: {msg})"
+            msg.contains("unknown field \"spec.template.metadata.unknownSubMeta\""),
+            "must also flag the unknown field on the embedded object's metadata, in \
+             upstream's exact wording (got: {msg})"
         );
     }
 
@@ -9784,6 +9862,224 @@ mod tests {
             result.is_ok(),
             "an unknown field under an x-kubernetes-preserve-unknown-fields subtree must \
              not be rejected by fieldValidation=Strict"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CR structural-schema pruning (mayor-w1p59)
+    //
+    // Root cause: cr.rs never pruned CR data against the CRD's structural schema at all —
+    // `apply_cr_field_validation` only DETECTED unknown fields for ?fieldValidation=
+    // reporting, it never removed them, so a CRD's schema was purely advisory. Two
+    // consequences, both conformance failures:
+    //   1. A field a mutating admission webhook adds (which the schema doesn't declare)
+    //      survived in the stored object forever, because pruning never re-ran after
+    //      mutating webhooks — real k8s prunes both at decode time AND again right before
+    //      storage (AdmissionWebhook "should mutate custom resource with pruning").
+    //   2. The ?fieldValidation=Strict rejection message used invented wording
+    //      (".foo: field not declared in schema") instead of upstream's exact
+    //      `unknown field "foo"` phrasing that kubectl/conformance greps for
+    //      (CustomResourcePublishOpenAPI "works for CRD with validation schema").
+    // ---------------------------------------------------------------------------
+
+    /// `prune_cr_unknown_fields` must remove a key the schema does not declare while
+    /// leaving schema-declared siblings untouched — this is the core mechanism both
+    /// conformance failures trace back to (nothing pruned CR data before this fix).
+    #[test]
+    fn prune_cr_unknown_fields_removes_undeclared_key_keeps_declared_siblings() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "properties": {
+                        "mutation-start": { "type": "string" },
+                        "mutation-stage-1": { "type": "string" }
+                        // mutation-stage-2 is intentionally undeclared, mirroring the
+                        // upstream AdmissionWebhook pruning conformance test's CRD.
+                    }
+                }
+            }
+        });
+        let mut obj = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "cr-instance-1" },
+            "data": {
+                "mutation-start": "yes",
+                "mutation-stage-1": "yes",
+                "mutation-stage-2": "yes"
+            }
+        });
+
+        let mut out = Vec::new();
+        prune_cr_unknown_fields(&mut obj, &schema, "", true, true, &mut out);
+
+        assert_eq!(
+            obj["data"],
+            serde_json::json!({ "mutation-start": "yes", "mutation-stage-1": "yes" }),
+            "an undeclared field a mutating webhook injected must be pruned, while \
+             schema-declared fields must survive untouched (got: {:?})",
+            obj["data"]
+        );
+        assert_eq!(
+            out,
+            vec!["data.mutation-stage-2".to_string()],
+            "the pruned path must be reported without a leading dot, matching upstream's \
+             field.Path wording used in `unknown field \"<path>\"` messages"
+        );
+    }
+
+    /// A subtree marked `x-kubernetes-preserve-unknown-fields` must survive pruning
+    /// entirely — this is the escape hatch CRDs like cert-manager rely on for free-form
+    /// spec data, and a pruning implementation that ignores it would break them.
+    #[test]
+    fn prune_cr_unknown_fields_preserves_marked_subtree() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true,
+                    "properties": { "foo": { "type": "string" } }
+                }
+            }
+        });
+        let mut obj = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "cr-instance-1" },
+            "spec": { "foo": "foo1", "freeform": { "anything": "goes" } }
+        });
+
+        let mut out = Vec::new();
+        prune_cr_unknown_fields(&mut obj, &schema, "", true, true, &mut out);
+
+        assert_eq!(
+            obj["spec"]["freeform"],
+            serde_json::json!({ "anything": "goes" }),
+            "a field under x-kubernetes-preserve-unknown-fields must not be pruned"
+        );
+        assert!(
+            out.is_empty(),
+            "a preserved field must not be reported as an unknown-field violation either"
+        );
+    }
+
+    /// End-to-end: a mutating webhook that adds a field the CRD schema does not declare
+    /// must not leave that field in the stored/returned object. This is the exact upstream
+    /// AdmissionWebhook "should mutate custom resource with pruning" scenario — before this
+    /// fix, create_cr never re-pruned after `run_mutating_webhooks`, so `mutation-stage-2`
+    /// (added by the webhook, absent from the schema) survived in the response.
+    #[tokio::test]
+    async fn create_cr_prunes_field_a_mutating_webhook_adds_but_schema_does_not_declare() {
+        use axum::routing::post;
+        use axum::Router;
+        use bytes::Bytes as AxumBytes;
+        use u7s_store::Store;
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/data/mutation-stage-1", "value": "yes"},
+                    {"op": "add", "path": "/data/mutation-stage-2", "value": "yes"}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "uid-mutate",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "object",
+                        "properties": {
+                            "mutation-start": { "type": "string" },
+                            "mutation-stage-1": { "type": "string" }
+                            // mutation-stage-2 intentionally undeclared.
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cr-prune-test-mwc"},
+            "webhooks": [{
+                "name": "cr.mutate.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cr-prune-test-mwc",
+                AxumBytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "cr-instance-1" },
+                "data": { "mutation-start": "yes" }
+            })
+            .to_string(),
+        );
+
+        let result = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await
+        .expect("create must succeed: the mutating webhook only adds fields, it never denies");
+
+        let body = axum::response::IntoResponse::into_response(result);
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            obj["data"],
+            serde_json::json!({ "mutation-start": "yes", "mutation-stage-1": "yes" }),
+            "mutation-stage-2 was added by the webhook but never declared in the CRD's \
+             schema, so it must be pruned before storage — same as it must be for the \
+             upstream AdmissionWebhook pruning conformance test (got: {:?})",
+            obj["data"]
         );
     }
 
