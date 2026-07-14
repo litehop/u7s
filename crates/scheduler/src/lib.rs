@@ -127,6 +127,50 @@ struct PodSpec {
     scheduling_gates: Option<Vec<Value>>,
     /// The pod's tolerations, gating which tainted nodes it may be bound to.
     tolerations: Option<Vec<Toleration>>,
+    affinity: Option<Affinity>,
+}
+
+/// A pod's `spec.affinity`. Only `nodeAffinity` is modeled — the scheduler has
+/// no pod-affinity/anti-affinity handling yet, out of scope for the
+/// SchedulerPredicates gap this fixes.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Affinity {
+    node_affinity: Option<NodeAffinity>,
+}
+
+/// A pod's `spec.affinity.nodeAffinity`. Only the `required` term is modeled —
+/// `preferredDuringSchedulingIgnoredDuringExecution` is a soft signal upstream
+/// only weighs during scoring, and this scheduler does no scoring.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeAffinity {
+    pub required_during_scheduling_ignored_during_execution: Option<NodeSelectorSpec>,
+}
+
+/// The `nodeSelectorTerms` list inside a `requiredDuringSchedulingIgnoredDuringExecution`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSelectorSpec {
+    #[serde(default)]
+    pub node_selector_terms: Vec<NodeSelectorTerm>,
+}
+
+/// One term of a `NodeSelector`: its `matchExpressions` are ANDed together.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSelectorTerm {
+    #[serde(default)]
+    pub match_expressions: Vec<NodeSelectorRequirement>,
+}
+
+/// A single `matchExpressions[]` entry: `key <operator> values`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeSelectorRequirement {
+    pub key: String,
+    pub operator: String,
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 /// A pod's `spec.tolerations[]` entry.
@@ -181,6 +225,9 @@ pub struct PendingPod {
     /// The pod's `spec.tolerations` (empty if absent) — gates which tainted
     /// nodes it may be bound to.
     pub tolerations: Vec<Toleration>,
+    /// The pod's `spec.affinity.nodeAffinity`, if any — gates which nodes it
+    /// may be bound to by label, in addition to `node_selector`.
+    pub node_affinity: Option<NodeAffinity>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -234,12 +281,18 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
     let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
     let priority = watch_event.object.spec.priority.unwrap_or(0);
     let tolerations = watch_event.object.spec.tolerations.unwrap_or_default();
+    let node_affinity = watch_event
+        .object
+        .spec
+        .affinity
+        .and_then(|a| a.node_affinity);
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
         node_selector,
         priority,
         tolerations,
+        node_affinity,
     })
 }
 
@@ -406,14 +459,16 @@ pub fn parse_node_pods(body: &str) -> anyhow::Result<Vec<NodePod>> {
 }
 
 /// Return true when `node` is eligible to host `pod` at all, independent of
-/// capacity: its labels satisfy the pod's `nodeSelector`, AND every
-/// scheduling-blocking taint on the node is tolerated.
+/// capacity: its labels satisfy the pod's `nodeSelector` AND (if present)
+/// required `nodeAffinity`, AND every scheduling-blocking taint on the node
+/// is tolerated.
 ///
 /// Shared by `select_node_with_capacity` (direct scheduling) and
 /// `find_preemption_plan`, so preemption never evicts pods on a node the
 /// pending pod could not use anyway even after the eviction.
 fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
     node_selector_matches(&node.metadata.labels, &pod.node_selector)
+        && node_affinity_matches(&node.metadata.labels, pod.node_affinity.as_ref())
         && node_taints_tolerated(&node.spec.taints, &pod.tolerations)
 }
 
@@ -523,6 +578,56 @@ pub fn node_selector_matches(
     selector
         .iter()
         .all(|(k, v)| labels.get(k).map(|s| s == v).unwrap_or(false))
+}
+
+/// Evaluate one `matchExpressions[]` requirement against a node's labels.
+///
+/// `Gt`/`Lt` (numeric comparison operators) are not implemented by this MVP —
+/// they never match. The SchedulerPredicates conformance suite only exercises
+/// `In`/`NotIn`, and silently treating an unrecognized/unsupported operator as
+/// an automatic pass would let a pod bypass an affinity rule it doesn't
+/// actually satisfy.
+fn node_selector_requirement_matches(
+    labels: &std::collections::HashMap<String, String>,
+    req: &NodeSelectorRequirement,
+) -> bool {
+    match req.operator.as_str() {
+        "In" => labels.get(&req.key).is_some_and(|v| req.values.contains(v)),
+        "NotIn" => !labels.get(&req.key).is_some_and(|v| req.values.contains(v)),
+        "Exists" => labels.contains_key(&req.key),
+        "DoesNotExist" => !labels.contains_key(&req.key),
+        _ => false,
+    }
+}
+
+/// Return true when `labels` satisfy a required `nodeAffinity`.
+///
+/// `nodeSelectorTerms` are ORed together (any one term matching is enough);
+/// `matchExpressions` within a single term are ANDed (every requirement in
+/// the term must hold) — mirroring Kubernetes' `NodeSelector` semantics.
+/// `None` (no nodeAffinity, or no `requiredDuringSchedulingIgnoredDuringExecution`,
+/// or an empty term list) matches any node — there is nothing to restrict on.
+///
+/// Extracted as a pure function so the predicate can be unit-tested without
+/// network access — mirrors `node_selector_matches`.
+pub fn node_affinity_matches(
+    labels: &std::collections::HashMap<String, String>,
+    affinity: Option<&NodeAffinity>,
+) -> bool {
+    let Some(affinity) = affinity else {
+        return true;
+    };
+    let Some(required) = &affinity.required_during_scheduling_ignored_during_execution else {
+        return true;
+    };
+    if required.node_selector_terms.is_empty() {
+        return true;
+    }
+    required.node_selector_terms.iter().any(|term| {
+        term.match_expressions
+            .iter()
+            .all(|req| node_selector_requirement_matches(labels, req))
+    })
 }
 
 /// Return true when `toleration` tolerates `taint`, mirroring Kubernetes'
@@ -1853,6 +1958,220 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // nodeAffinity (mayor-oei5x): RequiredDuringSchedulingIgnoredDuringExecution
+    // must be enforced like nodeSelector. Before this fix, crates/scheduler/ had
+    // zero handling of spec.affinity.nodeAffinity anywhere — a pod whose required
+    // nodeAffinity term no node satisfied was bound anyway, failing "validates
+    // that NodeAffinity is respected if not matching".
+    // ---------------------------------------------------------------------------
+
+    fn requirement(key: &str, operator: &str, values: &[&str]) -> NodeSelectorRequirement {
+        NodeSelectorRequirement {
+            key: key.to_owned(),
+            operator: operator.to_owned(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn required_affinity(terms: Vec<NodeSelectorTerm>) -> NodeAffinity {
+        NodeAffinity {
+            required_during_scheduling_ignored_during_execution: Some(NodeSelectorSpec {
+                node_selector_terms: terms,
+            }),
+        }
+    }
+
+    /// `None` (no nodeAffinity at all) must match any node — most pods never
+    /// set affinity, and this must not restrict them.
+    #[test]
+    fn node_affinity_matches_true_when_no_affinity_set() {
+        let labels: std::collections::HashMap<String, String> = Default::default();
+        assert!(
+            node_affinity_matches(&labels, None),
+            "a pod with no nodeAffinity must be schedulable on any node"
+        );
+    }
+
+    /// The exact scenario from the conformance test: two ORed terms, neither of
+    /// which any node label satisfies — the node must be rejected.
+    #[test]
+    fn node_affinity_matches_false_when_no_term_satisfied() {
+        let labels: std::collections::HashMap<String, String> = Default::default();
+        let affinity = required_affinity(vec![
+            NodeSelectorTerm {
+                match_expressions: vec![requirement("foo", "In", &["bar", "value2"])],
+            },
+            NodeSelectorTerm {
+                match_expressions: vec![requirement("diffkey", "In", &["wrong", "value2"])],
+            },
+        ]);
+        assert!(
+            !node_affinity_matches(&labels, Some(&affinity)),
+            "a node satisfying neither ORed nodeSelectorTerm must be rejected — \
+             reverting this check binds the pod anyway, failing 'validates that \
+             NodeAffinity is respected if not matching'"
+        );
+    }
+
+    /// A node whose labels satisfy one of several ORed terms must be accepted —
+    /// nodeSelectorTerms are ORed, not ANDed.
+    #[test]
+    fn node_affinity_matches_true_when_one_of_ored_terms_satisfied() {
+        let labels: std::collections::HashMap<String, String> =
+            [("foo".to_owned(), "bar".to_owned())].into();
+        let affinity = required_affinity(vec![
+            NodeSelectorTerm {
+                match_expressions: vec![requirement("foo", "In", &["bar", "value2"])],
+            },
+            NodeSelectorTerm {
+                match_expressions: vec![requirement("diffkey", "In", &["wrong", "value2"])],
+            },
+        ]);
+        assert!(
+            node_affinity_matches(&labels, Some(&affinity)),
+            "a node satisfying at least one ORed nodeSelectorTerm must be accepted"
+        );
+    }
+
+    /// matchExpressions within a single term are ANDed — a node satisfying only
+    /// one of two required expressions in the same term must be rejected.
+    #[test]
+    fn node_affinity_matches_false_when_only_one_of_anded_expressions_satisfied() {
+        let labels: std::collections::HashMap<String, String> =
+            [("foo".to_owned(), "bar".to_owned())].into();
+        let affinity = required_affinity(vec![NodeSelectorTerm {
+            match_expressions: vec![
+                requirement("foo", "In", &["bar"]),
+                requirement("other", "Exists", &[]),
+            ],
+        }]);
+        assert!(
+            !node_affinity_matches(&labels, Some(&affinity)),
+            "matchExpressions in one term are ANDed — satisfying only one of two \
+             must not be enough"
+        );
+    }
+
+    /// NotIn excludes a node whose label value is in the forbidden set.
+    #[test]
+    fn node_selector_requirement_not_in_excludes_matching_value() {
+        let labels: std::collections::HashMap<String, String> =
+            [("zone".to_owned(), "bad".to_owned())].into();
+        assert!(
+            !node_selector_requirement_matches(&labels, &requirement("zone", "NotIn", &["bad"])),
+            "NotIn must reject a node whose label value is in the forbidden set"
+        );
+    }
+
+    /// An unsupported operator (Gt/Lt, not implemented by this MVP) must never
+    /// match — treating it as an automatic pass would let a pod bypass an
+    /// affinity rule it doesn't actually satisfy.
+    #[test]
+    fn node_selector_requirement_unsupported_operator_never_matches() {
+        let labels: std::collections::HashMap<String, String> =
+            [("cpus".to_owned(), "4".to_owned())].into();
+        assert!(
+            !node_selector_requirement_matches(&labels, &requirement("cpus", "Gt", &["2"])),
+            "an unimplemented operator must never silently match"
+        );
+    }
+
+    /// needs_scheduling extracts spec.affinity.nodeAffinity from the watch
+    /// event — if dropped, node_affinity_matches always sees None and every
+    /// pod with a NodeAffinity restriction is bound as if it had none.
+    #[test]
+    fn needs_scheduling_returns_node_affinity_from_event() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "restricted-pod", "namespace": "default" },
+                "spec": {
+                    "affinity": {
+                        "nodeAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": {
+                                "nodeSelectorTerms": [
+                                    { "matchExpressions": [
+                                        { "key": "foo", "operator": "In", "values": ["bar"] }
+                                    ] }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        let affinity = pending
+            .node_affinity
+            .expect("nodeAffinity must be extracted from the watch event");
+        let required = affinity
+            .required_during_scheduling_ignored_during_execution
+            .expect("required term must be extracted");
+        assert_eq!(required.node_selector_terms.len(), 1);
+        assert_eq!(
+            required.node_selector_terms[0].match_expressions[0].key,
+            "foo"
+        );
+    }
+
+    /// A pod with no affinity set must produce `None`, not fail deserialization.
+    #[test]
+    fn needs_scheduling_returns_none_node_affinity_when_absent() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "plain-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert!(
+            pending.node_affinity.is_none(),
+            "a pod without spec.affinity must produce node_affinity: None"
+        );
+    }
+
+    /// select_node_with_capacity must skip a node that fails the pod's required
+    /// nodeAffinity, even when it has free pod capacity — the exact scenario the
+    /// conformance test exercises (a pod bound anyway means this predicate never ran).
+    #[test]
+    fn select_node_with_capacity_skips_node_failing_required_affinity() {
+        let node = make_node_with_capacity("worker-0", &[], "110");
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
+            match_expressions: vec![requirement("foo", "In", &["bar"])],
+        }]));
+        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert!(
+            result.is_err(),
+            "a node whose labels satisfy no required nodeAffinity term must be \
+             skipped — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// select_node_with_capacity must select a node whose labels satisfy the
+    /// pod's required nodeAffinity.
+    #[test]
+    fn select_node_with_capacity_selects_node_satisfying_required_affinity() {
+        let node = make_node_with_capacity("worker-0", &[("foo", "bar")], "110");
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
+            match_expressions: vec![requirement("foo", "In", &["bar"])],
+        }]));
+        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_eq!(
+            result.unwrap(),
+            "worker-0",
+            "a node whose labels satisfy the required nodeAffinity term must be selected"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // NodeResourcesFit / pod-capacity gate (mayor-bbxr)
     //
     // Without this check the scheduler binds pods to nodes already at their pod
@@ -1881,9 +2200,10 @@ mod tests {
         }
     }
 
-    /// A minimal PendingPod for tests that only care about capacity/taint gating,
-    /// not identity or priority — empty selector (matches any node), no
-    /// tolerations (tolerates nothing but taint-free nodes).
+    /// A minimal PendingPod for tests that only care about capacity/taint/affinity
+    /// gating, not identity or priority — empty selector (matches any node), no
+    /// tolerations (tolerates nothing but taint-free nodes), no nodeAffinity
+    /// (matches any node).
     fn empty_pending_pod() -> PendingPod {
         PendingPod {
             namespace: "default".to_owned(),
@@ -1891,6 +2211,7 @@ mod tests {
             node_selector: Default::default(),
             priority: 0,
             tolerations: Vec::new(),
+            node_affinity: None,
         }
     }
 
