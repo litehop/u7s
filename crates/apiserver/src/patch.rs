@@ -334,10 +334,12 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         | "spec.ephemeralContainers"
         | "spec.volumes"
         | "spec.imagePullSecrets"
+        | "spec.schedulingGates"
         | "spec.template.spec.containers"
         | "spec.template.spec.initContainers"
         | "spec.template.spec.volumes"
-        | "spec.template.spec.imagePullSecrets" => MergeKeyKind::Key("name"),
+        | "spec.template.spec.imagePullSecrets"
+        | "spec.template.spec.schedulingGates" => MergeKeyKind::Key("name"),
 
         "spec.hostAliases" => MergeKeyKind::Key("ip"),
 
@@ -554,6 +556,45 @@ mod tests {
             containers[0]["name"].as_str().unwrap(),
             "keep",
             "the wrong container was removed"
+        );
+    }
+
+    /// spec.schedulingGates must be registered with merge key "name" (matching upstream's
+    /// `patchStrategy:"merge" patchMergeKey:"name"` tag on PodSpec.SchedulingGates).
+    ///
+    /// The real e2e test removes scheduling gates one at a time via exactly this kind of
+    /// $patch:delete — predicates.go's "validates Pods with non-empty schedulingGates are
+    /// blocked on scheduling" test patches `[{name: foo, $patch: delete}]` to drop "foo"
+    /// while leaving "bar" in place. Without this entry, `merge_key_for_path` falls through
+    /// to Unknown, and any $patch:delete on this field returns 400 ("no merge key is
+    /// registered"), so the test can never even reach the "remove the remaining gate" step.
+    #[test]
+    fn test_smp_scheduling_gates_delete_by_name() {
+        let mut target = json!({
+            "spec": {
+                "schedulingGates": [
+                    {"name": "foo"},
+                    {"name": "bar"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "schedulingGates": [
+                    {"name": "foo", "$patch": "delete"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch)
+            .expect("$patch:delete on spec.schedulingGates must be accepted, not 400");
+
+        let gates = target["spec"]["schedulingGates"].as_array().unwrap();
+        assert_eq!(
+            gates,
+            &vec![json!({"name": "bar"})],
+            "only the gate named \"foo\" should be removed — \"bar\" must remain untouched \
+             since gates clear one at a time, not all-or-nothing"
         );
     }
 

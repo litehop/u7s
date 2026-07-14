@@ -18,7 +18,8 @@ use clap::Parser;
 use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
-    bind_pod, delete_pod, find_preemption_plan, needs_scheduling, pick_node, should_schedule,
+    bind_pod, delete_pod, find_preemption_plan, needs_scheduling, patch_pod_status, pick_node,
+    scheduling_gate_status_patch, scheduling_gate_status_reset, should_schedule,
     stream_watch_events,
 };
 
@@ -93,6 +94,36 @@ async fn main() -> anyhow::Result<()> {
         let in_flight_ref = &in_flight;
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
+            // A gated pod never enters the scheduling cycle below (needs_scheduling
+            // returns None for it) — without this, its PodScheduled condition never
+            // gets touched at all, and WaitForPodsSchedulingGated (which polls for
+            // {type: PodScheduled, reason: SchedulingGated}, not just "unscheduled")
+            // times out even though the pod correctly stays Pending.
+            if let Some(gated) = scheduling_gate_status_patch(&event) {
+                let connector_clone = connector_ref.clone();
+                let server_clone = server_ref.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = patch_pod_status(
+                        &connector_clone,
+                        &server_clone,
+                        &gated.namespace,
+                        &gated.pod_name,
+                        &gated.patch,
+                    )
+                    .await
+                    {
+                        error!(
+                            "failed to set SchedulingGated status for {}/{}: {e}",
+                            gated.namespace, gated.pod_name
+                        );
+                    }
+                });
+            }
+            // Computed from this same event, before the pod potentially gets bound
+            // below — cleared once bound (needs_scheduling's already_scheduled check
+            // has no bearing here since this reads the same event, not a later one).
+            let stale_gate_reset = scheduling_gate_status_reset(&event);
+
             let Some(pending) = needs_scheduling(&event) else {
                 return;
             };
@@ -121,6 +152,21 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 let namespace = pending.namespace.clone();
                 let pod_name = pending.pod_name.clone();
+                // Best-effort: clear the stale SchedulingGated reason before attempting
+                // to schedule below. Not folded into `result` via `?` — a transient
+                // failure here must not block the actual scheduling attempt that
+                // follows, since getting the pod running matters more than tidying up
+                // a status message.
+                if let Some(reset) = stale_gate_reset {
+                    if let Err(e) =
+                        patch_pod_status(&connector_clone, &server_clone, &namespace, &pod_name, &reset)
+                            .await
+                    {
+                        error!(
+                            "failed to clear stale SchedulingGated status for {namespace}/{pod_name}: {e}"
+                        );
+                    }
+                }
                 let result: anyhow::Result<()> = async {
                     match pick_node(&connector_clone, &server_clone, &pending).await {
                         Ok(node) => {
