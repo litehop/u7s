@@ -128,6 +128,25 @@ struct PodSpec {
     /// The pod's tolerations, gating which tainted nodes it may be bound to.
     tolerations: Option<Vec<Toleration>>,
     affinity: Option<Affinity>,
+    /// The pod's containers, whose `resources.requests` are summed for the
+    /// NodeResourcesFit predicate. Reused as-is by `PodListItem` (a pod
+    /// already bound to a node) and `PreemptionPodListItem`.
+    #[serde(default)]
+    containers: Vec<ContainerSpec>,
+}
+
+/// Minimal typed view of a container's `resources.requests` — cpu/memory/
+/// ephemeral-storage quantity strings, as needed by NodeResourcesFit.
+#[derive(Debug, Default, Deserialize)]
+struct ContainerSpec {
+    #[serde(default)]
+    resources: ContainerResources,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ContainerResources {
+    #[serde(default)]
+    requests: std::collections::HashMap<String, String>,
 }
 
 /// A pod's `spec.affinity`. Only `nodeAffinity` is modeled — the scheduler has
@@ -228,6 +247,9 @@ pub struct PendingPod {
     /// The pod's `spec.affinity.nodeAffinity`, if any — gates which nodes it
     /// may be bound to by label, in addition to `node_selector`.
     pub node_affinity: Option<NodeAffinity>,
+    /// Summed `resources.requests.{cpu,memory,ephemeral-storage}` across the
+    /// pod's containers — the NodeResourcesFit predicate's resource dimension.
+    pub requests: ResourceRequests,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -286,6 +308,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         .spec
         .affinity
         .and_then(|a| a.node_affinity);
+    let requests = sum_container_requests(&watch_event.object.spec.containers);
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
@@ -293,6 +316,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         priority,
         tolerations,
         node_affinity,
+        requests,
     })
 }
 
@@ -356,6 +380,16 @@ pub struct NodeAllocatable {
     /// Zero means the field was absent — treat as unlimited for safety (no cap check).
     #[serde(default)]
     pub pods: String,
+    /// CPU quantity string (e.g. "4", "500m"). Empty/unparseable means unknown
+    /// — that dimension of NodeResourcesFit is not checked (see `resource_fits`).
+    #[serde(default)]
+    pub cpu: String,
+    /// Memory quantity string (e.g. "8Gi"). Same "unknown → skip" convention as `cpu`.
+    #[serde(default)]
+    pub memory: String,
+    /// Ephemeral-storage quantity string (e.g. "20Gi"). Same convention as `cpu`.
+    #[serde(default, rename = "ephemeral-storage")]
+    pub ephemeral_storage: String,
 }
 
 #[derive(Deserialize)]
@@ -374,9 +408,112 @@ pub fn parse_pod_capacity(s: &str) -> u32 {
     s.trim().parse::<u32>().unwrap_or(0)
 }
 
-/// Minimal typed view of a pod list item needed to count running pods on a node.
+/// A pod's (or a node's allocatable) cpu/memory/ephemeral-storage, all in
+/// milli-units — see `parse_quantity_milli`. Working in milli-units
+/// throughout means comparisons never need to convert back to a display unit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceRequests {
+    pub cpu_milli: i64,
+    pub memory_milli: i64,
+    pub ephemeral_storage_milli: i64,
+}
+
+impl std::ops::Add for ResourceRequests {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self {
+            cpu_milli: self.cpu_milli + other.cpu_milli,
+            memory_milli: self.memory_milli + other.memory_milli,
+            ephemeral_storage_milli: self.ephemeral_storage_milli + other.ephemeral_storage_milli,
+        }
+    }
+}
+
+/// Parse a Kubernetes resource quantity string into milli-units: for CPU,
+/// "500m" -> 500, "1" -> 1000; for memory/ephemeral-storage, "128Mi" ->
+/// 128*1024*1024*1000. Mirrors the arithmetic in
+/// `crates/apiserver/src/quota.rs`'s `parse_quantity_milli` (kept separate
+/// here — the scheduler and apiserver are independent binaries with no shared
+/// types crate today).
+///
+/// Returns 0 for an absent/unparseable string. Callers must treat 0 as "no
+/// value was set" — for a pod's own request that means "this container
+/// declared no request for that resource" (contributes 0 to the sum, matching
+/// Kubernetes' best-effort semantics); for a node's allocatable it means
+/// "capacity unknown" (that dimension is not checked), the same convention
+/// `parse_pod_capacity` already uses for `status.allocatable.pods`.
+fn parse_quantity_milli(s: &str) -> i64 {
+    if s.is_empty() {
+        return 0;
+    }
+    if let Some(rest) = s.strip_suffix('m') {
+        return rest.parse::<i64>().unwrap_or(0);
+    }
+    let binary_suffixes = [
+        ("Ki", 1024i64),
+        ("Mi", 1024 * 1024),
+        ("Gi", 1024 * 1024 * 1024),
+        ("Ti", 1024 * 1024 * 1024 * 1024),
+        ("Pi", 1024 * 1024 * 1024 * 1024 * 1024),
+        ("Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+    ];
+    for (suf, mult) in &binary_suffixes {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return rest.parse::<i64>().map(|n| n * mult * 1000).unwrap_or(0);
+        }
+    }
+    let decimal_suffixes = [
+        ("k", 1_000i64),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("E", 1_000_000_000_000_000_000),
+    ];
+    for (suf, mult) in &decimal_suffixes {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return rest.parse::<i64>().map(|n| n * mult * 1000).unwrap_or(0);
+        }
+    }
+    s.parse::<i64>().map(|n| n * 1000).unwrap_or(0)
+}
+
+/// Sum `resources.requests.{cpu,memory,ephemeral-storage}` across a pod's
+/// containers. Init containers are not accounted for — this MVP sums the
+/// steady-state (regular) containers only, matching what the conformance
+/// suite's saturate-then-overflow tests actually create.
+fn sum_container_requests(containers: &[ContainerSpec]) -> ResourceRequests {
+    let mut total = ResourceRequests::default();
+    for c in containers {
+        total.cpu_milli += c
+            .resources
+            .requests
+            .get("cpu")
+            .map(|s| parse_quantity_milli(s))
+            .unwrap_or(0);
+        total.memory_milli += c
+            .resources
+            .requests
+            .get("memory")
+            .map(|s| parse_quantity_milli(s))
+            .unwrap_or(0);
+        total.ephemeral_storage_milli += c
+            .resources
+            .requests
+            .get("ephemeral-storage")
+            .map(|s| parse_quantity_milli(s))
+            .unwrap_or(0);
+    }
+    total
+}
+
+/// Minimal typed view of a pod list item needed to summarize a node's usage:
+/// its phase (to exclude terminated pods) and its containers' resource
+/// requests (reuses `PodSpec`, which already parses `spec.containers`).
 #[derive(Deserialize)]
 struct PodListItem {
+    #[serde(default)]
+    spec: PodSpec,
     status: PodListItemStatus,
 }
 
@@ -386,25 +523,41 @@ struct PodListItemStatus {
     phase: String,
 }
 
-/// Count non-terminated pods from a raw JSON pod list response body.
+/// A node's already-committed usage from its non-terminated pods: the pod
+/// count (against `status.allocatable.pods`) and summed cpu/memory/
+/// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NodeUsage {
+    pub pod_count: u32,
+    pub requests: ResourceRequests,
+}
+
+/// Summarize a node's already-committed usage from a raw JSON pod list
+/// response body (GET /api/v1/pods?fieldSelector=spec.nodeName=<node>).
 ///
 /// "Non-terminated" means phase is not Succeeded or Failed.  This matches the
-/// upstream NodeResourcesFit predicate: running and pending pods consume a slot;
-/// completed pods do not.
+/// upstream NodeResourcesFit predicate: running and pending pods consume a
+/// slot and their resource requests count against allocatable; completed pods
+/// do neither. One parse of the body produces both the pod count AND the
+/// resource sum, avoiding a second network round-trip or a second JSON parse.
 ///
 /// Returns Err if the body cannot be parsed as a pod list.
-pub fn count_non_terminated_pods(body: &str) -> anyhow::Result<u32> {
+pub fn summarize_node_pods(body: &str) -> anyhow::Result<NodeUsage> {
     #[derive(Deserialize)]
     struct PodList {
         items: Vec<PodListItem>,
     }
     let list: PodList = serde_json::from_str(body).context("parse pod list for node capacity")?;
-    let count = list
+    let mut usage = NodeUsage::default();
+    for p in list
         .items
         .iter()
         .filter(|p| p.status.phase != "Succeeded" && p.status.phase != "Failed")
-        .count();
-    Ok(count as u32)
+    {
+        usage.pod_count += 1;
+        usage.requests = usage.requests + sum_container_requests(&p.spec.containers);
+    }
+    Ok(usage)
 }
 
 /// A pod already on a node, as needed by preemption victim selection: its
@@ -417,7 +570,7 @@ pub struct NodePod {
 }
 
 /// Minimal typed view of a pod list item needed for preemption: unlike
-/// `PodListItem` (used by `count_non_terminated_pods`), this retains identity
+/// `PodListItem` (used by `summarize_node_pods`), this retains identity
 /// (namespace/name) and priority instead of collapsing to a count.
 #[derive(Deserialize)]
 struct PreemptionPodListItem {
@@ -431,7 +584,7 @@ struct PreemptionPodListItem {
 /// Parse a raw pod-list JSON response body (GET /api/v1/pods?fieldSelector=...)
 /// into the non-terminated pods on that node, keyed for preemption eviction.
 ///
-/// Mirrors `count_non_terminated_pods`'s terminal-phase filter (Succeeded/Failed
+/// Mirrors `summarize_node_pods`'s terminal-phase filter (Succeeded/Failed
 /// pods are not occupying a slot and so can never be preemption victims) but
 /// keeps each pod's namespace/name and priority instead of reducing to a count.
 ///
@@ -472,16 +625,41 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
         && node_taints_tolerated(&node.spec.taints, &pod.tolerations)
 }
 
+/// Return true when adding `requested` to a node's already-committed `used`
+/// requests would not exceed `allocatable`, independently for each of
+/// cpu/memory/ephemeral-storage. An allocatable value of 0 (field absent or
+/// unparseable — see `parse_quantity_milli`) means that dimension is unknown
+/// and is not checked, mirroring `parse_pod_capacity`'s existing convention
+/// for `status.allocatable.pods`.
+fn resource_fits(
+    allocatable: &NodeAllocatable,
+    used: ResourceRequests,
+    requested: ResourceRequests,
+) -> bool {
+    let cpu_cap = parse_quantity_milli(&allocatable.cpu);
+    let mem_cap = parse_quantity_milli(&allocatable.memory);
+    let eph_cap = parse_quantity_milli(&allocatable.ephemeral_storage);
+    (cpu_cap == 0 || used.cpu_milli + requested.cpu_milli <= cpu_cap)
+        && (mem_cap == 0 || used.memory_milli + requested.memory_milli <= mem_cap)
+        && (eph_cap == 0
+            || used.ephemeral_storage_milli + requested.ephemeral_storage_milli <= eph_cap)
+}
+
 /// Select the first node from `list` that qualifies for `pod`
-/// (see `node_qualifies_for_pod`) AND that has at least one free pod slot.
+/// (see `node_qualifies_for_pod`) AND that has at least one free pod slot AND
+/// enough uncommitted cpu/memory/ephemeral-storage to fit `pod.requests`
+/// (NodeResourcesFit).
 ///
-/// `pod_counts` maps node name → current non-terminated pod count (from a prior
-/// GET /api/v1/pods?fieldSelector=spec.nodeName=<node>).  If a node's name is
-/// absent from `pod_counts`, its count is treated as 0 (conservative: schedule).
+/// `node_usage` maps node name → current non-terminated pod count and summed
+/// resource requests (from a prior GET
+/// /api/v1/pods?fieldSelector=spec.nodeName=<node>).  If a node's name is
+/// absent from `node_usage`, its usage is treated as zero (conservative:
+/// schedule).
 ///
-/// Capacity is read from `status.allocatable.pods`, falling back to
+/// Pod-count capacity is read from `status.allocatable.pods`, falling back to
 /// `status.capacity.pods`.  A capacity of 0 (field absent / unparseable) means
-/// the limit is unknown; such nodes are NOT skipped (the old safe behaviour).
+/// the limit is unknown; such nodes are NOT skipped (the old safe behaviour) —
+/// the same convention applies to each resource dimension (see `resource_fits`).
 ///
 /// Returns `Err` when no node qualifies with free capacity, so the caller can
 /// leave the pod Pending instead of binding to a full or unusable node.
@@ -490,28 +668,30 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
 pub fn select_node_with_capacity(
     list: NodeList,
     pod: &PendingPod,
-    pod_counts: &std::collections::HashMap<String, u32>,
+    node_usage: &std::collections::HashMap<String, NodeUsage>,
 ) -> anyhow::Result<String> {
     let found = list.items.into_iter().find(|n| {
         if !node_qualifies_for_pod(n, pod) {
             return false;
         }
-        // Resolve capacity: prefer allocatable, fall back to capacity.
+        let usage = node_usage
+            .get(&n.metadata.name)
+            .copied()
+            .unwrap_or_default();
+        // Resolve pod-count capacity: prefer allocatable, fall back to capacity.
         let cap_str = if !n.status.allocatable.pods.is_empty() {
             &n.status.allocatable.pods
         } else {
             &n.status.capacity.pods
         };
         let cap = parse_pod_capacity(cap_str);
-        if cap == 0 {
-            // Capacity unknown — do not block scheduling.
-            return true;
+        if cap != 0 && usage.pod_count >= cap {
+            return false;
         }
-        let used = pod_counts.get(&n.metadata.name).copied().unwrap_or(0);
-        used < cap
+        resource_fits(&n.status.allocatable, usage.requests, pod.requests)
     });
     found.map(|n| n.metadata.name).context(
-        "no node satisfies the pod's nodeSelector/tolerations with free pod capacity (NodeResourcesFit)",
+        "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)",
     )
 }
 
@@ -702,16 +882,19 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
 }
 
 /// Return the name of the first node that qualifies for `pod`
-/// (see `node_qualifies_for_pod`) and has at least one free pod slot
+/// (see `node_qualifies_for_pod`), has at least one free pod slot, and has
+/// enough uncommitted cpu/memory/ephemeral-storage for `pod.requests`
 /// (NodeResourcesFit predicate).
 ///
 /// Fetches the node list from the API server, then — for each qualifying
-/// candidate — counts non-terminated pods already assigned to it via
-/// GET /api/v1/pods?fieldSelector=spec.nodeName%3D<node>.  A node at or above
-/// its `status.allocatable.pods` limit is skipped.  Returns `Err` when no
+/// candidate — summarizes non-terminated pods already assigned to it via
+/// GET /api/v1/pods?fieldSelector=spec.nodeName%3D<node> (pod count AND
+/// summed resource requests, see `summarize_node_pods`).  A node at or above
+/// its `status.allocatable.pods` limit, or that cannot fit `pod.requests`
+/// alongside what's already committed, is skipped.  Returns `Err` when no
 /// suitable node exists so that the caller can skip binding and leave the pod
 /// Pending (mayor-bbxr: without this check, pods are bound to full nodes and
-/// the kubelet fails them OutOfpods).
+/// the kubelet fails them OutOfpods/OutOfcpu/OutOfephemeral-storage).
 pub async fn pick_node(
     connector: &TlsConnector,
     server: &str,
@@ -723,9 +906,11 @@ pub async fn pick_node(
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
 
-    // Build per-node pod counts for every candidate node (qualifying nodes only).
-    // We only query nodes that pass the selector/taints to avoid unnecessary API calls.
-    let mut pod_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // Build per-node usage for every candidate node (qualifying nodes only).
+    // We only query nodes that pass the selector/affinity/taints to avoid
+    // unnecessary API calls.
+    let mut node_usage: std::collections::HashMap<String, NodeUsage> =
+        std::collections::HashMap::new();
     for node in &list.items {
         if !node_qualifies_for_pod(node, pod) {
             continue;
@@ -733,31 +918,29 @@ pub async fn pick_node(
         let node_name = &node.metadata.name;
         let pods_path = format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{node_name}");
         match http_get(connector, server, &pods_path).await {
-            Ok((ps, pb)) if ps.is_success() => {
-                match count_non_terminated_pods(&pb) {
-                    Ok(n) => {
-                        pod_counts.insert(node_name.clone(), n);
-                    }
-                    Err(e) => {
-                        // Treat count as 0 (allow scheduling) rather than failing
-                        // the entire pick_node call — a parse error here is not
-                        // grounds to leave the pod unscheduled indefinitely.
-                        tracing::warn!("failed to count pods on {node_name}: {e} — treating as 0");
-                    }
+            Ok((ps, pb)) if ps.is_success() => match summarize_node_pods(&pb) {
+                Ok(usage) => {
+                    node_usage.insert(node_name.clone(), usage);
                 }
-            }
+                Err(e) => {
+                    // Treat usage as zero (allow scheduling) rather than failing
+                    // the entire pick_node call — a parse error here is not
+                    // grounds to leave the pod unscheduled indefinitely.
+                    tracing::warn!("failed to summarize pods on {node_name}: {e} — treating as 0");
+                }
+            },
             Ok((ps, pb)) => {
                 tracing::warn!(
-                    "GET pods for node {node_name} returned {ps}: {pb} — treating count as 0"
+                    "GET pods for node {node_name} returned {ps}: {pb} — treating usage as 0"
                 );
             }
             Err(e) => {
-                tracing::warn!("GET pods for node {node_name} failed: {e} — treating count as 0");
+                tracing::warn!("GET pods for node {node_name} failed: {e} — treating usage as 0");
             }
         }
     }
 
-    select_node_with_capacity(list, pod, &pod_counts)
+    select_node_with_capacity(list, pod, &node_usage)
 }
 
 /// A viable preemption outcome: the node to bind the pending pod to, and the
@@ -1929,7 +2112,7 @@ mod tests {
         node.spec.taints = vec![taint("dedicated", "gpu", "NoSchedule")];
         let list = NodeList { items: vec![node] };
         let pod = empty_pending_pod();
-        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_err(),
@@ -1948,7 +2131,7 @@ mod tests {
         let list = NodeList { items: vec![node] };
         let mut pod = empty_pending_pod();
         pod.tolerations = vec![toleration("dedicated", "gpu", "NoSchedule")];
-        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert_eq!(
             result.unwrap(),
@@ -2142,7 +2325,7 @@ mod tests {
         pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
             match_expressions: vec![requirement("foo", "In", &["bar"])],
         }]));
-        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_err(),
@@ -2162,7 +2345,7 @@ mod tests {
         pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
             match_expressions: vec![requirement("foo", "In", &["bar"])],
         }]));
-        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert_eq!(
             result.unwrap(),
@@ -2192,18 +2375,30 @@ mod tests {
             status: NodeStatus {
                 allocatable: NodeAllocatable {
                     pods: capacity.to_owned(),
+                    ..Default::default()
                 },
                 capacity: NodeAllocatable {
                     pods: capacity.to_owned(),
+                    ..Default::default()
                 },
             },
+        }
+    }
+
+    /// A NodeUsage with only a pod count set — the shorthand tests that predate
+    /// resource-request tracking use to describe "this many pods already on
+    /// the node, none of them requesting any resources".
+    fn usage_with_pod_count(pod_count: u32) -> NodeUsage {
+        NodeUsage {
+            pod_count,
+            requests: ResourceRequests::default(),
         }
     }
 
     /// A minimal PendingPod for tests that only care about capacity/taint/affinity
     /// gating, not identity or priority — empty selector (matches any node), no
     /// tolerations (tolerates nothing but taint-free nodes), no nodeAffinity
-    /// (matches any node).
+    /// (matches any node), no resource requests.
     fn empty_pending_pod() -> PendingPod {
         PendingPod {
             namespace: "default".to_owned(),
@@ -2212,6 +2407,7 @@ mod tests {
             priority: 0,
             tolerations: Vec::new(),
             node_affinity: None,
+            requests: ResourceRequests::default(),
         }
     }
 
@@ -2227,8 +2423,8 @@ mod tests {
         };
         let pod = empty_pending_pod();
         // Node already has 110 pods — at capacity.
-        let counts: std::collections::HashMap<String, u32> =
-            [("worker-0".to_owned(), 110u32)].into();
+        let counts: std::collections::HashMap<String, NodeUsage> =
+            [("worker-0".to_owned(), usage_with_pod_count(110))].into();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_err(),
@@ -2249,8 +2445,8 @@ mod tests {
         };
         let pod = empty_pending_pod();
         // Node has 109 pods — one slot free.
-        let counts: std::collections::HashMap<String, u32> =
-            [("worker-0".to_owned(), 109u32)].into();
+        let counts: std::collections::HashMap<String, NodeUsage> =
+            [("worker-0".to_owned(), usage_with_pod_count(109))].into();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_ok(),
@@ -2271,9 +2467,9 @@ mod tests {
             ],
         };
         let pod = empty_pending_pod();
-        let counts: std::collections::HashMap<String, u32> = [
-            ("worker-full".to_owned(), 110u32),
-            ("worker-free".to_owned(), 50u32),
+        let counts: std::collections::HashMap<String, NodeUsage> = [
+            ("worker-full".to_owned(), usage_with_pod_count(110)),
+            ("worker-free".to_owned(), usage_with_pod_count(50)),
         ]
         .into();
         let result = select_node_with_capacity(list, &pod, &counts);
@@ -2299,9 +2495,9 @@ mod tests {
             ],
         };
         let pod = empty_pending_pod();
-        let counts: std::collections::HashMap<String, u32> = [
-            ("worker-0".to_owned(), 110u32),
-            ("worker-1".to_owned(), 110u32),
+        let counts: std::collections::HashMap<String, NodeUsage> = [
+            ("worker-0".to_owned(), usage_with_pod_count(110)),
+            ("worker-1".to_owned(), usage_with_pod_count(110)),
         ]
         .into();
         let result = select_node_with_capacity(list, &pod, &counts);
@@ -2322,8 +2518,8 @@ mod tests {
             items: vec![make_node_with_capacity("worker-0", &[], "")],
         };
         let pod = empty_pending_pod();
-        let counts: std::collections::HashMap<String, u32> =
-            [("worker-0".to_owned(), 999u32)].into();
+        let counts: std::collections::HashMap<String, NodeUsage> =
+            [("worker-0".to_owned(), usage_with_pod_count(999))].into();
         let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_ok(),
@@ -2341,13 +2537,13 @@ mod tests {
         assert_eq!(parse_pod_capacity("not-a-number"), 0);
     }
 
-    /// count_non_terminated_pods counts correctly, excluding Succeeded and Failed.
+    /// summarize_node_pods counts pods correctly, excluding Succeeded and Failed.
     ///
     /// This is the NodeResourcesFit predicate: running/pending pods consume a slot;
     /// completed pods do not.  Reverting to count all pods would over-count and
     /// block scheduling when completed pods have not yet been GC'd.
     #[test]
-    fn count_non_terminated_pods_excludes_terminal_phases() {
+    fn summarize_node_pods_excludes_terminal_phases_from_pod_count() {
         let body = serde_json::json!({
             "items": [
                 { "status": { "phase": "Running" } },
@@ -2358,11 +2554,302 @@ mod tests {
             ]
         })
         .to_string();
-        let count = count_non_terminated_pods(&body).expect("should parse");
+        let usage = summarize_node_pods(&body).expect("should parse");
         assert_eq!(
-            count, 3,
+            usage.pod_count, 3,
             "Running + Pending + unknown-phase count as consuming a slot; \
              Succeeded and Failed do not (NodeResourcesFit predicate, mayor-bbxr)"
+        );
+    }
+
+    /// summarize_node_pods also excludes terminal-phase pods' resource requests
+    /// from the sum — a completed pod that requested 4 CPUs must not still count
+    /// against the node's allocatable cpu, or a saturated-but-idle node would
+    /// wrongly reject new pods forever.
+    #[test]
+    fn summarize_node_pods_excludes_terminal_phases_from_resource_sum() {
+        let body = serde_json::json!({
+            "items": [
+                {
+                    "spec": { "containers": [{ "resources": { "requests": { "cpu": "1" } } }] },
+                    "status": { "phase": "Running" }
+                },
+                {
+                    "spec": { "containers": [{ "resources": { "requests": { "cpu": "4" } } }] },
+                    "status": { "phase": "Succeeded" }
+                },
+            ]
+        })
+        .to_string();
+        let usage = summarize_node_pods(&body).expect("should parse");
+        assert_eq!(
+            usage.requests.cpu_milli, 1000,
+            "a Succeeded pod's cpu request must not count against the node's usage"
+        );
+    }
+
+    /// summarize_node_pods sums cpu/memory/ephemeral-storage requests across
+    /// all non-terminated pods on the node — the exact input pick_node needs to
+    /// decide whether a pending pod's own requests still fit.
+    #[test]
+    fn summarize_node_pods_sums_resource_requests_across_pods() {
+        let body = serde_json::json!({
+            "items": [
+                {
+                    "spec": { "containers": [{ "resources": { "requests": {
+                        "cpu": "500m", "memory": "1Gi", "ephemeral-storage": "1Gi"
+                    } } }] },
+                    "status": { "phase": "Running" }
+                },
+                {
+                    "spec": { "containers": [{ "resources": { "requests": {
+                        "cpu": "500m", "memory": "1Gi", "ephemeral-storage": "1Gi"
+                    } } }] },
+                    "status": { "phase": "Pending" }
+                },
+            ]
+        })
+        .to_string();
+        let usage = summarize_node_pods(&body).expect("should parse");
+        assert_eq!(usage.pod_count, 2);
+        assert_eq!(
+            usage.requests.cpu_milli, 1000,
+            "two 500m-cpu pods must sum to 1000 milli-cpu"
+        );
+        assert_eq!(
+            usage.requests.memory_milli,
+            2 * 1024 * 1024 * 1024 * 1000,
+            "two 1Gi-memory pods must sum to 2Gi (in milli-bytes)"
+        );
+    }
+
+    // parse_quantity_milli tests — the resource-quantity arithmetic underlying
+    // NodeResourcesFit's cpu/memory/ephemeral-storage checks. A parsing bug here
+    // silently mis-sizes every resource comparison the scheduler makes.
+
+    #[test]
+    fn parse_quantity_milli_handles_cpu_milli_suffix() {
+        assert_eq!(parse_quantity_milli("500m"), 500);
+    }
+
+    #[test]
+    fn parse_quantity_milli_handles_plain_cpu_cores() {
+        assert_eq!(
+            parse_quantity_milli("2"),
+            2000,
+            "a plain integer is whole cores, so '2' must be 2000 milli-cpu"
+        );
+    }
+
+    #[test]
+    fn parse_quantity_milli_handles_binary_memory_suffix() {
+        assert_eq!(
+            parse_quantity_milli("1Gi"),
+            1024 * 1024 * 1024 * 1000,
+            "1Gi must convert to exact bytes (Gi is binary, 1024-based), times 1000 for milli-units"
+        );
+    }
+
+    #[test]
+    fn parse_quantity_milli_returns_zero_for_empty_or_unparseable() {
+        assert_eq!(
+            parse_quantity_milli(""),
+            0,
+            "an absent quantity must be 0, treated by callers as 'unknown/unset', \
+             not an error that blocks scheduling"
+        );
+        assert_eq!(parse_quantity_milli("not-a-quantity"), 0);
+    }
+
+    // resource_fits / NodeResourcesFit resource-dimension tests (mayor-7duz2):
+    // the scheduler previously only checked pod COUNT against
+    // status.allocatable.pods; a node saturated on cpu/memory/ephemeral-storage
+    // but with a free pod slot would still accept a pod the kubelet then rejects
+    // OutOfcpu/OutOfephemeral-storage — a real kubelet failure, not a scheduler
+    // FailedScheduling event, so the conformance test's event-watch timed out.
+
+    fn node_allocatable(cpu: &str, memory: &str, ephemeral_storage: &str) -> NodeAllocatable {
+        NodeAllocatable {
+            pods: String::new(),
+            cpu: cpu.to_owned(),
+            memory: memory.to_owned(),
+            ephemeral_storage: ephemeral_storage.to_owned(),
+        }
+    }
+
+    fn requests(
+        cpu_milli: i64,
+        memory_milli: i64,
+        ephemeral_storage_milli: i64,
+    ) -> ResourceRequests {
+        ResourceRequests {
+            cpu_milli,
+            memory_milli,
+            ephemeral_storage_milli,
+        }
+    }
+
+    /// The exact saturate-then-overflow shape from predicates.go:129: a node's
+    /// cpu is already fully committed by existing pods, and the pending pod's
+    /// own request would push usage over allocatable — must be rejected.
+    #[test]
+    fn resource_fits_false_when_cpu_would_be_overcommitted() {
+        let allocatable = node_allocatable("4", "", "");
+        let used = requests(4000, 0, 0); // node already fully committed at 4 cores
+        let pending = requests(1000, 0, 0); // one more core requested
+        assert!(
+            !resource_fits(&allocatable, used, pending),
+            "a pending pod's cpu request must be rejected when it would push \
+             usage past allocatable cpu — reverting this lets the scheduler bind \
+             pods the kubelet then fails OutOfcpu"
+        );
+    }
+
+    /// The exact ephemeral-storage saturate-then-overflow shape from
+    /// predicates.go:129.
+    #[test]
+    fn resource_fits_false_when_ephemeral_storage_would_be_overcommitted() {
+        let allocatable = node_allocatable("", "", "10Gi");
+        let used = requests(0, 0, 10 * 1024 * 1024 * 1024 * 1000);
+        let pending = requests(0, 0, 1000); // 1 milli-byte over the line
+        assert!(
+            !resource_fits(&allocatable, used, pending),
+            "a pending pod's ephemeral-storage request must be rejected when it \
+             would push usage past allocatable ephemeral-storage"
+        );
+    }
+
+    /// A pending pod that fits within remaining capacity must be accepted —
+    /// the positive-path counterpart, so this predicate doesn't block all
+    /// scheduling by always returning false.
+    #[test]
+    fn resource_fits_true_when_request_fits_within_remaining_capacity() {
+        let allocatable = node_allocatable("4", "8Gi", "20Gi");
+        let used = requests(2000, 4 * 1024 * 1024 * 1024 * 1000, 0);
+        let pending = requests(1000, 1024 * 1024 * 1024 * 1000, 0);
+        assert!(
+            resource_fits(&allocatable, used, pending),
+            "a request that fits within remaining allocatable must be accepted"
+        );
+    }
+
+    /// An allocatable dimension of 0 (field absent/unparseable) means "unknown"
+    /// — that dimension must not block scheduling, mirroring
+    /// `parse_pod_capacity`'s existing convention for `status.allocatable.pods`.
+    #[test]
+    fn resource_fits_true_when_allocatable_dimension_unknown() {
+        let allocatable = node_allocatable("", "", "");
+        let used = requests(999_999_000, 0, 0);
+        let pending = requests(999_999_000, 0, 0);
+        assert!(
+            resource_fits(&allocatable, used, pending),
+            "an unknown (empty) allocatable dimension must not block scheduling"
+        );
+    }
+
+    // needs_scheduling / select_node_with_capacity resource-request wiring
+    // (mayor-7duz2): the pending pod's OWN requests must be extracted from the
+    // watch event and factored into the fit check, not just the already-bound
+    // pods' requests.
+
+    /// needs_scheduling sums spec.containers[].resources.requests into
+    /// pending.requests — if dropped, select_node_with_capacity always sees a
+    /// zero-request pod and never rejects it for lack of resources.
+    #[test]
+    fn needs_scheduling_returns_resource_requests_from_event() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "big-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [
+                        { "resources": { "requests": { "cpu": "2", "memory": "4Gi" } } }
+                    ]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            pending.requests.cpu_milli, 2000,
+            "spec.containers[].resources.requests.cpu must be summed into pending.requests"
+        );
+        assert_eq!(pending.requests.memory_milli, 4 * 1024 * 1024 * 1024 * 1000);
+    }
+
+    /// Multiple containers' requests must be summed, not just the first
+    /// container's — Kubernetes charges a pod for the sum of all its
+    /// containers' requests, not the max.
+    #[test]
+    fn needs_scheduling_sums_requests_across_multiple_containers() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "multi-container-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [
+                        { "resources": { "requests": { "cpu": "500m" } } },
+                        { "resources": { "requests": { "cpu": "500m" } } }
+                    ]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            pending.requests.cpu_milli, 1000,
+            "two 500m-cpu containers in one pod must sum to 1000 milli-cpu, not 500"
+        );
+    }
+
+    /// select_node_with_capacity must reject a node where the pending pod's own
+    /// cpu request would overflow allocatable cpu, even though the node has
+    /// free pod-count capacity — this is the exact predicates.go:129
+    /// saturate-then-overflow scenario the scheduler previously missed entirely.
+    #[test]
+    fn select_node_with_capacity_skips_node_that_cannot_fit_pending_pod_cpu_request() {
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "4".to_owned();
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.requests.cpu_milli = 1000; // pending pod wants 1 core
+        let usage: std::collections::HashMap<String, NodeUsage> = [(
+            "worker-0".to_owned(),
+            NodeUsage {
+                pod_count: 1,
+                requests: requests(4000, 0, 0), // node already fully committed at 4 cores
+            },
+        )]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &usage);
+        assert!(
+            result.is_err(),
+            "a node with free pod-count capacity but no free cpu must still be \
+             rejected — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// select_node_with_capacity must accept a node where the pending pod's
+    /// requests fit within remaining allocatable resources.
+    #[test]
+    fn select_node_with_capacity_selects_node_with_enough_remaining_resources() {
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "4".to_owned();
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.requests.cpu_milli = 1000;
+        let usage: std::collections::HashMap<String, NodeUsage> = [(
+            "worker-0".to_owned(),
+            NodeUsage {
+                pod_count: 1,
+                requests: requests(1000, 0, 0), // 1 of 4 cores already used
+            },
+        )]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &usage);
+        assert_eq!(
+            result.unwrap(),
+            "worker-0",
+            "a node with enough remaining cpu for the pending pod's request must be selected"
         );
     }
 
@@ -2477,7 +2964,7 @@ mod tests {
     }
 
     // parse_node_pods tests — the per-node pod listing that drives preemption
-    // victim selection. Unlike count_non_terminated_pods, this retains identity
+    // victim selection. Unlike summarize_node_pods, this retains identity
     // (to DELETE the victim) and priority (to decide if it's a legal victim).
 
     /// parse_node_pods excludes terminal-phase pods (they are not occupying a
