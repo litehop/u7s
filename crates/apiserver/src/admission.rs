@@ -399,7 +399,7 @@ enum WebhookTarget {
 /// - 169.254.0.0/16 (link-local / cloud IMDS)
 /// - 100.64.0.0/10 (shared address space, used by some cloud providers for metadata)
 /// - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918 private ranges)
-/// - IPv6 loopback (::1), unspecified (::), and unique-local (fc00::/7)
+/// - IPv6 loopback (::1), unspecified (::), unique-local (fc00::/7), and link-local (fe80::/10)
 /// - IPv6 bracket notation [::1] which previously bypassed the ::1 check
 pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
     // Extract the scheme and host.
@@ -456,11 +456,17 @@ pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
                 "webhook url must not target IPv6 loopback or unspecified address: {url}"
             ));
         }
+        let octets = addr.octets();
         // fc00::/7 — unique-local (analogous to RFC1918 for IPv6)
-        let first = addr.octets()[0];
-        if first & 0xFE == 0xFC {
+        if octets[0] & 0xFE == 0xFC {
             return Err(format!(
                 "webhook url must not target IPv6 unique-local address (fc00::/7): {url}"
+            ));
+        }
+        // fe80::/10 — link-local (reachable from any host/pod on the same L2 segment)
+        if octets[0] == 0xFE && (octets[1] & 0xC0) == 0x80 {
+            return Err(format!(
+                "webhook url must not target IPv6 link-local address (fe80::/10): {url}"
             ));
         }
     }
@@ -8723,6 +8729,51 @@ mod tests {
             result.is_ok(),
             "https://webhook.example.com/validate must be accepted — \
              the IPv6 bracket fix must not block legitimate external webhook URLs"
+        );
+    }
+
+    // -- IPv6 link-local SSRF tests --
+
+    /// https://[fe80::1]/ must be rejected even though it uses https and a bracket-quoted host.
+    ///
+    /// fe80::/10 link-local addresses are reachable from any host or pod sharing an L2 network
+    /// segment. Before this check, a webhook config could point at a link-local neighbor and the
+    /// apiserver would make an authenticated-looking HTTPS request to it (SSRF) — the same class
+    /// of gap already closed for IPv4 link-local (169.254.0.0/16) and IPv6 unique-local (fc00::/7).
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_link_local() {
+        let result = validate_webhook_url("https://[fe80::1]/");
+        assert!(
+            result.is_err(),
+            "https://[fe80::1]/ must be rejected — \
+             IPv6 link-local addresses are reachable from any host/pod on the same L2 segment (SSRF)"
+        );
+    }
+
+    /// fe80::/10's top address, febf:ffff::1 (second octet 0xbf, top two bits still 10), must
+    /// still be rejected — confirms the mask covers the full range, not just the fe80:: literal.
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_link_local_range_upper_bound() {
+        let result = validate_webhook_url("https://[febf:ffff::1]/");
+        assert!(
+            result.is_err(),
+            "https://[febf:ffff::1]/ must be rejected — \
+             it is still inside fe80::/10 (top two bits of the second octet are '10')"
+        );
+    }
+
+    /// fec0::1 sits just outside fe80::/10 (top two bits of the second octet are '11', not '10')
+    /// and must be accepted.
+    ///
+    /// Confirms the `octets[1] & 0xC0 == 0x80` mask is exact rather than an overly broad "starts
+    /// with fe" check, which would also block unrelated legitimate IPv6 webhook hosts.
+    #[test]
+    fn validate_webhook_url_accepts_ipv6_address_just_outside_link_local_range() {
+        let result = validate_webhook_url("https://[fec0::1]/");
+        assert!(
+            result.is_ok(),
+            "https://[fec0::1]/ must be accepted — \
+             the fe80::/10 mask must not overreach into adjacent IPv6 ranges"
         );
     }
 
