@@ -1027,6 +1027,17 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             );
         }
     }
+    // terminationGracePeriodSeconds — a Go *int64 pointer field upstream. Unlike
+    // activeDeadlineSeconds, 0 is a legitimate "kill immediately" value a client can set on
+    // purpose, not noise, so it must be emitted whenever the wire carried any value at all.
+    // Dropping it makes KCM's Deployment controller see nil here vs its own cached &N, which
+    // EqualIgnoreHash treats as unequal — triggering an unbounded ReplicaSet collision storm.
+    if let Some(tgps) = spec.termination_grace_period_seconds {
+        spec_map.insert(
+            "terminationGracePeriodSeconds".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(tgps)),
+        );
+    }
     if let Some(san) = spec.service_account_name.filter(|s| !s.is_empty()) {
         spec_map.insert(
             "serviceAccountName".to_string(),
@@ -3075,6 +3086,79 @@ mod tests {
         assert_eq!(
             result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "100m",
             "an explicitly-set resource limit must survive decode unchanged"
+        );
+    }
+
+    /// `terminationGracePeriodSeconds` is a Go `*int64` pointer field upstream. Dropping it
+    /// during decode leaves the Deployment controller comparing a freshly-decoded ReplicaSet
+    /// template (nil) against its own cached copy (`&1`); `apiequality.Semantic.DeepEqual`
+    /// treats these as unequal, which drives `EqualIgnoreHash` to conclude the ReplicaSet it
+    /// just created isn't its own and triggers an unbounded collision-count/recreate storm.
+    #[test]
+    fn generated_pod_spec_preserves_termination_grace_period_seconds() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("grace-period-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                termination_grace_period_seconds: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["terminationGracePeriodSeconds"], 1,
+            "an explicit terminationGracePeriodSeconds must survive protobuf decode — if it's \
+             dropped, KCM sees nil where its cached Deployment template has &1, and \
+             EqualIgnoreHash's DeepEqual treats that as a template mismatch, causing an \
+             unbounded ReplicaSet hash-collision storm"
+        );
+    }
+
+    /// `terminationGracePeriodSeconds: 0` ("kill immediately") is a legitimate value a client
+    /// can set on purpose — unlike `activeDeadlineSeconds`, it must NOT be treated as
+    /// unset-vs-zero noise and suppressed.
+    #[test]
+    fn generated_pod_spec_preserves_zero_termination_grace_period_seconds() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("zero-grace-period-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                termination_grace_period_seconds: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["terminationGracePeriodSeconds"], 0,
+            "an explicit terminationGracePeriodSeconds of 0 (kill immediately) must survive \
+             decode — treating it like activeDeadlineSeconds's unset-vs-zero-is-noise case \
+             would silently give the pod the kubelet's default grace period instead"
         );
     }
 
