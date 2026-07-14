@@ -780,6 +780,45 @@ async fn cascade_delete_namespace_resources<S: Store>(
     any_soft_deleted
 }
 
+/// Cascade-delete a namespace's resources, re-verifying emptiness before letting the
+/// caller hard-delete the namespace, retrying if a resource is still present.
+///
+/// `create_namespaced_resource` (and the CR equivalent) rejects writes into a namespace
+/// whose `status.phase` is already `Terminating` — but that check reads the namespace,
+/// then later writes the new object, a classic check-then-act window. A create that lands
+/// in that window is invisible to a single `cascade_delete_namespace_resources` pass: its
+/// own `list_namespace_objects` snapshot is taken before the racing write lands, so its
+/// delete loop can't touch an object it doesn't know exists yet. If the caller trusts that
+/// one pass and hard-deletes the namespace immediately after, the racily-created object is
+/// orphaned forever: it has no namespace left to ever re-drain it, and — if it was still
+/// Pending/unscheduled — it silently blocks anything that requires every pod cluster-wide
+/// to be scheduled, e.g. the SchedulerPredicates/SchedulerPreemption conformance suite's
+/// "wait for stable cluster" precondition (bd mayor-35zvy).
+///
+/// Returns `true` if the namespace must stay Terminating (a finalizer'd object needs its
+/// controller to act, or resources kept reappearing after the retry budget ran out) and
+/// `false` once a pass finds nothing left to soft-delete and a fresh list confirms empty.
+async fn cascade_delete_namespace_resources_until_stable<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+) -> bool {
+    const MAX_ATTEMPTS: u32 = 5;
+    for _ in 0..MAX_ATTEMPTS {
+        if cascade_delete_namespace_resources(state, namespace).await {
+            // A finalizer'd object was soft-deleted — its controller owns finishing this,
+            // not us. No amount of retrying here will make it disappear faster.
+            return true;
+        }
+        match state.store.list_namespace_objects(namespace).await {
+            Ok(remaining) if remaining.is_empty() => return false,
+            Ok(_) => continue, // an object appeared after this pass's cascade — retry
+            Err(_) => return false,
+        }
+    }
+    // Objects kept reappearing across every retry — don't hard-delete out from under them.
+    true
+}
+
 /// Check if a Terminating namespace can now be hard-deleted.
 ///
 /// Called after an object in a namespace has its finalizers cleared and is hard-deleted.
@@ -956,7 +995,8 @@ pub async fn delete_namespace<S: Store>(
             // No remaining spec.finalizers — attempt hard-delete.
             // But first cascade-delete contained objects, respecting their metadata.finalizers.
             delete_namespace_scoped_crds(&state, &name).await;
-            let has_soft_deleted = cascade_delete_namespace_resources(&state, &name).await;
+            let has_soft_deleted =
+                cascade_delete_namespace_resources_until_stable(&state, &name).await;
             if has_soft_deleted {
                 // Some contained objects have finalizers and were soft-deleted (Terminating).
                 // The namespace must stay alive until those objects' controllers clear their
@@ -997,7 +1037,7 @@ pub async fn delete_namespace<S: Store>(
     // Objects with metadata.finalizers are still soft-deleted for correctness but the
     // namespace itself is immediately gone (no Terminating state mechanism without
     // deletionTimestamp on the namespace).
-    cascade_delete_namespace_resources(&state, &name).await;
+    cascade_delete_namespace_resources_until_stable(&state, &name).await;
     state
         .store
         .delete(&key, None)
@@ -3975,6 +4015,198 @@ mod tests {
             ns_after.is_none(),
             "namespace must hard-delete once all finalizer'd contained objects are cleared — \
              without maybe_finalize_terminating_namespace the namespace stays Terminating forever"
+        );
+    }
+
+    use std::sync::Arc;
+    use u7s_store::SqliteStore;
+
+    /// A store wrapper whose first `list_namespace_objects` call for a chosen namespace
+    /// writes a plain (finalizer-less) racer pod into the inner store immediately AFTER
+    /// taking its snapshot — simulating a controller's create landing strictly after
+    /// `cascade_delete_namespace_resources`'s own LIST call already returned, but before the
+    /// namespace-delete request finishes. Every other call, and every later
+    /// `list_namespace_objects` call, delegates straight to the inner SqliteStore.
+    struct RaceInjectStore {
+        inner: Arc<SqliteStore>,
+        target_ns: String,
+        racer_key: String,
+        injected: std::sync::atomic::AtomicBool,
+    }
+
+    impl u7s_store::Store for RaceInjectStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            let should_inject_after = namespace == self.target_ns
+                && !self
+                    .injected
+                    .swap(true, std::sync::atomic::Ordering::SeqCst);
+            let racer_key = self.racer_key.clone();
+            let target_ns = self.target_ns.clone();
+            async move {
+                let result = inner.list_namespace_objects(&ns).await;
+                if should_inject_after {
+                    let racer = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": { "name": "racer-pod", "namespace": target_ns },
+                        "spec": { "containers": [] }
+                    });
+                    inner
+                        .put(&racer_key, Bytes::from(racer.to_string()), None)
+                        .await
+                        .expect("racer pod write must succeed");
+                }
+                result
+            }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// Regression: a pod created in the window between a namespace-delete cascade's LIST
+    /// snapshot and the namespace's hard-delete must not be silently orphaned forever.
+    ///
+    /// `create_namespaced_resource` rejects writes once it observes the namespace as
+    /// Terminating, but it checks-then-acts: a create already past that check can still
+    /// land after `cascade_delete_namespace_resources` took its LIST snapshot. A single,
+    /// un-retried cascade pass can't see that pod, and once the namespace hard-deletes there
+    /// is nothing left to ever re-drain it — if it was never scheduled, it silently blocks
+    /// anything that requires every pod cluster-wide to have a node (the mechanism behind
+    /// the SchedulerPredicates/SchedulerPreemption conformance suite's "wait for stable
+    /// cluster" timeout on leftover pods from unrelated namespaces; bd mayor-35zvy).
+    ///
+    /// Fails on revert: reverting `delete_namespace` to call `cascade_delete_namespace_resources`
+    /// directly (no retry-until-stable) makes this test fail — the racer pod survives the
+    /// namespace hard-delete because the one-shot cascade's snapshot predates it.
+    #[tokio::test]
+    async fn delete_namespace_catches_pod_created_during_cascade_race() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let racer_key = crate::keys::object_key("pods", "race-ns", "racer-pod");
+        let race_store = Arc::new(RaceInjectStore {
+            inner: Arc::clone(&inner),
+            target_ns: "race-ns".to_string(),
+            racer_key: racer_key.clone(),
+            injected: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let state = crate::state::AppState::new(
+            Arc::clone(&race_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Create the namespace through the real handler so it gets the "kubernetes" finalizer.
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("race-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Delete it — the wrapped store injects a racer pod right after cascade's first LIST
+        // snapshot returns, simulating a concurrent create landing in the check-then-act window.
+        assert!(
+            delete_namespace(
+                State(state.clone()),
+                Path("race-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
+            "namespace delete must succeed"
+        );
+
+        let racer_stored = inner
+            .get(&racer_key)
+            .await
+            .expect("store get must not error");
+        assert!(
+            racer_stored.is_none(),
+            "a pod created during the namespace-delete cascade race must still be reaped by a \
+             retry pass — otherwise it is orphaned forever with no namespace left to ever \
+             re-drain it"
         );
     }
 }
