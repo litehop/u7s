@@ -11008,6 +11008,250 @@ mod handler_tests {
              retrying, the finalizer stays and Job GC never completes"
         );
     }
+
+    /// A store wrapper that, on the first put() after arm(), writes an INDEPENDENT
+    /// object (simulating a different concurrent writer, e.g. the kubelet PATCHing
+    /// /status) instead of the caller's own value, then reports RevisionMismatch.
+    ///
+    /// Unlike ConflictInjectStore (which replays the caller's own computed value as
+    /// the "concurrent" write, so a retry trivially reproduces the same result), this
+    /// models two writers changing two different fields, so a retry that clobbers
+    /// instead of re-reading would provably lose one side's update.
+    struct ConcurrentWriterStore {
+        inner: Arc<SqliteStore>,
+        concurrent_write: Bytes,
+        inject_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl ConcurrentWriterStore {
+        fn new(inner: Arc<SqliteStore>, concurrent_write: Bytes) -> Self {
+            Self {
+                inner,
+                concurrent_write,
+                inject_next: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.inject_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for ConcurrentWriterStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .inject_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            let concurrent_write = self.concurrent_write.clone();
+            async move {
+                if inject {
+                    // A different writer's change lands here, independent of `value`
+                    // (the caller's own not-yet-persisted attempt).
+                    let _ = inner.put(&key, concurrent_write, None).await;
+                    Err(u7s_store::StoreError::RevisionMismatch {
+                        expected: 1,
+                        current: 99,
+                    })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// mayor-y832 investigated sonobuoy's `sonobuoy status` freezing mid-run: the
+    /// aggregator PATCHes its own pod's annotation to publish progress while the
+    /// kubelet concurrently PATCHes the same pod's /status. The leading hypothesis
+    /// was a lost-update clobber between the two writers. Live evidence from a full
+    /// conformance run showed zero RevisionMismatch retries even occurred — ruling out
+    /// a race as the cause of the observed freeze (the actual freeze traces to the
+    /// upstream e2e progress reporter never emitting incremental completed counts, not
+    /// to u7s). This test locks in the invariant that makes such a race safe *if* it
+    /// ever does happen: patch_pod must re-read the fresh object on RevisionMismatch
+    /// and reapply its own patch, rather than clobbering a concurrent writer's change
+    /// with a write based on stale data.
+    #[tokio::test]
+    async fn patch_pod_annotation_survives_concurrent_status_write_race() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let ns_key = "/registry/namespaces/default";
+        inner
+            .put(
+                ns_key,
+                Bytes::from(
+                    serde_json::to_vec(
+                        &serde_json::json!({"kind":"Namespace","metadata":{"name":"default"}}),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_key = "/registry/pods/default/sonobuoy";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sonobuoy",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {},
+            "status": {"phase": "Running"}
+        });
+        inner
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // What the kubelet's concurrent /status write lands as, between patch_pod's
+        // read and its first write attempt — a different field than the annotation
+        // patch below touches.
+        let concurrent_status_write = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sonobuoy",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {},
+            "status": {"phase": "Succeeded"}
+        });
+        let racing_store = Arc::new(ConcurrentWriterStore::new(
+            Arc::clone(&inner),
+            Bytes::from(serde_json::to_vec(&concurrent_status_write).unwrap()),
+        ));
+        racing_store.arm();
+
+        let state = AppState::new(
+            Arc::clone(&racing_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        // The aggregator's annotation PATCH — the write sonobuoy status polling depends on.
+        let patch_body = serde_json::json!({
+            "metadata": {"annotations": {"sonobuoy.hept.io/status": "progress-update"}}
+        });
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/sonobuoy")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "annotation PATCH must retry past the concurrent status write and succeed"
+        );
+
+        let stored = inner.get(pod_key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["metadata"]["annotations"]["sonobuoy.hept.io/status"], "progress-update",
+            "the annotation PATCH must not be lost after retrying past a concurrent status \
+             write — this is the exact write 'sonobuoy status' depends on to show live progress"
+        );
+        assert_eq!(
+            stored_body["status"]["phase"], "Succeeded",
+            "the concurrent status write must survive too — a patch_pod that clobbers on \
+             retry (e.g. writing unconditionally, or reapplying against stale data) would \
+             silently revert the kubelet's status update"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
