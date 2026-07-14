@@ -18,8 +18,8 @@ use clap::Parser;
 use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
-    bind_pod, delete_pod, find_preemption_plan, needs_scheduling, pick_node, should_schedule,
-    stream_watch_events,
+    bind_pod, delete_pod, emit_scheduling_event, find_preemption_plan, needs_scheduling, pick_node,
+    should_schedule, stream_watch_events,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,13 @@ async fn main() -> anyhow::Result<()> {
             let server_clone = server_ref.to_string();
             let in_flight_clone = in_flight_ref.clone();
             tokio::spawn(async move {
-                let result: anyhow::Result<()> = async {
+                // Ok(node_name) on a successful bind, Err on any failure to schedule
+                // (no node fits, even after preemption) or to bind. Distinguishing
+                // the two lets us emit the matching Event below — without it,
+                // `kubectl describe pod` and the SchedulerPredicates e2e suite's
+                // observeEventAfterAction watch never see a Scheduled/FailedScheduling
+                // event and the watch times out (mayor-lafgk).
+                let outcome: anyhow::Result<String> = async {
                     match pick_node(&connector_clone, &server_clone, &node_selector).await {
                         Ok(node) => {
                             bind_pod(
@@ -127,7 +133,8 @@ async fn main() -> anyhow::Result<()> {
                                 &pod_name,
                                 &node,
                             )
-                            .await
+                            .await?;
+                            Ok(node)
                         }
                         Err(_no_capacity) => {
                             // No node has a free slot — try preemption before giving
@@ -158,7 +165,8 @@ async fn main() -> anyhow::Result<()> {
                                 &pod_name,
                                 &plan.node_name,
                             )
-                            .await
+                            .await?;
+                            Ok(plan.node_name)
                         }
                     }
                 }
@@ -168,8 +176,30 @@ async fn main() -> anyhow::Result<()> {
                     .lock()
                     .expect("in_flight lock poisoned")
                     .remove(&key);
-                if let Err(e) = result {
-                    error!("scheduling error for {key}: {e}");
+
+                let (reason, message, event_type) = match &outcome {
+                    Ok(node) => (
+                        "Scheduled",
+                        format!("Successfully assigned {namespace}/{pod_name} to {node}"),
+                        "Normal",
+                    ),
+                    Err(e) => {
+                        error!("scheduling error for {key}: {e}");
+                        ("FailedScheduling", format!("{e}"), "Warning")
+                    }
+                };
+                if let Err(e) = emit_scheduling_event(
+                    &connector_clone,
+                    &server_clone,
+                    &namespace,
+                    &pod_name,
+                    reason,
+                    &message,
+                    event_type,
+                )
+                .await
+                {
+                    error!("failed to emit {reason} event for {key}: {e}");
                 }
             });
         })
