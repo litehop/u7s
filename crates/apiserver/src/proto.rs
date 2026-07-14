@@ -521,6 +521,7 @@ pub fn decode_proto_by_kind_and_version(
 ) -> Option<serde_json::Value> {
     match kind {
         "CustomResourceDefinition" => crate::apiextensions_gen_adapter::decode_crd_proto_gen(raw),
+        "APIService" => crate::apiregistration_gen_adapter::decode_apiservice_proto_gen(raw),
         "Namespace" => crate::core_gen_adapter::decode_namespace_proto_gen(raw),
         "ConfigMap" => crate::core_gen_adapter::decode_configmap_proto_gen(raw),
         "Pod" => crate::core_gen_adapter::decode_pod_proto_gen(raw),

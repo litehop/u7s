@@ -94,6 +94,10 @@ fn main() {
                     .join("k8s.io/api/events/v1/generated.proto")
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join("k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )
