@@ -107,11 +107,14 @@ pub async fn core_list_resource<S: Store>(
             .as_deref()
             .map(parse_field_selector)
             .transpose()?;
-        let continue_key = query
+        // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
+        // response (and every later page) must report — see decode_continue's doc for why.
+        let continue_decoded = query
             .continue_token
             .as_deref()
-            .map(|t| decode_continue(t, &state.continue_token_key))
+            .map(|t| decode_continue(t, state.store.current_revision(), &state.continue_token_key))
             .transpose()?;
+        let continue_key = continue_decoded.as_ref().map(|(k, _)| k.clone());
         let resp = state
             .store
             .list(
@@ -124,6 +127,7 @@ pub async fn core_list_resource<S: Store>(
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
         let mut items = Vec::with_capacity(resp.items.len());
         for obj in &resp.items {
             let v: serde_json::Value =
@@ -140,7 +144,7 @@ pub async fn core_list_resource<S: Store>(
             "Pod",
             "",
             "v1",
-            resp.revision,
+            list_revision,
             items,
             resp.continue_key,
             resp.remaining_count,

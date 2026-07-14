@@ -125,11 +125,14 @@ pub async fn list_resource<S: Store>(
             .map(parse_field_selector)
             .transpose()?
     };
-    let continue_key = query
+    // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
+    // response (and every later page) must report — see decode_continue's doc for why.
+    let continue_decoded = query
         .continue_token
         .as_deref()
-        .map(|t| decode_continue(t, &state.continue_token_key))
+        .map(|t| decode_continue(t, state.store.current_revision(), &state.continue_token_key))
         .transpose()?;
+    let continue_key = continue_decoded.as_ref().map(|(k, _)| k.clone());
     let resp = state
         .store
         .list(
@@ -142,6 +145,10 @@ pub async fn list_resource<S: Store>(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    // First page (no continue token yet): the fresh store revision becomes the pin for
+    // subsequent pages. Continuation page: reuse the pin decoded above, not the store's
+    // current (possibly-advanced) revision.
+    let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
@@ -176,7 +183,7 @@ pub async fn list_resource<S: Store>(
         let body = serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
             "kind": "PartialObjectMetadataList",
-            "metadata": { "resourceVersion": resp.revision.to_string() },
+            "metadata": { "resourceVersion": list_revision.to_string() },
             "items": pom_items
         });
         return Ok(Json(body).into_response());
@@ -190,7 +197,7 @@ pub async fn list_resource<S: Store>(
         &meta.kind,
         &group,
         &version,
-        resp.revision,
+        list_revision,
         items,
         resp.continue_key,
         resp.remaining_count,
@@ -1225,11 +1232,14 @@ pub async fn list_namespaced_resource<S: Store>(
             .map(parse_field_selector)
             .transpose()?
     };
-    let continue_key = query
+    // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
+    // response (and every later page) must report — see decode_continue's doc for why.
+    let continue_decoded = query
         .continue_token
         .as_deref()
-        .map(|t| decode_continue(t, &state.continue_token_key))
+        .map(|t| decode_continue(t, state.store.current_revision(), &state.continue_token_key))
         .transpose()?;
+    let continue_key = continue_decoded.as_ref().map(|(k, _)| k.clone());
     let resp = state
         .store
         .list(
@@ -1242,6 +1252,10 @@ pub async fn list_namespaced_resource<S: Store>(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    // First page (no continue token yet): the fresh store revision becomes the pin for
+    // subsequent pages. Continuation page: reuse the pin decoded above, not the store's
+    // current (possibly-advanced) revision.
+    let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
@@ -1276,7 +1290,7 @@ pub async fn list_namespaced_resource<S: Store>(
         let body = serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
             "kind": "PartialObjectMetadataList",
-            "metadata": { "resourceVersion": resp.revision.to_string() },
+            "metadata": { "resourceVersion": list_revision.to_string() },
             "items": pom_items
         });
         return Ok(Json(body).into_response());
@@ -1290,7 +1304,7 @@ pub async fn list_namespaced_resource<S: Store>(
         &meta.kind,
         &group,
         &version,
-        resp.revision,
+        list_revision,
         items,
         resp.continue_key,
         resp.remaining_count,
@@ -10017,6 +10031,163 @@ mod tests {
         assert!(
             !cont.is_empty(),
             "metadata.continue in the 410 response must be a non-empty token"
+        );
+    }
+
+    /// Regression test: `?limit`/`?continue` pagination must walk every object exactly once,
+    /// in a stable order, while every page reports the SAME `metadata.resourceVersion`.
+    ///
+    /// This is the exact contract the Kubernetes chunking conformance suite
+    /// ([sig-api-machinery] "should return chunks of results for list calls") checks: it
+    /// creates many PodTemplates, pages through them with `?limit=`, and asserts
+    /// `list.ResourceVersion` is identical across every page of one pagination pass — the
+    /// live global store revision otherwise drifts upward between page requests (any other
+    /// resource being written concurrently bumps it), which fails that assertion even when
+    /// the paged items themselves are correct. If this test is run against a build that
+    /// reports `resp.revision` (the store's live revision) instead of the token-pinned
+    /// revision, it fails because concurrent writes between pages change the reported rv.
+    #[tokio::test]
+    async fn list_namespaced_resource_paginates_all_items_once_with_stable_resource_version() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        const TOTAL: usize = 25;
+        for i in 0..TOTAL {
+            let name = format!("template-{i:02}");
+            let body = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodTemplate",
+                "metadata": { "name": name, "namespace": "default" },
+                "template": { "spec": { "containers": [{ "name": "c", "image": "busybox" }] } }
+            });
+            store
+                .put(
+                    &format!("/registry/podtemplates/default/{name}"),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let signing_key: [u8; 32] = *b"test-signing-key-32-bytes-padded";
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: Some(signing_key),
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let mut collected_names: Vec<String> = Vec::new();
+        let mut resource_versions: Vec<String> = Vec::new();
+        let mut continue_token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(
+                pages <= TOTAL + 1,
+                "pagination did not terminate — likely stuck on one page"
+            );
+
+            let resp = list_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "podtemplates".into(),
+                )),
+                Query(CollectionQuery {
+                    watch: None,
+                    resource_version: None,
+                    label_selector: None,
+                    field_selector: None,
+                    limit: Some(7),
+                    continue_token: continue_token.take(),
+                    send_initial_events: None,
+                    allow_watch_bookmarks: None,
+                    timeout_seconds: None,
+                }),
+                axum::http::HeaderMap::new(),
+                test_user(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("paginated list must succeed, got {e:?}"));
+
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            let items = val["items"].as_array().expect("items must be an array");
+            assert!(
+                items.len() <= 7,
+                "a page must never exceed the requested ?limit=7"
+            );
+            for item in items {
+                collected_names.push(item["metadata"]["name"].as_str().unwrap().to_string());
+            }
+            resource_versions.push(val["metadata"]["resourceVersion"].as_str().unwrap().into());
+
+            match val["metadata"]["continue"].as_str() {
+                Some(tok) if !tok.is_empty() => continue_token = Some(tok.to_string()),
+                _ => break,
+            }
+
+            // Simulate a concurrent, unrelated write landing between page fetches (e.g. a
+            // Lease renewal from another controller). This bumps the store's live global
+            // revision but must NOT change the resourceVersion this pagination walk reports
+            // on the next page — without the fix, the next page's `build_list_response` uses
+            // the store's now-advanced revision, breaking the assertion below.
+            state
+                .store
+                .put(
+                    &format!("/registry/leases/kube-node-lease/unrelated-node-{pages}"),
+                    bytes::Bytes::from_static(b"{}"),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            collected_names.len(),
+            TOTAL,
+            "every created PodTemplate must be returned exactly once across all pages \
+             combined — duplicates or gaps mean the continue cursor is mis-tracking position"
+        );
+        let mut expected: Vec<String> = (0..TOTAL).map(|i| format!("template-{i:02}")).collect();
+        expected.sort();
+        let mut actual = collected_names.clone();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "the set of names returned across all pages must equal the set created"
+        );
+        assert_eq!(
+            collected_names, expected,
+            "pages must be returned in stable ascending key order so that resuming from a \
+             continue token never re-visits or skips an item"
+        );
+        assert!(
+            resource_versions.windows(2).all(|w| w[0] == w[1]),
+            "every page of one pagination pass must report the SAME resourceVersion ({:?}); \
+             a mismatch means the response used the store's live (advancing) revision instead \
+             of the revision pinned in the continue token, which fails the Kubernetes chunking \
+             conformance assertion `list.ResourceVersion == lastRV`",
+            resource_versions
         );
     }
 
