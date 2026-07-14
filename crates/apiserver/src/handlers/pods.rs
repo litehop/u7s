@@ -3591,6 +3591,21 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
     }
 
+    // securityContext: default to an empty object when absent, mirroring upstream's
+    // unconditional `obj.SecurityContext = &v1.PodSecurityContext{}` in SetDefaults_PodSpec.
+    // The kubelet's generatePodSandboxLinuxConfig only calls NamespacesForPod (which computes
+    // the CRI NamespaceOption for hostNetwork/hostPID/hostIPC) inside an
+    // `if pod.Spec.SecurityContext != nil` guard — with securityContext absent, the CRI
+    // RunPodSandboxRequest carries no NamespaceOptions at all and every namespace mode
+    // silently defaults to POD, even for hostNetwork:true pods. CRI-O then creates an
+    // isolated network namespace instead of sharing the host's, so the kubelet's own
+    // post-creation PodSandboxChanged check (comparing the sandbox's actual namespace mode
+    // against pod.Spec.HostNetwork) finds a mismatch and recreates the sandbox — forever,
+    // once per sync — which is the hostNetwork pod "Sandbox for pod has changed" churn loop.
+    if pod["spec"]["securityContext"].is_null() {
+        pod["spec"]["securityContext"] = serde_json::json!({});
+    }
+
     // terminationGracePeriodSeconds: default to 30 when absent, mirroring
     // upstream's unconditional default in SetDefaults_PodSpec. This value is
     // set once at creation and never touched again, including through a
@@ -4672,6 +4687,68 @@ mod create_defaults_tests {
             serde_json::json!("None"),
             "dnsPolicy=None must be preserved — user-managed DNS pods configure \
              nameservers via dnsConfig; overriding would silently redirect DNS traffic"
+        );
+    }
+
+    // --- securityContext defaulting tests ---
+
+    /// create_pod must default spec.securityContext to an empty object when absent.
+    ///
+    /// The real kubelet's generatePodSandboxLinuxConfig only calls NamespacesForPod
+    /// (which computes the CRI NamespaceOption for hostNetwork/hostPID/hostIPC) inside
+    /// an `if pod.Spec.SecurityContext != nil` guard. Without this default, a
+    /// hostNetwork:true pod with no explicit pod-level securityContext gets a CRI
+    /// RunPodSandboxRequest with no NamespaceOptions at all, so CRI-O creates an
+    /// isolated (non-host) network namespace. The kubelet's own post-creation
+    /// PodSandboxChanged check then detects that the sandbox's actual namespace mode
+    /// doesn't match pod.Spec.HostNetwork and recreates the sandbox — forever, once per
+    /// sync — which is the observed "Sandbox for pod has changed. Need to start a new
+    /// one" churn loop that prevents any hostNetwork pod (e.g. an e2e host-exec pod)
+    /// from ever stabilizing.
+    #[test]
+    fn security_context_defaults_to_empty_object_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "hostnet-pod", "namespace": "default"},
+            "spec": {
+                "hostNetwork": true,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert!(
+            pod["spec"]["securityContext"].is_object(),
+            "securityContext must default to a non-null (even empty) object — upstream \
+             SetDefaults_PodSpec stamps this unconditionally, and the kubelet's \
+             NamespacesForPod call (which sets hostNetwork/hostPID/hostIPC on the CRI \
+             sandbox request) is gated on securityContext being non-nil; leaving it null \
+             silently breaks hostNetwork for every pod that doesn't set it explicitly"
+        );
+    }
+
+    /// create_pod must NOT override an explicit securityContext value.
+    ///
+    /// A pod that sets its own pod-level securityContext (e.g. runAsNonRoot, fsGroup)
+    /// must keep those settings — defaulting must only fill the field when absent, not
+    /// replace an already-present (even partially populated) object.
+    #[test]
+    fn security_context_explicit_value_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "securityContext": {"runAsNonRoot": true, "fsGroup": 1000},
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["securityContext"],
+            serde_json::json!({"runAsNonRoot": true, "fsGroup": 1000}),
+            "an explicit securityContext must not be overridden or merged with defaults — \
+             a user's runAsNonRoot/fsGroup settings must survive pod creation unchanged"
         );
     }
 
