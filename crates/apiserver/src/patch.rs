@@ -161,6 +161,9 @@ fn strategic_merge_array(
     if !target.is_array() {
         *target = serde_json::Value::Array(vec![]);
     }
+    // Snapshot the pre-patch order: needed after the merge loop below to replicate
+    // upstream's element-ordering rule (see reorder_merged_array).
+    let original: Vec<serde_json::Value> = target.as_array().unwrap().clone();
     let target_arr = target.as_array_mut().unwrap();
 
     for patch_elem in patch_arr {
@@ -206,7 +209,96 @@ fn strategic_merge_array(
         }
     }
 
+    reorder_merged_array(target, &original, patch_arr, merge_key);
+
     Ok(())
+}
+
+/// Reorder a just-merged strategic-merge-patch array to match upstream ordering semantics
+/// (`mergeSortedSlice` in k8s.io/apimachinery/pkg/util/strategicpatch/patch.go).
+///
+/// A merge-key array is split into "server-only" elements (untouched — their merge key
+/// isn't referenced anywhere in the patch) and "patch" elements (matched-and-merged, or
+/// brand new). Upstream interleaves the two using each element's position in the
+/// PRE-patch array as the comparison key. A brand-new patch element has no pre-patch
+/// position, so the comparison can't place it relative to a not-yet-placed server-only
+/// element — upstream resolves that ambiguity by emitting the patch element immediately,
+/// i.e. brand-new elements land ahead of whatever untouched elements remain, not appended
+/// at the end.
+///
+/// Without this, a StrategicMergePatch that adds a container whose name doesn't match any
+/// existing container (e.g. the StatefulSet "list, patch and delete a collection" e2e test,
+/// which patches in a container named after the StatefulSet rather than the fixture's
+/// "webserver" container) lands the new container at index 1 instead of index 0, so
+/// `Containers[0].Image` still reads the OLD image and the test's post-patch assertion
+/// fails immediately — no controller or watch behavior involved, purely a patch-storage bug.
+fn reorder_merged_array(
+    target: &mut serde_json::Value,
+    original: &[serde_json::Value],
+    patch_arr: &[serde_json::Value],
+    merge_key: &str,
+) {
+    let key_of = |v: &serde_json::Value| v.get(merge_key).cloned();
+
+    // Only patch elements that carry the merge key participate in ordering; an element
+    // missing the merge key can't be matched against anything, so it keeps the
+    // append-at-the-end placement it got from the merge loop above.
+    let patch_keys: Vec<serde_json::Value> = patch_arr
+        .iter()
+        .filter(|e| e.get("$patch").is_none())
+        .filter_map(key_of)
+        .collect();
+
+    let merged = target.as_array().unwrap().clone();
+    let (keyed, keyless): (Vec<_>, Vec<_>) = merged.into_iter().partition(|v| key_of(v).is_some());
+
+    let (mut patch_items, mut server_only): (Vec<_>, Vec<_>) = keyed
+        .into_iter()
+        .partition(|v| patch_keys.contains(&key_of(v).unwrap()));
+
+    // patch_items must appear in the order they were given in the raw patch.
+    patch_items.sort_by_key(|v| {
+        let k = key_of(v).unwrap();
+        patch_keys
+            .iter()
+            .position(|pk| *pk == k)
+            .unwrap_or(usize::MAX)
+    });
+    let original_index = |v: &serde_json::Value| {
+        key_of(v).and_then(|k| original.iter().position(|o| key_of(o).as_ref() == Some(&k)))
+    };
+    // server_only elements always existed pre-patch, so this is always Some(_) in
+    // practice; unwrap_or is defensive only.
+    server_only.sort_by_key(|v| original_index(v).unwrap_or(usize::MAX));
+
+    let mut result = Vec::with_capacity(server_only.len() + patch_items.len() + keyless.len());
+    let (mut i, mut j) = (0, 0);
+    while i < server_only.len() || j < patch_items.len() {
+        if i >= server_only.len() {
+            result.push(patch_items[j].clone());
+            j += 1;
+        } else if j >= patch_items.len() {
+            result.push(server_only[i].clone());
+            i += 1;
+        } else {
+            // Take the server-only element only if it demonstrably preceded the patch
+            // element pre-patch; a brand-new patch element (no original position) always
+            // loses this comparison, so it's emitted next instead.
+            let take_left = matches!(
+                (original_index(&server_only[i]), original_index(&patch_items[j])),
+                (Some(l), Some(r)) if l < r
+            );
+            if take_left {
+                result.push(server_only[i].clone());
+                i += 1;
+            } else {
+                result.push(patch_items[j].clone());
+                j += 1;
+            }
+        }
+    }
+    result.extend(keyless);
+    *target = serde_json::Value::Array(result);
 }
 
 enum MergeKeyKind {
@@ -367,6 +459,55 @@ mod tests {
             "original container must survive"
         );
         assert!(names.contains(&"sidecar"), "new container must be added");
+    }
+
+    /// StatefulSet "list, patch and delete a collection" conformance test patches in a
+    /// container named after the StatefulSet (not the fixture's "webserver" container),
+    /// then immediately asserts `Containers[0].Image` is the patched image. Upstream's
+    /// strategic-merge-patch places an unmatched (brand-new) patch element ahead of
+    /// untouched elements it wasn't compared against, so the new container must land at
+    /// index 0 — not appended at the end, which would leave index 0 holding the stale
+    /// image and fail the test immediately after the patch, before any controller runs.
+    #[test]
+    fn test_smp_unmatched_container_lands_before_untouched_container() {
+        let mut target = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": "webserver", "image": "agnhost:old"}
+                        ]
+                    }
+                }
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": "test-ss", "image": "pause:new"}
+                        ]
+                    }
+                }
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(containers.len(), 2, "both containers must be present");
+        assert_eq!(
+            containers[0]["image"], "pause:new",
+            "the unmatched patch container must be at index 0 so Containers[0].Image reads \
+             the patched image, matching upstream strategic-merge-patch ordering"
+        );
+        assert_eq!(
+            containers[1]["name"], "webserver",
+            "the untouched original container must survive at index 1"
+        );
     }
 
     #[test]
