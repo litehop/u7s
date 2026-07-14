@@ -176,6 +176,20 @@ pub(crate) fn encode_watch_event(
                     if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(s) {
                         obj["metadata"]["resourceVersion"] =
                             serde_json::Value::String(revision.to_string());
+                        // Re-stamp apiVersion/kind unconditionally, mirroring the ADDED/MODIFIED
+                        // path (chunk_stream sets these on every emitted event). The stored body
+                        // is not guaranteed to carry them: a PUT/Update sent through the dynamic
+                        // (unstructured) client from a typed Go struct with an empty TypeMeta
+                        // serializes apiVersion/kind as absent (omitempty), and
+                        // replace_namespaced_resource persists the body as received without
+                        // injecting them. A DELETED event built from that stored body then lacks
+                        // apiVersion/kind entirely. client-go's watch decoder cannot determine the
+                        // object's type without them and fails to decode the event, which closes
+                        // the watch's ResultChan — RetryWatcher reconnects (without ever having
+                        // extracted a resourceVersion from the failed event) and repeats forever,
+                        // wedging any caller waiting on a DELETED event.
+                        obj["apiVersion"] = serde_json::Value::String(api_version.to_owned());
+                        obj["kind"] = serde_json::Value::String(kind.to_owned());
                         return Some(ndjson_event_value("DELETED", &obj));
                     }
                 }
@@ -607,7 +621,10 @@ pub(crate) async fn watch_generic<S: Store>(
                     })
                 } => {
                     match maybe_event {
-                        None => break,
+                        None => {
+                            tracing::debug!(prefix = %prefix, last_rv, "watch: event_stream ended (None), closing response body");
+                            break;
+                        }
                         Some(event) => {
                             match &event {
                                 WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
@@ -742,9 +759,18 @@ pub(crate) async fn watch_generic<S: Store>(
                                 } else {
                                     true
                                 };
+                                tracing::debug!(
+                                    prefix = %prefix,
+                                    key = %key,
+                                    should_send,
+                                    has_body = body.is_some(),
+                                    "watch: DELETED event reached handler"
+                                );
                                 if should_send {
                                     if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
                                         yield Ok::<Bytes, axum::BoxError>(chunk);
+                                    } else {
+                                        tracing::debug!(prefix = %prefix, key = %key, "watch: DELETED event dropped by encode_watch_event");
                                     }
                                 }
                             } else if !matches!(&event, WatchEvent::Bookmark { .. }) || allow_watch_bookmarks {
@@ -770,6 +796,7 @@ pub(crate) async fn watch_generic<S: Store>(
                 }
 
                 _ = &mut max_duration => {
+                    tracing::debug!(prefix = %prefix, last_rv, stream_timeout_secs, "watch: max_duration elapsed, closing response body");
                     if allow_watch_bookmarks {
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
@@ -951,6 +978,59 @@ mod tests {
         assert_eq!(
             decoded["object"]["metadata"]["resourceVersion"], "78",
             "DELETED event must stamp the deletion revision into resourceVersion"
+        );
+    }
+
+    /// Regression: a DELETED event's stored body may lack apiVersion/kind — e.g. a PUT/Update
+    /// sent via the dynamic (unstructured) client from a typed Go struct with an empty
+    /// TypeMeta serializes apiVersion/kind as absent (`omitempty`), and
+    /// `replace_namespaced_resource` persists the body as received without injecting them.
+    /// `encode_watch_event` must still stamp apiVersion/kind on the emitted DELETED object,
+    /// exactly like the ADDED/MODIFIED path always does.
+    ///
+    /// Why it matters: client-go's watch decoder cannot determine an event's Go type without
+    /// apiVersion/kind and fails to decode the event, which closes the watch's ResultChan.
+    /// client-go's RetryWatcher (used by `watchtools.Until`, e.g. sonobuoy's "lifecycle of a
+    /// Deployment" conformance test) then reconnects — without ever having extracted a
+    /// resourceVersion from the undecodable event — and repeats forever from the same stale
+    /// resourceVersion, wedging any caller waiting on a DELETED event. This test fails on
+    /// revert: without the fix, decoded["object"]["apiVersion"]/["kind"] would be absent.
+    #[test]
+    fn deleted_watch_event_stamps_api_version_and_kind_when_stored_body_lacks_them() {
+        let body_without_type_meta = serde_json::json!({
+            "metadata": {
+                "name": "test-deployment",
+                "namespace": "deployment-5815",
+                "resourceVersion": "1597"
+            },
+            "spec": { "replicas": 2 }
+        });
+        let body_bytes = bytes::Bytes::from(
+            serde_json::to_vec(&body_without_type_meta).expect("body serializes"),
+        );
+
+        let event = WatchEvent::Deleted {
+            key: "/registry/apps/deployments/deployment-5815/test-deployment".into(),
+            revision: 1650,
+            body: Some(body_bytes),
+        };
+
+        let chunk = encode_watch_event(&event, "apps/v1", "Deployment", false)
+            .expect("DELETED event with body must produce a chunk");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end())
+                .expect("chunk must be valid JSON");
+
+        assert_eq!(
+            decoded["object"]["apiVersion"], "apps/v1",
+            "DELETED event must stamp apiVersion even when the stored body lacks it; without \
+             this, client-go's watch decoder cannot determine the object's type and silently \
+             fails to decode the event, wedging watchtools.Until forever"
+        );
+        assert_eq!(
+            decoded["object"]["kind"], "Deployment",
+            "DELETED event must stamp kind even when the stored body lacks it, for the same \
+             reason as apiVersion above"
         );
     }
 

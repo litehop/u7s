@@ -96,80 +96,19 @@ impl SqliteStore {
         })
     }
 
+    /// Test-only helper: broadcast an event without going through a real write. Production
+    /// code calls `push_event_locked` directly from inside the `spawn_blocking` closure that
+    /// holds `write_conn`'s guard (see its doc comment); tests use this to simulate specific
+    /// broadcast orderings without needing a real concurrent write race.
+    #[cfg(test)]
     fn push_event(&self, event: Arc<InternalEvent>) {
-        // Write to ring buffer synchronously using std::sync::RwLock.
-        // This avoids a spawned task race between write and watch replay.
-        {
-            let mut guard = self.ring.write().expect("ring poisoned");
-            guard.push_back(Arc::clone(&event));
-            if guard.len() > RING_CAPACITY {
-                guard.pop_front();
-                // Update compaction horizon to the revision of the oldest remaining entry.
-                if let Some(oldest) = guard.front() {
-                    self.compaction_horizon
-                        .store(oldest.revision, Ordering::Relaxed);
-                }
-            }
-        }
-        // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
-        // compaction can still receive DELETED events for objects deleted before compaction.
-        //
-        // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
-        //
-        // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
-        //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
-        //    any watcher reconnecting will see the live object in a fresh list response. Keeping
-        //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
-        //    event for the current incarnation.
-        //
-        // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
-        //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
-        //    to cover any watcher within the ring window; tombstones evicted by this path are
-        //    for keys deleted more than 2000 writes ago, which any active watcher has already
-        //    processed via the broadcast channel.
-        {
-            let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
-            if event.value.is_none() {
-                // Deletion: insert tombstone then cap the map.
-                guard.insert(event.key.clone(), Arc::clone(&event));
-                const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
-                if guard.len() > DELETION_LOG_CAP {
-                    // Find and remove the entry with the smallest revision.
-                    if let Some(oldest_key) = guard
-                        .iter()
-                        .min_by_key(|(_, e)| e.revision)
-                        .map(|(k, _)| k.clone())
-                    {
-                        guard.remove(&oldest_key);
-                    }
-                }
-            } else {
-                // Creation/update: evict any stale tombstone for this key.
-                guard.remove(&event.key);
-            }
-        }
-        // Best-effort broadcast of the specific event.
-        let event_revision = event.revision;
-        let _ = self.tx.send(event);
-        // Broadcast a global bookmark (key="") to advance all informers' sync RVs.
-        // KCM's ConsistencyStore.EnsureReady() checks each informer's
-        // LastStoreSyncResourceVersion against the RV of writes the controller made.
-        // A StatefulSet watch only sees StatefulSet events — without a global bookmark,
-        // its sync RV lags pod write RVs and EnsureReady requeues indefinitely.
-        //
-        // Use this event's own revision (not last_written_revision) so that concurrent
-        // writes cannot inject a higher RV into this event's bookmark.  If write-B
-        // commits and bumps last_written_revision to N+1 before write-A calls
-        // last_written_revision.load(), write-A's bookmark would carry rv=N+1, advancing
-        // watchers' last_replayed to N+1 before write-B's event(rv=N+1) is broadcast —
-        // causing write-B's event to be dedup-skipped and silently dropped.
-        let _ = self.tx.send(Arc::new(InternalEvent {
-            key: String::new(),
-            revision: event_revision,
-            value: None,
-            is_create: false,
-            deleted_body: None,
-        }));
+        push_event_locked(
+            &self.tx,
+            &self.ring,
+            &self.deletion_log,
+            &self.compaction_horizon,
+            event,
+        );
     }
 
     /// Return the current compaction horizon: the lowest revision no longer in the ring.
@@ -183,6 +122,106 @@ impl SqliteStore {
     pub fn set_compaction_horizon_for_test(&self, horizon: u64) {
         self.compaction_horizon.store(horizon, Ordering::Relaxed);
     }
+}
+
+/// Push one write's event onto the ring buffer, deletion log, and broadcast channel.
+///
+/// Callers in `put`/`delete`/`delete_namespace_resources` invoke this from INSIDE the
+/// `spawn_blocking` closure, while still holding the `write_conn` mutex guard used to
+/// assign this write's own revision. This is required for correctness, not just style:
+/// under heavy concurrent write load (e.g. a real conformance run's kubelet heartbeats,
+/// node lease renewals, and many controllers writing at once), two concurrent writers'
+/// `spawn_blocking` closures finish revision assignment in strict order (guaranteed by
+/// the mutex), but if the broadcast call happened AFTER the closure returned (in the
+/// async caller, post-`.await`), the tokio scheduler could poll and resume the
+/// higher-revision writer's continuation before the lower-revision writer's — sending
+/// the higher-revision event to the broadcast channel first. A watcher on the same
+/// prefix would then see its `last_replayed` dedup high-water mark jump to the higher
+/// revision before the lower-revision event ever arrives, causing the dedup check
+/// (`event.revision <= last_replayed`) to silently discard it. This is how a Deployment
+/// DeleteCollection's own DELETED event could vanish: an unrelated, concurrently-committed
+/// Deployment/ReplicaSet write on the same prefix with a higher revision raced ahead of it
+/// into the broadcast channel. Calling this while still holding the write lock makes
+/// broadcast order match revision-assignment order for every writer, closing the race.
+fn push_event_locked(
+    tx: &broadcast::Sender<Arc<InternalEvent>>,
+    ring: &RwLock<VecDeque<Arc<InternalEvent>>>,
+    deletion_log: &RwLock<HashMap<String, Arc<InternalEvent>>>,
+    compaction_horizon: &AtomicU64,
+    event: Arc<InternalEvent>,
+) {
+    // Write to ring buffer synchronously using std::sync::RwLock.
+    // This avoids a spawned task race between write and watch replay.
+    {
+        let mut guard = ring.write().expect("ring poisoned");
+        guard.push_back(Arc::clone(&event));
+        if guard.len() > RING_CAPACITY {
+            guard.pop_front();
+            // Update compaction horizon to the revision of the oldest remaining entry.
+            if let Some(oldest) = guard.front() {
+                compaction_horizon.store(oldest.revision, Ordering::Relaxed);
+            }
+        }
+    }
+    // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
+    // compaction can still receive DELETED events for objects deleted before compaction.
+    //
+    // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
+    //
+    // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
+    //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
+    //    any watcher reconnecting will see the live object in a fresh list response. Keeping
+    //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
+    //    event for the current incarnation.
+    //
+    // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
+    //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
+    //    to cover any watcher within the ring window; tombstones evicted by this path are
+    //    for keys deleted more than 2000 writes ago, which any active watcher has already
+    //    processed via the broadcast channel.
+    {
+        let mut guard = deletion_log.write().expect("deletion_log poisoned");
+        if event.value.is_none() {
+            // Deletion: insert tombstone then cap the map.
+            guard.insert(event.key.clone(), Arc::clone(&event));
+            const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+            if guard.len() > DELETION_LOG_CAP {
+                // Find and remove the entry with the smallest revision.
+                if let Some(oldest_key) = guard
+                    .iter()
+                    .min_by_key(|(_, e)| e.revision)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest_key);
+                }
+            }
+        } else {
+            // Creation/update: evict any stale tombstone for this key.
+            guard.remove(&event.key);
+        }
+    }
+    // Best-effort broadcast of the specific event.
+    let event_revision = event.revision;
+    let _ = tx.send(event);
+    // Broadcast a global bookmark (key="") to advance all informers' sync RVs.
+    // KCM's ConsistencyStore.EnsureReady() checks each informer's
+    // LastStoreSyncResourceVersion against the RV of writes the controller made.
+    // A StatefulSet watch only sees StatefulSet events — without a global bookmark,
+    // its sync RV lags pod write RVs and EnsureReady requeues indefinitely.
+    //
+    // Use this event's own revision (not last_written_revision) so that concurrent
+    // writes cannot inject a higher RV into this event's bookmark.  If write-B
+    // commits and bumps last_written_revision to N+1 before write-A calls
+    // last_written_revision.load(), write-A's bookmark would carry rv=N+1, advancing
+    // watchers' last_replayed to N+1 before write-B's event(rv=N+1) is broadcast —
+    // causing write-B's event to be dedup-skipped and silently dropped.
+    let _ = tx.send(Arc::new(InternalEvent {
+        key: String::new(),
+        revision: event_revision,
+        value: None,
+        is_create: false,
+        deleted_body: None,
+    }));
 }
 
 fn open_conn(path: &str) -> Result<Connection> {
@@ -841,19 +880,32 @@ impl Store for SqliteStore {
         let conn = self.write_conn.clone();
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
-        let (revision, stamped_value, is_create) = tokio::task::spawn_blocking(move || {
+        let tx = self.tx.clone();
+        let ring = Arc::clone(&self.ring);
+        let deletion_log = Arc::clone(&self.deletion_log);
+        let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            put_sync(&conn, &key_str, value, expected_revision, &last_written)
+            let (revision, stamped_value, is_create) =
+                put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
+            // Broadcast while still holding write_conn's guard — see push_event_locked's
+            // doc comment for why this ordering matters under concurrent writers.
+            push_event_locked(
+                &tx,
+                &ring,
+                &deletion_log,
+                &compaction_horizon,
+                Arc::new(InternalEvent {
+                    key: key_str,
+                    revision,
+                    value: Some(stamped_value),
+                    is_create,
+                    deleted_body: None,
+                }),
+            );
+            Ok::<u64, StoreError>(revision)
         })
         .await??;
-
-        self.push_event(Arc::new(InternalEvent {
-            key: key.to_string(),
-            revision,
-            value: Some(stamped_value),
-            is_create,
-            deleted_body: None,
-        }));
 
         Ok(revision)
     }
@@ -862,19 +914,32 @@ impl Store for SqliteStore {
         let conn = self.write_conn.clone();
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
+        let tx = self.tx.clone();
+        let ring = Arc::clone(&self.ring);
+        let deletion_log = Arc::clone(&self.deletion_log);
+        let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let (revision, last_value) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            delete_sync(&conn, &key_str, expected_revision, &last_written)
+            let (revision, last_value) =
+                delete_sync(&conn, &key_str, expected_revision, &last_written)?;
+            // Broadcast while still holding write_conn's guard — see push_event_locked's
+            // doc comment for why this ordering matters under concurrent writers.
+            push_event_locked(
+                &tx,
+                &ring,
+                &deletion_log,
+                &compaction_horizon,
+                Arc::new(InternalEvent {
+                    key: key_str,
+                    revision,
+                    value: None,
+                    is_create: false,
+                    deleted_body: Some(last_value.clone()),
+                }),
+            );
+            Ok::<(u64, Bytes), StoreError>((revision, last_value))
         })
         .await??;
-
-        self.push_event(Arc::new(InternalEvent {
-            key: key.to_string(),
-            revision,
-            value: None,
-            is_create: false,
-            deleted_body: Some(last_value.clone()),
-        }));
 
         Ok((revision, last_value))
     }
@@ -910,22 +975,35 @@ impl Store for SqliteStore {
         let conn = self.write_conn.clone();
         let ns = namespace.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
-        let deleted = tokio::task::spawn_blocking(move || {
+        let tx = self.tx.clone();
+        let ring = Arc::clone(&self.ring);
+        let deletion_log = Arc::clone(&self.deletion_log);
+        let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let keys = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            delete_namespace_sync(&conn, &ns, &last_written)
+            let deleted = delete_namespace_sync(&conn, &ns, &last_written)?;
+            let keys: Vec<String> = deleted.iter().map(|(k, _, _)| k.clone()).collect();
+            // Broadcast each tombstone while still holding write_conn's guard — see
+            // push_event_locked's doc comment for why this ordering matters under
+            // concurrent writers.
+            for (key, body, revision) in deleted {
+                push_event_locked(
+                    &tx,
+                    &ring,
+                    &deletion_log,
+                    &compaction_horizon,
+                    Arc::new(InternalEvent {
+                        key,
+                        revision,
+                        value: None,
+                        is_create: false,
+                        deleted_body: Some(body),
+                    }),
+                );
+            }
+            Ok::<Vec<String>, StoreError>(keys)
         })
         .await??;
-
-        let keys: Vec<String> = deleted.iter().map(|(k, _, _)| k.clone()).collect();
-        for (key, body, revision) in deleted {
-            self.push_event(Arc::new(InternalEvent {
-                key,
-                revision,
-                value: None,
-                is_create: false,
-                deleted_body: Some(body),
-            }));
-        }
 
         Ok(keys)
     }
@@ -949,6 +1027,14 @@ impl Store for SqliteStore {
                 .cloned()
                 .collect()
         };
+
+        tracing::debug!(
+            prefix,
+            from_revision,
+            horizon,
+            replayed_count = replayed.len(),
+            "watch: stream opened"
+        );
 
         let prefix_owned = prefix.to_string();
         let compaction_horizon_arc = Arc::clone(&self.compaction_horizon);
@@ -978,6 +1064,12 @@ impl Store for SqliteStore {
                 for tombstone in &tombstones {
                     yield internal_to_watch(tombstone);
                 }
+                tracing::debug!(
+                    prefix = %prefix_owned,
+                    from_revision,
+                    horizon,
+                    "watch: compacted at connect (from_revision below horizon)"
+                );
                 yield WatchEvent::Compacted { requested: from_revision, horizon };
                 return;
             }
@@ -1109,6 +1201,12 @@ impl Store for SqliteStore {
                                 last_replayed = last_replayed.max(tombstone.revision);
                                 yield internal_to_watch(tombstone);
                             }
+                            tracing::debug!(
+                                prefix = %prefix_owned,
+                                last_replayed,
+                                current_horizon,
+                                "watch: compacted after lag recovery (ring also compacted past last_replayed)"
+                            );
                             yield WatchEvent::Compacted {
                                 requested: last_replayed,
                                 horizon: current_horizon,
@@ -1119,6 +1217,7 @@ impl Store for SqliteStore {
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Sender dropped; stop stream.
+                        tracing::debug!(prefix = %prefix_owned, "watch: broadcast sender closed, stopping stream");
                         return;
                     }
                 }
@@ -1815,5 +1914,71 @@ mod tests {
                  rv, gets 409, and loops forever (EndpointSlice conformance failure)"
             );
         }
+    }
+
+    /// Concurrent writes to DIFFERENT keys under the SAME watch prefix must never cause a
+    /// watcher to silently drop one of them.
+    ///
+    /// Why it matters: `put`/`delete` assign each write's revision under `write_conn`'s
+    /// mutex (serialized), but the specific event's broadcast used to happen in the async
+    /// continuation AFTER that mutex was released — unserialized across concurrent writers.
+    /// The tokio scheduler does not guarantee a lower-revision writer's continuation resumes
+    /// and broadcasts before a higher-revision writer's does. If a higher-revision event on
+    /// the same prefix reaches a watcher first, `last_replayed` jumps ahead and the
+    /// lower-revision event is silently dedup-skipped when it finally arrives. This is
+    /// exactly how sonobuoy's "lifecycle of a Deployment" test's own DeleteCollection DELETED
+    /// event could vanish under real conformance-suite write concurrency (many unrelated
+    /// Deployment/ReplicaSet writes racing on the same prefix): the DELETE's own event
+    /// arrived after another same-prefix write's higher revision had already been broadcast.
+    ///
+    /// The fix broadcasts from inside the `spawn_blocking` closure while still holding
+    /// `write_conn`'s guard, so broadcast order structurally matches revision-assignment
+    /// order — closing the race rather than relying on scheduling luck.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_same_prefix_writes_never_drop_a_watch_event() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let prefix = "/registry/deployments/race-ns/";
+
+        // Subscribe before any writes so every write is observed as a live event.
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        const N: usize = 300;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let store = Arc::clone(&store);
+            let key = format!("{prefix}dep-{i}");
+            handles.push(tokio::spawn(async move {
+                let val = Bytes::from(format!(
+                    r#"{{"apiVersion":"apps/v1","kind":"Deployment","metadata":{{"name":"dep-{i}","namespace":"race-ns"}}}}"#
+                ));
+                store.put(&key, val, None).await.expect("put must succeed");
+            }));
+        }
+        for h in handles {
+            h.await.expect("writer task must not panic");
+        }
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while seen.len() < N {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Added(obj))) => {
+                    seen.insert(obj.key.clone());
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            seen.len(),
+            N,
+            "all {N} concurrent same-prefix writes must be observed by the watcher; a \
+             missing key means its event was dedup-skipped because an unrelated, \
+             later-broadcast, higher-revision event on the same prefix advanced \
+             last_replayed past it before it arrived (missing {} of {N})",
+            N - seen.len()
+        );
     }
 }
