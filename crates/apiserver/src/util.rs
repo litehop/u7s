@@ -644,6 +644,15 @@ mod tests {
         out
     }
 
+    /// Encode a wire-type-0 (varint) field: bools and int32s in proto2 (e.g.
+    /// APIServiceSpec.insecureSkipTLSVerify, .groupPriorityMinimum, .versionPriority).
+    fn encode_varint_field(field_number: u64, value: u64) -> Vec<u8> {
+        let tag = field_number << 3; // wire type 0
+        let mut out = encode_varint(tag);
+        out.extend_from_slice(&encode_varint(value));
+        out
+    }
+
     /// Build a k8s Unknown envelope with TypeMeta (field 1), raw (field 2), and optional
     /// contentType (field 4). Pass `content_type=None` to omit field 4, which is what kubectl
     /// does for core types like Namespace and ConfigMap (the smoke-test bug scenario).
@@ -1178,5 +1187,78 @@ mod tests {
         assert_eq!(json["kind"], "PodDisruptionBudget");
         assert_eq!(json["apiVersion"], "policy/v1");
         assert_eq!(json["metadata"]["name"], "my-pdb");
+    }
+
+    /// test_apiservice_create_kubectl_wire_format
+    ///
+    /// The aggregator's client-go clientset (used by the sig-api-machinery "1.17 Sample API
+    /// Server" conformance test, and any real client registering an APIService) sends:
+    ///   Content-Type: application/vnd.kubernetes.protobuf
+    ///   Body: magic + Unknown{ TypeMeta{apiregistration.k8s.io/v1/APIService},
+    ///                          raw=proto(APIService), contentType="" (absent) }
+    ///
+    /// Before decode_proto_by_kind_and_version registered "APIService", extract_body fell
+    /// through every branch (raw bytes are proto, not JSON, so the '{' fallback doesn't match
+    /// either) and returned the original magic-prefixed bytes unchanged. The generic create
+    /// handler then tried to serde_json::from_slice those bytes and failed with exactly
+    /// "invalid JSON: expected value at line 1 column 1", the observed conformance failure
+    /// (POST /apis/apiregistration.k8s.io/v1/apiservices -> 400).
+    #[test]
+    fn test_apiservice_create_kubectl_wire_format() {
+        let obj_meta = build_object_meta(b"v1alpha1.wardle.example.com", None);
+
+        let mut service_ref = encode_ld(1, b"wardle"); // ServiceReference.namespace = field 1
+        service_ref.extend_from_slice(&encode_ld(2, b"api")); // .name = field 2
+        service_ref.extend_from_slice(&encode_varint_field(3, 443)); // .port = field 3
+
+        let mut spec_proto = encode_ld(1, &service_ref); // APIServiceSpec.service = field 1
+        spec_proto.extend_from_slice(&encode_ld(2, b"wardle.example.com")); // .group = field 2
+        spec_proto.extend_from_slice(&encode_ld(3, b"v1alpha1")); // .version = field 3
+        spec_proto.extend_from_slice(&encode_varint_field(4, 1)); // .insecureSkipTLSVerify = field 4
+        spec_proto.extend_from_slice(&encode_varint_field(7, 1000)); // .groupPriorityMinimum = field 7
+        spec_proto.extend_from_slice(&encode_varint_field(8, 15)); // .versionPriority = field 8
+
+        let mut apiservice_proto = encode_ld(1, &obj_meta); // APIService.metadata = field 1
+        apiservice_proto.extend_from_slice(&encode_ld(2, &spec_proto)); // .spec = field 2
+
+        // client-go omits contentType (field 4) for types with a registered proto codec.
+        let body = build_kubectl_proto_body(
+            b"apiregistration.k8s.io/v1",
+            b"APIService",
+            &apiservice_proto,
+            None,
+        );
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+
+        assert!(
+            !decoded.is_empty(),
+            "extract_body must NOT return empty bytes for proto-encoded APIService"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must produce valid JSON for a proto-encoded APIService — before the \
+             fix, kind=\"APIService\" had no registered decoder, extract_body returned the raw \
+             magic-prefixed envelope, and the handler returned HTTP 400 'invalid JSON: expected \
+             value at line 1 column 1', blocking the sig-api-machinery aggregator conformance test",
+        );
+
+        assert_eq!(json["kind"], "APIService");
+        assert_eq!(json["apiVersion"], "apiregistration.k8s.io/v1");
+        assert_eq!(
+            json["metadata"]["name"], "v1alpha1.wardle.example.com",
+            "name must survive proto decode — apiregistration's registry keys off this name"
+        );
+        assert_eq!(json["spec"]["service"]["namespace"], "wardle");
+        assert_eq!(json["spec"]["service"]["name"], "api");
+        assert_eq!(json["spec"]["service"]["port"], 443);
+        assert_eq!(json["spec"]["group"], "wardle.example.com");
+        assert_eq!(json["spec"]["version"], "v1alpha1");
+        assert_eq!(
+            json["spec"]["groupPriorityMinimum"], 1000,
+            "groupPriorityMinimum must survive: the aggregator uses it to order competing groups"
+        );
+        assert_eq!(json["spec"]["versionPriority"], 15);
     }
 }

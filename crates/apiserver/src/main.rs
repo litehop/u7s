@@ -3,6 +3,8 @@ mod admissionreg_gen;
 mod admissionreg_gen_adapter;
 mod apiextensions_gen;
 mod apiextensions_gen_adapter;
+mod apiregistration_gen;
+mod apiregistration_gen_adapter;
 mod apps_gen;
 mod apps_gen_adapter;
 mod auth;
