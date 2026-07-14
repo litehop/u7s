@@ -65,6 +65,23 @@ fn strategic_merge_patch_at(
     let target_obj = target.as_object_mut().unwrap();
 
     for (key, value) in patch_obj {
+        // `$deleteFromPrimitiveList/<field>` removes listed elements from a primitive
+        // (non-object) array such as metadata.finalizers, which has no merge key to match
+        // elements by. KCM's Job controller removes the batch.kubernetes.io/job-tracking
+        // finalizer this way (removeTrackingFinalizerPatch); without this directive the
+        // key falls through to "unknown array" handling and is stored as a literal garbage
+        // sibling field, so the finalizer is never actually removed and the evicted pod
+        // stays Terminating forever — the Job's pod-failure-policy e2e test then times out
+        // waiting for the pod to be deleted.
+        if let Some(field) = key.strip_prefix("$deleteFromPrimitiveList/") {
+            if let Some(to_remove) = value.as_array() {
+                if let Some(target_arr) = target_obj.get_mut(field).and_then(|v| v.as_array_mut()) {
+                    target_arr.retain(|elem| !to_remove.contains(elem));
+                }
+            }
+            continue;
+        }
+
         if value.is_null() {
             if key != "creationTimestamp" {
                 target_obj.remove(key);
@@ -1341,6 +1358,50 @@ mod tests {
         assert!(
             refs.iter().any(|r| r["uid"] == "rs-uid-Y"),
             "new ownerReference (rs-uid-Y) must be present after the merge"
+        );
+    }
+
+    /// KCM's Job controller removes the `batch.kubernetes.io/job-tracking` finalizer with a
+    /// `$deleteFromPrimitiveList/finalizers` strategic-merge patch (finalizers is a plain
+    /// []string with no merge key, so `$patch:delete` on an object element can't be used).
+    /// Without this directive, the evicted pod's finalizer is never removed, the pod is
+    /// stuck Terminating forever, and the "ignore failure matching on DisruptionTarget"
+    /// Job conformance test times out waiting for pod deletion.
+    #[test]
+    fn smp_delete_from_primitive_list_removes_finalizer_not_stores_directive() {
+        let mut target = serde_json::json!({
+            "metadata": {
+                "finalizers": [
+                    "batch.kubernetes.io/job-tracking",
+                    "kubernetes.io/pv-protection"
+                ]
+            }
+        });
+        let patch = serde_json::json!({
+            "metadata": {
+                "$deleteFromPrimitiveList/finalizers": ["batch.kubernetes.io/job-tracking"]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let finalizers = target["metadata"]["finalizers"].as_array().unwrap();
+        assert_eq!(
+            finalizers.len(),
+            1,
+            "$deleteFromPrimitiveList must remove the named finalizer — if it doesn't, the \
+             pod-tracking finalizer is never released and evicted Job pods never finish \
+             deleting, timing out the DisruptionTarget pod-failure-policy conformance test"
+        );
+        assert_eq!(
+            finalizers[0], "kubernetes.io/pv-protection",
+            "the untouched finalizer must survive"
+        );
+        assert!(
+            target["metadata"]
+                .get("$deleteFromPrimitiveList/finalizers")
+                .is_none(),
+            "the directive key must never be stored literally as a sibling metadata field"
         );
     }
 
