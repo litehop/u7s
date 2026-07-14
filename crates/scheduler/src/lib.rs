@@ -119,6 +119,12 @@ struct PodSpec {
     /// priorityClassName to a value (or none was set) — treated as 0, the
     /// lowest rung, by `needs_scheduling`.
     priority: Option<i32>,
+    /// Non-empty scheduling gates ("spec.schedulingGates") mean the pod is not
+    /// yet ready to be considered for scheduling at all — a signal distinct
+    /// from a predicate failure, managed by external controllers that PATCH
+    /// gates away when the pod is ready. Only presence matters here; gate
+    /// names are opaque to the scheduler.
+    scheduling_gates: Option<Vec<Value>>,
 }
 
 /// Minimal typed view of a Pod's metadata needed by the scheduler.
@@ -138,7 +144,10 @@ struct PodObject {
 /// Determine whether a watch event represents a pod that needs scheduling.
 ///
 /// Returns `Some((namespace, pod_name, node_selector, priority))` when the event
-/// is an ADDED or MODIFIED pod with an empty `spec.nodeName`; `None` otherwise.
+/// is an ADDED or MODIFIED pod with an empty `spec.nodeName` and no non-empty
+/// `spec.schedulingGates`; `None` otherwise. A non-empty `schedulingGates` list
+/// means the pod is not yet ready to be considered for scheduling at all — it
+/// must never enter the scheduling cycle, distinct from a predicate failure.
 /// `node_selector` is the pod's `spec.nodeSelector` map (empty if absent).
 /// `priority` is the pod's `spec.priority`, defaulting to 0 (the lowest rung)
 /// when absent, so preemption has a value to compare even for pods that never
@@ -173,6 +182,17 @@ pub fn needs_scheduling(
         .as_deref()
         .is_some_and(|n| !n.is_empty());
     if already_scheduled {
+        return None;
+    }
+    let has_scheduling_gates = watch_event
+        .object
+        .spec
+        .scheduling_gates
+        .as_ref()
+        .is_some_and(|gates| !gates.is_empty());
+    if has_scheduling_gates {
+        // Gated pods must never enter the scheduling cycle — this is not a
+        // predicate failure (no FailedScheduling event), it's "not ready yet".
         return None;
     }
     let namespace = watch_event
@@ -1047,6 +1067,52 @@ mod tests {
         let (ns, name, _, _) = result.unwrap();
         assert_eq!(ns, "staging");
         assert_eq!(name, "pending-pod");
+    }
+
+    // schedulingGates tests (mayor-vkobg): a ReplicaSet's pods can carry
+    // spec.schedulingGates so they stay Pending — not even considered "ready to
+    // schedule" — until an external controller clears the gates. Without this
+    // check the scheduler binds gated pods immediately, which is why the
+    // conformance test "validates Pods with non-empty schedulingGates are
+    // blocked on scheduling" saw all 3 ReplicaSet pods get bound and start
+    // Running right away.
+
+    #[test]
+    fn needs_scheduling_returns_none_when_scheduling_gates_non_empty() {
+        // A pod carrying schedulingGates: [foo, bar] must never enter the
+        // scheduling cycle, no matter how empty spec.nodeName is.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [{"name": "foo"}, {"name": "bar"}] }
+            }
+        });
+        assert!(
+            needs_scheduling(&event).is_none(),
+            "a pod with non-empty schedulingGates must stay out of the scheduling \
+             cycle entirely — reverting this check would bind gated ReplicaSet pods \
+             immediately, failing 'validates Pods with non-empty schedulingGates \
+             are blocked on scheduling'"
+        );
+    }
+
+    #[test]
+    fn needs_scheduling_returns_some_when_scheduling_gates_is_empty_array() {
+        // An empty gate list (all gates cleared) must behave exactly like no
+        // gates at all — the pod is ready to schedule.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "ungated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [] }
+            }
+        });
+        assert!(
+            needs_scheduling(&event).is_some(),
+            "an empty schedulingGates array means all gates are cleared — the pod \
+             must be schedulable, not stuck forever"
+        );
     }
 
     // binding_path tests — verify the REST path conforms to the Kubernetes API spec.
