@@ -87,6 +87,16 @@ fn strategic_merge_patch_at(
                     strategic_merge_array(entry, value, merge_key, &child_path)?;
                 }
                 MergeKeyKind::Replace | MergeKeyKind::Unknown => {
+                    // $patch:delete can only be honored by matching a merge key; an array
+                    // with no registered merge key has no way to identify which element to
+                    // remove. Fail loud instead of storing the directive object literally
+                    // (which would corrupt the array with a garbage {$patch:delete,...} entry).
+                    if has_delete_directive(value) {
+                        return Err(PatchError::InvalidDirective(format!(
+                            "$patch:delete on '{child_path}' but no merge key is registered \
+                             for this path — cannot identify which element to delete"
+                        )));
+                    }
                     // Last-write-wins: check for $patch:replace directive in elements.
                     if has_replace_directive(value) {
                         // Strip directive elements from patch before storing.
@@ -295,6 +305,13 @@ fn should_replace_object(path: &str) -> bool {
             || path.contains("ephemeralContainerStatuses"))
 }
 
+fn has_delete_directive(arr: &serde_json::Value) -> bool {
+    arr.as_array().is_some_and(|a| {
+        a.iter()
+            .any(|e| e.get("$patch").and_then(|v| v.as_str()) == Some("delete"))
+    })
+}
+
 fn has_replace_directive(arr: &serde_json::Value) -> bool {
     arr.as_array().is_some_and(|a| {
         a.iter()
@@ -440,6 +457,48 @@ mod tests {
             tolerations[0]["key"].as_str().unwrap(),
             "new",
             "replacement element must be the patch value"
+        );
+    }
+
+    #[test]
+    fn test_smp_patch_delete_on_unregistered_array_errors_loudly() {
+        // $patch:delete on an array with no registered merge key (tolerations) must be
+        // rejected, not stored literally. Without this guard, the directive object
+        // {"$patch":"delete",...} would be silently written into the array as a garbage
+        // element (last-write-wins), corrupting the resource in a way that's invisible
+        // until something downstream chokes on the malformed entry.
+        let mut target = json!({
+            "spec": {
+                "tolerations": [
+                    {"key": "old", "effect": "NoSchedule"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "tolerations": [
+                    {"key": "old", "$patch": "delete"}
+                ]
+            }
+        });
+
+        let err = strategic_merge_patch(&mut target, &patch)
+            .expect_err("$patch:delete on an unregistered array must be rejected");
+        assert!(
+            matches!(err, PatchError::InvalidDirective(_)),
+            "error must be InvalidDirective so callers can distinguish it from other patch failures, got: {err:?}"
+        );
+
+        // The directive element must never have been written into the array.
+        let tolerations = target["spec"]["tolerations"].as_array().unwrap();
+        assert_eq!(
+            tolerations.len(),
+            1,
+            "target must be untouched on error — the garbage directive element must not appear"
+        );
+        assert!(
+            tolerations[0].get("$patch").is_none(),
+            "the literal $patch directive object must never be stored in the array"
         );
     }
 
