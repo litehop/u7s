@@ -125,6 +125,28 @@ struct PodSpec {
     /// gates away when the pod is ready. Only presence matters here; gate
     /// names are opaque to the scheduler.
     scheduling_gates: Option<Vec<Value>>,
+    /// The pod's tolerations, gating which tainted nodes it may be bound to.
+    tolerations: Option<Vec<Toleration>>,
+}
+
+/// A pod's `spec.tolerations[]` entry.
+///
+/// `key: None` (with `operator: "Exists"`) tolerates every taint regardless of
+/// key — the "tolerate everything" wildcard. `effect: None` tolerates a
+/// matching key/value taint of any effect. Mirrors the upstream
+/// `v1.Toleration` shape exactly so a typo in a JSON field is a deserialization
+/// gap, not a silent always-false match.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Toleration {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub effect: Option<String>,
 }
 
 /// Minimal typed view of a Pod's metadata needed by the scheduler.
@@ -141,28 +163,37 @@ struct PodObject {
     spec: PodSpec,
 }
 
+/// A pod discovered by `needs_scheduling` as ready to enter the scheduling
+/// cycle, carrying every placement input the predicates need to gate node
+/// selection. A struct (not a growing tuple) so each new predicate this
+/// scheduler learns to enforce is a named field, not another `_` in a
+/// destructure at every call site.
+#[derive(Debug)]
+pub struct PendingPod {
+    pub namespace: String,
+    pub pod_name: String,
+    /// The pod's `spec.nodeSelector` map (empty if absent).
+    pub node_selector: std::collections::HashMap<String, String>,
+    /// The pod's `spec.priority`, defaulting to 0 (the lowest rung) when
+    /// absent, so preemption has a value to compare even for pods that never
+    /// had a priority resolved.
+    pub priority: i32,
+    /// The pod's `spec.tolerations` (empty if absent) — gates which tainted
+    /// nodes it may be bound to.
+    pub tolerations: Vec<Toleration>,
+}
+
 /// Determine whether a watch event represents a pod that needs scheduling.
 ///
-/// Returns `Some((namespace, pod_name, node_selector, priority))` when the event
-/// is an ADDED or MODIFIED pod with an empty `spec.nodeName` and no non-empty
-/// `spec.schedulingGates`; `None` otherwise. A non-empty `schedulingGates` list
-/// means the pod is not yet ready to be considered for scheduling at all — it
-/// must never enter the scheduling cycle, distinct from a predicate failure.
-/// `node_selector` is the pod's `spec.nodeSelector` map (empty if absent).
-/// `priority` is the pod's `spec.priority`, defaulting to 0 (the lowest rung)
-/// when absent, so preemption has a value to compare even for pods that never
-/// had a priority resolved.
+/// Returns `Some(PendingPod)` when the event is an ADDED or MODIFIED pod with
+/// an empty `spec.nodeName` and no non-empty `spec.schedulingGates`; `None`
+/// otherwise. A non-empty `schedulingGates` list means the pod is not yet
+/// ready to be considered for scheduling at all — it must never enter the
+/// scheduling cycle, distinct from a predicate failure.
 ///
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
-pub fn needs_scheduling(
-    event: &Value,
-) -> Option<(
-    String,
-    String,
-    std::collections::HashMap<String, String>,
-    i32,
-)> {
+pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
     let watch_event: WatchEvent<PodObject> =
         serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
@@ -202,7 +233,14 @@ pub fn needs_scheduling(
         .unwrap_or_else(|| "default".to_owned());
     let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
     let priority = watch_event.object.spec.priority.unwrap_or(0);
-    Some((namespace, pod_name.to_owned(), node_selector, priority))
+    let tolerations = watch_event.object.spec.tolerations.unwrap_or_default();
+    Some(PendingPod {
+        namespace,
+        pod_name: pod_name.to_owned(),
+        node_selector,
+        priority,
+        tolerations,
+    })
 }
 
 /// Return `true` if a spawn for `key` ("namespace/name") should proceed.
@@ -228,7 +266,27 @@ pub struct NodeList {
 pub struct NodeItem {
     pub metadata: NodeMetadata,
     #[serde(default)]
+    pub spec: NodeSpec,
+    #[serde(default)]
     pub status: NodeStatus,
+}
+
+#[derive(Deserialize, Default)]
+pub struct NodeSpec {
+    #[serde(default)]
+    pub taints: Vec<Taint>,
+}
+
+/// A node taint (`spec.taints[]`). Only `NoSchedule`/`NoExecute` effects block
+/// scheduling in this MVP — `PreferNoSchedule` is a soft signal upstream only
+/// weighs during scoring, and this scheduler does no scoring, so it is treated
+/// as always tolerated.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Taint {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+    pub effect: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -347,8 +405,20 @@ pub fn parse_node_pods(body: &str) -> anyhow::Result<Vec<NodePod>> {
         .collect())
 }
 
-/// Select the first node from `list` whose labels satisfy `selector` AND that
-/// has at least one free pod slot.
+/// Return true when `node` is eligible to host `pod` at all, independent of
+/// capacity: its labels satisfy the pod's `nodeSelector`, AND every
+/// scheduling-blocking taint on the node is tolerated.
+///
+/// Shared by `select_node_with_capacity` (direct scheduling) and
+/// `find_preemption_plan`, so preemption never evicts pods on a node the
+/// pending pod could not use anyway even after the eviction.
+fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
+    node_selector_matches(&node.metadata.labels, &pod.node_selector)
+        && node_taints_tolerated(&node.spec.taints, &pod.tolerations)
+}
+
+/// Select the first node from `list` that qualifies for `pod`
+/// (see `node_qualifies_for_pod`) AND that has at least one free pod slot.
 ///
 /// `pod_counts` maps node name → current non-terminated pod count (from a prior
 /// GET /api/v1/pods?fieldSelector=spec.nodeName=<node>).  If a node's name is
@@ -358,17 +428,17 @@ pub fn parse_node_pods(body: &str) -> anyhow::Result<Vec<NodePod>> {
 /// `status.capacity.pods`.  A capacity of 0 (field absent / unparseable) means
 /// the limit is unknown; such nodes are NOT skipped (the old safe behaviour).
 ///
-/// Returns `Err` when no node satisfies the selector with free capacity, so the
-/// caller can leave the pod Pending instead of binding to a full node.
+/// Returns `Err` when no node qualifies with free capacity, so the caller can
+/// leave the pod Pending instead of binding to a full or unusable node.
 ///
 /// Pure function so the capacity-gate logic can be unit-tested without a network.
 pub fn select_node_with_capacity(
     list: NodeList,
-    selector: &std::collections::HashMap<String, String>,
+    pod: &PendingPod,
     pod_counts: &std::collections::HashMap<String, u32>,
 ) -> anyhow::Result<String> {
     let found = list.items.into_iter().find(|n| {
-        if !node_selector_matches(&n.metadata.labels, selector) {
+        if !node_qualifies_for_pod(n, pod) {
             return false;
         }
         // Resolve capacity: prefer allocatable, fall back to capacity.
@@ -386,7 +456,7 @@ pub fn select_node_with_capacity(
         used < cap
     });
     found.map(|n| n.metadata.name).context(
-        "no node satisfies the pod's nodeSelector with free pod capacity (NodeResourcesFit)",
+        "no node satisfies the pod's nodeSelector/tolerations with free pod capacity (NodeResourcesFit)",
     )
 }
 
@@ -455,6 +525,45 @@ pub fn node_selector_matches(
         .all(|(k, v)| labels.get(k).map(|s| s == v).unwrap_or(false))
 }
 
+/// Return true when `toleration` tolerates `taint`, mirroring Kubernetes'
+/// `Toleration.ToleratesTaint`: an empty `key` only ever matches when paired
+/// with `operator: Exists` (the "tolerate everything" wildcard); otherwise the
+/// key must match exactly, and — unless `operator: Exists` — the value must
+/// match exactly too (operator `Equal`, the default when absent). A
+/// toleration with a set `effect` only tolerates a taint of that same effect.
+fn toleration_matches_taint(toleration: &Toleration, taint: &Taint) -> bool {
+    if let Some(t_effect) = &toleration.effect {
+        if t_effect != &taint.effect {
+            return false;
+        }
+    }
+    match &toleration.key {
+        None => toleration.operator.as_deref() == Some("Exists"),
+        Some(key) => {
+            key == &taint.key
+                && (toleration.operator.as_deref() == Some("Exists")
+                    || toleration.value.as_deref().unwrap_or("") == taint.value)
+        }
+    }
+}
+
+/// Return true when every scheduling-blocking taint on the node (`NoSchedule`
+/// or `NoExecute`) is tolerated by at least one of the pod's tolerations.
+///
+/// A node with no such taints trivially satisfies this (nothing to tolerate).
+/// Extracted as a pure function so the taint/toleration predicate can be
+/// unit-tested without network access — mirrors `node_selector_matches`.
+pub fn node_taints_tolerated(taints: &[Taint], tolerations: &[Toleration]) -> bool {
+    taints
+        .iter()
+        .filter(|t| t.effect == "NoSchedule" || t.effect == "NoExecute")
+        .all(|t| {
+            tolerations
+                .iter()
+                .any(|tol| toleration_matches_taint(tol, t))
+        })
+}
+
 /// Select the first node from `list` whose labels satisfy `selector`.
 ///
 /// An empty `selector` matches any node (standard Kubernetes semantics).
@@ -487,10 +596,11 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
         .context("no nodes available")
 }
 
-/// Return the name of the first node that satisfies `node_selector` and has
-/// at least one free pod slot (NodeResourcesFit predicate).
+/// Return the name of the first node that qualifies for `pod`
+/// (see `node_qualifies_for_pod`) and has at least one free pod slot
+/// (NodeResourcesFit predicate).
 ///
-/// Fetches the node list from the API server, then — for each selector-matching
+/// Fetches the node list from the API server, then — for each qualifying
 /// candidate — counts non-terminated pods already assigned to it via
 /// GET /api/v1/pods?fieldSelector=spec.nodeName%3D<node>.  A node at or above
 /// its `status.allocatable.pods` limit is skipped.  Returns `Err` when no
@@ -500,7 +610,7 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
 pub async fn pick_node(
     connector: &TlsConnector,
     server: &str,
-    node_selector: &std::collections::HashMap<String, String>,
+    pod: &PendingPod,
 ) -> anyhow::Result<String> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
@@ -508,11 +618,11 @@ pub async fn pick_node(
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
 
-    // Build per-node pod counts for every candidate node (selector-matching).
-    // We only query nodes that pass the selector to avoid unnecessary API calls.
+    // Build per-node pod counts for every candidate node (qualifying nodes only).
+    // We only query nodes that pass the selector/taints to avoid unnecessary API calls.
     let mut pod_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for node in &list.items {
-        if !node_selector_matches(&node.metadata.labels, node_selector) {
+        if !node_qualifies_for_pod(node, pod) {
             continue;
         }
         let node_name = &node.metadata.name;
@@ -542,7 +652,7 @@ pub async fn pick_node(
         }
     }
 
-    select_node_with_capacity(list, node_selector, &pod_counts)
+    select_node_with_capacity(list, pod, &pod_counts)
 }
 
 /// A viable preemption outcome: the node to bind the pending pod to, and the
@@ -553,9 +663,9 @@ pub struct PreemptionPlan {
     pub victims: Vec<String>,
 }
 
-/// Search every node satisfying `node_selector` for a viable preemption target:
-/// a node where evicting some lower-priority pods would free a slot for a pod
-/// at `pending_priority`.
+/// Search every node that qualifies for `pod` (see `node_qualifies_for_pod`)
+/// for a viable preemption target: a node where evicting some lower-priority
+/// pods would free a slot for `pod`.
 ///
 /// Intended to run only after `pick_node` has already failed for the same pod —
 /// this is the fallback that stops a higher-priority pod from staying Pending
@@ -568,8 +678,7 @@ pub struct PreemptionPlan {
 pub async fn find_preemption_plan(
     connector: &TlsConnector,
     server: &str,
-    node_selector: &std::collections::HashMap<String, String>,
-    pending_priority: i32,
+    pod: &PendingPod,
 ) -> anyhow::Result<PreemptionPlan> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
@@ -579,7 +688,7 @@ pub async fn find_preemption_plan(
 
     let mut best: Option<PreemptionPlan> = None;
     for node in &list.items {
-        if !node_selector_matches(&node.metadata.labels, node_selector) {
+        if !node_qualifies_for_pod(node, pod) {
             continue;
         }
         let cap_str = if !node.status.allocatable.pods.is_empty() {
@@ -618,7 +727,7 @@ pub async fn find_preemption_plan(
             }
         };
 
-        let victims = select_preemption_victims(pending_priority, &node_pods, capacity);
+        let victims = select_preemption_victims(pod.priority, &node_pods, capacity);
         if victims.is_empty() {
             continue;
         }
@@ -990,9 +1099,12 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some(), "expected Some for unscheduled pod");
-        let (ns, name, _, _) = result.unwrap();
-        assert_eq!(ns, "kube-system", "namespace must come from event metadata");
-        assert_eq!(name, "coredns-abc");
+        let pending = result.unwrap();
+        assert_eq!(
+            pending.namespace, "kube-system",
+            "namespace must come from event metadata"
+        );
+        assert_eq!(pending.pod_name, "coredns-abc");
     }
 
     #[test]
@@ -1006,9 +1118,9 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some());
-        let (ns, name, _, _) = result.unwrap();
-        assert_eq!(ns, "default");
-        assert_eq!(name, "my-pod");
+        let pending = result.unwrap();
+        assert_eq!(pending.namespace, "default");
+        assert_eq!(pending.pod_name, "my-pod");
     }
 
     #[test]
@@ -1046,9 +1158,9 @@ mod tests {
                 "spec": {}
             }
         });
-        let (ns, name, _, _) = needs_scheduling(&event).expect("should schedule");
-        assert_eq!(ns, "default");
-        assert_eq!(name, "no-ns-pod");
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(pending.namespace, "default");
+        assert_eq!(pending.pod_name, "no-ns-pod");
     }
 
     #[test]
@@ -1064,9 +1176,9 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some());
-        let (ns, name, _, _) = result.unwrap();
-        assert_eq!(ns, "staging");
-        assert_eq!(name, "pending-pod");
+        let pending = result.unwrap();
+        assert_eq!(pending.namespace, "staging");
+        assert_eq!(pending.pod_name, "pending-pod");
     }
 
     // schedulingGates tests (mayor-vkobg): a ReplicaSet's pods can carry
@@ -1278,6 +1390,7 @@ mod tests {
                         name: "node-a".to_owned(),
                         labels: Default::default(),
                     },
+                    spec: NodeSpec::default(),
                     status: NodeStatus::default(),
                 },
                 NodeItem {
@@ -1285,6 +1398,7 @@ mod tests {
                         name: "node-b".to_owned(),
                         labels: Default::default(),
                     },
+                    spec: NodeSpec::default(),
                     status: NodeStatus::default(),
                 },
             ],
@@ -1358,9 +1472,9 @@ mod tests {
             result.is_some(),
             "null nodeName must be treated as unscheduled"
         );
-        let (ns, name, _, _) = result.unwrap();
-        assert_eq!(ns, "default");
-        assert_eq!(name, "null-node-pod");
+        let pending = result.unwrap();
+        assert_eq!(pending.namespace, "default");
+        assert_eq!(pending.pod_name, "null-node-pod");
     }
 
     // binding_path with special characters — ensures the path template doesn't
@@ -1384,6 +1498,7 @@ mod tests {
                     name: "worker-0".to_owned(),
                     labels: Default::default(),
                 },
+                spec: NodeSpec::default(),
                 status: NodeStatus::default(),
             }],
         };
@@ -1407,6 +1522,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             },
+            spec: NodeSpec::default(),
             status: NodeStatus::default(),
         }
     }
@@ -1536,6 +1652,207 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // taints/tolerations (mayor-2ksh8): the scheduler must not bind a pod to a
+    // NoSchedule/NoExecute-tainted node unless the pod tolerates that taint.
+    // Before this fix, crates/scheduler/ had zero taint/toleration handling —
+    // pods without a matching toleration were bound to tainted nodes anyway,
+    // failing "validates that taints-tolerations is respected if not matching".
+    // ---------------------------------------------------------------------------
+
+    fn taint(key: &str, value: &str, effect: &str) -> Taint {
+        Taint {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            effect: effect.to_owned(),
+        }
+    }
+
+    fn toleration(key: &str, value: &str, effect: &str) -> Toleration {
+        Toleration {
+            key: Some(key.to_owned()),
+            operator: None,
+            value: Some(value.to_owned()),
+            effect: Some(effect.to_owned()),
+        }
+    }
+
+    /// A NoSchedule taint with no matching toleration must block the node —
+    /// this is the exact scenario the conformance test exercises: a pod with
+    /// no tolerations must stay Pending against a NoSchedule-tainted node.
+    #[test]
+    fn node_taints_tolerated_false_when_no_toleration_matches() {
+        let taints = vec![taint("dedicated", "gpu", "NoSchedule")];
+        assert!(
+            !node_taints_tolerated(&taints, &[]),
+            "a NoSchedule taint with zero tolerations must block the node — \
+             reverting this would bind untolerating pods to tainted nodes, \
+             failing 'validates that taints-tolerations is respected if not matching'"
+        );
+    }
+
+    /// A toleration matching key/value/effect exactly must tolerate the taint.
+    #[test]
+    fn node_taints_tolerated_true_when_toleration_matches_exactly() {
+        let taints = vec![taint("dedicated", "gpu", "NoSchedule")];
+        let tolerations = vec![toleration("dedicated", "gpu", "NoSchedule")];
+        assert!(
+            node_taints_tolerated(&taints, &tolerations),
+            "an exact key/value/effect toleration must tolerate the matching taint"
+        );
+    }
+
+    /// A toleration with a different value must NOT tolerate the taint —
+    /// otherwise pods could bypass taints meant to reserve nodes for specific
+    /// workloads.
+    #[test]
+    fn node_taints_tolerated_false_when_value_differs() {
+        let taints = vec![taint("dedicated", "gpu", "NoSchedule")];
+        let tolerations = vec![toleration("dedicated", "cpu-only", "NoSchedule")];
+        assert!(
+            !node_taints_tolerated(&taints, &tolerations),
+            "a toleration for a different value must not tolerate the taint"
+        );
+    }
+
+    /// operator: Exists tolerates any value for the matching key — this is the
+    /// upstream `Toleration{Key, Operator: Exists}` shape used to tolerate a
+    /// taint regardless of its value.
+    #[test]
+    fn node_taints_tolerated_true_with_exists_operator_ignores_value() {
+        let taints = vec![taint("dedicated", "gpu", "NoSchedule")];
+        let tolerations = vec![Toleration {
+            key: Some("dedicated".to_owned()),
+            operator: Some("Exists".to_owned()),
+            value: None,
+            effect: Some("NoSchedule".to_owned()),
+        }];
+        assert!(
+            node_taints_tolerated(&taints, &tolerations),
+            "operator Exists must tolerate the taint regardless of its value"
+        );
+    }
+
+    /// An empty-key toleration with operator Exists tolerates every taint,
+    /// regardless of key — the upstream "tolerate everything" wildcard.
+    #[test]
+    fn node_taints_tolerated_true_with_wildcard_toleration() {
+        let taints = vec![
+            taint("dedicated", "gpu", "NoSchedule"),
+            taint("other", "x", "NoExecute"),
+        ];
+        let tolerations = vec![Toleration {
+            key: None,
+            operator: Some("Exists".to_owned()),
+            value: None,
+            effect: None,
+        }];
+        assert!(
+            node_taints_tolerated(&taints, &tolerations),
+            "a wildcard toleration (no key, operator Exists) must tolerate every taint"
+        );
+    }
+
+    /// PreferNoSchedule is a soft signal this MVP scheduler (no scoring) never
+    /// hard-blocks on — only NoSchedule/NoExecute gate scheduling.
+    #[test]
+    fn node_taints_tolerated_true_for_prefer_no_schedule_without_toleration() {
+        let taints = vec![taint("dedicated", "gpu", "PreferNoSchedule")];
+        assert!(
+            node_taints_tolerated(&taints, &[]),
+            "PreferNoSchedule must never block scheduling in a scheduler with no scoring"
+        );
+    }
+
+    /// A node with no taints at all trivially qualifies regardless of tolerations.
+    #[test]
+    fn node_taints_tolerated_true_when_node_has_no_taints() {
+        assert!(
+            node_taints_tolerated(&[], &[]),
+            "a node with zero taints has nothing to tolerate"
+        );
+    }
+
+    /// needs_scheduling extracts spec.tolerations from the watch event — if this
+    /// is dropped, node_taints_tolerated always sees an empty toleration list and
+    /// every tainted node is treated as blocked, even for pods meant to tolerate it.
+    #[test]
+    fn needs_scheduling_returns_tolerations_from_event() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "tolerant-pod", "namespace": "default" },
+                "spec": {
+                    "tolerations": [
+                        { "key": "dedicated", "operator": "Equal", "value": "gpu", "effect": "NoSchedule" }
+                    ]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            pending.tolerations.len(),
+            1,
+            "spec.tolerations must be extracted from the watch event"
+        );
+        assert_eq!(pending.tolerations[0].key.as_deref(), Some("dedicated"));
+        assert_eq!(pending.tolerations[0].effect.as_deref(), Some("NoSchedule"));
+    }
+
+    /// A pod with no tolerations must produce an empty list, not fail deserialization.
+    #[test]
+    fn needs_scheduling_returns_empty_tolerations_when_absent() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "plain-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert!(
+            pending.tolerations.is_empty(),
+            "a pod without tolerations must produce an empty list"
+        );
+    }
+
+    /// select_node_with_capacity must skip a tainted node the pod does not
+    /// tolerate, even when it has free pod capacity — capacity alone is not
+    /// enough; the node must also qualify (selector + taints).
+    #[test]
+    fn select_node_with_capacity_skips_untolerated_tainted_node() {
+        let mut node = make_node_with_capacity("tainted-node", &[], "110");
+        node.spec.taints = vec![taint("dedicated", "gpu", "NoSchedule")];
+        let list = NodeList { items: vec![node] };
+        let pod = empty_pending_pod();
+        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert!(
+            result.is_err(),
+            "a NoSchedule-tainted node with no matching toleration must be skipped \
+             even when it has free capacity — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// select_node_with_capacity must select a tainted node when the pod
+    /// carries a matching toleration.
+    #[test]
+    fn select_node_with_capacity_selects_tainted_node_with_matching_toleration() {
+        let mut node = make_node_with_capacity("tainted-node", &[], "110");
+        node.spec.taints = vec![taint("dedicated", "gpu", "NoSchedule")];
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.tolerations = vec![toleration("dedicated", "gpu", "NoSchedule")];
+        let counts: std::collections::HashMap<String, u32> = Default::default();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_eq!(
+            result.unwrap(),
+            "tainted-node",
+            "a pod tolerating the node's taint must be scheduled there"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // NodeResourcesFit / pod-capacity gate (mayor-bbxr)
     //
     // Without this check the scheduler binds pods to nodes already at their pod
@@ -1552,6 +1869,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             },
+            spec: NodeSpec::default(),
             status: NodeStatus {
                 allocatable: NodeAllocatable {
                     pods: capacity.to_owned(),
@@ -1560,6 +1878,19 @@ mod tests {
                     pods: capacity.to_owned(),
                 },
             },
+        }
+    }
+
+    /// A minimal PendingPod for tests that only care about capacity/taint gating,
+    /// not identity or priority — empty selector (matches any node), no
+    /// tolerations (tolerates nothing but taint-free nodes).
+    fn empty_pending_pod() -> PendingPod {
+        PendingPod {
+            namespace: "default".to_owned(),
+            pod_name: "pod".to_owned(),
+            node_selector: Default::default(),
+            priority: 0,
+            tolerations: Vec::new(),
         }
     }
 
@@ -1573,11 +1904,11 @@ mod tests {
         let list = NodeList {
             items: vec![make_node_with_capacity("worker-0", &[], "110")],
         };
-        let selector = std::collections::HashMap::new();
+        let pod = empty_pending_pod();
         // Node already has 110 pods — at capacity.
         let counts: std::collections::HashMap<String, u32> =
             [("worker-0".to_owned(), 110u32)].into();
-        let result = select_node_with_capacity(list, &selector, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_err(),
             "a node at pod capacity must return Err so the pod stays Pending, \
@@ -1595,11 +1926,11 @@ mod tests {
         let list = NodeList {
             items: vec![make_node_with_capacity("worker-0", &[], "110")],
         };
-        let selector = std::collections::HashMap::new();
+        let pod = empty_pending_pod();
         // Node has 109 pods — one slot free.
         let counts: std::collections::HashMap<String, u32> =
             [("worker-0".to_owned(), 109u32)].into();
-        let result = select_node_with_capacity(list, &selector, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_ok(),
             "a node with a free slot must be selected — if this fails, scheduling is \
@@ -1618,13 +1949,13 @@ mod tests {
                 make_node_with_capacity("worker-free", &[], "110"),
             ],
         };
-        let selector = std::collections::HashMap::new();
+        let pod = empty_pending_pod();
         let counts: std::collections::HashMap<String, u32> = [
             ("worker-full".to_owned(), 110u32),
             ("worker-free".to_owned(), 50u32),
         ]
         .into();
-        let result = select_node_with_capacity(list, &selector, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_ok(),
             "must pick worker-free when worker-full is at capacity"
@@ -1646,13 +1977,13 @@ mod tests {
                 make_node_with_capacity("worker-1", &[], "110"),
             ],
         };
-        let selector = std::collections::HashMap::new();
+        let pod = empty_pending_pod();
         let counts: std::collections::HashMap<String, u32> = [
             ("worker-0".to_owned(), 110u32),
             ("worker-1".to_owned(), 110u32),
         ]
         .into();
-        let result = select_node_with_capacity(list, &selector, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_err(),
             "all nodes full must return Err so the pod stays Pending, not be bound \
@@ -1669,10 +2000,10 @@ mod tests {
         let list = NodeList {
             items: vec![make_node_with_capacity("worker-0", &[], "")],
         };
-        let selector = std::collections::HashMap::new();
+        let pod = empty_pending_pod();
         let counts: std::collections::HashMap<String, u32> =
             [("worker-0".to_owned(), 999u32)].into();
-        let result = select_node_with_capacity(list, &selector, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts);
         assert!(
             result.is_ok(),
             "a node with unknown capacity (empty string) must not be blocked — \
@@ -1737,11 +2068,14 @@ mod tests {
             result.is_some(),
             "expected Some for unscheduled pod with nodeSelector"
         );
-        let (ns, name, selector, _) = result.unwrap();
-        assert_eq!(ns, "sched-pred");
-        assert_eq!(name, "restricted-pod");
+        let pending = result.unwrap();
+        assert_eq!(pending.namespace, "sched-pred");
+        assert_eq!(pending.pod_name, "restricted-pod");
         assert_eq!(
-            selector.get("scheduledOnNode").map(|s| s.as_str()),
+            pending
+                .node_selector
+                .get("scheduledOnNode")
+                .map(|s| s.as_str()),
             Some("lima-node-2"),
             "nodeSelector must be extracted from spec.nodeSelector in the watch event — \
              if the selector is dropped, pick_node sees an empty selector and schedules \
@@ -1762,9 +2096,9 @@ mod tests {
                 "spec": {}
             }
         });
-        let (_, _, selector, _) = needs_scheduling(&event).expect("should schedule");
+        let pending = needs_scheduling(&event).expect("should schedule");
         assert!(
-            selector.is_empty(),
+            pending.node_selector.is_empty(),
             "pod without nodeSelector must produce an empty selector (matches any node)"
         );
     }
@@ -1792,9 +2126,9 @@ mod tests {
                 "spec": { "priority": 1000 }
             }
         });
-        let (_, _, _, priority) = needs_scheduling(&event).expect("should schedule");
+        let pending = needs_scheduling(&event).expect("should schedule");
         assert_eq!(
-            priority, 1000,
+            pending.priority, 1000,
             "spec.priority must be extracted from the watch event — otherwise \
              preemption cannot distinguish this pod from a default-priority one"
         );
@@ -1813,9 +2147,9 @@ mod tests {
                 "spec": {}
             }
         });
-        let (_, _, _, priority) = needs_scheduling(&event).expect("should schedule");
+        let pending = needs_scheduling(&event).expect("should schedule");
         assert_eq!(
-            priority, 0,
+            pending.priority, 0,
             "a pod with no priority set must default to 0, not be treated as \
              missing/unschedulable"
         );
