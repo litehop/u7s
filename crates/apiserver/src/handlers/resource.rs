@@ -1462,6 +1462,10 @@ pub async fn create_namespaced_resource<S: Store>(
     obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
 
     // ResourceQuota: ensure object count does not exceed hard limits.
+    // Held across check-then-write: without this, concurrent creates of the same
+    // resource type in the same namespace can each observe pre-write usage, all pass
+    // the check, and collectively exceed the quota.
+    let _quota_lock = state.quota_admission_locks.lock(&ns).await;
     quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
