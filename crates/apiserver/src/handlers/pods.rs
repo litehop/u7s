@@ -7495,6 +7495,122 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
+    // nodeSelector / affinity protobuf-decode regression test
+    // -----------------------------------------------------------------------
+
+    fn encode_varint_field(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    fn encode_ld(field_number: u64, payload: &[u8]) -> Vec<u8> {
+        let tag = (field_number << 3) | 2;
+        let mut out = encode_varint_field(tag);
+        out.extend_from_slice(&encode_varint_field(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The full create_pod pipeline (protobuf decode -> defaults -> SA token injection ->
+    /// admission -> LimitRange -> quota -> store.put) must preserve spec.nodeSelector and
+    /// spec.affinity.nodeAffinity end to end when the request arrives protobuf-encoded, the
+    /// wire format client-go clientsets use by default for built-in types (e2e test binaries,
+    /// kube-scheduler, kube-controller-manager). kubectl instead sends JSON, which is why a
+    /// manual `kubectl apply` of an identical pod could never reproduce the sonobuoy failure
+    /// this regresses: "[sig-scheduling] SchedulerPredicates validates that NodeSelector/
+    /// NodeAffinity is respected if not matching". Asserting on the object fetched back out of
+    /// the store (not just the CREATE response) matches the live repro exactly: `kubectl get
+    /// pod -o json` on the persisted object showed both fields completely absent.
+    #[tokio::test]
+    async fn create_pod_preserves_node_selector_and_node_affinity_from_protobuf_body() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let mut obj_meta = encode_ld(1, b"restricted-pod");
+        obj_meta.extend_from_slice(&encode_ld(3, b"default"));
+
+        let mut container = encode_ld(1, b"c");
+        container.extend_from_slice(&encode_ld(2, b"img"));
+
+        // PodSpec.nodeSelector (field 7): map entry {key(1)="label", value(2)="nonempty"}.
+        let mut map_entry = encode_ld(1, b"label");
+        map_entry.extend_from_slice(&encode_ld(2, b"nonempty"));
+
+        // PodSpec.affinity (field 18) -> Affinity.nodeAffinity(1) ->
+        // NodeAffinity.requiredDuringSchedulingIgnoredDuringExecution(1) ->
+        // NodeSelector.nodeSelectorTerms(1) -> NodeSelectorTerm.matchExpressions(1) ->
+        // NodeSelectorRequirement{key(1),operator(2),values(3)}.
+        let mut requirement = encode_ld(1, b"restrict-me");
+        requirement.extend_from_slice(&encode_ld(2, b"In"));
+        requirement.extend_from_slice(&encode_ld(3, b"true"));
+        let term = encode_ld(1, &requirement);
+        let node_selector_msg = encode_ld(1, &term);
+        let node_affinity_msg = encode_ld(1, &node_selector_msg);
+        let affinity_msg = encode_ld(1, &node_affinity_msg);
+
+        let mut pod_spec = encode_ld(2, &container);
+        pod_spec.extend_from_slice(&encode_ld(7, &map_entry));
+        pod_spec.extend_from_slice(&encode_ld(18, &affinity_msg));
+
+        let mut pod_proto = encode_ld(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_ld(2, &pod_spec));
+
+        // Wrap in the k8s Unknown envelope client-go uses for core types (empty contentType).
+        let mut type_meta = encode_ld(1, b"v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"Pod"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &pod_proto));
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // magic
+        body.extend_from_slice(&unknown);
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/vnd.kubernetes.protobuf")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/restricted-pod")
+            .await
+            .expect("store get must succeed")
+            .expect("pod must be persisted");
+        let persisted: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            persisted["spec"]["nodeSelector"]["label"], "nonempty",
+            "spec.nodeSelector must be present on the object fetched back out of the store — \
+             a protobuf-encoded create must not lose it anywhere in the create_pod pipeline"
+        );
+        assert_eq!(
+            persisted["spec"]["affinity"]["nodeAffinity"]
+                ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
+                ["matchExpressions"][0],
+            serde_json::json!({"key": "restrict-me", "operator": "In", "values": ["true"]}),
+            "spec.affinity.nodeAffinity must be present on the object fetched back out of the \
+             store — a protobuf-encoded create must not lose it anywhere in the create_pod \
+             pipeline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // RuntimeClass overhead injection regression test
     // -----------------------------------------------------------------------
 

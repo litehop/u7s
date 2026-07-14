@@ -861,6 +861,106 @@ fn gen_ephemeral_container_to_json(ec: core_v1::EphemeralContainer) -> serde_jso
     serde_json::Value::Object(m)
 }
 
+fn gen_node_selector_requirement_to_json(
+    req: core_v1::NodeSelectorRequirement,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
+        m.insert("key".to_string(), serde_json::Value::String(k));
+    }
+    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
+        m.insert("operator".to_string(), serde_json::Value::String(op));
+    }
+    if !req.values.is_empty() {
+        m.insert(
+            "values".to_string(),
+            serde_json::Value::Array(
+                req.values
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_node_selector_term_to_json(term: core_v1::NodeSelectorTerm) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !term.match_expressions.is_empty() {
+        m.insert(
+            "matchExpressions".to_string(),
+            serde_json::Value::Array(
+                term.match_expressions
+                    .into_iter()
+                    .map(gen_node_selector_requirement_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !term.match_fields.is_empty() {
+        m.insert(
+            "matchFields".to_string(),
+            serde_json::Value::Array(
+                term.match_fields
+                    .into_iter()
+                    .map(gen_node_selector_requirement_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Only `nodeAffinity` is decoded here — `podAffinity`/`podAntiAffinity` are dropped
+/// from the returned JSON. This mirrors crates/scheduler, which has no matching logic
+/// for pod (anti-)affinity yet, so there is no consumer for those fields today. If a
+/// pod sets only podAffinity/podAntiAffinity (no nodeAffinity), it round-trips through
+/// this decoder as `spec.affinity: {}` — a narrower, pre-existing version of the same
+/// silent-drop bug this function fixes for nodeAffinity.
+fn gen_node_affinity_to_json(na: core_v1::NodeAffinity) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(req) = na.required_during_scheduling_ignored_during_execution {
+        m.insert(
+            "requiredDuringSchedulingIgnoredDuringExecution".to_string(),
+            serde_json::json!({
+                "nodeSelectorTerms": req
+                    .node_selector_terms
+                    .into_iter()
+                    .map(gen_node_selector_term_to_json)
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+    if !na
+        .preferred_during_scheduling_ignored_during_execution
+        .is_empty()
+    {
+        let preferred: Vec<serde_json::Value> = na
+            .preferred_during_scheduling_ignored_during_execution
+            .into_iter()
+            .map(|p| {
+                let mut pm = serde_json::Map::new();
+                if let Some(w) = p.weight {
+                    pm.insert("weight".to_string(), serde_json::Value::Number(w.into()));
+                }
+                if let Some(pref) = p.preference {
+                    pm.insert(
+                        "preference".to_string(),
+                        gen_node_selector_term_to_json(pref),
+                    );
+                }
+                serde_json::Value::Object(pm)
+            })
+            .collect();
+        m.insert(
+            "preferredDuringSchedulingIgnoredDuringExecution".to_string(),
+            serde_json::Value::Array(preferred),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value {
     let containers: Vec<serde_json::Value> = spec
         .containers
@@ -1075,6 +1175,32 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             "runtimeClassName".to_string(),
             serde_json::Value::String(rcn),
         );
+    }
+    // nodeSelector — gates which nodes the scheduler's NodeSelector predicate will bind
+    // this pod to. Without it, a pod that explicitly restricted itself to nodes with a
+    // specific label is silently treated as unrestricted and bound to any node — this
+    // exact gap is what "[sig-scheduling] SchedulerPredicates validates that NodeSelector
+    // is respected if not matching" caught: client-go clientsets (used by e2e test
+    // binaries, kube-scheduler, kube-controller-manager) send Pod creates as protobuf by
+    // default, unlike kubectl which sends JSON, so this decoder — not the scheduler — was
+    // dropping the field.
+    if !spec.node_selector.is_empty() {
+        let ns: serde_json::Map<String, serde_json::Value> = spec
+            .node_selector
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        spec_map.insert("nodeSelector".to_string(), serde_json::Value::Object(ns));
+    }
+    // affinity.nodeAffinity — same silent-drop mechanism and same conformance coverage as
+    // nodeSelector above ("... validates that NodeAffinity is respected if not matching").
+    // See gen_node_affinity_to_json for the podAffinity/podAntiAffinity caveat.
+    if let Some(affinity) = spec.affinity {
+        let mut am = serde_json::Map::new();
+        if let Some(na) = affinity.node_affinity {
+            am.insert("nodeAffinity".to_string(), gen_node_affinity_to_json(na));
+        }
+        spec_map.insert("affinity".to_string(), serde_json::Value::Object(am));
     }
     // tolerations — required for taint-based eviction and scheduling constraints.
     // Without this field, pods that tolerate taints are treated as if they have no
