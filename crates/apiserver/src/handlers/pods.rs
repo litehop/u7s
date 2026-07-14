@@ -1894,45 +1894,17 @@ pub fn apply_status_patch(
             result["status"] = patch_status.clone();
         }
     }
-    // Apply metadata changes from the patch body (labels, annotations, etc.).
-    // Identity fields and lifecycle-control fields are preserved from the stored object —
-    // the status subresource cannot change them.  In particular, `finalizers` and
+    // Apply metadata changes from the patch body (annotations, etc.) via the same guard the
+    // generic status handlers use: identity fields, lifecycle-control fields, and `labels`
+    // are preserved from the stored object rather than reimplementing the same protected-field
+    // list here, which had drifted out of sync and let a status-only merge patch smuggle in
+    // a `metadata.labels` change. In particular, `finalizers` and
     // `deletionTimestamp` must never be changed via /status: the kubelet's status patch
     // body reflects the pod the kubelet last saw (which may still carry the job-tracking
     // finalizer), so without this guard every kubelet status update would restore the
     // finalizer that KCM just removed, causing a livelock where the finalizer is never
     // permanently removed and pods stay Terminating forever.
-    if let Some(patch_meta) = patch.get("metadata") {
-        if patch_meta.is_object() {
-            // Immutable or lifecycle-control fields: capture current value (may be null)
-            // and restore unconditionally after merge so the patch cannot change them.
-            const PROTECTED: &[&str] = &[
-                "name",
-                "namespace",
-                "uid",
-                "creationTimestamp",
-                "resourceVersion",
-                "generation",
-                "finalizers",
-                "deletionTimestamp",
-            ];
-            let saved: Vec<(&str, serde_json::Value)> = PROTECTED
-                .iter()
-                .map(|&k| (k, result["metadata"][k].clone()))
-                .collect();
-            crate::patch::merge_patch(&mut result["metadata"], patch_meta);
-            for (k, v) in saved {
-                if v.is_null() {
-                    // Field was absent in stored object; remove it if the patch added it.
-                    if let Some(meta_obj) = result["metadata"].as_object_mut() {
-                        meta_obj.remove(k);
-                    }
-                } else {
-                    result["metadata"][k] = v;
-                }
-            }
-        }
-    }
+    crate::handlers::status::merge_incoming_metadata(&mut result, patch);
 
     // Enforce hostNetwork invariant: a pod sharing the host network namespace has
     // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets
@@ -9102,6 +9074,75 @@ mod handler_tests {
         );
     }
 
+    /// PATCH /status must reject a smuggled metadata.labels change while still applying a
+    /// legitimate status update. A caller granted only `pods/status` RBAC rights
+    /// (e.g. the kubelet) must not be able to rewrite a pod's labels through this endpoint —
+    /// labels gate Service/selector membership and scheduling, so this is a privilege-escalation
+    /// path, not just a data-integrity bug. This exercises the real HTTP handler end to end
+    /// (not just the pure merge function) so it fails if the guard is wired to the wrong call site.
+    #[tokio::test]
+    async fn patch_pod_status_does_not_persist_smuggled_labels() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "label-pod",
+            serde_json::json!({
+                "metadata": {
+                    "name": "label-pod",
+                    "namespace": "default",
+                    "resourceVersion": "1",
+                    "labels": { "app": "web" }
+                },
+                "status": { "phase": "Pending" }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({
+            "metadata": { "labels": { "app": "evil", "escalated": "true" } },
+            "status": { "phase": "Running" }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/label-pod/status")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /status must return 200"
+        );
+
+        let key = "/registry/pods/default/label-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["metadata"]["labels"],
+            serde_json::json!({ "app": "web" }),
+            "labels must be unchanged in the store after a /status PATCH — a status-only \
+             RBAC grant must not be able to rewrite labels that gate selector-based \
+             scheduling and Service membership"
+        );
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "a legitimate status field update must still be applied through the same request"
+        );
+    }
+
     /// PATCH /status with an unsupported content-type must return 415.
     #[tokio::test]
     async fn patch_pod_status_unsupported_content_type_returns_415() {
@@ -13019,6 +13060,39 @@ mod status_patch_metadata_tests {
             "status subresource must not restore finalizers from the patch body; \
              if it does, KCM's finalizer removal and kubelet status updates create a livelock \
              that keeps pods stuck Terminating forever"
+        );
+    }
+
+    /// PATCH /pods/{name}/status must NOT change metadata.labels even if the patch carries them.
+    /// Labels drive selector-based scheduling and service membership; a caller
+    /// holding only pods/status RBAC rights (e.g. the kubelet) must not be able to smuggle a
+    /// label change through a status merge-patch, the same guard merge_incoming_metadata already
+    /// enforces for the generic status handlers. Without this guard, an attacker with
+    /// only status-write rights could flip a pod's labels to escape a NetworkPolicy or Service
+    /// selector, or add/remove itself from a controller's label selector — a privilege escalation
+    /// beyond what the status subresource is meant to allow.
+    #[test]
+    fn apply_status_patch_does_not_change_labels() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod", "namespace": "default", "uid": "uid-1",
+                          "labels": { "app": "web" } },
+            "spec": {},
+            "status": {}
+        });
+        let patch = serde_json::json!({
+            "metadata": { "labels": { "app": "evil", "escalated": "true" } },
+            "status": { "phase": "Running" }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        assert_eq!(
+            result["metadata"]["labels"],
+            serde_json::json!({ "app": "web" }),
+            "labels must not change via a status patch; a status-only RBAC grant must not be \
+             able to rewrite labels that gate selector-based scheduling and service membership"
+        );
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "a legitimate status-only field must still be applied"
         );
     }
 
