@@ -456,7 +456,9 @@ fn validate_cr_schema(
     schemas.validate(obj, idx).map_err(|e| {
         Status::unprocessable_entity(format!(
             "CR schema validation failed: {}",
-            enum_violation_message(&e, obj).unwrap_or_else(|| e.to_string())
+            enum_violation_message(&e, obj)
+                .or_else(|| required_violation_message(&e))
+                .unwrap_or_else(|| e.to_string())
         ))
     })
 }
@@ -487,6 +489,46 @@ fn enum_violation_message(e: &boon::ValidationError, obj: &serde_json::Value) ->
     e.causes
         .iter()
         .find_map(|cause| enum_violation_message(cause, obj))
+}
+
+/// Depth-first search for a `required` keyword violation in a boon validation-error tree,
+/// rendered in the k8s `field.Error` "Required value" phrasing (`<path>: Required value`)
+/// instead of boon's own wording (`missing properties 'name'`). kubectl and the upstream
+/// CRD-with-validation conformance test match on this exact phrasing (or the legacy
+/// client-side-validation wording `missing required field "name"`), so a differently-worded
+/// rejection is treated as "did not reject" even though the CR was in fact rejected.
+fn required_violation_message(e: &boon::ValidationError) -> Option<String> {
+    if let boon::ErrorKind::Required { want } = &e.kind {
+        let field = want.first()?;
+        let base = instance_location_as_field_path(&e.instance_location);
+        let path = if base.is_empty() {
+            (*field).to_string()
+        } else {
+            format!("{base}.{field}")
+        };
+        return Some(format!("{path}: Required value"));
+    }
+    e.causes.iter().find_map(required_violation_message)
+}
+
+/// Renders a boon `InstanceLocation` as a k8s `field.Path`-style dotted/bracketed path
+/// (`spec.bars[0]`) rather than boon's JSON-pointer form (`/spec/bars/0`).
+fn instance_location_as_field_path(loc: &boon::InstanceLocation) -> String {
+    let mut path = String::new();
+    for tok in &loc.tokens {
+        match tok {
+            boon::InstanceToken::Prop(p) => {
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(p);
+            }
+            boon::InstanceToken::Item(i) => {
+                path.push_str(&format!("[{i}]"));
+            }
+        }
+    }
+    path
 }
 
 /// Follows a boon `InstanceLocation`'s JSON-pointer tokens into `obj` to recover the value
@@ -4306,6 +4348,43 @@ mod tests {
         assert!(
             msg.contains(r#""Great""#) && msg.contains(r#""Down""#),
             "message must list the supported values so clients can see what was expected (got: {msg})"
+        );
+    }
+
+    // required-field violation nested inside an array item must render in the k8s
+    // `field.Error` "Required value" phrasing (`spec.bars[0].name: Required value`), not
+    // boon's own wording (`missing properties 'name'`). The upstream CRD-with-validation-
+    // schema conformance test matches the rejection error string against exactly this
+    // phrasing (or the legacy `missing required field "name"` wording) — a differently-
+    // worded (even if equally-rejecting) message makes that check treat the CR as accepted.
+    #[test]
+    fn schema_required_violation_in_array_item_uses_upstream_required_value_phrasing() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "bars": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["name"],
+                                "properties": {
+                                    "name": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let value = serde_json::json!({ "spec": { "bars": [{ "age": "10" }] } });
+        let err = check_schema(&value, schema).unwrap_err();
+        let msg = &err.1.message;
+        assert!(
+            msg.contains("spec.bars[0].name: Required value"),
+            "message must use upstream's field.Error phrasing so kubectl/conformance error-string matches succeed (got: {msg})"
         );
     }
 
