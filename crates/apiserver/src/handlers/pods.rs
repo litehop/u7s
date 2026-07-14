@@ -468,6 +468,10 @@ pub async fn create_pod<S: Store>(
         crate::limit_range::apply_limit_ranges(&state, obj.body, ns.as_str(), "pods").await?;
 
     // ResourceQuota: ensure pod count does not exceed hard limits, respecting scope selectors.
+    // Held across check-then-write: without this, concurrent pod creates in the same
+    // namespace (e.g. a ReplicationController's burst replica creation) can each observe
+    // pre-write usage, all pass the check, and collectively exceed the quota.
+    let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
     crate::quota::check_resource_quota(&state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
 
     obj.body["status"]["qosClass"] =
@@ -12752,6 +12756,106 @@ mod admission_tests {
             v["metadata"]["labels"]["admitted"], "yes",
             "mutating webhook label must be present after replace_pod — \
              without the fix, replace_pod bypassed admission and the label was never injected"
+        );
+    }
+
+    /// Concurrent create_pod calls in a quota-limited namespace must never let more pods
+    /// through than the hard limit allows.
+    ///
+    /// This mirrors what the real kube-controller-manager's ReplicationController
+    /// controller does: it creates all missing replicas concurrently in one burst
+    /// (`slowStartBatch`). Without a lock spanning the quota check and the store write,
+    /// each concurrent create lists pre-write usage, all observe "0 of 2 used", and all
+    /// pass — collectively exceeding the quota. When that happens, KCM never sees a
+    /// rejected create and so never sets the RC's `ReplicaFailure` status condition,
+    /// which is exactly the symptom the conformance test
+    /// "should surface a failure condition on a common issue like exceeded quota" caught.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_pod_never_exceeds_resource_quota() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "pod-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "2" } }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/pod-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let make_body = |name: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+                })
+                .to_string(),
+            )
+        };
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            h
+        };
+
+        // Three concurrent creates against a quota that only allows 2 pods.
+        let (r1, r2, r3) = tokio::join!(
+            create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers.clone(),
+                make_body("pod-a"),
+            ),
+            create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers.clone(),
+                make_body("pod-b"),
+            ),
+            create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers.clone(),
+                make_body("pod-c"),
+            ),
+        );
+
+        let ok_count = [&r1, &r2, &r3].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count, 2,
+            "exactly 2 of 3 concurrent creates must succeed against a pods=2 quota — \
+             without the per-namespace admission lock, a TOCTOU race lets all 3 through, \
+             which is why KCM's RC controller never saw a create rejected and never set \
+             the ReplicaFailure condition"
+        );
+
+        let prefix = "/registry/pods/default/";
+        let stored = store.list(prefix, u7s_store::ListOptions::default()).await;
+        assert_eq!(
+            stored.unwrap().items.len(),
+            2,
+            "the store must contain exactly 2 pods — a quota is a hard limit, not \
+             advisory, regardless of how many creates race for it"
         );
     }
 }
