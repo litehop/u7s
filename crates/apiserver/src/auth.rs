@@ -58,6 +58,29 @@ struct SaClaims {
     jti: Option<String>,
     /// Subject — format: "system:serviceaccount:<namespace>:<name>"
     sub: String,
+    /// The `kubernetes.io` private claim carrying pod/node binding info for
+    /// bound (projected) service-account tokens. Absent on legacy tokens.
+    #[serde(rename = "kubernetes.io", default)]
+    kubernetes_io: KubernetesIoClaims,
+}
+
+/// Bound-object claims embedded by `handlers::tokens::create_token` under the
+/// `kubernetes.io` claim. Both fields are `None` for legacy (unbound) tokens.
+#[derive(Debug, Deserialize, Default)]
+struct KubernetesIoClaims {
+    #[serde(default)]
+    pod: Option<ClaimRef>,
+    #[serde(default)]
+    node: Option<ClaimRef>,
+}
+
+/// A `{name, uid}` reference embedded in a bound SA token's `kubernetes.io` claim.
+#[derive(Debug, Deserialize)]
+struct ClaimRef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    uid: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -391,16 +414,45 @@ pub(crate) fn try_verify_sa_jwt(
             // Surface the token's unique ID as authentication.kubernetes.io/credential-id
             // so that TokenReview callers can verify which specific token was used.
             // Upstream format: "JTI=" + the jti claim value.
-            let extra = if let Some(jti) = jti {
-                let mut m = HashMap::new();
-                m.insert(
+            let mut extra = HashMap::new();
+            if let Some(jti) = jti {
+                extra.insert(
                     "authentication.kubernetes.io/credential-id".to_owned(),
                     vec![format!("JTI={jti}")],
                 );
-                m
-            } else {
-                HashMap::new()
-            };
+            }
+            // Bound (projected) SA tokens carry pod/node binding info under the
+            // kubernetes.io claim (see handlers::tokens::create_token). Conformance
+            // ([sig-auth] ServiceAccounts "should mount an API token into pods")
+            // calls TokenReview on such a token and asserts these extra entries are
+            // present with values matching the actual bound pod/node — omit them
+            // entirely for legacy tokens that carry no binding rather than fabricate.
+            if let Some(pod) = data.claims.kubernetes_io.pod {
+                if !pod.name.is_empty() && !pod.uid.is_empty() {
+                    extra.insert(
+                        "authentication.kubernetes.io/pod-name".to_owned(),
+                        vec![pod.name],
+                    );
+                    extra.insert(
+                        "authentication.kubernetes.io/pod-uid".to_owned(),
+                        vec![pod.uid],
+                    );
+                }
+            }
+            if let Some(node) = data.claims.kubernetes_io.node {
+                if !node.name.is_empty() {
+                    extra.insert(
+                        "authentication.kubernetes.io/node-name".to_owned(),
+                        vec![node.name],
+                    );
+                    if !node.uid.is_empty() {
+                        extra.insert(
+                            "authentication.kubernetes.io/node-uid".to_owned(),
+                            vec![node.uid],
+                        );
+                    }
+                }
+            }
             Some(UserInfo {
                 username: sub,
                 uid: String::new(),
@@ -1556,6 +1608,93 @@ mod tests {
             result.is_none(),
             "JWT with malformed sub (missing name segment) must be rejected, \
              not silently accepted with incomplete groups"
+        );
+    }
+
+    /// TokenReview on a bound (projected) SA token must surface pod/node binding
+    /// info as extra fields, matching what conformance's "should mount an API
+    /// token into pods" test asserts via TokenReview.Status.User.Extra. Before
+    /// this fix, `kubernetes.io.pod`/`kubernetes.io.node` claims were decoded
+    /// nowhere, so bound tokens looked identical to legacy tokens to any caller.
+    #[test]
+    fn bound_sa_jwt_extra_includes_pod_and_node_info() {
+        let (enc, dec) = test_rsa_keypair();
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "jti": "bound-jti-1",
+            "iss": "https://kubernetes.default.svc",
+            "sub": "system:serviceaccount:default:my-sa",
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + 3600,
+            "kubernetes.io": {
+                "namespace": "default",
+                "serviceaccount": {"name": "my-sa", "uid": "sa-uid-1"},
+                "pod": {"name": "my-pod", "uid": "pod-uid-1"},
+                "node": {"name": "node-a", "uid": "node-uid-1"},
+            },
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+
+        let user = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new())
+            .expect("bound SA JWT with valid signature must authenticate");
+
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/pod-name"),
+            Some(&vec!["my-pod".to_owned()]),
+            "pod-name extra must match the bound pod claim — conformance TokenReview \
+             asserts this exact key/value"
+        );
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/pod-uid"),
+            Some(&vec!["pod-uid-1".to_owned()]),
+            "pod-uid extra must match the bound pod claim"
+        );
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/node-name"),
+            Some(&vec!["node-a".to_owned()]),
+            "node-name extra must match the bound node claim"
+        );
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/node-uid"),
+            Some(&vec!["node-uid-1".to_owned()]),
+            "node-uid extra must match the bound node claim"
+        );
+    }
+
+    /// A legacy (unbound) SA token — no `kubernetes.io.pod`/`node` claims — must
+    /// NOT have pod/node extra fields fabricated. Only the credential-id extra
+    /// (from `jti`) may be present; inventing pod/node info for a token that
+    /// never carried it would let TokenReview lie about binding provenance.
+    #[test]
+    fn unbound_sa_jwt_extra_omits_pod_and_node_info() {
+        let (enc, dec) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let user = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new())
+            .expect("valid unbound SA JWT must authenticate");
+        assert!(
+            !user
+                .extra
+                .contains_key("authentication.kubernetes.io/pod-name"),
+            "unbound token must not fabricate a pod-name extra"
+        );
+        assert!(
+            !user
+                .extra
+                .contains_key("authentication.kubernetes.io/pod-uid"),
+            "unbound token must not fabricate a pod-uid extra"
+        );
+        assert!(
+            !user
+                .extra
+                .contains_key("authentication.kubernetes.io/node-name"),
+            "unbound token must not fabricate a node-name extra"
         );
     }
 
