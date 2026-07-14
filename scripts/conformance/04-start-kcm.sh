@@ -40,9 +40,14 @@ if ! command -v limactl &>/dev/null; then
   exit 1
 fi
 
-# Kill any stale kube-controller-manager from a previous run.
+# Kill any stale kube-controller-manager from a previous run. The real process
+# is launched via an absolute cached-binary path (e.g.
+# /home/.../kube-controller-manager-1.36.2-linux-arm64), so an anchored
+# '^kube-controller-manager' pattern never matches — match the versioned
+# binary basename instead (the trailing [0-9] also keeps this guard's own
+# quoted pattern text below from matching itself).
 limactl shell "$VM_NAME" bash -c \
-  "if pgrep -f '^kube-controller-manager' >/dev/null 2>&1; then echo 'WARNING: kube-controller-manager already running — killing and restarting' >&2; pkill -f '^kube-controller-manager' 2>/dev/null || true; sleep 1; fi"
+  "if pgrep -f 'kube-controller-manager-[0-9]' >/dev/null 2>&1; then echo 'WARNING: kube-controller-manager already running — killing and restarting' >&2; pkill -f 'kube-controller-manager-[0-9]' 2>/dev/null || true; sleep 1; fi"
 
 # Run setup foreground (download, cert conversion, kubeconfig rewrite),
 # then background only the final binary launch.
