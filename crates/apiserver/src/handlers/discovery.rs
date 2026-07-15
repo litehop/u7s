@@ -75,7 +75,8 @@ pub async fn api_versions<S: Store>(
         // /api returns only the core group (name="") in the aggregated discovery list.
         // client-go's GroupsAndMaybeResources() handles /api and /apis separately;
         // include_core=true here, and /apis uses include_core=false to avoid duplicates.
-        let body = build_aggregated_discovery(&state, version, true).await;
+        let authorization = headers.get(axum::http::header::AUTHORIZATION);
+        let body = build_aggregated_discovery(&state, version, true, authorization).await;
         let items = body["items"].as_array().cloned().unwrap_or_default();
         let resource_version = body["metadata"]["resourceVersion"].clone();
         let core_only = items
@@ -146,7 +147,8 @@ pub async fn api_group_list<S: Store>(
         // /apis returns only non-core groups (include_core=false).
         // The core group is returned by /api; client-go merges both separately.
         // Including core here would cause duplicate kind registrations (Namespace, Pod, etc.).
-        let body = build_aggregated_discovery(&state, version, false).await;
+        let authorization = headers.get(axum::http::header::AUTHORIZATION);
+        let body = build_aggregated_discovery(&state, version, false, authorization).await;
         return (
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -212,6 +214,18 @@ pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGr
         }
     }
 
+    // Aggregated groups (APIService-backed): a group already covered by a built-in or CRD
+    // group above is skipped -- u7s never creates an APIService for either, so in practice
+    // this only ever adds genuinely external groups like wardle.example.com.
+    let seen: std::collections::HashSet<String> = groups.iter().map(|g| g.name.clone()).collect();
+    for (group, preferred, served) in super::aggregation::list_apiservice_groups(state).await {
+        if seen.contains(group.as_str()) {
+            continue;
+        }
+        let served_refs: Vec<&str> = served.iter().map(String::as_str).collect();
+        groups.push(make_group(&group, &preferred, &served_refs));
+    }
+
     APIGroupList {
         kind: "APIGroupList",
         api_version: "v1",
@@ -267,10 +281,15 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 /// When `include_core` is false, only non-core groups are included — this is used by `/apis`
 /// with aggregated Accept. client-go's GroupsAndMaybeResources() merges /api (core) and /apis
 /// (non-core) separately; including core in /apis causes duplicate Namespace/Pod registrations.
+///
+/// `authorization` is the caller's own bearer token (forwarded to APIService backends for
+/// their live discovery fetch — see `discovery_resources_for_apiservice`'s doc for why an
+/// aggregated group would otherwise silently show zero resources).
 pub(crate) async fn build_aggregated_discovery<S: Store>(
     state: &AppState<S>,
     discovery_version: &str,
     include_core: bool,
+    authorization: Option<&axum::http::HeaderValue>,
 ) -> serde_json::Value {
     // Collect all groups+versions (same logic as api_group_list_inner).
     let group_list = api_group_list_inner(state).await;
@@ -301,7 +320,37 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
                 api_resources_to_discovery_resources(&rl)
             } else {
                 // Dynamic group (CRD-backed): look up resources from the store.
-                crd_group_resources(state, group.name.as_str(), gv.version.as_str()).await
+                let crd_resources =
+                    crd_group_resources(state, group.name.as_str(), gv.version.as_str()).await;
+                let crd_is_empty = crd_resources.as_array().is_none_or(|a| a.is_empty());
+                if !crd_is_empty {
+                    crd_resources
+                } else {
+                    // Not a CRD either: try an APIService-backed (aggregated) group. The
+                    // backend is the only source of truth for what it actually serves, so
+                    // this fetches its live discovery document rather than guessing.
+                    let apiservice = super::aggregation::find_apiservice(
+                        state,
+                        group.name.as_str(),
+                        gv.version.as_str(),
+                    )
+                    .await;
+                    match apiservice {
+                        Some(svc) => {
+                            match super::aggregation::discovery_resources_for_apiservice(
+                                state,
+                                &svc,
+                                authorization,
+                            )
+                            .await
+                            {
+                                Some(rl) => api_resources_to_discovery_resources(&rl),
+                                None => crd_resources,
+                            }
+                        }
+                        None => crd_resources,
+                    }
+                }
             };
             versions_arr.push(serde_json::json!({
                 "version": gv.version,
@@ -456,13 +505,17 @@ fn api_v1_resource_list_value() -> serde_json::Value {
 }
 
 /// Handler for `GET /discovery/v2` — always returns the aggregated discovery list.
-pub async fn aggregated_discovery_v2<S: Store>(State(state): State<AppState<S>>) -> Response {
+pub async fn aggregated_discovery_v2<S: Store>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    let authorization = headers.get(axum::http::header::AUTHORIZATION);
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "application/json;g=apidiscovery.k8s.io;v=v2beta1",
         )],
-        Json(build_aggregated_discovery(&state, "v2beta1", true).await),
+        Json(build_aggregated_discovery(&state, "v2beta1", true, authorization).await),
     )
         .into_response()
 }

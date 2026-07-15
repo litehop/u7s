@@ -1,3 +1,4 @@
+pub mod aggregation;
 pub mod approval;
 pub mod authorization;
 pub mod core;
