@@ -31,6 +31,13 @@ don't collide. Always pass `--kubelet-port <KUBELET_PORT>` to `run-all.sh` and
 scripts/worker-vm.sh start <VM> 127.0.0.1 <KUBELET_PORT>
 ```
 
+**Never `limactl stop <VM>` when you finish.** The mayor owns VM lifecycle across the
+whole session and reassigns your VM to the next worker once you're done — stopping it
+forces an unnecessary ~45s reprovision cost on whoever gets it next. Clean up only what
+you created: delete your own sonobuoy run if you started one (see the delete command
+later in this doc), leave the apiserver/kubelet/KCM stack running, and leave the VM
+itself running.
+
 ---
 
 ## Primary path — use run-all.sh
