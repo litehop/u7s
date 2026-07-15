@@ -580,6 +580,10 @@ struct RuleWithOperations {
     resources: Vec<String>,
     #[serde(default)]
     operations: Vec<String>,
+    /// Upstream `Rule.Scope`: "Namespaced", "Cluster", "*", or absent. Absent/"*" matches
+    /// both namespaced and cluster-scoped resources; see `matches_rule_typed`.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -642,23 +646,27 @@ pub fn matches_rule(
 /// matchConstraints/matchResources rules (`matches_match_constraints` and its caller)
 /// only ever exist as raw `Value` — VAP objects are never parsed into a typed struct.
 ///
-/// `RuleWithOperations` has no `scope` field (unlike upstream's `Rule.Scope`), so this
-/// never filters by scope. That matches current behavior: the `to_value(rule)` round
-/// trip this replaces never produced a "scope" key either, since the field was never
-/// captured by this struct in the first place.
+/// Scope matching mirrors `matches_rule` exactly: "Namespaced" only matches when
+/// `namespace` is `Some`, "Cluster" only when it's `None`, "*"/absent matches both.
 fn matches_rule_typed(
     rule: &RuleWithOperations,
     group: &str,
     version: &str,
     resource: &str,
+    namespace: Option<&str>,
     operation: &str,
 ) -> bool {
     let group_match = rule.api_groups.iter().any(|g| g == "*" || g == group);
     let version_match = rule.api_versions.iter().any(|v| v == "*" || v == version);
     let resource_match = rule.resources.iter().any(|r| r == "*" || r == resource);
     let operation_match = rule.operations.iter().any(|o| o == "*" || o == operation);
+    let scope_match = match rule.scope.as_deref().unwrap_or("*") {
+        "Namespaced" => namespace.is_some(),
+        "Cluster" => namespace.is_none(),
+        _ => true,
+    };
 
-    group_match && version_match && resource_match && operation_match
+    group_match && version_match && resource_match && operation_match && scope_match
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +1018,14 @@ async fn invoke_mutating_webhook<S: Store>(
     // Check if this webhook matches any rule.
     if !webhook.rules.is_empty() {
         let has_match = webhook.rules.iter().any(|rule| {
-            matches_rule_typed(rule, ctx.group, ctx.version, ctx.resource, ctx.operation)
+            matches_rule_typed(
+                rule,
+                ctx.group,
+                ctx.version,
+                ctx.resource,
+                ctx.namespace,
+                ctx.operation,
+            )
         });
         if !has_match {
             return Ok((object.clone(), false));
@@ -2916,7 +2931,14 @@ pub async fn run_validating_webhooks<S: Store>(
         // Check rule match.
         if !webhook.rules.is_empty() {
             let has_match = webhook.rules.iter().any(|rule| {
-                matches_rule_typed(rule, ctx.group, ctx.version, ctx.resource, ctx.operation)
+                matches_rule_typed(
+                    rule,
+                    ctx.group,
+                    ctx.version,
+                    ctx.resource,
+                    ctx.namespace,
+                    ctx.operation,
+                )
             });
             if !has_match {
                 continue;
@@ -3482,9 +3504,8 @@ mod tests {
     //
     // matches_rule_typed replaces the per-rule serde_json::to_value(rule) round trip on the
     // admission hot path (invoke_mutating_webhook / run_validating_webhooks). These mirror
-    // the matches_rule tests above (minus scope, which RuleWithOperations does not carry —
-    // see matches_rule_typed's doc comment) to prove the typed fast path agrees with the
-    // Value-based one it replaces.
+    // the matches_rule tests above, including scope, to prove the typed fast path agrees
+    // with the Value-based one it replaces.
 
     fn make_rule_typed(
         group: &str,
@@ -3497,6 +3518,7 @@ mod tests {
             api_versions: vec![version.to_string()],
             resources: vec![resource.to_string()],
             operations: vec![operation.to_string()],
+            scope: None,
         }
     }
 
@@ -3510,13 +3532,21 @@ mod tests {
             api_versions: vec!["*".to_string()],
             resources: vec!["*".to_string()],
             operations: vec!["*".to_string()],
+            scope: None,
         };
         assert!(
-            matches_rule_typed(&rule, "apps", "v1", "deployments", "CREATE"),
+            matches_rule_typed(
+                &rule,
+                "apps",
+                "v1",
+                "deployments",
+                Some("default"),
+                "CREATE"
+            ),
             "wildcard rule must match any resource"
         );
         assert!(
-            matches_rule_typed(&rule, "", "v1", "pods", "UPDATE"),
+            matches_rule_typed(&rule, "", "v1", "pods", None, "UPDATE"),
             "wildcard rule must match core group"
         );
     }
@@ -3527,11 +3557,18 @@ mod tests {
     fn matches_rule_typed_specific_resource_matches_only_that_resource() {
         let rule = make_rule_typed("apps", "v1", "deployments", "CREATE");
         assert!(
-            matches_rule_typed(&rule, "apps", "v1", "deployments", "CREATE"),
+            matches_rule_typed(
+                &rule,
+                "apps",
+                "v1",
+                "deployments",
+                Some("default"),
+                "CREATE"
+            ),
             "specific resource rule must match the named resource"
         );
         assert!(
-            !matches_rule_typed(&rule, "apps", "v1", "pods", "CREATE"),
+            !matches_rule_typed(&rule, "apps", "v1", "pods", Some("default"), "CREATE"),
             "specific resource rule must not match a different resource"
         );
     }
@@ -3542,7 +3579,14 @@ mod tests {
     fn matches_rule_typed_operation_mismatch_does_not_match() {
         let rule = make_rule_typed("apps", "v1", "deployments", "CREATE");
         assert!(
-            !matches_rule_typed(&rule, "apps", "v1", "deployments", "UPDATE"),
+            !matches_rule_typed(
+                &rule,
+                "apps",
+                "v1",
+                "deployments",
+                Some("default"),
+                "UPDATE"
+            ),
             "rule for CREATE must not match UPDATE operation"
         );
     }
@@ -3552,7 +3596,7 @@ mod tests {
     fn matches_rule_typed_group_mismatch_does_not_match() {
         let rule = make_rule_typed("apps", "v1", "pods", "CREATE");
         assert!(
-            !matches_rule_typed(&rule, "", "v1", "pods", "CREATE"),
+            !matches_rule_typed(&rule, "", "v1", "pods", None, "CREATE"),
             "rule for group 'apps' must not match core group ''"
         );
     }
@@ -3566,48 +3610,121 @@ mod tests {
             api_versions: vec![],
             resources: vec![],
             operations: vec![],
+            scope: None,
         };
         assert!(
-            !matches_rule_typed(&rule, "apps", "v1", "deployments", "CREATE"),
+            !matches_rule_typed(
+                &rule,
+                "apps",
+                "v1",
+                "deployments",
+                Some("default"),
+                "CREATE"
+            ),
             "empty lists must not match anything"
         );
     }
 
+    /// A rule with scope "Namespaced" must not match a cluster-scoped resource — same
+    /// guarantee as matches_rule_scope_namespaced_rejects_cluster_scoped_request, but
+    /// exercised on the typed path that actually runs on every admission-gated request.
+    /// Without this, a webhook registered with `scope: Namespaced` would fire on
+    /// cluster-scoped resources like Nodes, contrary to the admin's intent.
+    #[test]
+    fn matches_rule_typed_scope_namespaced_rejects_cluster_scoped_request() {
+        let mut rule = make_rule_typed("*", "*", "*", "*");
+        rule.scope = Some("Namespaced".to_string());
+        assert!(
+            !matches_rule_typed(&rule, "", "v1", "nodes", None, "CREATE"),
+            "scope=Namespaced must not match a cluster-scoped resource (namespace=None)"
+        );
+        assert!(
+            matches_rule_typed(&rule, "", "v1", "pods", Some("default"), "CREATE"),
+            "scope=Namespaced must match a namespaced resource (namespace=Some)"
+        );
+    }
+
+    /// A rule with scope "Cluster" must not match a namespaced resource — the inverse of
+    /// the Namespaced case, exercised on the typed path.
+    #[test]
+    fn matches_rule_typed_scope_cluster_rejects_namespaced_request() {
+        let mut rule = make_rule_typed("*", "*", "*", "*");
+        rule.scope = Some("Cluster".to_string());
+        assert!(
+            !matches_rule_typed(&rule, "", "v1", "pods", Some("default"), "CREATE"),
+            "scope=Cluster must not match a namespaced resource (namespace=Some)"
+        );
+        assert!(
+            matches_rule_typed(&rule, "", "v1", "nodes", None, "CREATE"),
+            "scope=Cluster must match a cluster-scoped resource (namespace=None)"
+        );
+    }
+
+    /// A rule with scope "*" (or absent, the common case) must match both namespaced and
+    /// cluster-scoped resources on the typed path.
+    #[test]
+    fn matches_rule_typed_scope_wildcard_matches_both_namespaced_and_cluster() {
+        let mut rule_star = make_rule_typed("*", "*", "*", "*");
+        rule_star.scope = Some("*".to_string());
+        let rule_absent = make_rule_typed("*", "*", "*", "*");
+        for (label, rule) in [("scope=*", &rule_star), ("scope=absent", &rule_absent)] {
+            assert!(
+                matches_rule_typed(rule, "", "v1", "nodes", None, "CREATE"),
+                "{label}: must match cluster-scoped resource"
+            );
+            assert!(
+                matches_rule_typed(rule, "", "v1", "pods", Some("default"), "CREATE"),
+                "{label}: must match namespaced resource"
+            );
+        }
+    }
+
     /// matches_rule_typed must agree with matches_rule (the function it replaces on the
-    /// hot path) for every equivalent group/version/resource/operation rule and request.
+    /// hot path) for every equivalent group/version/resource/operation/scope rule and
+    /// request/namespace pair.
     ///
     /// Why this matters: this is the correctness claim behind eliminating the per-rule
     /// serde_json::to_value(rule) call — the typed fast path must be a drop-in behavioral
     /// replacement, not just a faster one. A divergence here means some webhook would
     /// start firing (or stop firing) purely because of the internal representation change.
+    /// Scope is included in the matrix because a prior version of this typed path silently
+    /// dropped scope enforcement entirely — this is exactly the drift this test exists to catch.
     #[test]
     fn matches_rule_typed_agrees_with_value_based_matches_rule() {
-        let cases: &[(&str, &str, &str, &str)] = &[
-            ("*", "*", "*", "*"),
-            ("apps", "v1", "deployments", "CREATE"),
-            ("apps", "v1", "deployments", "UPDATE"),
-            ("", "v1", "pods", "CREATE"),
+        let cases: &[(&str, &str, &str, &str, Option<&str>)] = &[
+            ("*", "*", "*", "*", None),
+            ("apps", "v1", "deployments", "CREATE", Some("Namespaced")),
+            ("", "v1", "nodes", "CREATE", Some("Cluster")),
+            ("", "v1", "nodes", "CREATE", Some("*")),
         ];
-        let requests: &[(&str, &str, &str, &str)] = &[
-            ("apps", "v1", "deployments", "CREATE"),
-            ("apps", "v1", "pods", "CREATE"),
-            ("", "v1", "pods", "CREATE"),
-            ("batch", "v1", "jobs", "DELETE"),
+        // Every scoped case above is checked against BOTH a namespaced and a
+        // cluster-scoped request for its exact group/version/resource/operation — this is
+        // load-bearing: it's what makes the scope check the deciding factor for at least
+        // one (case, request) pair, so a matcher that silently ignores scope (matches
+        // regardless of namespace) diverges from one that enforces it and this test fails.
+        let requests: &[(&str, &str, &str, &str, Option<&str>)] = &[
+            ("apps", "v1", "deployments", "CREATE", Some("default")),
+            ("apps", "v1", "deployments", "CREATE", None),
+            ("", "v1", "nodes", "CREATE", Some("default")),
+            ("", "v1", "nodes", "CREATE", None),
+            ("batch", "v1", "jobs", "DELETE", None),
         ];
-        for &(rg, rv, rr, ro) in cases {
-            let value_rule = make_rule(rg, rv, rr, ro);
-            let typed_rule = make_rule_typed(rg, rv, rr, ro);
-            for &(g, v, r, o) in requests {
-                // namespace is irrelevant here: RuleWithOperations carries no scope field,
-                // so pass Some(..) to matches_rule to pin scope_match to "always true"
-                // (scope absent ⇒ matches both), matching matches_rule_typed's behavior.
-                let expected = matches_rule(&value_rule, g, v, r, Some("default"), o);
-                let actual = matches_rule_typed(&typed_rule, g, v, r, o);
+        for &(rg, rv, rr, ro, rs) in cases {
+            let mut value_rule = make_rule(rg, rv, rr, ro);
+            let mut typed_rule = make_rule_typed(rg, rv, rr, ro);
+            if let Some(s) = rs {
+                value_rule["scope"] = json!(s);
+                typed_rule.scope = Some(s.to_string());
+            }
+            for &(g, v, r, o, ns) in requests {
+                let expected = matches_rule(&value_rule, g, v, r, ns, o);
+                let actual = matches_rule_typed(&typed_rule, g, v, r, ns, o);
                 assert_eq!(
                     actual, expected,
-                    "matches_rule_typed({rg}/{rv}/{rr}/{ro} rule, {g}/{v}/{r}/{o}) = {actual}, \
-                     but matches_rule (the function it replaces) = {expected} — the typed fast \
-                     path must never disagree with the Value-based path it replaces"
+                    "matches_rule_typed({rg}/{rv}/{rr}/{ro} scope={rs:?} rule, \
+                     {g}/{v}/{r}/{o} ns={ns:?}) = {actual}, but matches_rule (the function \
+                     it replaces) = {expected} — the typed fast path must never disagree \
+                     with the Value-based path it replaces, including on scope"
                 );
             }
         }
@@ -3643,6 +3760,43 @@ mod tests {
             vec!["a1.example.com", "a2.example.com", "b1.example.com"],
             "entries must be flattened in config-list order, and the unparseable config in \
              between must be skipped rather than dropping config_b's entries too"
+        );
+    }
+
+    /// A rule's `scope` field (e.g. "Namespaced") must survive the real deserialization
+    /// path — JSON config -> WebhookConfig -> WebhookEntry -> RuleWithOperations.
+    ///
+    /// Why this matters: RuleWithOperations previously had no `scope` field at all, so
+    /// serde silently dropped a user-specified `scope: Namespaced`/`Cluster` on every rule
+    /// (no deny_unknown_fields to catch it). A webhook admin configuring a Namespaced-only
+    /// rule got no error and no enforcement — the rule silently behaved as if scope were
+    /// "*". This fails on revert of the scope field itself, independent of whether
+    /// matches_rule_typed's own scope logic is correct.
+    #[test]
+    fn parse_webhook_entries_preserves_rule_scope_field() {
+        let config = json!({
+            "webhooks": [{
+                "name": "scoped.example.com",
+                "clientConfig": {"url": "https://example.com"},
+                "rules": [{
+                    "apiGroups": ["*"],
+                    "apiVersions": ["*"],
+                    "resources": ["*"],
+                    "operations": ["*"],
+                    "scope": "Namespaced"
+                }]
+            }]
+        });
+
+        let entries = parse_webhook_entries(vec![config]);
+
+        assert_eq!(entries.len(), 1, "must parse exactly one webhook entry");
+        assert_eq!(
+            entries[0].rules[0].scope.as_deref(),
+            Some("Namespaced"),
+            "a rule's scope field must survive real JSON deserialization instead of being \
+             silently dropped, or scope enforcement can never take effect for actual \
+             MutatingWebhookConfiguration/ValidatingWebhookConfiguration objects"
         );
     }
 
@@ -9587,6 +9741,7 @@ mod tests {
                 api_versions: vec!["v1".to_string()],
                 resources: vec!["jobs".to_string()],
                 operations: vec!["CREATE".to_string()],
+                scope: None,
             }],
             failure_policy: default_failure_policy(),
             reinvocation_policy: String::new(),
@@ -9905,6 +10060,96 @@ mod tests {
             err.1.message.contains("denied from warm cache"),
             "denial message must come from the webhook served out of the warm cache, got: {}",
             err.1.message
+        );
+    }
+
+    /// A ValidatingWebhookConfiguration rule with `scope: Namespaced` must not fire for a
+    /// cluster-scoped resource (a Node create) and must fire for a namespaced resource (a
+    /// Pod create) — driven entirely through the real store -> WebhookConfig ->
+    /// WebhookEntry -> RuleWithOperations deserialization path, not a hand-built
+    /// RuleWithOperations like the matches_rule_typed unit tests use.
+    ///
+    /// Why this matters: RuleWithOperations previously had no `scope` field, so a
+    /// user-configured `scope: Namespaced` was silently dropped at parse time and the
+    /// webhook fired unconditionally on both namespaced and cluster-scoped requests. The
+    /// clientConfig URL here is unreachable with failurePolicy: Fail, so if scope
+    /// filtering doesn't actually reach this deserialize-then-dispatch path, the
+    /// cluster-scoped request below would also try to dial the webhook and fail closed —
+    /// this test fails on revert of either the scope field or its enforcement in
+    /// matches_rule_typed, even though the isolated matches_rule_typed unit tests above
+    /// would still pass (they bypass real deserialization entirely).
+    #[tokio::test]
+    async fn validating_webhook_scope_namespaced_enforced_through_real_deserialization() {
+        let state = make_state();
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "namespaced-only"},
+            "webhooks": [{
+                "name": "namespaced-only.example.com",
+                "clientConfig": { "url": "https://127.0.0.1:1" },
+                "rules": [{
+                    "apiGroups": ["*"],
+                    "apiVersions": ["*"],
+                    "resources": ["*"],
+                    "operations": ["*"],
+                    "scope": "Namespaced"
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/namespaced-only",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-1"}
+        });
+        let cluster_scoped_ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "nodes",
+            name: "worker-1",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &node, None, &cluster_scoped_ctx).await;
+        assert!(
+            result.is_ok(),
+            "scope=Namespaced rule must not match a cluster-scoped Node create, so the \
+             (unreachable, failurePolicy=Fail) webhook must never be dialed: {result:?}"
+        );
+
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web-1", "namespace": "default"}
+        });
+        let namespaced_ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "web-1",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &pod, None, &namespaced_ctx).await;
+        assert!(
+            result.is_err(),
+            "scope=Namespaced rule must match a namespaced Pod create, so the unreachable \
+             webhook must be dialed and, with failurePolicy=Fail, deny the request"
         );
     }
 }
