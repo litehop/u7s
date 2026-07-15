@@ -41,8 +41,19 @@ fi
 # namespaces that get stuck terminating or are simply too old.
 #
 # Thresholds:
-#   5 min  — force-delete Active namespaces (namespace leak / stuck creation)
-#   10 min — force-delete ANY non-system namespace regardless of phase
+#   20 min — force-delete Active namespaces (namespace leak / stuck creation)
+#   30 min — force-delete ANY non-system namespace regardless of phase
+#
+# The Active threshold must clear the longest-running legitimate [Slow]
+# conformance test, not just the common case: "[sig-apps] CronJob should not
+# schedule jobs when suspended" keeps its namespace Active for a full 5-minute
+# gomega.Consistently check (cronJobTimeout), and under a loaded parallel
+# e2e run that budget is only the floor, not the ceiling. A 5-minute threshold
+# here raced that test's own 5-minute check directly: the watchdog force-deleted
+# the namespace out from under the still-running test, which then failed with
+# "CronJob \"suspended\" not found" even though nothing was actually wrong with
+# the CronJob. 20/30 min keeps this a safety net for genuinely leaked/stuck
+# namespaces without racing known-slow-but-healthy tests.
 #
 # System namespaces excluded: default, kube-*, sonobuoy
 # ---------------------------------------------------------------------------
@@ -74,12 +85,12 @@ watchdog_loop() {
       age_s=$(( now - created_s ))
 
       local should_delete=0 reason=""
-      if [ "$phase" = "Active" ] && [ "$age_s" -ge 300 ]; then
+      if [ "$phase" = "Active" ] && [ "$age_s" -ge 1200 ]; then
         should_delete=1
-        reason="Active for ${age_s}s (>= 5m threshold)"
-      elif [ "$age_s" -ge 600 ]; then
+        reason="Active for ${age_s}s (>= 20m threshold)"
+      elif [ "$age_s" -ge 1800 ]; then
         should_delete=1
-        reason="age=${age_s}s (>= 10m threshold, phase=${phase})"
+        reason="age=${age_s}s (>= 30m threshold, phase=${phase})"
       fi
 
       if [ "$should_delete" -eq 1 ]; then
