@@ -82,20 +82,41 @@ pub async fn find_apiservice<S: Store>(
 
 /// Build the backend base URL (`https://{svc}.{ns}.svc:{port}`) from `spec.service`.
 ///
-/// Returns `None` when `spec.service` is absent or null — a "local" `APIService` (the
-/// shape real kube-apiserver uses for CRD- and built-in-backed groups). u7s never creates
-/// these, but a user could `PUT` one by hand; treating it as "nothing to proxy to" (rather
-/// than erroring) lets the caller fall back to normal CRD/built-in routing instead of
-/// hijacking a group it has no way to actually serve.
-fn backend_base_url(apiservice: &serde_json::Value) -> Option<String> {
-    let svc = apiservice.get("spec")?.get("service")?;
+/// Returns `Ok(None)` when `spec.service` is absent, null, or missing its `name`/`namespace`
+/// keys — a "local" `APIService` (the shape real kube-apiserver uses for CRD- and
+/// built-in-backed groups), or simply an incomplete one. u7s never creates these itself,
+/// but a user could `PUT` one by hand; treating it as "nothing to proxy to" (rather than
+/// erroring) lets the caller fall back to normal CRD/built-in routing instead of hijacking
+/// a group it has no way to actually serve.
+///
+/// Returns `Err` when `name`/`namespace` are present but fail `validate_name` (e.g. contain
+/// `/` or `..`). Without this check, a crafted `spec.service.namespace` such as
+/// `"ns/evil.example.com"` would break the intended host out of the URL authority (built
+/// via a bare `format!`), redirecting the connection — and the caller's live bearer token,
+/// which `proxy_to_backend` forwards unchanged — to an attacker-controlled destination.
+/// Mirrors `admission.rs`'s `validate_service_reference`, which guards the identical
+/// Service-DNS-URL construction for webhook `clientConfig.service` references; registering
+/// an `APIService` requires the same cluster-admin-tier privilege as webhook configs, so
+/// this is a defense against a privileged actor harvesting *other* callers' credentials,
+/// not a low-privilege escalation.
+fn backend_base_url(apiservice: &serde_json::Value) -> Result<Option<String>, String> {
+    let Some(svc) = apiservice.get("spec").and_then(|s| s.get("service")) else {
+        return Ok(None);
+    };
     if svc.is_null() {
-        return None;
+        return Ok(None);
     }
-    let name = svc.get("name")?.as_str()?;
-    let namespace = svc.get("namespace")?.as_str()?;
+    let Some(name) = svc.get("name").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Some(namespace) = svc.get("namespace").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    crate::handlers::generic::validate_name("spec.service.name", name).map_err(|e| e.1.message)?;
+    crate::handlers::generic::validate_name("spec.service.namespace", namespace)
+        .map_err(|e| e.1.message)?;
     let port = svc.get("port").and_then(|p| p.as_i64()).unwrap_or(443);
-    Some(format!("https://{name}.{namespace}.svc:{port}"))
+    Ok(Some(format!("https://{name}.{namespace}.svc:{port}")))
 }
 
 /// Build a `reqwest::Client` trusting `spec.caBundle` (or accepting any certificate when
@@ -189,11 +210,20 @@ pub async fn proxy_to_backend<S: Store>(
         .get("spec")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let Some(base) = backend_base_url(apiservice) else {
-        return Status::service_unavailable(format!(
-            "apiservice \"{version}.{group}\" has no backing service"
-        ))
-        .into_response();
+    let base = match backend_base_url(apiservice) {
+        Ok(Some(base)) => base,
+        Ok(None) => {
+            return Status::service_unavailable(format!(
+                "apiservice \"{version}.{group}\" has no backing service"
+            ))
+            .into_response();
+        }
+        Err(e) => {
+            return Status::internal(format!(
+                "apiservice \"{version}.{group}\" has an invalid spec.service: {e}"
+            ))
+            .into_response();
+        }
     };
 
     let mut url = format!("{base}/apis/{group}/{version}");
@@ -265,10 +295,22 @@ pub async fn proxy_middleware<S: Store>(
     let Some(apiservice) = find_apiservice(&state, &group, &version).await else {
         return next.run(req).await;
     };
-    if backend_base_url(&apiservice).is_none() {
-        // No spec.service (a "local" APIService u7s never creates itself) -- nothing to
-        // proxy to; let CRD/built-in routing handle it as if this object didn't exist.
-        return next.run(req).await;
+    match backend_base_url(&apiservice) {
+        Ok(Some(_)) => {} // has a real backend -- proceed to proxy below
+        Ok(None) => {
+            // No spec.service (a "local" APIService u7s never creates itself) -- nothing to
+            // proxy to; let CRD/built-in routing handle it as if this object didn't exist.
+            return next.run(req).await;
+        }
+        Err(e) => {
+            // spec.service is present but invalid (e.g. a crafted namespace/name breaking
+            // out of the URL authority) -- reject outright, before reading the request body
+            // or ever attempting to build/dial a URL from it.
+            return Status::internal(format!(
+                "apiservice \"{version}.{group}\" has an invalid spec.service: {e}"
+            ))
+            .into_response();
+        }
     }
 
     let query = req.uri().query().map(str::to_owned);
@@ -320,7 +362,11 @@ pub async fn discovery_resources_for_apiservice<S: Store>(
     let spec = apiservice.get("spec")?;
     let group = spec.get("group")?.as_str()?;
     let version = spec.get("version")?.as_str()?;
-    let base = backend_base_url(apiservice)?;
+    // An invalid spec.service is treated the same as "no backend" here: this function's
+    // contract is "give me resources or None", with no channel to surface a distinct error
+    // to the discovery caller — the resource proxy path (proxy_middleware/proxy_to_backend)
+    // is what surfaces the rejection explicitly.
+    let base = backend_base_url(apiservice).ok().flatten()?;
     let client = build_backend_client(state, spec);
     let url = format!("{base}/apis/{group}/{version}");
     let mut req = client.get(&url);
@@ -430,8 +476,8 @@ async fn check_and_persist_availability<S: Store>(
     revision: u64,
     apiservice: &serde_json::Value,
 ) {
-    if backend_base_url(apiservice).is_none() {
-        return; // local APIService -- nothing to health-check
+    if !matches!(backend_base_url(apiservice), Ok(Some(_))) {
+        return; // local APIService, or an invalid spec.service -- nothing safe to health-check
     }
 
     let (status_str, reason, message) = match health_check_backend(state, apiservice).await {
@@ -495,7 +541,11 @@ async fn health_check_backend<S: Store>(
         .get("version")
         .and_then(|v| v.as_str())
         .ok_or("spec.version missing")?;
-    let base = backend_base_url(apiservice).ok_or("spec.service missing")?;
+    let base = match backend_base_url(apiservice) {
+        Ok(Some(base)) => base,
+        Ok(None) => return Err("spec.service missing".to_string()),
+        Err(e) => return Err(format!("invalid spec.service: {e}")),
+    };
     let client = build_backend_client(state, spec);
     let url = format!("{base}/apis/{group}/{version}");
     client
@@ -649,7 +699,7 @@ mod tests {
         });
         assert_eq!(
             backend_base_url(&apiservice),
-            Some("https://sample-api.agg-1.svc:7443".to_string())
+            Ok(Some("https://sample-api.agg-1.svc:7443".to_string()))
         );
     }
 
@@ -661,7 +711,7 @@ mod tests {
         });
         assert_eq!(
             backend_base_url(&apiservice),
-            Some("https://svc.ns.svc:443".to_string())
+            Ok(Some("https://svc.ns.svc:443".to_string()))
         );
     }
 
@@ -671,7 +721,49 @@ mod tests {
     #[test]
     fn backend_base_url_returns_none_for_local_apiservice() {
         let apiservice = serde_json::json!({ "spec": { "group": "x", "version": "v1" } });
-        assert_eq!(backend_base_url(&apiservice), None);
+        assert_eq!(backend_base_url(&apiservice), Ok(None));
+    }
+
+    /// Regression test (security): a crafted `spec.service.namespace` containing `/` must be
+    /// rejected, not silently built into a URL. `format!("https://{name}.{namespace}.svc:{port}")`
+    /// has no escaping — a namespace of `"ns/evil.example.com"` would build
+    /// `https://svc.ns/evil.example.com.svc:443`, breaking `evil.example.com` out of the
+    /// intended host and redirecting the connection (and the caller's live bearer token,
+    /// which `proxy_to_backend` forwards unchanged) to an attacker-controlled destination.
+    /// Revert the `validate_name` calls in `backend_base_url` and this fails again.
+    #[test]
+    fn backend_base_url_rejects_namespace_containing_slash() {
+        let apiservice = serde_json::json!({
+            "spec": { "service": { "namespace": "ns/evil.example.com", "name": "svc", "port": 443 } }
+        });
+        let result = backend_base_url(&apiservice);
+        assert!(
+            result.is_err(),
+            "a namespace containing '/' must be rejected, not built into a URL: got {result:?}"
+        );
+    }
+
+    /// Same attack surface via `spec.service.name` instead of `namespace`.
+    #[test]
+    fn backend_base_url_rejects_name_containing_slash() {
+        let apiservice = serde_json::json!({
+            "spec": { "service": { "namespace": "ns", "name": "svc/evil.example.com", "port": 443 } }
+        });
+        let result = backend_base_url(&apiservice);
+        assert!(
+            result.is_err(),
+            "a service name containing '/' must be rejected, not built into a URL: got {result:?}"
+        );
+    }
+
+    /// `..` is the other traversal/authority-escape vector `validate_name` rejects; confirm
+    /// `backend_base_url` inherits that check rather than only checking for `/`.
+    #[test]
+    fn backend_base_url_rejects_namespace_containing_dot_dot() {
+        let apiservice = serde_json::json!({
+            "spec": { "service": { "namespace": "..", "name": "svc", "port": 443 } }
+        });
+        assert!(backend_base_url(&apiservice).is_err());
     }
 
     // ---- discovery_request_headers ---------------------------------------------------
@@ -981,6 +1073,64 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test (security), end-to-end through the real middleware: a registered
+    /// `APIService` with a crafted `spec.service.namespace` containing `/` must be rejected
+    /// outright, not proxied. Without the `validate_name` check in `backend_base_url`, this
+    /// would build `https://sample-api.agg-1/evil.example.com.svc:443` and attempt to dial
+    /// it — forwarding whatever Authorization header the caller sent (see `proxy_to_backend`)
+    /// to a host an attacker fully controls via the crafted namespace. Asserting a distinct
+    /// status (not 503, which is what an *unreachable-but-well-formed* backend returns —
+    /// see `proxy_middleware_returns_503_not_502_when_backend_unreachable`) proves the
+    /// request was rejected before any connection attempt, not merely failed to connect.
+    #[tokio::test]
+    async fn proxy_middleware_rejects_apiservice_with_crafted_namespace() {
+        let state = make_state();
+        let key = crate::keys::group_object_key(
+            "apiregistration.k8s.io",
+            "apiservices",
+            None,
+            "v1alpha1.wardle.example.com",
+        );
+        let body = serde_json::json!({
+            "spec": {
+                "group": "wardle.example.com",
+                "version": "v1alpha1",
+                "service": {
+                    "namespace": "agg-1/evil.example.com",
+                    "name": "sample-api",
+                    "port": 7443
+                }
+            }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(body.to_string()), Some(0))
+            .await
+            .expect("seed apiservice");
+
+        let router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/apis/wardle.example.com/v1alpha1/namespaces/default/flunders")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                "Bearer super-secret-token",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "must be rejected as a bad configuration, not treated as merely 'unreachable' \
+             (503) -- 503 would mean the code tried to dial the malformed host"
+        );
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "a crafted spec.service.namespace must produce an error response, not a 2xx that \
+             would mean the caller's bearer token was silently forwarded somewhere"
+        );
     }
 
     // ---- reconcile_apiservice_availability (integration) ---------------------------
