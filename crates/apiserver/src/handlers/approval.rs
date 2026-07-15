@@ -24,7 +24,7 @@ use bytes::Bytes;
 
 use crate::{
     handlers::generic::{store_err, validate_name},
-    handlers::json_patch::{apply_json_patch, detect_patch_type, PatchType},
+    handlers::json_patch::{apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType},
     handlers::status::merge_incoming_metadata,
     keys::group_object_key,
     state::AppState,
@@ -97,6 +97,7 @@ pub async fn patch_approval<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = group_object_key(GROUP, PLURAL, None, &name);
     let stored = state
@@ -109,8 +110,14 @@ pub async fn patch_approval<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
+    // other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     // Snapshot fields /approval must never change, before applying any patch type.
     // `spec_before` is restored unconditionally below regardless of patch type —
@@ -539,6 +546,54 @@ mod tests {
         assert!(
             v["status"]["certificate"].is_null() || v["status"].get("certificate").is_none(),
             "patch_approval must not write certificate field — that belongs to the signer"
+        );
+    }
+
+    /// PATCH /approval with a genuine multi-line YAML apply-patch+yaml body must succeed,
+    /// not 400 "invalid patch JSON".
+    ///
+    /// WHY this matters: `kubectl certificate approve/deny --server-side` sends real YAML
+    /// block syntax. Before this fix, patch_approval had no is_ssa handling at all — every
+    /// apply-patch+yaml body was parsed with serde_json::from_slice, which rejects YAML
+    /// outright, even though detect_patch_type already accepted the content type.
+    #[tokio::test]
+    async fn patch_approval_accepts_real_yaml_apply_patch_body() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "yaml-approval-csr";
+        seed_csr(&store, name, None).await;
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let patch_body = "status:\n  conditions:\n  - type: Approved\n    status: \"True\"\n    reason: ManualApproval\n    message: approved via yaml ssa\n";
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from_static(patch_body.as_bytes()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH /approval with a genuine YAML apply-patch+yaml body must succeed, not 400 \
+             'invalid patch JSON': {:?}",
+            result.err()
         );
     }
 

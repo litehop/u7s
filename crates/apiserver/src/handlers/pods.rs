@@ -19,7 +19,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Binding, Namespace, Object, ObjectMeta, PodSpec},
-    util::{extract_body, parse_resource_version},
+    util::{content_type, extract_body, parse_resource_version},
 };
 
 #[derive(Deserialize)]
@@ -735,13 +735,20 @@ pub async fn patch_pod<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = super::json_patch::detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
+    // other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        super::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     // Retry loop: PATCH semantics are "apply this change to the current state". If a
     // concurrent write (e.g. kubelet status patch) advances the stored resourceVersion
@@ -10600,6 +10607,46 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod — apply-patch+yaml (Server-Side Apply)
+    // -----------------------------------------------------------------------
+
+    /// PATCH with a genuine multi-line YAML apply-patch+yaml body must succeed, not 400
+    /// "invalid patch JSON".
+    ///
+    /// WHY this matters: `kubectl apply --server-side` against a Pod sends real YAML block
+    /// syntax, not JSON. Before this fix, patch_pod had no is_ssa handling at all — every
+    /// apply-patch+yaml body was parsed with serde_json::from_slice, which rejects YAML
+    /// outright, so SSA against a Pod always 400'd even though the content type itself was
+    /// accepted (detect_patch_type maps it to StrategicMerge).
+    #[tokio::test]
+    async fn patch_pod_accepts_real_yaml_apply_patch_body() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let yaml_body = "metadata:\n  annotations:\n    k: v\n";
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/apply-patch+yaml")
+            .body(Body::from(yaml_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "apply-patch+yaml with a genuine YAML body must succeed, not 400 'invalid patch JSON'"
+        );
     }
 
     // -----------------------------------------------------------------------

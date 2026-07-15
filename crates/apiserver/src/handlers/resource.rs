@@ -27,7 +27,7 @@ use super::generic::{
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
-    strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
+    ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
 };
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
@@ -821,8 +821,11 @@ pub(crate) async fn do_patch<S: Store>(
 
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
-        let mut obj = Object::from_bytes(&body)
-            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+        // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side), which
+        // Object::from_bytes (JSON-only) rejects outright — ssa_body_to_json handles both.
+        let mut obj = Object {
+            body: ssa_body_to_json(&body)?,
+        };
         // Strip any managedFields the client sent — we don't track field ownership.
         strip_managed_fields(&mut obj.body);
         let mut obj_meta: ObjectMeta =
@@ -858,8 +861,7 @@ pub(crate) async fn do_patch<S: Store>(
                     .ok_or_else(|| Status::not_found(name, &meta.kind))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-                let mut patch: serde_json::Value = serde_json::from_slice(&body)
-                    .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+                let mut patch: serde_json::Value = ssa_body_to_json(&body)?;
                 strip_managed_fields(&mut patch);
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
@@ -944,8 +946,13 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        let mut patch: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+        // apply-patch+yaml bodies are genuine YAML; every other patch type is JSON.
+        let mut patch: serde_json::Value = if is_ssa {
+            ssa_body_to_json(&body)?
+        } else {
+            serde_json::from_slice(&body)
+                .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+        };
 
         // Strip managedFields the client sent in the apply body — we don't track field ownership.
         if is_ssa {
@@ -3939,6 +3946,89 @@ mod tests {
         assert!(
             patch_result.is_ok(),
             "PATCH with application/apply-patch+yaml must succeed"
+        );
+    }
+
+    /// apply-patch+yaml PATCH on an EXISTING resource must accept a genuine multi-line YAML
+    /// body, not just a JSON body wearing the +yaml content-type.
+    ///
+    /// WHY this matters: `kubectl apply --server-side` and the k8s conformance client send
+    /// real YAML block syntax for apply-patch+yaml bodies — the test above
+    /// (apply_patch_yaml_accepted_and_updates_resource) only proves the content type is
+    /// accepted, since its body is JSON bytes wearing a +yaml label, which serde_json
+    /// parses fine either way. Before this fix, the update branch of do_patch parsed the
+    /// body unconditionally with serde_json::from_slice regardless of is_ssa, so a SECOND
+    /// `kubectl apply --server-side` against an already-applied object — the common case —
+    /// 400'd with "invalid patch JSON".
+    #[tokio::test]
+    async fn apply_patch_yaml_with_real_yaml_body_updates_existing_resource() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let _ = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Lease PUT must succeed"))
+        .into_response();
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let yaml_patch = bytes::Bytes::from_static(
+            b"apiVersion: coordination.k8s.io/v1\nkind: Lease\nmetadata:\n  name: worker-node-1\n  namespace: kube-node-lease\nspec:\n  holderIdentity: worker-node-1\n  leaseDurationSeconds: 99\n",
+        );
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let patch_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            yaml_patch,
+        )
+        .await;
+
+        let resp = patch_result
+            .unwrap_or_else(|e| {
+                panic!(
+                    "PATCH with a genuine multi-line YAML apply-patch+yaml body on an \
+                     existing resource must succeed, not 400 'invalid patch JSON': {:?}",
+                    e.0
+                )
+            })
+            .into_response();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["spec"]["leaseDurationSeconds"].as_i64(),
+            Some(99),
+            "the YAML patch's leaseDurationSeconds must be applied to the stored Lease"
         );
     }
 
