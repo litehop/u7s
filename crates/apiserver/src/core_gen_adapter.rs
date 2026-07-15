@@ -961,6 +961,57 @@ fn gen_node_affinity_to_json(na: core_v1::NodeAffinity) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+fn gen_label_selector_requirement_to_json(
+    req: meta_v1::LabelSelectorRequirement,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
+        m.insert("key".to_string(), serde_json::Value::String(k));
+    }
+    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
+        m.insert("operator".to_string(), serde_json::Value::String(op));
+    }
+    if !req.values.is_empty() {
+        m.insert(
+            "values".to_string(),
+            serde_json::Value::Array(
+                req.values
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Used by topologySpreadConstraints.labelSelector. matchLabels-only decode would silently
+/// drop a constraint expressed purely via matchExpressions (e.g. `key In [a,b]`), making the
+/// scheduler treat the spread constraint as matching zero/all pods instead of the intended set.
+fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !sel.match_labels.is_empty() {
+        let labels: serde_json::Map<String, serde_json::Value> = sel
+            .match_labels
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        m.insert("matchLabels".to_string(), serde_json::Value::Object(labels));
+    }
+    if !sel.match_expressions.is_empty() {
+        m.insert(
+            "matchExpressions".to_string(),
+            serde_json::Value::Array(
+                sel.match_expressions
+                    .into_iter()
+                    .map(gen_label_selector_requirement_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value {
     let containers: Vec<serde_json::Value> = spec
         .containers
@@ -1144,6 +1195,12 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             serde_json::Value::String(san),
         );
     }
+    // serviceAccount — deprecated alias for serviceAccountName, still accepted on the wire.
+    // Dropping it silently discards the ServiceAccount choice of a legacy client that only
+    // ever sets this field rather than serviceAccountName.
+    if let Some(sa) = spec.service_account.filter(|s| !s.is_empty()) {
+        spec_map.insert("serviceAccount".to_string(), serde_json::Value::String(sa));
+    }
     if let Some(nn) = spec.node_name.filter(|s| !s.is_empty()) {
         spec_map.insert("nodeName".to_string(), serde_json::Value::String(nn));
     }
@@ -1176,6 +1233,16 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             serde_json::Value::String(rcn),
         );
     }
+    // overhead — spec-level RuntimeClass pod overhead as sent directly by the client, distinct
+    // from the value apply_runtime_class_overhead injects from the RuntimeClass object at
+    // admission time (see proto.rs/pods.rs). Dropping it here erases whatever the client
+    // itself computed and sent before admission ever runs.
+    if !spec.overhead.is_empty() {
+        spec_map.insert(
+            "overhead".to_string(),
+            gen_quantity_map_to_json(spec.overhead),
+        );
+    }
     // nodeSelector — gates which nodes the scheduler's NodeSelector predicate will bind
     // this pod to. Without it, a pod that explicitly restricted itself to nodes with a
     // specific label is silently treated as unrestricted and bound to any node — this
@@ -1201,6 +1268,12 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             am.insert("nodeAffinity".to_string(), gen_node_affinity_to_json(na));
         }
         spec_map.insert("affinity".to_string(), serde_json::Value::Object(am));
+    }
+    // schedulerName — selects which scheduler binds this pod; dropping it makes a pod that
+    // asked for a custom scheduler (e.g. a batch/GPU scheduler) fall back to being picked up
+    // by the default scheduler instead, silently changing where/how it gets bound.
+    if let Some(sn) = spec.scheduler_name.filter(|s| !s.is_empty()) {
+        spec_map.insert("schedulerName".to_string(), serde_json::Value::String(sn));
     }
     // tolerations — required for taint-based eviction and scheduling constraints.
     // Without this field, pods that tolerate taints are treated as if they have no
@@ -1252,6 +1325,68 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             serde_json::Value::Array(gates),
         );
     }
+    // topologySpreadConstraints — scheduler-enforced pod spreading across topology domains
+    // (e.g. zone/hostname); dropping this makes the scheduler treat a pod that asked to be
+    // spread across zones/nodes as unconstrained, letting it land in a single zone/node and
+    // defeating the availability guarantee the workload owner configured.
+    if !spec.topology_spread_constraints.is_empty() {
+        let constraints: Vec<serde_json::Value> = spec
+            .topology_spread_constraints
+            .into_iter()
+            .map(|c| {
+                let mut m = serde_json::Map::new();
+                if let Some(ms) = c.max_skew {
+                    m.insert("maxSkew".to_string(), serde_json::Value::Number(ms.into()));
+                }
+                if let Some(tk) = c.topology_key.filter(|s| !s.is_empty()) {
+                    m.insert("topologyKey".to_string(), serde_json::Value::String(tk));
+                }
+                if let Some(wu) = c.when_unsatisfiable.filter(|s| !s.is_empty()) {
+                    m.insert(
+                        "whenUnsatisfiable".to_string(),
+                        serde_json::Value::String(wu),
+                    );
+                }
+                if let Some(ls) = c.label_selector {
+                    m.insert("labelSelector".to_string(), gen_label_selector_to_json(ls));
+                }
+                if let Some(md) = c.min_domains {
+                    m.insert(
+                        "minDomains".to_string(),
+                        serde_json::Value::Number(md.into()),
+                    );
+                }
+                if let Some(nap) = c.node_affinity_policy.filter(|s| !s.is_empty()) {
+                    m.insert(
+                        "nodeAffinityPolicy".to_string(),
+                        serde_json::Value::String(nap),
+                    );
+                }
+                if let Some(ntp) = c.node_taints_policy.filter(|s| !s.is_empty()) {
+                    m.insert(
+                        "nodeTaintsPolicy".to_string(),
+                        serde_json::Value::String(ntp),
+                    );
+                }
+                if !c.match_label_keys.is_empty() {
+                    m.insert(
+                        "matchLabelKeys".to_string(),
+                        serde_json::Value::Array(
+                            c.match_label_keys
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        spec_map.insert(
+            "topologySpreadConstraints".to_string(),
+            serde_json::Value::Array(constraints),
+        );
+    }
     // priorityClassName — used by PriorityAdmission to look up the integer priority value.
     // Without this field, pods are treated as having no priority class, which can result in
     // them being preempted by lower-priority pods that happen to have a class set.
@@ -1266,11 +1401,38 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     if let Some(p) = spec.priority.filter(|&v| v != 0) {
         spec_map.insert("priority".to_string(), serde_json::Value::Number(p.into()));
     }
+    // preemptionPolicy — governs whether this pod may preempt lower-priority pods; dropping
+    // an explicit "Never" silently reverts to the cluster default (PreemptLowerPriority),
+    // letting the pod preempt others despite the client explicitly opting out.
+    if let Some(pp) = spec.preemption_policy.filter(|s| !s.is_empty()) {
+        spec_map.insert(
+            "preemptionPolicy".to_string(),
+            serde_json::Value::String(pp),
+        );
+    }
     // hostNetwork — the kubelet reads this to decide whether to share the host network
     // namespace; dropping it makes KubeletManagedEtcHosts and hostPort-on-hostNetwork
     // behavior silently wrong for every protobuf-created pod.
     if let Some(hn) = spec.host_network {
         spec_map.insert("hostNetwork".to_string(), serde_json::Value::Bool(hn));
+    }
+    // hostPID/hostIPC/shareProcessNamespace — namespace-sharing toggles the kubelet reads to
+    // set up container isolation. Dropping hostPID/hostIPC silently re-isolates a pod that
+    // asked to see the host's process/IPC namespace, breaking debugging/monitoring pods that
+    // depend on it; dropping shareProcessNamespace silently re-isolates sibling containers
+    // from each other, breaking sidecar patterns that signal or trace another container's
+    // PID 1.
+    if let Some(v) = spec.host_pid {
+        spec_map.insert("hostPID".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = spec.host_ipc {
+        spec_map.insert("hostIPC".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = spec.share_process_namespace {
+        spec_map.insert(
+            "shareProcessNamespace".to_string(),
+            serde_json::Value::Bool(v),
+        );
     }
     // automountServiceAccountToken — pod-level override of the ServiceAccount default;
     // dropping it means a pod that explicitly opted out of token automount gets one anyway.
@@ -1278,6 +1440,22 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         spec_map.insert(
             "automountServiceAccountToken".to_string(),
             serde_json::Value::Bool(v),
+        );
+    }
+    // imagePullSecrets — credentials the kubelet uses to authenticate private-registry image
+    // pulls for every container in the pod; dropping this makes the kubelet attempt an
+    // unauthenticated pull and ImagePullBackOff the pod even though the client supplied
+    // working credentials.
+    if !spec.image_pull_secrets.is_empty() {
+        let refs: Vec<serde_json::Value> = spec
+            .image_pull_secrets
+            .into_iter()
+            .filter_map(|r| r.name.filter(|s| !s.is_empty()))
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        spec_map.insert(
+            "imagePullSecrets".to_string(),
+            serde_json::Value::Array(refs),
         );
     }
     // hostAliases — injected into the pod's /etc/hosts by the kubelet; dropping this means
@@ -1352,6 +1530,22 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         }
         spec_map.insert("dnsConfig".to_string(), serde_json::Value::Object(m));
     }
+    // readinessGates — extra pod conditions (beyond container readiness) that must be True
+    // for the pod to count as Ready; dropping this makes the pod report Ready as soon as its
+    // containers are, ignoring a gate a workload controller (e.g. for injected sidecars)
+    // depends on.
+    if !spec.readiness_gates.is_empty() {
+        let gates: Vec<serde_json::Value> = spec
+            .readiness_gates
+            .into_iter()
+            .filter_map(|g| g.condition_type.filter(|s| !s.is_empty()))
+            .map(|ct| serde_json::json!({ "conditionType": ct }))
+            .collect();
+        spec_map.insert(
+            "readinessGates".to_string(),
+            serde_json::Value::Array(gates),
+        );
+    }
     // ephemeralContainers — needed so UpdateEphemeralContainers (protobuf by default in
     // client-go) round-trips the debug container through apply_ephemeral_containers_patch.
     if !spec.ephemeral_containers.is_empty() {
@@ -1372,6 +1566,44 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         spec_map.insert(
             "securityContext".to_string(),
             gen_pod_security_context_to_json(sc),
+        );
+    }
+    // os — declares the pod's target OS (linux/windows), which gates which securityContext
+    // and host-namespace fields validation allows; dropping it makes OS-conditional
+    // validation silently permissive for the OS the client actually declared.
+    if let Some(name) = spec.os.and_then(|os| os.name).filter(|s| !s.is_empty()) {
+        spec_map.insert("os".to_string(), serde_json::json!({ "name": name }));
+    }
+    // resourceClaims — DRA claims a container may reference by name; dropping this means a
+    // container's resources.claims[].name resolves to nothing, so the pod starts without
+    // ever reserving the device/resource the client asked for.
+    if !spec.resource_claims.is_empty() {
+        let claims: Vec<serde_json::Value> = spec
+            .resource_claims
+            .into_iter()
+            .map(|rc| {
+                let mut m = serde_json::Map::new();
+                if let Some(n) = rc.name.filter(|s| !s.is_empty()) {
+                    m.insert("name".to_string(), serde_json::Value::String(n));
+                }
+                if let Some(rcn) = rc.resource_claim_name.filter(|s| !s.is_empty()) {
+                    m.insert(
+                        "resourceClaimName".to_string(),
+                        serde_json::Value::String(rcn),
+                    );
+                }
+                if let Some(rctn) = rc.resource_claim_template_name.filter(|s| !s.is_empty()) {
+                    m.insert(
+                        "resourceClaimTemplateName".to_string(),
+                        serde_json::Value::String(rctn),
+                    );
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        spec_map.insert(
+            "resourceClaims".to_string(),
+            serde_json::Value::Array(claims),
         );
     }
     serde_json::Value::Object(spec_map)
@@ -3278,6 +3510,459 @@ mod tests {
         assert!(
             result["spec"].get("schedulingGates").is_none(),
             "schedulingGates must be omitted (not an empty array) when the wire carried none"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.schedulerName (PodSpec field 19).
+    ///
+    /// client-go's typed Pod client sends protobuf by default, unlike kubectl (JSON). A pod
+    /// that asks for a non-default scheduler (e.g. a batch/GPU scheduler) but has this field
+    /// dropped on decode is silently left for the built-in scheduler to pick up instead,
+    /// changing which component binds it and defeating the workload's scheduling setup.
+    #[test]
+    fn generated_pod_spec_preserves_scheduler_name() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("custom-scheduler-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                scheduler_name: Some("my-scheduler".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["schedulerName"], "my-scheduler",
+            "schedulerName must survive protobuf decode — without it a pod requesting a \
+             non-default scheduler is silently handled by the built-in scheduler instead"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.hostPID/hostIPC/shareProcessNamespace
+    /// (PodSpec fields 12, 13, 27).
+    ///
+    /// These are namespace-sharing toggles the kubelet reads when starting containers.
+    /// Dropping hostPID/hostIPC on decode silently re-isolates a pod that asked to observe
+    /// the host's process/IPC namespace (breaking debug/monitoring pods that rely on it);
+    /// dropping shareProcessNamespace silently re-isolates sibling containers from each
+    /// other, breaking sidecar patterns that signal or trace another container's PID 1.
+    #[test]
+    fn generated_pod_spec_preserves_host_pid_host_ipc_and_share_process_namespace() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("host-namespaces-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_pid: Some(true),
+                host_ipc: Some(true),
+                share_process_namespace: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["hostPID"], true,
+            "hostPID must survive decode — without it a pod that needs the host's process \
+             namespace for debugging silently runs isolated instead"
+        );
+        assert_eq!(
+            result["spec"]["hostIPC"], true,
+            "hostIPC must survive decode — without it a pod that needs the host's IPC \
+             namespace silently runs isolated instead"
+        );
+        assert_eq!(
+            result["spec"]["shareProcessNamespace"], true,
+            "shareProcessNamespace must survive decode — without it sidecar containers that \
+             expect to see/signal each other's processes silently cannot"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.imagePullSecrets (PodSpec field 15) — distinct
+    /// from ServiceAccount.imagePullSecrets, which is already covered elsewhere.
+    ///
+    /// Dropping the pod's own explicit list on decode makes the kubelet attempt an
+    /// unauthenticated pull against a private registry and ImagePullBackOff the pod even
+    /// though the client supplied working credentials.
+    #[test]
+    fn generated_pod_spec_preserves_image_pull_secrets() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("private-image-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("private.example.com/img".to_string()),
+                    ..Default::default()
+                }],
+                image_pull_secrets: vec![core_v1::LocalObjectReference {
+                    name: Some("registry-cred".to_string()),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["imagePullSecrets"][0]["name"], "registry-cred",
+            "spec.imagePullSecrets must survive decode — without it the kubelet cannot \
+             authenticate the private-registry pull and the pod gets stuck in \
+             ImagePullBackOff despite the client supplying credentials"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve the deprecated spec.serviceAccount alias (PodSpec
+    /// field 9), separate from spec.serviceAccountName.
+    ///
+    /// A legacy client that only ever sets this deprecated field (never serviceAccountName)
+    /// has its ServiceAccount choice silently discarded on decode if this field is dropped.
+    #[test]
+    fn generated_pod_spec_preserves_deprecated_service_account_alias() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("legacy-sa-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                service_account: Some("legacy-sa".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["serviceAccount"], "legacy-sa",
+            "the deprecated spec.serviceAccount alias must survive decode — a legacy client \
+             that only sets this field (not serviceAccountName) must not silently lose its \
+             ServiceAccount choice"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.preemptionPolicy (PodSpec field 31).
+    ///
+    /// Dropping an explicit "Never" on decode silently reverts the pod to the cluster
+    /// default (PreemptLowerPriority), letting it preempt other pods despite the client
+    /// explicitly opting out of preemption.
+    #[test]
+    fn generated_pod_spec_preserves_preemption_policy() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-preempt-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                preemption_policy: Some("Never".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["preemptionPolicy"], "Never",
+            "preemptionPolicy=Never must survive decode — dropping it silently reverts to \
+             the cluster default of allowing this pod to preempt lower-priority pods"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.topologySpreadConstraints (PodSpec field 33),
+    /// including the nested labelSelector's matchLabels and matchExpressions.
+    ///
+    /// Dropping this makes the scheduler treat a pod that asked to be spread across zones as
+    /// unconstrained, letting every replica land in the same zone/node and silently
+    /// defeating the availability guarantee pod-topology-spread conformance tests assert on.
+    #[test]
+    fn generated_pod_spec_preserves_topology_spread_constraints() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("spread-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                topology_spread_constraints: vec![core_v1::TopologySpreadConstraint {
+                    max_skew: Some(1),
+                    topology_key: Some("topology.kubernetes.io/zone".to_string()),
+                    when_unsatisfiable: Some("DoNotSchedule".to_string()),
+                    label_selector: Some(meta_v1::LabelSelector {
+                        match_labels: [("app".to_string(), "demo".to_string())]
+                            .into_iter()
+                            .collect(),
+                        match_expressions: vec![meta_v1::LabelSelectorRequirement {
+                            key: Some("tier".to_string()),
+                            operator: Some("In".to_string()),
+                            values: vec!["frontend".to_string()],
+                        }],
+                    }),
+                    min_domains: Some(2),
+                    node_affinity_policy: Some("Honor".to_string()),
+                    node_taints_policy: Some("Ignore".to_string()),
+                    match_label_keys: vec!["pod-template-hash".to_string()],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        let c = &result["spec"]["topologySpreadConstraints"][0];
+        assert_eq!(
+            c["maxSkew"], 1,
+            "maxSkew must survive decode — the scheduler needs it to compute the allowed skew"
+        );
+        assert_eq!(
+            c["topologyKey"], "topology.kubernetes.io/zone",
+            "topologyKey must survive decode — without it the scheduler doesn't know which \
+             domain to spread across"
+        );
+        assert_eq!(
+            c["whenUnsatisfiable"], "DoNotSchedule",
+            "whenUnsatisfiable must survive decode — dropping it silently turns a hard \
+             spreading requirement into no constraint at all"
+        );
+        assert_eq!(
+            c["labelSelector"]["matchLabels"]["app"], "demo",
+            "labelSelector.matchLabels must survive decode — without it the scheduler counts \
+             the wrong set of pods when computing skew"
+        );
+        assert_eq!(
+            c["labelSelector"]["matchExpressions"][0],
+            serde_json::json!({"key": "tier", "operator": "In", "values": ["frontend"]}),
+            "labelSelector.matchExpressions must survive decode — a spread constraint \
+             expressed purely via matchExpressions must not be silently treated as an \
+             empty (matches-everything) selector"
+        );
+        assert_eq!(c["minDomains"], 2, "minDomains must survive decode");
+        assert_eq!(
+            c["nodeAffinityPolicy"], "Honor",
+            "nodeAffinityPolicy must survive decode"
+        );
+        assert_eq!(
+            c["nodeTaintsPolicy"], "Ignore",
+            "nodeTaintsPolicy must survive decode"
+        );
+        assert_eq!(
+            c["matchLabelKeys"][0], "pod-template-hash",
+            "matchLabelKeys must survive decode"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.readinessGates (PodSpec field 28).
+    ///
+    /// Dropping this makes the pod report Ready as soon as its containers are, ignoring an
+    /// extra condition a workload controller (e.g. one injecting a sidecar) depends on being
+    /// evaluated before the pod is considered Ready.
+    #[test]
+    fn generated_pod_spec_preserves_readiness_gates() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("readiness-gated-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                readiness_gates: vec![core_v1::PodReadinessGate {
+                    condition_type: Some("www.example.com/feature-1".to_string()),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["readinessGates"][0]["conditionType"], "www.example.com/feature-1",
+            "readinessGates must survive decode — without it the pod is marked Ready before \
+             the extra condition the workload controller depends on is ever evaluated"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.overhead (PodSpec field 32) exactly as sent by
+    /// the client — distinct from the value apply_runtime_class_overhead injects from the
+    /// RuntimeClass object at admission time (see proto.rs/pods.rs tests for that path).
+    ///
+    /// Dropping the client-supplied value here erases scheduling accounting the client
+    /// already computed and sent before admission ever runs.
+    #[test]
+    fn generated_pod_spec_preserves_overhead() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("overhead-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                overhead: std::collections::HashMap::from([(
+                    "cpu".to_string(),
+                    crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                        string: Some("250m".to_string()),
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["overhead"]["cpu"], "250m",
+            "spec.overhead must survive decode — dropping a client-supplied value here \
+             erases scheduling accounting the client already computed before admission runs"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.os (PodSpec field 36, PodOS.name).
+    ///
+    /// Dropping it makes OS-conditional validation (which fields are legal on Linux vs
+    /// Windows pods) silently permissive for the OS the client actually declared.
+    #[test]
+    fn generated_pod_spec_preserves_os() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("windows-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                os: Some(core_v1::PodOs {
+                    name: Some("windows".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["os"]["name"], "windows",
+            "spec.os.name must survive decode — without it OS-conditional field validation \
+             silently applies the wrong OS's rules to this pod"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.resourceClaims (PodSpec field 39).
+    ///
+    /// Dropping this means a container's `resources.claims[].name` reference resolves to
+    /// nothing, so the pod starts without ever reserving the DRA device/resource the client
+    /// asked for.
+    #[test]
+    fn generated_pod_spec_preserves_resource_claims() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("dra-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                resource_claims: vec![core_v1::PodResourceClaim {
+                    name: Some("gpu".to_string()),
+                    resource_claim_name: Some("shared-gpu-claim".to_string()),
+                    resource_claim_template_name: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["resourceClaims"][0]["name"], "gpu",
+            "resourceClaims[].name must survive decode — without it a container's \
+             resources.claims[].name reference resolves to nothing"
+        );
+        assert_eq!(
+            result["spec"]["resourceClaims"][0]["resourceClaimName"], "shared-gpu-claim",
+            "resourceClaims[].resourceClaimName must survive decode — without it the pod \
+             never reserves the DRA resource the client asked for"
         );
     }
 
