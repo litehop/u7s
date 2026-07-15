@@ -824,99 +824,6 @@ fn apply_cr_field_validation(
 }
 
 // ---------------------------------------------------------------------------
-// SSA body parser: YAML-or-JSON → serde_json::Value
-//
-// The k8s conformance client sends genuine YAML block-mapping bytes (not JSON)
-// in apply-patch+yaml bodies, verified by logging body_prefix in a live run:
-//   "\napiVersion: mygroup.example.com/v1beta1\nkind: ...\nmetadata:\n..."
-// yaml-rust2 is a pure-Rust YAML parser (no unsafe-libyaml); it also parses
-// JSON because JSON is valid YAML, so kubelet-style JSON bodies work too.
-// ---------------------------------------------------------------------------
-
-/// yaml_rust2 reports duplicate mapping keys as `info() == "<Debug of Yaml key>: duplicated
-/// key in mapping"` (e.g. `String("foo"): duplicated key in mapping`). Upstream k8s's
-/// conformance suite greps the error body for `line N: key "X" already set in map`, so
-/// reformat to that phrasing rather than leaking the raw yaml-rust2 Debug output.
-fn dup_key_message(e: &yaml_rust2::ScanError) -> String {
-    let Some(key_debug) = e.info().strip_suffix(": duplicated key in mapping") else {
-        return format!("invalid SSA body: {e}");
-    };
-    let key = key_debug
-        .strip_prefix("String(\"")
-        .and_then(|s| s.strip_suffix("\")"))
-        .unwrap_or(key_debug);
-    format!(
-        "line {}: key \"{key}\" already set in map",
-        e.marker().line()
-    )
-}
-
-/// Parse `apply-patch+yaml` body bytes (YAML or JSON) into a serde_json::Value.
-///
-/// Returns 400 Bad Request on any parse or encoding error so the caller does not
-/// store garbage.
-fn ssa_body_to_json(body: &[u8]) -> Result<serde_json::Value, crate::status::StatusError> {
-    let s = std::str::from_utf8(body)
-        .map_err(|e| Status::bad_request(format!("SSA body is not valid UTF-8: {e}")))?;
-    let docs = yaml_rust2::YamlLoader::load_from_str(s)
-        .map_err(|e| Status::bad_request(dup_key_message(&e)))?;
-    let doc = docs
-        .into_iter()
-        .next()
-        .ok_or_else(|| Status::bad_request("SSA body is empty".into()))?;
-    yaml_to_json(&doc)
-        .ok_or_else(|| Status::bad_request("SSA body contains unparseable value".into()))
-}
-
-/// Recursively convert a `yaml_rust2::Yaml` node to a `serde_json::Value`.
-///
-/// Returns `None` for `BadValue` (malformed YAML node) so the caller can
-/// surface a 400 instead of silently storing garbage.
-fn yaml_to_json(y: &yaml_rust2::Yaml) -> Option<serde_json::Value> {
-    use serde_json::{Number, Value};
-    use yaml_rust2::Yaml;
-    Some(match y {
-        Yaml::String(s) => Value::String(s.clone()),
-        Yaml::Integer(i) => Value::Number(Number::from(*i)),
-        Yaml::Real(s) => {
-            // Yaml::Real holds the raw string; parse to f64 and reject non-finite values
-            // (NaN/Inf are not valid JSON) rather than silently coercing them to null.
-            match s.parse::<f64>() {
-                Ok(f) if f.is_finite() => {
-                    Value::Number(Number::from_f64(f).unwrap_or_else(|| Number::from(0)))
-                }
-                _ => return None,
-            }
-        }
-        Yaml::Boolean(b) => Value::Bool(*b),
-        Yaml::Array(a) => Value::Array(a.iter().map(yaml_to_json).collect::<Option<Vec<_>>>()?),
-        Yaml::Hash(m) => {
-            let mut map = serde_json::Map::new();
-            for (k, v) in m {
-                // k8s bodies always use string keys; coerce non-string scalar keys
-                // to their string representation defensively rather than panicking.
-                let key = match k {
-                    Yaml::String(s) => s.clone(),
-                    Yaml::Integer(i) => i.to_string(),
-                    Yaml::Real(s) => s.clone(),
-                    Yaml::Boolean(b) => b.to_string(),
-                    Yaml::Null => "null".into(),
-                    // Non-scalar keys (nested mappings/arrays) or bad values cannot
-                    // be coerced to a string key — skip the entry.
-                    _ => continue,
-                };
-                map.insert(key, yaml_to_json(v)?);
-            }
-            Value::Object(map)
-        }
-        Yaml::Null => Value::Null,
-        // BadValue signals a parse problem within the document; surface it as None
-        // so the caller returns 400 rather than storing garbage.
-        Yaml::BadValue | Yaml::Alias(_) => return None,
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Cluster-scoped CR handlers
 // ---------------------------------------------------------------------------
 
@@ -2135,7 +2042,7 @@ pub async fn patch_cr<S: Store>(
     // handles kubelet SSA bodies that happen to be JSON, CR SSA bodies from the conformance
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
-        let mut obj: serde_json::Value = ssa_body_to_json(&body)?;
+        let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header =
             apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -2182,8 +2089,14 @@ pub async fn patch_cr<S: Store>(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (same conformance client as the create path
+    // above); every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        crate::handlers::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     // Snapshot .status before applying the patch: status is a separate RBAC subresource
     // (`<crd>/status`), so a main-endpoint patch must never change it — including via
@@ -2295,7 +2208,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
-        let mut obj: serde_json::Value = ssa_body_to_json(&body)?;
+        let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header =
             apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -2348,8 +2261,14 @@ pub async fn patch_cr_namespaced<S: Store>(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (same conformance client as the create path
+    // above); every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        crate::handlers::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     // Snapshot .status before applying the patch: status is a separate RBAC subresource
     // (`<crd>/status`), so a main-endpoint patch must never change it — including via
@@ -2592,92 +2511,6 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         )
-    }
-
-    // ---------------------------------------------------------------------------
-    // Unit tests for ssa_body_to_json / yaml_to_json
-    //
-    // WHY these matter: the k8s conformance client sends genuine YAML bytes in
-    // apply-patch+yaml bodies. These tests ensure the conversion is correct and
-    // that garbage bodies surface as 400 rather than silently storing bad data.
-    // ---------------------------------------------------------------------------
-
-    /// A genuine YAML body (as sent by the k8s conformance client) must parse to
-    /// the expected serde_json::Value.
-    #[test]
-    fn ssa_body_to_json_parses_yaml_block_syntax() {
-        let yaml = b"\napiVersion: mygroup.example.com/v1beta1\nkind: FooBar\nmetadata:\n  name: mytest\nspec:\n  foo: foo1\n  ports:\n  - containerPort: 80\n    protocol: TCP\n";
-        let val = ssa_body_to_json(yaml).expect("valid YAML must parse");
-        assert_eq!(
-            val["apiVersion"].as_str(),
-            Some("mygroup.example.com/v1beta1"),
-            "apiVersion must survive YAML → JSON conversion"
-        );
-        assert_eq!(val["metadata"]["name"].as_str(), Some("mytest"));
-        assert_eq!(
-            val["spec"]["ports"][0]["containerPort"].as_i64(),
-            Some(80),
-            "integer values must parse as JSON numbers, not strings"
-        );
-    }
-
-    /// A JSON body (as sent by kubelet SSA / resource.rs-style callers) must also
-    /// parse correctly — JSON is valid YAML, so ssa_body_to_json handles both.
-    #[test]
-    fn ssa_body_to_json_parses_json_body() {
-        let json = br#"{"apiVersion":"v1","kind":"Thing","metadata":{"name":"obj"},"spec":{"count":42,"flag":true}}"#;
-        let val = ssa_body_to_json(json).expect("JSON body must parse via yaml-rust2");
-        assert_eq!(val["kind"].as_str(), Some("Thing"));
-        assert_eq!(
-            val["spec"]["count"].as_i64(),
-            Some(42),
-            "JSON integers must survive YAML parse as JSON numbers"
-        );
-        assert!(
-            val["spec"]["flag"].as_bool() == Some(true),
-            "JSON booleans must survive"
-        );
-    }
-
-    /// An invalid (non-UTF-8) body must return 400, not panic or store garbage.
-    #[test]
-    fn ssa_body_to_json_rejects_non_utf8() {
-        let bad: &[u8] = b"\xff\xfe not utf8";
-        let result = ssa_body_to_json(bad);
-        assert!(
-            result.is_err(),
-            "non-UTF-8 body must return Err (400) rather than panic or store garbage"
-        );
-    }
-
-    /// A non-finite float in YAML (NaN, Inf) must return 400 — these are not
-    /// valid JSON values and must not be silently stored as null or coerced.
-    #[test]
-    fn ssa_body_to_json_rejects_non_finite_float() {
-        // YAML allows ".inf" and ".nan" as special float values
-        let yaml = b"value: .inf";
-        let result = ssa_body_to_json(yaml);
-        assert!(
-            result.is_err(),
-            "non-finite float (.inf) in YAML must return Err (400) — JSON has no Infinity"
-        );
-    }
-
-    /// Upstream's FieldValidation conformance test greps the CR create/patch error body for
-    /// the literal phrase `line N: key "X" already set in map`; the raw yaml-rust2 Debug
-    /// output (`String("foo"): duplicated key in mapping`) does not contain that phrase, so
-    /// a passthrough would keep failing conformance even though the duplicate is rejected.
-    #[test]
-    fn ssa_body_to_json_dup_key_error_matches_upstream_wording() {
-        let yaml = b"spec:\n  unknown: uk1\n  foo: foo1\n  foo: foo2\n";
-        let err = ssa_body_to_json(yaml).expect_err("duplicate mapping key must be rejected");
-        assert!(
-            err.1
-                .message
-                .contains("line 4: key \"foo\" already set in map"),
-            "error message must match upstream's expected phrasing, got: {}",
-            err.1.message
-        );
     }
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
@@ -5321,6 +5154,74 @@ mod tests {
         assert_eq!(
             obj["spec"]["color"], "purple",
             "spec.color must be updated by patch"
+        );
+    }
+
+    // patch_cr on an EXISTING CR with a genuine multi-line YAML apply-patch+yaml body must
+    // succeed, not 400 "invalid patch JSON".
+    //
+    // WHY this matters: the create path (ssa_apply_patch_creates_cluster_scoped_cr_when_absent
+    // above) already handles real YAML via ssa_body_to_json, but the update path (this test)
+    // fell through to an unconditional serde_json::from_slice regardless of content type —
+    // so `kubectl apply --server-side` on a CR applied a SECOND time (the common case) 400'd
+    // even though the first apply succeeded.
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_ssa_accepts_real_yaml_body_on_existing_cr() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "ssa-yaml-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let yaml_patch = Bytes::from_static(b"spec:\n  color: purple\n");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_cr(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            test_user(),
+            headers,
+            yaml_patch,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "apply-patch+yaml with a genuine YAML body on an existing CR must succeed, not \
+             400 'invalid patch JSON': {:?}",
+            result.err()
+        );
+
+        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed after SSA patch"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "purple",
+            "spec.color from the YAML SSA body must be applied to the existing CR"
         );
     }
 

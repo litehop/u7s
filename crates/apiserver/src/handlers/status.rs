@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::generic::{lookup, store_err, validate_name};
-use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
+use super::json_patch::{apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType};
 use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 
 /// Merge incoming metadata onto the current object's metadata, preserving fields that
@@ -141,6 +141,7 @@ pub async fn patch_resource_status<S: Store>(
     validate_name("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = group_object_key(&group, &plural, None, &name);
     let stored = state
@@ -153,8 +154,14 @@ pub async fn patch_resource_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
+    // every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     match patch_type {
         PatchType::Json => {
@@ -280,6 +287,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     validate_name("namespace", &ns)?;
     validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
         Ok(meta) => (
@@ -312,8 +320,14 @@ pub async fn patch_namespaced_resource_status<S: Store>(
         .map(str::to_owned)
         .unwrap_or(kind_fallback);
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
+    // every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     match patch_type {
         PatchType::Json => {
@@ -918,6 +932,69 @@ mod tests {
         );
     }
 
+    /// patch_resource_status must accept a genuine multi-line YAML apply-patch+yaml body,
+    /// not just a JSON body wearing the +yaml content-type.
+    ///
+    /// WHY this matters: `kubectl apply --server-side` against a /status subresource
+    /// (e.g. e2e ApplyStatus()) sends real YAML block syntax. Before this fix,
+    /// patch_resource_status had no is_ssa handling at all — every apply-patch+yaml body
+    /// was parsed with serde_json::from_slice, which rejects YAML outright with "invalid
+    /// patch JSON", so ApplyStatus() 400'd on every call.
+    #[tokio::test]
+    async fn patch_resource_status_accepts_real_yaml_apply_patch_body() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "ssa-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/ssa-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let yaml_body = b"status:\n  conditions:\n  - type: Ready\n    status: \"True\"\n".to_vec();
+
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "ssa-node".into(),
+            )),
+            ssa_headers,
+            bytes::Bytes::from(yaml_body),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "apply-patch+yaml with a genuine YAML body on /status must succeed, not 400 \
+             'invalid patch JSON': {:?}",
+            result.err()
+        );
+    }
+
     /// patch_namespaced_resource_status with strategic-merge-patch.
     #[tokio::test]
     async fn patch_namespaced_resource_status_with_strategic_merge_patch() {
@@ -969,6 +1046,69 @@ mod tests {
         assert!(
             result.is_ok(),
             "strategic-merge-patch on namespaced status must succeed"
+        );
+    }
+
+    /// patch_namespaced_resource_status must accept a genuine multi-line YAML
+    /// apply-patch+yaml body, not just a JSON body wearing the +yaml content-type.
+    ///
+    /// WHY this matters: same ApplyStatus() SSA gap as the cluster-scoped test above,
+    /// but for namespaced resources (e.g. Deployment/status, which conformance also
+    /// applies via SSA).
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_accepts_real_yaml_apply_patch_body() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "ssa-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "ssa-lease" },
+            "status": {}
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/ssa-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let yaml_body =
+            b"status:\n  conditions:\n  - type: Available\n    status: \"True\"\n".to_vec();
+
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "ssa-lease".into(),
+            )),
+            ssa_headers,
+            bytes::Bytes::from(yaml_body),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "apply-patch+yaml with a genuine YAML body on namespaced /status must succeed, \
+             not 400 'invalid patch JSON': {:?}",
+            result.err()
         );
     }
 

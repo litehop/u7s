@@ -12,7 +12,9 @@ use crate::{
     auth::UserInfo,
     handlers::{
         generic::apply_delete_policy,
-        json_patch::{apply_json_patch, detect_patch_type, PatchQuery, PatchType},
+        json_patch::{
+            apply_json_patch, detect_patch_type, ssa_body_to_json, PatchQuery, PatchType,
+        },
         resource::{do_patch, PatchConfig},
     },
     keys::{cluster_list_prefix, cluster_object_key},
@@ -658,6 +660,7 @@ pub async fn patch_namespace_status<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = cluster_object_key("namespaces", &name);
     let stored = state
@@ -670,8 +673,14 @@ pub async fn patch_namespace_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
+    // every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     match patch_type {
         PatchType::Json => {
@@ -3124,6 +3133,57 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-patch-ns",
             "metadata must be unchanged after PATCH /status"
+        );
+    }
+
+    /// patch_namespace_status must accept a genuine multi-line YAML apply-patch+yaml body,
+    /// not just a JSON body wearing the +yaml content-type.
+    ///
+    /// WHY this matters: this is the exact e2e ApplyStatus() gap that motivated this fix —
+    /// "apply changes to a namespace status" calls ApplyStatus(), which sends real YAML
+    /// block syntax to PATCH .../namespaces/{name}/status. Before this fix,
+    /// patch_namespace_status had no is_ssa handling at all: detect_patch_type accepted the
+    /// content type, but the body was still parsed with serde_json::from_slice, which
+    /// rejects YAML outright with "invalid patch JSON" — ApplyStatus() 400'd and the e2e
+    /// client panicked indexing an empty conditions slice.
+    #[tokio::test]
+    async fn patch_namespace_status_accepts_real_yaml_apply_patch_body() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("ssa-status-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let patch_body = Bytes::from_static(
+            b"status:\n  conditions:\n  - type: NamespaceDeletionContentFailure\n    status: \"False\"\n",
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_namespace_status(
+            State(state.clone()),
+            Path("ssa-status-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "apply-patch+yaml with a genuine YAML body on namespace /status must succeed, \
+             not 400 'invalid patch JSON': {:?}",
+            result.err()
         );
     }
 
