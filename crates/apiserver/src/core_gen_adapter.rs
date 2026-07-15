@@ -1476,8 +1476,11 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         );
     }
     // priority — the integer priority value resolved by the scheduler from priorityClassName.
-    // Without this field, the scheduler cannot perform preemption ordering correctly.
-    if let Some(p) = spec.priority.filter(|&v| v != 0) {
+    // Like terminationGracePeriodSeconds, 0 is a legitimate explicit value (lowest possible
+    // priority) a client can set on purpose, not noise, so it must be emitted whenever the
+    // wire carried any value at all. Without this field, the scheduler cannot perform
+    // preemption ordering correctly.
+    if let Some(p) = spec.priority {
         spec_map.insert("priority".to_string(), serde_json::Value::Number(p.into()));
     }
     // preemptionPolicy — governs whether this pod may preempt lower-priority pods; dropping
@@ -4526,6 +4529,78 @@ mod tests {
             "an explicit terminationGracePeriodSeconds of 0 (kill immediately) must survive \
              decode — treating it like activeDeadlineSeconds's unset-vs-zero-is-noise case \
              would silently give the pod the kubelet's default grace period instead"
+        );
+    }
+
+    /// `priority` is a proto3 `optional int32` upstream (a real `Option<i32>` on the wire, not
+    /// a plain non-nullable field like `hostNetwork`), so an explicit 0 (the lowest possible
+    /// priority) is real client intent, not noise from an unset field. Filtering it out by
+    /// value — as this code used to do — made an explicitly-zero-priority pod indistinguishable
+    /// from a pod that never set priority at all, which would let the scheduler's preemption
+    /// ordering silently fall back to "no priority" instead of "priority zero".
+    #[test]
+    fn generated_pod_spec_preserves_zero_priority() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("zero-priority-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                priority: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["priority"], 0,
+            "an explicit priority of 0 must survive protobuf decode — treating it like an \
+             unset value would make the scheduler's preemption ordering silently ignore the \
+             client's explicit choice"
+        );
+    }
+
+    /// A pod that never sets `priority` at all must decode with the field absent, not with a
+    /// fabricated 0 — otherwise every priority-unset pod would look identical to one that
+    /// explicitly asked for priority 0, which is the exact ambiguity this fix removes.
+    #[test]
+    fn generated_pod_spec_omits_priority_when_never_set() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-priority-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                priority: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"].get("priority").is_none(),
+            "priority must be omitted when the client never set it — fabricating a value here \
+             would make an unset priority indistinguishable from an explicit 0"
         );
     }
 
