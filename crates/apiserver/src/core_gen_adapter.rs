@@ -1618,6 +1618,46 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             serde_json::Value::Array(claims),
         );
     }
+    // setHostnameAsFQDN/hostUsers — genuine *bool fields upstream (unlike hostNetwork's plain
+    // bool), so gogoproto only writes them when the client's pointer is non-nil; Some(_) here
+    // reliably means "the client set this", true or false. Dropping setHostnameAsFQDN=true
+    // silently reverts the kernel hostname to the leaf name instead of the FQDN the client
+    // asked for; dropping hostUsers=false silently puts the pod back in the host user
+    // namespace, undoing a client's explicit userns-isolation opt-in for breakout mitigation.
+    if let Some(v) = spec.set_hostname_as_fqdn {
+        spec_map.insert("setHostnameAsFQDN".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = spec.host_users {
+        spec_map.insert("hostUsers".to_string(), serde_json::Value::Bool(v));
+    }
+    // resources — pod-level ResourceRequirements (alpha PodLevelResources feature gate). Unlike
+    // Container.Resources (a Go value type that upstream always writes on the wire, handled via
+    // omit-when-empty above), PodSpec.Resources is a genuine `*ResourceRequirements` pointer, so
+    // Some(_) reliably reflects client intent — mirrors the affinity/dnsConfig treatment
+    // elsewhere in this function rather than the container-resources one. Dropping it silently
+    // discards fine-grained CPU/memory sharing the client configured across all containers.
+    if let Some(res) = spec.resources {
+        let mut res_map = serde_json::Map::new();
+        if !res.limits.is_empty() {
+            res_map.insert("limits".to_string(), gen_quantity_map_to_json(res.limits));
+        }
+        if !res.requests.is_empty() {
+            res_map.insert(
+                "requests".to_string(),
+                gen_quantity_map_to_json(res.requests),
+            );
+        }
+        spec_map.insert("resources".to_string(), serde_json::Value::Object(res_map));
+    }
+    // hostnameOverride — alpha HostnameOverride feature gate; takes precedence over
+    // hostname/subdomain for what the pod perceives as its own hostname. Dropping it silently
+    // falls back to the leaf/FQDN hostname the client explicitly asked to override.
+    if let Some(ho) = spec.hostname_override.filter(|s| !s.is_empty()) {
+        spec_map.insert(
+            "hostnameOverride".to_string(),
+            serde_json::Value::String(ho),
+        );
+    }
     serde_json::Value::Object(spec_map)
 }
 
@@ -3975,6 +4015,311 @@ mod tests {
             result["spec"]["resourceClaims"][0]["resourceClaimName"], "shared-gpu-claim",
             "resourceClaims[].resourceClaimName must survive decode — without it the pod \
              never reserves the DRA resource the client asked for"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve an explicit spec.hostUsers=false (PodSpec field 37).
+    ///
+    /// hostUsers defaults to true upstream, so false is the only value that changes behavior:
+    /// dropping it on decode silently puts the pod back in the host user namespace, undoing a
+    /// client's explicit userns-isolation opt-in used to mitigate container breakout.
+    #[test]
+    fn generated_pod_spec_preserves_host_users_false() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("userns-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_users: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["hostUsers"], false,
+            "hostUsers=false must survive decode — without it the pod silently runs in the \
+             host user namespace despite the client explicitly isolating it"
+        );
+    }
+
+    /// decode_pod_proto_gen must omit spec.hostUsers when the client never set it.
+    ///
+    /// hostUsers is a genuine `*bool` upstream (unlike hostNetwork's plain bool), so unlike
+    /// the hostNetwork zero-value case, prost only produces `Some` here when the wire actually
+    /// carried the field — a regression that always emits the key (e.g. defaulting to `false`)
+    /// would fabricate a userns opt-in the client never asked for.
+    #[test]
+    fn generated_pod_spec_omits_host_users_when_unset() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-userns-opinion-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_users: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"].get("hostUsers").is_none(),
+            "hostUsers must be omitted when the client never set it — materializing a key \
+             here fabricates an opinion the client never expressed"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve an explicit spec.setHostnameAsFQDN=true (PodSpec
+    /// field 35).
+    ///
+    /// setHostnameAsFQDN defaults to false upstream, so true is the value that changes kernel
+    /// behavior: dropping it on decode silently keeps the leaf hostname instead of the FQDN
+    /// the client asked the kubelet to set in the container's kernel hostname.
+    #[test]
+    fn generated_pod_spec_preserves_set_hostname_as_fqdn() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("fqdn-hostname-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                set_hostname_as_fqdn: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["setHostnameAsFQDN"], true,
+            "setHostnameAsFQDN=true must survive decode — without it the kubelet silently \
+             sets the kernel hostname to the leaf name instead of the FQDN the client asked for"
+        );
+    }
+
+    /// decode_pod_proto_gen must omit spec.setHostnameAsFQDN when the client never set it —
+    /// same genuine-`*bool` reasoning as the hostUsers omission test above.
+    #[test]
+    fn generated_pod_spec_omits_set_hostname_as_fqdn_when_unset() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-fqdn-opinion-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                set_hostname_as_fqdn: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"].get("setHostnameAsFQDN").is_none(),
+            "setHostnameAsFQDN must be omitted when the client never set it — materializing a \
+             key here fabricates an opinion the client never expressed"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.hostnameOverride (PodSpec field 41, alpha
+    /// HostnameOverride feature gate).
+    ///
+    /// This field takes precedence over hostname/subdomain for what the pod perceives as its
+    /// own hostname; dropping it on decode silently falls back to the name the client
+    /// explicitly asked to override.
+    #[test]
+    fn generated_pod_spec_preserves_hostname_override() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("hostname-override-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                hostname_override: Some("worker-1.example.com".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["hostnameOverride"], "worker-1.example.com",
+            "hostnameOverride must survive decode — without it the pod silently keeps the \
+             name the client explicitly asked to override"
+        );
+    }
+
+    /// decode_pod_proto_gen must omit spec.hostnameOverride when the client never set it.
+    #[test]
+    fn generated_pod_spec_omits_hostname_override_when_unset() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-hostname-override-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                hostname_override: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"].get("hostnameOverride").is_none(),
+            "hostnameOverride must be omitted when the client never set it — materializing an \
+             empty override key could be mistaken for an explicit override to nothing"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.resources (PodSpec field 40, pod-level
+    /// ResourceRequirements, alpha PodLevelResources feature gate).
+    ///
+    /// Unlike Container.Resources (a value type upstream, handled by the omit-when-empty
+    /// container-resources decoder above), PodSpec.Resources is a genuine `*ResourceRequirements`
+    /// pointer, so dropping it on decode silently discards resource sharing the client
+    /// configured across every container in the pod, not just one container's own limits.
+    #[test]
+    fn generated_pod_spec_preserves_pod_level_resources() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("pod-level-resources-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                resources: Some(core_v1::ResourceRequirements {
+                    limits: std::collections::HashMap::from([(
+                        "cpu".to_string(),
+                        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                            string: Some("500m".to_string()),
+                        },
+                    )]),
+                    requests: std::collections::HashMap::from([(
+                        "cpu".to_string(),
+                        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                            string: Some("250m".to_string()),
+                        },
+                    )]),
+                    claims: vec![],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["resources"]["limits"]["cpu"], "500m",
+            "spec.resources.limits must survive decode — without it pod-level CPU sharing \
+             across all containers is silently discarded"
+        );
+        assert_eq!(
+            result["spec"]["resources"]["requests"]["cpu"], "250m",
+            "spec.resources.requests must survive decode — without it pod-level CPU sharing \
+             across all containers is silently discarded"
+        );
+    }
+
+    /// decode_pod_proto_gen must omit spec.resources when the client never set it — a
+    /// regression that materializes `resources: {}` here would make a protobuf-decoded pod
+    /// template fail a structural-equality diff against an equivalent JSON-decoded one, the
+    /// same hash-collision hazard documented on the container-resources omit-when-empty test.
+    #[test]
+    fn generated_pod_spec_omits_pod_level_resources_when_unset() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-pod-level-resources-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                resources: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"].get("resources").is_none(),
+            "spec.resources must be omitted when the client never set it — materializing an \
+             empty object here breaks structural-equality diffs against a JSON-created \
+             equivalent template"
         );
     }
 
