@@ -170,6 +170,25 @@ impl HyperApiClient {
         path: &str,
         body: Option<String>,
     ) -> anyhow::Result<(hyper::StatusCode, String)> {
+        self.request_with_content_type(method, path, body, "application/json")
+            .await
+    }
+
+    /// Send an HTTP request with an explicit Content-Type header, when a body is
+    /// present.
+    ///
+    /// Status-subresource PATCH endpoints reject the default `application/json`
+    /// (the apiserver's `accepts_patch_content_type` requires
+    /// `application/merge-patch+json` or `application/strategic-merge-patch+json`,
+    /// returning 415 otherwise), so callers that PATCH `.../status` need to
+    /// override it rather than go through [`request`].
+    pub async fn request_with_content_type(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<String>,
+        content_type: &str,
+    ) -> anyhow::Result<(hyper::StatusCode, String)> {
         let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
         let io = self.connect(&host, &addr).await?;
 
@@ -194,7 +213,7 @@ impl HyperApiClient {
             .header("Accept", "application/json");
         if body.is_some() {
             builder = builder
-                .header("Content-Type", "application/json")
+                .header("Content-Type", content_type)
                 .header("Content-Length", body_bytes.len().to_string());
         }
         if let Some(tok) = &self.bearer {
