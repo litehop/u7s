@@ -1067,7 +1067,7 @@ fn gen_label_selector_requirement_to_json(
 /// Used by topologySpreadConstraints.labelSelector. matchLabels-only decode would silently
 /// drop a constraint expressed purely via matchExpressions (e.g. `key In [a,b]`), making the
 /// scheduler treat the spread constraint as matching zero/all pods instead of the intended set.
-fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
+pub(crate) fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if !sel.match_labels.is_empty() {
         let labels: serde_json::Map<String, serde_json::Value> = sel
@@ -2654,14 +2654,14 @@ pub fn decode_serviceaccount_proto_gen(data: &[u8]) -> Option<serde_json::Value>
 
 // ---- Decoder A: PersistentVolumeClaim --------------------------------------
 
-pub fn decode_persistentvolumeclaim_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = core_v1::PersistentVolumeClaim::decode(data).ok()?;
+/// Shared by decode_persistentvolumeclaim_proto_gen and StatefulSetSpec.volumeClaimTemplates
+/// (apps_gen_adapter.rs) — a VolumeClaimTemplate entry is a full embedded PersistentVolumeClaim,
+/// so both call sites need the exact same metadata/spec/status mapping.
+pub(crate) fn gen_persistent_volume_claim_to_json(
+    obj: core_v1::PersistentVolumeClaim,
+) -> serde_json::Value {
     let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": meta
-    });
+    let mut result = serde_json::json!({ "metadata": meta });
     if let Some(spec) = obj.spec {
         let mut spec_json = serde_json::json!({});
         if !spec.access_modes.is_empty() {
@@ -2729,6 +2729,14 @@ pub fn decode_persistentvolumeclaim_proto_gen(data: &[u8]) -> Option<serde_json:
             result["status"] = status_json;
         }
     }
+    result
+}
+
+pub fn decode_persistentvolumeclaim_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = core_v1::PersistentVolumeClaim::decode(data).ok()?;
+    let mut result = gen_persistent_volume_claim_to_json(obj);
+    result["apiVersion"] = "v1".into();
+    result["kind"] = "PersistentVolumeClaim".into();
     Some(result)
 }
 
