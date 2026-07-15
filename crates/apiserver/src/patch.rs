@@ -373,6 +373,21 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
 
         path if path.ends_with(".volumeMounts") => MergeKeyKind::Key("mountPath"),
 
+        // volumeDevices — same nested-inside-container shape as volumeMounts above
+        // (Container.volumeDevices and EphemeralContainerCommon.volumeDevices both declare
+        // patchMergeKey=devicePath/patchStrategy=merge upstream). Without this entry, a
+        // strategic-merge-patch adding one block device to a container that already has
+        // volumeDevices entries silently replaces the whole array instead of merging by
+        // devicePath, dropping every other device mapping.
+        path if path.ends_with(".volumeDevices") => MergeKeyKind::Key("devicePath"),
+
+        // allocatedResourcesStatus is nested inside a containerStatuses element (same shape
+        // as volumeMounts/env above, but for ContainerStatus rather than Container). Upstream
+        // declares patchMergeKey=name/patchStrategy=merge; without this entry a kubelet status
+        // patch reporting a new allocated-resource health entry silently replaces the whole
+        // array instead of merging by name.
+        path if path.ends_with(".allocatedResourcesStatus") => MergeKeyKind::Key("name"),
+
         // Service spec.ports uses "port" (integer) as the merge key, not "containerPort".
         // This exact match must come before the suffix match below.
         "spec.ports" => MergeKeyKind::Key("port"),
@@ -394,6 +409,30 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // reconcile and continuously recreate the pod sandbox (sandbox loop).
         path if path == "podIPs" || path.ends_with(".podIPs") => MergeKeyKind::Key("ip"),
 
+        // resourceClaimStatuses — same top-level-PodStatus shape as podIPs above (DRA claim
+        // allocation results the kubelet reports back). Upstream declares
+        // patchMergeKey=name/patchStrategy=merge,retainKeys; without this entry a
+        // $patch:delete removing one claim's status returns 400 instead of removing just
+        // that entry.
+        path if path == "resourceClaimStatuses" || path.ends_with(".resourceClaimStatuses") => {
+            MergeKeyKind::Key("name")
+        }
+
+        // NodeStatus.addresses — upstream declares patchMergeKey=type/patchStrategy=merge, but
+        // unlike podIPs' "ip", "type" is not safely unique here (upstream's own comment on this
+        // field warns the merge key "is not sufficiently unique, which can cause data
+        // corruption when merged"). This also can't be a generic ".addresses" suffix arm: a
+        // different array, core/v1 Endpoints' EndpointSubset.addresses, shares the field name
+        // "addresses" but has NO merge-key annotation (must stay whole-array-replace) — a
+        // suffix arm would silently start "merging" EndpointSubset.addresses by a "type" field
+        // those elements don't even have, turning every subsequent patch into an
+        // accumulate-only append that never removes stale endpoints. Two literal paths only:
+        // "addresses" (the /status subresource handler, path root stripped to "") and
+        // "status.addresses" (a full Node-object patch, computed transiently before the
+        // main-endpoint handler restores the stored status — see handlers::resource's
+        // has_status_subresource restore step).
+        "addresses" | "status.addresses" => MergeKeyKind::Key("type"),
+
         // ownerReferences is keyed by uid.  KCM releases a pod from a ReplicaSet/RC by
         // sending $patch:delete with the RS uid; without this entry the directive is stored
         // literally, leaving a garbage ownerReference {$patch:delete, uid:…} that causes
@@ -411,6 +450,13 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         {
             MergeKeyKind::Key("name")
         }
+
+        // ServiceAccount.secrets is a top-level field directly on the object (ServiceAccount
+        // has no spec/status wrapper), so PATCHing a ServiceAccount always produces the bare
+        // "secrets" path (root path is "" for a main-resource PATCH). Upstream declares
+        // patchMergeKey=name/patchStrategy=merge; without this entry a strategic-merge-patch
+        // adding a second secret reference silently replaces the whole list.
+        "secrets" => MergeKeyKind::Key("name"),
 
         "rules" | "subjects" => MergeKeyKind::Replace,
 
@@ -1638,6 +1684,454 @@ mod tests {
         assert!(
             state.get("terminated").is_some(),
             "terminated must be present after init container exits"
+        );
+    }
+
+    /// Container.volumeDevices must be registered with merge key "devicePath" (matching
+    /// upstream's `patchStrategy:"merge" patchMergeKey:"devicePath"` tag — the same
+    /// nested-inside-container shape as volumeMounts above; EphemeralContainerCommon.
+    /// volumeDevices carries the identical tag and is covered by the same suffix arm).
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a patch that
+    /// adds one block device to a container that already has one configured silently
+    /// REPLACES the whole array instead of merging by devicePath — unmounting the
+    /// pre-existing block device out from under the running container.
+    #[test]
+    fn test_smp_volume_devices_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "volumeDevices": [
+                        {"name": "data-disk", "devicePath": "/dev/xvda"}
+                    ]
+                }]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "volumeDevices": [
+                        {"name": "log-disk", "devicePath": "/dev/xvdb"}
+                    ]
+                }]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let devices = target["spec"]["containers"][0]["volumeDevices"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            devices.len(),
+            2,
+            "adding a new block device must not silently drop the pre-existing one — the \
+             container would lose access to its already-mounted device; got: {devices:?}"
+        );
+        let paths: Vec<&str> = devices
+            .iter()
+            .map(|d| d["devicePath"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"/dev/xvda") && paths.contains(&"/dev/xvdb"),
+            "both the original and newly-patched devicePath must survive; got: {paths:?}"
+        );
+    }
+
+    /// ContainerStatus.allocatedResourcesStatus must be registered with merge key "name"
+    /// (matching upstream's `patchStrategy:"merge" patchMergeKey:"name"` tag).
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a kubelet
+    /// status patch reporting a newly-allocated resource's health silently REPLACES the
+    /// whole array instead of merging by name — discarding the health status of every
+    /// other already-allocated resource the moment a second one is allocated.
+    #[test]
+    fn test_smp_allocated_resources_status_merge_preserves_existing() {
+        let mut target = json!({
+            "status": {
+                "containerStatuses": [{
+                    "name": "app",
+                    "allocatedResourcesStatus": [
+                        {"name": "gpu", "resources": [{"resourceID": "gpu-0", "health": "Healthy"}]}
+                    ]
+                }]
+            }
+        });
+        let patch = json!({
+            "status": {
+                "containerStatuses": [{
+                    "name": "app",
+                    "allocatedResourcesStatus": [
+                        {"name": "nic", "resources": [{"resourceID": "nic-0", "health": "Healthy"}]}
+                    ]
+                }]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let statuses = target["status"]["containerStatuses"][0]["allocatedResourcesStatus"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            statuses.len(),
+            2,
+            "reporting a newly-allocated resource must not silently drop the health status \
+             of an already-allocated one; got: {statuses:?}"
+        );
+        let names: Vec<&str> = statuses
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"gpu") && names.contains(&"nic"),
+            "both the original and newly-patched resource name must survive; got: {names:?}"
+        );
+    }
+
+    /// NodeStatus.addresses must be registered with merge key "type" (matching upstream's
+    /// `patchStrategy:"merge" patchMergeKey:"type"` tag), reached via the /status subresource
+    /// handler which strips the "status" wrapper before calling SMP (path root "").
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a cloud
+    /// controller manager patch that adds a newly-discovered address (e.g. an ExternalIP
+    /// assigned after node registration) silently REPLACES the whole array instead of
+    /// merging by type — dropping the node's InternalIP and disconnecting it from the
+    /// cluster network view.
+    #[test]
+    fn test_smp_node_addresses_merge_preserves_existing() {
+        let mut status = json!({
+            "addresses": [
+                {"type": "InternalIP", "address": "10.0.0.5"}
+            ]
+        });
+        let patch = json!({
+            "addresses": [
+                {"type": "ExternalIP", "address": "203.0.113.5"}
+            ]
+        });
+
+        strategic_merge_patch(&mut status, &patch).unwrap();
+
+        let addresses = status["addresses"].as_array().unwrap();
+        assert_eq!(
+            addresses.len(),
+            2,
+            "adding an ExternalIP must not silently drop the node's InternalIP — the cluster \
+             would lose its route to the node; got: {addresses:?}"
+        );
+        let types: Vec<&str> = addresses
+            .iter()
+            .map(|a| a["type"].as_str().unwrap())
+            .collect();
+        assert!(
+            types.contains(&"InternalIP") && types.contains(&"ExternalIP"),
+            "both the original and newly-patched address type must survive; got: {types:?}"
+        );
+    }
+
+    /// PodStatus.resourceClaimStatuses must be registered with merge key "name" (matching
+    /// upstream's `patchStrategy:"merge,retainKeys" patchMergeKey:"name"` tag), reached via
+    /// the /status subresource handler which strips the "status" wrapper before calling SMP.
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a kubelet
+    /// status patch reporting a newly-allocated DRA claim silently REPLACES the whole array
+    /// instead of merging by name — dropping the allocation result of every other
+    /// already-allocated claim.
+    #[test]
+    fn test_smp_resource_claim_statuses_merge_preserves_existing() {
+        let mut status = json!({
+            "resourceClaimStatuses": [
+                {"name": "gpu", "resourceClaimName": "gpu-claim-abc123"}
+            ]
+        });
+        let patch = json!({
+            "resourceClaimStatuses": [
+                {"name": "nic", "resourceClaimName": "nic-claim-def456"}
+            ]
+        });
+
+        strategic_merge_patch(&mut status, &patch).unwrap();
+
+        let statuses = status["resourceClaimStatuses"].as_array().unwrap();
+        assert_eq!(
+            statuses.len(),
+            2,
+            "reporting a newly-allocated claim must not silently drop an already-allocated \
+             claim's status; got: {statuses:?}"
+        );
+        let names: Vec<&str> = statuses
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"gpu") && names.contains(&"nic"),
+            "both the original and newly-patched claim name must survive; got: {names:?}"
+        );
+    }
+
+    /// ServiceAccount.secrets must be registered with merge key "name" (matching upstream's
+    /// `patchStrategy:"merge" patchMergeKey:"name"` tag). Unlike the other fixes above,
+    /// ServiceAccount has no spec/status wrapper — secrets is a top-level field, so the path
+    /// is always the bare field name (root path "" on a main-resource PATCH).
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a patch adding
+    /// a newly-created secret reference silently REPLACES the whole array instead of merging
+    /// by name — revoking every other secret's mountable-secrets grant for pods using this
+    /// ServiceAccount.
+    #[test]
+    fn test_smp_service_account_secrets_merge_preserves_existing() {
+        let mut target = json!({
+            "secrets": [
+                {"name": "default-token-abc12"}
+            ]
+        });
+        let patch = json!({
+            "secrets": [
+                {"name": "extra-token-xyz89"}
+            ]
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let secrets = target["secrets"].as_array().unwrap();
+        assert_eq!(
+            secrets.len(),
+            2,
+            "adding a new secret reference must not silently drop the original — pods \
+             already relying on it would lose access; got: {secrets:?}"
+        );
+        let names: Vec<&str> = secrets
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"default-token-abc12") && names.contains(&"extra-token-xyz89"),
+            "both the original and newly-patched secret name must survive; got: {names:?}"
+        );
+    }
+
+    // --- Completeness check: every schema-declared +patchMergeKey field must have SOME
+    // matching entry in merge_key_for_path ---
+    //
+    // The vendored .proto files carry upstream's patchMergeKey/patchStrategy/listType
+    // annotations verbatim as `//` comments (copied from the Go struct tags this repo has no
+    // other access to). This parses those comments and cross-references every
+    // (message, field, patchMergeKey) triple found against merge_key_for_path, so a field
+    // that declares a merge key upstream can't silently regress to whole-array-replace the
+    // way the 5 fields fixed above did — without this test ever having to hand-list every
+    // field merge_key_for_path already knows about.
+
+    /// One `+patchMergeKey=...` field extracted from a vendored .proto file's comments,
+    /// together with any `+listType=...` annotation on the same field (needed to detect the
+    /// legacy-strategic-merge-patch-vs-SSA annotation conflicts handled below).
+    struct ProtoPatchMergeKeyField {
+        message: String,
+        field: String,
+        patch_merge_key: String,
+        list_type: Option<String>,
+    }
+
+    /// Extracts every `repeated` field whose immediately-preceding comment block declares
+    /// `+patchMergeKey=<key>`, pairing it with the enclosing `message` and any co-located
+    /// `+listType=<value>` annotation. Annotation comments only ever apply to the field
+    /// declared directly below them, so any other line (a blank line, a non-repeated field, a
+    /// closing brace, ...) resets whatever was pending.
+    fn parse_patch_merge_key_fields(proto_source: &str) -> Vec<ProtoPatchMergeKeyField> {
+        let mut fields = Vec::new();
+        let mut current_message = String::new();
+        let mut pending_key: Option<String> = None;
+        let mut pending_list_type: Option<String> = None;
+
+        for raw_line in proto_source.lines() {
+            let line = raw_line.trim();
+
+            if let Some(rest) = line.strip_prefix("message ") {
+                current_message = rest.trim_end_matches('{').trim().to_string();
+                pending_key = None;
+                pending_list_type = None;
+                continue;
+            }
+
+            if let Some(comment) = line.strip_prefix("//") {
+                let comment = comment.trim();
+                if let Some(v) = comment.strip_prefix("+patchMergeKey=") {
+                    pending_key = Some(v.to_string());
+                } else if let Some(v) = comment.strip_prefix("+listType=") {
+                    pending_list_type = Some(v.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("repeated ") {
+                if let Some(key) = pending_key.take() {
+                    let field = rest.split_whitespace().nth(1).unwrap_or("").to_string();
+                    fields.push(ProtoPatchMergeKeyField {
+                        message: current_message.clone(),
+                        field,
+                        patch_merge_key: key,
+                        list_type: pending_list_type.take(),
+                    });
+                }
+                pending_key = None;
+                pending_list_type = None;
+                continue;
+            }
+
+            // An `optional` field, a blank line, a closing brace, ... — annotations never
+            // carry over past a line that isn't the field they were written for.
+            pending_key = None;
+            pending_list_type = None;
+        }
+
+        fields
+    }
+
+    fn collect_proto_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_proto_files(&path, out);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("generated.proto") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// True if `merge_key_for_path` returns `Key(expected_key)` for at least one JSON path
+    /// shape a field named `field` could realistically appear at: a top-level field (bare, or
+    /// directly under spec/spec.template.spec — matching an exact-path table entry), or
+    /// nested one level inside an already-merged array element (matching a generic
+    /// `.ends_with(".field")` suffix arm — any non-empty prefix probes every suffix arm
+    /// identically, so one stand-in nested prefix is enough to cover all of them).
+    fn merge_key_for_path_covers(field: &str, expected_key: &str) -> bool {
+        let candidates = [
+            field.to_string(),
+            format!("spec.{field}"),
+            format!("spec.template.spec.{field}"),
+            format!("spec.containers.{field}"),
+        ];
+        candidates
+            .iter()
+            .any(|p| matches!(merge_key_for_path(p), MergeKeyKind::Key(k) if k == expected_key))
+    }
+
+    #[test]
+    fn merge_key_for_path_covers_every_schema_declared_patch_merge_key() {
+        // Fields whose upstream annotations are self-contradictory: they declare BOTH
+        // patchStrategy=merge/patchMergeKey=<key> (the legacy strategic-merge-patch this file
+        // implements) AND +listType=atomic (an SSA-era annotation meaning "always replace the
+        // whole list"). The two systems disagree on these specific fields and nothing here
+        // can pick a winner without evidence of real client behavior — asserting an answer
+        // would just be a guess, so these are deliberately excluded from the "must have a
+        // merge key" check below rather than silently forced one way or the other.
+        let known_ambiguous: &[(&str, &str)] =
+            &[("JobStatus", "conditions"), ("PodStatus", "hostIPs")];
+
+        // Real, unambiguous gaps this same check found beyond the batch fixed above — kept
+        // failing-by-default (not silently fixed here) because each needs its own
+        // collision/JSON-key review before a table entry can be written, same as
+        // NodeStatus.addresses above needed:
+        //  - CSINodeSpec.drivers, and the four *.matchConditions (MutatingWebhook,
+        //    MutatingAdmissionPolicySpec, ValidatingWebhook, ValidatingAdmissionPolicySpec):
+        //    field name is unique/consistent, a plain suffix arm is likely safe, but unverified
+        //    against a live cluster.
+        //  - ValidatingAdmissionPolicySpec.variables: MutatingAdmissionPolicySpec.variables
+        //    shares the field name but declares +listType=atomic with NO patchMergeKey — same
+        //    cross-message collision shape as addresses, needs an exact-path (not suffix) entry.
+        //  - {Mutating,Validating}WebhookConfiguration's field is literally spelled "Webhooks"
+        //    (capitalized) in this .proto, but the real JSON wire key is lowercase "webhooks"
+        //    (see admissionreg_gen_adapter.rs's `"webhooks": webhooks` construction) — a table
+        //    entry keyed on the proto token as-is would never match real traffic.
+        //  - JSONSchemaProps.xKubernetesValidations: the real JSON wire key is hyphenated
+        //    "x-kubernetes-validations" (see apiextensions_gen_adapter.rs's
+        //    `"x-kubernetes-validations".to_string()`), not the camelCase proto token; also
+        //    nested inside a recursive schema structure with no fixed depth.
+        let known_missing_tracked_separately: &[(&str, &str)] = &[
+            ("CSINodeSpec", "drivers"),
+            ("MutatingAdmissionPolicySpec", "matchConditions"),
+            ("MutatingWebhook", "matchConditions"),
+            ("ValidatingAdmissionPolicySpec", "matchConditions"),
+            ("ValidatingAdmissionPolicySpec", "variables"),
+            ("ValidatingWebhook", "matchConditions"),
+            ("MutatingWebhookConfiguration", "Webhooks"),
+            ("ValidatingWebhookConfiguration", "Webhooks"),
+            ("JSONSchemaProps", "xKubernetesValidations"),
+        ];
+
+        let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto-include");
+        let mut proto_paths = Vec::new();
+        collect_proto_files(&proto_dir, &mut proto_paths);
+        assert!(
+            proto_paths.len() > 10,
+            "sanity check: expected many vendored generated.proto files under {}, found {} — \
+             did the vendor layout move (this test would otherwise pass vacuously)?",
+            proto_dir.display(),
+            proto_paths.len()
+        );
+
+        let mut missing = Vec::new();
+        let mut unexpected_ambiguous = Vec::new();
+
+        for path in &proto_paths {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for f in parse_patch_merge_key_fields(&source) {
+                let is_annotation_conflict = f.list_type.as_deref() == Some("atomic");
+                let is_known_ambiguous = known_ambiguous
+                    .iter()
+                    .any(|(m, field)| *m == f.message && *field == f.field);
+
+                if is_annotation_conflict {
+                    if !is_known_ambiguous {
+                        unexpected_ambiguous.push(format!(
+                            "{}.{} (patchMergeKey={}) in {}",
+                            f.message,
+                            f.field,
+                            f.patch_merge_key,
+                            path.display()
+                        ));
+                    }
+                    continue;
+                }
+
+                let is_tracked_separately = known_missing_tracked_separately
+                    .iter()
+                    .any(|(m, field)| *m == f.message && *field == f.field);
+
+                if !is_tracked_separately
+                    && !merge_key_for_path_covers(&f.field, &f.patch_merge_key)
+                {
+                    missing.push(format!(
+                        "{}.{} (patchMergeKey={}) in {}",
+                        f.message,
+                        f.field,
+                        f.patch_merge_key,
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            unexpected_ambiguous.is_empty(),
+            "field(s) newly declare BOTH patchMergeKey and +listType=atomic (a conflict \
+             between the legacy strategic-merge-patch and SSA annotation systems) that aren't \
+             in the known_ambiguous allowlist above — decide deliberately which annotation \
+             patch.rs should trust for each rather than picking a side here: \
+             {unexpected_ambiguous:#?}"
+        );
+        assert!(
+            missing.is_empty(),
+            "merge_key_for_path has no registered entry (exact-path or suffix arm) for these \
+             schema-declared +patchMergeKey fields — a strategic-merge-patch against them will \
+             silently replace the whole array instead of merging by key (or 400 on \
+             $patch:delete): {missing:#?}"
         );
     }
 }
