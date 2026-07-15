@@ -25,9 +25,11 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CollectionQuery {
     pub watch: Option<bool>,
+    #[serde(rename = "resourceVersion")]
     pub resource_version: Option<u64>,
     #[serde(rename = "labelSelector")]
     pub label_selector: Option<String>,
+    #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
     /// When true, the server emits existing pods as ADDED events before streaming
     /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
@@ -1247,7 +1249,8 @@ mod watch_tests {
     }
 
     /// CollectionQuery with watch=true and resource_version=42 routes to watch mode.
-    /// Verified by constructing the struct directly and checking the fields Axum would populate.
+    /// Constructs the struct directly, so this only checks field wiring — it does NOT
+    /// exercise axum's query-string deserialization (see the camelCase test below for that).
     #[test]
     fn collection_query_watch_flag_present() {
         let q = CollectionQuery {
@@ -1277,6 +1280,38 @@ mod watch_tests {
         };
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);
+    }
+
+    /// Regression: kubectl, client-go, and the e2e test framework always send
+    /// `resourceVersion` (camelCase) on the wire — never `resource_version`. The two
+    /// tests above construct CollectionQuery as a Rust struct literal, so they never
+    /// exercise axum's actual query-string deserialization and would keep passing even
+    /// if resourceVersion silently failed to parse.
+    ///
+    /// Without `#[serde(rename = "resourceVersion")]`, axum's Query extractor leaves
+    /// resource_version as None for every real watch request, so
+    /// `from_rv = query.resource_version.unwrap_or(0)` always resolves to 0: every
+    /// namespaced pod watch replays the full object history instead of resuming from
+    /// the client's snapshot revision. This is what made
+    /// "[sig-apps] Deployment should delete old replica sets" see a spurious extra pod
+    /// ADDED event and fail with "Expect only one pod creation, second creation event
+    /// ADDED" — the test's own List+Watch(resourceVersion) on a namespace-scoped pod
+    /// watch hit exactly this path. This test fails on revert of the rename.
+    #[test]
+    fn collection_query_parses_camel_case_resource_version_from_real_query_string() {
+        let uri: axum::http::Uri =
+            "/api/v1/namespaces/default/pods?watch=true&resourceVersion=1477"
+                .parse()
+                .unwrap();
+        let Query(q) = Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("valid query string must deserialize");
+        assert_eq!(
+            q.resource_version,
+            Some(1477),
+            "resourceVersion (the wire format every real client sends) must populate \
+             resource_version; a missing #[serde(rename)] leaves it None and silently \
+             resets every watch to a full history replay"
+        );
     }
 }
 
@@ -9613,6 +9648,10 @@ mod handler_tests {
     }
 
     /// GET /pods with a field selector must filter pods by nodeName.
+    ///
+    /// Uses the camelCase `fieldSelector` key real clients send (kubectl, client-go,
+    /// kubelet) — not `field_selector`. A struct missing `#[serde(rename)]` would
+    /// silently leave the field unparsed and return all pods unfiltered.
     #[tokio::test]
     async fn list_pods_with_field_selector_filters_pods() {
         use axum::http::method::Method;
@@ -9665,7 +9704,7 @@ mod handler_tests {
 
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/api/v1/namespaces/default/pods?field_selector=spec.nodeName%3Dworker-1")
+            .uri("/api/v1/namespaces/default/pods?fieldSelector=spec.nodeName%3Dworker-1")
             .body(Body::empty())
             .unwrap();
 
