@@ -1464,6 +1464,27 @@ pub async fn openapi_v2<S: Store>(
 pub async fn openapi_v3<S: Store>(State(state): State<AppState<S>>) -> Response {
     let mut paths = serde_json::Map::new();
 
+    // Core group ("" / v1) and every STATIC_GROUPS group+version get a real entry here
+    // even with zero CRDs registered. kubectl 1.28+'s default (v3) `explain` renderer
+    // looks up "api/v1" or "apis/<group>/<version>" in exactly this map and errors with
+    // `couldn't find resource for ...` if the key is missing -- it does NOT fall back to
+    // /openapi/v2 just because a key is absent (only if fetching /openapi/v3 itself errors
+    // outright), so a missing entry here breaks `kubectl explain <builtin>` unconditionally.
+    paths.insert(
+        "api/v1".to_string(),
+        serde_json::json!({ "serverRelativeURL": "/openapi/v3/api/v1" }),
+    );
+    for group in &api_group_list_inner(&state).await.groups {
+        if !STATIC_GROUPS.iter().any(|(name, _)| *name == group.name) {
+            continue; // CRD-backed groups are added below; aggregated groups aren't served yet.
+        }
+        for gv in &group.versions {
+            let key = format!("apis/{}", gv.group_version);
+            let url = format!("/openapi/v3/{key}");
+            paths.insert(key, serde_json::json!({ "serverRelativeURL": url }));
+        }
+    }
+
     if let Ok(resp) = state
         .store
         .list(
@@ -1782,7 +1803,20 @@ pub async fn openapi_v3_group<S: Store>(
     }
 
     if schemas.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
+        // Not CRD-backed -- fall back to a static built-in group/version, if this is
+        // one, so `kubectl explain <builtin>` gets a real document instead of a 404
+        // (client-go's explain v2 renderer treats a fetch error here as a hard
+        // failure, not a signal to retry against /openapi/v2).
+        return match static_group_resources(group.as_str(), version.as_str()) {
+            Some(resource_list) => Json(static_group_v3_document(
+                group.as_str(),
+                version.as_str(),
+                &resource_list,
+                &format!("/apis/{group}/{version}"),
+            ))
+            .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
     }
     schemas.insert(OBJECT_META_SCHEMA_NAME.to_string(), object_meta_v3_schema());
 
@@ -1793,6 +1827,296 @@ pub async fn openapi_v3_group<S: Store>(
         "components": { "schemas": schemas }
     }))
     .into_response()
+}
+
+/// Handler for `GET /openapi/v3/api/v1` — the core group's OpenAPI v3 document.
+/// `kubectl explain <core-kind>` (Pod, Service, ConfigMap, ...) needs this: the default
+/// (v3) explain renderer resolves "api/v1" from `/openapi/v3`'s `paths` map (see
+/// `openapi_v3`) and then fetches exactly this document.
+pub async fn openapi_v3_core() -> Response {
+    Json(static_group_v3_document(
+        "",
+        "v1",
+        &api_v1_resource_list_value(),
+        "/api/v1",
+    ))
+    .into_response()
+}
+
+/// Curated, real top-level description for the handful of built-in Kinds users most
+/// commonly `kubectl explain`. Transcribed verbatim (trimmed to the essential sentence)
+/// from k8s.io/api's `types.go` doc comments (release-1.36) — not invented, so it can't
+/// drift from what `kubectl explain <kind>` shows against a real cluster.
+fn curated_kind_description(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Pod" => Some(
+            "Pod is a collection of containers that can run on a host. This resource is \
+             created by clients and scheduled onto hosts.",
+        ),
+        "Service" => Some(
+            "Service is a named abstraction of software service (for example, mysql) \
+             consisting of local port (for example 3306) that the proxy listens on, and the \
+             selector that determines which pods will answer requests sent through the proxy.",
+        ),
+        "ConfigMap" => Some("ConfigMap holds configuration data for pods to consume."),
+        "Secret" => Some(
+            "Secret holds secret data of a certain type. The total bytes of the values in the \
+             Data field must be less than MaxSecretSize bytes.",
+        ),
+        "Namespace" => {
+            Some("Namespace provides a scope for Names. Use of multiple namespaces is optional.")
+        }
+        "Deployment" => Some("Deployment enables declarative updates for Pods and ReplicaSets."),
+        _ => None,
+    }
+}
+
+/// Curated, real top-level properties (beyond the universal apiVersion/kind/metadata every
+/// Kind gets from `inject_standard_object_fields`) for the same curated Kinds as
+/// `curated_kind_description`, transcribed from `types.go` the same way.
+///
+/// Deliberately shallow: each property is `type: object` (or a primitive/map) with no
+/// nested `properties` of its own. `kubectl explain <kind>` (no field path) only reads a
+/// Kind's OWN top-level shape, so this is enough to make that succeed with real field
+/// names; going deeper (e.g. every PodSpec field) is follow-up scope.
+///
+/// Kinds NOT listed here still get a valid, correct schema (apiVersion/kind/metadata only)
+/// rather than a guessed `spec`/`status` -- many built-ins (ConfigMap, Secret, Endpoints...)
+/// don't follow that convention, and a wrong field name is worse than an incomplete one.
+fn curated_top_level_properties(kind: &str) -> Option<Vec<(&'static str, serde_json::Value)>> {
+    match kind {
+        "Pod" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Specification of the desired behavior of the pod. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Most recently observed status of the pod. This data may not be \
+                        up to date. Populated by the system. Read-only. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "Service" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Spec defines the behavior of a service. \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Most recently observed status of the service. Populated by the \
+                        system. Read-only. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "Namespace" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Spec defines the behavior of the Namespace. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Status describes the current status of a Namespace. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "ConfigMap" => Some(vec![
+            (
+                "immutable",
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Immutable, if set to true, ensures that data stored in the \
+                        ConfigMap cannot be updated (only object metadata can be modified). If not \
+                        set to true, the field can be modified at any time. Defaulted to nil."
+                }),
+            ),
+            (
+                "data",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Data contains the configuration data. Each key must consist of \
+                        alphanumeric characters, '-', '_' or '.'. Values with non-UTF-8 byte \
+                        sequences must use the BinaryData field. The keys stored in Data must not \
+                        overlap with the keys in the BinaryData field, this is enforced during \
+                        validation process."
+                }),
+            ),
+            (
+                "binaryData",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string", "format": "byte" },
+                    "description": "BinaryData contains the binary data. Each key must consist of \
+                        alphanumeric characters, '-', '_' or '.'. BinaryData can contain byte \
+                        sequences that are not in the UTF-8 range. The keys stored in BinaryData \
+                        must not overlap with the ones in the Data field, this is enforced during \
+                        validation process. Using this field will require 1.10+ apiserver and kubelet."
+                }),
+            ),
+        ]),
+        "Secret" => Some(vec![
+            (
+                "immutable",
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Immutable, if set to true, ensures that data stored in the \
+                        Secret cannot be updated (only object metadata can be modified). If not set \
+                        to true, the field can be modified at any time. Defaulted to nil."
+                }),
+            ),
+            (
+                "data",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string", "format": "byte" },
+                    "description": "Data contains the secret data. Each key must consist of \
+                        alphanumeric characters, '-', '_' or '.'. The serialized form of the secret \
+                        data is a base64 encoded string, representing the arbitrary (possibly \
+                        non-string) data value here. Described in \
+                        https://tools.ietf.org/html/rfc4648#section-4"
+                }),
+            ),
+            (
+                "stringData",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "stringData allows specifying non-binary secret data in string \
+                        form. It is provided as a write-only input field for convenience. All keys \
+                        and values are merged into the data field on write, overwriting any existing \
+                        values. The stringData field is never output when reading from the API."
+                }),
+            ),
+            (
+                "type",
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Used to facilitate programmatic handling of secret data. More \
+                        info: https://kubernetes.io/docs/concepts/configuration/secret/#secret-types"
+                }),
+            ),
+        ]),
+        "Deployment" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Specification of the desired behavior of the Deployment."
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Most recently observed status of the Deployment."
+                }),
+            ),
+        ]),
+        _ => None,
+    }
+}
+
+/// Build an OpenAPI v3 document (`paths` + `components.schemas`) for a static (built-in)
+/// group/version from its `APIResourceList`-shaped resource data (the same JSON already
+/// used to answer `GET /apis/<group>/<version>` and `GET /api/v1` — see
+/// `static_group_resources` / `api_v1_resource_list_value`).
+///
+/// One function serves every static group uniformly: every Kind gets a real, correct
+/// schema (apiVersion/kind/metadata, always accurate) enriched with
+/// `curated_top_level_properties` for the handful of Kinds that table covers. This is
+/// deliberately the ONLY place built-in v3 schemas are assembled — adding a group or Kind
+/// never means copy-pasting this function, only adding data to the curated tables above.
+fn static_group_v3_document(
+    group: &str,
+    version: &str,
+    resource_list: &serde_json::Value,
+    path_prefix: &str,
+) -> serde_json::Value {
+    let mut schemas = serde_json::Map::new();
+    let mut paths = serde_json::Map::new();
+    let empty = Vec::new();
+    let resources = resource_list["resources"].as_array().unwrap_or(&empty);
+
+    for r in resources {
+        let name = r["name"].as_str().unwrap_or("");
+        // Subresources (scale, status, binding, ...) share their parent's Kind schema and
+        // aren't independently explainable Kinds.
+        if name.is_empty() || name.contains('/') {
+            continue;
+        }
+        let kind = r["kind"].as_str().unwrap_or("");
+        if kind.is_empty() || schemas.contains_key(kind) {
+            continue;
+        }
+        let namespaced = r["namespaced"].as_bool().unwrap_or(false);
+        let gvk = serde_json::json!({ "group": group, "version": version, "kind": kind });
+
+        let mut schema_obj = serde_json::Map::new();
+        schema_obj.insert("type".to_string(), serde_json::json!("object"));
+        if let Some(description) = curated_kind_description(kind) {
+            schema_obj.insert("description".to_string(), serde_json::json!(description));
+        }
+        schema_obj.insert(
+            "x-kubernetes-group-version-kind".to_string(),
+            serde_json::json!([gvk.clone()]),
+        );
+        inject_standard_object_fields(&mut schema_obj);
+        if let Some(extra) = curated_top_level_properties(kind) {
+            if let Some(properties) = schema_obj
+                .get_mut("properties")
+                .and_then(|p| p.as_object_mut())
+            {
+                for (field, def) in extra {
+                    properties.insert(field.to_string(), def);
+                }
+            }
+        }
+        schemas.insert(kind.to_string(), serde_json::Value::Object(schema_obj));
+
+        let path_key = if namespaced {
+            format!("{path_prefix}/namespaces/{{namespace}}/{name}")
+        } else {
+            format!("{path_prefix}/{name}")
+        };
+        paths.insert(
+            path_key,
+            serde_json::json!({ "get": { "x-kubernetes-group-version-kind": gvk } }),
+        );
+    }
+
+    schemas.insert(OBJECT_META_SCHEMA_NAME.to_string(), object_meta_v3_schema());
+
+    serde_json::json!({
+        "openapi": "3.0.0",
+        "info": {
+            "title": if group.is_empty() { version.to_string() } else { format!("{group}/{version}") },
+            "version": "v1"
+        },
+        "paths": paths,
+        "components": { "schemas": schemas }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4051,6 +4375,171 @@ mod tests {
              CustomResourcePublishOpenAPI conformance test regex requires this exact \
              prefix; got: {:?}",
             creation_timestamp["description"]
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // openapi_v3 built-in (non-CRD) group coverage — kubectl explain <builtin>
+    //
+    // Before this fix, `openapi_v3()`'s `paths` map only ever contained CRD-backed
+    // group/versions, so on a stack with zero CRDs registered `kubectl explain pods`
+    // and `kubectl explain deployments` failed unconditionally with `couldn't find
+    // resource for "..."` — kubectl 1.28+'s default explain renderer looks up
+    // "api/v1"/"apis/<group>/<version>" in exactly this map and does not fall back to
+    // /openapi/v2 just because the key is absent.
+    // ---------------------------------------------------------------------------
+
+    // /openapi/v3's root `paths` index must list "api/v1" and every STATIC_GROUPS
+    // group/version even when zero CRDs are registered — this is the exact repro that
+    // made `kubectl explain <any built-in>` fail 100% of the time on a fresh stack.
+    #[tokio::test]
+    async fn openapi_v3_root_paths_includes_core_and_static_groups_with_zero_crds() {
+        let state = make_state();
+
+        let resp = openapi_v3(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let paths = val["paths"].as_object().expect("paths must be an object");
+
+        assert!(
+            paths.contains_key("api/v1"),
+            "paths must contain \"api/v1\" with zero CRDs registered — kubectl explain's \
+             v3 renderer looks up this exact key for every core-group resource (Pod, \
+             Service, ConfigMap, ...) and errors with `couldn't find resource` if it's \
+             absent; got keys: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            paths.contains_key("apis/apps/v1"),
+            "paths must contain \"apis/apps/v1\" with zero CRDs registered — \
+             `kubectl explain deployments` looks up this exact key; got keys: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // GET /openapi/v3/api/v1 (Pod, the type `kubectl explain pods` needs) must return a
+    // document whose Pod schema has the real top-level fields (apiVersion, kind, metadata,
+    // spec, status) and whose `paths` resolves the pods resource to the Pod GVK — the two
+    // things kubectl's v3 explain renderer reads before it can print anything.
+    #[tokio::test]
+    async fn openapi_v3_core_pod_schema_has_real_top_level_fields() {
+        let resp = openapi_v3_core().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let pod = &val["components"]["schemas"]["Pod"];
+        assert_eq!(
+            pod["description"].as_str().unwrap_or_default(),
+            "Pod is a collection of containers that can run on a host. This resource is \
+             created by clients and scheduled onto hosts.",
+            "kubectl explain pods must show Pod's real top-level DESCRIPTION"
+        );
+        for field in ["apiVersion", "kind", "metadata", "spec", "status"] {
+            assert!(
+                !pod["properties"][field].is_null(),
+                "Pod schema must have a \"{field}\" property — this is exactly what \
+                 `kubectl explain pods`'s FIELDS section lists; got properties: {:?}",
+                pod["properties"]
+            );
+        }
+
+        let paths = val["paths"].as_object().expect("paths must be an object");
+        let op = paths
+            .get("/api/v1/namespaces/{namespace}/pods")
+            .expect("paths must resolve the pods resource to a GVK");
+        assert_eq!(op["get"]["x-kubernetes-group-version-kind"]["kind"], "Pod");
+    }
+
+    // GET /openapi/v3/apis/apps/v1 (Deployment) on a stack with zero CRDs registered must
+    // return 200 with a Deployment schema, not the CRD-only 404 — this is the second
+    // explicitly-required repro from the bug report (`kubectl explain deployments`).
+    #[tokio::test]
+    async fn openapi_v3_group_apps_v1_returns_deployment_schema_with_zero_crds() {
+        let state = make_state();
+
+        let resp =
+            openapi_v3_group(State(state), Path(("apps".to_string(), "v1".to_string()))).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/openapi/v3/apis/apps/v1 must return 200 even with zero CRDs registered — \
+             apps/v1 is a built-in group, not CRD-backed"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let deployment = &val["components"]["schemas"]["Deployment"];
+        assert_eq!(
+            deployment["properties"]["spec"]["description"]
+                .as_str()
+                .unwrap_or_default(),
+            "Specification of the desired behavior of the Deployment.",
+            "kubectl explain deployments must show Deployment's real \"spec\" field"
+        );
+        assert!(
+            !deployment["properties"]["status"].is_null(),
+            "Deployment schema must have a \"status\" property"
+        );
+    }
+
+    // A built-in Kind not in the curated top-level-fields table (ConfigMap does NOT follow
+    // the spec/status convention: real ConfigMap fields are data/binaryData/immutable) must
+    // show its OWN real fields, never a guessed "spec" — a wrong field name would be more
+    // misleading to a `kubectl explain configmaps` user than an incomplete schema.
+    #[tokio::test]
+    async fn openapi_v3_core_configmap_schema_has_real_fields_not_invented_spec() {
+        let resp = openapi_v3_core().await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let props = &val["components"]["schemas"]["ConfigMap"]["properties"];
+
+        assert!(
+            !props["data"].is_null(),
+            "ConfigMap schema must have its real \"data\" field"
+        );
+        assert!(
+            props["spec"].is_null(),
+            "ConfigMap has no \"spec\" field in real Kubernetes — inventing one would be \
+             actively wrong, not just incomplete; got properties: {props:?}"
+        );
+    }
+
+    // A built-in Kind in a group with NO curated top-level fields at all (batch/v1 isn't in
+    // the curated table) must still resolve to a valid document — `kubectl explain jobs`
+    // should get a correct-but-minimal schema (apiVersion/kind/metadata), never the 404 an
+    // unrecognized group gets, since batch/v1 IS a real built-in group.
+    #[tokio::test]
+    async fn openapi_v3_group_uncurated_static_group_still_returns_200_not_404() {
+        let state = make_state();
+
+        let resp =
+            openapi_v3_group(State(state), Path(("batch".to_string(), "v1".to_string()))).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "batch/v1 is a real built-in group (STATIC_GROUPS) — it must never 404 just \
+             because it has no curated top-level fields yet"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let job = &val["components"]["schemas"]["Job"];
+        assert_eq!(
+            job["properties"]["apiVersion"]["type"], "string",
+            "even an uncurated Kind must get the real apiVersion/kind/metadata fields; \
+             got: {job:?}"
         );
     }
 
