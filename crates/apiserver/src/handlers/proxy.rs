@@ -1561,6 +1561,21 @@ async fn pod_proxy_via_connect_tunnel(
     Ok((status, headers, collected.to_bytes()))
 }
 
+/// Merge the inbound request's query string (if any) onto the forwarded proxy path.
+///
+/// `path_suffix` (the portion after `/proxy/`) never carries the query string —
+/// axum's path extractor and `http::Uri` keep them separate — so callers that build
+/// the outbound URL from `path_suffix` alone silently drop it. That breaks apps like
+/// the guestbook conformance test whose entire request contract is `?cmd=set&key=k&value=v`
+/// query params. Skips the `?` entirely when there is no query string, so a request
+/// with no query does not grow a bare trailing `?`.
+fn append_query(path_suffix: &str, query: Option<&str>) -> String {
+    match query {
+        Some(q) => format!("{path_suffix}?{q}"),
+        None => path_suffix.to_owned(),
+    }
+}
+
 /// Proxy a request to the pod's IP and containerPort.
 ///
 /// Shared implementation for both the with-subpath and no-subpath pod proxy routes.
@@ -1575,9 +1590,11 @@ async fn pod_proxy_dispatch<S: Store>(
     let (pod_ip, port, proxy_addr) = resolve_pod_proxy_target(state, ns, pod_name).await?;
 
     let method = req.method().clone();
+    let query = req.uri().query().map(str::to_owned);
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+    let path_with_query = append_query(path_suffix, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
         // Route through konnectivity via an explicit CONNECT tunnel.
@@ -1586,7 +1603,7 @@ async fn pod_proxy_dispatch<S: Store>(
             addr,
             &pod_ip,
             port,
-            path_suffix,
+            &path_with_query,
             method,
             body_bytes,
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
@@ -1618,7 +1635,7 @@ async fn pod_proxy_dispatch<S: Store>(
     }
 
     // No konnectivity proxy — direct connection to pod IP.
-    let target_url = format!("http://{pod_ip}:{port}/{path_suffix}");
+    let target_url = format!("http://{pod_ip}:{port}/{path_with_query}");
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -1861,16 +1878,18 @@ async fn service_proxy_dispatch<S: Store>(
     // Service endpoints are reached the same way as pod IPs — via konnectivity
     // when configured, or directly otherwise.
     let method = req.method().clone();
+    let query = req.uri().query().map(str::to_owned);
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+    let path_with_query = append_query(path_suffix, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
         let (status, headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &ep_ip,
             port,
-            path_suffix,
+            &path_with_query,
             method,
             body_bytes,
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
@@ -1901,7 +1920,7 @@ async fn service_proxy_dispatch<S: Store>(
         return proxied_response(status, &headers, Body::from(body));
     }
 
-    let target_url = format!("http://{ep_ip}:{port}/{path_suffix}");
+    let target_url = format!("http://{ep_ip}:{port}/{path_with_query}");
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -4590,6 +4609,228 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Proxy requests must forward the inbound query string
+    //
+    // pod_proxy_dispatch/service_proxy_dispatch built the outbound request from
+    // path_suffix alone — req.uri().query() was never read in any of the direct-HTTP
+    // or konnectivity-tunnel branches. Apps proxied through the pod/Service proxy
+    // subresource whose entire protocol is query params (e.g. the Kubectl Guestbook
+    // conformance test's ?cmd=&key=&value=) silently received no arguments at all and
+    // returned "unsupported cmd: ''" for every request even though routing succeeded.
+    // -----------------------------------------------------------------------
+
+    /// append_query must append a present query string onto the forwarded path.
+    ///
+    /// pod_proxy_dispatch and service_proxy_dispatch call this instead of using
+    /// path_suffix directly. If it stops appending the query, every proxied request
+    /// that depends on query params (e.g. guestbook's cmd/key/value) breaks even
+    /// though routing to the right pod/endpoint still succeeds.
+    #[test]
+    fn append_query_appends_present_query_string() {
+        assert_eq!(
+            super::append_query("guestbook", Some("cmd=set&key=k&value=v")),
+            "guestbook?cmd=set&key=k&value=v",
+            "the full multi-param query string must survive intact — dropping any \
+             part of it silently breaks a proxied app's request contract"
+        );
+    }
+
+    /// append_query must NOT grow a bare trailing '?' when there is no query string.
+    ///
+    /// Forwarding "path?" instead of "path" would needlessly change the exact request
+    /// the backend sees for requests that never had a query string at all.
+    #[test]
+    fn append_query_no_bare_trailing_question_mark_when_absent() {
+        assert_eq!(
+            super::append_query("guestbook", None),
+            "guestbook",
+            "a proxied request with no query string must not gain a bare trailing '?'"
+        );
+    }
+
+    /// pod_proxy (direct HTTP, no konnectivity) must forward the request's query string.
+    ///
+    /// Before this fix, a GET to .../pods/<p>/proxy/guestbook?cmd=set&key=k&value=v
+    /// reached the pod as a bare "/guestbook" — the guestbook app's entire request
+    /// contract is its cmd/key/value query params, so every proxied request failed
+    /// with "unsupported cmd: ''" even though the pod was healthy and reachable.
+    #[tokio::test]
+    async fn pod_proxy_forwards_query_string() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pod_port = listener.local_addr().unwrap().port();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(request.lines().next().unwrap_or("").to_string());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let state = make_state();
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
+            },
+            "status": {"podIP": "127.0.0.1"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri(
+                "/api/v1/namespaces/default/pods/mypod/proxy/guestbook?cmd=set&key=messages&value=hello",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the mock pod backend must be reachable over plain HTTP"
+        );
+        assert_eq!(
+            rx.await.unwrap(),
+            "GET /guestbook?cmd=set&key=messages&value=hello HTTP/1.1",
+            "pod_proxy_dispatch's direct-HTTP branch dropped the query string — the \
+             backend received a bare path instead of the full guestbook request"
+        );
+    }
+
+    /// pod_proxy over a konnectivity tunnel must also forward the request's query string.
+    ///
+    /// The tunnel branch builds its own request URI from path_suffix inside
+    /// pod_proxy_via_connect_tunnel; fixing only the direct-HTTP branch would leave
+    /// every konnectivity-proxied cluster (the common case once a real CNI is
+    /// involved) still dropping guestbook's cmd/key/value params.
+    #[tokio::test]
+    async fn pod_proxy_via_connect_tunnel_forwards_query_string() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap().to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+
+            // Read and accept the CONNECT request; the target is covered by a
+            // dedicated test, this one only cares about what follows the tunnel.
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+
+            // Read the pod's HTTP request sent over the now-open tunnel.
+            let mut buf2 = [0u8; 512];
+            let n = stream.read(&mut buf2).await.unwrap();
+            let request = String::from_utf8_lossy(&buf2[..n]).to_string();
+            let _ = tx.send(request.lines().next().unwrap_or("").to_string());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}]},
+            "status": {"podIP": "10.0.0.1"}
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: Some(proxy_addr),
+            sa_public_key_pem: None,
+        });
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri(
+                "/api/v1/namespaces/default/pods/mypod/proxy/guestbook?cmd=set&key=messages&value=hello",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the mock konnectivity+pod backend must be reachable over the tunnel"
+        );
+        assert_eq!(
+            rx.await.unwrap(),
+            "GET /guestbook?cmd=set&key=messages&value=hello HTTP/1.1",
+            "pod_proxy_via_connect_tunnel's request URI dropped the query string — a \
+             konnectivity-proxied cluster would drop guestbook's cmd/key/value params \
+             even though the direct-HTTP branch was fixed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // pod_attach: admission webhook check before websocket upgrade
     //
     // The attach handler must run validating webhooks BEFORE upgrading to
@@ -5603,6 +5844,102 @@ mod tests {
                  status means routing or the bare-root redirect is broken"
             );
         }
+    }
+
+    /// service_proxy (direct HTTP, no konnectivity) must forward the request's query string.
+    ///
+    /// service_proxy_dispatch has its own target_url string construction, separate
+    /// from pod_proxy_dispatch's — fixing only the pod path would leave every Service
+    /// proxy request (e.g. the Kubectl Guestbook conformance test reaching guestbook
+    /// through its frontend Service) still dropping cmd/key/value query params.
+    #[tokio::test]
+    async fn service_proxy_forwards_query_string() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep_port = listener.local_addr().unwrap().port();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(request.lines().next().unwrap_or("").to_string());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let state = make_state();
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "frontend", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "frontend"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "frontend-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "frontend"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {"addresses": ["127.0.0.1"], "conditions": {"ready": true}}
+            ],
+            "ports": [{"name": "http", "port": ep_port, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "frontend-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri(
+                "/api/v1/namespaces/default/services/frontend/proxy/guestbook?cmd=set&key=messages&value=hello",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the mock service endpoint must be reachable over plain HTTP"
+        );
+        assert_eq!(
+            rx.await.unwrap(),
+            "GET /guestbook?cmd=set&key=messages&value=hello HTTP/1.1",
+            "service_proxy_dispatch's direct-HTTP branch dropped the query string — the \
+             endpoint received a bare path instead of the full guestbook request"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -3,6 +3,8 @@ mod admissionreg_gen;
 mod admissionreg_gen_adapter;
 mod apiextensions_gen;
 mod apiextensions_gen_adapter;
+mod apiregistration_gen;
+mod apiregistration_gen_adapter;
 mod apps_gen;
 mod apps_gen_adapter;
 mod auth;
@@ -2075,6 +2077,57 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "ClusterRole"
     );
 
+    // -----------------------------------------------------------------------
+    // ClusterRole: system:auth-delegator — lets extension API servers (e.g. an
+    // aggregated sample-apiserver or CRD conversion webhook) delegate
+    // authn/authz decisions back to us via TokenReview/SubjectAccessReview.
+    // Without this, a RoleBinding/ClusterRoleBinding an extension apiserver's
+    // own manifest creates against this ClusterRole grants nothing, and its
+    // in-cluster lookups (e.g. requestheader-client-ca-file from the
+    // extension-apiserver-authentication configmap) fail Forbidden instead of
+    // the tolerated NotFound, which is treated as fatal and crash-loops it.
+    // -----------------------------------------------------------------------
+    let key = keys::group_object_key(GROUP, "clusterroles", None, "system:auth-delegator");
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:auth-delegator", "uid": "00000000-0000-0000-0000-000000000068", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] }
+        ]
+    });
+    put!(key, body, "system:auth-delegator", "ClusterRole");
+
+    // -----------------------------------------------------------------------
+    // Role: kube-system/extension-apiserver-authentication-reader — grants
+    // read access to the extension-apiserver-authentication configmap.
+    // Extension apiservers bind their own service account to this Role name
+    // (it must already exist, same as real kube-apiserver's bootstrap
+    // policy) so their RunOnce lookup of that configmap gets a tolerated
+    // NotFound instead of a fatal Forbidden.
+    // -----------------------------------------------------------------------
+    let key = keys::group_object_key(
+        GROUP,
+        "roles",
+        Some("kube-system"),
+        "extension-apiserver-authentication-reader",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": { "name": "extension-apiserver-authentication-reader", "namespace": "kube-system", "uid": "00000000-0000-0000-0000-000000000069", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["extension-apiserver-authentication"], "verbs": ["get","list","watch"] }
+        ]
+    });
+    put!(
+        key,
+        body,
+        "kube-system/extension-apiserver-authentication-reader",
+        "Role"
+    );
+
     Ok(())
 }
 
@@ -4061,6 +4114,80 @@ mod tests {
         assert!(
             !state.rbac_index.is_allowed(&pod_read_other),
             "users not in system:nodes must not inherit kubelet permissions"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_apiserver_can_read_own_auth_configmap_after_namespace_rolebinding() {
+        // Aggregated apiservers (sample-apiserver) and CRD conversion webhooks bind
+        // their own default ServiceAccount to the well-known
+        // "extension-apiserver-authentication-reader" Role via a RoleBinding they
+        // create themselves in kube-system — exactly like real kube-apiserver's
+        // bootstrap policy, this Role must already exist for that binding to grant
+        // anything. Without it, the extension apiserver's own in-cluster lookup of
+        // the extension-apiserver-authentication configmap gets Forbidden (not the
+        // tolerated NotFound), which is fatal and crash-loops the pod forever, so
+        // its Deployment never becomes Available.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        // Simulate the extension apiserver's own RoleBinding, created at runtime
+        // (not part of bootstrap seeding) in kube-system, targeting its SA in some
+        // other namespace — mirrors what SetUpSampleAPIServer / crd_conversion_webhook
+        // do against the real kube-apiserver.
+        let binding_key = keys::group_object_key(
+            GROUP,
+            "rolebindings",
+            Some("kube-system"),
+            "wardler-auth-reader-aggregator-1234",
+        );
+        let binding_val = serde_json::json!({
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "extension-apiserver-authentication-reader"
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": "default",
+                "namespace": "aggregator-1234"
+            }]
+        });
+        use bytes::Bytes;
+        use u7s_store::Store;
+        store
+            .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+            .await
+            .expect("put rolebinding must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let configmap_read = rbac::AuthzRequest {
+            username: "system:serviceaccount:aggregator-1234:default",
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "configmaps",
+            subresource: "",
+            namespace: Some("kube-system"),
+            name: Some("extension-apiserver-authentication"),
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&configmap_read),
+            "the bootstrap Role kube-system/extension-apiserver-authentication-reader \
+             must exist so an extension apiserver's own RoleBinding to it actually grants \
+             read access — otherwise every aggregated apiserver / CRD conversion webhook \
+             crash-loops fatally on startup"
         );
     }
 

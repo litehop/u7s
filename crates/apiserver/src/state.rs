@@ -85,6 +85,43 @@ impl WatchLimitState {
     }
 }
 
+/// Per-namespace serialization for ResourceQuota admission.
+///
+/// ResourceQuota admission is check-then-act: list current usage, compare to the hard
+/// limit, then write the new object. Without a lock spanning both steps, concurrent
+/// creates in the same namespace (e.g. a ReplicationController controller creating all
+/// missing replicas in one burst) can each list pre-write usage, all pass the check, and
+/// collectively exceed the quota — this is why KCM's RC controller never observed a
+/// rejected create and so never set the `ReplicaFailure` condition. A namespace-scoped
+/// Semaphore(1) serializes the check+write critical section per namespace without
+/// blocking unrelated namespaces.
+#[derive(Clone, Default)]
+pub struct QuotaAdmissionLocks {
+    inner: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+}
+
+impl QuotaAdmissionLocks {
+    pub fn new() -> Self {
+        QuotaAdmissionLocks::default()
+    }
+
+    /// Acquire the per-namespace quota admission lock. Hold the returned permit across
+    /// the whole check-then-write critical section (quota check through the store put)
+    /// so no other create in the same namespace can interleave between them.
+    pub async fn lock(&self, namespace: &str) -> tokio::sync::OwnedSemaphorePermit {
+        let semaphore = {
+            let mut map = self.inner.lock().unwrap();
+            map.entry(namespace.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                .clone()
+        };
+        semaphore
+            .acquire_owned()
+            .await
+            .expect("quota admission semaphore is never closed")
+    }
+}
+
 /// In-memory cache for the 5 admission configuration object sets.
 ///
 /// Cache invalidation strategy: inline, write-through.
@@ -185,6 +222,9 @@ pub struct AppState<S = SqliteStore> {
     /// In-memory cache for the 5 admission configuration object sets.
     /// See `AdmissionConfigCache` for the invalidation strategy.
     pub admission_cache: Arc<AdmissionConfigCache>,
+    /// Per-namespace lock serializing ResourceQuota check-then-write critical sections.
+    /// See `QuotaAdmissionLocks` for why this is required.
+    pub quota_admission_locks: QuotaAdmissionLocks,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -246,6 +286,7 @@ impl<S> Clone for AppState<S> {
             revoked_jtis: self.revoked_jtis.clone(),
             sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
+            quota_admission_locks: self.quota_admission_locks.clone(),
         }
     }
 }
@@ -430,6 +471,7 @@ impl<S: Store> AppState<S> {
             revoked_jtis: Arc::new(Mutex::new(HashSet::new())),
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
+            quota_admission_locks: QuotaAdmissionLocks::new(),
         }
     }
 

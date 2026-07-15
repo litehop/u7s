@@ -58,6 +58,29 @@ struct SaClaims {
     jti: Option<String>,
     /// Subject — format: "system:serviceaccount:<namespace>:<name>"
     sub: String,
+    /// The `kubernetes.io` private claim carrying pod/node binding info for
+    /// bound (projected) service-account tokens. Absent on legacy tokens.
+    #[serde(rename = "kubernetes.io", default)]
+    kubernetes_io: KubernetesIoClaims,
+}
+
+/// Bound-object claims embedded by `handlers::tokens::create_token` under the
+/// `kubernetes.io` claim. Both fields are `None` for legacy (unbound) tokens.
+#[derive(Debug, Deserialize, Default)]
+struct KubernetesIoClaims {
+    #[serde(default)]
+    pod: Option<ClaimRef>,
+    #[serde(default)]
+    node: Option<ClaimRef>,
+}
+
+/// A `{name, uid}` reference embedded in a bound SA token's `kubernetes.io` claim.
+#[derive(Debug, Deserialize)]
+struct ClaimRef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    uid: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -391,16 +414,45 @@ pub(crate) fn try_verify_sa_jwt(
             // Surface the token's unique ID as authentication.kubernetes.io/credential-id
             // so that TokenReview callers can verify which specific token was used.
             // Upstream format: "JTI=" + the jti claim value.
-            let extra = if let Some(jti) = jti {
-                let mut m = HashMap::new();
-                m.insert(
+            let mut extra = HashMap::new();
+            if let Some(jti) = jti {
+                extra.insert(
                     "authentication.kubernetes.io/credential-id".to_owned(),
                     vec![format!("JTI={jti}")],
                 );
-                m
-            } else {
-                HashMap::new()
-            };
+            }
+            // Bound (projected) SA tokens carry pod/node binding info under the
+            // kubernetes.io claim (see handlers::tokens::create_token). Conformance
+            // ([sig-auth] ServiceAccounts "should mount an API token into pods")
+            // calls TokenReview on such a token and asserts these extra entries are
+            // present with values matching the actual bound pod/node — omit them
+            // entirely for legacy tokens that carry no binding rather than fabricate.
+            if let Some(pod) = data.claims.kubernetes_io.pod {
+                if !pod.name.is_empty() && !pod.uid.is_empty() {
+                    extra.insert(
+                        "authentication.kubernetes.io/pod-name".to_owned(),
+                        vec![pod.name],
+                    );
+                    extra.insert(
+                        "authentication.kubernetes.io/pod-uid".to_owned(),
+                        vec![pod.uid],
+                    );
+                }
+            }
+            if let Some(node) = data.claims.kubernetes_io.node {
+                if !node.name.is_empty() {
+                    extra.insert(
+                        "authentication.kubernetes.io/node-name".to_owned(),
+                        vec![node.name],
+                    );
+                    if !node.uid.is_empty() {
+                        extra.insert(
+                            "authentication.kubernetes.io/node-uid".to_owned(),
+                            vec![node.uid],
+                        );
+                    }
+                }
+            }
             Some(UserInfo {
                 username: sub,
                 uid: String::new(),
@@ -480,6 +532,65 @@ fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
         Some(_) => "get",
         None => "list",
     }
+}
+
+/// Decode RFC 3986 `%XX` percent-escapes in a URL query-string component.
+///
+/// Kubernetes clients (client-go) percent-encode `fieldSelector` values, e.g.
+/// `metadata.name%3Dfoo` for `metadata.name=foo`. Bytes that don't form a valid
+/// `%XX` escape are passed through unchanged.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extract the resource name implied by a `fieldSelector=metadata.name=<name>` query
+/// parameter, mirroring real Kubernetes' `RequestInfo` construction (requestinfo.go): a
+/// LIST/WATCH request whose field selector is a single exact-match term on
+/// `metadata.name` is treated, for authorization purposes, as targeting that one named
+/// resource — even though the verb itself remains "list"/"watch".
+///
+/// This is the standard way every client-go informer watches a single named object (e.g.
+/// the ConfigMap informer aggregated apiservers use to read
+/// `kube-system/extension-apiserver-authentication`). Without recognizing it, an RBAC Role
+/// restricted via `resourceNames` can never match this pattern, since a bare LIST/WATCH
+/// request has no name in its URL path.
+///
+/// Only a *single* exact-match term counts (no comma-joined multi-term selector), matching
+/// `FieldSelector.RequiresExactMatch` upstream: a selector combined with other terms, or
+/// using `!=`, does not uniquely identify one resource name.
+fn field_selector_name(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    let raw = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("fieldSelector="))?;
+    let decoded = percent_decode(raw);
+    if decoded.contains(',') {
+        return None;
+    }
+    // Try "==" (explicit equality) before "=" so "key==value" doesn't split into
+    // key="key=" / value="value". "key!=value" is rejected because the key comparison
+    // below fails (the leftover "!" makes it not equal to "metadata.name").
+    let (key, value) = decoded
+        .split_once("==")
+        .or_else(|| decoded.split_once('='))?;
+    if key != "metadata.name" || value.is_empty() {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 /// Parsed path components needed for AuthzRequest construction.
@@ -810,6 +921,26 @@ where
             method_to_verb(req.method())
         };
 
+        // RBAC `resourceNames` restrictions must also recognize the LIST/WATCH-with-
+        // `fieldSelector=metadata.name=<name>` pattern used by every client-go informer
+        // that watches a single named object — e.g. the built-in
+        // `extension-apiserver-authentication-reader` Role grants access to the
+        // extension-apiserver-authentication ConfigMap this way, and every aggregated
+        // apiserver (including the "sample-apiserver" conformance test) reads it through
+        // exactly this informer pattern, never a plain named GET. Real Kubernetes derives
+        // RequestInfo.Name from such an exact-match field selector for authorization
+        // purposes even though the verb stays list/watch (see requestinfo.go). Without this,
+        // a resourceNames-restricted Role can never grant informer-style access — the
+        // ConfigMap read is Forbidden forever, regardless of how long the RoleBinding has
+        // existed, which is why the aggregator conformance test's sample-apiserver pod
+        // crash-loops indefinitely instead of eventually recovering.
+        let fs_name = if parsed.name.is_none() && (verb == "list" || verb == "watch") {
+            field_selector_name(req.uri().query())
+        } else {
+            None
+        };
+        let authz_name = parsed.name.as_deref().or(fs_name.as_deref());
+
         let allowed = self.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
             groups: &user.groups,
@@ -818,7 +949,7 @@ where
             resource: &parsed.resource,
             subresource: &parsed.subresource,
             namespace: parsed.namespace.as_deref(),
-            name: parsed.name.as_deref(),
+            name: authz_name,
             non_resource_url,
         });
 
@@ -1477,6 +1608,93 @@ mod tests {
             result.is_none(),
             "JWT with malformed sub (missing name segment) must be rejected, \
              not silently accepted with incomplete groups"
+        );
+    }
+
+    /// TokenReview on a bound (projected) SA token must surface pod/node binding
+    /// info as extra fields, matching what conformance's "should mount an API
+    /// token into pods" test asserts via TokenReview.Status.User.Extra. Before
+    /// this fix, `kubernetes.io.pod`/`kubernetes.io.node` claims were decoded
+    /// nowhere, so bound tokens looked identical to legacy tokens to any caller.
+    #[test]
+    fn bound_sa_jwt_extra_includes_pod_and_node_info() {
+        let (enc, dec) = test_rsa_keypair();
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "jti": "bound-jti-1",
+            "iss": "https://kubernetes.default.svc",
+            "sub": "system:serviceaccount:default:my-sa",
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + 3600,
+            "kubernetes.io": {
+                "namespace": "default",
+                "serviceaccount": {"name": "my-sa", "uid": "sa-uid-1"},
+                "pod": {"name": "my-pod", "uid": "pod-uid-1"},
+                "node": {"name": "node-a", "uid": "node-uid-1"},
+            },
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+
+        let user = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new())
+            .expect("bound SA JWT with valid signature must authenticate");
+
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/pod-name"),
+            Some(&vec!["my-pod".to_owned()]),
+            "pod-name extra must match the bound pod claim — conformance TokenReview \
+             asserts this exact key/value"
+        );
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/pod-uid"),
+            Some(&vec!["pod-uid-1".to_owned()]),
+            "pod-uid extra must match the bound pod claim"
+        );
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/node-name"),
+            Some(&vec!["node-a".to_owned()]),
+            "node-name extra must match the bound node claim"
+        );
+        assert_eq!(
+            user.extra.get("authentication.kubernetes.io/node-uid"),
+            Some(&vec!["node-uid-1".to_owned()]),
+            "node-uid extra must match the bound node claim"
+        );
+    }
+
+    /// A legacy (unbound) SA token — no `kubernetes.io.pod`/`node` claims — must
+    /// NOT have pod/node extra fields fabricated. Only the credential-id extra
+    /// (from `jti`) may be present; inventing pod/node info for a token that
+    /// never carried it would let TokenReview lie about binding provenance.
+    #[test]
+    fn unbound_sa_jwt_extra_omits_pod_and_node_info() {
+        let (enc, dec) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let user = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new())
+            .expect("valid unbound SA JWT must authenticate");
+        assert!(
+            !user
+                .extra
+                .contains_key("authentication.kubernetes.io/pod-name"),
+            "unbound token must not fabricate a pod-name extra"
+        );
+        assert!(
+            !user
+                .extra
+                .contains_key("authentication.kubernetes.io/pod-uid"),
+            "unbound token must not fabricate a pod-uid extra"
+        );
+        assert!(
+            !user
+                .extra
+                .contains_key("authentication.kubernetes.io/node-name"),
+            "unbound token must not fabricate a node-name extra"
         );
     }
 
@@ -2169,6 +2387,226 @@ mod tests {
             user.extra.is_empty(),
             "SA JWT without jti must produce empty extra — \
              credential-id must only be set when the token actually contains a jti claim"
+        );
+    }
+
+    // --- field_selector_name() (mayor-fnym9) ---
+    //
+    // Every client-go informer that watches a single named object (e.g. the ConfigMap
+    // informer aggregated apiservers use to read
+    // kube-system/extension-apiserver-authentication) does so via LIST+WATCH with
+    // fieldSelector=metadata.name=<name>, never a plain named GET. An RBAC Role whose
+    // rules are restricted via resourceNames can only match this pattern if the
+    // authorizer recognizes the field selector as identifying that one resource name.
+
+    #[test]
+    fn field_selector_name_extracts_percent_encoded_exact_match() {
+        // client-go percent-encodes '=' as %3D, e.g. what the sample-apiserver's
+        // authentication ConfigMap informer actually sends on the wire.
+        let query = "allowWatchBookmarks=true&fieldSelector=metadata.name%3Dextension-apiserver-authentication&watch=true";
+        assert_eq!(
+            field_selector_name(Some(query)).as_deref(),
+            Some("extension-apiserver-authentication"),
+            "must decode the percent-encoded fieldSelector and extract the exact-match name; \
+             without this, resourceNames-restricted Roles can never match informer traffic"
+        );
+    }
+
+    #[test]
+    fn field_selector_name_accepts_double_equals_form() {
+        // Field selectors also accept "key==value" for equality.
+        let query = "fieldSelector=metadata.name%3D%3Dfoo";
+        assert_eq!(field_selector_name(Some(query)).as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn field_selector_name_rejects_inequality() {
+        // "metadata.name!=foo" does not identify a single target — must not match.
+        let query = "fieldSelector=metadata.name%21%3Dfoo";
+        assert!(
+            field_selector_name(Some(query)).is_none(),
+            "an inequality selector must never be treated as identifying one resource name"
+        );
+    }
+
+    #[test]
+    fn field_selector_name_rejects_multi_term_selector() {
+        // A selector combining multiple terms doesn't uniquely pin one name — mirrors
+        // upstream's RequiresExactMatch, which only fires for a single-term selector.
+        let query = "fieldSelector=metadata.name%3Dfoo%2Cstatus.phase%3DRunning";
+        assert!(
+            field_selector_name(Some(query)).is_none(),
+            "a comma-joined multi-term field selector must not be treated as an exact name match"
+        );
+    }
+
+    #[test]
+    fn field_selector_name_rejects_other_field() {
+        // A selector on a field other than metadata.name must not synthesize a name —
+        // otherwise unrelated selectors could accidentally satisfy resourceNames checks.
+        let query = "fieldSelector=spec.nodeName%3Dnode-1";
+        assert!(field_selector_name(Some(query)).is_none());
+    }
+
+    #[test]
+    fn field_selector_name_absent_returns_none() {
+        assert!(field_selector_name(None).is_none());
+        assert!(field_selector_name(Some("watch=true")).is_none());
+    }
+
+    /// End-to-end regression for the sample-apiserver aggregator conformance failure
+    /// (mayor-fnym9): a Role restricted via resourceNames to one ConfigMap must grant a
+    /// LIST-with-fieldSelector request for that exact name, the same way real Kubernetes
+    /// does. Before this fix, `is_allowed` always saw `name: None` for such requests (the
+    /// URL path carries no name on a collection endpoint), so the resourceNames check in
+    /// `rule_covers` unconditionally denied it — the ConfigMap read stayed Forbidden
+    /// forever, regardless of how long the RoleBinding had existed, which is why the
+    /// sample-apiserver pod crash-looped for the entire test timeout instead of recovering
+    /// once RBAC was seeded.
+    #[tokio::test]
+    async fn list_with_field_selector_matches_resource_names_restricted_role() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/roles/extension-apiserver-authentication-reader",
+            &serde_json::json!({
+                "rules": [{
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "resourceNames": ["extension-apiserver-authentication"],
+                    "verbs": ["get", "list", "watch"]
+                }]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/rolebindings/auth-reader",
+            &serde_json::json!({
+                "subjects": [{ "kind": "ServiceAccount", "namespace": "aggregator-1", "name": "default" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": "extension-apiserver-authentication-reader"
+                },
+                "namespace": "kube-system"
+            }),
+        );
+
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "sample-apiserver-token".to_owned(),
+            UserInfo {
+                username: "system:serviceaccount:aggregator-1:default".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/kube-system/configmaps",
+                get(|| async { "ok" }),
+            )
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            ));
+
+        // Exactly the request client-go's ConfigMap informer issues: a LIST (not watch)
+        // with an exact-match fieldSelector on metadata.name, no name in the URL path.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/kube-system/configmaps?fieldSelector=metadata.name%3Dextension-apiserver-authentication")
+            .header("authorization", "Bearer sample-apiserver-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a resourceNames-restricted Role must grant a LIST request whose fieldSelector \
+             exactly names the allowed resource — this is how every client-go informer \
+             (including the one every aggregated apiserver uses to read its own auth \
+             ConfigMap) actually requests a single named object; denying it means \
+             resourceNames-restricted Roles can never work for informer-style consumers"
+        );
+    }
+
+    /// The same fieldSelector-derived name must NOT bypass a resourceNames restriction for
+    /// an unrelated resource name — the fix must narrow access to exactly the named
+    /// resource, not disable the resourceNames check for LIST/WATCH entirely.
+    #[tokio::test]
+    async fn list_with_field_selector_for_different_name_still_denied() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/roles/extension-apiserver-authentication-reader",
+            &serde_json::json!({
+                "rules": [{
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "resourceNames": ["extension-apiserver-authentication"],
+                    "verbs": ["get", "list", "watch"]
+                }]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/rolebindings/auth-reader",
+            &serde_json::json!({
+                "subjects": [{ "kind": "ServiceAccount", "namespace": "aggregator-1", "name": "default" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": "extension-apiserver-authentication-reader"
+                },
+                "namespace": "kube-system"
+            }),
+        );
+
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "sample-apiserver-token".to_owned(),
+            UserInfo {
+                username: "system:serviceaccount:aggregator-1:default".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/kube-system/configmaps",
+                get(|| async { "ok" }),
+            )
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/kube-system/configmaps?fieldSelector=metadata.name%3Dsome-other-configmap")
+            .header("authorization", "Bearer sample-apiserver-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a fieldSelector naming a DIFFERENT resource must still be denied by a \
+             resourceNames-restricted Role — the fix must not turn resourceNames into a \
+             no-op for LIST/WATCH requests"
         );
     }
 }

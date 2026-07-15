@@ -83,11 +83,21 @@ struct KubernetesClaims {
 #[derive(Serialize)]
 struct KubernetesClaimsExt {
     namespace: String,
-    serviceaccount: SaRef,
+    serviceaccount: ClaimRef,
+    /// Present only for tokens bound to a Pod (KEP-1205 projected SA tokens).
+    /// Consumed by the token authenticator to populate TokenReview's
+    /// `authentication.kubernetes.io/pod-{name,uid}` extra fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod: Option<ClaimRef>,
+    /// Present only when a pod-bound token's pod is scheduled to a known node.
+    /// Consumed by the token authenticator to populate TokenReview's
+    /// `authentication.kubernetes.io/node-{name,uid}` extra fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<ClaimRef>,
 }
 
 #[derive(Serialize)]
-struct SaRef {
+struct ClaimRef {
     name: String,
     uid: String,
 }
@@ -171,7 +181,60 @@ pub async fn create_token<S: Store>(
         })
         .unwrap_or_default();
 
-    // 6. Mint JWT.
+    // 6. Resolve pod (and its node) claims from the *stored* Pod object when the
+    // request is bound to one, rather than trusting the caller-supplied
+    // boundObjectRef verbatim. A caller only needs `create` on
+    // serviceaccounts/token to mint a token, so embedding unverified pod/node
+    // identity into the signed claims would let it forge TokenReview's
+    // authentication.kubernetes.io/pod-* extra info for a pod it doesn't own.
+    // When the referenced Pod (or its node) cannot be found, the corresponding
+    // claim is simply omitted — never fabricated.
+    let mut pod_ref: Option<ClaimRef> = None;
+    let mut node_ref: Option<ClaimRef> = None;
+    if let Some(bor) = spec.bound_object_ref.as_ref() {
+        if bor["kind"].as_str() == Some("Pod") {
+            if let Some(pod_name) = bor["name"].as_str() {
+                let pod_key = object_key("pods", ns.as_str(), pod_name);
+                if let Ok(Some(pod_obj)) = state.store.get(&pod_key).await {
+                    if let Ok(pod_val) = serde_json::from_slice::<serde_json::Value>(&pod_obj.value)
+                    {
+                        let pod_uid = pod_val["metadata"]["uid"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        if !pod_uid.is_empty() {
+                            pod_ref = Some(ClaimRef {
+                                name: pod_name.to_owned(),
+                                uid: pod_uid,
+                            });
+                        }
+                        if let Some(node_name) = pod_val["spec"]["nodeName"].as_str() {
+                            if !node_name.is_empty() {
+                                let node_key = cluster_object_key("nodes", node_name);
+                                let node_uid = match state.store.get(&node_key).await {
+                                    Ok(Some(node_obj)) => {
+                                        serde_json::from_slice::<serde_json::Value>(&node_obj.value)
+                                            .ok()
+                                            .and_then(|v| {
+                                                v["metadata"]["uid"].as_str().map(str::to_owned)
+                                            })
+                                            .unwrap_or_default()
+                                    }
+                                    _ => String::new(),
+                                };
+                                node_ref = Some(ClaimRef {
+                                    name: node_name.to_owned(),
+                                    uid: node_uid,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Mint JWT.
     //
     // The JWT `exp` is floored at MIN_JWT_LIFETIME_SECS (24 h) as a safety net for
     // transient refresh failures (mayor-tq5y).  The response still returns the
@@ -197,10 +260,12 @@ pub async fn create_token<S: Store>(
         iat: now,
         kubernetes_io: KubernetesClaimsExt {
             namespace: ns.as_str().to_owned(),
-            serviceaccount: SaRef {
+            serviceaccount: ClaimRef {
                 name: sa_name.clone(),
                 uid,
             },
+            pod: pod_ref,
+            node: node_ref,
         },
     };
 
@@ -208,7 +273,7 @@ pub async fn create_token<S: Store>(
     let token = jsonwebtoken::encode(&header, &claims, encoding_key)
         .map_err(|e| Status::internal(format!("JWT encode error: {e}")))?;
 
-    // 7. Build response.
+    // 8. Build response.
     // Include spec.expirationSeconds and spec.audiences in the response so that kubelet's
     // token_manager can read them. Kubelet reads spec.expirationSeconds to schedule token
     // refresh; if absent it logs "Expiration seconds was nil for token request" and falls back.
@@ -314,10 +379,12 @@ mod tests {
             iat: 1_704_067_200,
             kubernetes_io: KubernetesClaimsExt {
                 namespace: "default".to_owned(),
-                serviceaccount: SaRef {
+                serviceaccount: ClaimRef {
                     name: "my-sa".to_owned(),
                     uid: String::new(),
                 },
+                pod: None,
+                node: None,
             },
         };
 
@@ -336,6 +403,11 @@ mod tests {
             v["jti"], "test-jti-value",
             "jti claim must be serialised so it appears in minted tokens"
         );
+        assert!(
+            v["kubernetes.io"]["pod"].is_null(),
+            "an unbound token must not carry a pod claim — the authenticator relies \
+             on its absence to avoid fabricating pod-name/pod-uid TokenReview extra info"
+        );
     }
 
     /// SA UID must appear in the kubernetes.io.serviceaccount.uid claim so that
@@ -352,10 +424,12 @@ mod tests {
             iat: 1_704_067_200,
             kubernetes_io: KubernetesClaimsExt {
                 namespace: "kube-system".to_owned(),
-                serviceaccount: SaRef {
+                serviceaccount: ClaimRef {
                     name: "coredns".to_owned(),
                     uid: "abc-123".to_owned(),
                 },
+                pod: None,
+                node: None,
             },
         };
 
@@ -981,6 +1055,142 @@ mod handler_tests {
         assert!(
             resp_body["spec"]["boundObjectRef"].is_null(),
             "spec.boundObjectRef must be absent when not sent in request (must not fabricate)"
+        );
+    }
+
+    async fn seed_pod(store: &Arc<SqliteStore>, ns: &str, name: &str, uid: &str, node_name: &str) {
+        let key = format!("/registry/pods/{ns}/{name}");
+        let val = serde_json::json!({
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": ns, "uid": uid},
+            "spec": {"nodeName": node_name}
+        });
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed pod");
+    }
+
+    async fn seed_node(store: &Arc<SqliteStore>, name: &str, uid: &str) {
+        let key = format!("/registry/nodes/{name}");
+        let val = serde_json::json!({
+            "kind": "Node",
+            "metadata": {"name": name, "uid": uid}
+        });
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed node");
+    }
+
+    /// When boundObjectRef references a Pod that actually exists in the store, the
+    /// minted JWT must embed `kubernetes.io.pod` using the *stored* pod's UID (not
+    /// necessarily the caller-supplied one) and `kubernetes.io.node` from the pod's
+    /// scheduled node. This is what lets the token authenticator later populate
+    /// TokenReview's `authentication.kubernetes.io/pod-*` and `/node-*` extra info —
+    /// the conformance test "should mount an API token into pods" fails without it.
+    #[tokio::test]
+    async fn create_token_embeds_pod_and_node_claims_when_pod_exists() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-sa").await;
+        seed_pod(&store, "default", "my-pod", "pod-uid-real", "node-a").await;
+        seed_node(&store, "node-a", "node-uid-real").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "audiences": ["https://kubernetes.default.svc"],
+                "expirationSeconds": 3607,
+                "boundObjectRef": {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": "my-pod",
+                    // Deliberately wrong UID: the claim must come from the stored
+                    // Pod object, not be trusted verbatim from the request.
+                    "uid": "attacker-supplied-uid"
+                }
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        let token = resp_body["status"]["token"].as_str().expect("token string");
+        let claims = decode_jwt_claims(token);
+        assert_eq!(
+            claims["kubernetes.io"]["pod"]["name"], "my-pod",
+            "pod name must be embedded in the JWT claims"
+        );
+        assert_eq!(
+            claims["kubernetes.io"]["pod"]["uid"], "pod-uid-real",
+            "pod uid must come from the stored Pod object, not the caller-supplied \
+             boundObjectRef.uid — otherwise any caller with token-create permission \
+             could forge TokenReview pod-uid extra info for a pod it doesn't own"
+        );
+        assert_eq!(
+            claims["kubernetes.io"]["node"]["name"], "node-a",
+            "node name must be resolved from the pod's spec.nodeName"
+        );
+        assert_eq!(
+            claims["kubernetes.io"]["node"]["uid"], "node-uid-real",
+            "node uid must be resolved from the stored Node object"
+        );
+    }
+
+    /// When boundObjectRef references a Pod name that does NOT exist in the store,
+    /// the minted JWT must omit the pod/node claims entirely rather than trusting
+    /// the unverifiable caller-supplied name/uid — fabricating an unverifiable
+    /// binding claim would let TokenReview report false pod identity.
+    #[tokio::test]
+    async fn create_token_omits_pod_claim_when_pod_not_found() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-sa-2").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "audiences": ["https://kubernetes.default.svc"],
+                "expirationSeconds": 3607,
+                "boundObjectRef": {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": "ghost-pod",
+                    "uid": "ghost-uid"
+                }
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        let token = resp_body["status"]["token"].as_str().expect("token string");
+        let claims = decode_jwt_claims(token);
+        assert!(
+            claims["kubernetes.io"]["pod"].is_null(),
+            "pod claim must be omitted when the referenced Pod cannot be found — \
+             the caller-supplied name/uid must never be trusted verbatim"
         );
     }
 

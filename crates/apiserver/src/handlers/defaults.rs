@@ -41,6 +41,11 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "replicationcontrollers") = (group, plural) {
         default_replicationcontroller(obj);
     }
+    if group == "rbac.authorization.k8s.io"
+        && (plural == "rolebindings" || plural == "clusterrolebindings")
+    {
+        default_role_ref_api_group(obj);
+    }
 
     if is_workload_resource(group, plural) {
         initialize_workload_generation(obj);
@@ -182,6 +187,26 @@ fn default_replicationcontroller(obj: &mut serde_json::Value) {
 fn default_lease(obj: &mut serde_json::Value) {
     if obj["spec"]["leaseTransitions"].is_null() {
         obj["spec"]["leaseTransitions"] = serde_json::json!(0i32);
+    }
+}
+
+/// Default `roleRef.apiGroup` to `"rbac.authorization.k8s.io"` when absent or empty on a
+/// RoleBinding or ClusterRoleBinding, matching real Kubernetes'
+/// `SetDefaults_RoleBinding`/`SetDefaults_ClusterRoleBinding` (pkg/apis/rbac/v1/defaults.go).
+///
+/// Clients (including the upstream aggregator conformance test, which builds
+/// `RoleRef{APIGroup: ""}` directly and relies on server-side defaulting) commonly omit
+/// this field. Without defaulting it here, the stored roleRef.apiGroup stays "", and the
+/// RBAC engine's `resolve_role_rules`/`resolve_cluster_role_rules` — which require an exact
+/// `"rbac.authorization.k8s.io"` match — silently resolve to zero rules. The binding then
+/// never grants anything, no matter how correct its subjects are, and no matter how long it
+/// has existed — exactly the permanently-Forbidden failure mode that made the
+/// extension-apiserver-authentication-reader RoleBinding never take effect for the sample
+/// API server conformance test.
+fn default_role_ref_api_group(obj: &mut serde_json::Value) {
+    let api_group = &mut obj["roleRef"]["apiGroup"];
+    if api_group.as_str().is_none_or(str::is_empty) {
+        *api_group = serde_json::json!("rbac.authorization.k8s.io");
     }
 }
 
@@ -3076,6 +3101,91 @@ mod tests {
             serde_json::Value::Number(5.into()),
             "existing spec.leaseTransitions must not be overwritten — \
              resetting the transition count breaks holder-identity tracking"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: RoleBinding/ClusterRoleBinding roleRef.apiGroup defaulting
+    // (mayor-fnym9)
+    // ---------------------------------------------------------------------------
+
+    /// A RoleBinding created with `roleRef.apiGroup: ""` (as the upstream aggregator
+    /// conformance test's RoleBinding object literally does, relying on server-side
+    /// defaulting) must have apiGroup defaulted to "rbac.authorization.k8s.io".
+    ///
+    /// Without this, the stored roleRef.apiGroup stays "", and the RBAC engine's
+    /// resolve_role_rules — which requires an exact "rbac.authorization.k8s.io" match —
+    /// silently resolves to zero rules. The binding then grants nothing no matter how
+    /// long it has existed, which is exactly why the sample-apiserver's
+    /// extension-apiserver-authentication-reader RoleBinding never took effect and its
+    /// pod crash-looped for the whole conformance test timeout.
+    #[test]
+    fn rolebinding_empty_role_ref_api_group_defaults_to_rbac_group() {
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "wardler-auth-reader", "namespace": "kube-system" },
+            "subjects": [{ "kind": "ServiceAccount", "name": "default", "namespace": "aggregator-1" }],
+            "roleRef": { "apiGroup": "", "kind": "Role", "name": "extension-apiserver-authentication-reader" }
+        });
+
+        apply_defaults("rbac.authorization.k8s.io", "rolebindings", &mut obj);
+
+        assert_eq!(
+            obj["roleRef"]["apiGroup"], "rbac.authorization.k8s.io",
+            "empty roleRef.apiGroup must default to \"rbac.authorization.k8s.io\" — \
+             leaving it empty means the RBAC engine treats the binding as referencing no \
+             role at all, denying access forever regardless of RoleBinding timing"
+        );
+    }
+
+    /// A ClusterRoleBinding with `roleRef.apiGroup` absent entirely (not present in the
+    /// JSON body at all, not merely empty) must also get the default applied.
+    #[test]
+    fn clusterrolebinding_missing_role_ref_api_group_defaults_to_rbac_group() {
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "wardler-auth-delegator" },
+            "subjects": [{ "kind": "ServiceAccount", "name": "sample-apiserver", "namespace": "aggregator-1" }],
+            "roleRef": { "kind": "ClusterRole", "name": "system:auth-delegator" }
+        });
+
+        apply_defaults("rbac.authorization.k8s.io", "clusterrolebindings", &mut obj);
+
+        assert_eq!(
+            obj["roleRef"]["apiGroup"], "rbac.authorization.k8s.io",
+            "absent roleRef.apiGroup must default to \"rbac.authorization.k8s.io\", \
+             matching real Kubernetes' SetDefaults_ClusterRoleBinding"
+        );
+    }
+
+    /// An explicit, correct roleRef.apiGroup must not be overwritten.
+    #[test]
+    fn rolebinding_explicit_role_ref_api_group_preserved() {
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "custom-binding", "namespace": "default" },
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "custom-role" }
+        });
+
+        apply_defaults("rbac.authorization.k8s.io", "rolebindings", &mut obj);
+
+        assert_eq!(
+            obj["roleRef"]["apiGroup"], "rbac.authorization.k8s.io",
+            "an already-correct roleRef.apiGroup must be preserved unchanged"
+        );
+    }
+
+    /// A non-RBAC-group resource with a similarly-shaped `roleRef.apiGroup` field must
+    /// not be touched — the defaulting must be scoped to rolebindings/clusterrolebindings.
+    #[test]
+    fn non_rbac_resource_role_ref_untouched() {
+        let mut obj = serde_json::json!({
+            "roleRef": { "apiGroup": "" }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["roleRef"]["apiGroup"], "",
+            "defaulting must only apply to rbac.authorization.k8s.io rolebindings/\
+             clusterrolebindings, not incidentally-similar fields on other resources"
         );
     }
 

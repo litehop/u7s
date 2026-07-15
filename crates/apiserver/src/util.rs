@@ -97,13 +97,23 @@ pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
 
 /// Parse an optional `resourceVersion` string into an optional `u64`.
 ///
-/// - `None` or `""` → `Ok(None)` (unconditional write)
-/// - `"0"`          → `Ok(Some(0))` (write only if key doesn't exist)
-/// - any other      → parse as `u64`, error on failure
+/// - `None`, `""`, or `"0"` → `Ok(None)` (unconditional write)
+/// - any other              → parse as `u64`, error on failure
+///
+/// Only ever called from update/replace/patch handlers (create paths pass a hardcoded
+/// `Some(0)` to `Store::put` directly, bypassing this function entirely). That split
+/// matters: `Store::put`'s `Some(0)` means "create-only, must not exist", but a client
+/// submitting `resourceVersion: "0"` on an Update means the opposite — real kube-apiserver
+/// treats resourceVersion 0 on Update as "unconditional write", used by controllers/tests
+/// that hold a possibly-stale object and want to force the write through regardless of the
+/// current stored revision (e.g. sig-scheduling's node-status BeforeEach/AfterEach, which
+/// sets `nodeCopy.ResourceVersion = "0"` before `UpdateStatus` specifically to bypass
+/// conflict detection). So "0" must map to the same `None` (unconditional) as an absent
+/// resourceVersion, not to `Some(0)` — mapping it to `Some(0)` made every such update
+/// against an already-existing object fail with a spurious 409 AlreadyExists.
 pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
-        None | Some("") => Ok(None),
-        Some("0") => Ok(Some(0)),
+        None | Some("") | Some("0") => Ok(None),
         Some(s) => s
             .parse::<u64>()
             .map(Some)
@@ -246,6 +256,38 @@ mod tests {
             current: 2,
         };
         assert_eq!(store_err_to_status(&e), StatusCode::CONFLICT);
+    }
+
+    // -- parse_resource_version --
+
+    /// Explicit resourceVersion: "0" on an update must mean "unconditional write",
+    /// the same as an absent resourceVersion — NOT `Some(0)`.
+    ///
+    /// `Store::put`'s `Some(0)` sentinel means "create-only, key must not exist". If
+    /// this function mapped "0" to `Some(0)`, then a client update carrying an existing
+    /// node's status with `resourceVersion: "0"` (the real-world pattern used by
+    /// sig-scheduling's node-status e2e test to force a write past a possibly-stale
+    /// local copy) would be rejected with a spurious 409 AlreadyExists against the node
+    /// that plainly already exists.
+    #[test]
+    fn parse_resource_version_zero_is_unconditional_not_create_only() {
+        assert_eq!(
+            parse_resource_version(Some("0")).unwrap(),
+            None,
+            "resourceVersion \"0\" must parse the same as absent (unconditional update), \
+             not as Some(0) (create-only) — else updates to existing objects wrongly 409"
+        );
+        assert_eq!(
+            parse_resource_version(Some("0")).unwrap(),
+            parse_resource_version(None).unwrap(),
+            "\"0\" and absent resourceVersion must produce identical Store::put semantics"
+        );
+    }
+
+    /// A real (non-zero) resourceVersion still enforces optimistic concurrency.
+    #[test]
+    fn parse_resource_version_nonzero_is_conditional() {
+        assert_eq!(parse_resource_version(Some("42")).unwrap(), Some(42));
     }
 
     /// StoreError::NotFound must NOT expose the internal registry key path to clients.
@@ -599,6 +641,15 @@ mod tests {
         let mut out = encode_varint(tag);
         out.extend_from_slice(&encode_varint(payload.len() as u64));
         out.extend_from_slice(payload);
+        out
+    }
+
+    /// Encode a wire-type-0 (varint) field: bools and int32s in proto2 (e.g.
+    /// APIServiceSpec.insecureSkipTLSVerify, .groupPriorityMinimum, .versionPriority).
+    fn encode_varint_field(field_number: u64, value: u64) -> Vec<u8> {
+        let tag = field_number << 3; // wire type 0
+        let mut out = encode_varint(tag);
+        out.extend_from_slice(&encode_varint(value));
         out
     }
 
@@ -1136,5 +1187,78 @@ mod tests {
         assert_eq!(json["kind"], "PodDisruptionBudget");
         assert_eq!(json["apiVersion"], "policy/v1");
         assert_eq!(json["metadata"]["name"], "my-pdb");
+    }
+
+    /// test_apiservice_create_kubectl_wire_format
+    ///
+    /// The aggregator's client-go clientset (used by the sig-api-machinery "1.17 Sample API
+    /// Server" conformance test, and any real client registering an APIService) sends:
+    ///   Content-Type: application/vnd.kubernetes.protobuf
+    ///   Body: magic + Unknown{ TypeMeta{apiregistration.k8s.io/v1/APIService},
+    ///                          raw=proto(APIService), contentType="" (absent) }
+    ///
+    /// Before decode_proto_by_kind_and_version registered "APIService", extract_body fell
+    /// through every branch (raw bytes are proto, not JSON, so the '{' fallback doesn't match
+    /// either) and returned the original magic-prefixed bytes unchanged. The generic create
+    /// handler then tried to serde_json::from_slice those bytes and failed with exactly
+    /// "invalid JSON: expected value at line 1 column 1", the observed conformance failure
+    /// (POST /apis/apiregistration.k8s.io/v1/apiservices -> 400).
+    #[test]
+    fn test_apiservice_create_kubectl_wire_format() {
+        let obj_meta = build_object_meta(b"v1alpha1.wardle.example.com", None);
+
+        let mut service_ref = encode_ld(1, b"wardle"); // ServiceReference.namespace = field 1
+        service_ref.extend_from_slice(&encode_ld(2, b"api")); // .name = field 2
+        service_ref.extend_from_slice(&encode_varint_field(3, 443)); // .port = field 3
+
+        let mut spec_proto = encode_ld(1, &service_ref); // APIServiceSpec.service = field 1
+        spec_proto.extend_from_slice(&encode_ld(2, b"wardle.example.com")); // .group = field 2
+        spec_proto.extend_from_slice(&encode_ld(3, b"v1alpha1")); // .version = field 3
+        spec_proto.extend_from_slice(&encode_varint_field(4, 1)); // .insecureSkipTLSVerify = field 4
+        spec_proto.extend_from_slice(&encode_varint_field(7, 1000)); // .groupPriorityMinimum = field 7
+        spec_proto.extend_from_slice(&encode_varint_field(8, 15)); // .versionPriority = field 8
+
+        let mut apiservice_proto = encode_ld(1, &obj_meta); // APIService.metadata = field 1
+        apiservice_proto.extend_from_slice(&encode_ld(2, &spec_proto)); // .spec = field 2
+
+        // client-go omits contentType (field 4) for types with a registered proto codec.
+        let body = build_kubectl_proto_body(
+            b"apiregistration.k8s.io/v1",
+            b"APIService",
+            &apiservice_proto,
+            None,
+        );
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+
+        assert!(
+            !decoded.is_empty(),
+            "extract_body must NOT return empty bytes for proto-encoded APIService"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must produce valid JSON for a proto-encoded APIService — before the \
+             fix, kind=\"APIService\" had no registered decoder, extract_body returned the raw \
+             magic-prefixed envelope, and the handler returned HTTP 400 'invalid JSON: expected \
+             value at line 1 column 1', blocking the sig-api-machinery aggregator conformance test",
+        );
+
+        assert_eq!(json["kind"], "APIService");
+        assert_eq!(json["apiVersion"], "apiregistration.k8s.io/v1");
+        assert_eq!(
+            json["metadata"]["name"], "v1alpha1.wardle.example.com",
+            "name must survive proto decode — apiregistration's registry keys off this name"
+        );
+        assert_eq!(json["spec"]["service"]["namespace"], "wardle");
+        assert_eq!(json["spec"]["service"]["name"], "api");
+        assert_eq!(json["spec"]["service"]["port"], 443);
+        assert_eq!(json["spec"]["group"], "wardle.example.com");
+        assert_eq!(json["spec"]["version"], "v1alpha1");
+        assert_eq!(
+            json["spec"]["groupPriorityMinimum"], 1000,
+            "groupPriorityMinimum must survive: the aggregator uses it to order competing groups"
+        );
+        assert_eq!(json["spec"]["versionPriority"], 15);
     }
 }

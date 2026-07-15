@@ -93,12 +93,11 @@ async fn main() -> anyhow::Result<()> {
         let in_flight_ref = &in_flight;
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
-            let Some((namespace, pod_name, node_selector, priority)) = needs_scheduling(&event)
-            else {
+            let Some(pending) = needs_scheduling(&event) else {
                 return;
             };
 
-            let key = format!("{namespace}/{pod_name}");
+            let key = format!("{}/{}", pending.namespace, pending.pod_name);
 
             // Dedup: skip if a bind task for this pod is already in flight.
             {
@@ -110,13 +109,18 @@ async fn main() -> anyhow::Result<()> {
                 guard.insert(key.clone());
             }
 
-            info!("unscheduled pod detected: {namespace}/{pod_name}");
+            info!(
+                "unscheduled pod detected: {}/{}",
+                pending.namespace, pending.pod_name
+            );
 
             // Schedule asynchronously — spawn a task so we don't block the stream.
             let connector_clone = connector_ref.clone();
             let server_clone = server_ref.to_string();
             let in_flight_clone = in_flight_ref.clone();
             tokio::spawn(async move {
+                let namespace = pending.namespace.clone();
+                let pod_name = pending.pod_name.clone();
                 // Ok(node_name) on a successful bind, Err on any failure to schedule
                 // (no node fits, even after preemption) or to bind. Distinguishing
                 // the two lets us emit the matching Event below — without it,
@@ -124,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 // observeEventAfterAction watch never see a Scheduled/FailedScheduling
                 // event and the watch times out (mayor-lafgk).
                 let outcome: anyhow::Result<String> = async {
-                    match pick_node(&connector_clone, &server_clone, &node_selector).await {
+                    match pick_node(&connector_clone, &server_clone, &pending).await {
                         Ok(node) => {
                             bind_pod(
                                 &connector_clone,
@@ -140,13 +144,9 @@ async fn main() -> anyhow::Result<()> {
                             // No node has a free slot — try preemption before giving
                             // up: evict lower-priority pods to make room rather than
                             // leaving a higher-priority pod Pending forever (mayor-rsei).
-                            let plan = find_preemption_plan(
-                                &connector_clone,
-                                &server_clone,
-                                &node_selector,
-                                priority,
-                            )
-                            .await?;
+                            let plan =
+                                find_preemption_plan(&connector_clone, &server_clone, &pending)
+                                    .await?;
                             info!(
                                 "preempting {} pod(s) on {} to schedule higher-priority pod {namespace}/{pod_name}",
                                 plan.victims.len(),

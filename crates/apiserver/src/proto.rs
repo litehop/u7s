@@ -521,6 +521,7 @@ pub fn decode_proto_by_kind_and_version(
 ) -> Option<serde_json::Value> {
     match kind {
         "CustomResourceDefinition" => crate::apiextensions_gen_adapter::decode_crd_proto_gen(raw),
+        "APIService" => crate::apiregistration_gen_adapter::decode_apiservice_proto_gen(raw),
         "Namespace" => crate::core_gen_adapter::decode_namespace_proto_gen(raw),
         "ConfigMap" => crate::core_gen_adapter::decode_configmap_proto_gen(raw),
         "Pod" => crate::core_gen_adapter::decode_pod_proto_gen(raw),
@@ -1367,6 +1368,99 @@ mod tests {
             "spec.runtimeClassName must survive proto decode — without it the overhead \
              injection block in create_pod is never entered and spec.overhead stays absent, \
              causing the RuntimeClass conformance test to fail"
+        );
+    }
+
+    /// decode_pod_proto must preserve spec.nodeSelector (a proto3 map, field 7 of PodSpec).
+    ///
+    /// "[sig-scheduling] SchedulerPredicates validates that NodeSelector is respected if not
+    /// matching [Conformance]" creates a "restricted-pod" with a nodeSelector no node satisfies,
+    /// via the typed Go client (protobuf). client-go's map<string,string> wire encoding repeats
+    /// the field tag once per entry, each a length-delimited {key(1), value(2)} sub-message —
+    /// this must round-trip into a JSON object, not be silently dropped. Before this decoder
+    /// handled field 7, the persisted pod had no spec.nodeSelector at all, so the scheduler
+    /// (which correctly treats an absent selector as "matches any node") bound the pod to a
+    /// node it explicitly asked to avoid, and the test's expectation of the pod staying
+    /// Pending/Unschedulable never happened.
+    #[test]
+    fn decode_pod_proto_preserves_node_selector() {
+        let mut obj_meta = encode_length_delimited(1, b"restricted-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"sched-pred"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        // PodSpec.nodeSelector map entry: {key(1)="label", value(2)="nonempty"}, field 7.
+        let mut map_entry = encode_length_delimited(1, b"label");
+        map_entry.extend_from_slice(&encode_length_delimited(2, b"nonempty"));
+
+        let mut pod_spec = encode_length_delimited(2, &container); // containers at field 2
+        pod_spec.extend_from_slice(&encode_length_delimited(7, &map_entry)); // nodeSelector at field 7
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
+            .expect("decode_pod_proto must succeed for a pod with nodeSelector");
+
+        assert_eq!(
+            result["spec"]["nodeSelector"]["label"], "nonempty",
+            "spec.nodeSelector must survive proto decode — without it the scheduler sees no \
+             restriction at all and binds the pod to a node it explicitly asked to avoid, \
+             failing the SchedulerPredicates NodeSelector conformance test"
+        );
+    }
+
+    /// decode_pod_proto must preserve spec.affinity.nodeAffinity (field 18 of PodSpec).
+    ///
+    /// "[sig-scheduling] SchedulerPredicates validates that NodeAffinity is respected if not
+    /// matching" is the nodeAffinity sibling of the nodeSelector test above, and failed the
+    /// same way: the persisted pod had no spec.affinity at all, so the scheduler (which
+    /// correctly treats absent nodeAffinity as "matches any node") bound the pod anyway.
+    #[test]
+    fn decode_pod_proto_preserves_node_affinity_required_term() {
+        let mut obj_meta = encode_length_delimited(1, b"restricted-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"sched-pred"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        // NodeSelectorRequirement { key(1)="label", operator(2)="In", values(3)=["nonempty"] }
+        let mut requirement = encode_length_delimited(1, b"label");
+        requirement.extend_from_slice(&encode_length_delimited(2, b"In"));
+        requirement.extend_from_slice(&encode_length_delimited(3, b"nonempty"));
+
+        // NodeSelectorTerm { matchExpressions(1) = [requirement] }
+        let term = encode_length_delimited(1, &requirement);
+
+        // NodeSelector { nodeSelectorTerms(1) = [term] }
+        let node_selector = encode_length_delimited(1, &term);
+
+        // NodeAffinity { requiredDuringSchedulingIgnoredDuringExecution(1) = node_selector }
+        let node_affinity = encode_length_delimited(1, &node_selector);
+
+        // Affinity { nodeAffinity(1) = node_affinity }
+        let affinity = encode_length_delimited(1, &node_affinity);
+
+        let mut pod_spec = encode_length_delimited(2, &container); // containers at field 2
+        pod_spec.extend_from_slice(&encode_length_delimited(18, &affinity)); // affinity at field 18
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
+            .expect("decode_pod_proto must succeed for a pod with affinity.nodeAffinity");
+
+        let terms = result["spec"]["affinity"]["nodeAffinity"]
+            ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+            .as_array()
+            .expect("nodeSelectorTerms must be an array");
+        assert_eq!(
+            terms[0]["matchExpressions"][0],
+            serde_json::json!({"key": "label", "operator": "In", "values": ["nonempty"]}),
+            "spec.affinity.nodeAffinity must survive proto decode — without it the scheduler \
+             sees no restriction at all and binds the pod to a node it explicitly asked to \
+             avoid, failing the SchedulerPredicates NodeAffinity conformance test"
         );
     }
 

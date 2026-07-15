@@ -8,7 +8,10 @@
 //!   - Merges incoming `metadata` (labels/annotations) — same isolation rules as
 //!     the /status subresource (identity fields and finalizers are protected).
 //!   - MUST NOT touch `spec` or `status.certificate` — those are controlled by
-//!     the signer, not the approver.
+//!     the signer, not the approver. For `application/json-patch+json`, which
+//!     addresses the whole document with no structural isolation, ops outside
+//!     `status.conditions`/`metadata.annotations` are rejected with 422 rather
+//!     than silently dropped (see `validate_approval_json_patch_paths`).
 //!   - Honours `resourceVersion` in incoming body for OCC (returns 409 on conflict).
 
 use axum::{
@@ -83,7 +86,9 @@ pub async fn put_approval<S: Store>(
 /// PATCH /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval
 ///
 /// Applies a patch to the approval subresource. Only status.conditions may be
-/// changed. spec and status.certificate are never modified.
+/// changed. spec and status.certificate are never modified — for JSON Patch,
+/// which addresses the whole document, ops outside status.conditions/
+/// metadata.annotations are rejected outright (see `validate_approval_json_patch_paths`).
 pub async fn patch_approval<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -107,7 +112,12 @@ pub async fn patch_approval<S: Store>(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // Deserialize current status to extract the certificate field before patching.
+    // Snapshot fields /approval must never change, before applying any patch type.
+    // `spec_before` is restored unconditionally below regardless of patch type —
+    // defense in depth alongside the PatchType::Json path check just below, so a
+    // bug in (or future change to) that check can never let a JSON Patch smuggle a
+    // different spec.request/spec.signerName past approval.
+    let spec_before = current.body["spec"].clone();
     let status_before: CertificateSigningRequestStatus =
         serde_json::from_value(current.body["status"].clone()).unwrap_or_else(|_| {
             CertificateSigningRequestStatus {
@@ -119,7 +129,12 @@ pub async fn patch_approval<S: Store>(
 
     match patch_type {
         PatchType::Json => {
-            // JSON Patch addresses the full document — apply as-is, then restore protected fields.
+            // Unlike a merge patch, JSON Patch addresses the full document with no
+            // structural isolation — an op can name /spec or any metadata field.
+            // Reject the whole patch up front if it targets anything outside the
+            // fields /approval may change, instead of applying it and relying
+            // solely on restoring the damage afterward.
+            validate_approval_json_patch_paths(&patch)?;
             apply_json_patch(&mut current.body, &patch)?;
         }
         PatchType::Merge | PatchType::StrategicMerge => {
@@ -139,7 +154,18 @@ pub async fn patch_approval<S: Store>(
         }
     }
 
-    // Restore protected fields — spec and status.certificate must never change via /approval.
+    // Restore protected fields — spec and status.certificate must never change via
+    // /approval, for every patch type (not just PatchType::Json).
+    match spec_before {
+        serde_json::Value::Null => {
+            // Make sure spec wasn't introduced by the patch (a CSR always has one,
+            // but a stored object shouldn't gain a spec it didn't have).
+            if let Some(m) = current.body.as_object_mut() {
+                m.remove("spec");
+            }
+        }
+        v => current.body["spec"] = v,
+    }
     match &status_before.certificate {
         Some(cert) => {
             current.body["status"]["certificate"] = serde_json::Value::String(cert.clone());
@@ -161,6 +187,49 @@ pub async fn patch_approval<S: Store>(
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
+}
+
+/// Validate that every JSON Patch op targeting `/approval` addresses only
+/// `status.conditions` or `metadata.annotations` — the two fields `/approval` may
+/// change. Mirrors `handlers::status::validate_status_json_patch_paths`, which
+/// exists for the identical reason on the `/status` subresource.
+///
+/// JSON Patch (RFC 6902) addresses the entire stored document with no built-in
+/// notion of subresource boundaries, unlike the Merge/StrategicMerge branch in
+/// `patch_approval`, which only ever writes `status.conditions` and routes
+/// metadata through `merge_incoming_metadata`. Without this check, a caller
+/// holding only `certificatesigningrequests/approval` update rights — granted
+/// specifically so they can approve/deny a CSR WITHOUT controlling what gets
+/// signed — could get a CSR approved, then PATCH `/approval` again with a JSON
+/// Patch replacing `spec.request`/`spec.signerName` with a different, unreviewed
+/// request and have an external signer issue a trusted certificate for an
+/// attacker-chosen identity.
+///
+/// Rejects (422) the whole patch rather than silently dropping the offending op,
+/// so the caller gets a clear signal instead of a write that looks like it worked
+/// but didn't.
+pub(crate) fn validate_approval_json_patch_paths(
+    patch: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    const ALLOWED: &[&str] = &["/status/conditions", "/metadata/annotations"];
+    let ops = patch
+        .as_array()
+        .ok_or_else(|| Status::unprocessable_entity("JSON patch must be an array".into()))?;
+    for op in ops {
+        let path = op["path"].as_str().ok_or_else(|| {
+            Status::unprocessable_entity("JSON patch op missing 'path' field".into())
+        })?;
+        let allowed = ALLOWED
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")));
+        if !allowed {
+            return Err(Status::unprocessable_entity(format!(
+                "JSON patch on /approval subresource may only target /status/conditions or \
+                 /metadata/annotations; got '{path}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Merge `status.conditions` from `incoming` into `current`.
@@ -607,6 +676,284 @@ mod tests {
         assert!(
             conds.iter().any(|c| c["type"] == "Denied"),
             "json-patch on /approval must add the Denied condition"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // JSON-Patch /spec and protected-metadata escalation — security regression
+    // ---------------------------------------------------------------------------
+
+    /// PATCH /approval with json-patch+json replacing /spec/request must be
+    /// rejected and must NOT change the stored spec.request.
+    ///
+    /// `certificatesigningrequests/approval` is RBAC's mechanism for granting
+    /// "can approve/deny" WITHOUT granting control over what's being signed.
+    /// Before this fix, `apply_json_patch` mutated the whole stored document and
+    /// only `status.certificate` was restored afterward, so a caller with only
+    /// approval rights could get a CSR approved, then swap `spec.request` to a
+    /// different, unreviewed request via this same subresource and have an
+    /// external signer (e.g. kube-controller-manager's csrsigningcontroller)
+    /// issue a trusted certificate for whatever identity the replacement request
+    /// encodes — a full authentication-boundary escalation, not just a
+    /// data-integrity bug.
+    #[tokio::test]
+    async fn patch_approval_json_patch_cannot_replace_spec_request() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "escalation-request-csr";
+        seed_csr(&store, name, None).await;
+
+        // Attacker-controlled request encoding a different, unreviewed CSR — in a
+        // real cluster this would be one requesting e.g. O=system:masters.
+        let patch_body = json!([
+            {
+                "op": "replace",
+                "path": "/spec/request",
+                "value": "QVRUQUNLRVJfQ09OVFJPTExFRF9DU1I="
+            }
+        ]);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a JSON Patch targeting /spec via /approval must be rejected with 422, \
+                 not silently applied or silently dropped"
+            ),
+            Ok(_) => panic!(
+                "PATCH /approval must reject a JSON Patch targeting /spec/request — \
+                 accepting it lets an approval-only-scoped caller swap in an unreviewed \
+                 signing request after approval and get a certificate issued for an \
+                 attacker-chosen identity"
+            ),
+        }
+
+        // Whatever the response, the stored spec.request must be untouched — this
+        // is the exact escalation path the audit found.
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["request"], "dGVzdA==",
+            "spec.request must never change via /approval regardless of patch type — \
+             an approval-only RBAC grant must not be able to control what gets signed"
+        );
+    }
+
+    /// PATCH /approval with json-patch+json replacing /spec/signerName must be
+    /// rejected and must NOT change the stored spec.signerName.
+    ///
+    /// Same escalation as spec.request: swapping the signer can route an
+    /// already-approved CSR to a signer whose issuance policy the approver never
+    /// reviewed (e.g. from a narrowly-scoped signer to `kubernetes.io/kube-apiserver-client`).
+    #[tokio::test]
+    async fn patch_approval_json_patch_cannot_replace_spec_signer_name() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "escalation-signer-csr";
+        seed_csr(&store, name, None).await;
+
+        // seed_csr sets signerName to "kubernetes.io/kube-apiserver-client"; the
+        // attacker reroutes to a different signer that never reviewed the request.
+        let patch_body = json!([
+            {
+                "op": "replace",
+                "path": "/spec/signerName",
+                "value": "attacker.example.com/evil-signer"
+            }
+        ]);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a JSON Patch targeting /spec via /approval must be rejected with 422"
+            ),
+            Ok(_) => panic!(
+                "PATCH /approval must reject a JSON Patch targeting /spec/signerName — \
+                 an approval-only-scoped caller must not be able to reroute an approved \
+                 CSR to a different signer"
+            ),
+        }
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["signerName"], "kubernetes.io/kube-apiserver-client",
+            "spec.signerName must never change via /approval regardless of patch type — \
+             rerouting an approved CSR to a different, unreviewed signer is the same \
+             authentication-boundary escalation as swapping spec.request"
+        );
+    }
+
+    /// PATCH /approval with json-patch+json adding `/metadata/labels` must be
+    /// rejected and must NOT change the stored labels.
+    ///
+    /// Labels drive policy decisions elsewhere (selector-based matching, PSA
+    /// enforcement) and are protected on `/status` for the same reason (see
+    /// `merge_incoming_metadata`'s PROTECTED list) — `/approval` must not let a
+    /// JSON Patch bypass that protection just because JSON Patch addresses the
+    /// whole document instead of a scoped sub-object.
+    #[tokio::test]
+    async fn patch_approval_json_patch_cannot_change_protected_metadata_labels() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "escalation-labels-csr";
+        seed_csr(&store, name, None).await;
+
+        let patch_body = json!([
+            {
+                "op": "add",
+                "path": "/metadata/labels",
+                "value": {"escalated": "true"}
+            }
+        ]);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "a JSON Patch targeting /metadata/labels via /approval must be rejected \
+                 with 422 — approval-only rights must not be able to rewrite labels"
+            ),
+            Ok(_) => panic!("PATCH /approval must reject a JSON Patch targeting /metadata/labels"),
+        }
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"].get("labels").is_none() || v["metadata"]["labels"].is_null(),
+            "labels must never be introduced via a JSON Patch to /approval"
+        );
+    }
+
+    /// PATCH /approval with json-patch+json adding `/metadata/annotations` must
+    /// still succeed — the path-restriction fix must not break this legitimate,
+    /// already-supported use (kubectl certificate approve/deny and the sig-auth
+    /// CSR conformance test also tag approvals via annotations, just via merge
+    /// patch rather than JSON Patch).
+    #[tokio::test]
+    async fn patch_approval_json_patch_can_still_add_annotation() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "legit-annotation-csr";
+        seed_csr(&store, name, None).await;
+
+        let patch_body = json!([
+            {
+                "op": "add",
+                "path": "/metadata/annotations",
+                "value": {"approved-by": "test-operator"}
+            }
+        ]);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        if let Err(e) = &result {
+            panic!(
+                "a JSON Patch adding /metadata/annotations via /approval must still succeed — \
+                 over-tightening the /spec fix must not break this legitimate use: {e:?}"
+            );
+        }
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["annotations"]["approved-by"], "test-operator",
+            "the annotation from a legitimate JSON Patch must be persisted"
         );
     }
 

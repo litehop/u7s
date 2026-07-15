@@ -468,6 +468,10 @@ pub async fn create_pod<S: Store>(
         crate::limit_range::apply_limit_ranges(&state, obj.body, ns.as_str(), "pods").await?;
 
     // ResourceQuota: ensure pod count does not exceed hard limits, respecting scope selectors.
+    // Held across check-then-write: without this, concurrent pod creates in the same
+    // namespace (e.g. a ReplicationController's burst replica creation) can each observe
+    // pre-write usage, all pass the check, and collectively exceed the quota.
+    let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
     crate::quota::check_resource_quota(&state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
 
     obj.body["status"]["qosClass"] =
@@ -1890,45 +1894,17 @@ pub fn apply_status_patch(
             result["status"] = patch_status.clone();
         }
     }
-    // Apply metadata changes from the patch body (labels, annotations, etc.).
-    // Identity fields and lifecycle-control fields are preserved from the stored object —
-    // the status subresource cannot change them.  In particular, `finalizers` and
+    // Apply metadata changes from the patch body (annotations, etc.) via the same guard the
+    // generic status handlers use: identity fields, lifecycle-control fields, and `labels`
+    // are preserved from the stored object rather than reimplementing the same protected-field
+    // list here, which had drifted out of sync and let a status-only merge patch smuggle in
+    // a `metadata.labels` change. In particular, `finalizers` and
     // `deletionTimestamp` must never be changed via /status: the kubelet's status patch
     // body reflects the pod the kubelet last saw (which may still carry the job-tracking
     // finalizer), so without this guard every kubelet status update would restore the
     // finalizer that KCM just removed, causing a livelock where the finalizer is never
     // permanently removed and pods stay Terminating forever.
-    if let Some(patch_meta) = patch.get("metadata") {
-        if patch_meta.is_object() {
-            // Immutable or lifecycle-control fields: capture current value (may be null)
-            // and restore unconditionally after merge so the patch cannot change them.
-            const PROTECTED: &[&str] = &[
-                "name",
-                "namespace",
-                "uid",
-                "creationTimestamp",
-                "resourceVersion",
-                "generation",
-                "finalizers",
-                "deletionTimestamp",
-            ];
-            let saved: Vec<(&str, serde_json::Value)> = PROTECTED
-                .iter()
-                .map(|&k| (k, result["metadata"][k].clone()))
-                .collect();
-            crate::patch::merge_patch(&mut result["metadata"], patch_meta);
-            for (k, v) in saved {
-                if v.is_null() {
-                    // Field was absent in stored object; remove it if the patch added it.
-                    if let Some(meta_obj) = result["metadata"].as_object_mut() {
-                        meta_obj.remove(k);
-                    }
-                } else {
-                    result["metadata"][k] = v;
-                }
-            }
-        }
-    }
+    crate::handlers::status::merge_incoming_metadata(&mut result, patch);
 
     // Enforce hostNetwork invariant: a pod sharing the host network namespace has
     // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets
@@ -3591,6 +3567,21 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
     }
 
+    // securityContext: default to an empty object when absent, mirroring upstream's
+    // unconditional `obj.SecurityContext = &v1.PodSecurityContext{}` in SetDefaults_PodSpec.
+    // The kubelet's generatePodSandboxLinuxConfig only calls NamespacesForPod (which computes
+    // the CRI NamespaceOption for hostNetwork/hostPID/hostIPC) inside an
+    // `if pod.Spec.SecurityContext != nil` guard — with securityContext absent, the CRI
+    // RunPodSandboxRequest carries no NamespaceOptions at all and every namespace mode
+    // silently defaults to POD, even for hostNetwork:true pods. CRI-O then creates an
+    // isolated network namespace instead of sharing the host's, so the kubelet's own
+    // post-creation PodSandboxChanged check (comparing the sandbox's actual namespace mode
+    // against pod.Spec.HostNetwork) finds a mismatch and recreates the sandbox — forever,
+    // once per sync — which is the hostNetwork pod "Sandbox for pod has changed" churn loop.
+    if pod["spec"]["securityContext"].is_null() {
+        pod["spec"]["securityContext"] = serde_json::json!({});
+    }
+
     // terminationGracePeriodSeconds: default to 30 when absent, mirroring
     // upstream's unconditional default in SetDefaults_PodSpec. This value is
     // set once at creation and never touched again, including through a
@@ -4672,6 +4663,68 @@ mod create_defaults_tests {
             serde_json::json!("None"),
             "dnsPolicy=None must be preserved — user-managed DNS pods configure \
              nameservers via dnsConfig; overriding would silently redirect DNS traffic"
+        );
+    }
+
+    // --- securityContext defaulting tests ---
+
+    /// create_pod must default spec.securityContext to an empty object when absent.
+    ///
+    /// The real kubelet's generatePodSandboxLinuxConfig only calls NamespacesForPod
+    /// (which computes the CRI NamespaceOption for hostNetwork/hostPID/hostIPC) inside
+    /// an `if pod.Spec.SecurityContext != nil` guard. Without this default, a
+    /// hostNetwork:true pod with no explicit pod-level securityContext gets a CRI
+    /// RunPodSandboxRequest with no NamespaceOptions at all, so CRI-O creates an
+    /// isolated (non-host) network namespace. The kubelet's own post-creation
+    /// PodSandboxChanged check then detects that the sandbox's actual namespace mode
+    /// doesn't match pod.Spec.HostNetwork and recreates the sandbox — forever, once per
+    /// sync — which is the observed "Sandbox for pod has changed. Need to start a new
+    /// one" churn loop that prevents any hostNetwork pod (e.g. an e2e host-exec pod)
+    /// from ever stabilizing.
+    #[test]
+    fn security_context_defaults_to_empty_object_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "hostnet-pod", "namespace": "default"},
+            "spec": {
+                "hostNetwork": true,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert!(
+            pod["spec"]["securityContext"].is_object(),
+            "securityContext must default to a non-null (even empty) object — upstream \
+             SetDefaults_PodSpec stamps this unconditionally, and the kubelet's \
+             NamespacesForPod call (which sets hostNetwork/hostPID/hostIPC on the CRI \
+             sandbox request) is gated on securityContext being non-nil; leaving it null \
+             silently breaks hostNetwork for every pod that doesn't set it explicitly"
+        );
+    }
+
+    /// create_pod must NOT override an explicit securityContext value.
+    ///
+    /// A pod that sets its own pod-level securityContext (e.g. runAsNonRoot, fsGroup)
+    /// must keep those settings — defaulting must only fill the field when absent, not
+    /// replace an already-present (even partially populated) object.
+    #[test]
+    fn security_context_explicit_value_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "securityContext": {"runAsNonRoot": true, "fsGroup": 1000},
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["securityContext"],
+            serde_json::json!({"runAsNonRoot": true, "fsGroup": 1000}),
+            "an explicit securityContext must not be overridden or merged with defaults — \
+             a user's runAsNonRoot/fsGroup settings must survive pod creation unchanged"
         );
     }
 
@@ -7442,6 +7495,122 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
+    // nodeSelector / affinity protobuf-decode regression test
+    // -----------------------------------------------------------------------
+
+    fn encode_varint_field(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    fn encode_ld(field_number: u64, payload: &[u8]) -> Vec<u8> {
+        let tag = (field_number << 3) | 2;
+        let mut out = encode_varint_field(tag);
+        out.extend_from_slice(&encode_varint_field(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The full create_pod pipeline (protobuf decode -> defaults -> SA token injection ->
+    /// admission -> LimitRange -> quota -> store.put) must preserve spec.nodeSelector and
+    /// spec.affinity.nodeAffinity end to end when the request arrives protobuf-encoded, the
+    /// wire format client-go clientsets use by default for built-in types (e2e test binaries,
+    /// kube-scheduler, kube-controller-manager). kubectl instead sends JSON, which is why a
+    /// manual `kubectl apply` of an identical pod could never reproduce the sonobuoy failure
+    /// this regresses: "[sig-scheduling] SchedulerPredicates validates that NodeSelector/
+    /// NodeAffinity is respected if not matching". Asserting on the object fetched back out of
+    /// the store (not just the CREATE response) matches the live repro exactly: `kubectl get
+    /// pod -o json` on the persisted object showed both fields completely absent.
+    #[tokio::test]
+    async fn create_pod_preserves_node_selector_and_node_affinity_from_protobuf_body() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let mut obj_meta = encode_ld(1, b"restricted-pod");
+        obj_meta.extend_from_slice(&encode_ld(3, b"default"));
+
+        let mut container = encode_ld(1, b"c");
+        container.extend_from_slice(&encode_ld(2, b"img"));
+
+        // PodSpec.nodeSelector (field 7): map entry {key(1)="label", value(2)="nonempty"}.
+        let mut map_entry = encode_ld(1, b"label");
+        map_entry.extend_from_slice(&encode_ld(2, b"nonempty"));
+
+        // PodSpec.affinity (field 18) -> Affinity.nodeAffinity(1) ->
+        // NodeAffinity.requiredDuringSchedulingIgnoredDuringExecution(1) ->
+        // NodeSelector.nodeSelectorTerms(1) -> NodeSelectorTerm.matchExpressions(1) ->
+        // NodeSelectorRequirement{key(1),operator(2),values(3)}.
+        let mut requirement = encode_ld(1, b"restrict-me");
+        requirement.extend_from_slice(&encode_ld(2, b"In"));
+        requirement.extend_from_slice(&encode_ld(3, b"true"));
+        let term = encode_ld(1, &requirement);
+        let node_selector_msg = encode_ld(1, &term);
+        let node_affinity_msg = encode_ld(1, &node_selector_msg);
+        let affinity_msg = encode_ld(1, &node_affinity_msg);
+
+        let mut pod_spec = encode_ld(2, &container);
+        pod_spec.extend_from_slice(&encode_ld(7, &map_entry));
+        pod_spec.extend_from_slice(&encode_ld(18, &affinity_msg));
+
+        let mut pod_proto = encode_ld(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_ld(2, &pod_spec));
+
+        // Wrap in the k8s Unknown envelope client-go uses for core types (empty contentType).
+        let mut type_meta = encode_ld(1, b"v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"Pod"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &pod_proto));
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // magic
+        body.extend_from_slice(&unknown);
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/vnd.kubernetes.protobuf")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/restricted-pod")
+            .await
+            .expect("store get must succeed")
+            .expect("pod must be persisted");
+        let persisted: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            persisted["spec"]["nodeSelector"]["label"], "nonempty",
+            "spec.nodeSelector must be present on the object fetched back out of the store — \
+             a protobuf-encoded create must not lose it anywhere in the create_pod pipeline"
+        );
+        assert_eq!(
+            persisted["spec"]["affinity"]["nodeAffinity"]
+                ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
+                ["matchExpressions"][0],
+            serde_json::json!({"key": "restrict-me", "operator": "In", "values": ["true"]}),
+            "spec.affinity.nodeAffinity must be present on the object fetched back out of the \
+             store — a protobuf-encoded create must not lose it anywhere in the create_pod \
+             pipeline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // RuntimeClass overhead injection regression test
     // -----------------------------------------------------------------------
 
@@ -9095,6 +9264,75 @@ mod handler_tests {
         assert_eq!(
             v["spec"]["containers"][0]["name"], "app",
             "spec.containers must be unchanged after a status-only PATCH"
+        );
+    }
+
+    /// PATCH /status must reject a smuggled metadata.labels change while still applying a
+    /// legitimate status update. A caller granted only `pods/status` RBAC rights
+    /// (e.g. the kubelet) must not be able to rewrite a pod's labels through this endpoint —
+    /// labels gate Service/selector membership and scheduling, so this is a privilege-escalation
+    /// path, not just a data-integrity bug. This exercises the real HTTP handler end to end
+    /// (not just the pure merge function) so it fails if the guard is wired to the wrong call site.
+    #[tokio::test]
+    async fn patch_pod_status_does_not_persist_smuggled_labels() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "label-pod",
+            serde_json::json!({
+                "metadata": {
+                    "name": "label-pod",
+                    "namespace": "default",
+                    "resourceVersion": "1",
+                    "labels": { "app": "web" }
+                },
+                "status": { "phase": "Pending" }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({
+            "metadata": { "labels": { "app": "evil", "escalated": "true" } },
+            "status": { "phase": "Running" }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/label-pod/status")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /status must return 200"
+        );
+
+        let key = "/registry/pods/default/label-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["metadata"]["labels"],
+            serde_json::json!({ "app": "web" }),
+            "labels must be unchanged in the store after a /status PATCH — a status-only \
+             RBAC grant must not be able to rewrite labels that gate selector-based \
+             scheduling and Service membership"
+        );
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "a legitimate status field update must still be applied through the same request"
         );
     }
 
@@ -11004,6 +11242,250 @@ mod handler_tests {
              retrying, the finalizer stays and Job GC never completes"
         );
     }
+
+    /// A store wrapper that, on the first put() after arm(), writes an INDEPENDENT
+    /// object (simulating a different concurrent writer, e.g. the kubelet PATCHing
+    /// /status) instead of the caller's own value, then reports RevisionMismatch.
+    ///
+    /// Unlike ConflictInjectStore (which replays the caller's own computed value as
+    /// the "concurrent" write, so a retry trivially reproduces the same result), this
+    /// models two writers changing two different fields, so a retry that clobbers
+    /// instead of re-reading would provably lose one side's update.
+    struct ConcurrentWriterStore {
+        inner: Arc<SqliteStore>,
+        concurrent_write: Bytes,
+        inject_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl ConcurrentWriterStore {
+        fn new(inner: Arc<SqliteStore>, concurrent_write: Bytes) -> Self {
+            Self {
+                inner,
+                concurrent_write,
+                inject_next: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.inject_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for ConcurrentWriterStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .inject_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            let concurrent_write = self.concurrent_write.clone();
+            async move {
+                if inject {
+                    // A different writer's change lands here, independent of `value`
+                    // (the caller's own not-yet-persisted attempt).
+                    let _ = inner.put(&key, concurrent_write, None).await;
+                    Err(u7s_store::StoreError::RevisionMismatch {
+                        expected: 1,
+                        current: 99,
+                    })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// mayor-y832 investigated sonobuoy's `sonobuoy status` freezing mid-run: the
+    /// aggregator PATCHes its own pod's annotation to publish progress while the
+    /// kubelet concurrently PATCHes the same pod's /status. The leading hypothesis
+    /// was a lost-update clobber between the two writers. Live evidence from a full
+    /// conformance run showed zero RevisionMismatch retries even occurred — ruling out
+    /// a race as the cause of the observed freeze (the actual freeze traces to the
+    /// upstream e2e progress reporter never emitting incremental completed counts, not
+    /// to u7s). This test locks in the invariant that makes such a race safe *if* it
+    /// ever does happen: patch_pod must re-read the fresh object on RevisionMismatch
+    /// and reapply its own patch, rather than clobbering a concurrent writer's change
+    /// with a write based on stale data.
+    #[tokio::test]
+    async fn patch_pod_annotation_survives_concurrent_status_write_race() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let ns_key = "/registry/namespaces/default";
+        inner
+            .put(
+                ns_key,
+                Bytes::from(
+                    serde_json::to_vec(
+                        &serde_json::json!({"kind":"Namespace","metadata":{"name":"default"}}),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_key = "/registry/pods/default/sonobuoy";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sonobuoy",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {},
+            "status": {"phase": "Running"}
+        });
+        inner
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // What the kubelet's concurrent /status write lands as, between patch_pod's
+        // read and its first write attempt — a different field than the annotation
+        // patch below touches.
+        let concurrent_status_write = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sonobuoy",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {},
+            "status": {"phase": "Succeeded"}
+        });
+        let racing_store = Arc::new(ConcurrentWriterStore::new(
+            Arc::clone(&inner),
+            Bytes::from(serde_json::to_vec(&concurrent_status_write).unwrap()),
+        ));
+        racing_store.arm();
+
+        let state = AppState::new(
+            Arc::clone(&racing_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        // The aggregator's annotation PATCH — the write sonobuoy status polling depends on.
+        let patch_body = serde_json::json!({
+            "metadata": {"annotations": {"sonobuoy.hept.io/status": "progress-update"}}
+        });
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/sonobuoy")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "annotation PATCH must retry past the concurrent status write and succeed"
+        );
+
+        let stored = inner.get(pod_key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["metadata"]["annotations"]["sonobuoy.hept.io/status"], "progress-update",
+            "the annotation PATCH must not be lost after retrying past a concurrent status \
+             write — this is the exact write 'sonobuoy status' depends on to show live progress"
+        );
+        assert_eq!(
+            stored_body["status"]["phase"], "Succeeded",
+            "the concurrent status write must survive too — a patch_pod that clobbers on \
+             retry (e.g. writing unconditionally, or reapplying against stale data) would \
+             silently revert the kubelet's status update"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12754,6 +13236,106 @@ mod admission_tests {
              without the fix, replace_pod bypassed admission and the label was never injected"
         );
     }
+
+    /// Concurrent create_pod calls in a quota-limited namespace must never let more pods
+    /// through than the hard limit allows.
+    ///
+    /// This mirrors what the real kube-controller-manager's ReplicationController
+    /// controller does: it creates all missing replicas concurrently in one burst
+    /// (`slowStartBatch`). Without a lock spanning the quota check and the store write,
+    /// each concurrent create lists pre-write usage, all observe "0 of 2 used", and all
+    /// pass — collectively exceeding the quota. When that happens, KCM never sees a
+    /// rejected create and so never sets the RC's `ReplicaFailure` status condition,
+    /// which is exactly the symptom the conformance test
+    /// "should surface a failure condition on a common issue like exceeded quota" caught.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_pod_never_exceeds_resource_quota() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "pod-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "2" } }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/pod-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let make_body = |name: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+                })
+                .to_string(),
+            )
+        };
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            h
+        };
+
+        // Three concurrent creates against a quota that only allows 2 pods.
+        let (r1, r2, r3) = tokio::join!(
+            create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers.clone(),
+                make_body("pod-a"),
+            ),
+            create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers.clone(),
+                make_body("pod-b"),
+            ),
+            create_pod(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("default".to_string(),)),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                headers.clone(),
+                make_body("pod-c"),
+            ),
+        );
+
+        let ok_count = [&r1, &r2, &r3].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count, 2,
+            "exactly 2 of 3 concurrent creates must succeed against a pods=2 quota — \
+             without the per-namespace admission lock, a TOCTOU race lets all 3 through, \
+             which is why KCM's RC controller never saw a create rejected and never set \
+             the ReplicaFailure condition"
+        );
+
+        let prefix = "/registry/pods/default/";
+        let stored = store.list(prefix, u7s_store::ListOptions::default()).await;
+        assert_eq!(
+            stored.unwrap().items.len(),
+            2,
+            "the store must contain exactly 2 pods — a quota is a hard limit, not \
+             advisory, regardless of how many creates race for it"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -12915,6 +13497,39 @@ mod status_patch_metadata_tests {
             "status subresource must not restore finalizers from the patch body; \
              if it does, KCM's finalizer removal and kubelet status updates create a livelock \
              that keeps pods stuck Terminating forever"
+        );
+    }
+
+    /// PATCH /pods/{name}/status must NOT change metadata.labels even if the patch carries them.
+    /// Labels drive selector-based scheduling and service membership; a caller
+    /// holding only pods/status RBAC rights (e.g. the kubelet) must not be able to smuggle a
+    /// label change through a status merge-patch, the same guard merge_incoming_metadata already
+    /// enforces for the generic status handlers. Without this guard, an attacker with
+    /// only status-write rights could flip a pod's labels to escape a NetworkPolicy or Service
+    /// selector, or add/remove itself from a controller's label selector — a privilege escalation
+    /// beyond what the status subresource is meant to allow.
+    #[test]
+    fn apply_status_patch_does_not_change_labels() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod", "namespace": "default", "uid": "uid-1",
+                          "labels": { "app": "web" } },
+            "spec": {},
+            "status": {}
+        });
+        let patch = serde_json::json!({
+            "metadata": { "labels": { "app": "evil", "escalated": "true" } },
+            "status": { "phase": "Running" }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        assert_eq!(
+            result["metadata"]["labels"],
+            serde_json::json!({ "app": "web" }),
+            "labels must not change via a status patch; a status-only RBAC grant must not be \
+             able to rewrite labels that gate selector-based scheduling and service membership"
+        );
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "a legitimate status-only field must still be applied"
         );
     }
 
