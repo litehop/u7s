@@ -89,6 +89,27 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     m
 }
 
+fn gen_label_selector_requirement_to_json(
+    req: meta_v1::LabelSelectorRequirement,
+) -> serde_json::Value {
+    let mut m = serde_json::json!({});
+    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
+        m["key"] = serde_json::Value::String(k);
+    }
+    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
+        m["operator"] = serde_json::Value::String(op);
+    }
+    if !req.values.is_empty() {
+        m["values"] = serde_json::Value::Array(
+            req.values
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+    }
+    m
+}
+
 fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
     let mut m = serde_json::json!({});
     if !sel.match_labels.is_empty() {
@@ -100,18 +121,12 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
         m["matchLabels"] = serde_json::Value::Object(labels);
     }
     if !sel.match_expressions.is_empty() {
-        let exprs: Vec<serde_json::Value> = sel
-            .match_expressions
-            .into_iter()
-            .map(|req| {
-                serde_json::json!({
-                    "key": req.key.unwrap_or_default(),
-                    "operator": req.operator.unwrap_or_default(),
-                    "values": req.values,
-                })
-            })
-            .collect();
-        m["matchExpressions"] = serde_json::Value::Array(exprs);
+        m["matchExpressions"] = serde_json::Value::Array(
+            sel.match_expressions
+                .into_iter()
+                .map(gen_label_selector_requirement_to_json)
+                .collect(),
+        );
     }
     m
 }
@@ -968,6 +983,58 @@ mod tests {
             result["spec"]["paramRef"]["name"], "my-params",
             "paramRef must survive decode — without it the policy's mutation expression \
              evaluates against no params"
+        );
+    }
+
+    /// A namespaceSelector expressed purely via matchExpressions must survive decode, and an
+    /// Exists requirement (which has no values) must omit "values" rather than emit "values":
+    /// [] unconditionally.
+    ///
+    /// This admissionreg copy of gen_label_selector_to_json had drifted from the canonical
+    /// omit-empty semantics in core_gen_adapter.rs (it used unwrap_or_default() for every
+    /// matchExpressions field). If a matchExpressions-only selector were dropped entirely, an
+    /// empty/absent namespaceSelector matches every namespace instead of only the ones
+    /// satisfying `env Exists`, silently widening which namespaces the webhook fires for.
+    #[test]
+    fn decode_validatingwebhookconfiguration_proto_gen_preserves_matchexpressions_selector() {
+        let vwc = ar_v1::ValidatingWebhookConfiguration {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ns-selector-vwc".to_string()),
+                ..Default::default()
+            }),
+            webhooks: vec![ar_v1::ValidatingWebhook {
+                name: Some("select.example.com".to_string()),
+                namespace_selector: Some(meta_v1::LabelSelector {
+                    match_labels: Default::default(),
+                    match_expressions: vec![meta_v1::LabelSelectorRequirement {
+                        key: Some("env".to_string()),
+                        operator: Some("Exists".to_string()),
+                        values: vec![],
+                    }],
+                }),
+                ..Default::default()
+            }],
+        };
+        let mut buf = Vec::new();
+        vwc.encode(&mut buf).unwrap();
+
+        let result = decode_validatingwebhookconfiguration_proto_gen(&buf)
+            .expect("ValidatingWebhookConfiguration must decode");
+
+        let sel = &result["webhooks"][0]["namespaceSelector"];
+        assert_ne!(
+            *sel,
+            serde_json::json!({}),
+            "a matchExpressions-only namespaceSelector must not collapse to {{}} — an empty \
+             selector matches every namespace instead of only namespaces satisfying `env Exists`"
+        );
+        assert_eq!(sel["matchExpressions"][0]["key"], "env");
+        assert_eq!(sel["matchExpressions"][0]["operator"], "Exists");
+        assert!(
+            sel["matchExpressions"][0].get("values").is_none(),
+            "an Exists requirement has no values — emitting \"values\": [] unconditionally \
+             (the pre-fix unwrap_or_default() behavior) diverges from the canonical omit-empty \
+             semantics in core_gen_adapter.rs and misrepresents what the client actually sent"
         );
     }
 }
