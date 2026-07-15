@@ -496,6 +496,9 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     if let Some(v) = c.image.filter(|s| !s.is_empty()) {
         cm.insert("image".to_string(), serde_json::Value::String(v));
     }
+    if let Some(v) = c.working_dir.filter(|s| !s.is_empty()) {
+        cm.insert("workingDir".to_string(), serde_json::Value::String(v));
+    }
     if let Some(v) = c.image_pull_policy.filter(|s| !s.is_empty()) {
         cm.insert("imagePullPolicy".to_string(), serde_json::Value::String(v));
     }
@@ -720,6 +723,19 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
             gen_security_context_to_json(sc),
         );
     }
+    // stdin/stdinOnce/tty — allocate an interactive stdin/TTY for the container; dropping
+    // these silently turns a pod created for `kubectl run -it`/attach-style interactive use
+    // into a non-interactive one, since the kubelet never learns the client asked for a
+    // stdin/TTY pipe in the first place.
+    if let Some(v) = c.stdin {
+        cm.insert("stdin".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = c.stdin_once {
+        cm.insert("stdinOnce".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = c.tty {
+        cm.insert("tty".to_string(), serde_json::Value::Bool(v));
+    }
     if !c.resize_policy.is_empty() {
         let rp_json: Vec<serde_json::Value> = c
             .resize_policy
@@ -742,6 +758,45 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
     }
     if let Some(rp) = c.restart_policy.filter(|s| !s.is_empty()) {
         cm.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
+    }
+    // restartPolicyRules — sidecar-style per-exit-code restart overrides; dropping this
+    // silently reverts a container to its plain restartPolicy, so an exit code the client
+    // explicitly carved out an exception for (e.g. "don't restart on exit code 0") is instead
+    // handled by the container's blanket policy.
+    if !c.restart_policy_rules.is_empty() {
+        let rules: Vec<serde_json::Value> = c
+            .restart_policy_rules
+            .into_iter()
+            .map(|r| {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = r.action.filter(|s| !s.is_empty()) {
+                    m.insert("action".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(ec) = r.exit_codes {
+                    let mut ecm = serde_json::Map::new();
+                    if let Some(v) = ec.operator.filter(|s| !s.is_empty()) {
+                        ecm.insert("operator".to_string(), serde_json::Value::String(v));
+                    }
+                    if !ec.values.is_empty() {
+                        ecm.insert(
+                            "values".to_string(),
+                            serde_json::Value::Array(
+                                ec.values
+                                    .into_iter()
+                                    .map(|n| serde_json::Value::Number(n.into()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    m.insert("exitCodes".to_string(), serde_json::Value::Object(ecm));
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        cm.insert(
+            "restartPolicyRules".to_string(),
+            serde_json::Value::Array(rules),
+        );
     }
     if !c.volume_mounts.is_empty() {
         let mounts: Vec<serde_json::Value> = c
@@ -768,6 +823,30 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
             })
             .collect();
         cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
+    }
+    // volumeDevices — raw block device mounts (as opposed to filesystem volumeMounts);
+    // dropping this silently starts the container without a block device the client
+    // explicitly asked to have mapped in, breaking workloads (e.g. databases) that require
+    // raw block access instead of a filesystem mount.
+    if !c.volume_devices.is_empty() {
+        let devices: Vec<serde_json::Value> = c
+            .volume_devices
+            .into_iter()
+            .map(|vd| {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = vd.name.filter(|s| !s.is_empty()) {
+                    m.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = vd.device_path.filter(|s| !s.is_empty()) {
+                    m.insert("devicePath".to_string(), serde_json::Value::String(v));
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        cm.insert(
+            "volumeDevices".to_string(),
+            serde_json::Value::Array(devices),
+        );
     }
     serde_json::Value::Object(cm)
 }
@@ -1656,6 +1735,20 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         spec_map.insert(
             "hostnameOverride".to_string(),
             serde_json::Value::String(ho),
+        );
+    }
+    // schedulingGroup — alpha GenericWorkload feature gate identifying the gang-scheduling
+    // group a pod belongs to. Dropping it silently strips PodGroupName from a
+    // protobuf-encoded pod create/update, leaving the scheduler no way to apply workload-aware
+    // (gang) scheduling semantics the client explicitly asked for.
+    if let Some(pgn) = spec
+        .scheduling_group
+        .and_then(|sg| sg.pod_group_name)
+        .filter(|s| !s.is_empty())
+    {
+        spec_map.insert(
+            "schedulingGroup".to_string(),
+            serde_json::json!({ "podGroupName": pgn }),
         );
     }
     serde_json::Value::Object(spec_map)
@@ -5524,5 +5617,185 @@ mod tests {
             "Secret.data must survive decode — without it a mounted Secret volume or env var \
              is silently empty for every pod using it"
         );
+    }
+
+    // ---- Sentinel completeness: gen_pod_spec_to_json / gen_container_to_json ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in these hand-written gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_pod_proto_gen entry point,
+    // and asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how hostUsers/setHostnameAsFQDN previously went
+    // missing, and how workingDir/stdin/stdinOnce/tty/volumeDevices/restartPolicyRules/
+    // schedulingGroup were found missing from this file while building this test.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    /// Recursively collects every leaf key path in a JSON value tree, joining nested object
+    /// keys with '.'. Arrays contribute their elements' own leaf paths without an index: an
+    /// array's length and content depend on how many synthetic elements a sentinel produced,
+    /// so indexing would make the expected path set depend on that count instead of just on
+    /// which fields exist.
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    /// True if `field` appears as a whole path segment somewhere in `leaf_paths` — i.e. it was
+    /// decoded at some level, regardless of nesting depth. Segment (not full-path) matching is
+    /// deliberate: this only cares whether a field survived decode at all, matching the
+    /// historical bug shape of a field dropped entirely from a gen_*_to_json function.
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json function (or, if the omission is \
+             deliberate, document why and drop the field from this test's `expected` list)"
+        );
+    }
+
+    /// Builds a Pod whose spec is a fully sentinel-populated PodSpec (which recursively
+    /// sentinel-populates its `containers: Vec<Container>` too), and decodes it through the
+    /// real decode_pod_proto_gen entry point — the same function every protobuf-encoded Pod
+    /// create/update actually goes through in production (client-go's typed clientsets, used
+    /// by every controller and kube-scheduler, default to protobuf).
+    fn sentinel_pod_json() -> serde_json::Value {
+        let pod = core_v1::Pod {
+            spec: Some(core_v1::PodSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+        decode_pod_proto_gen(&buf).expect("sentinel Pod must decode via the generated path")
+    }
+
+    #[test]
+    fn sentinel_completeness_gen_pod_spec_to_json() {
+        let pod = sentinel_pod_json();
+        let mut spec_only = pod["spec"].clone();
+        // Blank out (but keep the keys of) nested Container/EphemeralContainer output: both
+        // share field names with PodSpec itself (resources, restartPolicy, securityContext),
+        // so without this a dropped PodSpec-level field could hide behind its Container-level
+        // namesake still being present somewhere in the tree.
+        if let Some(obj) = spec_only.as_object_mut() {
+            for key in ["containers", "initContainers", "ephemeralContainers"] {
+                obj.insert(key.to_string(), serde_json::Value::Array(Vec::new()));
+            }
+        }
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&spec_only, "", &mut paths);
+
+        let expected = [
+            "volumes",
+            "initContainers",
+            "containers",
+            "ephemeralContainers",
+            "restartPolicy",
+            "terminationGracePeriodSeconds",
+            "activeDeadlineSeconds",
+            "dnsPolicy",
+            "nodeSelector",
+            "serviceAccountName",
+            "serviceAccount",
+            "automountServiceAccountToken",
+            "nodeName",
+            "hostNetwork",
+            "hostPID",
+            "hostIPC",
+            "shareProcessNamespace",
+            "securityContext",
+            "imagePullSecrets",
+            "hostname",
+            "subdomain",
+            "affinity",
+            "schedulerName",
+            "tolerations",
+            "hostAliases",
+            "priorityClassName",
+            "priority",
+            "dnsConfig",
+            "readinessGates",
+            "runtimeClassName",
+            "enableServiceLinks",
+            "preemptionPolicy",
+            "overhead",
+            "topologySpreadConstraints",
+            "setHostnameAsFQDN",
+            "os",
+            "hostUsers",
+            "schedulingGates",
+            "resourceClaims",
+            "resources",
+            "hostnameOverride",
+            "schedulingGroup",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_gen_container_to_json() {
+        let pod = sentinel_pod_json();
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&pod["spec"]["containers"], "", &mut paths);
+
+        let expected = [
+            "name",
+            "image",
+            "command",
+            "args",
+            "workingDir",
+            "ports",
+            "envFrom",
+            "env",
+            "resources",
+            "resizePolicy",
+            "restartPolicy",
+            "restartPolicyRules",
+            "volumeMounts",
+            "volumeDevices",
+            "livenessProbe",
+            "readinessProbe",
+            "startupProbe",
+            "lifecycle",
+            "terminationMessagePath",
+            "terminationMessagePolicy",
+            "imagePullPolicy",
+            "securityContext",
+            "stdin",
+            "stdinOnce",
+            "tty",
+        ];
+        assert_fields_present(&paths, &expected);
     }
 }

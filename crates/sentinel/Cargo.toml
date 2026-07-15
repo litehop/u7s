@@ -1,0 +1,7 @@
+[package]
+name    = "u7s-sentinel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+u7s-sentinel-derive = { path = "../sentinel-derive" }
