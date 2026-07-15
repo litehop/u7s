@@ -115,7 +115,7 @@ struct WebhookConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct WebhookEntry {
+pub(crate) struct WebhookEntry {
     name: String,
     client_config: WebhookClientConfig,
     #[serde(default)]
@@ -569,7 +569,7 @@ async fn webhook_url<S: Store>(
     ))
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RuleWithOperations {
     #[serde(default)]
@@ -633,6 +633,34 @@ pub fn matches_rule(
     group_match && version_match && resource_match && operation_match && scope_match
 }
 
+/// Typed equivalent of `matches_rule` for webhook rules already parsed into
+/// `RuleWithOperations`.
+///
+/// Used on the admission hot path (`invoke_mutating_webhook`, `run_validating_webhooks`)
+/// so matching a rule no longer requires re-serializing it into a `serde_json::Value`
+/// first. `matches_rule` itself stays Value-based because ValidatingAdmissionPolicy
+/// matchConstraints/matchResources rules (`matches_match_constraints` and its caller)
+/// only ever exist as raw `Value` — VAP objects are never parsed into a typed struct.
+///
+/// `RuleWithOperations` has no `scope` field (unlike upstream's `Rule.Scope`), so this
+/// never filters by scope. That matches current behavior: the `to_value(rule)` round
+/// trip this replaces never produced a "scope" key either, since the field was never
+/// captured by this struct in the first place.
+fn matches_rule_typed(
+    rule: &RuleWithOperations,
+    group: &str,
+    version: &str,
+    resource: &str,
+    operation: &str,
+) -> bool {
+    let group_match = rule.api_groups.iter().any(|g| g == "*" || g == group);
+    let version_match = rule.api_versions.iter().any(|v| v == "*" || v == version);
+    let resource_match = rule.resources.iter().any(|r| r == "*" || r == resource);
+    let operation_match = rule.operations.iter().any(|o| o == "*" || o == operation);
+
+    group_match && version_match && resource_match && operation_match
+}
+
 // ---------------------------------------------------------------------------
 // Resource context passed through the admission pipeline
 // ---------------------------------------------------------------------------
@@ -657,7 +685,26 @@ pub struct AdmissionContext<'a> {
 // Store helpers: fetch webhook configurations
 // ---------------------------------------------------------------------------
 
-async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_json::Value>> {
+/// Parse a list of raw MutatingWebhookConfiguration/ValidatingWebhookConfiguration objects
+/// into their flattened, typed `webhooks[]` entries.
+///
+/// Flattening at parse time (instead of caching one `WebhookConfig` per top-level resource
+/// and flattening on every request) means `fetch_mutating_configs`/`fetch_validating_configs`
+/// can hand callers an `Arc<Vec<WebhookEntry>>` they iterate directly — no per-request
+/// `serde_json::from_value` or intermediate `Vec` allocation. Called only at write-through
+/// refresh time (`AppState::refresh_admission_config`) and on the cache's cold-path
+/// fallback, never per admission-gated request.
+pub(crate) fn parse_webhook_entries(configs: Vec<serde_json::Value>) -> Vec<WebhookEntry> {
+    let mut entries = Vec::new();
+    for config in configs {
+        if let Ok(wc) = serde_json::from_value::<WebhookConfig>(config) {
+            entries.extend(wc.webhooks);
+        }
+    }
+    entries
+}
+
+async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<WebhookEntry>> {
     // Hot path: read from the in-memory cache when warm (None = cold, falls back to store).
     // Cache is warmed at startup by init_admission_cache() and kept current by
     // refresh_admission_config() called write-through in handlers/resource.rs.
@@ -672,21 +719,22 @@ async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_
     }
     // Cache cold (first use or test without init): fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/";
-    let configs = match state.store.list(prefix, ListOptions::default()).await {
-        Ok(resp) => resp
-            .items
-            .into_iter()
-            .filter_map(|item| serde_json::from_slice(&item.value).ok())
-            .collect(),
-        Err(e) => {
-            tracing::warn!("admission: failed to list MutatingWebhookConfigurations: {e}");
-            vec![]
-        }
-    };
-    Arc::new(configs)
+    let configs: Vec<serde_json::Value> =
+        match state.store.list(prefix, ListOptions::default()).await {
+            Ok(resp) => resp
+                .items
+                .into_iter()
+                .filter_map(|item| serde_json::from_slice(&item.value).ok())
+                .collect(),
+            Err(e) => {
+                tracing::warn!("admission: failed to list MutatingWebhookConfigurations: {e}");
+                vec![]
+            }
+        };
+    Arc::new(parse_webhook_entries(configs))
 }
 
-async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serde_json::Value>> {
+async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<WebhookEntry>> {
     // Hot path: read from the in-memory cache when warm. See fetch_mutating_configs for why
     // this must be an Arc::clone, not a deep clone of the Vec.
     {
@@ -697,18 +745,19 @@ async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Arc<Vec<serd
     }
     // Cache cold: fall back to the store once.
     let prefix = "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/";
-    let configs = match state.store.list(prefix, ListOptions::default()).await {
-        Ok(resp) => resp
-            .items
-            .into_iter()
-            .filter_map(|item| serde_json::from_slice(&item.value).ok())
-            .collect(),
-        Err(e) => {
-            tracing::warn!("admission: failed to list ValidatingWebhookConfigurations: {e}");
-            vec![]
-        }
-    };
-    Arc::new(configs)
+    let configs: Vec<serde_json::Value> =
+        match state.store.list(prefix, ListOptions::default()).await {
+            Ok(resp) => resp
+                .items
+                .into_iter()
+                .filter_map(|item| serde_json::from_slice(&item.value).ok())
+                .collect(),
+            Err(e) => {
+                tracing::warn!("admission: failed to list ValidatingWebhookConfigurations: {e}");
+                vec![]
+            }
+        };
+    Arc::new(parse_webhook_entries(configs))
 }
 
 // ---------------------------------------------------------------------------
@@ -961,15 +1010,7 @@ async fn invoke_mutating_webhook<S: Store>(
     // Check if this webhook matches any rule.
     if !webhook.rules.is_empty() {
         let has_match = webhook.rules.iter().any(|rule| {
-            let rule_val = serde_json::to_value(rule).unwrap_or(serde_json::Value::Null);
-            matches_rule(
-                &rule_val,
-                ctx.group,
-                ctx.version,
-                ctx.resource,
-                ctx.namespace,
-                ctx.operation,
-            )
+            matches_rule_typed(rule, ctx.group, ctx.version, ctx.resource, ctx.operation)
         });
         if !has_match {
             return Ok((object.clone(), false));
@@ -2472,26 +2513,16 @@ pub async fn run_mutating_webhooks<S: Store>(
     // CEL-based MutatingAdmissionPolicy runs before the webhook chain (Kubernetes ordering).
     object = run_cel_mutating_policies(state, object, ctx).await;
 
-    let configs = fetch_mutating_configs(state).await;
-    if configs.is_empty() {
-        return Ok(object);
-    }
-
-    // Collect all webhook entries from all configurations.
-    let mut all_webhooks: Vec<WebhookEntry> = Vec::new();
-    for config in configs.iter() {
-        if let Ok(wc) = serde_json::from_value::<WebhookConfig>(config.clone()) {
-            all_webhooks.extend(wc.webhooks);
-        }
-    }
-
+    // Already-flattened, typed webhook entries — the cache holds the parsed form so
+    // this never re-serializes/re-parses a config per request (see parse_webhook_entries).
+    let all_webhooks = fetch_mutating_configs(state).await;
     if all_webhooks.is_empty() {
         return Ok(object);
     }
 
     // First pass: run all webhooks.
     let mut any_patched = false;
-    for webhook in &all_webhooks {
+    for webhook in all_webhooks.iter() {
         let (new_obj, patched) =
             invoke_mutating_webhook(state, webhook, &object, old_object, ctx, false).await?;
         if patched {
@@ -2502,7 +2533,7 @@ pub async fn run_mutating_webhooks<S: Store>(
 
     // Reinvocation pass: if any patch was applied, re-run IfNeeded webhooks once.
     if any_patched {
-        for webhook in &all_webhooks {
+        for webhook in all_webhooks.iter() {
             let (new_obj, _) =
                 invoke_mutating_webhook(state, webhook, &object, old_object, ctx, true).await?;
             object = new_obj;
@@ -2877,27 +2908,15 @@ pub async fn run_validating_webhooks<S: Store>(
         return Ok(());
     }
 
-    let configs = fetch_validating_configs(state).await;
-    let mut all_webhooks: Vec<WebhookEntry> = Vec::new();
-    for config in configs.iter() {
-        if let Ok(wc) = serde_json::from_value::<WebhookConfig>(config.clone()) {
-            all_webhooks.extend(wc.webhooks);
-        }
-    }
+    // Already-flattened, typed webhook entries — the cache holds the parsed form so
+    // this never re-serializes/re-parses a config per request (see parse_webhook_entries).
+    let all_webhooks = fetch_validating_configs(state).await;
 
-    for webhook in &all_webhooks {
+    for webhook in all_webhooks.iter() {
         // Check rule match.
         if !webhook.rules.is_empty() {
             let has_match = webhook.rules.iter().any(|rule| {
-                let rule_val = serde_json::to_value(rule).unwrap_or(serde_json::Value::Null);
-                matches_rule(
-                    &rule_val,
-                    ctx.group,
-                    ctx.version,
-                    ctx.resource,
-                    ctx.namespace,
-                    ctx.operation,
-                )
+                matches_rule_typed(rule, ctx.group, ctx.version, ctx.resource, ctx.operation)
             });
             if !has_match {
                 continue;
@@ -3457,6 +3476,174 @@ mod tests {
                 "{label}: must match namespaced resource"
             );
         }
+    }
+
+    // -- matches_rule_typed tests --
+    //
+    // matches_rule_typed replaces the per-rule serde_json::to_value(rule) round trip on the
+    // admission hot path (invoke_mutating_webhook / run_validating_webhooks). These mirror
+    // the matches_rule tests above (minus scope, which RuleWithOperations does not carry —
+    // see matches_rule_typed's doc comment) to prove the typed fast path agrees with the
+    // Value-based one it replaces.
+
+    fn make_rule_typed(
+        group: &str,
+        version: &str,
+        resource: &str,
+        operation: &str,
+    ) -> RuleWithOperations {
+        RuleWithOperations {
+            api_groups: vec![group.to_string()],
+            api_versions: vec![version.to_string()],
+            resources: vec![resource.to_string()],
+            operations: vec![operation.to_string()],
+        }
+    }
+
+    /// Wildcard "*" must match any resource/operation, same as matches_rule. Without this,
+    /// the most common webhook rule pattern would silently stop matching after switching
+    /// invoke_mutating_webhook/run_validating_webhooks to the typed fast path.
+    #[test]
+    fn matches_rule_typed_wildcard_matches_any_resource() {
+        let rule = RuleWithOperations {
+            api_groups: vec!["*".to_string()],
+            api_versions: vec!["*".to_string()],
+            resources: vec!["*".to_string()],
+            operations: vec!["*".to_string()],
+        };
+        assert!(
+            matches_rule_typed(&rule, "apps", "v1", "deployments", "CREATE"),
+            "wildcard rule must match any resource"
+        );
+        assert!(
+            matches_rule_typed(&rule, "", "v1", "pods", "UPDATE"),
+            "wildcard rule must match core group"
+        );
+    }
+
+    /// A rule scoped to "deployments" must not fire on "pods" — same guarantee as
+    /// matches_rule_specific_resource_matches_only_that_resource, for the typed path.
+    #[test]
+    fn matches_rule_typed_specific_resource_matches_only_that_resource() {
+        let rule = make_rule_typed("apps", "v1", "deployments", "CREATE");
+        assert!(
+            matches_rule_typed(&rule, "apps", "v1", "deployments", "CREATE"),
+            "specific resource rule must match the named resource"
+        );
+        assert!(
+            !matches_rule_typed(&rule, "apps", "v1", "pods", "CREATE"),
+            "specific resource rule must not match a different resource"
+        );
+    }
+
+    /// A rule for CREATE must not fire on UPDATE — admission chains are op-specific;
+    /// firing on the wrong operation would apply mutations/denials the admin never asked for.
+    #[test]
+    fn matches_rule_typed_operation_mismatch_does_not_match() {
+        let rule = make_rule_typed("apps", "v1", "deployments", "CREATE");
+        assert!(
+            !matches_rule_typed(&rule, "apps", "v1", "deployments", "UPDATE"),
+            "rule for CREATE must not match UPDATE operation"
+        );
+    }
+
+    /// A rule for group "apps" must not fire for core-group ("") resources.
+    #[test]
+    fn matches_rule_typed_group_mismatch_does_not_match() {
+        let rule = make_rule_typed("apps", "v1", "pods", "CREATE");
+        assert!(
+            !matches_rule_typed(&rule, "", "v1", "pods", "CREATE"),
+            "rule for group 'apps' must not match core group ''"
+        );
+    }
+
+    /// Empty rule lists must not match — a misconfigured rule with no groups/versions/
+    /// resources/operations must be skipped, not treated as match-all.
+    #[test]
+    fn matches_rule_typed_empty_lists_do_not_match() {
+        let rule = RuleWithOperations {
+            api_groups: vec![],
+            api_versions: vec![],
+            resources: vec![],
+            operations: vec![],
+        };
+        assert!(
+            !matches_rule_typed(&rule, "apps", "v1", "deployments", "CREATE"),
+            "empty lists must not match anything"
+        );
+    }
+
+    /// matches_rule_typed must agree with matches_rule (the function it replaces on the
+    /// hot path) for every equivalent group/version/resource/operation rule and request.
+    ///
+    /// Why this matters: this is the correctness claim behind eliminating the per-rule
+    /// serde_json::to_value(rule) call — the typed fast path must be a drop-in behavioral
+    /// replacement, not just a faster one. A divergence here means some webhook would
+    /// start firing (or stop firing) purely because of the internal representation change.
+    #[test]
+    fn matches_rule_typed_agrees_with_value_based_matches_rule() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("*", "*", "*", "*"),
+            ("apps", "v1", "deployments", "CREATE"),
+            ("apps", "v1", "deployments", "UPDATE"),
+            ("", "v1", "pods", "CREATE"),
+        ];
+        let requests: &[(&str, &str, &str, &str)] = &[
+            ("apps", "v1", "deployments", "CREATE"),
+            ("apps", "v1", "pods", "CREATE"),
+            ("", "v1", "pods", "CREATE"),
+            ("batch", "v1", "jobs", "DELETE"),
+        ];
+        for &(rg, rv, rr, ro) in cases {
+            let value_rule = make_rule(rg, rv, rr, ro);
+            let typed_rule = make_rule_typed(rg, rv, rr, ro);
+            for &(g, v, r, o) in requests {
+                // namespace is irrelevant here: RuleWithOperations carries no scope field,
+                // so pass Some(..) to matches_rule to pin scope_match to "always true"
+                // (scope absent ⇒ matches both), matching matches_rule_typed's behavior.
+                let expected = matches_rule(&value_rule, g, v, r, Some("default"), o);
+                let actual = matches_rule_typed(&typed_rule, g, v, r, o);
+                assert_eq!(
+                    actual, expected,
+                    "matches_rule_typed({rg}/{rv}/{rr}/{ro} rule, {g}/{v}/{r}/{o}) = {actual}, \
+                     but matches_rule (the function it replaces) = {expected} — the typed fast \
+                     path must never disagree with the Value-based path it replaces"
+                );
+            }
+        }
+    }
+
+    /// parse_webhook_entries must flatten webhooks[] across multiple configs, in the same
+    /// order the configs were listed, and must skip a config that fails to parse instead of
+    /// dropping the whole batch.
+    ///
+    /// Why this matters: this function now does the Value -> WebhookEntry parsing exactly
+    /// once, at write-through refresh time (AppState::refresh_admission_config) — the
+    /// per-request parse loop it replaces is gone. A config that fails to parse (e.g. a
+    /// corrupt or partially-written object) must not take down webhook enforcement for
+    /// every OTHER configured webhook.
+    #[test]
+    fn parse_webhook_entries_flattens_across_configs_in_order_and_skips_unparseable() {
+        let config_a = json!({
+            "webhooks": [
+                {"name": "a1.example.com", "clientConfig": {"url": "https://a1"}},
+                {"name": "a2.example.com", "clientConfig": {"url": "https://a2"}}
+            ]
+        });
+        let unparseable = json!({"webhooks": "not-an-array"});
+        let config_b = json!({
+            "webhooks": [{"name": "b1.example.com", "clientConfig": {"url": "https://b1"}}]
+        });
+
+        let entries = parse_webhook_entries(vec![config_a, unparseable, config_b]);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a1.example.com", "a2.example.com", "b1.example.com"],
+            "entries must be flattened in config-list order, and the unparseable config in \
+             between must be skipped rather than dropping config_b's entries too"
+        );
     }
 
     // -- run_mutating_webhooks: no webhooks configured → object passes through unchanged --
@@ -9172,7 +9359,16 @@ mod tests {
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
             "metadata": {"name": "cache-test-mwc"},
-            "webhooks": []
+            "webhooks": [{
+                "name": "cache-test-webhook.example.com",
+                "clientConfig": {"url": "https://127.0.0.1:1"},
+                "rules": [{
+                    "apiGroups": ["*"],
+                    "apiVersions": ["*"],
+                    "resources": ["*"],
+                    "operations": ["*"]
+                }]
+            }]
         });
         store
             .put(
@@ -9188,7 +9384,7 @@ mod tests {
             .refresh_admission_config("mutatingwebhookconfigurations")
             .await;
 
-        // Cache must now be warm and contain the config.
+        // Cache must now be warm and contain the already-parsed, typed webhook entry.
         let slot = state.admission_cache.mutating_webhooks.read().unwrap();
         let cached = slot.as_ref().expect(
             "cache must be warm (Some) after refresh_admission_config — \
@@ -9197,14 +9393,14 @@ mod tests {
         assert_eq!(
             cached.len(),
             1,
-            "cache must contain exactly the one MutatingWebhookConfiguration that was stored — \
-             if len=0, refresh_admission_config listed the wrong prefix or skipped the put"
+            "cache must contain exactly the one webhook entry from the MutatingWebhookConfiguration \
+             that was stored — if len=0, refresh_admission_config listed the wrong prefix, skipped \
+             the put, or failed to parse the entry"
         );
         assert_eq!(
-            cached[0]["metadata"]["name"].as_str(),
-            Some("cache-test-mwc"),
-            "cached config must have the name we stored — \
-             a mismatch means the store prefix or deserialization is wrong"
+            cached[0].name, "cache-test-webhook.example.com",
+            "cached entry must have the webhook name we stored — \
+             a mismatch means the store prefix or typed parsing is wrong"
         );
     }
 
@@ -9230,7 +9426,16 @@ mod tests {
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
             "metadata": {"name": "ephemeral-mwc"},
-            "webhooks": []
+            "webhooks": [{
+                "name": "ephemeral-webhook.example.com",
+                "clientConfig": {"url": "https://127.0.0.1:1"},
+                "rules": [{
+                    "apiGroups": ["*"],
+                    "apiVersions": ["*"],
+                    "resources": ["*"],
+                    "operations": ["*"]
+                }]
+            }]
         });
         let key =
             "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/ephemeral-mwc";
@@ -9248,7 +9453,7 @@ mod tests {
             .refresh_admission_config("mutatingwebhookconfigurations")
             .await;
 
-        // Verify cache is warm with 1 entry.
+        // Verify cache is warm with the 1 flattened webhook entry.
         {
             let slot = state.admission_cache.mutating_webhooks.read().unwrap();
             let cached = slot
@@ -9257,7 +9462,7 @@ mod tests {
             assert_eq!(
                 cached.len(),
                 1,
-                "cache must contain the config before delete"
+                "cache must contain the webhook entry before delete"
             );
         }
 
@@ -9365,19 +9570,36 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // Directly inject a value into the cache without touching the store.
-        // This lets us distinguish "came from cache" vs "came from store".
-        let fake_config = serde_json::json!({
-            "apiVersion": "admissionregistration.k8s.io/v1",
-            "kind": "ValidatingWebhookConfiguration",
-            "metadata": {"name": "fake-from-cache"},
-            "webhooks": []
-        });
+        // Directly inject an already-typed entry into the cache without touching the store.
+        // This lets us distinguish "came from cache" vs "came from store". The rule
+        // (batch/v1/jobs) deliberately does not match the request below (apps/v1/deployments),
+        // so the webhook is skipped by rule mismatch rather than actually dialing the
+        // unreachable clientConfig URL.
+        let fake_entry = WebhookEntry {
+            name: "fake-from-cache".to_string(),
+            client_config: WebhookClientConfig {
+                url: Some("https://127.0.0.1:1".to_string()),
+                service: None,
+                ca_bundle: None,
+            },
+            rules: vec![RuleWithOperations {
+                api_groups: vec!["batch".to_string()],
+                api_versions: vec!["v1".to_string()],
+                resources: vec!["jobs".to_string()],
+                operations: vec!["CREATE".to_string()],
+            }],
+            failure_policy: default_failure_policy(),
+            reinvocation_policy: String::new(),
+            namespace_selector: None,
+            object_selector: None,
+            timeout_seconds: None,
+            match_conditions: vec![],
+        };
         *state.admission_cache.validating_webhooks.write().unwrap() =
-            Some(std::sync::Arc::new(vec![fake_config.clone()]));
+            Some(std::sync::Arc::new(vec![fake_entry]));
 
         // The store has no configs — if fetch reads from the store it would return empty.
-        // If it reads from the cache it returns the injected fake config.
+        // If it reads from the cache it returns the injected fake entry.
         let ctx = AdmissionContext {
             group: "apps",
             version: "v1",
@@ -9389,12 +9611,12 @@ mod tests {
             dry_run: false,
         };
         // run_validating_webhooks calls fetch_validating_configs internally.
-        // With an empty webhook list (no URL configured), it returns Ok(()) regardless.
-        // We verify the cache was read by checking the cache slot is still Some (not cleared).
+        // The rule mismatch means the webhook is skipped, so this returns Ok regardless of
+        // the (unreachable) clientConfig URL.
         let result = run_validating_webhooks(&state, &serde_json::json!({}), None, &ctx).await;
         assert!(
             result.is_ok(),
-            "validating webhooks with empty list must return Ok"
+            "validating webhooks with a non-matching rule must return Ok without dialing the webhook"
         );
 
         // The cache slot must still hold the injected value — if fetch had gone to the store
@@ -9406,18 +9628,17 @@ mod tests {
         assert_eq!(
             cached.len(),
             1,
-            "cache must still contain the injected config after fetch — \
+            "cache must still contain the injected entry after fetch — \
              if len=0, fetch read from the (empty) store instead of the cache"
         );
         assert_eq!(
-            cached[0]["metadata"]["name"].as_str(),
-            Some("fake-from-cache"),
-            "cache must serve the injected config, proving the fetch read from cache not store"
+            cached[0].name, "fake-from-cache",
+            "cache must serve the injected entry, proving the fetch read from cache not store"
         );
     }
 
     /// Regression test for the admission hot path: fetching the cached config set must
-    /// clone the `Arc` (O(1) refcount bump), not deep-clone the underlying `Vec<Value>`.
+    /// clone the `Arc` (O(1) refcount bump), not deep-clone the underlying `Vec<WebhookEntry>`.
     ///
     /// Why this matters: admission runs on nearly every write (resource.rs, pods.rs,
     /// namespaces.rs, cr.rs, crd.rs, csr.rs, proxy.rs). A deep clone here re-allocates every
@@ -9430,13 +9651,22 @@ mod tests {
     async fn fetch_mutating_configs_shares_arc_not_deep_clone() {
         let state = make_state();
 
-        let fake_config = serde_json::json!({
-            "apiVersion": "admissionregistration.k8s.io/v1",
-            "kind": "MutatingWebhookConfiguration",
-            "metadata": {"name": "shared-arc-test"},
-            "webhooks": []
-        });
-        let cached_arc = Arc::new(vec![fake_config]);
+        let fake_entry = WebhookEntry {
+            name: "shared-arc-test".to_string(),
+            client_config: WebhookClientConfig {
+                url: Some("https://127.0.0.1:1".to_string()),
+                service: None,
+                ca_bundle: None,
+            },
+            rules: vec![],
+            failure_policy: default_failure_policy(),
+            reinvocation_policy: String::new(),
+            namespace_selector: None,
+            object_selector: None,
+            timeout_seconds: None,
+            match_conditions: vec![],
+        };
+        let cached_arc = Arc::new(vec![fake_entry]);
         *state.admission_cache.mutating_webhooks.write().unwrap() = Some(cached_arc.clone());
 
         // Two owners so far: `cached_arc` (this test's local handle) and the cache slot.
@@ -9459,6 +9689,222 @@ mod tests {
             Arc::ptr_eq(&cached_arc, &fetched),
             "fetched Arc must point at the same allocation as the cache slot — a different \
              allocation means fetch deep-cloned the Vec instead of cloning the Arc"
+        );
+    }
+
+    /// After the cache is warmed via `refresh_admission_config`, a matching mutating
+    /// webhook must still fire and its patch must still apply.
+    ///
+    /// Why this matters: every other webhook-invocation test in this file leaves the
+    /// cache cold, so `fetch_mutating_configs` falls back to listing+parsing the store
+    /// directly on every call — none of them exercise the cache-warm code path this fix
+    /// changed (the cache now stores already-parsed `WebhookEntry` values instead of raw
+    /// config `Value`s). A bug in `parse_webhook_entries` (e.g. dropping rules or
+    /// misreading clientConfig while flattening at refresh time) would silently make
+    /// every write skip real webhooks while every other (cold-cache) test here kept
+    /// passing.
+    #[tokio::test]
+    async fn mutating_webhook_fires_from_warm_typed_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let router = Router::new().route(
+            "/mutate",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let patch = serde_json::json!([
+                        {"op": "add", "path": "/metadata/labels", "value": {"managed-by": "warm-cache-webhook"}}
+                    ]);
+                    let patch_b64 = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        serde_json::to_string(&patch).unwrap(),
+                    );
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {
+                            "uid": "warm-cache-uid",
+                            "allowed": true,
+                            "patch": patch_b64,
+                            "patchType": "JSONPatch"
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+
+        let state = make_state();
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "warm-cache-labeler"},
+            "webhooks": [{
+                "name": "warm-cache.labeler.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/warm-cache-labeler",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Warm the cache BEFORE invoking the pipeline — unlike every other webhook test
+        // in this file, which leaves the cache cold and relies on the store fallback.
+        state
+            .refresh_admission_config("mutatingwebhookconfigurations")
+            .await;
+        assert!(
+            state
+                .admission_cache
+                .mutating_webhooks
+                .read()
+                .unwrap()
+                .is_some(),
+            "test setup must actually warm the cache, or this test would just exercise \
+             the same cold path as every other webhook-invocation test in this file"
+        );
+
+        let configmap = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "warm-cache-cm", "namespace": "default"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "warm-cache-cm",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_mutating_webhooks(&state, configmap, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "mutating webhook pipeline must succeed when served from the warm typed cache"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "webhook must be invoked exactly once from the warm cache — a miss here means \
+             parse_webhook_entries dropped or mismatched the cached rule"
+        );
+        let mutated = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(
+            mutated["metadata"]["labels"]["managed-by"], "warm-cache-webhook",
+            "patch from the warm-cache-driven webhook call must still apply to the object"
+        );
+    }
+
+    /// After the cache is warmed via `refresh_admission_config`, a matching validating
+    /// webhook must still deny the request.
+    ///
+    /// Why this matters: mirrors `mutating_webhook_fires_from_warm_typed_cache` for the
+    /// validating chain. Every other `run_validating_webhooks` test in this file leaves
+    /// the cache cold; none of them would catch a bug that only manifests on the
+    /// write-through refresh path (e.g. validatingwebhookconfigurations refreshed into
+    /// the wrong cache slot, or with the wrong rule attached).
+    #[tokio::test]
+    async fn validating_webhook_denies_from_warm_typed_cache() {
+        let router = Router::new().route(
+            "/validate",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "warm-cache-deny-uid",
+                        "allowed": false,
+                        "status": {"message": "denied from warm cache"}
+                    }
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+
+        let state = make_state();
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "warm-cache-denier"},
+            "webhooks": [{
+                "name": "warm-cache.denier.example.com",
+                "clientConfig": { "url": format!("{base_url}/validate") },
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/warm-cache-denier",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        state
+            .refresh_admission_config("validatingwebhookconfigurations")
+            .await;
+        assert!(
+            state
+                .admission_cache
+                .validating_webhooks
+                .read()
+                .unwrap()
+                .is_some(),
+            "test setup must actually warm the cache, or this test would just exercise \
+             the same cold path as every other webhook-invocation test in this file"
+        );
+
+        let deployment = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "warm-cache-deploy", "namespace": "default"}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "warm-cache-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &deployment, None, &ctx).await;
+        let err = result.expect_err(
+            "validating webhook served from the warm typed cache must still deny the request",
+        );
+        assert!(
+            err.1.message.contains("denied from warm cache"),
+            "denial message must come from the webhook served out of the warm cache, got: {}",
+            err.1.message
         );
     }
 }

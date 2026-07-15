@@ -69,12 +69,28 @@ pub fn parse_apis_path(path: &str) -> Option<(&str, &str, &str)> {
 // ---------------------------------------------------------------------------
 
 /// Look up the `APIService` named `{version}.{group}`, if any.
+///
+/// Reads `AppState::apiservice_cache` when warm, falling back to a direct store lookup only
+/// when the cache is cold (first use, or a test that seeds the store directly without going
+/// through the write handlers in `handlers/resource.rs`). This runs on every
+/// `/apis/{group}/{version}/...` request via `proxy_middleware` — including every request for
+/// a built-in or CRD-backed group, which never has a matching `APIService` — so avoiding the
+/// store round-trip on that common case matters for all non-core apiserver traffic, not just
+/// requests that actually hit an aggregated backend. See `ApiServiceCache` for the
+/// write-through invalidation that keeps this cache correct.
 pub async fn find_apiservice<S: Store>(
     state: &AppState<S>,
     group: &str,
     version: &str,
 ) -> Option<serde_json::Value> {
     let name = format!("{version}.{group}");
+    let cached = {
+        let guard = state.apiservice_cache.apiservices.read().unwrap();
+        guard.as_ref().cloned()
+    };
+    if let Some(map) = cached {
+        return map.get(&name).cloned();
+    }
     let key = crate::keys::group_object_key(APISERVICE_GROUP, APISERVICE_PLURAL, None, &name);
     let stored = state.store.get(&key).await.ok().flatten()?;
     serde_json::from_slice(&stored.value).ok()
@@ -397,36 +413,62 @@ fn discovery_request_headers(
     headers
 }
 
+/// Accumulate one `APIService`'s `spec.group`/`spec.version` (plus priority fields) into
+/// `by_group`. Shared by both branches of `list_apiservice_groups` (cache warm or cold) so the
+/// two data sources — the cached objects and a fresh store list — are folded identically.
+fn accumulate_apiservice_group_version(
+    by_group: &mut std::collections::HashMap<String, Vec<(String, i64, i64)>>,
+    svc: &serde_json::Value,
+) {
+    let (Some(group), Some(version)) = (
+        svc["spec"]["group"].as_str().map(str::to_owned),
+        svc["spec"]["version"].as_str().map(str::to_owned),
+    ) else {
+        return;
+    };
+    let group_priority_min = svc["spec"]["groupPriorityMinimum"].as_i64().unwrap_or(0);
+    let version_priority = svc["spec"]["versionPriority"].as_i64().unwrap_or(0);
+    by_group
+        .entry(group)
+        .or_default()
+        .push((version, group_priority_min, version_priority));
+}
+
 /// List every distinct `spec.group` among registered `APIService` objects, with the
 /// preferred version (highest `versionPriority`, ties broken by `groupPriorityMinimum`
 /// then name) and the full set of served versions — mirroring how `/apis` (APIGroupList)
 /// reports a CRD group's versions today.
+///
+/// Reads `AppState::apiservice_cache` when warm (see `find_apiservice`'s doc for why this
+/// matters: this runs on every plain `GET /apis`), falling back to a store list only when the
+/// cache is cold.
 pub async fn list_apiservice_groups<S: Store>(
     state: &AppState<S>,
 ) -> Vec<(String, String, Vec<String>)> {
-    let prefix = group_list_prefix(APISERVICE_GROUP, APISERVICE_PLURAL, None);
-    let Ok(resp) = state.store.list(&prefix, ListOptions::default()).await else {
-        return Vec::new();
+    let cached = {
+        let guard = state.apiservice_cache.apiservices.read().unwrap();
+        guard.as_ref().cloned()
     };
 
     let mut by_group: std::collections::HashMap<String, Vec<(String, i64, i64)>> =
         std::collections::HashMap::new();
-    for item in &resp.items {
-        let Ok(svc) = serde_json::from_slice::<serde_json::Value>(&item.value) else {
-            continue;
-        };
-        let (Some(group), Some(version)) = (
-            svc["spec"]["group"].as_str().map(str::to_owned),
-            svc["spec"]["version"].as_str().map(str::to_owned),
-        ) else {
-            continue;
-        };
-        let group_priority_min = svc["spec"]["groupPriorityMinimum"].as_i64().unwrap_or(0);
-        let version_priority = svc["spec"]["versionPriority"].as_i64().unwrap_or(0);
-        by_group
-            .entry(group)
-            .or_default()
-            .push((version, group_priority_min, version_priority));
+    match cached {
+        Some(map) => {
+            for svc in map.values() {
+                accumulate_apiservice_group_version(&mut by_group, svc);
+            }
+        }
+        None => {
+            let prefix = group_list_prefix(APISERVICE_GROUP, APISERVICE_PLURAL, None);
+            let Ok(resp) = state.store.list(&prefix, ListOptions::default()).await else {
+                return Vec::new();
+            };
+            for item in &resp.items {
+                if let Ok(svc) = serde_json::from_slice::<serde_json::Value>(&item.value) {
+                    accumulate_apiservice_group_version(&mut by_group, &svc);
+                }
+            }
+        }
     }
 
     by_group
@@ -885,6 +927,296 @@ mod tests {
         );
         served.sort();
         assert_eq!(served, vec!["v1alpha1".to_string(), "v1beta1".to_string()]);
+    }
+
+    // ---- apiservice_cache: eliminates the per-request store round-trip ---------------
+
+    /// A `Store` wrapper that panics on `get`/`list` once armed, delegating to a real
+    /// in-memory `SqliteStore` otherwise. Proves `find_apiservice`/`list_apiservice_groups`
+    /// answer entirely from `AppState::apiservice_cache` once it is warm -- zero store calls --
+    /// which is the whole point of the cache: both functions run on every single
+    /// `/apis/{group}/{version}/...` request (via `proxy_middleware`) and every plain `GET
+    /// /apis`, respectively, so a store round-trip there was paid by all non-core apiserver
+    /// traffic, not just requests that actually hit an aggregated backend.
+    struct PanicsOnReadWhenArmedStore {
+        inner: Arc<SqliteStore>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl PanicsOnReadWhenArmedStore {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(SqliteStore::new(":memory:").expect("open in-memory db")),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Arm the panic. Call only after seeding data and warming the cache -- both of
+        /// which legitimately go through the store.
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Store for PanicsOnReadWhenArmedStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let armed = self.armed.load(std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                assert!(
+                    !armed,
+                    "find_apiservice called store.get() while the apiservice cache was warm -- \
+                     this is exactly the per-request store round-trip the cache exists to \
+                     eliminate"
+                );
+                inner.get(&key).await
+            }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let armed = self.armed.load(std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move {
+                assert!(
+                    !armed,
+                    "list_apiservice_groups called store.list() while the apiservice cache was \
+                     warm -- this is exactly the per-request store round-trip the cache exists \
+                     to eliminate"
+                );
+                inner.list(&prefix, opts).await
+            }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// The common case this bead is about: with zero `APIService` objects ever registered
+    /// (true for every u7s cluster that never installs an aggregated API), a request for an
+    /// unrelated group (apps, batch, rbac, CRDs, ...) must resolve its "not aggregated" miss
+    /// entirely from the (empty) warm cache. Before this cache existed, `find_apiservice` ran
+    /// a real store lookup on every single `/apis/{group}/{version}/...` request regardless.
+    #[tokio::test]
+    async fn find_apiservice_with_none_registered_resolves_miss_without_store_round_trip() {
+        let mock = Arc::new(PanicsOnReadWhenArmedStore::new());
+        let state = AppState::new(
+            mock.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        state.refresh_apiservice_cache().await; // warms to an empty cache -- nothing seeded
+        mock.arm();
+
+        assert!(
+            find_apiservice(&state, "apps", "v1").await.is_none(),
+            "a miss for an unrelated group must resolve from the warm (empty) cache, not a \
+             fresh store round-trip"
+        );
+    }
+
+    /// With an `APIService` registered, both a hit (the aggregated group itself) and a miss
+    /// (any other group) must resolve from the warm cache -- proving the cache is consulted
+    /// for the actual routing decision, not merely warmed and then bypassed.
+    #[tokio::test]
+    async fn find_apiservice_reads_warm_cache_for_hit_and_miss() {
+        let mock = Arc::new(PanicsOnReadWhenArmedStore::new());
+        let state = AppState::new(
+            mock.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let key = crate::keys::group_object_key(
+            "apiregistration.k8s.io",
+            "apiservices",
+            None,
+            "v1alpha1.wardle.example.com",
+        );
+        let body = serde_json::json!({
+            "spec": { "group": "wardle.example.com", "version": "v1alpha1" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(body.to_string()), Some(0))
+            .await
+            .expect("seed apiservice");
+
+        state.refresh_apiservice_cache().await;
+        mock.arm(); // any further store.get/store.list is the bug this test catches
+
+        let found = find_apiservice(&state, "wardle.example.com", "v1alpha1")
+            .await
+            .expect("must still find the seeded APIService from the warm cache");
+        assert_eq!(found["spec"]["group"], "wardle.example.com");
+
+        assert!(
+            find_apiservice(&state, "apps", "v1").await.is_none(),
+            "a miss for an unrelated group/version must also resolve from the warm cache"
+        );
+    }
+
+    /// `list_apiservice_groups` (the extra call `api_group_list_inner` makes on every plain
+    /// `GET /apis`) must likewise answer from the warm cache instead of a fresh store list.
+    #[tokio::test]
+    async fn list_apiservice_groups_reads_warm_cache() {
+        let mock = Arc::new(PanicsOnReadWhenArmedStore::new());
+        let state = AppState::new(
+            mock.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let key = crate::keys::group_object_key(
+            "apiregistration.k8s.io",
+            "apiservices",
+            None,
+            "v1alpha1.wardle.example.com",
+        );
+        let body = serde_json::json!({
+            "spec": {
+                "group": "wardle.example.com",
+                "version": "v1alpha1",
+                "service": { "namespace": "ns", "name": "svc" }
+            }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(body.to_string()), Some(0))
+            .await
+            .expect("seed apiservice");
+
+        state.refresh_apiservice_cache().await;
+        mock.arm();
+
+        let groups = list_apiservice_groups(&state).await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "wardle.example.com");
+    }
+
+    /// Regression test for the write-through invalidation itself: a create followed by a
+    /// delete (both via `refresh_apiservice_cache`, exactly as `handlers/resource.rs`'s write
+    /// handlers call it) must leave the cache reflecting the delete, not a stale hit -- a
+    /// cache that only ever grows would silently keep proxying to a backend the admin removed.
+    ///
+    /// Asserts on `apiservice_cache`'s own contents directly (not just `find_apiservice`'s
+    /// output) -- a `refresh_apiservice_cache` that silently no-ops would leave the cache cold,
+    /// and `find_apiservice` transparently falls back to the store when cold, which would mask
+    /// a broken refresh behind seemingly-correct behavior.
+    #[tokio::test]
+    async fn refresh_apiservice_cache_reflects_a_deletion() {
+        let state = make_state();
+        let key = crate::keys::group_object_key(
+            "apiregistration.k8s.io",
+            "apiservices",
+            None,
+            "v1alpha1.wardle.example.com",
+        );
+        let body = serde_json::json!({
+            "spec": { "group": "wardle.example.com", "version": "v1alpha1" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(body.to_string()), Some(0))
+            .await
+            .expect("seed apiservice");
+        state.refresh_apiservice_cache().await;
+        {
+            let guard = state.apiservice_cache.apiservices.read().unwrap();
+            let map = guard.as_ref().expect("cache must be warm after refresh");
+            assert_eq!(
+                map.len(),
+                1,
+                "the seeded apiservice must appear in the cache after refresh"
+            );
+        }
+
+        state.store.delete(&key, None).await.expect("delete");
+        state.refresh_apiservice_cache().await;
+
+        let guard = state.apiservice_cache.apiservices.read().unwrap();
+        let map = guard
+            .as_ref()
+            .expect("cache must still be warm after the second refresh");
+        assert!(
+            map.is_empty(),
+            "a deleted APIService must disappear from the cache after refresh, or a request \
+             for its group/version would keep proxying to a backend that no longer exists"
+        );
     }
 
     // ---- upsert_available_condition ---------------------------------------------------

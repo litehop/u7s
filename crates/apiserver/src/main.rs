@@ -294,6 +294,11 @@ async fn main() -> anyhow::Result<()> {
     // This ensures the first admission check after startup reads from cache, not the store.
     state.init_admission_cache().await;
 
+    // 10c-pre2. Populate the APIService cache from persisted objects before serving, so the
+    // first /apis/{group}/{version}/... request and the first plain GET /apis after startup
+    // read from cache instead of falling back to the store.
+    state.init_apiservice_cache().await;
+
     // 10c. Keep the kubernetes EndpointSlice in sync with the kubernetes Endpoints.
     // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
     // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
@@ -5179,6 +5184,7 @@ mod tests {
                 "jobs".to_string(),
                 "ci-job".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(
@@ -5451,6 +5457,7 @@ mod tests {
                 "gateways".to_string(),
                 "my-gateway".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(
@@ -5550,6 +5557,7 @@ mod tests {
                 "csinodes".to_string(),
                 "ci-node".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(
@@ -5809,6 +5817,7 @@ mod tests {
                 "certificatesigningrequests".into(),
                 "lifecycle-csr".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(get_result.is_ok(), "GET must succeed after POST");

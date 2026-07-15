@@ -335,13 +335,32 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         | "spec.volumes"
         | "spec.imagePullSecrets"
         | "spec.schedulingGates"
+        | "spec.resourceClaims"
         | "spec.template.spec.containers"
         | "spec.template.spec.initContainers"
         | "spec.template.spec.volumes"
         | "spec.template.spec.imagePullSecrets"
-        | "spec.template.spec.schedulingGates" => MergeKeyKind::Key("name"),
+        | "spec.template.spec.schedulingGates"
+        | "spec.template.spec.resourceClaims" => MergeKeyKind::Key("name"),
 
-        "spec.hostAliases" => MergeKeyKind::Key("ip"),
+        // topologySpreadConstraints — upstream patchMergeKey is "topologyKey" (singular;
+        // the second +listMapKey=whenUnsatisfiable doc annotation is only a composite-key
+        // hint for OpenAPI list-map validation, not a second real merge key: the Go struct
+        // has exactly one `patchMergeKey:"topologyKey"` tag). Without this, a
+        // strategic-merge-patch that adds one constraint (e.g. a GitOps tool layering a
+        // zone-spread on top of an existing hostname-spread) falls through to
+        // MergeKeyKind::Unknown, which silently replaces the whole array instead of
+        // merging by topologyKey — losing every pre-existing constraint.
+        "spec.topologySpreadConstraints" | "spec.template.spec.topologySpreadConstraints" => {
+            MergeKeyKind::Key("topologyKey")
+        }
+
+        // hostAliases inside a Pod template (Deployment/StatefulSet/DaemonSet/Job) — same
+        // silent-whole-array-replace bug as topologySpreadConstraints above: only the bare
+        // "spec.hostAliases" path was registered, so patching a Deployment's
+        // spec.template.spec.hostAliases to add one entry dropped every other hostAlias in
+        // the template.
+        "spec.hostAliases" | "spec.template.spec.hostAliases" => MergeKeyKind::Key("ip"),
 
         // Nested list fields inside container objects.
         // These paths are relative to the container object (e.g. spec.containers.env).
@@ -595,6 +614,145 @@ mod tests {
             &vec![json!({"name": "bar"})],
             "only the gate named \"foo\" should be removed — \"bar\" must remain untouched \
              since gates clear one at a time, not all-or-nothing"
+        );
+    }
+
+    /// spec.topologySpreadConstraints must be registered with merge key "topologyKey"
+    /// (matching upstream's `patchStrategy:"merge" patchMergeKey:"topologyKey"` tag on
+    /// PodSpec.TopologySpreadConstraints).
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a patch
+    /// that adds one constraint silently REPLACES the whole array instead of merging by
+    /// key — e.g. a GitOps tool layering a zone-spread constraint on top of an
+    /// already-configured hostname-spread constraint would silently delete the
+    /// hostname-spread constraint instead of adding the zone-spread one alongside it.
+    #[test]
+    fn test_smp_topology_spread_constraints_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "topologySpreadConstraints": [
+                    {"maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "topologySpreadConstraints": [
+                    {"maxSkew": 2, "topologyKey": "topology.kubernetes.io/zone", "whenUnsatisfiable": "ScheduleAnyway"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let constraints = target["spec"]["topologySpreadConstraints"]
+            .as_array()
+            .unwrap();
+        let keys: Vec<&str> = constraints
+            .iter()
+            .map(|c| c["topologyKey"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            constraints.len(),
+            2,
+            "adding a zone constraint must not silently drop the pre-existing hostname \
+             constraint — both scheduling constraints must remain in effect; got: {constraints:?}"
+        );
+        assert!(
+            keys.contains(&"kubernetes.io/hostname")
+                && keys.contains(&"topology.kubernetes.io/zone"),
+            "both the original and newly-patched topologyKey must survive; got: {keys:?}"
+        );
+    }
+
+    /// spec.template.spec.hostAliases must be registered with merge key "ip", not just the
+    /// bare spec.hostAliases (a Pod's own field) — hostAliases is commonly set inside a
+    /// Deployment/StatefulSet/DaemonSet/Job pod template (e.g. a Helm chart adding a
+    /// private-registry hostname override), and only the bare-Pod path was registered.
+    ///
+    /// Without the template-path entry, `merge_key_for_path` falls through to Unknown for
+    /// `spec.template.spec.hostAliases`, and a patch that adds one hostAlias entry silently
+    /// REPLACES the whole array instead of merging by ip — deleting every other host entry
+    /// the template previously configured.
+    #[test]
+    fn test_smp_host_aliases_in_pod_template_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "hostAliases": [
+                            {"ip": "10.0.0.1", "hostnames": ["registry.internal"]}
+                        ]
+                    }
+                }
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "hostAliases": [
+                            {"ip": "10.0.0.2", "hostnames": ["cache.internal"]}
+                        ]
+                    }
+                }
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let aliases = target["spec"]["template"]["spec"]["hostAliases"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            aliases.len(),
+            2,
+            "adding a new hostAlias to a pod template must not silently drop the \
+             pre-existing entry — the template's kubelet-injected /etc/hosts would lose an \
+             entry other pods still depend on; got: {aliases:?}"
+        );
+        let ips: Vec<&str> = aliases.iter().map(|a| a["ip"].as_str().unwrap()).collect();
+        assert!(
+            ips.contains(&"10.0.0.1") && ips.contains(&"10.0.0.2"),
+            "both the original and newly-patched ip must survive; got: {ips:?}"
+        );
+    }
+
+    /// spec.resourceClaims must be registered with merge key "name" (matching upstream's
+    /// `patchStrategy:"merge,retainKeys" patchMergeKey:"name"` tag on PodSpec.ResourceClaims).
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a
+    /// $patch:delete removing one DRA claim reference from a Pod template — e.g. a
+    /// Deployment rollout that drops a GPU claim from its template while keeping other
+    /// claims — returns 400 ("no merge key is registered") instead of removing just the
+    /// named claim.
+    #[test]
+    fn test_smp_resource_claims_delete_by_name() {
+        let mut target = json!({
+            "spec": {
+                "resourceClaims": [
+                    {"name": "gpu", "resourceClaimName": "gpu-claim"},
+                    {"name": "nic", "resourceClaimName": "nic-claim"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "resourceClaims": [
+                    {"name": "gpu", "$patch": "delete"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch)
+            .expect("$patch:delete on spec.resourceClaims must be accepted, not 400");
+
+        let claims = target["spec"]["resourceClaims"].as_array().unwrap();
+        assert_eq!(
+            claims,
+            &vec![json!({"name": "nic", "resourceClaimName": "nic-claim"})],
+            "only the claim named \"gpu\" should be removed — \"nic\" must remain untouched \
+             since claims are removed one at a time, not all-or-nothing"
         );
     }
 

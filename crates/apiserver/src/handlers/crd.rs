@@ -8,14 +8,16 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
-use crate::handlers::json_patch::{apply_json_patch, detect_patch_type, PatchType};
+use crate::handlers::json_patch::{
+    apply_json_patch, detect_patch_type, ssa_body_to_json, PatchType,
+};
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     state::AppState,
     status::Status,
     types::Object,
-    util::{extract_body, parse_resource_version, utc_now_rfc3339},
+    util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
 const GROUP: &str = "apiextensions.k8s.io";
@@ -632,6 +634,7 @@ pub async fn patch_crd<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = store_key(&name);
     let stored = state
@@ -644,8 +647,14 @@ pub async fn patch_crd<S: Store>(
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::unprocessable_entity(format!("invalid patch: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
+    // other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::unprocessable_entity(format!("invalid patch: {e}")))?
+    };
 
     match patch_type {
         PatchType::Merge | PatchType::StrategicMerge => {
@@ -776,6 +785,7 @@ pub async fn patch_crd_status<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = store_key(&name);
     let stored = state
@@ -788,8 +798,14 @@ pub async fn patch_crd_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
+    // every other patch type here is JSON.
+    let patch: serde_json::Value = if is_ssa {
+        ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
+    };
 
     match patch_type {
         PatchType::Json => {
@@ -1605,6 +1621,72 @@ mod tests {
         );
     }
 
+    /// PATCH .../customresourcedefinitions/{name} must accept a genuine multi-line YAML
+    /// apply-patch+yaml body, not just a JSON body wearing the +yaml content-type.
+    ///
+    /// WHY this matters: `kubectl apply --server-side` against a CRD (and the k8s
+    /// conformance suite's own SSA clients) send real YAML block syntax. Before this fix,
+    /// detect_patch_type accepted the apply-patch+yaml content type, but the body was still
+    /// parsed with serde_json::from_slice, which rejects YAML outright with "invalid patch:
+    /// expected value..." — every server-side apply against a CRD 400'd.
+    #[tokio::test]
+    async fn patch_crd_accepts_real_yaml_apply_patch_body() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes(name),
+        )
+        .await
+        .expect("create must succeed");
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes.
+        let patch_bytes = Bytes::from_static(
+            b"spec:\n  versions:\n  - name: v1alpha1\n    served: true\n    storage: true\n    schema:\n      openAPIV3Schema:\n        type: object\n        properties:\n          spec:\n            type: object\n            properties:\n              a:\n                type: string\n                default: A\n",
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("apply-patch+yaml with a genuine YAML body must succeed, not 400 'invalid patch': {e:?}")
+        })
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            StatusCode::OK,
+            "server-side apply against a CRD must return 200 OK with the patched object"
+        );
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+                ["properties"]["a"]["default"],
+            "A",
+            "the YAML-encoded schema default must be persisted and echoed back, proving the \
+             body was actually parsed rather than silently dropped"
+        );
+    }
+
     /// PATCH on a missing CRD must return 404, not 500.
     #[tokio::test]
     async fn patch_crd_missing_returns_404() {
@@ -1763,6 +1845,62 @@ mod tests {
         assert_eq!(
             v["spec"]["group"], "example.io",
             "PATCH on the status subresource must not touch spec"
+        );
+    }
+
+    /// PATCH .../customresourcedefinitions/{name}/status must accept a genuine multi-line
+    /// YAML apply-patch+yaml body, not just a JSON body wearing the +yaml content-type.
+    ///
+    /// WHY this matters: `kubectl apply --server-side` against a CRD's status subresource
+    /// (and the k8s conformance suite's ApplyStatus() calls) send real YAML block syntax.
+    /// Before this fix, detect_patch_type accepted the apply-patch+yaml content type, but
+    /// the body was still parsed with serde_json::from_slice, which rejects YAML outright
+    /// with "invalid patch JSON" — every server-side status apply against a CRD 400'd.
+    #[tokio::test]
+    async fn patch_crd_status_accepts_real_yaml_apply_patch_body() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        // Genuine YAML block syntax — NOT JSON serialized to bytes. Uses a condition type
+        // ("StoredVersionsPruned") that create_crd never seeds, so its presence can only be
+        // explained by this patch actually being parsed and merged — a merge key match
+        // against the pre-existing Established/NamesAccepted conditions would prove nothing.
+        let patch_bytes = Bytes::from_static(
+            b"status:\n  conditions:\n  - type: StoredVersionsPruned\n    status: \"True\"\n",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let resp = patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "apply-patch+yaml with a genuine YAML body on CRD /status must succeed, \
+                     not 400 'invalid patch JSON': {e:?}"
+                )
+            })
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let conditions = v["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be an array");
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c["type"] == "StoredVersionsPruned" && c["status"] == "True"),
+            "the YAML-encoded condition must be persisted and echoed back, proving the body \
+             was actually parsed rather than silently dropped: {conditions:?}"
         );
     }
 

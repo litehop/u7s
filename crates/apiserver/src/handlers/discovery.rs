@@ -310,59 +310,34 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         items.push(core_item);
     }
 
-    // Build one item per non-core group.
-    for group in &group_list.groups {
-        let mut versions_arr: Vec<serde_json::Value> = Vec::new();
-        for gv in &group.versions {
-            let resources = if let Some(rl) =
-                static_group_resources(group.name.as_str(), gv.version.as_str())
-            {
-                api_resources_to_discovery_resources(&rl)
-            } else {
-                // Dynamic group (CRD-backed): look up resources from the store.
-                let crd_resources =
-                    crd_group_resources(state, group.name.as_str(), gv.version.as_str()).await;
-                let crd_is_empty = crd_resources.as_array().is_none_or(|a| a.is_empty());
-                if !crd_is_empty {
-                    crd_resources
-                } else {
-                    // Not a CRD either: try an APIService-backed (aggregated) group. The
-                    // backend is the only source of truth for what it actually serves, so
-                    // this fetches its live discovery document rather than guessing.
-                    let apiservice = super::aggregation::find_apiservice(
-                        state,
-                        group.name.as_str(),
-                        gv.version.as_str(),
-                    )
-                    .await;
-                    match apiservice {
-                        Some(svc) => {
-                            match super::aggregation::discovery_resources_for_apiservice(
-                                state,
-                                &svc,
-                                authorization,
-                            )
-                            .await
-                            {
-                                Some(rl) => api_resources_to_discovery_resources(&rl),
-                                None => crd_resources,
-                            }
-                        }
-                        None => crd_resources,
-                    }
-                }
-            };
-            versions_arr.push(serde_json::json!({
+    // Build one item per non-core group. Every group+version is resolved as an independent
+    // future and run concurrently (futures_util::future::join_all) rather than one `.await`
+    // per loop iteration: an APIService-backed group's live discovery fetch carries its own
+    // ~10s connect+request timeout (aggregation::build_backend_client), so awaiting them one
+    // at a time means N slow/unresponsive backends add up to N * 10s to *every* /apis and
+    // /discovery/v2 response -- even for callers who never asked about that backend's group.
+    // Running them concurrently bounds the added latency to the single slowest backend.
+    let group_futures = group_list.groups.iter().map(|group| async move {
+        let version_futures = group.versions.iter().map(|gv| async move {
+            let resources = resolve_group_version_resources(
+                state,
+                group.name.as_str(),
+                gv.version.as_str(),
+                authorization,
+            )
+            .await;
+            serde_json::json!({
                 "version": gv.version,
                 "resources": resources,
                 "freshness": "Current"
-            }));
-        }
-        items.push(serde_json::json!({
+            })
+        });
+        serde_json::json!({
             "metadata": { "name": group.name },
-            "versions": versions_arr
-        }));
-    }
+            "versions": futures_util::future::join_all(version_futures).await
+        })
+    });
+    items.extend(futures_util::future::join_all(group_futures).await);
 
     // Compute a simple ETag from the number of items (sufficient for conformance).
     let resource_version = format!("{}", items.len());
@@ -373,6 +348,43 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         "metadata": { "resourceVersion": resource_version },
         "items": items
     })
+}
+
+/// Resolve the resource list for one group+version in the aggregated-discovery response.
+///
+/// Tries, in order: a static built-in list, then CRD-backed resources from the store, then
+/// (only if neither matched) an APIService-backed group's live discovery fetch -- the backend
+/// is the only source of truth for what it actually serves, so this fetches its live discovery
+/// document rather than guessing. Split out of `build_aggregated_discovery`'s loop so each
+/// group+version is an independent future that can be driven concurrently with the others
+/// instead of one at a time.
+async fn resolve_group_version_resources<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    version: &str,
+    authorization: Option<&axum::http::HeaderValue>,
+) -> serde_json::Value {
+    if let Some(rl) = static_group_resources(group, version) {
+        return api_resources_to_discovery_resources(&rl);
+    }
+    // Dynamic group (CRD-backed): look up resources from the store.
+    let crd_resources = crd_group_resources(state, group, version).await;
+    let crd_is_empty = crd_resources.as_array().is_none_or(|a| a.is_empty());
+    if !crd_is_empty {
+        return crd_resources;
+    }
+    // Not a CRD either: try an APIService-backed (aggregated) group.
+    match super::aggregation::find_apiservice(state, group, version).await {
+        Some(svc) => {
+            match super::aggregation::discovery_resources_for_apiservice(state, &svc, authorization)
+                .await
+            {
+                Some(rl) => api_resources_to_discovery_resources(&rl),
+                None => crd_resources,
+            }
+        }
+        None => crd_resources,
+    }
 }
 
 /// Look up CRD-backed resources for a group/version from the store and return discovery entries.
@@ -4039,6 +4051,189 @@ mod tests {
              CustomResourcePublishOpenAPI conformance test regex requires this exact \
              prefix; got: {:?}",
             creation_timestamp["description"]
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_aggregated_discovery — concurrent per-backend resolution
+    // ---------------------------------------------------------------------------
+
+    /// A store wrapper that sleeps before every `get()`, then delegates to the inner
+    /// in-memory store unchanged. Stands in for a slow per-backend APIService lookup: the
+    /// `.await` point this simulates (`find_apiservice`'s `store.get()`) sits inside the
+    /// exact same per-group-version future that a live APIService's network discovery
+    /// fetch (`discovery_resources_for_apiservice`) runs in, so proving this `.await` is
+    /// driven concurrently proves the network fetch would be too.
+    struct SlowGetStore {
+        inner: Arc<SqliteStore>,
+        delay: std::time::Duration,
+    }
+
+    impl u7s_store::Store for SlowGetStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            let delay = self.delay;
+            async move {
+                tokio::time::sleep(delay).await;
+                inner.get(&key).await
+            }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// Regression test: before this fix, `build_aggregated_discovery` resolved every
+    /// group+version with one `.await` per loop iteration, so N groups that each fall
+    /// through to an APIService lookup added N * (per-lookup latency) to the response. In
+    /// production that per-lookup step ends in a live network fetch to the backend with its
+    /// own ~10s timeout (`aggregation::build_backend_client`), so a handful of unresponsive
+    /// aggregated backends could add tens of seconds to *every* `/apis` and `/discovery/v2`
+    /// call, even for callers who never asked about the slow backend's group.
+    ///
+    /// This test simulates that slow backend with a slow store `get()` rather than a slow
+    /// live HTTP fetch: an APIService's backend is only reachable via a fixed
+    /// `{name}.{namespace}.svc` DNS suffix (`aggregation::backend_base_url`), which cannot
+    /// be pointed at a local test server without changing aggregation.rs's URL-resolution
+    /// code — out of scope for this fix. Omitting `spec.service` makes
+    /// `discovery_resources_for_apiservice` return instantly with no network call at all
+    /// (see its doc), isolating the slow step to exactly the `.await` this fix parallelizes.
+    ///
+    /// If the `for` loop's `join_all` fan-out is reverted back to sequential `.await`s, this
+    /// test's elapsed time goes from ~1 delay to ~BACKEND_COUNT delays and the assertion below
+    /// fails.
+    #[tokio::test]
+    async fn build_aggregated_discovery_resolves_backends_concurrently_not_sequentially() {
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        const BACKEND_COUNT: usize = 5;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        for i in 0..BACKEND_COUNT {
+            let group = format!("slowgroup{i}.example.com");
+            let name = format!("v1.{group}");
+            let key =
+                crate::keys::group_object_key("apiregistration.k8s.io", "apiservices", None, &name);
+            let body = serde_json::json!({
+                "metadata": { "name": name },
+                "spec": { "group": group, "version": "v1" }
+            });
+            inner
+                .put(&key, Bytes::from(body.to_string()), Some(0))
+                .await
+                .expect("seed apiservice");
+        }
+
+        let state = AppState::new(
+            Arc::new(SlowGetStore {
+                inner,
+                delay: DELAY,
+            }),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let start = std::time::Instant::now();
+        let body = build_aggregated_discovery(&state, "v2beta1", false, None).await;
+        let elapsed = start.elapsed();
+
+        let names: Vec<String> = body["items"]
+            .as_array()
+            .expect("items must be an array")
+            .iter()
+            .filter_map(|i| i["metadata"]["name"].as_str().map(str::to_owned))
+            .collect();
+        for i in 0..BACKEND_COUNT {
+            let expected = format!("slowgroup{i}.example.com");
+            assert!(
+                names.contains(&expected),
+                "every registered APIService-backed group must still appear in aggregated \
+                 discovery even though its resolution went through the slow store -- \
+                 concurrency must not drop or fail a slow backend's own group; got: {names:?}"
+            );
+        }
+
+        assert!(
+            elapsed < DELAY * 3,
+            "resolving {BACKEND_COUNT} backends one `.await` at a time would take at least \
+             {BACKEND_COUNT} * {DELAY:?} = {:?}; concurrent resolution must stay close to a \
+             single backend's own latency ({DELAY:?}) regardless of how many other backends \
+             are also slow, got {elapsed:?}",
+            DELAY * BACKEND_COUNT as u32
         );
     }
 }
