@@ -1495,6 +1495,218 @@ pub async fn openapi_v3<S: Store>(State(state): State<AppState<S>>) -> Response 
         .into_response()
 }
 
+/// components.schemas key for the shared ObjectMeta definition referenced by
+/// every CRD's `metadata` field (see `inject_standard_object_fields`).
+const OBJECT_META_SCHEMA_NAME: &str = "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta";
+
+/// Real kube-apiserver always injects TypeMeta (`apiVersion`, `kind`) and
+/// ObjectMeta (`metadata`) into a CRD's published OpenAPI schema server-side —
+/// CRD authors only ever describe `spec`/`status` in `openAPIV3Schema`.
+/// `kubectl explain <crd>` and `kubectl explain <crd>.metadata` rely on these
+/// standard fields being present; without them `apiVersion`/`kind` are
+/// missing from the top-level FIELDS list and `.metadata` cannot be explained
+/// at all (the field simply doesn't exist in the schema).
+fn inject_standard_object_fields(schema_obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let properties = schema_obj
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(properties) = properties.as_object_mut() else {
+        return;
+    };
+    properties.insert(
+        "apiVersion".to_string(),
+        serde_json::json!({
+            "type": "string",
+            "description": "APIVersion defines the versioned schema of this representation \
+                of an object. Servers should convert recognized schemas to the latest internal \
+                value, and may reject unrecognized values. More info: \
+                https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources"
+        }),
+    );
+    properties.insert(
+        "kind".to_string(),
+        serde_json::json!({
+            "type": "string",
+            "description": "Kind is a string value representing the REST resource this object \
+                represents. Servers may infer this from the endpoint the client submits requests \
+                to. Cannot be updated. In CamelCase. More info: \
+                https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
+        }),
+    );
+    // OpenAPI v3 ignores sibling keys next to `$ref` (unlike v2/Swagger), so a
+    // flat `{"$ref": ..., "description": ...}` loses the field-level
+    // description entirely once kubectl explain's template dereferences the
+    // `$ref` — `kubectl explain <crd>.metadata` would then show only
+    // ObjectMeta's own top-level description, never "Standard object's
+    // metadata". Wrapping the `$ref` in `allOf` is the standard workaround:
+    // kubectl's "description" template walks both the wrapper's own
+    // description AND each `allOf` member's resolved description.
+    properties.insert(
+        "metadata".to_string(),
+        serde_json::json!({
+            "description": "Standard object's metadata. More info: \
+                https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata",
+            "allOf": [
+                { "$ref": format!("#/components/schemas/{OBJECT_META_SCHEMA_NAME}") }
+            ]
+        }),
+    );
+}
+
+/// The ObjectMeta shape every Kubernetes object carries under `metadata`,
+/// referenced via `$ref` by `inject_standard_object_fields`. `kubectl explain
+/// <crd>.metadata` resolves nested fields (e.g. `creationTimestamp`) against
+/// this schema, so it needs real properties, not an opaque `type: object`.
+fn object_meta_v3_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "ObjectMeta is metadata that all persisted resources must have, which \
+            includes all objects users must create.",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Name must be unique within a namespace. Is required when \
+                    creating resources, although some resources may allow a client to request \
+                    the generation of an appropriate name automatically. Cannot be updated. \
+                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names"
+            },
+            "generateName": {
+                "type": "string",
+                "description": "GenerateName is an optional prefix, used by the server, to \
+                    generate a unique name ONLY IF the Name field has not been provided. \
+                    More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#idempotency"
+            },
+            "namespace": {
+                "type": "string",
+                "description": "Namespace defines the space within which each name must be \
+                    unique. An empty namespace is equivalent to the \"default\" namespace. \
+                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces"
+            },
+            "uid": {
+                "type": "string",
+                "description": "UID is the unique in time and space value for this object. It \
+                    is typically generated by the server on successful creation of a resource \
+                    and is not allowed to change on PUT operations. Populated by the system. \
+                    Read-only. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#uids"
+            },
+            "resourceVersion": {
+                "type": "string",
+                "description": "An opaque value that represents the internal version of this \
+                    object that can be used by clients to determine when objects have changed. \
+                    Populated by the system. Read-only. More info: \
+                    https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency"
+            },
+            "generation": {
+                "type": "integer",
+                "format": "int64",
+                "description": "A sequence number representing a specific generation of the \
+                    desired state. Populated by the system. Read-only."
+            },
+            "creationTimestamp": {
+                "type": "string",
+                "format": "date-time",
+                "description": "CreationTimestamp is a timestamp representing the server time \
+                    when this object was created. It is not guaranteed to be set in \
+                    happens-before order across separate operations. Clients may not set this \
+                    value. It is represented in RFC3339 form and is in UTC. Populated by the \
+                    system. Read-only. Null for lists. More info: \
+                    https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+            },
+            "deletionTimestamp": {
+                "type": "string",
+                "format": "date-time",
+                "description": "DeletionTimestamp is RFC 3339 date and time at which this \
+                    resource will be deleted. This field is set by the server when a graceful \
+                    deletion is requested by the user, and is not directly settable by a \
+                    client. Populated by the system when a graceful deletion is requested. \
+                    Read-only. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+            },
+            "deletionGracePeriodSeconds": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Number of seconds allowed for this object to gracefully \
+                    terminate before it will be removed from the system. Only set when \
+                    deletionTimestamp is also set. May only be shortened. Read-only."
+            },
+            "labels": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Map of string keys and values that can be used to organize and \
+                    categorize (scope and select) objects. May match selectors of replication \
+                    controllers and services. More info: \
+                    https://kubernetes.io/docs/concepts/overview/working-with-objects/labels"
+            },
+            "annotations": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Annotations is an unstructured key value map stored with a \
+                    resource that may be set by external tools to store and retrieve arbitrary \
+                    metadata. They are not queryable and should be preserved when modifying \
+                    objects. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations"
+            },
+            "finalizers": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Must be empty before the object is deleted from the registry. \
+                    Each entry is an identifier for the responsible component that will remove \
+                    the entry from the list. If the deletionTimestamp of the object is non-nil, \
+                    entries in this list can only be removed."
+            },
+            "ownerReferences": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "description": "OwnerReference contains enough information to let you \
+                        identify an owning object. An owning object must be in the same \
+                        namespace as the dependent, or be cluster-scoped, so there is no \
+                        namespace field.",
+                    "properties": {
+                        "apiVersion": { "type": "string", "description": "API version of the referent." },
+                        "kind": {
+                            "type": "string",
+                            "description": "Kind of the referent. More info: \
+                                https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the referent. More info: \
+                                https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names"
+                        },
+                        "uid": {
+                            "type": "string",
+                            "description": "UID of the referent. More info: \
+                                https://kubernetes.io/docs/concepts/overview/working-with-objects/names#uids"
+                        },
+                        "controller": {
+                            "type": "boolean",
+                            "description": "If true, this reference points to the managing controller."
+                        },
+                        "blockOwnerDeletion": {
+                            "type": "boolean",
+                            "description": "If true, AND if the owner has the \
+                                \"foregroundDeletion\" finalizer, then the owner cannot be \
+                                deleted from the key-value store until this reference is removed."
+                        }
+                    },
+                    "required": ["apiVersion", "kind", "name", "uid"]
+                },
+                "description": "List of objects depended by this object. If ALL objects in the \
+                    list have been deleted, this object will be garbage collected. If this \
+                    object is managed by a controller, then an entry in this list will point to \
+                    this controller, with the controller field set to true."
+            },
+            "managedFields": {
+                "type": "array",
+                "items": { "type": "object" },
+                "description": "ManagedFields maps workflow-id and version to the set of fields \
+                    that are managed by that workflow. This is mostly for internal \
+                    housekeeping, and users typically shouldn't need to set or understand this \
+                    field."
+            }
+        }
+    })
+}
+
 pub async fn openapi_v3_group<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version)): Path<(String, String)>,
@@ -1545,6 +1757,7 @@ pub async fn openapi_v3_group<S: Store>(
                     "x-kubernetes-group-version-kind".to_string(),
                     serde_json::json!([gvk.clone()]),
                 );
+                inject_standard_object_fields(schema_obj);
             }
             schemas.insert(kind.clone(), schema);
 
@@ -1571,6 +1784,7 @@ pub async fn openapi_v3_group<S: Store>(
     if schemas.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    schemas.insert(OBJECT_META_SCHEMA_NAME.to_string(), object_meta_v3_schema());
 
     Json(serde_json::json!({
         "openapi": "3.0.0",
@@ -3722,6 +3936,121 @@ mod tests {
             StatusCode::NOT_FOUND,
             "/openapi/v3/apis/<unknown>/<version> must return 404 — \
              client-go uses the 404 to skip schema loading for absent groups"
+        );
+    }
+
+    // Real kube-apiserver always injects TypeMeta (apiVersion, kind) and
+    // ObjectMeta (metadata) into a CRD's published OpenAPI schema server-side —
+    // CRD authors only ever declare spec/status. Without this injection,
+    // `kubectl explain <crd>` never shows apiVersion/kind, and `kubectl explain
+    // <crd>.metadata` fails outright with `field "metadata" does not exist`
+    // because the schema has no such property at all.
+    #[tokio::test]
+    async fn openapi_v3_group_schema_includes_standard_object_fields() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("probe.example.com", "widgets", "Widget", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("probe.example.com".to_string(), "v1".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let props = &val["components"]["schemas"]["Widget"]["properties"];
+
+        assert_eq!(
+            props["apiVersion"]["type"], "string",
+            "apiVersion must be injected as a string field — kubectl explain's FIELDS \
+             section needs it even though no CRD author ever declares it themselves"
+        );
+        assert!(
+            props["apiVersion"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("APIVersion defines"),
+            "apiVersion description must match upstream's TypeMeta doc — the \
+             CustomResourcePublishOpenAPI conformance test regex requires this exact \
+             prefix; got: {:?}",
+            props["apiVersion"]["description"]
+        );
+        assert_eq!(props["kind"]["type"], "string");
+
+        // OpenAPI v3 ignores sibling keys next to `$ref`, so `metadata` must wrap
+        // its `$ref` in `allOf` to keep its own description — a bare
+        // `{"$ref": ..., "description": ...}` silently loses "Standard object's
+        // metadata" once kubectl explain's template dereferences the `$ref`,
+        // even though the JSON itself looks perfectly reasonable.
+        assert!(
+            props["metadata"].get("$ref").is_none(),
+            "metadata must not be a bare $ref sibling — OpenAPI v3 drops the sibling \
+             description on dereference, breaking `kubectl explain <crd>.metadata`'s \
+             DESCRIPTION section"
+        );
+        assert_eq!(
+            props["metadata"]["allOf"][0]["$ref"],
+            format!("#/components/schemas/{OBJECT_META_SCHEMA_NAME}"),
+            "metadata must reference the shared ObjectMeta component schema via allOf"
+        );
+        assert_eq!(
+            props["metadata"]["description"],
+            "Standard object's metadata. More info: \
+             https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata"
+        );
+    }
+
+    // kubectl explain <crd>.metadata recursively dereferences the `metadata`
+    // property's $ref and lists the target schema's own properties; if the
+    // referenced ObjectMeta component schema is absent or empty, that command
+    // fails with `field "metadata" does not exist` even though the top-level
+    // `metadata` field itself is present and well-formed.
+    #[tokio::test]
+    async fn openapi_v3_group_object_meta_schema_has_creation_timestamp() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("probe.example.com", "widgets", "Widget", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("probe.example.com".to_string(), "v1".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let creation_timestamp = &val["components"]["schemas"][OBJECT_META_SCHEMA_NAME]
+            ["properties"]["creationTimestamp"];
+
+        assert_eq!(creation_timestamp["type"], "string");
+        assert!(
+            creation_timestamp["description"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("CreationTimestamp is a timestamp"),
+            "creationTimestamp's description must match upstream ObjectMeta — the \
+             CustomResourcePublishOpenAPI conformance test regex requires this exact \
+             prefix; got: {:?}",
+            creation_timestamp["description"]
         );
     }
 
