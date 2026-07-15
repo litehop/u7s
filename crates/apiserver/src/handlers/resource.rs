@@ -209,6 +209,7 @@ pub async fn list_resource<S: Store>(
 pub async fn get_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name_for_group("name", &name, &group)?;
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -230,6 +231,18 @@ pub async fn get_resource<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     super::defaults::apply_defaults(&group, &plural, &mut obj);
     inject_type_meta(&mut obj, &group, &version, &meta.kind);
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE (list_resource already
+    // handles this for LIST — see above).
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+    }
+
     Ok(Json(obj).into_response())
 }
 
@@ -1348,6 +1361,7 @@ pub async fn list_namespaced_resource<S: Store>(
 pub async fn get_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     validate_name_for_group("name", &name, &group)?;
@@ -1374,6 +1388,18 @@ pub async fn get_namespaced_resource<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     super::defaults::apply_defaults(&group, &plural, &mut obj);
     inject_type_meta(&mut obj, &group, &version, &meta.kind);
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE (list_namespaced_resource
+    // already handles this for LIST — see above).
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
+    }
+
     Ok(Json(obj).into_response())
 }
 
@@ -4206,6 +4232,7 @@ mod tests {
                 "csinodes".into(),
                 "missing-node".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
 
@@ -4252,11 +4279,86 @@ mod tests {
                 "csinodes".into(),
                 "worker-1".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
 
         let resp = result.unwrap_or_else(|_| panic!("get_resource must return 200"));
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// `kubectl get <resource> <name>` sends Accept: application/json;as=Table;... by default
+    /// for every resource type, not just Pods. Before this fix, get_resource ignored Accept
+    /// entirely and always returned the raw object, so kubectl fell back to printing only
+    /// NAME/AGE for any non-Pod resource (list_resource already handled this for LIST).
+    #[tokio::test]
+    async fn get_resource_with_table_accept_returns_single_row_table() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+
+        let resp = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_resource with Table accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "a plain CSINode kind here means kubectl can't decode it as a Table and silently \
+             falls back to hardcoded NAME/AGE-only columns"
+        );
+        let rows = v["rows"].as_array().expect("Table response must have rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single-object GET must produce exactly one Table row, not a full list"
+        );
+        assert_eq!(
+            rows[0]["object"]["metadata"]["name"], "worker-1",
+            "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
     }
 
     /// get_namespaced_resource returns 404 when the namespaced object does not exist.
@@ -4275,6 +4377,7 @@ mod tests {
                 "leases".into(),
                 "missing".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
 
@@ -7013,6 +7116,7 @@ mod tests {
                 "widgets".into(),
                 "my-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
 
@@ -7039,6 +7143,7 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
 
@@ -7915,6 +8020,7 @@ mod tests {
                 "csinodes".into(),
                 "..".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
 
@@ -8585,6 +8691,7 @@ mod tests {
                 "services".into(),
                 "my-svc".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("Service GET must succeed"));
@@ -8649,6 +8756,7 @@ mod tests {
                 "services".into(),
                 "headless-svc".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("headless Service GET must succeed"));
@@ -9663,6 +9771,7 @@ mod tests {
                 "configmaps".into(),
                 "kube-root-ca.crt".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("ConfigMap GET must succeed; got: {e:?}"))
@@ -9691,6 +9800,83 @@ mod tests {
             rv_int > 0,
             "metadata.resourceVersion must be > 0 after first write; got: {rv_int} \
              (mayor-bdsj: store counter starts at 1)"
+        );
+    }
+
+    /// `kubectl get <resource> <name> -n <ns>` sends Accept: application/json;as=Table;...
+    /// by default. Before this fix, get_namespaced_resource ignored Accept entirely and always
+    /// returned the raw object, so kubectl fell back to printing only NAME/AGE for any
+    /// namespaced non-Pod resource (list_namespaced_resource already handled this for LIST).
+    #[tokio::test]
+    async fn get_namespaced_resource_with_table_accept_returns_single_row_table() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "my-cm", "namespace": "default" },
+            "data": { "key": "value" }
+        });
+
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ConfigMap POST must succeed; got: {e:?}"));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+
+        let get_resp = get_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "my-cm".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ConfigMap GET with Table accept must succeed; got: {e:?}"))
+        .into_response();
+
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "a plain ConfigMap kind here means kubectl can't decode it as a Table and silently \
+             falls back to hardcoded NAME/AGE-only columns"
+        );
+        let rows = v["rows"].as_array().expect("Table response must have rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single-object GET must produce exactly one Table row, not a full list"
+        );
+        assert_eq!(
+            rows[0]["object"]["metadata"]["name"], "my-cm",
+            "kubectl reads the row's embedded object to resolve the resource on selection"
         );
     }
 
@@ -10674,6 +10860,7 @@ mod tests {
                 "events".to_string(),
                 "my-pod.series-event".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("Event GET must succeed; got: {e:?}"))
@@ -11099,6 +11286,7 @@ mod tests {
                 "resourceslices".to_string(),
                 "slice-without-meta".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("GET must succeed"))
@@ -12626,6 +12814,7 @@ mod tests {
                 "validatingadmissionpolicies".to_string(),
                 "test-vap-persist".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("VAP get must succeed: {e:?}"));
@@ -13994,6 +14183,7 @@ mod tests {
                 "leases".into(),
                 "test-lease".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("Lease GET must succeed: {e:?}"));
@@ -14066,6 +14256,7 @@ mod tests {
                 "leases".into(),
                 "test-lease".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("Lease second GET must succeed: {e:?}"));

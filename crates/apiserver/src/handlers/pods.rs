@@ -499,7 +499,22 @@ pub async fn create_pod<S: Store>(
 pub async fn get_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    // Same as list_pods: reject an unsupported Table version before namespace validation,
+    // since the format is not implementable regardless of whether the namespace exists.
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if version != "v1" {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 is accepted"
+            )));
+        }
+    }
+
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
@@ -509,6 +524,15 @@ pub async fn get_pod<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE instead of the usual
+    // READY/STATUS/RESTARTS columns (list_pods already handles this — see above).
+    if super::table::wants_table(accept) {
+        let pod: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(Json(super::table::build_table("", "pods", vec![pod])).into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -7444,6 +7468,84 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `kubectl get pod <name>` sends Accept: application/json;as=Table;... by default. Before
+    /// this fix, get_pod ignored Accept entirely and always returned the raw Pod object, so
+    /// kubectl logged "Unable to decode server response into a Table" and fell back to printing
+    /// only NAME/AGE instead of the usual READY/STATUS/RESTARTS/AGE columns (LIST already worked
+    /// via list_pods — this closes the gap for single-name GET).
+    #[tokio::test]
+    async fn get_pod_with_table_accept_returns_single_row_table() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header("accept", "application/json;as=Table;g=meta.k8s.io;v=v1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "a plain Pod kind here means kubectl can't decode it as a Table and silently \
+             falls back to hardcoded NAME/AGE-only columns"
+        );
+        let rows = v["rows"].as_array().expect("Table response must have rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single-object GET must produce exactly one Table row, not a full list"
+        );
+        assert_eq!(
+            rows[0]["cells"][0], "nginx",
+            "the Table row must describe the requested pod, not some other object"
+        );
+        assert_eq!(
+            rows[0]["object"]["metadata"]["name"], "nginx",
+            "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
+    }
+
+    /// A Table request for a v1beta1 Table (long deprecated) on a single-name GET must be
+    /// rejected the same way list_pods already rejects it on LIST — a stale client must be
+    /// told the format isn't supported rather than silently downgraded to plain JSON or v1.
+    #[tokio::test]
+    async fn get_pod_with_v1beta1_table_accept_returns_406() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header(
+                "accept",
+                "application/json;as=Table;g=meta.k8s.io;v=v1beta1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
     }
 
     // -----------------------------------------------------------------------

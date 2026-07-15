@@ -5179,6 +5179,7 @@ mod tests {
                 "jobs".to_string(),
                 "ci-job".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(
@@ -5451,6 +5452,7 @@ mod tests {
                 "gateways".to_string(),
                 "my-gateway".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(
@@ -5550,6 +5552,7 @@ mod tests {
                 "csinodes".to_string(),
                 "ci-node".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(
@@ -5809,6 +5812,7 @@ mod tests {
                 "certificatesigningrequests".into(),
                 "lifecycle-csr".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert!(get_result.is_ok(), "GET must succeed after POST");

@@ -82,8 +82,15 @@ pub async fn get_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    // Same as get_resource; status is embedded in the object.
-    get_resource(State(state), Path((group, version, plural, name))).await
+    // Same as get_resource; status is embedded in the object. Table format is a
+    // `kubectl get <resource>` concern, not applicable to the /status subresource, so
+    // no Accept header is forwarded here.
+    get_resource(
+        State(state),
+        Path((group, version, plural, name)),
+        HeaderMap::new(),
+    )
+    .await
 }
 
 pub async fn put_resource_status<S: Store>(
@@ -208,8 +215,15 @@ pub async fn get_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    // Same as get_namespaced_resource; status is embedded in the object.
-    get_namespaced_resource(State(state), Path((group, version, ns, plural, name))).await
+    // Same as get_namespaced_resource; status is embedded in the object. Table format is a
+    // `kubectl get <resource>` concern, not applicable to the /status subresource, so
+    // no Accept header is forwarded here.
+    get_namespaced_resource(
+        State(state),
+        Path((group, version, ns, plural, name)),
+        HeaderMap::new(),
+    )
+    .await
 }
 
 pub async fn put_namespaced_resource_status<S: Store>(

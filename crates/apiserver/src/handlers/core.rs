@@ -167,8 +167,14 @@ pub async fn core_list_resource<S: Store>(
 pub async fn core_get_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    get_resource(State(state), Path(("".into(), "v1".into(), plural, name))).await
+    get_resource(
+        State(state),
+        Path(("".into(), "v1".into(), plural, name)),
+        headers,
+    )
+    .await
 }
 
 pub async fn core_create_resource<S: Store>(
@@ -317,10 +323,12 @@ pub async fn core_list_namespaced_resource<S: Store>(
 pub async fn core_get_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     get_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        headers,
     )
     .await
 }
@@ -642,6 +650,70 @@ mod tests {
         assert_eq!(
             pods[0]["metadata"]["namespace"], "statefulset-9798",
             "pod must be from the correct namespace"
+        );
+    }
+
+    /// `kubectl get service <name>` (and every other core v1 type — configmaps, secrets, ...)
+    /// routes through core_get_namespaced_resource, a distinct wrapper from the generic
+    /// /apis/{group}/{version} handlers. Before this fix, the wrapper didn't extract the
+    /// Accept header at all, so fixing get_namespaced_resource alone would not have helped:
+    /// kubectl would still fall back to NAME/AGE-only output for any core v1 resource type.
+    #[tokio::test]
+    async fn core_get_namespaced_resource_honors_table_accept() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "my-svc", "namespace": "default" },
+            "spec": { "clusterIP": "10.0.0.5", "ports": [] }
+        });
+        store
+            .put(
+                "/registry/services/default/my-svc",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create service");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/{resource}/{name}",
+                get(super::core_get_namespaced_resource),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/services/my-svc")
+            .header("accept", "application/json;as=Table;g=meta.k8s.io;v=v1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["kind"], "Table",
+            "core_get_namespaced_resource must forward the real Accept header down to \
+             get_namespaced_resource — without it, `kubectl get service <name>` never gets \
+             Table output no matter what get_namespaced_resource itself does"
         );
     }
 }
