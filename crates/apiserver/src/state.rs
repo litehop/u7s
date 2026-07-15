@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Semaphore;
 use u7s_store::{ListOptions, SqliteStore, Store};
 
+use crate::admission::WebhookEntry;
 use crate::auth::UserInfo;
 use crate::rbac::RbacIndex;
 use crate::types::{ResourceKey, ResourceMeta};
@@ -137,14 +138,18 @@ impl QuotaAdmissionLocks {
 /// - `None` = cache cold (not yet populated; fetch functions fall back to the store).
 /// - `Some(v)` = cache warm; use directly.
 ///
+/// The webhook slots store the already-parsed, flattened `WebhookEntry` list (not the
+/// raw config `Value`s): parsing happens once per write-through refresh instead of once
+/// per admission-gated request. See `crate::admission::parse_webhook_entries`.
+///
 /// The cache is warmed at startup by `init_admission_cache`. Tests that seed the store
 /// directly (without going through the handler) may leave the cache cold; in that case
 /// fetch functions fall back to the store, preserving existing test behaviour.
 pub struct AdmissionConfigCache {
-    /// MutatingWebhookConfiguration objects.
-    pub mutating_webhooks: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
-    /// ValidatingWebhookConfiguration objects.
-    pub validating_webhooks: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    /// MutatingWebhookConfiguration `webhooks[]` entries, flattened across all configs.
+    pub mutating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
+    /// ValidatingWebhookConfiguration `webhooks[]` entries, flattened across all configs.
+    pub validating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
     /// MutatingAdmissionPolicy objects.
     pub mutating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
     /// ValidatingAdmissionPolicy objects.
@@ -607,26 +612,31 @@ impl<S: Store> AppState<S> {
                     return;
                 }
             };
-        let new_slot = Some(Arc::new(items));
         match plural {
+            // Webhook slots cache the already-parsed, flattened WebhookEntry list so the
+            // admission hot path never re-parses a config Value per request — see
+            // crate::admission::parse_webhook_entries.
             "mutatingwebhookconfigurations" => {
-                *self.admission_cache.mutating_webhooks.write().unwrap() = new_slot;
+                let entries = crate::admission::parse_webhook_entries(items);
+                *self.admission_cache.mutating_webhooks.write().unwrap() = Some(Arc::new(entries));
             }
             "validatingwebhookconfigurations" => {
-                *self.admission_cache.validating_webhooks.write().unwrap() = new_slot;
+                let entries = crate::admission::parse_webhook_entries(items);
+                *self.admission_cache.validating_webhooks.write().unwrap() =
+                    Some(Arc::new(entries));
             }
             "mutatingadmissionpolicies" => {
-                *self.admission_cache.mutating_policies.write().unwrap() = new_slot;
+                *self.admission_cache.mutating_policies.write().unwrap() = Some(Arc::new(items));
             }
             "validatingadmissionpolicies" => {
-                *self.admission_cache.validating_policies.write().unwrap() = new_slot;
+                *self.admission_cache.validating_policies.write().unwrap() = Some(Arc::new(items));
             }
             "validatingadmissionpolicybindings" => {
                 *self
                     .admission_cache
                     .validating_policy_bindings
                     .write()
-                    .unwrap() = new_slot;
+                    .unwrap() = Some(Arc::new(items));
             }
             _ => {
                 // Not an admission config type — nothing to refresh.
