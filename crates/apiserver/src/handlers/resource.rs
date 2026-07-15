@@ -1700,63 +1700,81 @@ pub async fn replace_namespaced_resource<S: Store>(
     let key = group_object_key(&group, &plural, Some(&ns), &name);
 
     // Read the stored object once: used for (a) immutability enforcement on
-    // Secrets/ConfigMaps, (b) generation tracking on workload resources, and
-    // (c) status restoration when the resource has a dedicated status subresource.
+    // Secrets/ConfigMaps, (b) generation tracking on workload resources and EndpointSlice,
+    // (c) status restoration when the resource has a dedicated status subresource, and
+    // (d) UID restoration (see stored_uid below) whenever we already have this object in hand.
     let needs_stored_read = super::defaults::is_workload_resource(&group, &plural)
+        || super::defaults::is_endpointslice(&group, &plural)
         || meta.has_status_subresource
         || (group.is_empty() && (plural == "secrets" || plural == "configmaps"));
-    let (spec_before_replace, stored_status, stored_generation) = if needs_stored_read {
-        let parsed = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+    let (spec_before_replace, stored_status, stored_generation, stored_uid, eps_before_replace) =
+        if needs_stored_read {
+            let parsed = state
+                .store
+                .get(&key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
 
-        // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
-        // reject any update that modifies data/binaryData/stringData or clears the
-        // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
-        if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
-            if let Some(ref stored) = parsed {
-                if stored["immutable"] == serde_json::Value::Bool(true) {
-                    let new_immutable = &obj.body["immutable"];
-                    let immutable_cleared =
-                        new_immutable == &serde_json::Value::Bool(false) || new_immutable.is_null();
-                    let data_changed = obj.body["data"] != stored["data"];
-                    let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
-                    let string_data_changed = obj.body["stringData"] != stored["stringData"];
-                    if immutable_cleared
-                        || data_changed
-                        || binary_data_changed
-                        || string_data_changed
-                    {
-                        return Err(Status::unprocessable_entity(format!(
-                            "{plural}/{name} is immutable and cannot be updated"
-                        )));
+            // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
+            // reject any update that modifies data/binaryData/stringData or clears the
+            // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
+            if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
+                if let Some(ref stored) = parsed {
+                    if stored["immutable"] == serde_json::Value::Bool(true) {
+                        let new_immutable = &obj.body["immutable"];
+                        let immutable_cleared = new_immutable == &serde_json::Value::Bool(false)
+                            || new_immutable.is_null();
+                        let data_changed = obj.body["data"] != stored["data"];
+                        let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
+                        let string_data_changed = obj.body["stringData"] != stored["stringData"];
+                        if immutable_cleared
+                            || data_changed
+                            || binary_data_changed
+                            || string_data_changed
+                        {
+                            return Err(Status::unprocessable_entity(format!(
+                                "{plural}/{name} is immutable and cannot be updated"
+                            )));
+                        }
                     }
                 }
             }
-        }
 
-        let spec = if super::defaults::is_workload_resource(&group, &plural) {
-            parsed.as_ref().map(|v| v["spec"].clone())
+            let spec = if super::defaults::is_workload_resource(&group, &plural) {
+                parsed.as_ref().map(|v| v["spec"].clone())
+            } else {
+                None
+            };
+            let status = if meta.has_status_subresource {
+                parsed.as_ref().map(|v| v["status"].clone())
+            } else {
+                None
+            };
+            let generation = if super::defaults::is_workload_resource(&group, &plural)
+                || super::defaults::is_endpointslice(&group, &plural)
+            {
+                parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
+            } else {
+                None
+            };
+            // UID is immutable and system-assigned. Captured whenever we already have the
+            // stored object in hand (no extra read) so a blind PUT that omits it — see the
+            // restamp below — can be defended against for every resource type this read
+            // already covers, not just EndpointSlice.
+            let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+            // Snapshot of the whole pre-update object, used by
+            // increment_endpointslice_generation_if_changed below to detect a real content
+            // change (EndpointSlice has no `.spec` to diff against).
+            let eps_before = if super::defaults::is_endpointslice(&group, &plural) {
+                parsed.clone()
+            } else {
+                None
+            };
+            (spec, status, generation, uid, eps_before)
         } else {
-            None
+            (None, None, None, None, None)
         };
-        let status = if meta.has_status_subresource {
-            parsed.as_ref().map(|v| v["status"].clone())
-        } else {
-            None
-        };
-        let generation = if super::defaults::is_workload_resource(&group, &plural) {
-            parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
-        } else {
-            None
-        };
-        (spec, status, generation)
-    } else {
-        (None, None, None)
-    };
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
     // omits metadata.generation. Restamp the stored value onto the incoming body before
@@ -1767,6 +1785,27 @@ pub async fn replace_namespaced_resource<S: Store>(
     if let Some(ref g) = stored_generation {
         if !g.is_null() {
             obj.body["metadata"]["generation"] = g.clone();
+        }
+    }
+
+    // UID is immutable; a client's PUT commonly omits it — e.g. KCM's EndpointSlice
+    // reconciler builds its Update() body without repopulating this field. Real
+    // kube-apiserver's generic update preparation (rest.BeforeUpdate) unconditionally
+    // restores the existing UID whenever the incoming body's is blank ("Use the existing
+    // UID if none is provided"). Without this, a blank UID is persisted and broadcast to
+    // watchers as-is: KCM's EndpointSliceTracker identifies slices by UID, so its
+    // StaleSlices() check permanently treats the tracked (real) UID as missing from the
+    // informer once the informer's cached copy carries the blank one instead — every later
+    // sync fails with "EndpointSlice informer cache is out of date" forever.
+    if obj.body["metadata"]["uid"]
+        .as_str()
+        .map(str::is_empty)
+        .unwrap_or(true)
+    {
+        if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
+            if !uid.is_empty() {
+                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            }
         }
     }
 
@@ -1805,6 +1844,9 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     if let Some(ref spec_before) = spec_before_replace {
         super::defaults::increment_workload_generation_if_spec_changed(&mut obj.body, spec_before);
+    }
+    if let Some(ref eps_before) = eps_before_replace {
+        super::defaults::increment_endpointslice_generation_if_changed(&mut obj.body, eps_before);
     }
 
     // Restore the stored status: controllers write status via /status; a full PUT on
@@ -7956,6 +7998,122 @@ mod tests {
              KCM informers receive blank-namespace objects and the EndpointSlice mirroring \
              controller enters an infinite retry loop (blank-namespace DELETE requests fail \
              with 'not found')"
+        );
+    }
+
+    /// replace_namespaced_resource (PUT) must restore metadata.uid from the stored object when
+    /// the request body omits it — matching real kube-apiserver's rest.BeforeUpdate ("Use the
+    /// existing UID if none is provided"), which runs unconditionally on every Update.
+    ///
+    /// This is the confirmed root cause of KCM's EndpointSlice controller permanently failing
+    /// with "EndpointSlice informer cache is out of date" after a Service's second required
+    /// EndpointSlice write (e.g. a second pod becoming Ready): KCM's reconciler builds its
+    /// Update() body without repopulating UID. A blank UID stored and broadcast to watchers
+    /// means the informer's cached copy no longer carries the UID the tracker expects, so
+    /// EndpointSliceTracker.StaleSlices() sees the tracked (real) UID as permanently missing
+    /// from the informer — every later sync fails, forever, even though the object itself is
+    /// otherwise fully present and correct.
+    ///
+    /// This test fails on revert: without the restamp, the response and stored object both
+    /// carry a blank uid instead of the original one.
+    #[tokio::test]
+    async fn replace_namespaced_resource_restores_uid_when_put_body_omits_it() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let key = "/registry/discovery.k8s.io/endpointslices/eps-repro/iso-web-04fa0";
+        let original_uid = "a8ad2091-a2f2-4145-a407-03eb5a133f4f";
+        let created = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "addressType": "IPv4",
+            "endpoints": [],
+            "ports": [],
+            "metadata": {
+                "name": "iso-web-04fa0",
+                "namespace": "eps-repro",
+                "uid": original_uid,
+                "labels": { "kubernetes.io/service-name": "iso-web" }
+            }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&created).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed put must succeed");
+
+        // Simulates KCM's EndpointSlice reconciler Update() call: a second pod became Ready,
+        // so the slice gains an endpoint, but the body does not repopulate metadata.uid.
+        let put_body = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "addressType": "IPv4",
+            "endpoints": [{ "addresses": ["10.85.0.6"] }],
+            "ports": [{ "port": 80, "protocol": "TCP" }],
+            "metadata": {
+                "name": "iso-web-04fa0",
+                "namespace": "eps-repro",
+                "labels": { "kubernetes.io/service-name": "iso-web" }
+            }
+        });
+
+        let resp = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "discovery.k8s.io".into(),
+                "v1".into(),
+                "eps-repro".into(),
+                "endpointslices".into(),
+                "iso-web-04fa0".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("replace must succeed when body omits uid"))
+        .into_response();
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let returned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            returned["metadata"]["uid"], original_uid,
+            "PUT response must preserve the existing UID when the request body omits it; \
+             a blank UID here means KCM's tracker will never see this UID again in a future \
+             informer list, permanently wedging endpoint sync for this Service"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .expect("store get must succeed")
+            .expect("object must be stored");
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["metadata"]["uid"], original_uid,
+            "stored object must retain the original uid — this is what gets broadcast to \
+             KCM's already-established EndpointSlice watch; a blank stored uid is what wedges \
+             EndpointSliceTracker.StaleSlices() forever"
+        );
+        assert_eq!(
+            stored_obj["metadata"]["generation"], 2,
+            "generation must increment from 1 to 2 when endpoints content changed on this PUT"
         );
     }
 

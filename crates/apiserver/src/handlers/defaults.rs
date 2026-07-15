@@ -47,7 +47,7 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_role_ref_api_group(obj);
     }
 
-    if is_workload_resource(group, plural) {
+    if is_workload_resource(group, plural) || is_endpointslice(group, plural) {
         initialize_workload_generation(obj);
     }
 
@@ -100,6 +100,21 @@ pub fn is_workload_resource(group: &str, plural: &str) -> bool {
     )
 }
 
+/// Returns true for EndpointSlice, which — unlike the `is_workload_resource` set — tracks
+/// `metadata.generation` via bespoke REST-strategy logic upstream
+/// (`pkg/registry/discovery/endpointslice/strategy.go`'s `PrepareForUpdate`) instead of a
+/// `.spec` comparison: EndpointSlice has no `.spec`, so its generation increments when
+/// `endpoints`, `ports`, or `addressType` change (or when labels change).
+///
+/// KCM's `EndpointSliceTracker.StaleSlices()` reads this field per-UID to detect a stale
+/// informer cache; leaving it permanently absent (as the old `is_workload_resource`-only gate
+/// did, on the theory that "generation is unused" — true for Services, wrong for
+/// EndpointSlice) makes that comparison a no-op (0 is never greater than 0), silently
+/// disabling one of its three staleness checks.
+pub fn is_endpointslice(group: &str, plural: &str) -> bool {
+    matches!((group, plural), ("discovery.k8s.io", "endpointslices"))
+}
+
 /// Set `metadata.generation = 1` on a newly created workload object if absent or null.
 ///
 /// KCM's deployment controller reads metadata.generation to decide whether to
@@ -126,6 +141,26 @@ pub fn increment_workload_generation_if_spec_changed(
     spec_before: &serde_json::Value,
 ) {
     if obj["spec"] != *spec_before {
+        let current = obj["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj["metadata"]["generation"] = serde_json::json!(current + 1);
+    }
+}
+
+/// Increment `metadata.generation` for an EndpointSlice when its endpoints, ports,
+/// addressType, or labels changed relative to `before`.
+///
+/// Mirrors upstream's `endpointSliceStrategy.PrepareForUpdate`, which bumps generation
+/// whenever anything other than (non-label) metadata changed — EndpointSlice has no
+/// `.spec`, so `increment_workload_generation_if_spec_changed` can't be reused here.
+pub fn increment_endpointslice_generation_if_changed(
+    obj: &mut serde_json::Value,
+    before: &serde_json::Value,
+) {
+    let content_changed = obj["endpoints"] != before["endpoints"]
+        || obj["ports"] != before["ports"]
+        || obj["addressType"] != before["addressType"];
+    let labels_changed = obj["metadata"]["labels"] != before["metadata"]["labels"];
+    if content_changed || labels_changed {
         let current = obj["metadata"]["generation"].as_i64().unwrap_or(1);
         obj["metadata"]["generation"] = serde_json::json!(current + 1);
     }
@@ -2553,6 +2588,118 @@ mod tests {
             obj["metadata"]["generation"], 1,
             "generation must not increment when spec is unchanged — spurious increments \
              cause unnecessary KCM reconcile loops"
+        );
+    }
+
+    /// EndpointSlice must get metadata.generation=1 on creation, like real kube-apiserver's
+    /// endpointSliceStrategy.PrepareForCreate.
+    ///
+    /// KCM's EndpointSliceTracker.StaleSlices() compares this field per-UID to detect a stale
+    /// informer cache. Leaving it permanently absent makes that comparison a no-op (0 is never
+    /// greater than 0), silently disabling one of the tracker's three staleness checks.
+    #[test]
+    fn endpointslice_create_sets_generation_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": { "name": "svc-abcde", "namespace": "default" },
+            "addressType": "IPv4",
+            "endpoints": [],
+            "ports": []
+        });
+
+        apply_defaults("discovery.k8s.io", "endpointslices", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "EndpointSlice must have metadata.generation=1 after creation, matching real \
+             kube-apiserver — a permanently-absent generation defeats StaleSlices()'s \
+             per-UID generation comparison"
+        );
+    }
+
+    /// increment_endpointslice_generation_if_changed must bump generation when endpoints change.
+    ///
+    /// This is the actual content mutation the EndpointSlice controller performs when a second
+    /// pod becomes Ready: the slice already exists, and its endpoints array grows. Real
+    /// kube-apiserver's endpointSliceStrategy.PrepareForUpdate increments generation for this;
+    /// without it, KCM's EndpointSliceTracker can't distinguish "informer has today's content"
+    /// from "informer has yesterday's content" once a Service has multiple EndpointSlice UIDs.
+    #[test]
+    fn endpointslice_generation_incremented_when_endpoints_change() {
+        let before = serde_json::json!({
+            "endpoints": [{"addresses": ["10.0.0.1"]}],
+            "ports": [{"port": 80}],
+            "addressType": "IPv4",
+            "metadata": { "labels": {} }
+        });
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "svc-abcde", "generation": 1, "labels": {} },
+            "endpoints": [{"addresses": ["10.0.0.1"]}, {"addresses": ["10.0.0.2"]}],
+            "ports": [{"port": 80}],
+            "addressType": "IPv4"
+        });
+
+        increment_endpointslice_generation_if_changed(&mut obj, &before);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "generation must increment from 1 to 2 when endpoints change — this is exactly \
+             the second-write case (a second pod becoming Ready) that KCM's \
+             EndpointSliceTracker must be able to detect via generation"
+        );
+    }
+
+    /// increment_endpointslice_generation_if_changed must not change generation for a no-op
+    /// resync (identical endpoints/ports/addressType/labels).
+    #[test]
+    fn endpointslice_generation_not_incremented_when_content_unchanged() {
+        let before = serde_json::json!({
+            "endpoints": [{"addresses": ["10.0.0.1"]}],
+            "ports": [{"port": 80}],
+            "addressType": "IPv4",
+            "metadata": { "labels": {} }
+        });
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "svc-abcde", "generation": 1, "labels": {} },
+            "endpoints": [{"addresses": ["10.0.0.1"]}],
+            "ports": [{"port": 80}],
+            "addressType": "IPv4"
+        });
+
+        increment_endpointslice_generation_if_changed(&mut obj, &before);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "generation must not increment on a no-op resync — spurious increments would make \
+             KCM's own tracker updates look like external changes"
+        );
+    }
+
+    /// increment_endpointslice_generation_if_changed must bump generation on a labels-only
+    /// change, matching upstream's separate Labels comparison (EndpointSlice has no `.spec`,
+    /// so label changes can't be caught by a spec-equality check).
+    #[test]
+    fn endpointslice_generation_incremented_on_label_only_change() {
+        let before = serde_json::json!({
+            "endpoints": [],
+            "ports": [],
+            "addressType": "IPv4",
+            "metadata": { "labels": { "app": "old" } }
+        });
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "svc-abcde", "generation": 1, "labels": { "app": "new" } },
+            "endpoints": [],
+            "ports": [],
+            "addressType": "IPv4"
+        });
+
+        increment_endpointslice_generation_if_changed(&mut obj, &before);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "generation must increment when only labels change — EndpointSlice has no .spec, \
+             so a labels-only change must be tracked separately from endpoints/ports content"
         );
     }
 
