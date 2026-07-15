@@ -232,6 +232,10 @@ this repo. When you need it:
   fresh worktree; if you need a file that lives in the mayor's `temp/research/`,
   ask the mayor to copy it into your worktree — do not reach into the mayor
   checkout or fetch a divergent copy elsewhere.
+- **Fetch with `gh api` or `curl`, never `WebFetch`** (blocked for workers).
+  E.g. `gh api -H "Accept: application/vnd.github.raw" "/repos/kubernetes/kubernetes/contents/test/e2e/node/pods.go?ref=release-1.36"`.
+  Fetch each file ONCE, save it into `temp/research/<filename>`, then grep/read
+  the cached copy locally for any further lookups — don't re-fetch per symbol.
 - **Pin to the latest Kubernetes version: `1.36.2`** (as of 2026-07) — branch
   `release-1.36` for raw GitHub fetches, and reference 1.36.2 API/test
   semantics, not an older minor. Deviate only if a run's `serverversion.json`
@@ -629,10 +633,9 @@ When a worker returns from a VM/sonobuoy-touching bead:
   upstream Go test body is NOT in this repo, the sonobuoy archive, or `temp/e2e/`
   — so agents waste calls searching. Tell them exactly where: check
   `temp/research/` FIRST (gitignored; already holds curated upstream k8s source),
-  and if the file isn't there, `WebFetch` it from the raw GitHub URL derived from
-  the `e2e.txt` failure line (e.g. `k8s.io/kubernetes/test/e2e/node/pods.go:530`
-  → `raw.githubusercontent.com/kubernetes/kubernetes/release-1.34/test/e2e/node/pods.go`,
-  branch pinned to the conformance client version). The full protocol is in
+  and if the file isn't there, fetch it once with `gh api`/`curl` (never
+  `WebFetch`, see Upstream source rules) and cache it into `temp/research/`
+  before grepping it. The full protocol is in
   `ai/prompts/vm-operations.md` (Step 6, "Locating the failing test's source") —
   point the worker there. Reconstructing the test from the bare assertion string
   is unreliable: `Expected 2 to be equivalent to 1` is meaningless without the
