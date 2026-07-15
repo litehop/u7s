@@ -2453,6 +2453,15 @@ pub async fn get_cr_status<S: Store>(
         plural: plural.clone(),
     };
     if state.resource_registry.contains_key(&registry_key) {
+        // APIService is a registry resource whose /status a client may read moments after
+        // it starts working (the aggregator conformance test does, ~70ms after its own
+        // readiness poll succeeds) — far tighter than the periodic availability sweep
+        // (main.rs) can reliably win. Block this one read on a single health check when
+        // the object has never been checked yet, so the condition the caller reads back
+        // is never a bare empty slice.
+        if group == "apiregistration.k8s.io" && plural == "apiservices" {
+            super::aggregation::ensure_availability_checked(&state, &name).await;
+        }
         // Delegate to the generic get handler for registry resources.
         return super::resource::get_resource(State(state), Path((group, version, plural, name)))
             .await;

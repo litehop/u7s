@@ -348,6 +348,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // 10e. Health-check every registered APIService's backend and keep
+    // status.conditions[type=Available] up to date (see handlers::aggregation for why this
+    // is a fixed-interval sweep rather than a full informer-driven controller).
+    let (_apiservice_reconciler_shutdown_tx, mut apiservice_reconciler_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let reconcile_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                handlers::aggregation::reconcile_apiservice_availability(&reconcile_state).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    _ = apiservice_reconciler_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
@@ -772,6 +790,14 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::status::patch_namespaced_resource_status),
         )
         .fallback(fallback_handler)
+        // API aggregation: for any /apis/{group}/{version}/* request whose group+version
+        // matches a registered APIService with a live backend, proxy it there instead of
+        // the routes above. Runs as a layer (not a route) so it covers every verb/subpath
+        // uniformly without a new route per HTTP method — see handlers::aggregation for why.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handlers::aggregation::proxy_middleware::<SqliteStore>,
+        ))
         .with_state(state)
 }
 

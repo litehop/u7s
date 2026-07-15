@@ -30,6 +30,7 @@ pub struct SelfSubjectAccessReviewRequest {
 #[serde(rename_all = "camelCase")]
 struct AccessReviewSpec {
     resource_attributes: Option<ResourceAttributes>,
+    non_resource_attributes: Option<NonResourceAttributes>,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +48,20 @@ struct ResourceAttributes {
     subresource: String,
     #[serde(default)]
     name: String,
+}
+
+/// A non-resource-URL access check (e.g. `{path: "/apis/wardle.example.com/v1alpha1", verb:
+/// "get"}`). Real apiservers issue these — not `resourceAttributes` — to authorize requests
+/// against their own non-resource endpoints (discovery, openapi, healthz, ...). An aggregated
+/// backend delegating authorization here (via `system:auth-delegator`) sends exactly this
+/// shape for its own `/apis/{group}/{version}` discovery endpoint.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NonResourceAttributes {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    verb: String,
 }
 
 #[derive(Serialize)]
@@ -118,6 +133,18 @@ pub async fn self_subject_access_review<S: Store>(
             namespace: ns,
             name,
             non_resource_url: None,
+        })
+    } else if let Some(attrs) = req.spec.non_resource_attributes {
+        state.rbac_index.is_allowed(&AuthzRequest {
+            username: &user.username,
+            groups: &user.groups,
+            verb: &attrs.verb,
+            api_group: "",
+            resource: "",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: Some(&attrs.path),
         })
     } else {
         false
@@ -264,6 +291,7 @@ struct SubjectAccessReviewSpec {
     #[serde(default)]
     groups: Vec<String>,
     resource_attributes: Option<ResourceAttributes>,
+    non_resource_attributes: Option<NonResourceAttributes>,
 }
 
 #[derive(Serialize)]
@@ -367,6 +395,24 @@ pub async fn subject_access_review<S: Store>(
             namespace: ns,
             name,
             non_resource_url: None,
+        })
+    } else if let Some(attrs) = spec.non_resource_attributes {
+        // Real apiservers delegate authorization for their own non-resource endpoints
+        // (discovery, openapi, ...) via exactly this shape instead of resourceAttributes.
+        // An aggregated backend's DelegatingAuthorizationOptions sends this for its own
+        // /apis/{group}/{version} discovery endpoint (system:auth-delegator's SAR call) —
+        // without this branch every such check fell through to `allowed: false` below,
+        // making aggregated discovery permanently 403 even for a cluster-admin caller.
+        state.rbac_index.is_allowed(&AuthzRequest {
+            username: &spec.user,
+            groups: &spec.groups,
+            verb: &attrs.verb,
+            api_group: "",
+            resource: "",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: Some(&attrs.path),
         })
     } else {
         false
@@ -1174,6 +1220,53 @@ mod handler_tests {
         );
     }
 
+    /// `kubectl auth can-i get /metrics` (and similar non-resource checks) send
+    /// nonResourceAttributes, not resourceAttributes. Before this fix SSAR only ever read
+    /// resourceAttributes, so this always reported allowed=false regardless of the caller's
+    /// actual nonResourceURLs grants.
+    #[tokio::test]
+    async fn ssar_allows_non_resource_attributes_matching_rbac_rule() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "nonResourceURLs": ["/metrics"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "nonResourceAttributes": { "path": "/metrics", "verb": "get" }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            body,
+            user("alice", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], true,
+            "a nonResourceURL RBAC grant must authorize a matching SSAR nonResourceAttributes \
+             check — otherwise `kubectl auth can-i get /metrics` always reports no for \
+             every user, regardless of their actual grants"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // self_subject_rules_review
     // -----------------------------------------------------------------------
@@ -1462,6 +1555,112 @@ mod handler_tests {
         assert_eq!(
             val["status"]["allowed"], false,
             "absent resourceAttributes must produce allowed=false, not an error"
+        );
+    }
+
+    /// Regression test: aggregated backends (e.g. sample-apiserver) authorize requests to
+    /// their own non-resource endpoints (discovery, openapi, ...) by sending a SAR with
+    /// `nonResourceAttributes`, not `resourceAttributes` — via their `system:auth-delegator`
+    /// identity, on behalf of the original caller. Before this fix, `subject_access_review`
+    /// only ever read `spec.resourceAttributes`; a nonResourceAttributes-only request fell
+    /// through to `allowed: false` unconditionally, so an aggregated backend's own discovery
+    /// endpoint was permanently 403 even for a cluster-admin caller — this silently emptied
+    /// that group out of `/apis` discovery (aggregator conformance:
+    /// "could not find group version resource for dynamic client and wardle/flunders"),
+    /// while the resource endpoints (which use resourceAttributes) worked fine. Revert the
+    /// nonResourceAttributes branch and this must fail again.
+    #[tokio::test]
+    async fn sar_allows_non_resource_attributes_matching_rbac_rule() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "nonResourceURLs": ["/apis/wardle.example.com/v1alpha1"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "nonResourceAttributes": {
+                    "path": "/apis/wardle.example.com/v1alpha1",
+                    "verb": "get"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            body,
+            user("admin", &["system:masters"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], true,
+            "a nonResourceURL RBAC grant must authorize a matching nonResourceAttributes \
+             SAR check, or every aggregated backend's own discovery endpoint stays 403 \
+             forever regardless of the caller's actual permissions"
+        );
+    }
+
+    /// A nonResourceAttributes check for a path the subject has no grant for must be denied,
+    /// not accidentally allowed (e.g. by falling back to some permissive default).
+    #[tokio::test]
+    async fn sar_denies_non_resource_attributes_without_matching_rbac_rule() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "nonResourceURLs": ["/healthz"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "nonResourceAttributes": {
+                    "path": "/apis/wardle.example.com/v1alpha1",
+                    "verb": "get"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            body,
+            user("admin", &["system:masters"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], false,
+            "a grant for a different nonResourceURL must not authorize an unrelated path"
         );
     }
 

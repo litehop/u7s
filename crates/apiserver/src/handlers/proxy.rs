@@ -1244,7 +1244,10 @@ fn forward_proxied_headers(headers: &mut axum::http::HeaderMap, upstream: &axum:
 
 /// Build the outgoing proxy `Response`, carrying the backend's status and
 /// (filtered) headers.
-fn proxied_response(
+///
+/// `pub(crate)` so `handlers::aggregation` can reuse the exact same header-filtering
+/// logic for APIService-backend responses instead of reimplementing it.
+pub(crate) fn proxied_response(
     status: axum::http::StatusCode,
     upstream_headers: &axum::http::HeaderMap,
     body: Body,
