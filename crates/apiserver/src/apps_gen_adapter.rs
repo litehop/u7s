@@ -12,6 +12,27 @@ fn gen_pod_template_spec_to_json(tmpl: core_v1::PodTemplateSpec) -> serde_json::
     crate::core_gen_adapter::gen_pod_template_spec_to_json(tmpl)
 }
 
+fn gen_label_selector_requirement_to_json(
+    req: meta_v1::LabelSelectorRequirement,
+) -> serde_json::Value {
+    let mut m = serde_json::json!({});
+    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
+        m["key"] = serde_json::Value::String(k);
+    }
+    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
+        m["operator"] = serde_json::Value::String(op);
+    }
+    if !req.values.is_empty() {
+        m["values"] = serde_json::Value::Array(
+            req.values
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+    }
+    m
+}
+
 fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
     let mut m = serde_json::json!({});
     if !sel.match_labels.is_empty() {
@@ -21,6 +42,14 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
         m["matchLabels"] = serde_json::Value::Object(labels);
+    }
+    if !sel.match_expressions.is_empty() {
+        m["matchExpressions"] = serde_json::Value::Array(
+            sel.match_expressions
+                .into_iter()
+                .map(gen_label_selector_requirement_to_json)
+                .collect(),
+        );
     }
     m
 }
@@ -53,7 +82,7 @@ fn gen_apps_spec_to_json(
     let mut non_empty = false;
 
     if let Some(sel) = selector {
-        if !sel.match_labels.is_empty() {
+        if !sel.match_labels.is_empty() || !sel.match_expressions.is_empty() {
             spec["selector"] = gen_label_selector_to_json(sel);
             non_empty = true;
         }
@@ -923,6 +952,107 @@ mod tests {
             result["data"]["spec"]["replicas"], 3,
             "data must survive decode and parse as JSON — without it a rollback replays an \
              empty state instead of the recorded one"
+        );
+    }
+
+    /// A Deployment selector expressed purely via matchExpressions (no matchLabels) must
+    /// survive protobuf decode.
+    ///
+    /// Before the fix, gen_label_selector_to_json had no matchExpressions branch, and
+    /// gen_apps_spec_to_json only emitted spec.selector when matchLabels was non-empty — so a
+    /// matchExpressions-only selector decoded to a completely absent spec.selector. Live repro
+    /// confirmed the fallout is worse than an empty `{}`: handlers/defaults.rs treats the missing
+    /// selector as "absent" and silently substitutes one derived from spec.template.metadata.labels,
+    /// discarding the user's actual selector without any error.
+    #[test]
+    fn decode_deployment_proto_gen_preserves_match_expressions_only_selector() {
+        let deploy = apps_v1::Deployment {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("matchexpr-deploy".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::DeploymentSpec {
+                replicas: Some(2),
+                selector: Some(meta_v1::LabelSelector {
+                    match_labels: Default::default(),
+                    match_expressions: vec![meta_v1::LabelSelectorRequirement {
+                        key: Some("tier".to_string()),
+                        operator: Some("In".to_string()),
+                        values: vec!["frontend".to_string()],
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        deploy.encode(&mut buf).unwrap();
+
+        let result = decode_deployment_proto_gen(&buf).expect("Deployment must decode");
+
+        assert_ne!(
+            result["spec"]["selector"],
+            serde_json::json!({}),
+            "a matchExpressions-only selector must not decode to an absent/empty selector — \
+             upstream treats that as \"select everything\", so the deployment controller would \
+             adopt every pod in the namespace instead of only tier=frontend"
+        );
+        assert_eq!(
+            result["spec"]["selector"]["matchExpressions"][0]["key"], "tier",
+            "matchExpressions must survive decode when matchLabels is empty"
+        );
+        assert_eq!(
+            result["spec"]["selector"]["matchExpressions"][0]["operator"], "In",
+            "matchExpressions[].operator must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["selector"]["matchExpressions"][0]["values"][0], "frontend",
+            "matchExpressions[].values must survive decode"
+        );
+    }
+
+    /// A DaemonSet selector expressed purely via matchExpressions must survive protobuf decode.
+    ///
+    /// DaemonSet has no `replicas` field and (unlike Deployment/ReplicaSet/StatefulSet) no
+    /// selector validation or defaulting in handlers/defaults.rs, so before the fix a
+    /// matchExpressions-only selector decoded to spec.selector being completely absent, and
+    /// nothing downstream caught or corrected it — live repro confirmed the DaemonSet was
+    /// created successfully with no selector key at all in spec, which upstream semantics treat
+    /// as matching every pod in the cluster.
+    #[test]
+    fn decode_daemonset_proto_gen_preserves_match_expressions_only_selector() {
+        let ds = apps_v1::DaemonSet {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("matchexpr-ds".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::DaemonSetSpec {
+                selector: Some(meta_v1::LabelSelector {
+                    match_labels: Default::default(),
+                    match_expressions: vec![meta_v1::LabelSelectorRequirement {
+                        key: Some("tier".to_string()),
+                        operator: Some("In".to_string()),
+                        values: vec!["frontend".to_string()],
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ds.encode(&mut buf).unwrap();
+
+        let result = decode_daemonset_proto_gen(&buf).expect("DaemonSet must decode");
+
+        assert!(
+            !result["spec"]["selector"].is_null(),
+            "a matchExpressions-only selector must not decode to a missing spec.selector — \
+             DaemonSet has no fallback defaulting/validation, so a missing selector silently \
+             becomes \"match every pod in the cluster\" with no error to the caller"
+        );
+        assert_eq!(
+            result["spec"]["selector"]["matchExpressions"][0]["key"], "tier",
+            "matchExpressions must survive decode when matchLabels is empty"
         );
     }
 }
