@@ -418,18 +418,33 @@ pub async fn replace_resource<S: Store>(
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
-    // Immutability check: PriorityClass.value drives scheduling/preemption ordering
-    // cluster-wide; allowing it to change post-create would silently reorder
-    // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
-    if group == "scheduling.k8s.io" && plural == "priorityclasses" {
-        let key = group_object_key(&group, &plural, None, &name);
-        if let Some(stored) = state
+    let key = group_object_key(&group, &plural, None, &name);
+
+    // Read the stored object once: used for (a) immutability enforcement on
+    // PriorityClass.value, (b) status restoration when the resource has a dedicated status
+    // subresource, and (c) UID restoration (see stored_uid below). Cluster-scoped resources
+    // (Node, ClusterRole, StorageClass, ...) have no per-type gate as narrow as (a)/(b) for
+    // most of them, so the read is also triggered whenever the incoming body's UID is blank —
+    // conditional on that predicate rather than firing unconditionally on every PUT.
+    let is_priorityclass = group == "scheduling.k8s.io" && plural == "priorityclasses";
+    let incoming_uid_blank = obj.body["metadata"]["uid"]
+        .as_str()
+        .map(str::is_empty)
+        .unwrap_or(true);
+    let needs_stored_read = is_priorityclass || meta.has_status_subresource || incoming_uid_blank;
+    let (stored_status, stored_uid) = if needs_stored_read {
+        let parsed = state
             .store
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-        {
-            if let Ok(stored_val) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+
+        // Immutability check: PriorityClass.value drives scheduling/preemption ordering
+        // cluster-wide; allowing it to change post-create would silently reorder
+        // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
+        if is_priorityclass {
+            if let Some(ref stored_val) = parsed {
                 if obj.body["value"] != stored_val["value"] {
                     return Err(Status::unprocessable_entity(format!(
                         "{plural}/{name} .value is immutable and cannot be updated"
@@ -437,22 +452,34 @@ pub async fn replace_resource<S: Store>(
                 }
             }
         }
-    }
 
-    // Read the stored status so we can restore it after the PUT — controllers write
-    // status via /status; a full PUT on the main endpoint must not wipe it out.
-    let stored_status = if meta.has_status_subresource {
-        let key = group_object_key(&group, &plural, None, &name);
-        state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok())
-            .map(|v| v["status"].clone())
+        let status = if meta.has_status_subresource {
+            parsed.as_ref().map(|v| v["status"].clone())
+        } else {
+            None
+        };
+        // UID is immutable and system-assigned. Captured whenever we already have the
+        // stored object in hand so a blind PUT that omits it can be defended against,
+        // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
+        let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+        (status, uid)
     } else {
-        None
+        (None, None)
     };
+
+    // UID is immutable; a client's blind PUT (built from a locally-held copy that never
+    // repopulated system-assigned fields) can omit it. Real kube-apiserver's generic update
+    // preparation (rest.BeforeUpdate) unconditionally restores the existing UID whenever the
+    // incoming body's is blank ("Use the existing UID if none is provided") for every
+    // resource, every Update — cluster-scoped resources are exactly as exposed to this as
+    // namespaced ones. Without this, a blank UID is persisted and broadcast to watchers as-is.
+    if incoming_uid_blank {
+        if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
+            if !uid.is_empty() {
+                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            }
+        }
+    }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
@@ -494,8 +521,6 @@ pub async fn replace_resource<S: Store>(
         inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         return Ok(Json(obj.body).into_response());
     }
-
-    let key = group_object_key(&group, &plural, None, &name);
 
     // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
     // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
@@ -8114,6 +8139,107 @@ mod tests {
         assert_eq!(
             stored_obj["metadata"]["generation"], 2,
             "generation must increment from 1 to 2 when endpoints content changed on this PUT"
+        );
+    }
+
+    /// replace_resource (cluster-scoped PUT) must restore metadata.uid from the stored object
+    /// when the request body omits it — the same class of bug fixed above for
+    /// replace_namespaced_resource, but for cluster-scoped resources (StorageClass, ClusterRole,
+    /// Node, PersistentVolume, ...), which are equally reachable by a client that PUTs a blind,
+    /// locally-cached copy of the object missing its system-assigned UID.
+    ///
+    /// StorageClass has neither a status subresource nor the PriorityClass.value immutability
+    /// check, so before this fix nothing in replace_resource's stored-object read ever ran for
+    /// it — a blank incoming UID would have been persisted and returned verbatim, exactly the
+    /// EndpointSlice bug above but for a resource type the narrower per-type gates never cover.
+    ///
+    /// This test fails on revert: without the restoration, the response and stored object both
+    /// carry a blank uid instead of the original one.
+    #[tokio::test]
+    async fn replace_resource_restores_uid_when_put_body_omits_it() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let key = "/registry/storage.k8s.io/storageclasses/blind-put-sc";
+        let original_uid = "b3e1f6a0-1c2d-4e3f-9a5b-6d7c8e9f0a1b";
+        let created = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "provisioner": "kubernetes.io/no-provisioner",
+            "metadata": {
+                "name": "blind-put-sc",
+                "uid": original_uid
+            }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&created).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed put must succeed");
+
+        // Simulates a blind PUT from a client that round-trips a locally-held copy of the
+        // object without repopulating metadata.uid (e.g. a dynamic client rebuilding the body
+        // from a typed struct that never carried the field through).
+        let put_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "provisioner": "kubernetes.io/no-provisioner",
+            "volumeBindingMode": "WaitForFirstConsumer",
+            "metadata": { "name": "blind-put-sc" }
+        });
+
+        let resp = replace_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+                "blind-put-sc".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("replace must succeed when body omits uid"))
+        .into_response();
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let returned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            returned["metadata"]["uid"], original_uid,
+            "PUT response must preserve the existing UID when the request body omits it — \
+             cluster-scoped resources are exactly as exposed to a client's blind PUT as \
+             namespaced ones are"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .expect("store get must succeed")
+            .expect("object must be stored");
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["metadata"]["uid"], original_uid,
+            "stored object must retain the original uid — a blank stored uid would be \
+             broadcast to any watcher identifying this object by UID, exactly as it did for \
+             EndpointSlice before replace_namespaced_resource's equivalent fix"
         );
     }
 
