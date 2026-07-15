@@ -1349,6 +1349,148 @@ pub fn check_delete_response(status: u16) -> anyhow::Result<()> {
     bail!("evict failed with HTTP {status}")
 }
 
+// ---------------------------------------------------------------------------
+// Scheduling Events — reports bind success/failure so `kubectl describe pod`
+// and clients that watch Events (e.g. the SchedulerPredicates e2e suite's
+// observeEventAfterAction) can see the outcome.
+// ---------------------------------------------------------------------------
+
+/// The `involvedObject` reference on a scheduling Event — always the pod.
+#[derive(Serialize)]
+struct EventInvolvedObject<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    kind: &'a str,
+    namespace: &'a str,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct EventSource<'a> {
+    component: &'a str,
+}
+
+#[derive(Serialize)]
+struct EventMeta<'a> {
+    name: &'a str,
+    namespace: &'a str,
+}
+
+/// Full Event object body as posted to the API server.
+#[derive(Serialize)]
+struct SchedulingEvent<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    kind: &'a str,
+    metadata: EventMeta<'a>,
+    #[serde(rename = "involvedObject")]
+    involved_object: EventInvolvedObject<'a>,
+    reason: &'a str,
+    message: &'a str,
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    count: u32,
+    source: EventSource<'a>,
+}
+
+/// Build a unique Event object name for `pod_name`.
+///
+/// Real Kubernetes event recorders name events `<involvedObjectName>.<hex-suffix>`.
+/// Upstream's e2e predicate (`scheduleFailureEvent`/`scheduleSuccessEvent` in
+/// `test/e2e/scheduling/events.go`) matches on `strings.HasPrefix(e.Name, podName)`,
+/// so the name MUST start with `pod_name` — any other shape makes the event
+/// invisible to that check even though it was created correctly.
+///
+/// `nanos` is passed in (rather than read from `SystemTime::now()` here) so the
+/// naming logic itself can be unit-tested without a clock dependency.
+pub fn scheduling_event_name(pod_name: &str, nanos: u128) -> String {
+    format!("{pod_name}.{nanos:x}")
+}
+
+/// Build the JSON payload for a Kubernetes Event recording a scheduling outcome
+/// (bind success or failure) for a pod.
+///
+/// Pure function so the payload shape can be verified in tests without a network.
+/// Uses typed structs so field renames are compile errors, not silent bugs —
+/// mirrors `binding_payload`.
+pub fn scheduling_event_payload(
+    namespace: &str,
+    pod_name: &str,
+    event_name: &str,
+    reason: &str,
+    message: &str,
+    event_type: &str,
+) -> Value {
+    let event = SchedulingEvent {
+        api_version: "v1",
+        kind: "Event",
+        metadata: EventMeta {
+            name: event_name,
+            namespace,
+        },
+        involved_object: EventInvolvedObject {
+            api_version: "v1",
+            kind: "Pod",
+            namespace,
+            name: pod_name,
+        },
+        reason,
+        message,
+        event_type,
+        count: 1,
+        source: EventSource {
+            component: "u7s-scheduler",
+        },
+    };
+    serde_json::to_value(event).expect("SchedulingEvent is always serializable")
+}
+
+/// Build the POST path for Events in a given namespace.
+///
+/// Pure function extracted so callers can test path construction without
+/// network access — mirrors `binding_path`.
+pub fn events_path(namespace: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/events")
+}
+
+/// Post a scheduling-outcome Event (`reason` "Scheduled" or "FailedScheduling")
+/// for `pod_name` to the API server.
+///
+/// Without this, `kubectl describe pod` never shows a scheduling event, and any
+/// client watching Events for a scheduling decision (e.g. the SchedulerPredicates
+/// e2e suite's `observeEventAfterAction`) times out waiting for one that was never
+/// created — the scheduler made the right bind/reject decision but nobody outside
+/// process memory ever heard about it.
+pub async fn emit_scheduling_event(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pod_name: &str,
+    reason: &str,
+    message: &str,
+    event_type: &str,
+) -> anyhow::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let event_name = scheduling_event_name(pod_name, nanos);
+    let payload = scheduling_event_payload(
+        namespace,
+        pod_name,
+        &event_name,
+        reason,
+        message,
+        event_type,
+    );
+    let path = events_path(namespace);
+    let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    if !status.is_success() {
+        bail!("POST event failed with HTTP {status}: {body}");
+    }
+    Ok(())
+}
+
 /// Evict a pod (preemption's victim-removal step) via DELETE .../pods/:name.
 ///
 /// The apiserver's pod DELETE always soft-deletes on the first call (stamps
@@ -3655,5 +3797,104 @@ mod tests {
     fn check_delete_response_err_on_failure() {
         assert!(check_delete_response(500).is_err());
         assert!(check_delete_response(403).is_err());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scheduling Events (mayor-lafgk): scheduling_event_name/scheduling_event_payload
+    // /events_path. Before this fix the scheduler never created an Event object on
+    // bind success or failure, so `kubectl describe pod` showed nothing and the
+    // SchedulerPredicates e2e suite's observeEventAfterAction watch timed out
+    // waiting for a FailedScheduling/Scheduled event that was never posted.
+    // ---------------------------------------------------------------------------
+
+    /// scheduling_event_name must start with pod_name — upstream's
+    /// scheduleFailureEvent/scheduleSuccessEvent predicates match on
+    /// `strings.HasPrefix(e.Name, podName)`. A name that doesn't start with the
+    /// pod name would make a correctly-created event invisible to that check.
+    #[test]
+    fn scheduling_event_name_starts_with_pod_name() {
+        let name = scheduling_event_name("my-pod", 0x1234abcd);
+        assert!(
+            name.starts_with("my-pod"),
+            "event name must start with pod_name for upstream's HasPrefix match; got {name}"
+        );
+    }
+
+    /// Two events for the same pod at different times must get distinct names —
+    /// otherwise the second POST would collide with (and be rejected as a
+    /// duplicate of) the first.
+    #[test]
+    fn scheduling_event_name_is_unique_per_nanos() {
+        let a = scheduling_event_name("my-pod", 1);
+        let b = scheduling_event_name("my-pod", 2);
+        assert_ne!(
+            a, b,
+            "distinct timestamps must produce distinct event names to avoid create collisions"
+        );
+    }
+
+    /// scheduling_event_payload must set reason/type/message exactly as given —
+    /// this is what upstream's predicate matches on (e.Type == "Warning" &&
+    /// e.Reason == "FailedScheduling" for the failure case).
+    #[test]
+    fn scheduling_event_payload_sets_failure_fields() {
+        let payload = scheduling_event_payload(
+            "sched-pred",
+            "unschedulable-pod",
+            "unschedulable-pod.abc123",
+            "FailedScheduling",
+            "0/1 nodes are available: node(s) didn't match Pod's node affinity/selector.",
+            "Warning",
+        );
+        assert_eq!(payload["kind"], "Event");
+        assert_eq!(payload["apiVersion"], "v1");
+        assert_eq!(payload["reason"], "FailedScheduling");
+        assert_eq!(payload["type"], "Warning");
+        assert_eq!(payload["metadata"]["name"], "unschedulable-pod.abc123");
+        assert_eq!(payload["metadata"]["namespace"], "sched-pred");
+    }
+
+    /// scheduling_event_payload's involvedObject must reference the pod by name,
+    /// namespace, and kind "Pod" — without this, the event exists but cannot be
+    /// correlated back to the pod it reports on (`kubectl describe pod` filters
+    /// events by involvedObject).
+    #[test]
+    fn scheduling_event_payload_involved_object_references_pod() {
+        let payload = scheduling_event_payload(
+            "staging",
+            "web-pod",
+            "web-pod.deadbeef",
+            "Scheduled",
+            "Successfully assigned staging/web-pod to worker-2",
+            "Normal",
+        );
+        assert_eq!(payload["involvedObject"]["kind"], "Pod");
+        assert_eq!(payload["involvedObject"]["name"], "web-pod");
+        assert_eq!(payload["involvedObject"]["namespace"], "staging");
+    }
+
+    /// scheduling_event_payload's message must be preserved verbatim — upstream's
+    /// scheduleSuccessEvent predicate checks
+    /// `strings.Contains(e.Message, "Successfully assigned ns/pod to node")`.
+    #[test]
+    fn scheduling_event_payload_preserves_message() {
+        let payload = scheduling_event_payload(
+            "default",
+            "my-pod",
+            "my-pod.123",
+            "Scheduled",
+            "Successfully assigned default/my-pod to node-1",
+            "Normal",
+        );
+        assert_eq!(
+            payload["message"], "Successfully assigned default/my-pod to node-1",
+            "message must be preserved verbatim for the success-event Contains() check"
+        );
+    }
+
+    #[test]
+    fn events_path_produces_correct_api_path() {
+        let path = events_path("kube-system");
+        assert_eq!(path, "/api/v1/namespaces/kube-system/events");
     }
 }
