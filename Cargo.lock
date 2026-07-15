@@ -3337,6 +3337,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "u7s-sentinel",
  "u7s-store",
  "uuid",
  "x509-cert",
@@ -3419,6 +3420,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "u7s-kubeconfig",
+]
+
+[[package]]
+name = "u7s-sentinel"
+version = "0.1.0"
+dependencies = [
+ "u7s-sentinel-derive",
+]
+
+[[package]]
+name = "u7s-sentinel-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

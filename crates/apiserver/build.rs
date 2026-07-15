@@ -8,6 +8,13 @@ fn main() {
 
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc);
+    // Blanket-derive Sentinel on every generated message so gen_*_to_json completeness tests
+    // (see core_gen_adapter.rs's tests module) can build a fully-populated instance of any
+    // message type without hand-listing its fields. Safe as a "." (root) pattern only because
+    // the vendored .proto schema has no `oneof`/`enum` types for it to hit (verified by grep);
+    // if one is ever added, u7s-sentinel-derive fails the build loudly instead of silently
+    // producing an incomplete sentinel.
+    config.type_attribute(".", "#[derive(u7s_sentinel::Sentinel)]");
 
     config
         .compile_protos(
