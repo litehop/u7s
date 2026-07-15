@@ -2462,9 +2462,15 @@ pub async fn get_cr_status<S: Store>(
         if group == "apiregistration.k8s.io" && plural == "apiservices" {
             super::aggregation::ensure_availability_checked(&state, &name).await;
         }
-        // Delegate to the generic get handler for registry resources.
-        return super::resource::get_resource(State(state), Path((group, version, plural, name)))
-            .await;
+        // Delegate to the generic get handler for registry resources. Table format is a
+        // `kubectl get <resource>` concern, not applicable to the /status subresource, so
+        // no Accept header is forwarded here.
+        return super::resource::get_resource(
+            State(state),
+            Path((group, version, plural, name)),
+            HeaderMap::new(),
+        )
+        .await;
     }
 
     // CR path.
