@@ -1234,6 +1234,24 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
             .collect();
         spec_map.insert("tolerations".to_string(), serde_json::Value::Array(tols));
     }
+    // schedulingGates — client-go/kube-controller-manager's typed Pod client (used by e.g.
+    // the ReplicaSet controller to create pods from a template) sends protobuf by default,
+    // not JSON. Without this field, a gated pod created via a controller (as opposed to a
+    // raw `kubectl apply`/JSON POST) silently loses its schedulingGates on decode, so
+    // needs_scheduling never sees them non-empty and schedules the pod immediately —
+    // failing "validates Pods with non-empty schedulingGates are blocked on scheduling".
+    if !spec.scheduling_gates.is_empty() {
+        let gates: Vec<serde_json::Value> = spec
+            .scheduling_gates
+            .into_iter()
+            .filter_map(|g| g.name.filter(|s| !s.is_empty()))
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        spec_map.insert(
+            "schedulingGates".to_string(),
+            serde_json::Value::Array(gates),
+        );
+    }
     // priorityClassName — used by PriorityAdmission to look up the integer priority value.
     // Without this field, pods are treated as having no priority class, which can result in
     // them being preempted by lower-priority pods that happen to have a class set.
@@ -3172,6 +3190,94 @@ mod tests {
              even with no limits/requests configured) must be omitted, not materialized as \
              resources: {{}} — otherwise a protobuf-decoded template never structurally \
              matches an equivalent JSON-created one"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.schedulingGates (PodSpec field 38) through
+    /// protobuf decode.
+    ///
+    /// client-go's typed Pod client — used by e.g. kube-controller-manager's ReplicaSet
+    /// controller to create pods from a template — sends protobuf, not JSON, by default.
+    /// Without this field, a gated pod created that way (as opposed to a raw `kubectl
+    /// apply`/JSON POST) silently loses its schedulingGates on decode: needs_scheduling
+    /// then never sees them as non-empty and schedules the pod immediately, failing
+    /// "validates Pods with non-empty schedulingGates are blocked on scheduling" even
+    /// though the scheduler's own gate-checking logic is correct.
+    #[test]
+    fn decode_pod_proto_gen_preserves_scheduling_gates() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("gated-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                scheduling_gates: vec![
+                    core_v1::PodSchedulingGate {
+                        name: Some("foo".to_string()),
+                    },
+                    core_v1::PodSchedulingGate {
+                        name: Some("bar".to_string()),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with schedulingGates must decode");
+
+        let gates = result["spec"]["schedulingGates"]
+            .as_array()
+            .expect("schedulingGates must survive protobuf decode as an array");
+        assert_eq!(
+            gates,
+            &vec![
+                serde_json::json!({"name": "foo"}),
+                serde_json::json!({"name": "bar"}),
+            ],
+            "both gate names must survive decode in order — losing either one changes \
+             whether the pod is considered gated at all"
+        );
+    }
+
+    /// A Pod with no schedulingGates must decode with the key entirely absent, not an
+    /// empty array — mirrors the `resources: {}` omission above. A controller that
+    /// structurally compares a freshly protobuf-decoded pod template against its own
+    /// cached (JSON-built, key-absent) template would otherwise never see them as equal.
+    #[test]
+    fn decode_pod_proto_gen_omits_scheduling_gates_when_empty() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ungated-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert!(
+            result["spec"].get("schedulingGates").is_none(),
+            "schedulingGates must be omitted (not an empty array) when the wire carried none"
         );
     }
 

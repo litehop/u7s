@@ -67,6 +67,32 @@ pub async fn http_delete(
     client.request(Method::DELETE, path, None).await
 }
 
+/// PATCH with `application/strategic-merge-patch+json`, the content type
+/// status-subresource endpoints require (the apiserver's
+/// `accepts_patch_content_type` rejects the plain `application/json` that
+/// [`http_post_json`]/[`request`] send, with 415).
+pub async fn http_patch_status(
+    connector: &TlsConnector,
+    base: &str,
+    path: &str,
+    payload: &Value,
+) -> anyhow::Result<(StatusCode, String)> {
+    let client = HyperApiClient {
+        server: base.to_owned(),
+        connector: connector.clone(),
+        bearer: None,
+    };
+    let body_str = serde_json::to_string(payload)?;
+    client
+        .request_with_content_type(
+            Method::PATCH,
+            path,
+            Some(body_str),
+            "application/strategic-merge-patch+json",
+        )
+        .await
+}
+
 // ---------------------------------------------------------------------------
 // Watch streaming — reads newline-delimited JSON from a watch endpoint
 // ---------------------------------------------------------------------------
@@ -219,11 +245,35 @@ struct PodMetadata {
     namespace: Option<String>,
 }
 
+/// A single `status.conditions[]` entry, as needed to read back whatever
+/// PodScheduled condition is currently stored — used only by the
+/// SchedulingGated status-patch bookkeeping (`scheduling_gate_status_patch` /
+/// `scheduling_gate_status_reset`) to decide whether a PATCH is still needed.
+/// `Option` (not `String` with `#[serde(default)]`) because a condition field
+/// can be present-but-`null`, not just absent — see `merge_conditions` in the
+/// apiserver, which can persist a literal `null` reason on first write.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodConditionView {
+    #[serde(rename = "type")]
+    condition_type: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PodStatusView {
+    #[serde(default)]
+    conditions: Vec<PodConditionView>,
+}
+
 /// Minimal typed view of a Pod object in a watch event.
 #[derive(Debug, Default, Deserialize)]
 struct PodObject {
     metadata: PodMetadata,
     spec: PodSpec,
+    #[serde(default)]
+    status: PodStatusView,
 }
 
 /// A pod discovered by `needs_scheduling` as ready to enter the scheduling
@@ -318,6 +368,167 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         node_affinity,
         requests,
     })
+}
+
+/// The `PodScheduled` condition type name — matches `v1.PodScheduled`.
+const POD_SCHEDULED: &str = "PodScheduled";
+/// The reason upstream's real scheduler stamps on a gated pod — matches
+/// `v1.PodReasonSchedulingGated`. `WaitForPodsSchedulingGated`
+/// (k8s.io/kubernetes/test/e2e/framework/pod/wait.go) polls for exactly this
+/// type/reason pair.
+const SCHEDULING_GATED_REASON: &str = "SchedulingGated";
+const SCHEDULING_GATED_MESSAGE: &str = "Scheduling is blocked due to non-empty scheduling gates";
+/// The reason/message the apiserver stamps on every new pod's initial
+/// PodScheduled=False condition (see `apply_pod_create_defaults`). Used to
+/// reset a stale SchedulingGated reason back to the same "don't know why yet"
+/// default the pod would have carried had it never been gated.
+const UNSCHEDULABLE_REASON: &str = "Unschedulable";
+const UNSCHEDULABLE_MESSAGE: &str = "pod not yet scheduled";
+
+/// A pending PATCH to a gated pod's `status.conditions`, identifying the pod
+/// and carrying the merge-patch body to send.
+#[derive(Debug, PartialEq)]
+pub struct GatedStatusPatch {
+    pub namespace: String,
+    pub pod_name: String,
+    pub patch: Value,
+}
+
+/// Determine whether a watch event's pod needs its `PodScheduled` condition
+/// set to `False`/`SchedulingGated`.
+///
+/// Mirrors the condition upstream's real kube-scheduler stamps on a gated pod
+/// (see `v1.PodReasonSchedulingGated`) so `WaitForPodsSchedulingGated` — which
+/// polls `status.conditions` for exactly `{type: PodScheduled, reason:
+/// SchedulingGated}`, not just "is the pod unscheduled" — can tell "blocked on
+/// gates" apart from a genuine predicate failure. `needs_scheduling` keeps
+/// gated pods out of the scheduling cycle entirely, so nothing else ever
+/// writes this condition for them.
+///
+/// Returns `None` (nothing to do) when: the pod has no non-empty
+/// `schedulingGates` (ungated pods take the normal scheduling path instead);
+/// the pod is already bound (`spec.nodeName` set — never touch a pod's
+/// `PodScheduled` condition once binding may have flipped it to `True`); or
+/// the condition already reads `False`/`SchedulingGated` (idempotent — avoids
+/// re-PATCHing on every reconcile tick, including the tick triggered by this
+/// function's own prior PATCH echoing back through the watch).
+pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
+    let watch_event: WatchEvent<PodObject> = serde_json::from_value(event.clone()).ok()?;
+    if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+        return None;
+    }
+    let pod_name = watch_event.object.metadata.name.clone().unwrap_or_default();
+    if pod_name.is_empty() {
+        return None;
+    }
+    let already_scheduled = watch_event
+        .object
+        .spec
+        .node_name
+        .as_deref()
+        .is_some_and(|n| !n.is_empty());
+    if already_scheduled {
+        return None;
+    }
+    let has_gates = watch_event
+        .object
+        .spec
+        .scheduling_gates
+        .as_ref()
+        .is_some_and(|gates| !gates.is_empty());
+    if !has_gates {
+        return None;
+    }
+    let already_marked = watch_event.object.status.conditions.iter().any(|c| {
+        c.condition_type.as_deref() == Some(POD_SCHEDULED)
+            && c.status.as_deref() == Some("False")
+            && c.reason.as_deref() == Some(SCHEDULING_GATED_REASON)
+    });
+    if already_marked {
+        return None;
+    }
+    let namespace = watch_event
+        .object
+        .metadata
+        .namespace
+        .unwrap_or_else(|| "default".to_owned());
+    let patch = serde_json::json!({
+        "status": {
+            "conditions": [{
+                "type": POD_SCHEDULED,
+                "status": "False",
+                "reason": SCHEDULING_GATED_REASON,
+                "message": SCHEDULING_GATED_MESSAGE,
+            }]
+        }
+    });
+    Some(GatedStatusPatch {
+        namespace,
+        pod_name,
+        patch,
+    })
+}
+
+/// Determine whether a watch event's pod needs its stale `SchedulingGated`
+/// reason cleared now that every gate has been removed.
+///
+/// `spec.schedulingGates` can be removed one at a time (a ReplicaSet's pods
+/// each carrying `[foo, bar]` may see `bar` removed first, leaving `[bar]`
+/// still non-empty) — this must only fire once the list is fully empty, not
+/// on every reduction. Once it does fire, the condition must not keep saying
+/// "blocked on scheduling gates" once that's no longer true, or `kubectl
+/// describe pod` lies about why the pod is still Pending.
+///
+/// Returns `None` when: any gate remains; the pod is already bound (never
+/// touch a bound pod's condition); or the condition doesn't currently say
+/// `SchedulingGated` (nothing stale to clear).
+///
+/// The returned patch deliberately omits `status`: a concurrent successful
+/// bind (`bind_pod` in the apiserver) flips `PodScheduled` to `True` in the
+/// same atomic write as `spec.nodeName`, and this reset runs concurrently
+/// with that scheduling attempt (see caller). Sending `status: "False"` here
+/// could race a fresh `True` and clobber it back to `False`; omitting the key
+/// entirely means this patch can only ever touch `reason`/`message`, never
+/// `status`, so it can never contradict a real bind outcome.
+pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
+    let watch_event: WatchEvent<PodObject> = serde_json::from_value(event.clone()).ok()?;
+    if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+        return None;
+    }
+    let already_scheduled = watch_event
+        .object
+        .spec
+        .node_name
+        .as_deref()
+        .is_some_and(|n| !n.is_empty());
+    if already_scheduled {
+        return None;
+    }
+    let has_gates = watch_event
+        .object
+        .spec
+        .scheduling_gates
+        .as_ref()
+        .is_some_and(|gates| !gates.is_empty());
+    if has_gates {
+        return None;
+    }
+    let still_marked_gated = watch_event.object.status.conditions.iter().any(|c| {
+        c.condition_type.as_deref() == Some(POD_SCHEDULED)
+            && c.reason.as_deref() == Some(SCHEDULING_GATED_REASON)
+    });
+    if !still_marked_gated {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": {
+            "conditions": [{
+                "type": POD_SCHEDULED,
+                "reason": UNSCHEDULABLE_REASON,
+                "message": UNSCHEDULABLE_MESSAGE,
+            }]
+        }
+    }))
 }
 
 /// Return `true` if a spawn for `key` ("namespace/name") should proceed.
@@ -1167,6 +1378,45 @@ pub async fn delete_pod(
     Ok(())
 }
 
+/// Build the status-subresource PATCH path for a pod.
+///
+/// Pure function extracted so callers can test path construction without
+/// network access — mirrors `binding_path`/`delete_pod_path`.
+pub fn pod_status_path(namespace: &str, pod_name: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/pods/{pod_name}/status")
+}
+
+/// Check a status-patch response status code, returning Err on non-2xx.
+///
+/// Extracted as a pure function so the error-returning logic can be
+/// unit-tested without network access — mirrors `check_bind_response`.
+pub fn check_status_patch_response(status: u16, body: &str) -> anyhow::Result<()> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    bail!("status patch failed with HTTP {status}: {body}")
+}
+
+/// PATCH a pod's `.status` via .../pods/:name/status.
+///
+/// Used to stamp/clear the `PodScheduled`/`SchedulingGated` condition
+/// (`scheduling_gate_status_patch` / `scheduling_gate_status_reset`) — the
+/// apiserver's `patch_pod_status` merges the `conditions` array by `.type`
+/// (see `merge_conditions`), so `patch` only needs to carry the single
+/// condition being added or changed; unrelated conditions are preserved.
+pub async fn patch_pod_status(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pod_name: &str,
+    patch: &Value,
+) -> anyhow::Result<()> {
+    let path = pod_status_path(namespace, pod_name);
+    let (status, body) = http_patch_status(connector, server, &path, patch).await?;
+    check_status_patch_response(status.as_u16(), &body)
+        .with_context(|| format!("patching status for {namespace}/{pod_name}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1512,6 +1762,267 @@ mod tests {
             needs_scheduling(&event).is_some(),
             "an empty schedulingGates array means all gates are cleared — the pod \
              must be schedulable, not stuck forever"
+        );
+    }
+
+    // scheduling_gate_status_patch / scheduling_gate_status_reset tests (mayor-pwf4g):
+    // needs_scheduling correctly keeps gated pods out of the scheduling cycle, but
+    // that alone leaves status.conditions untouched — WaitForPodsSchedulingGated
+    // (upstream test/e2e/framework/pod/wait.go) polls status.conditions for
+    // {type: PodScheduled, reason: SchedulingGated}, not just "is it unscheduled".
+    // These tests cover the PATCH-decision logic that fills that gap.
+
+    #[test]
+    fn scheduling_gate_status_patch_sets_condition_when_absent() {
+        // A freshly-created gated pod (no PodScheduled condition yet at all) must
+        // get one — otherwise `kubectl describe pod` and WaitForPodsSchedulingGated
+        // have nothing to read, even though the pod is correctly stuck Pending.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [{"name": "foo"}, {"name": "bar"}] }
+            }
+        });
+        let patch = scheduling_gate_status_patch(&event)
+            .expect("a newly gated pod with no condition yet must get one patched in");
+        assert_eq!(patch.namespace, "default");
+        assert_eq!(patch.pod_name, "gated-pod");
+        let cond = &patch.patch["status"]["conditions"][0];
+        assert_eq!(cond["type"], "PodScheduled");
+        assert_eq!(cond["status"], "False");
+        assert_eq!(
+            cond["reason"], "SchedulingGated",
+            "reason must exactly match v1.PodReasonSchedulingGated — \
+             WaitForPodsSchedulingGated string-matches this field"
+        );
+    }
+
+    #[test]
+    fn scheduling_gate_status_patch_sets_condition_over_create_time_default() {
+        // apply_pod_create_defaults (apiserver) stamps every new pod with
+        // PodScheduled=False/reason=Unschedulable at creation, including gated
+        // ones — this is the REAL starting state a gated ReplicaSet pod has, not
+        // "no condition at all". The gated reason must still get applied over it.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [{"name": "foo"}] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "pod not yet scheduled"}
+                    ]
+                }
+            }
+        });
+        let patch = scheduling_gate_status_patch(&event).expect(
+            "a gated pod still carrying the generic Unschedulable default must be \
+             re-patched to the specific SchedulingGated reason",
+        );
+        assert_eq!(
+            patch.patch["status"]["conditions"][0]["reason"],
+            "SchedulingGated"
+        );
+    }
+
+    #[test]
+    fn scheduling_gate_status_patch_is_idempotent_once_already_marked() {
+        // Every ADDED/MODIFIED event for a still-gated pod re-enters this
+        // function (including the event generated by this function's own prior
+        // PATCH echoing back through the watch). Once the condition already
+        // reads False/SchedulingGated, re-sending the identical PATCH forever
+        // would be a needless write storm — must return None instead.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [{"name": "bar"}] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "SchedulingGated", "message": "Scheduling is blocked due to non-empty scheduling gates"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            scheduling_gate_status_patch(&event).is_none(),
+            "condition already matches the target state (even with only one of \
+             the original two gates remaining — gates clear one at a time) — \
+             no PATCH is needed"
+        );
+    }
+
+    #[test]
+    fn scheduling_gate_status_patch_is_none_when_gates_empty() {
+        // An ungated pod takes the normal scheduling path; this function must
+        // never touch its PodScheduled condition.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "normal-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [] }
+            }
+        });
+        assert!(scheduling_gate_status_patch(&event).is_none());
+    }
+
+    #[test]
+    fn scheduling_gate_status_patch_is_none_when_already_scheduled() {
+        // A gated pod should never reach spec.nodeName != "" (the binding
+        // endpoint requires empty schedulingGates), but this must defensively
+        // refuse to touch a bound pod's condition regardless — matching the
+        // same non-interference guarantee needs_scheduling already provides.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "nodeName": "node-1", "schedulingGates": [{"name": "foo"}] }
+            }
+        });
+        assert!(scheduling_gate_status_patch(&event).is_none());
+    }
+
+    #[test]
+    fn scheduling_gate_status_reset_clears_stale_reason_once_gates_fully_removed() {
+        // Once every gate is gone, the pod is about to proceed through normal
+        // scheduling — leaving the condition saying SchedulingGated would lie
+        // about why it's still Pending if scheduling doesn't succeed instantly.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "SchedulingGated", "message": "Scheduling is blocked due to non-empty scheduling gates"}
+                    ]
+                }
+            }
+        });
+        let patch = scheduling_gate_status_reset(&event)
+            .expect("the stale SchedulingGated reason must be cleared once all gates clear");
+        assert_eq!(patch["status"]["conditions"][0]["reason"], "Unschedulable");
+    }
+
+    #[test]
+    fn scheduling_gate_status_reset_is_none_while_one_gate_remains() {
+        // Gates clear one at a time (predicates.go removes "foo" first, leaving
+        // "bar"): with "bar" still present the pod is genuinely still blocked,
+        // so the SchedulingGated reason must NOT be reset yet.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [{"name": "bar"}] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "SchedulingGated", "message": "Scheduling is blocked due to non-empty scheduling gates"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            scheduling_gate_status_reset(&event).is_none(),
+            "removing only one of two gates must not clear the condition — the \
+             pod is still blocked on the remaining gate"
+        );
+    }
+
+    #[test]
+    fn scheduling_gate_status_reset_is_none_once_already_scheduled() {
+        // If the pod was already bound (e.g. a fast scheduling attempt won the
+        // race against this reset check on an earlier event), its PodScheduled
+        // condition belongs to the bind outcome now — never touch it here.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "nodeName": "node-1", "schedulingGates": [] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True", "reason": "PodScheduled", "message": ""}
+                    ]
+                }
+            }
+        });
+        assert!(scheduling_gate_status_reset(&event).is_none());
+    }
+
+    #[test]
+    fn scheduling_gate_status_reset_is_none_for_a_pod_that_was_never_gated() {
+        // A normal pod's condition already reads Unschedulable from apiserver's
+        // create-time default — there is no stale SchedulingGated reason to
+        // clear, so this must not fire (and must not needlessly PATCH every pod).
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "normal-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "pod not yet scheduled"}
+                    ]
+                }
+            }
+        });
+        assert!(scheduling_gate_status_reset(&event).is_none());
+    }
+
+    #[test]
+    fn scheduling_gate_status_reset_patch_omits_status_field() {
+        // Load-bearing for race-safety: bind_pod (apiserver) flips PodScheduled
+        // to True atomically with spec.nodeName in one write, concurrently with
+        // this reset. If the reset patch included "status": "False", it could
+        // apply after a fresh bind and clobber True back to False. Omitting the
+        // key entirely means this patch can only ever touch reason/message.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "gated-pod", "namespace": "default" },
+                "spec": { "schedulingGates": [] },
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "SchedulingGated", "message": "Scheduling is blocked due to non-empty scheduling gates"}
+                    ]
+                }
+            }
+        });
+        let patch =
+            scheduling_gate_status_reset(&event).expect("gates cleared, reason still stale");
+        assert!(
+            patch["status"]["conditions"][0].get("status").is_none(),
+            "the reset patch must never carry a \"status\" field — doing so risks \
+             clobbering a concurrently-bound pod's True back to False"
+        );
+    }
+
+    // pod_status_path / check_status_patch_response tests — mirror the
+    // binding_path / check_bind_response coverage above for the new status
+    // subresource plumbing.
+
+    #[test]
+    fn pod_status_path_produces_correct_api_path() {
+        let path = pod_status_path("default", "my-pod");
+        assert_eq!(path, "/api/v1/namespaces/default/pods/my-pod/status");
+    }
+
+    #[test]
+    fn check_status_patch_response_ok_on_2xx() {
+        assert!(check_status_patch_response(200, "").is_ok());
+    }
+
+    #[test]
+    fn check_status_patch_response_err_on_415() {
+        // 415 is exactly what the apiserver returns for the wrong Content-Type
+        // (see accepts_patch_content_type) — must surface as Err, not be
+        // silently swallowed, or a content-type regression would go unnoticed.
+        let result = check_status_patch_response(415, "unsupported media type");
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("415"),
+            "error must include the status code; got: {msg}"
         );
     }
 
