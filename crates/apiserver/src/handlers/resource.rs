@@ -357,6 +357,9 @@ pub async fn create_resource<S: Store>(
     if group == ADMISSION_GROUP {
         state.refresh_admission_config(&plural).await;
     }
+    if group == APISERVICE_GROUP {
+        state.refresh_apiservice_cache().await;
+    }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
@@ -558,6 +561,9 @@ pub async fn replace_resource<S: Store>(
     if group == ADMISSION_GROUP {
         state.refresh_admission_config(&plural).await;
     }
+    if group == APISERVICE_GROUP {
+        state.refresh_apiservice_cache().await;
+    }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     Ok(Json(obj.body).into_response())
@@ -645,6 +651,9 @@ pub async fn delete_resource<S: Store>(
         if group == ADMISSION_GROUP {
             state.refresh_admission_config(&plural).await;
         }
+        if group == APISERVICE_GROUP {
+            state.refresh_apiservice_cache().await;
+        }
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -679,6 +688,9 @@ pub async fn delete_resource<S: Store>(
     }
     if group == ADMISSION_GROUP {
         state.refresh_admission_config(&plural).await;
+    }
+    if group == APISERVICE_GROUP {
+        state.refresh_apiservice_cache().await;
     }
     Ok(Json(serde_json::json!({
         "kind": "Status",
@@ -752,6 +764,9 @@ async fn complete_finalizer_drain<S: Store>(
     }
     if group == ADMISSION_GROUP {
         state.refresh_admission_config(plural).await;
+    }
+    if group == APISERVICE_GROUP {
+        state.refresh_apiservice_cache().await;
     }
     // If this object lived in a namespace, check whether its namespace is now ready to
     // complete deletion. This handles the OrderedNamespaceDeletion flow: after all
@@ -1086,6 +1101,9 @@ pub(crate) async fn do_patch<S: Store>(
                 }
                 if group == ADMISSION_GROUP {
                     state.refresh_admission_config(plural).await;
+                }
+                if group == APISERVICE_GROUP {
+                    state.refresh_apiservice_cache().await;
                 }
                 // SSA: echo synthetic managedFields so clients (e.g. Argo CD) can track field ownership.
                 if is_ssa {
@@ -2462,6 +2480,9 @@ pub async fn delete_collection_resource<S: Store>(
         // One re-list after all deletions in the collection — cheaper than per-object.
         state.refresh_admission_config(&plural).await;
     }
+    if group == APISERVICE_GROUP {
+        state.refresh_apiservice_cache().await;
+    }
 
     Ok(Json(serde_json::json!({
         "kind": "Status",
@@ -3066,6 +3087,7 @@ async fn remove_job_tracking_finalizer_from_pods<S: Store>(
 pub(crate) const ADMISSION_GROUP: &str = "admissionregistration.k8s.io";
 pub(crate) const VAP_PLURAL: &str = "validatingadmissionpolicies";
 pub(crate) const VAPB_PLURAL: &str = "validatingadmissionpolicybindings";
+pub(crate) const APISERVICE_GROUP: &str = "apiregistration.k8s.io";
 
 const BUILTIN_GROUPS: &[&str] = &[
     "",

@@ -165,6 +165,33 @@ impl AdmissionConfigCache {
     }
 }
 
+/// In-memory cache of registered `APIService` objects, keyed by the store-key name segment
+/// (`"{version}.{group}"`) rather than by `metadata.name` — this is the exact identity
+/// `find_apiservice`'s single-object `store.get` used before this cache existed, so a stale or
+/// missing `metadata.name` (as some tests seed directly) can never change a lookup's outcome.
+///
+/// Cache invalidation strategy: inline, write-through — identical to `AdmissionConfigCache`
+/// (see its doc for the full rationale). Every handler that writes or deletes an `APIService`
+/// object (in `handlers/resource.rs`) calls `AppState::refresh_apiservice_cache` immediately
+/// after the store write succeeds. `find_apiservice` and `list_apiservice_groups` in
+/// `handlers/aggregation.rs` — invoked on every `/apis/{group}/{version}/...` request via
+/// `proxy_middleware` and every plain `/apis` discovery request, respectively — then read the
+/// cached `Arc` instead of a store round-trip.
+///
+/// `None` = cache cold (not yet populated; callers fall back to the store, exactly as before
+/// this cache existed). `Some(v)` = cache warm; use directly.
+pub struct ApiServiceCache {
+    pub apiservices: RwLock<Option<Arc<HashMap<String, serde_json::Value>>>>,
+}
+
+impl ApiServiceCache {
+    pub fn new() -> Self {
+        ApiServiceCache {
+            apiservices: RwLock::new(None),
+        }
+    }
+}
+
 pub struct AppState<S = SqliteStore> {
     pub store: Arc<S>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
@@ -222,6 +249,9 @@ pub struct AppState<S = SqliteStore> {
     /// In-memory cache for the 5 admission configuration object sets.
     /// See `AdmissionConfigCache` for the invalidation strategy.
     pub admission_cache: Arc<AdmissionConfigCache>,
+    /// In-memory cache of registered `APIService` objects.
+    /// See `ApiServiceCache` for the invalidation strategy.
+    pub apiservice_cache: Arc<ApiServiceCache>,
     /// Per-namespace lock serializing ResourceQuota check-then-write critical sections.
     /// See `QuotaAdmissionLocks` for why this is required.
     pub quota_admission_locks: QuotaAdmissionLocks,
@@ -286,6 +316,7 @@ impl<S> Clone for AppState<S> {
             revoked_jtis: self.revoked_jtis.clone(),
             sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
+            apiservice_cache: self.apiservice_cache.clone(),
             quota_admission_locks: self.quota_admission_locks.clone(),
         }
     }
@@ -471,6 +502,7 @@ impl<S: Store> AppState<S> {
             revoked_jtis: Arc::new(Mutex::new(HashSet::new())),
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
+            apiservice_cache: Arc::new(ApiServiceCache::new()),
             quota_admission_locks: QuotaAdmissionLocks::new(),
         }
     }
@@ -649,6 +681,44 @@ impl<S: Store> AppState<S> {
             self.refresh_admission_config(plural).await;
         }
         tracing::info!("admission cache: initialized from store");
+    }
+
+    /// Refresh the `APIService` cache from the store.
+    ///
+    /// Called inline by write/delete handlers in `handlers/resource.rs` immediately after a
+    /// successful store write to an `APIService` object (there is only one plural here, unlike
+    /// `refresh_admission_config`'s 5, so no `plural` parameter is needed). Re-lists the whole
+    /// (cluster-admin-only, in practice tiny) `apiservices` collection and atomically swaps the
+    /// cached `Arc` — the same write-through invalidation `refresh_admission_config` uses.
+    pub async fn refresh_apiservice_cache(&self) {
+        let prefix = "/registry/apiregistration.k8s.io/apiservices/";
+        let items: HashMap<String, serde_json::Value> =
+            match self.store.list(prefix, ListOptions::default()).await {
+                Ok(resp) => resp
+                    .items
+                    .into_iter()
+                    .filter_map(|item| {
+                        let name = item.key.strip_prefix(prefix)?.to_string();
+                        let value = serde_json::from_slice(&item.value).ok()?;
+                        Some((name, value))
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("apiservice cache: failed to refresh: {e}; cache unchanged");
+                    return;
+                }
+            };
+        *self.apiservice_cache.apiservices.write().unwrap() = Some(Arc::new(items));
+    }
+
+    /// Populate the `APIService` cache from objects already persisted in the store.
+    ///
+    /// Must be called once at startup before serving requests, so the first
+    /// `/apis/{group}/{version}/...` request does not incur a cache miss and fall back to the
+    /// store. Mirrors `init_admission_cache`.
+    pub async fn init_apiservice_cache(&self) {
+        self.refresh_apiservice_cache().await;
+        tracing::info!("apiservice cache: initialized from store");
     }
 
     /// Attempt to allocate the next available clusterIP from the service CIDR.
