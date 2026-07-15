@@ -18,8 +18,8 @@ mislead you into thinking the harness produced no output.
 
 ## Verify with kubectl FIRST; reserve sonobuoy for the final gate
 
-A `sonobuoy --focus` run is 5+ minutes and can hang to 20 (the watchdog reaps the
-test namespace at 5 min, then ginkgo flails against the dead namespace until its
+A `sonobuoy --focus` run is 10+ minutes and can hang to 25 (the watchdog reaps the
+test namespace at 10 min, then ginkgo flails against the dead namespace until its
 own timeout). Do NOT iterate diagnosis on sonobuoy runs. Almost everything a
 single conformance test asserts is reproducible in seconds with `kubectl`.
 

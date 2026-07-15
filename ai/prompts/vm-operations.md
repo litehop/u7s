@@ -224,7 +224,7 @@ limactl shell <VM> pgrep -a kube-controller    # KCM alive
 ## Step 6 — Fast kubectl iteration (DIAGNOSE HERE, not on sonobuoy)
 
 This is where you spend almost all diagnostic time. A `sonobuoy --focus` run is
-5+ min and can hang to 20 (watchdog reaps the test namespace at 5 min, ginkgo
+10+ min and can hang to 25 (watchdog reaps the test namespace at 10 min, ginkgo
 then flails against the dead namespace). kubectl answers the same question in
 seconds. Read the failing test's source to learn its exact API sequence, then
 reproduce it here.

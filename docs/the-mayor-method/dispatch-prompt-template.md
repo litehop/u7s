@@ -490,8 +490,8 @@ when needed.
 
 ### Verify with kubectl first; reserve sonobuoy for the final gate
 
-A `sonobuoy --focus` run takes 5+ min and can hang for 20 (watchdog reaps the
-namespace at 5 min, then ginkgo flails against the dead namespace). Iterating
+A `sonobuoy --focus` run takes 10+ min and can hang for 25 (watchdog reaps the
+namespace at 10 min, then ginkgo flails against the dead namespace). Iterating
 diagnosis on sonobuoy is the single biggest time sink in this work. Almost
 everything a conformance test asserts is reproducible in seconds with `kubectl`
 against the running stack. The mechanics (read the test source → reproduce via
@@ -622,8 +622,8 @@ When a worker returns from a VM/sonobuoy-touching bead:
   UTC vs ginkgo/run-dir local). At review time, distrust any temporal claim in a
   worker's return that isn't backed by a quoted timestamp. See the "Evidence & time
   discipline" block — inject it via the common preamble.
-- **Workers burn 5–20 min per sonobuoy run when kubectl would answer in seconds.**
-  A `--focus` run is slow and can hang (watchdog reaps the namespace at 5 min,
+- **Workers burn 10–25 min per sonobuoy run when kubectl would answer in seconds.**
+  A `--focus` run is slow and can hang (watchdog reaps the namespace at 10 min,
   ginkgo then flails ~15 more min). Iterating diagnosis on sonobuoy is the single
   biggest time sink. Dispatch must direct the worker to: read the test source,
   reproduce via `kubectl` against the running stack + `/tmp/kcm.log`, root-cause
