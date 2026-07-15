@@ -1413,8 +1413,20 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     // hostNetwork — the kubelet reads this to decide whether to share the host network
     // namespace; dropping it makes KubeletManagedEtcHosts and hostPort-on-hostNetwork
     // behavior silently wrong for every protobuf-created pod.
-    if let Some(hn) = spec.host_network {
-        spec_map.insert("hostNetwork".to_string(), serde_json::Value::Bool(hn));
+    //
+    // Unlike automountServiceAccountToken/enableServiceLinks (genuine *bool upstream,
+    // tri-state), HostNetwork is a plain bool in k8s.io/api/core/v1/types.go ("Default to
+    // false" in the proto doc, vs. no such default for the tri-state fields). gogoproto's
+    // marshaler for a non-pointer field can't check "was this set", so it unconditionally
+    // writes the field on the wire — every protobuf client (KCM, kubelet, scheduler)
+    // decodes to Some(false) whether or not hostNetwork was ever touched, while JSON's
+    // omitempty drops the zero value. So Some(false) is indistinguishable from unset here;
+    // only Some(true) reflects real intent. Same class as priority/activeDeadlineSeconds
+    // above. Live-verified: KCM's protobuf-encoded ReplicaSet POST decoded
+    // spec.template.spec to "hostNetwork": false even though the source Deployment's
+    // JSON-decoded template had no hostNetwork key at all.
+    if let Some(true) = spec.host_network {
+        spec_map.insert("hostNetwork".to_string(), serde_json::Value::Bool(true));
     }
     // hostPID/hostIPC/shareProcessNamespace — namespace-sharing toggles the kubelet reads to
     // set up container isolation. Dropping hostPID/hostIPC silently re-isolates a pod that
@@ -4361,6 +4373,77 @@ mod tests {
         assert_eq!(
             result["spec"]["ephemeralContainers"][0]["targetContainerName"], "c",
             "ephemeralContainers[].targetContainerName must survive decode"
+        );
+    }
+
+    /// hostNetwork is a plain (non-pointer) bool upstream, unlike the genuine *bool tri-state
+    /// fields (automountServiceAccountToken, enableServiceLinks). gogoproto's marshaler for a
+    /// non-nullable field can't check "was this set" and always writes it, so every real
+    /// protobuf sender (KCM, kubelet, scheduler) puts hostNetwork=false on the wire for pods
+    /// that never touched the field at all — decoding that to "hostNetwork": false fabricates
+    /// a key the JSON-decoded source object never had. Live-verified via KCM's own
+    /// protobuf-encoded ReplicaSet POST: it decoded spec.template.spec to "hostNetwork":
+    /// false even though the source Deployment's JSON template had no such key, which throws
+    /// off any spec-equality diff downstream.
+    #[test]
+    fn generated_pod_spec_omits_host_network_when_wire_carries_the_zero_value() {
+        let unset_pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("host-network-unset-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_network: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        unset_pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with host_network=false must decode");
+
+        assert!(
+            result["spec"].get("hostNetwork").is_none(),
+            "hostNetwork must be omitted when the wire only carries the zero value — real \
+             protobuf senders always write false for pods that never asked for host \
+             networking, so emitting the key here fabricates an explicit false the source \
+             object never had"
+        );
+
+        let true_pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("host-network-true-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_network: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf2 = Vec::new();
+        true_pod.encode(&mut buf2).unwrap();
+
+        let result2 = decode_pod_proto_gen(&buf2).expect("Pod with host_network=true must decode");
+
+        assert_eq!(
+            result2["spec"]["hostNetwork"], true,
+            "an explicit hostNetwork=true must still survive decode — true is the only value \
+             a plain bool can carry that unambiguously reflects real user intent, and the \
+             kubelet needs it to decide whether to share the host network namespace"
         );
     }
 
