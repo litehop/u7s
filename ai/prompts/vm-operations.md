@@ -341,6 +341,17 @@ NOT the host's `temp/u7s/kubeconfig`. A fresh `run-all.sh --focus` (or `--reset`
 runs this delete automatically before starting, so you only need it by hand when
 you interrupted a run and want to re-issue one, or to abort without re-running.
 
+**`kubectl` itself is never installed inside the Lima VM — do not look for it
+there.** The `limactl shell <VM> sudo sonobuoy ... --kubeconfig /tmp/sonobuoy-kubeconfig`
+pattern above is specific to the `sonobuoy` CLI binary, which the script installs
+in-VM; it is not a general "kubectl runs in the VM" pattern. To inspect ANY cluster
+resource — including sonobuoy's own e2e pod, mid-run — use the normal host-side
+`kubectl --kubeconfig temp/u7s/kubeconfig ...` from your worktree, e.g.
+`kubectl --kubeconfig temp/u7s/kubeconfig logs -n sonobuoy -l component=sonobuoy,tier=analysis -c e2e --tail=15`.
+It reaches the same apiserver either way. If a `limactl shell <VM> ... kubectl ...`
+command fails, that is the signal you took the wrong path — switch to the host-side
+form rather than hunting for a kubectl binary inside the VM (there isn't one).
+
 ---
 
 ## Logs
