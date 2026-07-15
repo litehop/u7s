@@ -258,14 +258,14 @@ Two places only, in this order:
    source — test bodies like `statefulset_e2e.go` / `webhook-test.go`, plus
    controllers like `kcm_job_controller.go`). `ls temp/research/` and grep it for
    the test name or a distinctive assertion string. If the file is there, Read it.
-2. **Otherwise fetch it from GitHub** with the `WebFetch` tool against the raw
-   URL, and save it into `temp/research/`. The failure line in `e2e.txt` names
-   the file+line, e.g. `k8s.io/kubernetes/test/e2e/node/pods.go:530` →
-   `https://raw.githubusercontent.com/kubernetes/kubernetes/release-1.36/test/e2e/node/pods.go`
-   (pin the branch to `release-1.36` per the version rule above; check
-   `serverversion.json` in the run dir only if you suspect that run used a
-   different client). Read the function around the cited line to get the exact
-   create→update→assert sequence.
+2. **Otherwise fetch it once with `gh api`/`curl`** (never `WebFetch` — blocked
+   for workers) and cache it into `temp/research/`. The failure line in `e2e.txt`
+   names the file+line, e.g. `k8s.io/kubernetes/test/e2e/node/pods.go:530` →
+   `gh api -H "Accept: application/vnd.github.raw" "/repos/kubernetes/kubernetes/contents/test/e2e/node/pods.go?ref=release-1.36"`
+   (pin the branch to `release-1.36` per the version rule above). Fetch the
+   whole file in that one call, then use local `Grep`/`Read` for anything else
+   you need from it — don't re-fetch per symbol. Read the function around the
+   cited line to get the exact create→update→assert sequence.
 
 Never reconstruct the test from the failure message alone — the assertion text
 (`Expected 2 to be equivalent to 1`) is meaningless without the surrounding
