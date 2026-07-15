@@ -43,6 +43,20 @@ pub async fn core_list_resource<S: Store>(
     // Pods are namespaced; the registry has no cluster-scoped "pods" entry.
     // Handle GET /api/v1/pods by scanning across all namespaces.
     if plural == "pods" {
+        // Same as list_pods: reject an unsupported Table version up front, regardless of
+        // whether this turns out to be a watch or a plain list.
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if let Some(version) = super::table::table_accept_version(accept) {
+            if version != "v1" {
+                return Err(Status::not_acceptable(format!(
+                    "Table version \"{version}\" is not supported; only meta.k8s.io/v1 is accepted"
+                )));
+            }
+        }
+
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
             let from_rv = query.resource_version.unwrap_or(0);
@@ -140,6 +154,15 @@ pub async fn core_list_resource<S: Store>(
         } else {
             items
         };
+
+        // `kubectl get pods -A` sends the same Accept: application/json;as=Table;... header
+        // as `kubectl get pods -n <ns>` (list_pods, which already handles this). Without this,
+        // kubectl can't decode the response and falls back to printing only NAME/AGE instead of
+        // the usual READY/STATUS/RESTARTS/AGE columns.
+        if super::table::wants_table(accept) {
+            return Ok(Json(super::table::build_table("", "pods", items)).into_response());
+        }
+
         let body = build_list_response(
             "Pod",
             "",
@@ -643,5 +666,159 @@ mod tests {
             pods[0]["metadata"]["namespace"], "statefulset-9798",
             "pod must be from the correct namespace"
         );
+    }
+
+    /// `kubectl get pods -A` sends the same Accept: application/json;as=Table;... header as
+    /// `kubectl get pods -n <ns>` (list_pods). Before this fix, core_list_resource's
+    /// cross-namespace "pods" branch built its response via build_list_response directly and
+    /// never checked Accept at all, so kubectl logged "Unable to decode server response into a
+    /// Table" and fell back to printing only NAME/AGE — even though the namespaced LIST already
+    /// worked correctly via list_pods.
+    #[tokio::test]
+    async fn core_list_resource_cross_namespace_pods_with_table_accept_returns_table() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let pod_a = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "ns-a", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Running"}
+        });
+        let pod_b = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-b", "namespace": "ns-b", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(
+                "/registry/pods/ns-a/pod-a",
+                bytes::Bytes::from(serde_json::to_vec(&pod_a).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+        store
+            .put(
+                "/registry/pods/ns-b/pod-b",
+                bytes::Bytes::from(serde_json::to_vec(&pod_b).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pod-b");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/pods")
+            .header("accept", "application/json;as=Table;g=meta.k8s.io;v=v1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "a plain PodList kind here means kubectl can't decode it as a Table and silently \
+             falls back to hardcoded NAME/AGE-only columns for `kubectl get pods -A`"
+        );
+        let col_names: Vec<&str> = v["columnDefinitions"]
+            .as_array()
+            .expect("Table response must have columnDefinitions")
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            col_names.contains(&"Ready") && col_names.contains(&"Restarts"),
+            "cross-namespace pod Table must use the same READY/STATUS/RESTARTS columns as \
+             `kubectl get pods -n <ns>`, not the generic Name+Age fallback; got {col_names:?}"
+        );
+        let rows = v["rows"].as_array().expect("Table response must have rows");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the Table must still aggregate pods across every namespace, not just one"
+        );
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|r| r["object"]["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"pod-a") && names.contains(&"pod-b"),
+            "both cross-namespace pods must be present in the Table rows; got {names:?}"
+        );
+    }
+
+    /// A Table request for a v1beta1 Table (long deprecated) on the cross-namespace pods LIST
+    /// must be rejected the same way the namespaced list_pods already rejects it — a stale
+    /// client must be told the format isn't supported rather than silently downgraded.
+    #[tokio::test]
+    async fn core_list_resource_cross_namespace_pods_with_v1beta1_table_accept_returns_406() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/pods")
+            .header(
+                "accept",
+                "application/json;as=Table;g=meta.k8s.io;v=v1beta1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
     }
 }
