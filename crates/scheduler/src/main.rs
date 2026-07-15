@@ -6,8 +6,9 @@
 ///
 /// When no node has free capacity, falls back to preemption: evicts
 /// lower-priority pods to make room rather than leaving a higher-priority pod
-/// Pending forever (see `find_preemption_plan` in lib.rs for the MVP model —
-/// pod-count capacity only, no CPU/memory/extended-resource accounting).
+/// Pending forever (see `find_preemption_plan`/`select_preemption_victims` in
+/// lib.rs — pod-count, cpu/memory/ephemeral-storage, and extended resources
+/// are all accounted for).
 ///
 /// No leader election logic is implemented; the --leader-elect flag is
 /// accepted and silently ignored.
@@ -18,9 +19,9 @@ use clap::Parser;
 use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
-    bind_pod, delete_pod, emit_scheduling_event, find_preemption_plan, needs_scheduling,
-    patch_pod_status, pick_node, scheduling_gate_status_patch, scheduling_gate_status_reset,
-    should_schedule, stream_watch_events,
+    bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event, find_preemption_plan,
+    needs_scheduling, patch_pod_status, pick_node, scheduling_gate_status_patch,
+    scheduling_gate_status_reset, should_schedule, stream_watch_events,
 };
 
 // ---------------------------------------------------------------------------
@@ -202,6 +203,24 @@ async fn main() -> anyhow::Result<()> {
                                 let Some((v_ns, v_name)) = victim.split_once('/') else {
                                     continue;
                                 };
+                                // Best-effort: mirrors upstream kube-scheduler, which
+                                // stamps DisruptionTarget on the victim before deleting
+                                // it. A patch failure must not block the eviction
+                                // itself — freeing the slot for the higher-priority
+                                // pod matters more than the condition.
+                                if let Err(e) = patch_pod_status(
+                                    &connector_clone,
+                                    &server_clone,
+                                    v_ns,
+                                    v_name,
+                                    &disruption_target_patch(&pod_name),
+                                )
+                                .await
+                                {
+                                    error!(
+                                        "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
+                                    );
+                                }
                                 delete_pod(&connector_clone, &server_clone, v_ns, v_name).await?;
                             }
                             bind_pod(
