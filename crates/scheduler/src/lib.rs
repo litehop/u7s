@@ -601,6 +601,19 @@ pub struct NodeAllocatable {
     /// Ephemeral-storage quantity string (e.g. "20Gi"). Same convention as `cpu`.
     #[serde(default, rename = "ephemeral-storage")]
     pub ephemeral_storage: String,
+    /// Every other `status.allocatable`/`status.capacity` entry, keyed by
+    /// resource name to its raw quantity string — extended resources (e.g.
+    /// `scheduling.k8s.io/foo`, `nvidia.com/gpu`) and hugepages. The scheduler
+    /// has no fixed list of extended-resource names (they are cluster-defined
+    /// via `AddExtendedResource`-style PATCHes), so anything not already named
+    /// above is captured here rather than silently dropped. Without this,
+    /// `resource_fits`/preemption can never see that a node has (or lacks)
+    /// capacity for a resource beyond cpu/memory/ephemeral-storage/pod-count,
+    /// so a pod that only requests an extended resource always looks like it
+    /// fits — the exact gap that leaves the SchedulerPreemption conformance
+    /// suite's synthetic-resource tests unable to trigger eviction.
+    #[serde(flatten)]
+    pub extended: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -622,20 +635,48 @@ pub fn parse_pod_capacity(s: &str) -> u32 {
 /// A pod's (or a node's allocatable) cpu/memory/ephemeral-storage, all in
 /// milli-units — see `parse_quantity_milli`. Working in milli-units
 /// throughout means comparisons never need to convert back to a display unit.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+///
+/// `extended` carries every OTHER requested resource (name -> milli-units),
+/// e.g. `scheduling.k8s.io/foo` or `nvidia.com/gpu` — resource names the
+/// scheduler has no fixed list for, so they cannot be dedicated struct fields
+/// like cpu/memory. Without this, a pod requesting only an extended resource
+/// always looks like it requests nothing, and can never be blocked (or
+/// trigger preemption) by that resource being exhausted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResourceRequests {
     pub cpu_milli: i64,
     pub memory_milli: i64,
     pub ephemeral_storage_milli: i64,
+    pub extended: std::collections::BTreeMap<String, i64>,
 }
 
 impl std::ops::Add for ResourceRequests {
     type Output = Self;
-    fn add(self, other: Self) -> Self {
-        Self {
-            cpu_milli: self.cpu_milli + other.cpu_milli,
-            memory_milli: self.memory_milli + other.memory_milli,
-            ephemeral_storage_milli: self.ephemeral_storage_milli + other.ephemeral_storage_milli,
+    fn add(mut self, other: Self) -> Self {
+        self.cpu_milli += other.cpu_milli;
+        self.memory_milli += other.memory_milli;
+        self.ephemeral_storage_milli += other.ephemeral_storage_milli;
+        for (name, amount) in other.extended {
+            *self.extended.entry(name).or_insert(0) += amount;
+        }
+        self
+    }
+}
+
+/// Subtract `victim`'s requests out of `total` in place — the inverse of
+/// `Add`, used by `select_preemption_victims` to track how much of each
+/// dimension remains committed as candidate victims are evicted one at a
+/// time. Not a `Sub`/`SubAssign` impl: this is the only call site, and an
+/// operator overload would need to decide what negative remainders mean
+/// (they cannot occur here — a node's used total is always >= any single
+/// pod's request already counted in it).
+fn subtract_requests(total: &mut ResourceRequests, victim: &ResourceRequests) {
+    total.cpu_milli -= victim.cpu_milli;
+    total.memory_milli -= victim.memory_milli;
+    total.ephemeral_storage_milli -= victim.ephemeral_storage_milli;
+    for (name, amount) in &victim.extended {
+        if let Some(remaining) = total.extended.get_mut(name) {
+            *remaining -= amount;
         }
     }
 }
@@ -689,31 +730,23 @@ fn parse_quantity_milli(s: &str) -> i64 {
     s.parse::<i64>().map(|n| n * 1000).unwrap_or(0)
 }
 
-/// Sum `resources.requests.{cpu,memory,ephemeral-storage}` across a pod's
-/// containers. Init containers are not accounted for — this MVP sums the
-/// steady-state (regular) containers only, matching what the conformance
-/// suite's saturate-then-overflow tests actually create.
+/// Sum `resources.requests.{cpu,memory,ephemeral-storage}` plus every other
+/// (extended) resource key across a pod's containers. Init containers are not
+/// accounted for — this MVP sums the steady-state (regular) containers only,
+/// matching what the conformance suite's saturate-then-overflow tests
+/// actually create.
 fn sum_container_requests(containers: &[ContainerSpec]) -> ResourceRequests {
     let mut total = ResourceRequests::default();
     for c in containers {
-        total.cpu_milli += c
-            .resources
-            .requests
-            .get("cpu")
-            .map(|s| parse_quantity_milli(s))
-            .unwrap_or(0);
-        total.memory_milli += c
-            .resources
-            .requests
-            .get("memory")
-            .map(|s| parse_quantity_milli(s))
-            .unwrap_or(0);
-        total.ephemeral_storage_milli += c
-            .resources
-            .requests
-            .get("ephemeral-storage")
-            .map(|s| parse_quantity_milli(s))
-            .unwrap_or(0);
+        for (name, quantity) in &c.resources.requests {
+            let milli = parse_quantity_milli(quantity);
+            match name.as_str() {
+                "cpu" => total.cpu_milli += milli,
+                "memory" => total.memory_milli += milli,
+                "ephemeral-storage" => total.ephemeral_storage_milli += milli,
+                _ => *total.extended.entry(name.clone()).or_insert(0) += milli,
+            }
+        }
     }
     total
 }
@@ -737,7 +770,7 @@ struct PodListItemStatus {
 /// A node's already-committed usage from its non-terminated pods: the pod
 /// count (against `status.allocatable.pods`) and summed cpu/memory/
 /// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct NodeUsage {
     pub pod_count: u32,
     pub requests: ResourceRequests,
@@ -772,12 +805,15 @@ pub fn summarize_node_pods(body: &str) -> anyhow::Result<NodeUsage> {
 }
 
 /// A pod already on a node, as needed by preemption victim selection: its
-/// "namespace/name" key (to DELETE it) and its scheduling priority (to decide
-/// whether it is a legal victim for a given pending pod).
+/// "namespace/name" key (to DELETE it), its scheduling priority (to decide
+/// whether it is a legal victim for a given pending pod), and its own
+/// resource requests (how much pod-count/cpu/memory/ephemeral-storage/
+/// extended-resource capacity evicting it would actually free).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePod {
     pub key: String,
     pub priority: i32,
+    pub requests: ResourceRequests,
 }
 
 /// Minimal typed view of a pod list item needed for preemption: unlike
@@ -811,13 +847,17 @@ pub fn parse_node_pods(body: &str) -> anyhow::Result<Vec<NodePod>> {
         .items
         .into_iter()
         .filter(|p| p.status.phase != "Succeeded" && p.status.phase != "Failed")
-        .map(|p| NodePod {
-            key: format!(
-                "{}/{}",
-                p.metadata.namespace.unwrap_or_else(|| "default".to_owned()),
-                p.metadata.name.unwrap_or_default()
-            ),
-            priority: p.spec.priority.unwrap_or(0),
+        .map(|p| {
+            let requests = sum_container_requests(&p.spec.containers);
+            NodePod {
+                key: format!(
+                    "{}/{}",
+                    p.metadata.namespace.unwrap_or_else(|| "default".to_owned()),
+                    p.metadata.name.unwrap_or_default()
+                ),
+                priority: p.spec.priority.unwrap_or(0),
+                requests,
+            }
         })
         .collect())
 }
@@ -838,14 +878,22 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
 
 /// Return true when adding `requested` to a node's already-committed `used`
 /// requests would not exceed `allocatable`, independently for each of
-/// cpu/memory/ephemeral-storage. An allocatable value of 0 (field absent or
-/// unparseable — see `parse_quantity_milli`) means that dimension is unknown
-/// and is not checked, mirroring `parse_pod_capacity`'s existing convention
-/// for `status.allocatable.pods`.
+/// cpu/memory/ephemeral-storage/extended resources. An allocatable value of 0
+/// (field absent or unparseable — see `parse_quantity_milli`) means that
+/// cpu/memory/ephemeral-storage dimension is unknown and is not checked,
+/// mirroring `parse_pod_capacity`'s existing convention for
+/// `status.allocatable.pods`.
+///
+/// Extended resources are NOT given this "unknown means unlimited" treatment:
+/// a node that does not advertise a given extended resource at all has none
+/// of it to give, so requesting it must fail-closed, not be silently ignored
+/// — otherwise a pod requesting a GPU (say) could be bound to a node with no
+/// GPU, which the kubelet would then reject anyway (as the SchedulerPreemption
+/// conformance suite's synthetic `scheduling.k8s.io/foo` resource does today).
 fn resource_fits(
     allocatable: &NodeAllocatable,
-    used: ResourceRequests,
-    requested: ResourceRequests,
+    used: &ResourceRequests,
+    requested: &ResourceRequests,
 ) -> bool {
     let cpu_cap = parse_quantity_milli(&allocatable.cpu);
     let mem_cap = parse_quantity_milli(&allocatable.memory);
@@ -854,12 +902,24 @@ fn resource_fits(
         && (mem_cap == 0 || used.memory_milli + requested.memory_milli <= mem_cap)
         && (eph_cap == 0
             || used.ephemeral_storage_milli + requested.ephemeral_storage_milli <= eph_cap)
+        && requested.extended.iter().all(|(name, &want)| {
+            if want == 0 {
+                return true;
+            }
+            let cap = allocatable
+                .extended
+                .get(name)
+                .map(|s| parse_quantity_milli(s))
+                .unwrap_or(0);
+            let have = used.extended.get(name).copied().unwrap_or(0);
+            have + want <= cap
+        })
 }
 
 /// Select the first node from `list` that qualifies for `pod`
 /// (see `node_qualifies_for_pod`) AND that has at least one free pod slot AND
-/// enough uncommitted cpu/memory/ephemeral-storage to fit `pod.requests`
-/// (NodeResourcesFit).
+/// enough uncommitted cpu/memory/ephemeral-storage/extended resources to fit
+/// `pod.requests` (NodeResourcesFit).
 ///
 /// `node_usage` maps node name → current non-terminated pod count and summed
 /// resource requests (from a prior GET
@@ -887,7 +947,7 @@ pub fn select_node_with_capacity(
         }
         let usage = node_usage
             .get(&n.metadata.name)
-            .copied()
+            .cloned()
             .unwrap_or_default();
         // Resolve pod-count capacity: prefer allocatable, fall back to capacity.
         let cap_str = if !n.status.allocatable.pods.is_empty() {
@@ -899,7 +959,7 @@ pub fn select_node_with_capacity(
         if cap != 0 && usage.pod_count >= cap {
             return false;
         }
-        resource_fits(&n.status.allocatable, usage.requests, pod.requests)
+        resource_fits(&n.status.allocatable, &usage.requests, &pod.requests)
     });
     found.map(|n| n.metadata.name).context(
         "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)",
@@ -907,54 +967,153 @@ pub fn select_node_with_capacity(
 }
 
 /// Select the pods to evict from one node so that a pending pod at
-/// `pending_priority` fits, given the node's pod-count `capacity`.
+/// `pending_priority` requesting `pending_requests` fits, given the node's
+/// pod-count `pod_count_capacity` and resource `allocatable` — the same
+/// dimensions `resource_fits`/`select_node_with_capacity` check at bind time.
 ///
-/// This is the MVP preemption model: it mirrors `select_node_with_capacity`'s
-/// pod-count-only capacity dimension (no CPU/memory/extended-resource
-/// accounting — the scheduler does not track those at all today).
+/// Generalizes the original pod-count-only MVP: a pending pod can be blocked
+/// by pod-count OR by any resource dimension `select_node_with_capacity`
+/// would reject it for — most notably an extended resource (e.g. a GPU, or
+/// the SchedulerPreemption conformance suite's synthetic
+/// `scheduling.k8s.io/foo`). Without accounting for resources here too, a
+/// higher-priority pod whose only contention is an extended resource can
+/// never trigger eviction — `pick_node` already returns `Ok` for such a node
+/// (cpu/memory/pod-count all look free), so this function never even runs,
+/// and the pending pod is bound onto a node the kubelet then rejects it from,
+/// with no recourse.
 ///
 /// Only pods with priority STRICTLY LOWER than `pending_priority` are eligible
 /// victims: kube-scheduler never preempts equal-or-higher-priority pods, and
 /// neither must u7s — otherwise same-priority pods could evict each other in a
 /// cycle and scheduling would never stabilize. Eligible victims are evicted
-/// lowest-priority-first (cheapest disruption) until just enough slots are
-/// freed — never more than necessary.
+/// lowest-priority-first (cheapest disruption), accumulating freed pod-count
+/// and resource capacity one victim at a time, until the pending pod fits
+/// every dimension — never evicting more than necessary.
 ///
-/// Returns an empty `Vec` — meaning "do not evict anything" — when:
-/// - `capacity` is 0 (unknown/unparseable; `select_node_with_capacity` treats
-///   this as unlimited, so `pick_node` would already have chosen this node), OR
-/// - the pod already fits (fewer pods than capacity) — preemption must never
-///   run when there was room, or it would kill a workload for no reason, OR
-/// - evicting every eligible lower-priority pod still would not free enough
-///   capacity — the pending pod would not fit even after the disruption, so
-///   evicting anyone would be pointless.
+/// Returns an empty `Vec` — meaning "do not evict anything" — when the pod
+/// already fits (preemption must never run when there was room, or it would
+/// kill a workload for no reason), or when evicting every eligible
+/// lower-priority pod still would not free enough of some dimension — the
+/// pending pod would not fit even after the disruption, so evicting anyone
+/// would be pointless.
 pub fn select_preemption_victims(
     pending_priority: i32,
+    pending_requests: &ResourceRequests,
     node_pods: &[NodePod],
-    capacity: u32,
+    pod_count_capacity: u32,
+    allocatable: &NodeAllocatable,
 ) -> Vec<String> {
-    if capacity == 0 {
-        return Vec::new();
-    }
-    let used = node_pods.len() as u32;
-    if used < capacity {
-        return Vec::new();
-    }
-    let needed = used - capacity + 1;
+    let fits = |pod_count: u32, requests: &ResourceRequests| {
+        (pod_count_capacity == 0 || pod_count < pod_count_capacity)
+            && resource_fits(allocatable, requests, pending_requests)
+    };
 
+    let total_pod_count = node_pods.len() as u32;
+    let total_requests = node_pods
+        .iter()
+        .fold(ResourceRequests::default(), |acc, p| {
+            acc + p.requests.clone()
+        });
+
+    // Pod-count is a candidate-independent dimension: if it is short, EVERY
+    // pod helps (each occupies exactly one slot). A resource dimension is
+    // different: a pod that requests none of a specific short resource frees
+    // none of it by being evicted, no matter how low its priority — e.g. on a
+    // node short on the SchedulerPreemption suite's synthetic
+    // `scheduling.k8s.io/foo`, evicting coredns (which requests none of it)
+    // is pure collateral damage that helps nobody — reproduced live: before
+    // this filter, u7s evicted kube-system/coredns and
+    // kube-system/konnectivity-agent instead of the pod actually holding the
+    // contended resource, because they happened to have lower/no priority.
+    let pod_count_short = pod_count_capacity != 0 && total_pod_count >= pod_count_capacity;
     let mut candidates: Vec<&NodePod> = node_pods
         .iter()
         .filter(|p| p.priority < pending_priority)
+        .filter(|p| {
+            pod_count_short
+                || resource_deficiency_relevant(
+                    allocatable,
+                    &total_requests,
+                    pending_requests,
+                    &p.requests,
+                )
+        })
         .collect();
-    if (candidates.len() as u32) < needed {
-        return Vec::new();
-    }
     candidates.sort_by_key(|p| p.priority);
-    candidates
-        .into_iter()
-        .take(needed as usize)
-        .map(|p| p.key.clone())
-        .collect()
+
+    let mut remaining_pod_count = total_pod_count;
+    let mut remaining_requests = total_requests;
+    let mut victims = Vec::new();
+    for candidate in candidates {
+        if fits(remaining_pod_count, &remaining_requests) {
+            break;
+        }
+        remaining_pod_count -= 1;
+        subtract_requests(&mut remaining_requests, &candidate.requests);
+        victims.push(candidate.key.clone());
+    }
+
+    if fits(remaining_pod_count, &remaining_requests) {
+        victims
+    } else {
+        Vec::new()
+    }
+}
+
+/// Return true when evicting a pod requesting `candidate` could plausibly
+/// help admit `pending` — i.e. some resource dimension is both short (adding
+/// `pending`'s request to the node's `total_used` would exceed `allocatable`)
+/// AND `candidate` itself requests a nonzero amount of that SAME dimension.
+/// A pod holding none of the scarce resource cannot free any of it by being
+/// evicted, however low its priority (see `select_preemption_victims`).
+fn resource_deficiency_relevant(
+    allocatable: &NodeAllocatable,
+    total_used: &ResourceRequests,
+    pending: &ResourceRequests,
+    candidate: &ResourceRequests,
+) -> bool {
+    let short = |cap: i64, used: i64, want: i64| cap != 0 && used + want > cap;
+    if short(
+        parse_quantity_milli(&allocatable.cpu),
+        total_used.cpu_milli,
+        pending.cpu_milli,
+    ) && candidate.cpu_milli > 0
+    {
+        return true;
+    }
+    if short(
+        parse_quantity_milli(&allocatable.memory),
+        total_used.memory_milli,
+        pending.memory_milli,
+    ) && candidate.memory_milli > 0
+    {
+        return true;
+    }
+    if short(
+        parse_quantity_milli(&allocatable.ephemeral_storage),
+        total_used.ephemeral_storage_milli,
+        pending.ephemeral_storage_milli,
+    ) && candidate.ephemeral_storage_milli > 0
+    {
+        return true;
+    }
+    pending.extended.iter().any(|(name, &want)| {
+        if want == 0 {
+            return false;
+        }
+        // Unlike cpu/memory/ephemeral-storage, a missing/0 capacity for an
+        // extended resource is a real (exhausted) limit, not "unknown, don't
+        // check" — matches resource_fits's fail-closed convention. So this
+        // branch, unlike the three above, does NOT gate on `cap != 0`.
+        let cap = allocatable
+            .extended
+            .get(name)
+            .map(|s| parse_quantity_milli(s))
+            .unwrap_or(0);
+        let used = total_used.extended.get(name).copied().unwrap_or(0);
+        let candidate_has = candidate.extended.get(name).copied().unwrap_or(0);
+        used + want > cap && candidate_has > 0
+    })
 }
 
 /// Return true when all entries in `selector` are satisfied by `labels`.
@@ -1195,12 +1354,13 @@ pub async fn find_preemption_plan(
         } else {
             &node.status.capacity.pods
         };
+        // Unlike the old pod-count-only model, a 0 (unknown/unlimited)
+        // pod-count capacity does NOT mean this node can be skipped: `pod`
+        // may still fail to fit on a cpu/memory/extended-resource dimension,
+        // which is exactly why `pick_node` rejected it.
+        // `select_preemption_victims` treats 0 as "pod-count never blocks",
+        // the same convention `resource_fits` already uses for cpu/memory.
         let capacity = parse_pod_capacity(cap_str);
-        if capacity == 0 {
-            // Unknown/unlimited capacity — pick_node would already have picked
-            // this node, so it cannot be why scheduling failed.
-            continue;
-        }
 
         let node_name = &node.metadata.name;
         let pods_path = format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{node_name}");
@@ -1226,7 +1386,13 @@ pub async fn find_preemption_plan(
             }
         };
 
-        let victims = select_preemption_victims(pod.priority, &node_pods, capacity);
+        let victims = select_preemption_victims(
+            pod.priority,
+            &pod.requests,
+            &node_pods,
+            capacity,
+            &node.status.allocatable,
+        );
         if victims.is_empty() {
             continue;
         }
@@ -1489,6 +1655,36 @@ pub async fn emit_scheduling_event(
         bail!("POST event failed with HTTP {status}: {body}");
     }
     Ok(())
+}
+
+/// The `DisruptionTarget` condition reason upstream's real kube-scheduler
+/// stamps on a preemption victim before deleting it — matches
+/// `v1.PodReasonPreemptionByScheduler` (`pkg/scheduler/framework/preemption/executor.go`).
+const PREEMPTION_BY_SCHEDULER_REASON: &str = "PreemptionByScheduler";
+
+/// Build the status-conditions PATCH that marks a preemption victim with the
+/// `DisruptionTarget` condition, mirroring upstream kube-scheduler's
+/// `Executor.PreemptPod`: it patches this condition onto the victim BEFORE
+/// deleting it, so a client re-fetching the pod mid-termination (as the
+/// `validates pod disruption condition is added to the preempted pod`
+/// conformance test does) sees WHY it is being evicted, not just that it is
+/// disappearing. `VerifyPodHasConditionWithType`
+/// (test/e2e/framework/pod/resource.go) only checks the condition's `type`,
+/// but a made-up reason would misrepresent to `kubectl describe pod` who
+/// evicted the pod and why.
+pub fn disruption_target_patch(pending_pod_name: &str) -> Value {
+    serde_json::json!({
+        "status": {
+            "conditions": [{
+                "type": "DisruptionTarget",
+                "status": "True",
+                "reason": PREEMPTION_BY_SCHEDULER_REASON,
+                "message": format!(
+                    "u7s-scheduler: preempting to accommodate higher priority pod {pending_pod_name}"
+                ),
+            }]
+        }
+    })
 }
 
 /// Evict a pod (preemption's victim-removal step) via DELETE .../pods/:name.
@@ -2234,6 +2430,41 @@ mod tests {
         let json = json!({ "items": [] });
         let list: NodeList = serde_json::from_value(json).expect("should deserialize");
         assert!(list.items.is_empty());
+    }
+
+    /// A `status.allocatable` entry beyond the named cpu/memory/ephemeral-
+    /// storage/pods fields (e.g. an extended resource added by
+    /// `AddExtendedResource`, or hugepages) must be captured into `extended`,
+    /// not silently dropped — without this, resource_fits/preemption can
+    /// never see that a node has (or lacks) capacity for it.
+    #[test]
+    fn node_allocatable_captures_extended_resource_keys() {
+        let json = json!({
+            "pods": "110",
+            "cpu": "4",
+            "scheduling.k8s.io/foo": "5",
+            "nvidia.com/gpu": "2"
+        });
+        let allocatable: NodeAllocatable =
+            serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(
+            allocatable.pods, "110",
+            "named fields must still deserialize normally"
+        );
+        assert_eq!(
+            allocatable.extended.get("scheduling.k8s.io/foo"),
+            Some(&"5".to_owned()),
+            "an extended-resource key must land in `extended`, keyed by its full name"
+        );
+        assert_eq!(
+            allocatable.extended.get("nvidia.com/gpu"),
+            Some(&"2".to_owned()),
+            "every unrecognized key must be captured, not just the one the test set up first"
+        );
+        assert!(
+            !allocatable.extended.contains_key("cpu"),
+            "a named field (cpu) must not ALSO appear in `extended` — it would double-count"
+        );
     }
 
     // parse_uri_parts tests — the URI-parsing logic is shared by send_request and
@@ -3327,6 +3558,7 @@ mod tests {
             cpu: cpu.to_owned(),
             memory: memory.to_owned(),
             ephemeral_storage: ephemeral_storage.to_owned(),
+            extended: Default::default(),
         }
     }
 
@@ -3339,6 +3571,7 @@ mod tests {
             cpu_milli,
             memory_milli,
             ephemeral_storage_milli,
+            extended: Default::default(),
         }
     }
 
@@ -3351,7 +3584,7 @@ mod tests {
         let used = requests(4000, 0, 0); // node already fully committed at 4 cores
         let pending = requests(1000, 0, 0); // one more core requested
         assert!(
-            !resource_fits(&allocatable, used, pending),
+            !resource_fits(&allocatable, &used, &pending),
             "a pending pod's cpu request must be rejected when it would push \
              usage past allocatable cpu — reverting this lets the scheduler bind \
              pods the kubelet then fails OutOfcpu"
@@ -3366,7 +3599,7 @@ mod tests {
         let used = requests(0, 0, 10 * 1024 * 1024 * 1024 * 1000);
         let pending = requests(0, 0, 1000); // 1 milli-byte over the line
         assert!(
-            !resource_fits(&allocatable, used, pending),
+            !resource_fits(&allocatable, &used, &pending),
             "a pending pod's ephemeral-storage request must be rejected when it \
              would push usage past allocatable ephemeral-storage"
         );
@@ -3381,7 +3614,7 @@ mod tests {
         let used = requests(2000, 4 * 1024 * 1024 * 1024 * 1000, 0);
         let pending = requests(1000, 1024 * 1024 * 1024 * 1000, 0);
         assert!(
-            resource_fits(&allocatable, used, pending),
+            resource_fits(&allocatable, &used, &pending),
             "a request that fits within remaining allocatable must be accepted"
         );
     }
@@ -3395,8 +3628,63 @@ mod tests {
         let used = requests(999_999_000, 0, 0);
         let pending = requests(999_999_000, 0, 0);
         assert!(
-            resource_fits(&allocatable, used, pending),
+            resource_fits(&allocatable, &used, &pending),
             "an unknown (empty) allocatable dimension must not block scheduling"
+        );
+    }
+
+    // resource_fits extended-resource tests: before this fix, resource_fits
+    // only checked cpu/memory/ephemeral-storage, so a pod requesting an
+    // extended resource (e.g. a GPU, or the SchedulerPreemption conformance
+    // suite's synthetic `scheduling.k8s.io/foo`) always looked like it
+    // requested nothing — NodeResourcesFit could never reject it, and
+    // preemption could never see a shortage to act on.
+
+    /// The exact SchedulerPreemption conformance shape: a node advertises 1
+    /// unit of a fake extended resource, it is already fully used, and a
+    /// pending pod wants 1 more — must be rejected, or the scheduler binds a
+    /// pod the kubelet then fails OutOf<resource>.
+    #[test]
+    fn resource_fits_false_when_extended_resource_would_be_overcommitted() {
+        let allocatable = node_allocatable_extended("scheduling.k8s.io/foo", "1");
+        let used = extended_request("scheduling.k8s.io/foo", 1000); // already fully committed
+        let pending = extended_request("scheduling.k8s.io/foo", 1000); // wants 1 more
+        assert!(
+            !resource_fits(&allocatable, &used, &pending),
+            "a pending pod's extended-resource request must be rejected when it \
+             would push usage past allocatable — reverting this is the root cause \
+             of every SchedulerPreemption conformance failure: the scheduler binds \
+             the pod anyway and the kubelet rejects it outright"
+        );
+    }
+
+    /// Unlike cpu/memory/ephemeral-storage, a node that does not advertise an
+    /// extended resource AT ALL must fail-closed, not be treated as
+    /// "unknown/unlimited" — the node has none of a resource it never
+    /// declared, so a pod requesting it can never be scheduled there.
+    #[test]
+    fn resource_fits_false_when_node_does_not_advertise_the_extended_resource() {
+        let allocatable = NodeAllocatable::default(); // no scheduling.k8s.io/foo entry at all
+        let used = ResourceRequests::default();
+        let pending = extended_request("scheduling.k8s.io/foo", 1000);
+        assert!(
+            !resource_fits(&allocatable, &used, &pending),
+            "requesting a resource the node never advertised must fail-closed, \
+             not be silently ignored like an unset cpu/memory dimension"
+        );
+    }
+
+    /// The positive-path counterpart: a pod requesting an extended resource
+    /// that the node has enough spare capacity for must be accepted.
+    #[test]
+    fn resource_fits_true_when_extended_resource_fits_within_remaining_capacity() {
+        let allocatable = node_allocatable_extended("scheduling.k8s.io/foo", "5");
+        let used = extended_request("scheduling.k8s.io/foo", 2000); // 2 of 5 used
+        let pending = extended_request("scheduling.k8s.io/foo", 1000); // wants 1 more
+        assert!(
+            resource_fits(&allocatable, &used, &pending),
+            "a request that fits within remaining allocatable extended-resource \
+             capacity must be accepted"
         );
     }
 
@@ -3450,6 +3738,33 @@ mod tests {
         assert_eq!(
             pending.requests.cpu_milli, 1000,
             "two 500m-cpu containers in one pod must sum to 1000 milli-cpu, not 500"
+        );
+    }
+
+    /// An extended-resource request key (anything other than cpu/memory/
+    /// ephemeral-storage) must be captured into pending.requests.extended — if
+    /// dropped, a pod requesting only a GPU or the SchedulerPreemption suite's
+    /// synthetic `scheduling.k8s.io/foo` always looks like it requests
+    /// nothing, and NodeResourcesFit/preemption can never see it.
+    #[test]
+    fn needs_scheduling_captures_extended_resource_requests() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "gpu-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [
+                        { "resources": { "requests": { "scheduling.k8s.io/foo": "2" } } }
+                    ]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            pending.requests.extended.get("scheduling.k8s.io/foo"),
+            Some(&2000),
+            "an extended-resource request must be summed into pending.requests.extended \
+             in the same milli-unit convention as cpu/memory"
         );
     }
 
@@ -3661,6 +3976,37 @@ mod tests {
         );
     }
 
+    /// parse_node_pods must also capture each pod's own resource requests
+    /// (including extended resources) — without this, select_preemption_victims
+    /// has no way to know how much capacity evicting a given pod would
+    /// actually free, and can never select victims by resource shortage, only
+    /// by pod-count.
+    #[test]
+    fn parse_node_pods_captures_resource_requests() {
+        let body = serde_json::json!({
+            "items": [
+                {
+                    "metadata": {"name": "victim", "namespace": "default"},
+                    "spec": {
+                        "priority": 1,
+                        "containers": [
+                            { "resources": { "requests": { "scheduling.k8s.io/foo": "1" } } }
+                        ]
+                    },
+                    "status": {"phase": "Running"}
+                },
+            ]
+        })
+        .to_string();
+        let pods = parse_node_pods(&body).expect("should parse");
+        assert_eq!(
+            pods[0].requests.extended.get("scheduling.k8s.io/foo"),
+            Some(&1000),
+            "a preemption candidate's extended-resource request must be captured \
+             so evicting it is known to free that resource"
+        );
+    }
+
     // select_preemption_victims tests — the victim-selection decision at the
     // heart of preemption.
 
@@ -3668,6 +4014,20 @@ mod tests {
         NodePod {
             key: key.to_owned(),
             priority,
+            requests: ResourceRequests::default(),
+        }
+    }
+
+    /// A NodePod that additionally requests `amount` of extended resource
+    /// `name` — for the resource-dimension (not just pod-count) preemption
+    /// tests below.
+    fn np_extended(key: &str, priority: i32, name: &str, amount: i64) -> NodePod {
+        let mut requests = ResourceRequests::default();
+        requests.extended.insert(name.to_owned(), amount);
+        NodePod {
+            key: key.to_owned(),
+            priority,
+            requests,
         }
     }
 
@@ -3677,7 +4037,13 @@ mod tests {
     #[test]
     fn select_preemption_victims_evicts_lower_priority_pod_when_node_is_full() {
         let node_pods = vec![np("default/low", 1)];
-        let victims = select_preemption_victims(100, &node_pods, 1);
+        let victims = select_preemption_victims(
+            100,
+            &ResourceRequests::default(),
+            &node_pods,
+            1,
+            &NodeAllocatable::default(),
+        );
         assert_eq!(
             victims,
             vec!["default/low".to_owned()],
@@ -3692,7 +4058,13 @@ mod tests {
     #[test]
     fn select_preemption_victims_never_evicts_equal_or_higher_priority_pods() {
         let node_pods = vec![np("default/same", 100), np("default/higher", 500)];
-        let victims = select_preemption_victims(100, &node_pods, 1);
+        let victims = select_preemption_victims(
+            100,
+            &ResourceRequests::default(),
+            &node_pods,
+            1,
+            &NodeAllocatable::default(),
+        );
         assert!(
             victims.is_empty(),
             "equal/higher priority pods must never be preemption victims — got {victims:?}"
@@ -3705,7 +4077,13 @@ mod tests {
     #[test]
     fn select_preemption_victims_returns_empty_when_pod_already_fits() {
         let node_pods = vec![np("default/low", 1)];
-        let victims = select_preemption_victims(100, &node_pods, 5);
+        let victims = select_preemption_victims(
+            100,
+            &ResourceRequests::default(),
+            &node_pods,
+            5,
+            &NodeAllocatable::default(),
+        );
         assert!(
             victims.is_empty(),
             "no eviction is needed when the node already has free capacity; got {victims:?}"
@@ -3727,7 +4105,13 @@ mod tests {
             np("default/high-1", 500),
             np("default/high-2", 500),
         ];
-        let victims = select_preemption_victims(100, &node_pods, 1);
+        let victims = select_preemption_victims(
+            100,
+            &ResourceRequests::default(),
+            &node_pods,
+            1,
+            &NodeAllocatable::default(),
+        );
         assert!(
             victims.is_empty(),
             "must not evict any pod when doing so still would not free enough \
@@ -3742,7 +4126,13 @@ mod tests {
     fn select_preemption_victims_evicts_lowest_priority_first_and_no_more_than_needed() {
         let node_pods = vec![np("default/mid", 50), np("default/lowest", 1)];
         // capacity=2, used=2 (node exactly full) → needed = 2-2+1 = 1 slot.
-        let victims = select_preemption_victims(100, &node_pods, 2);
+        let victims = select_preemption_victims(
+            100,
+            &ResourceRequests::default(),
+            &node_pods,
+            2,
+            &NodeAllocatable::default(),
+        );
         assert_eq!(
             victims,
             vec!["default/lowest".to_owned()],
@@ -3757,10 +4147,147 @@ mod tests {
     #[test]
     fn select_preemption_victims_returns_empty_for_unknown_capacity_node() {
         let node_pods = vec![np("default/low", 1)];
-        let victims = select_preemption_victims(100, &node_pods, 0);
+        let victims = select_preemption_victims(
+            100,
+            &ResourceRequests::default(),
+            &node_pods,
+            0,
+            &NodeAllocatable::default(),
+        );
         assert!(
             victims.is_empty(),
             "unknown capacity (0) must never trigger eviction; got {victims:?}"
+        );
+    }
+
+    fn node_allocatable_extended(name: &str, capacity: &str) -> NodeAllocatable {
+        NodeAllocatable {
+            extended: [(name.to_owned(), capacity.to_owned())].into(),
+            ..Default::default()
+        }
+    }
+
+    fn extended_request(name: &str, amount: i64) -> ResourceRequests {
+        let mut r = ResourceRequests::default();
+        r.extended.insert(name.to_owned(), amount);
+        r
+    }
+
+    // select_preemption_victims extended-resource tests: the SchedulerPreemption
+    // conformance suite exhausts a synthetic extended resource
+    // (`scheduling.k8s.io/foo`), never pod-count or cpu/memory. Before this
+    // fix, select_preemption_victims only understood pod-count, so a node
+    // with 1 pod against a 110-pod cap always looked "not full", and a
+    // higher-priority pod blocked purely by an exhausted extended resource
+    // could never trigger eviction — it stayed unschedulable forever, and the
+    // real kubelet then rejected it outright (OutOf<resource>) once bound.
+
+    /// The exact SchedulerPreemption conformance shape: a node advertises 1
+    /// unit of a fake extended resource, a low-priority pod holds it, and a
+    /// higher-priority pod wants the same unit. Pod-count capacity is huge
+    /// (110) and never binding — only the extended resource is scarce.
+    #[test]
+    fn select_preemption_victims_evicts_lower_priority_pod_for_extended_resource_shortage() {
+        let node_pods = vec![np_extended(
+            "default/victim",
+            1,
+            "scheduling.k8s.io/foo",
+            1000,
+        )];
+        let victims = select_preemption_victims(
+            1000,
+            &extended_request("scheduling.k8s.io/foo", 1000),
+            &node_pods,
+            110,
+            &node_allocatable_extended("scheduling.k8s.io/foo", "1"),
+        );
+        assert_eq!(
+            victims,
+            vec!["default/victim".to_owned()],
+            "a pending pod blocked purely by an exhausted extended resource must \
+             still evict the lower-priority pod holding it — pod-count alone is \
+             not the only capacity dimension preemption must recognize"
+        );
+    }
+
+    /// Live-reproduced regression: on a node short on an extended resource, a
+    /// zero-priority pod that holds NONE of that resource (e.g. coredns,
+    /// which never requests `scheduling.k8s.io/foo`) must never be evicted
+    /// just because its priority happens to be lower than the actual
+    /// resource-holding victim's — evicting it frees nothing relevant and
+    /// only causes collateral damage. Caught by manually reproducing the
+    /// SchedulerPreemption conformance scenario against a live stack: the
+    /// first version of this fix evicted kube-system/coredns and
+    /// kube-system/konnectivity-agent (priority 0, no `scheduling.k8s.io/foo`
+    /// request) instead of the pod actually holding the contended resource.
+    #[test]
+    fn select_preemption_victims_never_evicts_a_pod_holding_none_of_the_short_resource() {
+        let node_pods = vec![
+            // Lower priority than the resource-holder, but requests nothing —
+            // must be skipped even though it is the "cheapest" by priority.
+            np("kube-system/irrelevant-system-pod", 0),
+            np_extended("default/victim", 1, "scheduling.k8s.io/foo", 1000),
+        ];
+        let victims = select_preemption_victims(
+            1000,
+            &extended_request("scheduling.k8s.io/foo", 1000),
+            &node_pods,
+            110,
+            &node_allocatable_extended("scheduling.k8s.io/foo", "1"),
+        );
+        assert_eq!(
+            victims,
+            vec!["default/victim".to_owned()],
+            "must evict only the pod actually holding the contended resource, \
+             never the lower-priority pod that holds none of it; got {victims:?}"
+        );
+    }
+
+    /// If the extended resource the pending pod wants is not actually
+    /// exhausted, no eviction may happen — mirrors
+    /// `select_preemption_victims_returns_empty_when_pod_already_fits` for the
+    /// extended-resource dimension specifically.
+    #[test]
+    fn select_preemption_victims_returns_empty_when_extended_resource_already_fits() {
+        let node_pods = vec![np_extended("default/low", 1, "scheduling.k8s.io/foo", 1000)];
+        let victims = select_preemption_victims(
+            100,
+            &extended_request("scheduling.k8s.io/foo", 1000),
+            &node_pods,
+            110,
+            &node_allocatable_extended("scheduling.k8s.io/foo", "5"),
+        );
+        assert!(
+            victims.is_empty(),
+            "1 of 5 units already used plus a 1-unit request still fits — no \
+             pod should be evicted; got {victims:?}"
+        );
+    }
+
+    /// When a single victim's extended-resource share is not enough, preemption
+    /// must keep evicting (lowest priority first) until the deficit is
+    /// actually cleared — mirrors the pod-count "minimal but sufficient"
+    /// eviction test for the extended-resource dimension.
+    #[test]
+    fn select_preemption_victims_evicts_multiple_pods_to_clear_extended_resource_deficit() {
+        let node_pods = vec![
+            np_extended("default/lowest", 1, "scheduling.k8s.io/foo", 1000),
+            np_extended("default/mid", 50, "scheduling.k8s.io/foo", 1000),
+        ];
+        // capacity=2 units, both used (2/2) — pending needs 2 more, so BOTH
+        // existing pods must go; evicting only one frees just 1 of the 2 needed.
+        let victims = select_preemption_victims(
+            100,
+            &extended_request("scheduling.k8s.io/foo", 2000),
+            &node_pods,
+            110,
+            &node_allocatable_extended("scheduling.k8s.io/foo", "2"),
+        );
+        assert_eq!(
+            victims,
+            vec!["default/lowest".to_owned(), "default/mid".to_owned()],
+            "evicting only the lowest-priority pod is not enough to clear a \
+             2-unit deficit that needs both pods freed; got {victims:?}"
         );
     }
 
@@ -3797,6 +4324,45 @@ mod tests {
     fn check_delete_response_err_on_failure() {
         assert!(check_delete_response(500).is_err());
         assert!(check_delete_response(403).is_err());
+    }
+
+    // disruption_target_patch tests: upstream kube-scheduler stamps a
+    // DisruptionTarget condition on a preemption victim before
+    // deleting it. Before this fix u7s's preemption path deleted victims with
+    // no condition at all, so `validates pod disruption condition is added to
+    // the preempted pod` failed even when eviction itself worked correctly —
+    // the eviction mechanism and the status bookkeeping are separate gaps.
+
+    /// The condition type/status/reason must match what
+    /// `VerifyPodHasConditionWithType` (test/e2e/framework/pod/resource.go)
+    /// and `kubectl describe pod` expect from a real scheduler preemption:
+    /// `DisruptionTarget`/`True`/`PreemptionByScheduler`.
+    #[test]
+    fn disruption_target_patch_sets_condition_type_status_and_reason() {
+        let patch = disruption_target_patch("preemptor-pod");
+        let condition = &patch["status"]["conditions"][0];
+        assert_eq!(condition["type"], "DisruptionTarget");
+        assert_eq!(condition["status"], "True");
+        assert_eq!(
+            condition["reason"], "PreemptionByScheduler",
+            "the reason must match upstream's v1.PodReasonPreemptionByScheduler, \
+             not a made-up string — it tells `kubectl describe pod` who evicted \
+             the pod and why"
+        );
+    }
+
+    /// The message must name the preemptor pod so a user reading `kubectl
+    /// describe pod` on the victim can tell which pod displaced it.
+    #[test]
+    fn disruption_target_patch_message_names_the_preemptor() {
+        let patch = disruption_target_patch("high-priority-pod");
+        let message = patch["status"]["conditions"][0]["message"]
+            .as_str()
+            .expect("message must be a string");
+        assert!(
+            message.contains("high-priority-pod"),
+            "the message must reference the preemptor pod by name; got {message:?}"
+        );
     }
 
     // ---------------------------------------------------------------------------
