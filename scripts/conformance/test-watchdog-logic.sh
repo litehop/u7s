@@ -3,10 +3,10 @@
 #
 # Exercises the core body of watchdog_loop without a real cluster:
 #   - System namespaces (default, kube-*, sonobuoy) must never be deleted.
-#   - Active namespaces >= 20 min must be flagged for deletion.
-#   - Any namespace >= 30 min must be flagged regardless of phase.
-#   - Fresh namespaces (< 20 min) must be left alone even if Active.
-#   - Terminating namespaces < 30 min must be left alone.
+#   - Active namespaces >= 10 min must be flagged for deletion.
+#   - Any namespace >= 15 min must be flagged regardless of phase.
+#   - Fresh namespaces (< 10 min) must be left alone even if Active.
+#   - Terminating namespaces < 15 min must be left alone.
 #   - A namespace still Active at the several-minute mark (the normal lifetime
 #     of a legitimate [Slow] conformance test, e.g. a 5-minute gomega.Consistently
 #     check) must be left alone — the watchdog is a leak/stuck-namespace safety
@@ -61,12 +61,12 @@ watchdog_decide() {
   local age_s=$(( now - created_s ))
 
   local should_delete=0 reason=""
-  if [ "$phase" = "Active" ] && [ "$age_s" -ge 1200 ]; then
+  if [ "$phase" = "Active" ] && [ "$age_s" -ge 600 ]; then
     should_delete=1
-    reason="Active for ${age_s}s (>= 20m threshold)"
-  elif [ "$age_s" -ge 1800 ]; then
+    reason="Active for ${age_s}s (>= 10m threshold)"
+  elif [ "$age_s" -ge 900 ]; then
     should_delete=1
-    reason="age=${age_s}s (>= 30m threshold, phase=${phase})"
+    reason="age=${age_s}s (>= 15m threshold, phase=${phase})"
   fi
 
   if [ "$should_delete" -eq 1 ]; then
@@ -90,17 +90,17 @@ ts_ago() {
 # Test cases
 # ---------------------------------------------------------------------------
 
-# 1. Active namespace, 21 minutes old → must be deleted (>= 20m Active threshold).
-OUT=$(watchdog_decide "$NOW" "e2e-test-abc" "Active" "$(ts_ago 1260)")
-assert_deleted "Active ns 21m old is force-deleted" "e2e-test-abc" "$OUT"
+# 1. Active namespace, 11 minutes old → must be deleted (>= 10m Active threshold).
+OUT=$(watchdog_decide "$NOW" "e2e-test-abc" "Active" "$(ts_ago 660)")
+assert_deleted "Active ns 11m old is force-deleted" "e2e-test-abc" "$OUT"
 
-# 2. Active namespace, 2 minutes old → must NOT be deleted (below 20m threshold).
+# 2. Active namespace, 2 minutes old → must NOT be deleted (below 10m threshold).
 OUT=$(watchdog_decide "$NOW" "e2e-test-fresh" "Active" "$(ts_ago 120)")
 assert_not_deleted "Active ns 2m old is left alone" "e2e-test-fresh" "$OUT"
 
-# 3. Terminating namespace, 31 minutes old → must be deleted (>= 30m any-phase threshold).
-OUT=$(watchdog_decide "$NOW" "e2e-test-stuck" "Terminating" "$(ts_ago 1860)")
-assert_deleted "Terminating ns 31m old is force-deleted" "e2e-test-stuck" "$OUT"
+# 3. Terminating namespace, 16 minutes old → must be deleted (>= 15m any-phase threshold).
+OUT=$(watchdog_decide "$NOW" "e2e-test-stuck" "Terminating" "$(ts_ago 960)")
+assert_deleted "Terminating ns 16m old is force-deleted" "e2e-test-stuck" "$OUT"
 
 # 4. Terminating namespace, 4 minutes old → must NOT be deleted (below both thresholds).
 OUT=$(watchdog_decide "$NOW" "e2e-test-draining" "Terminating" "$(ts_ago 240)")
@@ -118,17 +118,17 @@ assert_not_deleted "System ns 'sonobuoy' is never touched" "sonobuoy" "$OUT"
 OUT=$(watchdog_decide "$NOW" "kube-system" "Active" "$(ts_ago 3600)")
 assert_not_deleted "System ns 'kube-system' is never touched" "kube-system" "$OUT"
 
-# 8. Active namespace, exactly at 20m boundary (1200s) → must be deleted (>= means inclusive).
-OUT=$(watchdog_decide "$NOW" "e2e-test-boundary" "Active" "$(ts_ago 1200)")
-assert_deleted "Active ns exactly 20m old hits threshold" "e2e-test-boundary" "$OUT"
+# 8. Active namespace, exactly at 10m boundary (600s) → must be deleted (>= means inclusive).
+OUT=$(watchdog_decide "$NOW" "e2e-test-boundary" "Active" "$(ts_ago 600)")
+assert_deleted "Active ns exactly 10m old hits threshold" "e2e-test-boundary" "$OUT"
 
-# 9. Any-phase namespace, exactly at 30m boundary (1800s) → must be deleted.
-OUT=$(watchdog_decide "$NOW" "e2e-test-boundary2" "Terminating" "$(ts_ago 1800)")
-assert_deleted "Terminating ns exactly 30m old hits threshold" "e2e-test-boundary2" "$OUT"
+# 9. Any-phase namespace, exactly at 15m boundary (900s) → must be deleted.
+OUT=$(watchdog_decide "$NOW" "e2e-test-boundary2" "Terminating" "$(ts_ago 900)")
+assert_deleted "Terminating ns exactly 15m old hits threshold" "e2e-test-boundary2" "$OUT"
 
-# 10. Active namespace, 1199 seconds old → must NOT be deleted (just below threshold).
-OUT=$(watchdog_decide "$NOW" "e2e-test-just-under" "Active" "$(ts_ago 1199)")
-assert_not_deleted "Active ns 1199s old is below threshold" "e2e-test-just-under" "$OUT"
+# 10. Active namespace, 599 seconds old → must NOT be deleted (just below threshold).
+OUT=$(watchdog_decide "$NOW" "e2e-test-just-under" "Active" "$(ts_ago 599)")
+assert_not_deleted "Active ns 599s old is below threshold" "e2e-test-just-under" "$OUT"
 
 # 11. Regression: Active namespace, 6 minutes old → must NOT be deleted.
 # This is the exact namespace age profile of "[sig-apps] CronJob should not
