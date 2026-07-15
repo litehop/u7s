@@ -41,8 +41,21 @@ fi
 # namespaces that get stuck terminating or are simply too old.
 #
 # Thresholds:
-#   5 min  — force-delete Active namespaces (namespace leak / stuck creation)
-#   10 min — force-delete ANY non-system namespace regardless of phase
+#   10 min — force-delete Active namespaces (namespace leak / stuck creation)
+#   15 min — force-delete ANY non-system namespace regardless of phase
+#
+# The Active threshold must clear the longest-running legitimate [Slow]
+# conformance test, not just the common case: "[sig-apps] CronJob should not
+# schedule jobs when suspended" keeps its namespace Active for a full 5-minute
+# gomega.Consistently check (cronJobTimeout). A 5-minute threshold here raced
+# that test's own 5-minute check directly: the watchdog force-deleted the
+# namespace out from under the still-running test, which then failed with
+# "CronJob \"suspended\" not found" even though nothing was actually wrong
+# with the CronJob. 10 min gives a full 5 minutes of buffer beyond that
+# test's floor — enough to stop racing it — while staying meaningfully
+# tighter than a larger threshold so a genuine future hang still gets reaped
+# reasonably promptly. 15 min keeps the any-phase net comfortably above the
+# Active threshold without letting a stuck Terminating namespace linger.
 #
 # System namespaces excluded: default, kube-*, sonobuoy
 # ---------------------------------------------------------------------------
@@ -74,12 +87,12 @@ watchdog_loop() {
       age_s=$(( now - created_s ))
 
       local should_delete=0 reason=""
-      if [ "$phase" = "Active" ] && [ "$age_s" -ge 300 ]; then
+      if [ "$phase" = "Active" ] && [ "$age_s" -ge 600 ]; then
         should_delete=1
-        reason="Active for ${age_s}s (>= 5m threshold)"
-      elif [ "$age_s" -ge 600 ]; then
+        reason="Active for ${age_s}s (>= 10m threshold)"
+      elif [ "$age_s" -ge 900 ]; then
         should_delete=1
-        reason="age=${age_s}s (>= 10m threshold, phase=${phase})"
+        reason="age=${age_s}s (>= 15m threshold, phase=${phase})"
       fi
 
       if [ "$should_delete" -eq 1 ]; then
