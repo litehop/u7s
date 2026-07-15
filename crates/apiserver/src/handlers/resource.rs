@@ -215,7 +215,8 @@ pub async fn get_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::get_cr(State(state), Path((group, version, plural, name))).await;
+            return super::cr::get_cr(State(state), Path((group, version, plural, name)), headers)
+                .await;
         }
     };
 
@@ -1389,6 +1390,7 @@ pub async fn get_namespaced_resource<S: Store>(
             return super::cr::get_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                headers,
             )
             .await;
         }
@@ -7174,6 +7176,176 @@ mod tests {
             Ok(_) => panic!("missing namespaced CR must return 404"),
         };
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// `kubectl get <crd-plural> <name>` for a CRD-backed type routes through get_resource,
+    /// which falls back to cr::get_cr for groups not in the static registry. get_resource
+    /// must forward the real Accept header to that fallback — dropping it here would silently
+    /// undo the Table fix for every custom resource even after fixing get_cr itself, since
+    /// this generic /apis/{group}/{version}/{plural}/{name} route is what kubectl actually hits.
+    #[tokio::test]
+    async fn get_resource_cr_fallback_honors_table_accept() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.custom.example.com" },
+            "spec": {
+                "group": "custom.example.com",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget",
+                    "listKind": "WidgetList"
+                },
+                "scope": "Cluster",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(crd.to_string()),
+        )
+        .await
+        .expect("install CRD");
+
+        let widget = serde_json::json!({
+            "apiVersion": "custom.example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "my-widget" }
+        });
+        crate::handlers::cr::create_cr(
+            State(state.clone()),
+            Path(("custom.example.com".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(widget.to_string()),
+        )
+        .await
+        .expect("create CR");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+
+        let resp = get_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "my-widget".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_resource with Table accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "get_resource must forward Accept down to the CR-fallback get_cr — otherwise \
+             `kubectl get <crd-plural> <name>` never gets Table output for any custom \
+             resource no matter what get_cr itself does"
+        );
+    }
+
+    /// Namespaced counterpart of get_resource_cr_fallback_honors_table_accept: `kubectl get
+    /// <crd-plural> <name> -n <ns>` routes through get_namespaced_resource, which must also
+    /// forward Accept to cr::get_cr_namespaced rather than dropping it on the CR fallback path.
+    #[tokio::test]
+    async fn get_namespaced_resource_cr_fallback_honors_table_accept() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "gizmos.custom.example.com" },
+            "spec": {
+                "group": "custom.example.com",
+                "names": {
+                    "plural": "gizmos",
+                    "singular": "gizmo",
+                    "kind": "Gizmo",
+                    "listKind": "GizmoList"
+                },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(crd.to_string()),
+        )
+        .await
+        .expect("install CRD");
+
+        let gizmo = serde_json::json!({
+            "apiVersion": "custom.example.com/v1",
+            "kind": "Gizmo",
+            "metadata": { "name": "my-gizmo", "namespace": "default" }
+        });
+        crate::handlers::cr::create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "gizmos".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(gizmo.to_string()),
+        )
+        .await
+        .expect("create namespaced CR");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+
+        let resp = get_namespaced_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "gizmos".into(),
+                "my-gizmo".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_namespaced_resource with Table accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "get_namespaced_resource must forward Accept down to the CR-fallback \
+             get_cr_namespaced — otherwise `kubectl get <crd-plural> <name> -n <ns>` never \
+             gets Table output for any namespaced custom resource"
+        );
     }
 
     /// delete_resource follows the CR fallback path for unregistered groups.

@@ -1048,12 +1048,21 @@ pub async fn list_cr<S: Store>(
 pub async fn get_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
     }
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE (list_cr already handles
+    // this for LIST — see above).
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
     // The key is version-independent (see cr_store_key); a conversion webhook is only
     // consulted when the request targets a version other than the storage version.
@@ -1083,6 +1092,14 @@ pub async fn get_cr<S: Store>(
             if let Some(schema) = ctx.schema.as_ref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
+            if super::table::wants_table(accept) {
+                return Ok(Json(super::table::build_table(
+                    &group,
+                    &plural,
+                    vec![converted_obj],
+                ))
+                .into_response());
+            }
             let bytes =
                 serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
             return Ok((
@@ -1100,6 +1117,9 @@ pub async fn get_cr<S: Store>(
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
+    }
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
     }
     Ok(Json(obj).into_response())
 }
@@ -1666,12 +1686,21 @@ pub async fn list_cr_namespaced<S: Store>(
 pub async fn get_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
     }
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE (list_cr already handles
+    // this for LIST — see above).
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
     // The key is version-independent (see cr_store_key); a conversion webhook is only
     // consulted when the request targets a version other than the storage version.
@@ -1701,6 +1730,14 @@ pub async fn get_cr_namespaced<S: Store>(
             if let Some(schema) = ctx.schema.as_ref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
+            if super::table::wants_table(accept) {
+                return Ok(Json(super::table::build_table(
+                    &group,
+                    &plural,
+                    vec![converted_obj],
+                ))
+                .into_response());
+            }
             let bytes =
                 serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
             return Ok((
@@ -1718,6 +1755,9 @@ pub async fn get_cr_namespaced<S: Store>(
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
+    }
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
     }
     Ok(Json(obj).into_response())
 }
@@ -2677,6 +2717,7 @@ mod tests {
         let resp = match get_cr_namespaced(
             State(state.clone()),
             Path((group, version, ns, plural, name.clone())),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -2684,6 +2725,71 @@ mod tests {
             Err(_) => panic!("get must succeed after create"),
         };
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // `kubectl get <crd-plural> <name> -n <ns>` sends Accept: application/json;as=Table;...
+    // by default, same as for built-in namespaced types. Before this fix, get_cr_namespaced
+    // had no HeaderMap parameter at all and unconditionally returned the raw object, so
+    // kubectl fell back to printing only NAME/AGE for every namespaced custom resource.
+    #[tokio::test]
+    async fn get_cr_namespaced_with_table_accept_returns_single_row_table() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+
+        let resp = get_cr_namespaced(
+            State(state),
+            Path((group, version, ns, plural, name)),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_cr_namespaced with Table accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "a plain Application kind here means kubectl can't decode it as a Table and \
+             silently falls back to hardcoded NAME/AGE-only columns for the namespaced \
+             custom resource"
+        );
+        let rows = v["rows"].as_array().expect("Table response must have rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single-object GET must produce exactly one Table row, not a full list"
+        );
+        assert_eq!(
+            rows[0]["object"]["metadata"]["name"], "my-app",
+            "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
     }
 
     // Request for an unknown group must return 404 (no CRD installed for that group).
@@ -2957,6 +3063,7 @@ mod tests {
                     "applications".to_string(),
                     "nonexistent".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
             )
             .await,
             "missing CR must return 404",
@@ -2998,6 +3105,7 @@ mod tests {
                 "widgets".to_string(),
                 "my-widget".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -3005,6 +3113,131 @@ mod tests {
             Err(_) => panic!("get must succeed after create"),
         };
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // `kubectl get <crd-plural> <name>` sends Accept: application/json;as=Table;... by
+    // default, same as for built-in types. Before this fix, get_cr had no HeaderMap
+    // parameter at all and unconditionally returned the raw object, so kubectl fell back
+    // to printing only NAME/AGE for every custom resource (list_cr already handled this
+    // for LIST, leaving single-object GET as the last gap).
+    #[tokio::test]
+    async fn get_cr_with_table_accept_returns_single_row_table() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body("my-widget"),
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+
+        let resp = get_cr(
+            State(state),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "my-widget".to_string(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_cr with Table accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Table",
+            "a plain Widget kind here means kubectl can't decode it as a Table and silently \
+             falls back to hardcoded NAME/AGE-only columns for the custom resource"
+        );
+        let rows = v["rows"].as_array().expect("Table response must have rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single-object GET must produce exactly one Table row, not a full list"
+        );
+        assert_eq!(
+            rows[0]["object"]["metadata"]["name"], "my-widget",
+            "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
+    }
+
+    // `kubectl get <crd-plural> <name> -o json` sends a plain Accept: application/json (no
+    // as=Table) and must keep receiving the raw object. This guards against a broken
+    // wants_table condition silently turning every CR GET into a Table response.
+    #[tokio::test]
+    async fn get_cr_with_plain_json_accept_returns_raw_object() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body("my-widget"),
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped create must succeed"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let resp = get_cr(
+            State(state),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "my-widget".to_string(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_cr with plain JSON accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "Widget",
+            "`kubectl get widget <name> -o json` must still return the raw object, not a \
+             Table, when Accept does not request Table format"
+        );
+        assert_eq!(v["metadata"]["name"], "my-widget");
     }
 
     // List after create must return one item.
@@ -3229,6 +3462,7 @@ mod tests {
             get_cr_namespaced(
                 State(state.clone()),
                 Path((group, version, ns, plural, name)),
+                axum::http::HeaderMap::new(),
             )
             .await,
             "get after delete must return 404",
@@ -3291,6 +3525,7 @@ mod tests {
         let stored_resp = match get_cr_namespaced(
             State(state.clone()),
             Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -3798,6 +4033,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -3885,6 +4121,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -3983,6 +4220,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -4071,6 +4309,7 @@ mod tests {
         let resp = match get_cr(
             State(state.clone()),
             Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -4194,6 +4433,7 @@ mod tests {
         let resp = match get_cr_namespaced(
             State(state.clone()),
             Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -4789,7 +5029,13 @@ mod tests {
         );
 
         // Verify the update was persisted.
-        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must succeed after replace"),
         };
@@ -4985,7 +5231,13 @@ mod tests {
             "replace must succeed"
         );
 
-        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must succeed"),
         };
@@ -5043,7 +5295,12 @@ mod tests {
 
         // Subsequent get must return 404.
         let err = expect_err_status(
-            get_cr(State(state.clone()), Path((group, version, plural, name))).await,
+            get_cr(
+                State(state.clone()),
+                Path((group, version, plural, name)),
+                axum::http::HeaderMap::new(),
+            )
+            .await,
             "get after delete must return 404",
         );
         let json = serde_json::to_value(&err.1).unwrap();
@@ -5158,7 +5415,13 @@ mod tests {
         );
 
         // Verify the patch was applied.
-        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must succeed after patch"),
         };
@@ -5226,7 +5489,13 @@ mod tests {
             result.err()
         );
 
-        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must succeed after SSA patch"),
         };
@@ -5392,7 +5661,13 @@ mod tests {
             "patch must succeed"
         );
 
-        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must succeed"),
         };
@@ -5471,7 +5746,13 @@ mod tests {
             "main-endpoint JSON Patch must succeed"
         );
 
-        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must succeed"),
         };
@@ -6001,6 +6282,7 @@ mod tests {
                 "widgets".into(),
                 "my-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -6078,6 +6360,7 @@ mod tests {
                 "widgets".into(),
                 "my-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         {
@@ -7937,7 +8220,8 @@ mod tests {
         assert!(
             get_cr_namespaced(
                 State(state.clone()),
-                Path((group, version, ns, plural, name))
+                Path((group, version, ns, plural, name)),
+                axum::http::HeaderMap::new(),
             )
             .await
             .is_ok(),
@@ -8309,6 +8593,7 @@ mod tests {
         let resp = get_cr_namespaced(
             State(state.clone()),
             Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("get must succeed after create");
@@ -8359,6 +8644,7 @@ mod tests {
                 "widgets".to_string(),
                 "my-widget".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("get must succeed after create");
@@ -9565,6 +9851,7 @@ mod tests {
                 plural.to_string(),
                 "cr-instance-1".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect(
@@ -10551,6 +10838,7 @@ mod tests {
                 "widgets".to_string(),
                 "cr-1".to_string(),
             )),
+            axum::http::HeaderMap::new(),
         )
         .await
         .expect("get must succeed")
