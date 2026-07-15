@@ -93,6 +93,57 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     m
 }
 
+// Not delegated to core_gen_adapter's copy: this module's meta_v1::LabelSelector is generated
+// into its own private OUT_DIR include, so it is a nominally distinct Rust type — same reason
+// gen_object_meta_to_json above is its own copy rather than a shared call.
+fn gen_label_selector_requirement_to_json(
+    req: meta_v1::LabelSelectorRequirement,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
+        m.insert("key".to_string(), serde_json::Value::String(k));
+    }
+    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
+        m.insert("operator".to_string(), serde_json::Value::String(op));
+    }
+    if !req.values.is_empty() {
+        m.insert(
+            "values".to_string(),
+            serde_json::Value::Array(
+                req.values
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !sel.match_labels.is_empty() {
+        let labels: serde_json::Map<String, serde_json::Value> = sel
+            .match_labels
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        m.insert("matchLabels".to_string(), serde_json::Value::Object(labels));
+    }
+    if !sel.match_expressions.is_empty() {
+        m.insert(
+            "matchExpressions".to_string(),
+            serde_json::Value::Array(
+                sel.match_expressions
+                    .into_iter()
+                    .map(gen_label_selector_requirement_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_policy_rule_to_json(rule: rbac_v1::PolicyRule) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if !rule.verbs.is_empty() {
@@ -184,6 +235,72 @@ fn gen_role_ref_to_json(rr: rbac_v1::RoleRef) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+fn gen_field_selector_requirement_to_json(
+    req: meta_v1::FieldSelectorRequirement,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
+        m.insert("key".to_string(), serde_json::Value::String(k));
+    }
+    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
+        m.insert("operator".to_string(), serde_json::Value::String(op));
+    }
+    if !req.values.is_empty() {
+        m.insert(
+            "values".to_string(),
+            serde_json::Value::Array(
+                req.values
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_field_selector_attributes_to_json(
+    fsa: authz_v1::FieldSelectorAttributes,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = fsa.raw_selector.filter(|s| !s.is_empty()) {
+        m.insert("rawSelector".to_string(), serde_json::Value::String(v));
+    }
+    if !fsa.requirements.is_empty() {
+        m.insert(
+            "requirements".to_string(),
+            serde_json::Value::Array(
+                fsa.requirements
+                    .into_iter()
+                    .map(gen_field_selector_requirement_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_label_selector_attributes_to_json(
+    lsa: authz_v1::LabelSelectorAttributes,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = lsa.raw_selector.filter(|s| !s.is_empty()) {
+        m.insert("rawSelector".to_string(), serde_json::Value::String(v));
+    }
+    if !lsa.requirements.is_empty() {
+        m.insert(
+            "requirements".to_string(),
+            serde_json::Value::Array(
+                lsa.requirements
+                    .into_iter()
+                    .map(gen_label_selector_requirement_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_resource_attributes_to_json(ra: authz_v1::ResourceAttributes) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(v) = ra.namespace.filter(|s| !s.is_empty()) {
@@ -206,6 +323,21 @@ fn gen_resource_attributes_to_json(ra: authz_v1::ResourceAttributes) -> serde_js
     }
     if let Some(v) = ra.name.filter(|s| !s.is_empty()) {
         m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    // fieldSelector/labelSelector narrow a SubjectAccessReview to a field/label-limited request
+    // (AuthorizeWithSelectors); dropping them makes the authorizer evaluate an unlimited
+    // request instead of the narrower one the client actually asked about.
+    if let Some(fs) = ra.field_selector {
+        let fs_json = gen_field_selector_attributes_to_json(fs);
+        if !fs_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            m.insert("fieldSelector".to_string(), fs_json);
+        }
+    }
+    if let Some(ls) = ra.label_selector {
+        let ls_json = gen_label_selector_attributes_to_json(ls);
+        if !ls_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            m.insert("labelSelector".to_string(), ls_json);
+        }
     }
     serde_json::Value::Object(m)
 }
@@ -252,6 +384,21 @@ fn gen_sar_spec_to_json(spec: authz_v1::SubjectAccessReviewSpec) -> serde_json::
     if let Some(uid) = spec.uid.filter(|s| !s.is_empty()) {
         m.insert("uid".to_string(), serde_json::Value::String(uid));
     }
+    // extra carries authenticator-supplied attributes (e.g. impersonation extras) that a
+    // webhook authorizer or RBAC extra-based binding may key its decision on; dropping it
+    // silently strips that context from every SubjectAccessReview.
+    if !spec.extra.is_empty() {
+        let extra: serde_json::Map<String, serde_json::Value> = spec
+            .extra
+            .into_iter()
+            .map(|(k, v)| {
+                let items: Vec<serde_json::Value> =
+                    v.items.into_iter().map(serde_json::Value::String).collect();
+                (k, serde_json::Value::Array(items))
+            })
+            .collect();
+        m.insert("extra".to_string(), serde_json::Value::Object(extra));
+    }
     serde_json::Value::Object(m)
 }
 
@@ -261,12 +408,26 @@ pub fn decode_clusterrole_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let cr = rbac_v1::ClusterRole::decode(data).ok()?;
     let meta = gen_object_meta_to_json(cr.metadata.unwrap_or_default());
     let rules: Vec<serde_json::Value> = cr.rules.into_iter().map(gen_policy_rule_to_json).collect();
-    Some(serde_json::json!({
+    let mut obj = serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRole",
         "metadata": meta,
         "rules": rules
-    }))
+    });
+    // aggregationRule drives the built-in admin/edit/view ClusterRole aggregation controller
+    // (rbac.authorization.k8s.io/aggregate-to-* labels); dropping it here would silently turn
+    // an aggregated ClusterRole into a plain, controller-unmanaged one on every re-decode.
+    if let Some(ar) = cr.aggregation_rule {
+        if !ar.cluster_role_selectors.is_empty() {
+            let selectors: Vec<serde_json::Value> = ar
+                .cluster_role_selectors
+                .into_iter()
+                .map(gen_label_selector_to_json)
+                .collect();
+            obj["aggregationRule"] = serde_json::json!({ "clusterRoleSelectors": selectors });
+        }
+    }
+    Some(obj)
 }
 
 pub fn decode_clusterrolebinding_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -348,12 +509,24 @@ pub fn decode_local_subject_access_review_proto_gen(data: &[u8]) -> Option<serde
 pub fn decode_token_review_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let tr = authn_v1::TokenReview::decode(data).ok()?;
     let spec = tr.spec.unwrap_or_default();
+    let mut spec_json = serde_json::json!({
+        "token": spec.token.unwrap_or_default()
+    });
+    // audiences lets an audience-aware caller (e.g. a projected service account token
+    // consumer) scope the review to specific audiences; dropping it silently widens every
+    // TokenReview to "any audience", defeating the audience check entirely.
+    if !spec.audiences.is_empty() {
+        spec_json["audiences"] = serde_json::Value::Array(
+            spec.audiences
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+    }
     Some(serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenReview",
-        "spec": {
-            "token": spec.token.unwrap_or_default()
-        }
+        "spec": spec_json
     }))
 }
 
@@ -609,5 +782,380 @@ mod tests {
              authenticate the caller with, so a dropped token fails every request behind this \
              auth path"
         );
+    }
+
+    /// decode_token_review_proto_gen must preserve spec.audiences.
+    ///
+    /// An audience-aware authenticator rejects a token whose audiences don't intersect the
+    /// review's spec.audiences; dropping this field silently disables that check for every
+    /// TokenReview, widening it to "any audience".
+    #[test]
+    fn decode_token_review_proto_gen_preserves_audiences() {
+        let tr = authn_v1::TokenReview {
+            spec: Some(authn_v1::TokenReviewSpec {
+                token: Some("opaque-bearer-token-abc123".to_string()),
+                audiences: vec!["api".to_string(), "vault".to_string()],
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        tr.encode(&mut buf).unwrap();
+
+        let result = decode_token_review_proto_gen(&buf).expect("TokenReview must decode");
+
+        assert_eq!(
+            result["spec"]["audiences"][0], "api",
+            "spec.audiences must survive decode — without it an audience-aware authenticator \
+             cannot tell which audiences the caller actually asked to be validated for"
+        );
+        assert_eq!(result["spec"]["audiences"][1], "vault");
+    }
+
+    /// decode_clusterrole_proto_gen must preserve aggregationRule.
+    ///
+    /// The built-in admin/edit/view ClusterRoles (and any custom aggregated ClusterRole) rely
+    /// on this field to let the aggregation controller find and fold in matching ClusterRoles;
+    /// dropping it silently turns an aggregated role into an inert, controller-unmanaged one.
+    #[test]
+    fn decode_clusterrole_proto_gen_preserves_aggregation_rule() {
+        let cr = rbac_v1::ClusterRole {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("admin".to_string()),
+                ..Default::default()
+            }),
+            aggregation_rule: Some(rbac_v1::AggregationRule {
+                cluster_role_selectors: vec![meta_v1::LabelSelector {
+                    match_labels: std::collections::HashMap::from([(
+                        "rbac.authorization.k8s.io/aggregate-to-admin".to_string(),
+                        "true".to_string(),
+                    )]),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        cr.encode(&mut buf).unwrap();
+
+        let result = decode_clusterrole_proto_gen(&buf)
+            .expect("ClusterRole with aggregationRule must decode");
+
+        assert_eq!(
+            result["aggregationRule"]["clusterRoleSelectors"][0]["matchLabels"]
+                ["rbac.authorization.k8s.io/aggregate-to-admin"],
+            "true",
+            "aggregationRule.clusterRoleSelectors must survive decode — without it the \
+             aggregation controller never folds matching ClusterRoles' rules into this one"
+        );
+    }
+
+    /// decode_subject_access_review_proto_gen must preserve spec.extra.
+    ///
+    /// extra carries authenticator context (e.g. impersonation extras) that a webhook
+    /// authorizer or extras-keyed RBAC binding may condition its decision on; dropping it
+    /// silently strips that context from the authorization check.
+    #[test]
+    fn decode_subject_access_review_proto_gen_preserves_extra() {
+        let sar = authz_v1::SubjectAccessReview {
+            spec: Some(authz_v1::SubjectAccessReviewSpec {
+                user: Some("alice".to_string()),
+                extra: std::collections::HashMap::from([(
+                    "authentication.kubernetes.io/pod-name".to_string(),
+                    authz_v1::ExtraValue {
+                        items: vec!["my-pod".to_string()],
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sar.encode(&mut buf).unwrap();
+
+        let result = decode_subject_access_review_proto_gen(&buf)
+            .expect("SubjectAccessReview with extra must decode");
+
+        assert_eq!(
+            result["spec"]["extra"]["authentication.kubernetes.io/pod-name"][0], "my-pod",
+            "spec.extra must survive decode — without it a webhook authorizer or extras-keyed \
+             RBAC binding loses the authenticator context it needs to make its decision"
+        );
+    }
+
+    /// decode_subject_access_review_proto_gen must preserve resourceAttributes.fieldSelector
+    /// and .labelSelector.
+    ///
+    /// AuthorizeWithSelectors narrows the check to a field/label-limited request; dropping
+    /// these silently widens the authorizer's evaluation to an unlimited request, which can
+    /// make a narrowly-scoped `kubectl auth can-i` check report an incorrect answer.
+    #[test]
+    fn decode_subject_access_review_proto_gen_preserves_field_and_label_selectors() {
+        let sar = authz_v1::SubjectAccessReview {
+            spec: Some(authz_v1::SubjectAccessReviewSpec {
+                resource_attributes: Some(authz_v1::ResourceAttributes {
+                    resource: Some("pods".to_string()),
+                    field_selector: Some(authz_v1::FieldSelectorAttributes {
+                        raw_selector: Some("spec.nodeName=node-1".to_string()),
+                        ..Default::default()
+                    }),
+                    label_selector: Some(authz_v1::LabelSelectorAttributes {
+                        raw_selector: Some("app=web".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sar.encode(&mut buf).unwrap();
+
+        let result = decode_subject_access_review_proto_gen(&buf)
+            .expect("SubjectAccessReview with selectors must decode");
+
+        assert_eq!(
+            result["spec"]["resourceAttributes"]["fieldSelector"]["rawSelector"],
+            "spec.nodeName=node-1",
+            "resourceAttributes.fieldSelector must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["resourceAttributes"]["labelSelector"]["rawSelector"], "app=web",
+            "resourceAttributes.labelSelector must survive decode"
+        );
+    }
+
+    // ---- Sentinel completeness ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in this file's gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_*_proto_gen entry point, and
+    // asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how aggregationRule, extra, fieldSelector,
+    // labelSelector, and TokenReviewSpec.audiences were found missing from this file.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    // selfLink is a legacy field the system no longer populates — permanently omitted.
+    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+    // pending a separate investigation into gen_object_meta_to_json's correct handling of
+    // them; do not guess at the fix here.
+    const OBJECT_META_EXPECTED: &[&str] = &[
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+
+    #[test]
+    fn sentinel_completeness_decode_clusterrole_proto_gen() {
+        let cr = rbac_v1::ClusterRole {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            rules: vec![rbac_v1::PolicyRule::sentinel()],
+            aggregation_rule: Some(rbac_v1::AggregationRule::sentinel()),
+        };
+        let mut buf = Vec::new();
+        cr.encode(&mut buf).unwrap();
+        let decoded = decode_clusterrole_proto_gen(&buf)
+            .expect("sentinel ClusterRole must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "verbs",
+            "apiGroups",
+            "resources",
+            "resourceNames",
+            "nonResourceURLs",
+            "clusterRoleSelectors",
+            "matchLabels",
+            "matchExpressions",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_clusterrolebinding_proto_gen() {
+        let crb = rbac_v1::ClusterRoleBinding {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            subjects: vec![rbac_v1::Subject::sentinel()],
+            role_ref: Some(rbac_v1::RoleRef::sentinel()),
+        };
+        let mut buf = Vec::new();
+        crb.encode(&mut buf).unwrap();
+        let decoded = decode_clusterrolebinding_proto_gen(&buf)
+            .expect("sentinel ClusterRoleBinding must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // roleRef.apiGroup and subjects[].apiGroup collide by name with metadata's own
+        // apiVersion-adjacent fields only in spelling, not value — no masking risk here.
+        expected.extend(["apiGroup", "kind", "name", "namespace"]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_role_proto_gen() {
+        let role = rbac_v1::Role {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            rules: vec![rbac_v1::PolicyRule::sentinel()],
+        };
+        let mut buf = Vec::new();
+        role.encode(&mut buf).unwrap();
+        let decoded =
+            decode_role_proto_gen(&buf).expect("sentinel Role must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "verbs",
+            "apiGroups",
+            "resources",
+            "resourceNames",
+            "nonResourceURLs",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_rolebinding_proto_gen() {
+        let rb = rbac_v1::RoleBinding {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            subjects: vec![rbac_v1::Subject::sentinel()],
+            role_ref: Some(rbac_v1::RoleRef::sentinel()),
+        };
+        let mut buf = Vec::new();
+        rb.encode(&mut buf).unwrap();
+        let decoded = decode_rolebinding_proto_gen(&buf)
+            .expect("sentinel RoleBinding must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(["apiGroup", "kind", "name", "namespace"]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// decode_local_subject_access_review_proto_gen calls this exact same gen_sar_spec_to_json,
+    /// so its own completeness is covered by this test too; a separate hand-written test
+    /// (decode_local_subject_access_review_proto_gen_preserves_resource_attributes) already
+    /// checks that its dispatch path actually reaches that shared function.
+    #[test]
+    fn sentinel_completeness_decode_subject_access_review_proto_gen() {
+        let sar = authz_v1::SubjectAccessReview {
+            // metadata/status are left at their zero value: SubjectAccessReview is a virtual,
+            // non-persisted resource — real clients never set metadata, and status is always
+            // server-computed, never client-supplied on the request this decoder handles.
+            spec: Some(authz_v1::SubjectAccessReviewSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sar.encode(&mut buf).unwrap();
+        let decoded = decode_subject_access_review_proto_gen(&buf)
+            .expect("sentinel SubjectAccessReview must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = [
+            "namespace",
+            "verb",
+            "group",
+            "version",
+            "resource",
+            "subresource",
+            "name",
+            "rawSelector",
+            "requirements",
+            "key",
+            "operator",
+            "values",
+            "path",
+            "user",
+            "groups",
+            "extra",
+            "uid",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_token_review_proto_gen() {
+        let tr = authn_v1::TokenReview {
+            // metadata/status: same reasoning as SubjectAccessReview above — not a persisted
+            // resource, and status is always server-computed.
+            spec: Some(authn_v1::TokenReviewSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        tr.encode(&mut buf).unwrap();
+        let decoded = decode_token_review_proto_gen(&buf)
+            .expect("sentinel TokenReview must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = ["token", "audiences"];
+        assert_fields_present(&paths, &expected);
     }
 }

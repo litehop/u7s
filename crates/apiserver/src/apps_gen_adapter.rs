@@ -12,6 +12,10 @@ fn gen_pod_template_spec_to_json(tmpl: core_v1::PodTemplateSpec) -> serde_json::
     crate::core_gen_adapter::gen_pod_template_spec_to_json(tmpl)
 }
 
+fn gen_persistent_volume_claim_to_json(pvc: core_v1::PersistentVolumeClaim) -> serde_json::Value {
+    crate::core_gen_adapter::gen_persistent_volume_claim_to_json(pvc)
+}
+
 fn gen_label_selector_requirement_to_json(
     req: meta_v1::LabelSelectorRequirement,
 ) -> serde_json::Value {
@@ -70,6 +74,15 @@ macro_rules! apps_condition_to_json {
                 cond["message"] = msg.clone().into();
             }
         }
+        // lastTransitionTime is on all four *Condition types (only DeploymentCondition also has
+        // lastUpdateTime, handled separately at its call site); dropping it made every
+        // condition look like it had just transitioned, breaking anything that orders or ages
+        // conditions by this timestamp (e.g. progressDeadlineSeconds tracking on Deployments).
+        if let Some(t) = $c.last_transition_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                cond["lastTransitionTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
+        }
         cond
     }};
 }
@@ -125,12 +138,54 @@ pub fn decode_statefulset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 us_json["type"] = t.into();
             }
             if let Some(ru) = us.rolling_update {
-                us_json["rollingUpdate"] =
-                    serde_json::json!({ "partition": ru.partition.unwrap_or(0) });
+                let mut ru_json = serde_json::json!({ "partition": ru.partition.unwrap_or(0) });
+                if let Some(mu) = ru.max_unavailable {
+                    ru_json["maxUnavailable"] = gen_apps_int_or_string_to_json(mu);
+                }
+                us_json["rollingUpdate"] = ru_json;
             }
             if !us_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
                 spec_json["updateStrategy"] = us_json;
             }
+        }
+        // volumeClaimTemplates is the field StatefulSet exists for: it's how each replica gets
+        // its own stable PersistentVolumeClaim. serviceName drives the pod DNS/hostname pattern.
+        // Both were entirely unread here, so every protobuf-encoded StatefulSet create/update
+        // (client-go and kcm both default to protobuf) silently lost them on decode.
+        if !spec.volume_claim_templates.is_empty() {
+            spec_json["volumeClaimTemplates"] = spec
+                .volume_claim_templates
+                .into_iter()
+                .map(gen_persistent_volume_claim_to_json)
+                .collect::<Vec<_>>()
+                .into();
+        }
+        if let Some(v) = spec.service_name.filter(|s| !s.is_empty()) {
+            spec_json["serviceName"] = v.into();
+        }
+        if let Some(v) = spec.pod_management_policy.filter(|s| !s.is_empty()) {
+            spec_json["podManagementPolicy"] = v.into();
+        }
+        if let Some(v) = spec.revision_history_limit {
+            spec_json["revisionHistoryLimit"] = v.into();
+        }
+        if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {
+            spec_json["minReadySeconds"] = v.into();
+        }
+        if let Some(rp) = spec.persistent_volume_claim_retention_policy {
+            let mut rp_json = serde_json::json!({});
+            if let Some(v) = rp.when_deleted.filter(|s| !s.is_empty()) {
+                rp_json["whenDeleted"] = v.into();
+            }
+            if let Some(v) = rp.when_scaled.filter(|s| !s.is_empty()) {
+                rp_json["whenScaled"] = v.into();
+            }
+            if !rp_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                spec_json["persistentVolumeClaimRetentionPolicy"] = rp_json;
+            }
+        }
+        if let Some(ord) = spec.ordinals {
+            spec_json["ordinals"] = serde_json::json!({ "start": ord.start.unwrap_or(0) });
         }
         if !spec_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             out["spec"] = spec_json;
@@ -185,7 +240,7 @@ pub fn decode_statefulset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Deployment -------------------------------------------------
 
-fn gen_deployment_int_or_string_to_json(
+fn gen_apps_int_or_string_to_json(
     ios: crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
 ) -> serde_json::Value {
     if ios.r#type.unwrap_or(0) == 0 {
@@ -216,10 +271,10 @@ pub fn decode_deployment_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             if let Some(ru) = strategy.rolling_update {
                 let mut ru_json = serde_json::json!({});
                 if let Some(mu) = ru.max_unavailable {
-                    ru_json["maxUnavailable"] = gen_deployment_int_or_string_to_json(mu);
+                    ru_json["maxUnavailable"] = gen_apps_int_or_string_to_json(mu);
                 }
                 if let Some(ms) = ru.max_surge {
-                    ru_json["maxSurge"] = gen_deployment_int_or_string_to_json(ms);
+                    ru_json["maxSurge"] = gen_apps_int_or_string_to_json(ms);
                 }
                 if !ru_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
                     strategy_json["rollingUpdate"] = ru_json;
@@ -238,6 +293,14 @@ pub fn decode_deployment_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(v) = spec.progress_deadline_seconds {
             spec_json["progressDeadlineSeconds"] = v.into();
+        }
+        if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {
+            spec_json["minReadySeconds"] = v.into();
+        }
+        // paused is what `kubectl rollout pause` sets; dropping it here makes the pause appear
+        // to succeed (200 OK) while the deployment controller keeps rolling out regardless.
+        if let Some(true) = spec.paused {
+            spec_json["paused"] = true.into();
         }
         if !spec_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             out["spec"] = spec_json;
@@ -273,7 +336,19 @@ pub fn decode_deployment_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             status_json["conditions"] = status
                 .conditions
                 .iter()
-                .map(|c| apps_condition_to_json!(c))
+                .map(|c| {
+                    let mut cond = apps_condition_to_json!(c);
+                    // lastUpdateTime only exists on DeploymentCondition (not the other three
+                    // *Condition types sharing the macro above); the deployment controller's
+                    // progressDeadlineSeconds check depends on this timestamp to tell whether a
+                    // rollout has actually stalled or is still making progress.
+                    if let Some(t) = c.last_update_time.as_ref() {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cond["lastUpdateTime"] = crate::util::secs_to_rfc3339(secs).into();
+                        }
+                    }
+                    cond
+                })
                 .collect();
         }
         if !status_json
@@ -298,7 +373,42 @@ pub fn decode_daemonset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     if let Some(spec) = obj.spec {
-        if let Some(spec_json) = gen_apps_spec_to_json(spec.selector, spec.template) {
+        let update_strategy = spec.update_strategy;
+        let min_ready_seconds = spec.min_ready_seconds;
+        let revision_history_limit = spec.revision_history_limit;
+        let mut spec_json =
+            gen_apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
+        // updateStrategy/minReadySeconds/revisionHistoryLimit were entirely unread here — a
+        // protobuf-encoded DaemonSet create/update (client-go and kcm both default to protobuf)
+        // silently lost its rolling-update config and history-retention settings on decode.
+        if let Some(us) = update_strategy {
+            let mut us_json = serde_json::json!({});
+            if let Some(t) = us.r#type.filter(|s| !s.is_empty()) {
+                us_json["type"] = t.into();
+            }
+            if let Some(ru) = us.rolling_update {
+                let mut ru_json = serde_json::json!({});
+                if let Some(mu) = ru.max_unavailable {
+                    ru_json["maxUnavailable"] = gen_apps_int_or_string_to_json(mu);
+                }
+                if let Some(ms) = ru.max_surge {
+                    ru_json["maxSurge"] = gen_apps_int_or_string_to_json(ms);
+                }
+                if !ru_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    us_json["rollingUpdate"] = ru_json;
+                }
+            }
+            if !us_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                spec_json["updateStrategy"] = us_json;
+            }
+        }
+        if let Some(v) = min_ready_seconds.filter(|&v| v != 0) {
+            spec_json["minReadySeconds"] = v.into();
+        }
+        if let Some(v) = revision_history_limit {
+            spec_json["revisionHistoryLimit"] = v.into();
+        }
+        if !spec_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             out["spec"] = spec_json;
         }
     }
@@ -361,9 +471,13 @@ pub fn decode_replicaset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     });
     if let Some(spec) = obj.spec {
         let replicas = spec.replicas.unwrap_or(0);
+        let min_ready_seconds = spec.min_ready_seconds;
         let mut spec_json =
             gen_apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
         spec_json["replicas"] = serde_json::Value::Number(replicas.into());
+        if let Some(v) = min_ready_seconds.filter(|&v| v != 0) {
+            spec_json["minReadySeconds"] = v.into();
+        }
         if !spec_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             out["spec"] = spec_json;
         }
@@ -1054,5 +1168,527 @@ mod tests {
             result["spec"]["selector"]["matchExpressions"][0]["key"], "tier",
             "matchExpressions must survive decode when matchLabels is empty"
         );
+    }
+
+    /// decode_statefulset_proto_gen must preserve volumeClaimTemplates, serviceName,
+    /// podManagementPolicy, persistentVolumeClaimRetentionPolicy, ordinals,
+    /// revisionHistoryLimit, minReadySeconds, and updateStrategy.rollingUpdate.maxUnavailable.
+    ///
+    /// volumeClaimTemplates and serviceName are the fields StatefulSet exists for — stable
+    /// per-replica storage and network identity, per the type's own doc comment. Before this
+    /// fix, decode_statefulset_proto_gen only ever read replicas/selector/template/
+    /// updateStrategy.partition, so every protobuf-encoded StatefulSet create/update (client-go
+    /// and kcm both default to protobuf) silently lost the rest of its spec — a StatefulSet
+    /// with volumeClaimTemplates would decode with no storage claims at all.
+    #[test]
+    fn decode_statefulset_proto_gen_preserves_previously_dropped_spec_fields() {
+        let sts = apps_v1::StatefulSet {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("web".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::StatefulSetSpec {
+                replicas: Some(3),
+                service_name: Some("web-headless".to_string()),
+                pod_management_policy: Some("Parallel".to_string()),
+                revision_history_limit: Some(0),
+                min_ready_seconds: Some(30),
+                update_strategy: Some(apps_v1::StatefulSetUpdateStrategy {
+                    r#type: Some("RollingUpdate".to_string()),
+                    rolling_update: Some(apps_v1::RollingUpdateStatefulSetStrategy {
+                        partition: Some(2),
+                        max_unavailable: Some(
+                            crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
+                                r#type: Some(1),
+                                str_val: Some("20%".to_string()),
+                                ..Default::default()
+                            },
+                        ),
+                    }),
+                }),
+                persistent_volume_claim_retention_policy: Some(
+                    apps_v1::StatefulSetPersistentVolumeClaimRetentionPolicy {
+                        when_deleted: Some("Delete".to_string()),
+                        when_scaled: Some("Retain".to_string()),
+                    },
+                ),
+                ordinals: Some(apps_v1::StatefulSetOrdinals { start: Some(10) }),
+                volume_claim_templates: vec![core_v1::PersistentVolumeClaim {
+                    metadata: Some(meta_v1::ObjectMeta {
+                        name: Some("www".to_string()),
+                        ..Default::default()
+                    }),
+                    spec: Some(core_v1::PersistentVolumeClaimSpec {
+                        access_modes: vec!["ReadWriteOnce".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sts.encode(&mut buf).unwrap();
+
+        let result = decode_statefulset_proto_gen(&buf).expect("StatefulSet must decode");
+
+        assert_eq!(
+            result["spec"]["volumeClaimTemplates"][0]["metadata"]["name"], "www",
+            "volumeClaimTemplates must survive decode — without it every replica loses its \
+             stable per-pod storage claim"
+        );
+        assert_eq!(
+            result["spec"]["volumeClaimTemplates"][0]["spec"]["accessModes"][0], "ReadWriteOnce",
+            "volumeClaimTemplates[].spec must survive decode, not just metadata"
+        );
+        assert_eq!(
+            result["spec"]["serviceName"], "web-headless",
+            "serviceName must survive decode — without it pods lose their stable DNS identity"
+        );
+        assert_eq!(
+            result["spec"]["podManagementPolicy"], "Parallel",
+            "podManagementPolicy must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["revisionHistoryLimit"], 0,
+            "explicit revisionHistoryLimit=0 must survive decode, not be silently absent"
+        );
+        assert_eq!(
+            result["spec"]["minReadySeconds"], 30,
+            "minReadySeconds must survive decode — it gates when a newly created pod counts as \
+             available"
+        );
+        assert_eq!(
+            result["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"], "20%",
+            "updateStrategy.rollingUpdate.maxUnavailable must survive decode alongside partition"
+        );
+        assert_eq!(
+            result["spec"]["persistentVolumeClaimRetentionPolicy"]["whenDeleted"], "Delete",
+            "persistentVolumeClaimRetentionPolicy must survive decode — without it PVCs leak \
+             (or vanish) on StatefulSet deletion/scale-down against the user's stated policy"
+        );
+        assert_eq!(
+            result["spec"]["ordinals"]["start"], 10,
+            "ordinals.start must survive decode — without it replicas start from index 0 \
+             instead of the requested offset"
+        );
+    }
+
+    /// decode_deployment_proto_gen must preserve spec.paused and spec.minReadySeconds.
+    ///
+    /// `kubectl rollout pause deployment/foo` sets spec.paused=true; before this fix it was
+    /// never read, so the pause command would appear to succeed while the deployment
+    /// controller kept rolling out regardless.
+    #[test]
+    fn decode_deployment_proto_gen_preserves_paused_and_min_ready_seconds() {
+        let deploy = apps_v1::Deployment {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("paused-deploy".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::DeploymentSpec {
+                replicas: Some(2),
+                paused: Some(true),
+                min_ready_seconds: Some(15),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        deploy.encode(&mut buf).unwrap();
+
+        let result = decode_deployment_proto_gen(&buf).expect("Deployment must decode");
+
+        assert_eq!(
+            result["spec"]["paused"], true,
+            "spec.paused must survive decode — `kubectl rollout pause` depends on this field \
+             actually reaching storage"
+        );
+        assert_eq!(
+            result["spec"]["minReadySeconds"], 15,
+            "spec.minReadySeconds must survive decode — it gates when a newly created pod \
+             counts as available during a rollout"
+        );
+    }
+
+    /// decode_daemonset_proto_gen must preserve updateStrategy, minReadySeconds, and
+    /// revisionHistoryLimit.
+    ///
+    /// Before this fix, decode_daemonset_proto_gen only ever read selector/template — a
+    /// protobuf-encoded DaemonSet create/update with an explicit OnDelete or maxUnavailance
+    /// rolling-update strategy would silently fall back to defaults.rs's RollingUpdate default
+    /// instead, changing how node pods actually roll out.
+    #[test]
+    fn decode_daemonset_proto_gen_preserves_update_strategy_and_history_limit() {
+        let ds = apps_v1::DaemonSet {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ds-strategy".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::DaemonSetSpec {
+                min_ready_seconds: Some(5),
+                revision_history_limit: Some(0),
+                update_strategy: Some(apps_v1::DaemonSetUpdateStrategy {
+                    r#type: Some("RollingUpdate".to_string()),
+                    rolling_update: Some(apps_v1::RollingUpdateDaemonSet {
+                        max_unavailable: Some(
+                            crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
+                                r#type: Some(0),
+                                int_val: Some(2),
+                                ..Default::default()
+                            },
+                        ),
+                        max_surge: None,
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ds.encode(&mut buf).unwrap();
+
+        let result = decode_daemonset_proto_gen(&buf).expect("DaemonSet must decode");
+
+        assert_eq!(
+            result["spec"]["updateStrategy"]["type"], "RollingUpdate",
+            "updateStrategy.type must survive decode — dropping it lets defaults.rs silently \
+             overwrite a user-chosen OnDelete strategy with RollingUpdate"
+        );
+        assert_eq!(
+            result["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"], 2,
+            "updateStrategy.rollingUpdate.maxUnavailable must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["revisionHistoryLimit"], 0,
+            "explicit revisionHistoryLimit=0 must survive decode, not be silently absent"
+        );
+        assert_eq!(
+            result["spec"]["minReadySeconds"], 5,
+            "minReadySeconds must survive decode"
+        );
+    }
+
+    /// decode_replicaset_proto_gen must preserve spec.minReadySeconds.
+    ///
+    /// minReadySeconds gates when a newly created pod counts as available for the ReplicaSet's
+    /// own availability accounting; before this fix it was never read at all.
+    #[test]
+    fn decode_replicaset_proto_gen_preserves_min_ready_seconds() {
+        let rs = apps_v1::ReplicaSet {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("rs-min-ready".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::ReplicaSetSpec {
+                replicas: Some(2),
+                min_ready_seconds: Some(8),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        rs.encode(&mut buf).unwrap();
+
+        let result = decode_replicaset_proto_gen(&buf).expect("ReplicaSet must decode");
+
+        assert_eq!(
+            result["spec"]["minReadySeconds"], 8,
+            "spec.minReadySeconds must survive decode"
+        );
+    }
+
+    // ---- Sentinel completeness ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in this file's gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_*_proto_gen entry point, and
+    // asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how StatefulSet's volumeClaimTemplates/
+    // serviceName/podManagementPolicy/persistentVolumeClaimRetentionPolicy/ordinals,
+    // Deployment's paused, and DaemonSet's updateStrategy/revisionHistoryLimit (plus
+    // minReadySeconds on all four resources) were found missing from this file.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    // selfLink is a legacy field the system no longer populates — permanently omitted.
+    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+    // pending a separate investigation into gen_object_meta_to_json's correct handling of
+    // them (this file delegates to core_gen_adapter's copy, which has the same omissions); do
+    // not guess at the fix here.
+    const OBJECT_META_EXPECTED: &[&str] = &[
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+
+    /// PodSpec/Container's own completeness is covered separately in core_gen_adapter.rs; this
+    /// blanks (but keeps the key of) the nested template so a dropped *SetSpec-level field
+    /// (e.g. minReadySeconds shares no name with PodSpec, but this guards future additions too)
+    /// can't hide behind a PodSpec-level namesake still being present in the tree.
+    fn blank_template(spec_obj: &mut serde_json::Map<String, serde_json::Value>) {
+        spec_obj.insert("template".to_string(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_statefulset_proto_gen() {
+        let sts = apps_v1::StatefulSet {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(apps_v1::StatefulSetSpec::sentinel()),
+            status: Some(apps_v1::StatefulSetStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        sts.encode(&mut buf).unwrap();
+        let mut decoded = decode_statefulset_proto_gen(&buf)
+            .expect("sentinel StatefulSet must decode via the generated path");
+        if let Some(spec) = decoded.get_mut("spec").and_then(|s| s.as_object_mut()) {
+            blank_template(spec);
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "replicas",
+            "selector",
+            "template",
+            "volumeClaimTemplates",
+            "serviceName",
+            "podManagementPolicy",
+            "updateStrategy",
+            "revisionHistoryLimit",
+            "minReadySeconds",
+            "persistentVolumeClaimRetentionPolicy",
+            "whenDeleted",
+            "whenScaled",
+            "ordinals",
+            "start",
+            "partition",
+            "maxUnavailable",
+            "observedGeneration",
+            "readyReplicas",
+            "currentReplicas",
+            "updatedReplicas",
+            "currentRevision",
+            "updateRevision",
+            "collisionCount",
+            "availableReplicas",
+            "type",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_deployment_proto_gen() {
+        let deploy = apps_v1::Deployment {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(apps_v1::DeploymentSpec::sentinel()),
+            status: Some(apps_v1::DeploymentStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        deploy.encode(&mut buf).unwrap();
+        let mut decoded = decode_deployment_proto_gen(&buf)
+            .expect("sentinel Deployment must decode via the generated path");
+        if let Some(spec) = decoded.get_mut("spec").and_then(|s| s.as_object_mut()) {
+            blank_template(spec);
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "replicas",
+            "selector",
+            "template",
+            "strategy",
+            "maxUnavailable",
+            "maxSurge",
+            "revisionHistoryLimit",
+            "progressDeadlineSeconds",
+            "minReadySeconds",
+            "paused",
+            "observedGeneration",
+            "updatedReplicas",
+            "readyReplicas",
+            "availableReplicas",
+            "unavailableReplicas",
+            "terminatingReplicas",
+            "collisionCount",
+            "type",
+            "reason",
+            "message",
+            "lastTransitionTime",
+            "lastUpdateTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_daemonset_proto_gen() {
+        let ds = apps_v1::DaemonSet {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(apps_v1::DaemonSetSpec::sentinel()),
+            status: Some(apps_v1::DaemonSetStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        ds.encode(&mut buf).unwrap();
+        let mut decoded = decode_daemonset_proto_gen(&buf)
+            .expect("sentinel DaemonSet must decode via the generated path");
+        if let Some(spec) = decoded.get_mut("spec").and_then(|s| s.as_object_mut()) {
+            blank_template(spec);
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "selector",
+            "template",
+            "updateStrategy",
+            "maxUnavailable",
+            "maxSurge",
+            "minReadySeconds",
+            "revisionHistoryLimit",
+            "currentNumberScheduled",
+            "numberMisscheduled",
+            "desiredNumberScheduled",
+            "numberReady",
+            "observedGeneration",
+            "updatedNumberScheduled",
+            "numberAvailable",
+            "numberUnavailable",
+            "collisionCount",
+            "type",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_replicaset_proto_gen() {
+        let rs = apps_v1::ReplicaSet {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(apps_v1::ReplicaSetSpec::sentinel()),
+            status: Some(apps_v1::ReplicaSetStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        rs.encode(&mut buf).unwrap();
+        let mut decoded = decode_replicaset_proto_gen(&buf)
+            .expect("sentinel ReplicaSet must decode via the generated path");
+        if let Some(spec) = decoded.get_mut("spec").and_then(|s| s.as_object_mut()) {
+            blank_template(spec);
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "replicas",
+            "minReadySeconds",
+            "selector",
+            "template",
+            "fullyLabeledReplicas",
+            "readyReplicas",
+            "availableReplicas",
+            "terminatingReplicas",
+            "observedGeneration",
+            "type",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_controllerrevision_proto_gen() {
+        // Not ControllerRevision::sentinel() wholesale: RawExtension::sentinel() would fill
+        // `raw` with an arbitrary non-empty byte sequence, which decode_controllerrevision_proto_gen
+        // silently (and correctly) drops if it fails to parse as JSON — a sentinel value must be
+        // valid JSON here to actually exercise the "data survives" path this test checks.
+        let cr = apps_v1::ControllerRevision {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            data: Some(
+                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                    raw: Some(br#"{"a":1}"#.to_vec()),
+                },
+            ),
+            revision: Some(2),
+        };
+        let mut buf = Vec::new();
+        cr.encode(&mut buf).unwrap();
+        let decoded = decode_controllerrevision_proto_gen(&buf)
+            .expect("sentinel ControllerRevision must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(["revision", "data"]);
+        assert_fields_present(&paths, &expected);
     }
 }

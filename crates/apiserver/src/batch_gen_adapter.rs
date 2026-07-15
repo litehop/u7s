@@ -13,6 +13,10 @@ fn gen_pod_template_spec_to_json(
     crate::core_gen_adapter::gen_pod_template_spec_to_json(tmpl)
 }
 
+fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
+    crate::core_gen_adapter::gen_label_selector_to_json(sel)
+}
+
 fn gen_pod_failure_policy_to_json(pfp: batch_v1::PodFailurePolicy) -> serde_json::Value {
     let rules: Vec<serde_json::Value> = pfp
         .rules
@@ -116,6 +120,12 @@ fn gen_job_spec_to_json(spec: batch_v1::JobSpec) -> serde_json::Value {
     if let Some(v) = spec.managed_by.filter(|s| !s.is_empty()) {
         m.insert("managedBy".to_string(), v.into());
     }
+    if let Some(sel) = spec.selector {
+        m.insert("selector".to_string(), gen_label_selector_to_json(sel));
+    }
+    if let Some(true) = spec.manual_selector {
+        m.insert("manualSelector".to_string(), true.into());
+    }
     if let Some(pfp) = spec.pod_failure_policy {
         m.insert(
             "podFailurePolicy".to_string(),
@@ -187,6 +197,16 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 })
                 .collect();
         }
+        if let Some(t) = status.start_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json["startTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
+        }
+        if let Some(t) = status.completion_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json["completionTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
+        }
         if let Some(v) = status.active.filter(|&n| n != 0) {
             status_json["active"] = v.into();
         }
@@ -198,6 +218,32 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(v) = status.completed_indexes.filter(|s| !s.is_empty()) {
             status_json["completedIndexes"] = v.into();
+        }
+        if let Some(utp) = status.uncounted_terminated_pods {
+            let mut utp_map = serde_json::Map::new();
+            if !utp.succeeded.is_empty() {
+                utp_map.insert(
+                    "succeeded".to_string(),
+                    utp.succeeded
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !utp.failed.is_empty() {
+                utp_map.insert(
+                    "failed".to_string(),
+                    utp.failed
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !utp_map.is_empty() {
+                status_json["uncountedTerminatedPods"] = serde_json::Value::Object(utp_map);
+            }
         }
         if let Some(v) = status.ready.filter(|&n| n != 0) {
             status_json["ready"] = v.into();
@@ -299,6 +345,12 @@ pub fn decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(v) = r.uid.as_deref().filter(|s| !s.is_empty()) {
                         entry["uid"] = v.to_string().into();
+                    }
+                    if let Some(v) = r.resource_version.as_deref().filter(|s| !s.is_empty()) {
+                        entry["resourceVersion"] = v.to_string().into();
+                    }
+                    if let Some(v) = r.field_path.as_deref().filter(|s| !s.is_empty()) {
+                        entry["fieldPath"] = v.to_string().into();
                     }
                     Some(entry)
                 })
@@ -627,5 +679,351 @@ mod tests {
             result["status"]["ready"], 2,
             "status.ready must survive decode — readiness-gated Job completion depends on it"
         );
+    }
+
+    /// decode_job_proto_gen must preserve spec.selector and spec.manualSelector.
+    ///
+    /// selector is re-sent on every subsequent Update once the Job controller (or a client using
+    /// the legacy manual-selector workflow) has set it; before this fix it was never read at
+    /// all, so it silently disappeared from the stored object on the very next write.
+    #[test]
+    fn decode_job_proto_gen_preserves_selector_and_manual_selector() {
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1::LabelSelector;
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("manual-selector-job".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(batch_v1::JobSpec {
+                selector: Some(LabelSelector {
+                    match_labels: std::collections::HashMap::from([(
+                        "controller-uid".to_string(),
+                        "abc-123".to_string(),
+                    )]),
+                    ..Default::default()
+                }),
+                manual_selector: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job with selector must decode");
+
+        assert_eq!(
+            result["spec"]["selector"]["matchLabels"]["controller-uid"], "abc-123",
+            "spec.selector must survive decode — without it the Job's pods lose their owning \
+             selector on the next Update and orphan from their controller"
+        );
+        assert_eq!(
+            result["spec"]["manualSelector"], true,
+            "spec.manualSelector must survive decode — dropping it silently reverts a \
+             user-managed selector Job to system-managed labeling"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.startTime and status.completionTime.
+    ///
+    /// `kubectl get job` computes AGE/duration from startTime, and the TTL-after-finished
+    /// controller schedules cleanup from completionTime; before this fix neither field was read
+    /// at all, so every Job looked like it had never started or finished.
+    #[test]
+    fn decode_job_proto_gen_preserves_start_and_completion_time() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("timed-job-status".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::JobStatus {
+                start_time: Some(meta_v1::Time {
+                    seconds: Some(1_704_067_200),
+                    nanos: Some(0),
+                }),
+                completion_time: Some(meta_v1::Time {
+                    seconds: Some(1_704_067_260),
+                    nanos: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job with timed status must decode");
+
+        assert_eq!(
+            result["status"]["startTime"], "2024-01-01T00:00:00Z",
+            "startTime must survive decode; before the fix this field was never mapped and \
+             `kubectl get job` would show an empty AGE for a running Job"
+        );
+        assert_eq!(
+            result["status"]["completionTime"], "2024-01-01T00:01:00Z",
+            "completionTime must survive decode; before the fix ttlSecondsAfterFinished cleanup \
+             had no reference point to schedule from"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.uncountedTerminatedPods.
+    ///
+    /// The Job controller's pod-finalizer accounting (JobTrackingWithFinalizers) stages
+    /// terminated pod UIDs here before folding them into succeeded/failed counters; dropping
+    /// this field on decode would make the controller re-process (or lose track of) pods
+    /// between reconciliations, risking double-counted or stuck finalizers.
+    #[test]
+    fn decode_job_proto_gen_preserves_uncounted_terminated_pods() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("uncounted-job".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::JobStatus {
+                uncounted_terminated_pods: Some(batch_v1::UncountedTerminatedPods {
+                    succeeded: vec!["uid-succeeded-1".to_string()],
+                    failed: vec!["uid-failed-1".to_string()],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job with uncounted pods must decode");
+
+        assert_eq!(
+            result["status"]["uncountedTerminatedPods"]["succeeded"][0], "uid-succeeded-1",
+            "uncountedTerminatedPods.succeeded must survive decode — without it the controller \
+             cannot tell which succeeded pods it has already finalized and may double-count them"
+        );
+        assert_eq!(
+            result["status"]["uncountedTerminatedPods"]["failed"][0], "uid-failed-1",
+            "uncountedTerminatedPods.failed must survive decode"
+        );
+    }
+
+    /// decode_cronjob_proto_gen's status.active entries must preserve resourceVersion/fieldPath.
+    ///
+    /// ObjectReference has 7 fields; this hand-rolled mapping (not core_gen_adapter's shared
+    /// gen_object_reference_to_json) only carried 5 of them before this fix.
+    #[test]
+    fn decode_cronjob_proto_gen_preserves_active_resource_version_and_field_path() {
+        use crate::apps_gen::k8s::io::api::core::v1::ObjectReference;
+        let cj = batch_v1::CronJob {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ref-fields-cj".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::CronJobStatus {
+                active: vec![ObjectReference {
+                    name: Some("ref-fields-cj-job".to_string()),
+                    namespace: Some("default".to_string()),
+                    resource_version: Some("999".to_string()),
+                    field_path: Some("spec.containers{main}".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).unwrap();
+        let result = decode_cronjob_proto_gen(&buf).expect("CronJob with status must decode");
+
+        assert_eq!(
+            result["status"]["active"][0]["resourceVersion"], "999",
+            "status.active[0].resourceVersion must survive decode"
+        );
+        assert_eq!(
+            result["status"]["active"][0]["fieldPath"], "spec.containers{main}",
+            "status.active[0].fieldPath must survive decode"
+        );
+    }
+
+    // ---- Sentinel completeness: decode_job_proto_gen / decode_cronjob_proto_gen ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in gen_object_meta_to_json, gen_job_spec_to_json, decode_job_proto_gen, or
+    // decode_cronjob_proto_gen could mistake for "unset" (see u7s_sentinel::Sentinel), decodes
+    // it through the real entry point, and asserts every field name shows up somewhere in the
+    // resulting JSON. A name that never appears means one of those functions never reads that
+    // field from the decoded protobuf struct at all — this is exactly how spec.selector,
+    // spec.manualSelector, status.startTime, status.completionTime, and
+    // status.uncountedTerminatedPods were found missing from this file while building this test.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_job_proto_gen() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(batch_v1::JobSpec::sentinel()),
+            status: Some(batch_v1::JobStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let mut decoded =
+            decode_job_proto_gen(&buf).expect("sentinel Job must decode via the generated path");
+
+        // Blank (but keep the key of) the nested PodTemplateSpec: it shares field names with
+        // JobSpec itself (e.g. activeDeadlineSeconds), so without this a dropped JobSpec-level
+        // field could hide behind its PodSpec-level namesake still being present in the tree.
+        // PodSpec/Container's own completeness is covered separately in core_gen_adapter.rs.
+        if let Some(spec) = decoded.get_mut("spec").and_then(|s| s.as_object_mut()) {
+            spec.insert("template".to_string(), serde_json::json!({}));
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        // selfLink is a legacy field the system no longer populates — permanently omitted.
+        // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+        // pending a separate investigation into gen_object_meta_to_json's correct handling of
+        // them; do not guess at the fix here.
+        //
+        // JobCondition.status is left off `expected` too: it lives under this object's own
+        // "status" key, so the check would trivially pass off the ancestor key alone and could
+        // never actually fail if condition.status handling regressed — existing hand-written
+        // tests in this file cover it instead.
+        let expected = [
+            "name",
+            "generateName",
+            "namespace",
+            "uid",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "labels",
+            "annotations",
+            "ownerReferences",
+            "finalizers",
+            "parallelism",
+            "completions",
+            "activeDeadlineSeconds",
+            "backoffLimit",
+            "ttlSecondsAfterFinished",
+            "completionMode",
+            "suspend",
+            "podReplacementPolicy",
+            "backoffLimitPerIndex",
+            "maxFailedIndexes",
+            "managedBy",
+            "selector",
+            "manualSelector",
+            "podFailurePolicy",
+            "successPolicy",
+            "template",
+            "startTime",
+            "completionTime",
+            "active",
+            "succeeded",
+            "failed",
+            "completedIndexes",
+            "uncountedTerminatedPods",
+            "ready",
+            "failedIndexes",
+            "terminating",
+            "type",
+            "reason",
+            "message",
+            "lastProbeTime",
+            "lastTransitionTime",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_cronjob_proto_gen() {
+        let cj = batch_v1::CronJob {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(batch_v1::CronJobSpec::sentinel()),
+            status: Some(batch_v1::CronJobStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).unwrap();
+        let mut decoded = decode_cronjob_proto_gen(&buf)
+            .expect("sentinel CronJob must decode via the generated path");
+
+        // Blank the nested jobTemplate: JobTemplateSpec.spec is a full JobSpec, which shares
+        // field names with CronJobSpec itself (e.g. suspend) — without this a dropped
+        // CronJobSpec-level field could hide behind its JobSpec-level namesake. JobSpec's own
+        // completeness is covered separately by sentinel_completeness_decode_job_proto_gen.
+        if let Some(spec) = decoded.get_mut("spec").and_then(|s| s.as_object_mut()) {
+            spec.insert("jobTemplate".to_string(), serde_json::json!({}));
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        // Same ObjectMeta omissions as sentinel_completeness_decode_job_proto_gen; see there.
+        let expected = [
+            "name",
+            "generateName",
+            "namespace",
+            "uid",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "labels",
+            "annotations",
+            "ownerReferences",
+            "finalizers",
+            "schedule",
+            "timeZone",
+            "startingDeadlineSeconds",
+            "concurrencyPolicy",
+            "suspend",
+            "jobTemplate",
+            "successfulJobsHistoryLimit",
+            "failedJobsHistoryLimit",
+            "active",
+            "lastScheduleTime",
+            "lastSuccessfulTime",
+        ];
+        assert_fields_present(&paths, &expected);
     }
 }

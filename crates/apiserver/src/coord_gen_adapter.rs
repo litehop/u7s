@@ -289,4 +289,105 @@ mod tests {
              construction"
         );
     }
+
+    // ---- Sentinel completeness: decode_lease_proto_gen_a ----
+    //
+    // Builds a Lease with every metadata/spec field set to a value no zero/empty-elision check
+    // in gen_object_meta_to_json or decode_lease_proto_gen_a could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_lease_proto_gen_a entry point,
+    // and asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means this file's gen_object_meta_to_json (a near-duplicate of
+    // core_gen_adapter's, not shared code) or decode_lease_proto_gen_a never reads that field
+    // from the decoded protobuf struct at all.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in gen_object_meta_to_json or decode_lease_proto_gen_a (or, if the \
+             omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_lease_proto_gen_a() {
+        use crate::coord_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+        let lease = coord_v1::Lease {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(coord_v1::LeaseSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        lease.encode(&mut buf).unwrap();
+        let decoded = decode_lease_proto_gen_a(&buf)
+            .expect("sentinel Lease must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        // selfLink is a legacy field the system no longer populates (see the .proto's own
+        // "Deprecated" comment) — permanently omitted, not a gap.
+        //
+        // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+        // pending a separate investigation into gen_object_meta_to_json's correct handling of
+        // them; do not guess at the fix here.
+        let expected = [
+            "name",
+            "generateName",
+            "namespace",
+            "uid",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "labels",
+            "annotations",
+            "ownerReferences",
+            "finalizers",
+            "holderIdentity",
+            "leaseDurationSeconds",
+            "acquireTime",
+            "renewTime",
+            "leaseTransitions",
+            "strategy",
+            "preferredHolder",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
 }
