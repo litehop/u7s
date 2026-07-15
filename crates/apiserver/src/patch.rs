@@ -458,6 +458,39 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // adding a second secret reference silently replaces the whole list.
         "secrets" => MergeKeyKind::Key("name"),
 
+        // CSINodeSpec.drivers is the only "drivers" field across the vendored API surface
+        // (verified: no other message declares a `drivers` field), so a suffix arm can't
+        // collide with anything else. Upstream declares patchMergeKey=name/patchStrategy=merge;
+        // without this entry, installing a second CSI driver on a Node silently replaces the
+        // whole CSINode.spec.drivers array instead of merging by name, unregistering every
+        // other already-installed CSI driver on that node.
+        path if path.ends_with(".drivers") => MergeKeyKind::Key("name"),
+
+        // matchConditions is declared patchMergeKey=name/patchStrategy=merge on all four
+        // messages that carry it (MutatingWebhook, ValidatingWebhook, and both
+        // {Mutating,Validating}AdmissionPolicySpec) — all four agree on the same key, so one
+        // suffix arm covers every declaring message with no cross-message collision (unlike
+        // variables below). It's reached as "webhooks.matchConditions" for the two Webhook
+        // messages (one level inside the "webhooks" array — see that entry below) and as
+        // "spec.matchConditions" for the two AdmissionPolicySpec messages (a direct child of
+        // spec, no array wrapper). Without this entry, adding one match condition to an
+        // existing webhook or admission policy silently replaces the whole array instead of
+        // merging by name, dropping every other match condition that gates when it applies.
+        path if path.ends_with(".matchConditions") => MergeKeyKind::Key("name"),
+
+        // {Mutating,Validating}WebhookConfiguration.webhooks — the .proto token is spelled
+        // capitalized "Webhooks", but admissionreg_gen_adapter.rs's
+        // decode_{mutating,validating}webhookconfiguration_proto_gen constructs the real JSON
+        // key lowercase ("webhooks": webhooks); an entry keyed on the proto spelling would
+        // never match real traffic. Both configuration kinds have no spec/status wrapper (the
+        // same top-level shape as ServiceAccount.secrets above), so "webhooks" is always the
+        // bare path on a full-object patch. Without this entry, re-applying a webhook config
+        // that only changes one entry's .rules silently drops clientConfig, failurePolicy,
+        // admissionReviewVersions, and sideEffects from that entry — leaving the webhook
+        // registered but unusable, since invoke_mutating_webhook/run_validating_webhooks can't
+        // resolve a dispatch target without clientConfig.
+        "webhooks" => MergeKeyKind::Key("name"),
+
         "rules" | "subjects" => MergeKeyKind::Replace,
 
         _ => MergeKeyKind::Unknown,
@@ -1913,6 +1946,305 @@ mod tests {
         );
     }
 
+    /// CSINodeSpec.drivers must be registered with merge key "name" (matching upstream's
+    /// `patchStrategy:"merge" patchMergeKey:"name"` tag) — this is the only field named
+    /// "drivers" anywhere in the vendored API surface, so a plain suffix arm is safe.
+    ///
+    /// Without this entry, `merge_key_for_path` falls through to Unknown, and installing a
+    /// second CSI driver on a node (e.g. adding a block-storage driver alongside an existing
+    /// file-storage driver) silently REPLACES the whole array instead of merging by name,
+    /// unregistering the driver that was already there — kubelet then refuses volume
+    /// operations for the dropped driver even though its DaemonSet pod is still running.
+    #[test]
+    fn test_smp_csi_node_drivers_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "drivers": [
+                    {"name": "file.csi.example.com", "nodeID": "node-1", "topologyKeys": []}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "drivers": [
+                    {"name": "block.csi.example.com", "nodeID": "node-1", "topologyKeys": []}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let drivers = target["spec"]["drivers"].as_array().unwrap();
+        assert_eq!(
+            drivers.len(),
+            2,
+            "registering a second CSI driver must not silently unregister the first one; got: {drivers:?}"
+        );
+        let names: Vec<&str> = drivers
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"file.csi.example.com") && names.contains(&"block.csi.example.com"),
+            "both the original and newly-patched driver name must survive; got: {names:?}"
+        );
+    }
+
+    /// {Mutating,Validating}AdmissionPolicySpec.matchConditions must be registered with merge
+    /// key "name" (matching upstream's `patchStrategy:"merge" patchMergeKey:"name"` tag),
+    /// reached as "spec.matchConditions" — a direct child of spec, no array wrapper needed.
+    ///
+    /// Without this entry, adding a second match condition to an existing admission policy
+    /// (e.g. narrowing which namespaces a validating policy applies to, on top of an existing
+    /// "skip dry-run requests" condition) silently REPLACES the whole array instead of merging
+    /// by name, dropping the original gating condition — so the policy starts evaluating
+    /// requests it was explicitly configured to skip.
+    #[test]
+    fn test_smp_admission_policy_spec_match_conditions_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "matchConstraints": {"resourceRules": []},
+                "matchConditions": [
+                    {"name": "skip-dry-run", "expression": "!request.dryRun"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "matchConditions": [
+                    {"name": "prod-namespace-only", "expression": "object.metadata.namespace == 'prod'"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let conditions = target["spec"]["matchConditions"].as_array().unwrap();
+        assert_eq!(
+            conditions.len(),
+            2,
+            "adding a match condition must not silently drop the pre-existing one; got: {conditions:?}"
+        );
+        let names: Vec<&str> = conditions
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"skip-dry-run") && names.contains(&"prod-namespace-only"),
+            "both the original and newly-patched condition name must survive; got: {names:?}"
+        );
+    }
+
+    /// MutatingAdmissionPolicySpec.variables declares `+listType=atomic` with NO
+    /// patchMergeKey — upstream wants the whole array replaced on every patch, never merged.
+    /// This must stay true even though ValidatingAdmissionPolicySpec.variables (a genuinely
+    /// separate message) DOES declare `patchMergeKey=name` at the exact same JSON path
+    /// ("spec.variables" — both kinds are patched via the same generic
+    /// strategic_merge_patch(&mut current.body, ...) call starting at an empty root path, so
+    /// there is no path-based way to tell the two messages apart). Registering "spec.variables"
+    /// as a merge-by-name key to fix the Validating side would silently break this: a
+    /// MutatingAdmissionPolicy patch intended to remove a variable would instead leave it in
+    /// place forever (merge-by-name only adds/updates, never removes what's absent from the
+    /// patch). This is why ValidatingAdmissionPolicySpec.variables stays deliberately
+    /// unresolved in known_missing_tracked_separately below rather than "fixed" at the cost of
+    /// this test.
+    #[test]
+    fn mutating_admission_policy_variables_stays_atomic_replace_not_merged_by_name() {
+        assert!(
+            matches!(merge_key_for_path("spec.variables"), MergeKeyKind::Unknown),
+            "spec.variables must stay unregistered (Unknown -> whole-array replace) — if this \
+             ever changes to MergeKeyKind::Key, it means someone registered a merge key at this \
+             path to fix ValidatingAdmissionPolicySpec.variables, which would also incorrectly \
+             start merging MutatingAdmissionPolicySpec.variables by name instead of replacing it"
+        );
+
+        let mut target = json!({
+            "spec": {
+                "variables": [
+                    {"name": "isProdNamespace", "expression": "object.metadata.namespace == 'prod'"},
+                    {"name": "stale", "expression": "true"}
+                ]
+            }
+        });
+        // A MutatingAdmissionPolicy update that drops the "stale" variable entirely.
+        let patch = json!({
+            "spec": {
+                "variables": [
+                    {"name": "isProdNamespace", "expression": "object.metadata.namespace == 'prod'"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let variables = target["spec"]["variables"].as_array().unwrap();
+        assert_eq!(
+            variables.len(),
+            1,
+            "atomic (+listType=atomic, no patchMergeKey) semantics means the patch's array \
+             wholly REPLACES the target — the dropped \"stale\" variable must be gone, not \
+             retained as it would be under a (wrong, for this message) merge-by-name; got: {variables:?}"
+        );
+        assert_eq!(variables[0]["name"], "isProdNamespace");
+    }
+
+    /// ValidatingWebhookConfiguration.webhooks must be registered with merge key "name" at the
+    /// real (lowercase) JSON path "webhooks" — the .proto token is capitalized "Webhooks", but
+    /// admissionreg_gen_adapter.rs emits lowercase "webhooks", and this config kind has no
+    /// spec/status wrapper (webhooks is a bare top-level field, same shape as
+    /// ServiceAccount.secrets above).
+    ///
+    /// This is the exact repro from a real user-facing bug (mayor-t4opz): `kubectl create` a
+    /// ValidatingWebhookConfiguration, then `kubectl apply` the same object again with only
+    /// rules[].resources changed. Without this entry, "webhooks" falls through to Unknown
+    /// (whole-array replace using whatever the second apply's computed patch happens to
+    /// contain), which silently drops clientConfig, failurePolicy, admissionReviewVersions, and
+    /// sideEffects from the stored webhook — leaving it registered but non-functional, since
+    /// run_validating_webhooks can't resolve a dispatch target without clientConfig. This test
+    /// also exercises the nested "webhooks.matchConditions" suffix-arm fix at the same time
+    /// (adding a second match condition must not drop the first).
+    #[test]
+    fn test_smp_validating_webhook_configuration_apply_preserves_siblings_and_match_conditions() {
+        let mut target = json!({
+            "webhooks": [
+                {
+                    "name": "validate.example.com",
+                    "clientConfig": {"url": "https://example.com/validate"},
+                    "failurePolicy": "Fail",
+                    "admissionReviewVersions": ["v1"],
+                    "sideEffects": "None",
+                    "matchConditions": [
+                        {"name": "exclude-kube-system", "expression": "object.metadata.namespace != 'kube-system'"}
+                    ],
+                    "rules": [
+                        {"apiGroups": [""], "apiVersions": ["v1"], "operations": ["CREATE"], "resources": ["pods"]}
+                    ]
+                }
+            ]
+        });
+        // Second apply: only rules and matchConditions change; every other field is omitted,
+        // matching what a real strategic-merge-patch diff of "only rules changed" looks like.
+        let patch = json!({
+            "webhooks": [
+                {
+                    "name": "validate.example.com",
+                    "rules": [
+                        {"apiGroups": [""], "apiVersions": ["v1"], "operations": ["CREATE", "UPDATE"], "resources": ["pods"]}
+                    ],
+                    "matchConditions": [
+                        {"name": "exclude-kube-system", "expression": "object.metadata.namespace != 'kube-system'"},
+                        {"name": "exclude-kube-public", "expression": "object.metadata.namespace != 'kube-public'"}
+                    ]
+                }
+            ]
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let webhooks = target["webhooks"].as_array().unwrap();
+        assert_eq!(
+            webhooks.len(),
+            1,
+            "the patch must merge into the existing webhook entry by name, not append a second one"
+        );
+        let wh = &webhooks[0];
+        assert_eq!(
+            wh["clientConfig"]["url"], "https://example.com/validate",
+            "clientConfig must survive a patch that only changes rules — without it the \
+             webhook is registered but dispatch can never resolve a target"
+        );
+        assert_eq!(wh["failurePolicy"], "Fail", "failurePolicy must survive");
+        assert_eq!(
+            wh["admissionReviewVersions"],
+            json!(["v1"]),
+            "admissionReviewVersions must survive"
+        );
+        assert_eq!(wh["sideEffects"], "None", "sideEffects must survive");
+        assert_eq!(
+            wh["rules"][0]["operations"],
+            json!(["CREATE", "UPDATE"]),
+            "the patched field (rules) must actually be updated"
+        );
+
+        let conditions = wh["matchConditions"].as_array().unwrap();
+        assert_eq!(
+            conditions.len(),
+            2,
+            "adding a second match condition must not drop the first; got: {conditions:?}"
+        );
+        let names: Vec<&str> = conditions
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"exclude-kube-system") && names.contains(&"exclude-kube-public"),
+            "both match conditions must survive; got: {names:?}"
+        );
+    }
+
+    /// Same fix as the ValidatingWebhookConfiguration test above, applied to
+    /// MutatingWebhookConfiguration — the two kinds share the identical capitalization
+    /// mismatch ("Webhooks" in the .proto vs "webhooks" in the real JSON) and the identical
+    /// generic strategic-merge-patch code path, so both must be verified independently.
+    #[test]
+    fn test_smp_mutating_webhook_configuration_apply_preserves_siblings_and_match_conditions() {
+        let mut target = json!({
+            "webhooks": [
+                {
+                    "name": "mutate.example.com",
+                    "clientConfig": {"url": "https://example.com/mutate"},
+                    "failurePolicy": "Ignore",
+                    "admissionReviewVersions": ["v1"],
+                    "sideEffects": "None",
+                    "reinvocationPolicy": "Never",
+                    "matchConditions": [
+                        {"name": "exclude-kube-system", "expression": "object.metadata.namespace != 'kube-system'"}
+                    ],
+                    "rules": [
+                        {"apiGroups": [""], "apiVersions": ["v1"], "operations": ["CREATE"], "resources": ["pods"]}
+                    ]
+                }
+            ]
+        });
+        let patch = json!({
+            "webhooks": [
+                {
+                    "name": "mutate.example.com",
+                    "rules": [
+                        {"apiGroups": [""], "apiVersions": ["v1"], "operations": ["CREATE", "UPDATE"], "resources": ["pods"]}
+                    ]
+                }
+            ]
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let webhooks = target["webhooks"].as_array().unwrap();
+        assert_eq!(
+            webhooks.len(),
+            1,
+            "must merge by name, not append a second entry"
+        );
+        let wh = &webhooks[0];
+        assert_eq!(
+            wh["clientConfig"]["url"], "https://example.com/mutate",
+            "clientConfig must survive a patch that only changes rules"
+        );
+        assert_eq!(
+            wh["reinvocationPolicy"], "Never",
+            "reinvocationPolicy must survive"
+        );
+        assert_eq!(
+            wh["matchConditions"][0]["name"], "exclude-kube-system",
+            "matchConditions must survive untouched"
+        );
+        assert_eq!(
+            wh["rules"][0]["operations"],
+            json!(["CREATE", "UPDATE"]),
+            "the patched field (rules) must actually be updated"
+        );
+    }
+
     // --- Completeness check: every schema-declared +patchMergeKey field must have SOME
     // matching entry in merge_key_for_path ---
     //
@@ -2033,34 +2365,54 @@ mod tests {
         let known_ambiguous: &[(&str, &str)] =
             &[("JobStatus", "conditions"), ("PodStatus", "hostIPs")];
 
-        // Real, unambiguous gaps this same check found beyond the batch fixed above — kept
-        // failing-by-default (not silently fixed here) because each needs its own
-        // collision/JSON-key review before a table entry can be written, same as
-        // NodeStatus.addresses above needed:
-        //  - CSINodeSpec.drivers, and the four *.matchConditions (MutatingWebhook,
-        //    MutatingAdmissionPolicySpec, ValidatingWebhook, ValidatingAdmissionPolicySpec):
-        //    field name is unique/consistent, a plain suffix arm is likely safe, but unverified
-        //    against a live cluster.
-        //  - ValidatingAdmissionPolicySpec.variables: MutatingAdmissionPolicySpec.variables
-        //    shares the field name but declares +listType=atomic with NO patchMergeKey — same
-        //    cross-message collision shape as addresses, needs an exact-path (not suffix) entry.
-        //  - {Mutating,Validating}WebhookConfiguration's field is literally spelled "Webhooks"
-        //    (capitalized) in this .proto, but the real JSON wire key is lowercase "webhooks"
-        //    (see admissionreg_gen_adapter.rs's `"webhooks": webhooks` construction) — a table
-        //    entry keyed on the proto token as-is would never match real traffic.
+        // Two gaps from the same scan remain genuinely unresolved (the other 7 — CSINodeSpec.
+        // drivers, the four *.matchConditions fields, and both {Mutating,Validating}
+        // WebhookConfiguration.webhooks — are fixed above; see their regression tests below):
+        //
+        //  - ValidatingAdmissionPolicySpec.variables (patchMergeKey=name) collides with
+        //    MutatingAdmissionPolicySpec.variables (same field name, +listType=atomic, NO
+        //    patchMergeKey — must stay whole-array-replace). Unlike NodeStatus.addresses vs
+        //    EndpointSubset.addresses (resolved with two literal paths because Node and
+        //    Endpoints reach "addresses" at different structural depths), these two collide at
+        //    the byte-identical path: both kinds are patched by the very same generic
+        //    `strategic_merge_patch(&mut current.body, &patch)` call in handlers/resource.rs
+        //    (confirmed: "mutatingadmissionpolicies" is registered and patched the same way as
+        //    "validatingadmissionpolicies" in state.rs's build_registry), starting from an empty
+        //    root path, and both nest `variables` exactly one level under `.spec` — so
+        //    "spec.variables" is the identical string for both kinds. merge_key_for_path has no
+        //    resource-kind context to tell them apart (its signature is just `&str -> ...`, and
+        //    none of its call sites pass a kind/GVK), so neither an exact-path nor a suffix entry
+        //    can fix Validating without also silently changing Mutating's variables from correct
+        //    atomic-replace to incorrect merge-by-name. Resolving this needs a deliberate
+        //    decision to thread resource-kind context into merge_key_for_path (a bigger,
+        //    cross-cutting change) — flagged rather than guessed at here. See
+        //    `mutating_admission_policy_variables_stays_atomic_replace_not_merged_by_name` below,
+        //    which locks in the current (correct, for Mutating) behavior at this exact path.
         //  - JSONSchemaProps.xKubernetesValidations: the real JSON wire key is hyphenated
         //    "x-kubernetes-validations" (see apiextensions_gen_adapter.rs's
-        //    `"x-kubernetes-validations".to_string()`), not the camelCase proto token; also
-        //    nested inside a recursive schema structure with no fixed depth.
+        //    `"x-kubernetes-validations".to_string()`), not the camelCase proto token, and it's
+        //    nested inside a recursive JSONSchemaProps structure (properties/items/allOf/oneOf/
+        //    anyOf/not) with no fixed parent path. It's also unreachable in practice today: the
+        //    only way to reach it via strategic-merge-patch is by recursing through
+        //    CustomResourceDefinitionSpec.versions first, and upstream's own .proto declares no
+        //    patchMergeKey/patchStrategy on `versions` either — this codebase correctly leaves
+        //    it whole-array-replace, matching upstream, which means the traversal never gets
+        //    past `versions` to reach `schema.openAPIV3Schema.properties.*.x-kubernetes-
+        //    validations` in the first place. Lowest priority of the original 9 given how rarely
+        //    a CRD's OpenAPI schema is strategic-merge-patched at all.
+        //
+        // Two of the 7 fixed above (*WebhookConfiguration.webhooks) have a real JSON key that
+        // differs in case from the literal .proto token, so this test's per-field candidate
+        // probe (which always uses the verbatim proto token) can't see they're covered.
+        // json_key_overrides redirects those two lookups to the real key so the completeness
+        // check keeps verifying them instead of just deleting the safety net.
+        let json_key_overrides: &[(&str, &str, &str)] = &[
+            ("MutatingWebhookConfiguration", "Webhooks", "webhooks"),
+            ("ValidatingWebhookConfiguration", "Webhooks", "webhooks"),
+        ];
+
         let known_missing_tracked_separately: &[(&str, &str)] = &[
-            ("CSINodeSpec", "drivers"),
-            ("MutatingAdmissionPolicySpec", "matchConditions"),
-            ("MutatingWebhook", "matchConditions"),
-            ("ValidatingAdmissionPolicySpec", "matchConditions"),
             ("ValidatingAdmissionPolicySpec", "variables"),
-            ("ValidatingWebhook", "matchConditions"),
-            ("MutatingWebhookConfiguration", "Webhooks"),
-            ("ValidatingWebhookConfiguration", "Webhooks"),
             ("JSONSchemaProps", "xKubernetesValidations"),
         ];
 
@@ -2104,8 +2456,13 @@ mod tests {
                     .iter()
                     .any(|(m, field)| *m == f.message && *field == f.field);
 
+                let effective_field = json_key_overrides
+                    .iter()
+                    .find(|(m, field, _)| *m == f.message && *field == f.field)
+                    .map_or(f.field.as_str(), |(_, _, real_key)| *real_key);
+
                 if !is_tracked_separately
-                    && !merge_key_for_path_covers(&f.field, &f.patch_merge_key)
+                    && !merge_key_for_path_covers(effective_field, &f.patch_merge_key)
                 {
                     missing.push(format!(
                         "{}.{} (patchMergeKey={}) in {}",
