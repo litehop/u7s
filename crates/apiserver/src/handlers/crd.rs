@@ -57,6 +57,14 @@ pub struct CustomResourceDefinitionNames {
     pub list_kind: String,
 }
 
+/// A single `x-kubernetes-selectable-fields` entry: a JSON path (e.g. ".spec.host") that
+/// CR field selectors are allowed to reference for this version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectableField {
+    pub json_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionVersion {
@@ -69,6 +77,11 @@ pub struct CustomResourceDefinitionVersion {
     /// and non-null, indicates that this version has a status subresource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subresources: Option<serde_json::Value>,
+    /// Field paths CR field selectors may reference for this version (backs
+    /// CustomResourceFieldSelectors). Without this field, `parse_crd`/`patch_crd` round-trip
+    /// every CRD through this struct and silently drop any `selectableFields` the client sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectable_fields: Vec<SelectableField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2276,6 +2276,7 @@ mod tests {
                     storage: true,
                     schema: None,
                     subresources: None,
+                    selectable_fields: vec![],
                 }],
                 conversion: None,
                 preserve_unknown_fields: false,

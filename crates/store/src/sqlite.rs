@@ -666,39 +666,13 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
             };
 
             // Walk the dot-separated path in the parsed JSON and compare to expected value.
-            let path_parts: Vec<&str> = field.split('.').collect();
             let filtered: Vec<StoreObject> = raw
                 .into_iter()
                 .filter(|obj| {
                     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
                         return false;
                     };
-                    let mut cur = &parsed;
-                    let mut absent = false;
-                    for part in &path_parts {
-                        match cur.get(part) {
-                            Some(next) => cur = next,
-                            None => {
-                                absent = true;
-                                break;
-                            }
-                        }
-                    }
-                    // Absent fields are treated as the zero value: "" for strings,
-                    // false for bools. Both compare equal to "false" or "".
-                    let matches = if absent {
-                        value.is_empty() || value == "false"
-                    } else {
-                        match cur {
-                            serde_json::Value::String(s) => s == value,
-                            serde_json::Value::Bool(b) => {
-                                value == if *b { "true" } else { "false" }
-                            }
-                            serde_json::Value::Null => value.is_empty(),
-                            serde_json::Value::Number(n) => value.as_str() == n.to_string(),
-                            _ => false,
-                        }
-                    };
+                    let matches = crate::json_path_equals(&parsed, field, value);
                     if *negated {
                         !matches
                     } else {
