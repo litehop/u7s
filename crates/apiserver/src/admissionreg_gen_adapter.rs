@@ -475,6 +475,9 @@ fn gen_vap_status_to_json(status: ar_v1::ValidatingAdmissionPolicyStatus) -> ser
                             serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                     }
                 }
+                if let Some(og) = c.observed_generation.filter(|&g| g != 0) {
+                    cm["observedGeneration"] = og.into();
+                }
                 cm
             })
             .collect();
@@ -1036,5 +1039,338 @@ mod tests {
              (the pre-fix unwrap_or_default() behavior) diverges from the canonical omit-empty \
              semantics in core_gen_adapter.rs and misrepresents what the client actually sent"
         );
+    }
+
+    // ---- Sentinel completeness ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in this file's gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_*_proto_gen entry point, and
+    // asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how the per-condition observedGeneration on
+    // ValidatingAdmissionPolicyStatus.conditions was found missing from this file.
+    //
+    // This file's gen_object_meta_to_json and gen_label_selector_to_json/
+    // gen_label_selector_requirement_to_json were independently verified (by direct diff
+    // against core_gen_adapter.rs's canonical copies) to already match canonical omit-empty
+    // semantics as of this pass — the historical drift in gen_label_selector_to_json (see
+    // decode_validatingwebhookconfiguration_proto_gen_preserves_matchexpressions_selector
+    // above) was already fixed before this test was added. Do not assume that stays true after
+    // future edits to this file; that is exactly why this gets its own completeness check
+    // instead of trusting the other adapters' coverage.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    // selfLink is a legacy field the system no longer populates — permanently omitted.
+    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+    // pending a separate investigation into gen_object_meta_to_json's correct handling of
+    // them (this file's copy has the same omissions as every other gen_adapter's); do not
+    // guess at the fix here.
+    const OBJECT_META_EXPECTED: &[&str] = &[
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+
+    const LABEL_SELECTOR_EXPECTED: &[&str] = &[
+        "matchLabels",
+        "matchExpressions",
+        "key",
+        "operator",
+        "values",
+    ];
+
+    const MATCH_RESOURCES_EXPECTED: &[&str] = &[
+        "resourceRules",
+        "excludeResourceRules",
+        "resourceNames",
+        "apiGroups",
+        "apiVersions",
+        "resources",
+        "operations",
+        "scope",
+        "namespaceSelector",
+        "objectSelector",
+        "matchPolicy",
+    ];
+
+    const PARAM_REF_EXPECTED: &[&str] =
+        &["name", "namespace", "parameterNotFoundAction", "selector"];
+
+    #[test]
+    fn sentinel_completeness_decode_validatingwebhookconfiguration_proto_gen() {
+        let vwc = ar_v1::ValidatingWebhookConfiguration {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            webhooks: vec![ar_v1::ValidatingWebhook::sentinel()],
+        };
+        let mut buf = Vec::new();
+        vwc.encode(&mut buf).unwrap();
+        let result = decode_validatingwebhookconfiguration_proto_gen(&buf)
+            .expect("sentinel ValidatingWebhookConfiguration must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend([
+            "webhooks",
+            "clientConfig",
+            "caBundle",
+            "service",
+            "path",
+            "port",
+            "url",
+            "rules",
+            "operations",
+            "apiGroups",
+            "apiVersions",
+            "resources",
+            "scope",
+            "admissionReviewVersions",
+            "failurePolicy",
+            "matchPolicy",
+            "sideEffects",
+            "timeoutSeconds",
+            "namespaceSelector",
+            "objectSelector",
+            "matchConditions",
+            "expression",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_mutatingwebhookconfiguration_proto_gen() {
+        let mwc = ar_v1::MutatingWebhookConfiguration {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            webhooks: vec![ar_v1::MutatingWebhook::sentinel()],
+        };
+        let mut buf = Vec::new();
+        mwc.encode(&mut buf).unwrap();
+        let result = decode_mutatingwebhookconfiguration_proto_gen(&buf)
+            .expect("sentinel MutatingWebhookConfiguration must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend([
+            "webhooks",
+            "clientConfig",
+            "caBundle",
+            "service",
+            "path",
+            "port",
+            "url",
+            "rules",
+            "operations",
+            "apiGroups",
+            "apiVersions",
+            "resources",
+            "scope",
+            "admissionReviewVersions",
+            "failurePolicy",
+            "matchPolicy",
+            "sideEffects",
+            "timeoutSeconds",
+            "reinvocationPolicy",
+            "namespaceSelector",
+            "objectSelector",
+            "matchConditions",
+            "expression",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_validatingadmissionpolicy_proto_gen() {
+        let vap = ar_v1::ValidatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::ValidatingAdmissionPolicySpec::sentinel()),
+            status: Some(ar_v1::ValidatingAdmissionPolicyStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        vap.encode(&mut buf).unwrap();
+        let result = decode_validatingadmissionpolicy_proto_gen(&buf)
+            .expect("sentinel ValidatingAdmissionPolicy must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend(MATCH_RESOURCES_EXPECTED);
+        expected.extend([
+            "spec",
+            "matchConstraints",
+            "failurePolicy",
+            // paramKind.apiVersion/kind deliberately excluded: both would be masked by the
+            // envelope's own top-level "apiVersion"/"kind" literals, so a dropped
+            // paramKind.apiVersion or paramKind.kind could never fail this check.
+            "paramKind",
+            "validations",
+            "expression",
+            "message",
+            "reason",
+            "messageExpression",
+            "auditAnnotations",
+            "key",
+            "valueExpression",
+            "matchConditions",
+            "name",
+            "variables",
+            "status",
+            "observedGeneration",
+            "typeChecking",
+            "expressionWarnings",
+            "fieldRef",
+            "warning",
+            "conditions",
+            "type",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_validatingadmissionpolicybinding_proto_gen() {
+        let binding = ar_v1::ValidatingAdmissionPolicyBinding {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::ValidatingAdmissionPolicyBindingSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        binding.encode(&mut buf).unwrap();
+        let result = decode_validatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("sentinel ValidatingAdmissionPolicyBinding must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend(MATCH_RESOURCES_EXPECTED);
+        expected.extend(PARAM_REF_EXPECTED);
+        expected.extend([
+            "spec",
+            "policyName",
+            "paramRef",
+            "matchResources",
+            "validationActions",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_mutatingadmissionpolicy_proto_gen() {
+        let map_obj = ar_v1::MutatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::MutatingAdmissionPolicySpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        map_obj.encode(&mut buf).unwrap();
+        let result = decode_mutatingadmissionpolicy_proto_gen(&buf)
+            .expect("sentinel MutatingAdmissionPolicy must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(MATCH_RESOURCES_EXPECTED);
+        expected.extend([
+            "spec",
+            "matchConstraints",
+            "failurePolicy",
+            "reinvocationPolicy",
+            // paramKind.apiVersion/kind deliberately excluded — see the same note in
+            // sentinel_completeness_decode_validatingadmissionpolicy_proto_gen above.
+            "paramKind",
+            "variables",
+            "name",
+            "expression",
+            "mutations",
+            "patchType",
+            "applyConfiguration",
+            "jsonPatch",
+            "matchConditions",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_mutatingadmissionpolicybinding_proto_gen() {
+        let binding = ar_v1::MutatingAdmissionPolicyBinding {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::MutatingAdmissionPolicyBindingSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        binding.encode(&mut buf).unwrap();
+        let result = decode_mutatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("sentinel MutatingAdmissionPolicyBinding must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend(MATCH_RESOURCES_EXPECTED);
+        expected.extend(PARAM_REF_EXPECTED);
+        expected.extend(["spec", "policyName", "paramRef", "matchResources"]);
+        assert_fields_present(&paths, &expected);
     }
 }

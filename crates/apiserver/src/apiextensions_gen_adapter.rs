@@ -494,6 +494,14 @@ fn gen_printer_column_to_json(col: apiext_v1::CustomResourceColumnDefinition) ->
     serde_json::Value::Object(m)
 }
 
+fn gen_selectable_field_to_json(f: apiext_v1::SelectableField) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = f.json_path.filter(|s| !s.is_empty()) {
+        m.insert("jsonPath".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_subresources_to_json(sr: apiext_v1::CustomResourceSubresources) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if sr.status.is_some() {
@@ -566,6 +574,20 @@ fn gen_version_to_json(v: apiext_v1::CustomResourceDefinitionVersion) -> serde_j
                 v.additional_printer_columns
                     .into_iter()
                     .map(gen_printer_column_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    // selectableFields backs the CustomResourceFieldSelectors feature (`kubectl get widgets
+    // --field-selector ...`); dropping it silently strips a client's field-selector
+    // configuration on every protobuf-encoded CRD create/update.
+    if !v.selectable_fields.is_empty() {
+        m.insert(
+            "selectableFields".to_string(),
+            serde_json::Value::Array(
+                v.selectable_fields
+                    .into_iter()
+                    .map(gen_selectable_field_to_json)
                     .collect(),
             ),
         );
@@ -698,6 +720,9 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                                 serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                         }
                     }
+                    if let Some(og) = c.observed_generation.filter(|&g| g != 0) {
+                        cm["observedGeneration"] = og.into();
+                    }
                     cm
                 })
                 .collect();
@@ -717,6 +742,13 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                         .collect(),
                 ),
             );
+        }
+        // observedGeneration lets the CRDEstablishedController-style reconciler (and clients
+        // polling for spec.versions[].schema changes to take effect) detect a status update is
+        // stale; dropping it made every protobuf-written CRD status look permanently
+        // up-to-date.
+        if let Some(og) = status.observed_generation.filter(|&g| g != 0) {
+            status_m.insert("observedGeneration".to_string(), og.into());
         }
         if !status_m.is_empty() {
             obj["status"] = serde_json::Value::Object(status_m);
@@ -748,6 +780,22 @@ pub fn decode_delete_options_proto_gen(data: &[u8]) -> Option<serde_json::Value>
                 .map(serde_json::Value::String)
                 .collect(),
         );
+    }
+    // preconditions carries the UID/resourceVersion a client expects the target to still have;
+    // dropping it silently turned every protobuf-encoded conditional delete (client-go's
+    // DeleteOptions{Preconditions: ...}, used by the GC controller to avoid racing a recreate)
+    // into an unconditional one.
+    if let Some(pre) = opts.preconditions {
+        let mut pm = serde_json::Map::new();
+        if let Some(uid) = pre.uid.filter(|s| !s.is_empty()) {
+            pm.insert("uid".to_string(), serde_json::Value::String(uid));
+        }
+        if let Some(rv) = pre.resource_version.filter(|s| !s.is_empty()) {
+            pm.insert("resourceVersion".to_string(), serde_json::Value::String(rv));
+        }
+        if !pm.is_empty() {
+            obj["preconditions"] = serde_json::Value::Object(pm);
+        }
     }
     Some(obj)
 }
@@ -947,6 +995,10 @@ mod tests {
             orphan_dependents: None,
             grace_period_seconds: Some(30),
             dry_run: vec!["All".to_string()],
+            preconditions: Some(meta_v1::Preconditions {
+                uid: Some("target-uid".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut buf = Vec::new();
@@ -974,5 +1026,279 @@ mod tests {
              is indistinguishable from an explicit opt-out of orphaning, corrupting garbage \
              collection intent"
         );
+        assert_eq!(
+            result["preconditions"]["uid"], "target-uid",
+            "preconditions.uid must survive — dropping it turns a client's conditional delete \
+             (used by the GC controller to avoid racing a recreate) into an unconditional one"
+        );
+    }
+
+    // ---- Sentinel completeness ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in this file's gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_*_proto_gen entry point, and
+    // asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how CustomResourceDefinitionVersion's
+    // selectableFields, CustomResourceDefinitionStatus's/CustomResourceDefinitionCondition's
+    // observedGeneration, and DeleteOptions's preconditions were found missing from this file.
+    //
+    // JsonSchemaProps nests itself (properties/allOf/items/etc. all eventually contain another
+    // JsonSchemaProps), which without u7s_sentinel::sentinel_guard would make `.sentinel()`
+    // recurse forever; see crates/sentinel/tests/recursion.rs for the regression test covering
+    // that guard directly.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    // selfLink is a legacy field the system no longer populates — permanently omitted.
+    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+    // pending a separate investigation into gen_object_meta_to_json's correct handling of
+    // them (this file's copy has the same omissions as every other gen_adapter's); do not
+    // guess at the fix here.
+    const OBJECT_META_EXPECTED: &[&str] = &[
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+
+    #[test]
+    fn sentinel_completeness_decode_crd_proto_gen() {
+        let crd = apiext_v1::CustomResourceDefinition {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(apiext_v1::CustomResourceDefinitionSpec::sentinel()),
+            status: Some(apiext_v1::CustomResourceDefinitionStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).unwrap();
+        let mut decoded = decode_crd_proto_gen(&buf)
+            .expect("sentinel CustomResourceDefinition must decode via the generated path");
+
+        // JsonSchemaProps' own completeness is covered in isolation by the test below; blank
+        // it here so a dropped CRD-structural field that happens to share a name with a
+        // JsonSchemaProps field (type/format/description also appear on
+        // additionalPrinterColumns entries and status conditions) can't hide behind the
+        // schema's own copy still being present somewhere in the tree.
+        if let Some(schema_obj) = decoded
+            .get_mut("spec")
+            .and_then(|s| s.get_mut("versions"))
+            .and_then(|v| v.get_mut(0))
+            .and_then(|v0| v0.get_mut("schema"))
+            .and_then(|s| s.as_object_mut())
+        {
+            schema_obj.insert("openAPIV3Schema".to_string(), serde_json::json!({}));
+        }
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "group",
+            "scope",
+            "names",
+            "plural",
+            "singular",
+            // "kind" deliberately excluded: names.kind/acceptedNames.kind would be masked by
+            // the envelope's own top-level "kind": "CustomResourceDefinition" literal, so a
+            // dropped names.kind could never fail this check.
+            "listKind",
+            "shortNames",
+            "categories",
+            "versions",
+            "name",
+            "served",
+            "storage",
+            "deprecated",
+            "deprecationWarning",
+            "schema",
+            "openAPIV3Schema",
+            "subresources",
+            "status",
+            "scale",
+            "specReplicasPath",
+            "statusReplicasPath",
+            "labelSelectorPath",
+            "additionalPrinterColumns",
+            "type",
+            "jsonPath",
+            "format",
+            "description",
+            "priority",
+            "selectableFields",
+            "preserveUnknownFields",
+            "conversion",
+            "strategy",
+            "webhook",
+            "conversionReviewVersions",
+            "clientConfig",
+            "caBundle",
+            "url",
+            "service",
+            "namespace",
+            "path",
+            "port",
+            "conditions",
+            "reason",
+            "message",
+            "lastTransitionTime",
+            "observedGeneration",
+            "acceptedNames",
+            "storedVersions",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_gen_json_schema_props_to_json() {
+        let mut schema = apiext_v1::JsonSchemaProps::sentinel();
+        // Json.raw is arbitrary sentinel bytes, which gen_json_raw_to_value silently (and
+        // correctly) drops if they don't parse as JSON — give default/example/enum real JSON
+        // so decode_crd_proto_gen's handling of them is actually exercised (mirrors
+        // apps_gen_adapter.rs's ControllerRevision.data handling for the same
+        // RawExtension/Json-shaped gotcha).
+        schema.default = Some(apiext_v1::Json {
+            raw: Some(br#"{"d":1}"#.to_vec()),
+        });
+        schema.example = Some(apiext_v1::Json {
+            raw: Some(br#"{"e":2}"#.to_vec()),
+        });
+        schema.r#enum = vec![apiext_v1::Json {
+            raw: Some(br#"{"v":3}"#.to_vec()),
+        }];
+
+        let crd = apiext_v1::CustomResourceDefinition {
+            spec: Some(apiext_v1::CustomResourceDefinitionSpec {
+                versions: vec![apiext_v1::CustomResourceDefinitionVersion {
+                    schema: Some(apiext_v1::CustomResourceValidation {
+                        open_apiv3_schema: Some(schema),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).unwrap();
+        let decoded = decode_crd_proto_gen(&buf)
+            .expect("sentinel JsonSchemaProps must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(
+            &decoded["spec"]["versions"][0]["schema"]["openAPIV3Schema"],
+            "",
+            &mut paths,
+        );
+
+        let expected = [
+            "type",
+            "description",
+            "format",
+            "title",
+            "$ref",
+            "id",
+            "$schema",
+            "pattern",
+            "default",
+            "maximum",
+            "exclusiveMaximum",
+            "minimum",
+            "exclusiveMinimum",
+            "maxLength",
+            "minLength",
+            "maxItems",
+            "minItems",
+            "uniqueItems",
+            "multipleOf",
+            "maxProperties",
+            "minProperties",
+            "nullable",
+            "x-kubernetes-preserve-unknown-fields",
+            "x-kubernetes-embedded-resource",
+            "x-kubernetes-int-or-string",
+            "x-kubernetes-list-type",
+            "x-kubernetes-map-type",
+            "x-kubernetes-list-map-keys",
+            "required",
+            "enum",
+            "properties",
+            "patternProperties",
+            "definitions",
+            "dependencies",
+            "schema",
+            "property",
+            "items",
+            "additionalProperties",
+            "additionalItems",
+            "allOf",
+            "oneOf",
+            "anyOf",
+            "not",
+            "externalDocs",
+            "url",
+            "example",
+            "x-kubernetes-validations",
+            "rule",
+            "message",
+            "messageExpression",
+            "reason",
+            "fieldPath",
+            "optionalOldSelf",
+        ];
+        assert_fields_present(&paths, &expected);
     }
 }
