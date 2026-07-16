@@ -11,6 +11,13 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields};
 /// test build one instance that exercises every field of a message in a single encode/decode
 /// round trip, rather than hand-writing a fully-populated literal per test.
 ///
+/// The whole `Self { .. }` construction is wrapped in `u7s_sentinel::sentinel_guard` so a
+/// self-referential message (CRD's `JsonSchemaProps` nests itself through
+/// `properties`/`allOf`/`items`/etc.) can't recurse forever: the guard detects that `Self` is
+/// already being built further up the call stack and substitutes `Self::default()` instead of
+/// recursing again. This requires every derive target to implement `Default`, which every
+/// prost-generated message does.
+///
 /// Only plain structs with named fields are supported, matching what prost-build actually
 /// generates: there are no `oneof` unions or `enum` types anywhere in the vendored .proto schema
 /// (k8s API messages model both as plain optional/string fields instead). If a future schema
@@ -57,7 +64,7 @@ pub fn derive_sentinel(input: TokenStream) -> TokenStream {
         #[automatically_derived]
         impl ::u7s_sentinel::Sentinel for #name {
             fn sentinel() -> Self {
-                Self { #(#field_inits),* }
+                ::u7s_sentinel::sentinel_guard::<Self, _>(|| Self { #(#field_inits),* })
             }
         }
     }

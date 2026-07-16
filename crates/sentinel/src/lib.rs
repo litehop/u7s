@@ -1,5 +1,42 @@
 pub use u7s_sentinel_derive::Sentinel;
 
+use std::any::TypeId;
+use std::cell::RefCell;
+
+thread_local! {
+    static BUILDING: RefCell<Vec<TypeId>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Called by every `#[derive(Sentinel)]`-generated `sentinel()` body instead of
+/// constructing `Self` directly, so a self-referential message (e.g. CRD's
+/// `JsonSchemaProps`, which nests itself through `properties`/`allOf`/`items`/etc. with
+/// no `Option` a derive could treat as a base case) doesn't recurse forever and blow the
+/// stack. If `T` is already being built further up the call stack, `build` would
+/// construct another `T` which would try to build another `T`... without ever
+/// returning, so this short-circuits to `T::default()` instead: the outer occurrence of
+/// the recursive field still gets a real, encodable value (proving the corresponding
+/// gen_*_to_json function actually reads that field), it just isn't populated a second
+/// level deep. Non-recursive types (almost everything) never re-enter their own
+/// `TypeId` here, so this is a no-op for them.
+#[doc(hidden)]
+pub fn sentinel_guard<T, F>(build: F) -> T
+where
+    T: Default + 'static,
+    F: FnOnce() -> T,
+{
+    let id = TypeId::of::<T>();
+    let already_building = BUILDING.with(|stack| stack.borrow().contains(&id));
+    if already_building {
+        return T::default();
+    }
+    BUILDING.with(|stack| stack.borrow_mut().push(id));
+    let value = build();
+    BUILDING.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+    value
+}
+
 /// Builds an instance of `Self` with every field set to a distinguishable non-default value.
 ///
 /// `#[derive(Sentinel)]` (applied blanket to every prost-generated message in build.rs)

@@ -251,6 +251,30 @@ pub fn decode_csidriver_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         if let Some(v) = s.se_linux_mount {
             spec.insert("seLinuxMount".to_string(), serde_json::Value::Bool(v));
         }
+        // nodeAllocatableUpdatePeriodSeconds/serviceAccountTokenInSecrets/
+        // preventPodSchedulingIfMissing were silently dropped: without the first, periodic
+        // CSINode allocatable-count updates never resume after a capacity-related failure;
+        // without the second, service account tokens meant for the Secrets field are still
+        // sent via VolumeContext where they risk being logged; without the third, the
+        // scheduler stops refusing to place pods on nodes missing this driver.
+        if let Some(v) = s.node_allocatable_update_period_seconds.filter(|&v| v != 0) {
+            spec.insert(
+                "nodeAllocatableUpdatePeriodSeconds".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        if let Some(v) = s.service_account_token_in_secrets {
+            spec.insert(
+                "serviceAccountTokenInSecrets".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = s.prevent_pod_scheduling_if_missing {
+            spec.insert(
+                "preventPodSchedulingIfMissing".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
     }
 
     Some(serde_json::json!({
@@ -351,6 +375,11 @@ pub fn decode_volumeattachment_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                     );
                 }
             }
+            // errorCode is the gRPC status code the CSI driver returned; dropping it hid the
+            // machine-readable failure reason behind the free-text message.
+            if let Some(v) = err.error_code {
+                em.insert("errorCode".to_string(), serde_json::Value::Number(v.into()));
+            }
             status_map.insert("attachError".to_string(), serde_json::Value::Object(em));
         }
         if let Some(err) = status.detach_error {
@@ -365,6 +394,9 @@ pub fn decode_volumeattachment_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                         serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
                     );
                 }
+            }
+            if let Some(v) = err.error_code {
+                em.insert("errorCode".to_string(), serde_json::Value::Number(v.into()));
             }
             status_map.insert("detachError".to_string(), serde_json::Value::Object(em));
         }
@@ -415,6 +447,41 @@ pub fn decode_storageclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     }
     if let Some(v) = obj.volume_binding_mode.filter(|s| !s.is_empty()) {
         result["volumeBindingMode"] = serde_json::Value::String(v);
+    }
+    // allowedTopologies restricts which node topologies a volume of this class can be
+    // dynamically provisioned to; dropping it silently let the provisioner place volumes
+    // anywhere, defeating a topology restriction the user configured.
+    if !obj.allowed_topologies.is_empty() {
+        let topologies: Vec<serde_json::Value> = obj
+            .allowed_topologies
+            .into_iter()
+            .map(|t| {
+                let exprs: Vec<serde_json::Value> = t
+                    .match_label_expressions
+                    .into_iter()
+                    .map(|e| {
+                        let mut em = serde_json::Map::new();
+                        if let Some(k) = e.key.filter(|s| !s.is_empty()) {
+                            em.insert("key".to_string(), serde_json::Value::String(k));
+                        }
+                        if !e.values.is_empty() {
+                            em.insert(
+                                "values".to_string(),
+                                serde_json::Value::Array(
+                                    e.values
+                                        .into_iter()
+                                        .map(serde_json::Value::String)
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        serde_json::Value::Object(em)
+                    })
+                    .collect();
+                serde_json::json!({ "matchLabelExpressions": exprs })
+            })
+            .collect();
+        result["allowedTopologies"] = serde_json::Value::Array(topologies);
     }
 
     Some(result)
@@ -1515,5 +1582,426 @@ mod tests {
             "spec.exempt must stay absent when type is Limited — spuriously emitting it would \
              suggest this level ignores concurrency limits when it does not"
         );
+    }
+
+    // ---- Sentinel completeness ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in this file's gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_*_proto_gen entry point, and
+    // asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how CsiDriverSpec's
+    // nodeAllocatableUpdatePeriodSeconds/serviceAccountTokenInSecrets/
+    // preventPodSchedulingIfMissing, StorageClass.allowedTopologies, and VolumeError.errorCode
+    // (used by both attachError and detachError) were found missing from this file.
+    //
+    // VolumeAttachmentSource.inlineVolumeSpec (a full core/v1 PersistentVolumeSpec, used only by
+    // the legacy CSIMigration in-tree-plugin-translation path) is deliberately left unhandled
+    // and excluded from `expected` below: implementing it would mean duplicating a large
+    // fraction of PersistentVolumeSpec's own JSON translation for a feature u7s has no in-tree
+    // volume plugins to migrate from. Flagged here rather than guessed at.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    // selfLink is a legacy field the system no longer populates — permanently omitted.
+    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+    // pending a separate investigation into gen_object_meta_to_json's correct handling of
+    // them (this file's copy has the same omissions as every other gen_adapter's); do not
+    // guess at the fix here.
+    const OBJECT_META_EXPECTED: &[&str] = &[
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+
+    const LABEL_SELECTOR_EXPECTED: &[&str] = &[
+        "matchLabels",
+        "matchExpressions",
+        "key",
+        "operator",
+        "values",
+    ];
+
+    #[test]
+    fn sentinel_completeness_decode_csinode_proto_gen() {
+        let obj = storage_v1::CsiNode {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(storage_v1::CsiNodeSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_csinode_proto_gen(&buf)
+            .expect("sentinel CSINode must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "drivers",
+            "nodeID",
+            "topologyKeys",
+            "allocatable",
+            "count",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_csidriver_proto_gen() {
+        let obj = storage_v1::CsiDriver {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(storage_v1::CsiDriverSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_csidriver_proto_gen(&buf)
+            .expect("sentinel CSIDriver must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "attachRequired",
+            "podInfoOnMount",
+            "volumeLifecycleModes",
+            "storageCapacity",
+            "fsGroupPolicy",
+            "tokenRequests",
+            "audience",
+            "expirationSeconds",
+            "requiresRepublish",
+            "seLinuxMount",
+            "nodeAllocatableUpdatePeriodSeconds",
+            "serviceAccountTokenInSecrets",
+            "preventPodSchedulingIfMissing",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_csistoragecapacity_proto_gen() {
+        let obj = storage_v1::CsiStorageCapacity {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            node_topology: Some(meta_v1::LabelSelector::sentinel()),
+            storage_class_name: Some("standard".to_string()),
+            capacity: Some(quantity("100Gi")),
+            maximum_volume_size: Some(quantity("50Gi")),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_csistoragecapacity_proto_gen(&buf)
+            .expect("sentinel CSIStorageCapacity must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend([
+            "storageClassName",
+            "nodeTopology",
+            "capacity",
+            "maximumVolumeSize",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_volumeattachment_proto_gen() {
+        let obj = storage_v1::VolumeAttachment {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(storage_v1::VolumeAttachmentSpec {
+                source: Some(storage_v1::VolumeAttachmentSource {
+                    persistent_volume_name: Some("pv-1".to_string()),
+                    inline_volume_spec: None,
+                }),
+                ..storage_v1::VolumeAttachmentSpec::sentinel()
+            }),
+            status: Some(storage_v1::VolumeAttachmentStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_volumeattachment_proto_gen(&buf)
+            .expect("sentinel VolumeAttachment must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "attacher",
+            "nodeName",
+            "source",
+            "persistentVolumeName",
+            // inlineVolumeSpec deliberately excluded — see the module-level note above.
+            "status",
+            "attached",
+            "attachmentMetadata",
+            "attachError",
+            "message",
+            "time",
+            "errorCode",
+            "detachError",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_storageclass_proto_gen() {
+        let obj = storage_v1::StorageClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            provisioner: Some("csi.example.com".to_string()),
+            parameters: [("type".to_string(), "gp3".to_string())].into_iter().collect(),
+            reclaim_policy: Some("Retain".to_string()),
+            mount_options: vec!["noatime".to_string()],
+            allow_volume_expansion: Some(true),
+            volume_binding_mode: Some("WaitForFirstConsumer".to_string()),
+            allowed_topologies: vec![
+                crate::storage_node_flow_gen::k8s::io::api::core::v1::TopologySelectorTerm::sentinel(
+                ),
+            ],
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_storageclass_proto_gen(&buf)
+            .expect("sentinel StorageClass must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "provisioner",
+            "parameters",
+            "reclaimPolicy",
+            "mountOptions",
+            "allowVolumeExpansion",
+            "volumeBindingMode",
+            "allowedTopologies",
+            "matchLabelExpressions",
+            "key",
+            "values",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_volumeattributesclass_proto_gen() {
+        let obj = storage_v1::VolumeAttributesClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            driver_name: Some("csi.example.com".to_string()),
+            parameters: [("iops".to_string(), "3000".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_volumeattributesclass_proto_gen(&buf)
+            .expect("sentinel VolumeAttributesClass must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(["driverName", "parameters"]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_runtimeclass_proto_gen() {
+        let obj = node_v1::RuntimeClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            handler: Some("runsc".to_string()),
+            overhead: Some(node_v1::Overhead::sentinel()),
+            scheduling: Some(node_v1::Scheduling::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_runtimeclass_proto_gen(&buf)
+            .expect("sentinel RuntimeClass must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "handler",
+            "overhead",
+            "podFixed",
+            "scheduling",
+            "nodeSelector",
+            "tolerations",
+            "key",
+            "operator",
+            "value",
+            "effect",
+            "tolerationSeconds",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_priorityclass_proto_gen() {
+        let obj = scheduling_v1::PriorityClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            value: Some(1_000_000),
+            global_default: Some(true),
+            description: Some("critical workloads".to_string()),
+            preemption_policy: Some("Never".to_string()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_priorityclass_proto_gen(&buf)
+            .expect("sentinel PriorityClass must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(["value", "globalDefault", "description", "preemptionPolicy"]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_flowschema_proto_gen() {
+        let obj = flowcontrol_v1::FlowSchema {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(flowcontrol_v1::FlowSchemaSpec::sentinel()),
+            status: Some(flowcontrol_v1::FlowSchemaStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_flowschema_proto_gen(&buf)
+            .expect("sentinel FlowSchema must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "matchingPrecedence",
+            "priorityLevelConfiguration",
+            "distinguisherMethod",
+            "type",
+            "rules",
+            "subjects",
+            // Subject.kind deliberately excluded — masked by the envelope's own top-level
+            // "kind": "FlowSchema" literal.
+            "user",
+            "group",
+            "serviceAccount",
+            "resourceRules",
+            "verbs",
+            "apiGroups",
+            "resources",
+            "clusterScope",
+            "namespaces",
+            "nonResourceRules",
+            "nonResourceURLs",
+            "status",
+            "conditions",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_prioritylevelconfiguration_proto_gen() {
+        let obj = flowcontrol_v1::PriorityLevelConfiguration {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(flowcontrol_v1::PriorityLevelConfigurationSpec::sentinel()),
+            status: Some(flowcontrol_v1::PriorityLevelConfigurationStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_prioritylevelconfiguration_proto_gen(&buf)
+            .expect("sentinel PriorityLevelConfiguration must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "type",
+            "limited",
+            "nominalConcurrencyShares",
+            "lendablePercent",
+            "borrowingLimitPercent",
+            "limitResponse",
+            "queuing",
+            "queues",
+            "handSize",
+            "queueLengthLimit",
+            "exempt",
+            "status",
+            "conditions",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
     }
 }

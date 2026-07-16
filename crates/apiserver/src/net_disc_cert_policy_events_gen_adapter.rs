@@ -196,6 +196,22 @@ fn gen_ingress_backend_to_json(b: networking_v1::IngressBackend) -> serde_json::
         }
         out.insert("service".to_string(), serde_json::Value::Object(svc_json));
     }
+    // resource is the mutually-exclusive alternative to service (routes to a non-Service
+    // Kubernetes resource, e.g. a custom-resource-backed backend); dropping it silently
+    // turned every such Ingress rule/defaultBackend into one with no backend at all.
+    if let Some(r) = b.resource {
+        let mut rj = serde_json::Map::new();
+        if let Some(v) = r.api_group.filter(|s| !s.is_empty()) {
+            rj.insert("apiGroup".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+            rj.insert("kind".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+            rj.insert("name".to_string(), serde_json::Value::String(v));
+        }
+        out.insert("resource".to_string(), serde_json::Value::Object(rj));
+    }
     serde_json::Value::Object(out)
 }
 
@@ -363,6 +379,28 @@ pub fn decode_ingressclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         if let Some(ctrl) = spec.controller.filter(|s| !s.is_empty()) {
             spec_json.insert("controller".to_string(), serde_json::Value::String(ctrl));
         }
+        // parameters links this class to controller-specific config (e.g. an AWS ALB
+        // IngressClassParams CRD); dropping it silently strips that config from every
+        // Ingress routed through this class.
+        if let Some(p) = spec.parameters {
+            let mut pj = serde_json::Map::new();
+            if let Some(v) = p.a_pi_group.filter(|s| !s.is_empty()) {
+                pj.insert("apiGroup".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = p.kind.filter(|s| !s.is_empty()) {
+                pj.insert("kind".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = p.name.filter(|s| !s.is_empty()) {
+                pj.insert("name".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = p.scope.filter(|s| !s.is_empty()) {
+                pj.insert("scope".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = p.namespace.filter(|s| !s.is_empty()) {
+                pj.insert("namespace".to_string(), serde_json::Value::String(v));
+            }
+            spec_json.insert("parameters".to_string(), serde_json::Value::Object(pj));
+        }
         if !spec_json.is_empty() {
             out["spec"] = serde_json::Value::Object(spec_json);
         }
@@ -526,6 +564,23 @@ pub fn decode_endpointslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> 
                         hj.insert("forZones".to_string(), serde_json::Value::Array(fz));
                     }
                 }
+                // forNodes is forZones' node-local counterpart for topology-aware routing;
+                // dropping it silently discarded the hint kube-proxy uses to prefer
+                // same-node endpoints.
+                if !hints.for_nodes.is_empty() {
+                    let fnodes: Vec<serde_json::Value> = hints
+                        .for_nodes
+                        .into_iter()
+                        .filter_map(|n| {
+                            n.name
+                                .filter(|s| !s.is_empty())
+                                .map(|n| serde_json::json!({ "name": n }))
+                        })
+                        .collect();
+                    if !fnodes.is_empty() {
+                        hj.insert("forNodes".to_string(), serde_json::Value::Array(fnodes));
+                    }
+                }
                 if !hj.is_empty() {
                     ej.insert("hints".to_string(), serde_json::Value::Object(hj));
                 }
@@ -614,6 +669,21 @@ pub fn decode_csr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                         .collect(),
                 ),
             );
+        }
+        // extra carries authenticator-supplied attributes about the CSR's creator (e.g.
+        // impersonation extras); dropping it silently strips that context from the request a
+        // signer or approval webhook may key its decision on.
+        if !spec.extra.is_empty() {
+            let extra: serde_json::Map<String, serde_json::Value> = spec
+                .extra
+                .into_iter()
+                .map(|(k, v)| {
+                    let items: Vec<serde_json::Value> =
+                        v.items.into_iter().map(serde_json::Value::String).collect();
+                    (k, serde_json::Value::Array(items))
+                })
+                .collect();
+            spec_json.insert("extra".to_string(), serde_json::Value::Object(extra));
         }
         if !spec_json.is_empty() {
             out["spec"] = serde_json::Value::Object(spec_json);
@@ -866,6 +936,34 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
     }
     if let Some(count) = ev.deprecated_count.filter(|&v| v != 0) {
         out["deprecatedCount"] = serde_json::Value::Number(count.into());
+    }
+    // deprecatedSource/deprecatedFirstTimestamp/deprecatedLastTimestamp back-fill the legacy
+    // core/v1 Event fields for clients still reading events.k8s.io/v1 Events the old way;
+    // deprecatedCount already got this treatment above, these three should not be dropped
+    // just because they share the "deprecated" name.
+    if let Some(src) = ev.deprecated_source {
+        let mut srcj = serde_json::Map::new();
+        if let Some(v) = src.component.filter(|s| !s.is_empty()) {
+            srcj.insert("component".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = src.host.filter(|s| !s.is_empty()) {
+            srcj.insert("host".to_string(), serde_json::Value::String(v));
+        }
+        if !srcj.is_empty() {
+            out["deprecatedSource"] = serde_json::Value::Object(srcj);
+        }
+    }
+    if let Some(t) = ev.deprecated_first_timestamp {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            out["deprecatedFirstTimestamp"] =
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+        }
+    }
+    if let Some(t) = ev.deprecated_last_timestamp {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            out["deprecatedLastTimestamp"] =
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+        }
     }
     Some(out)
 }
@@ -1232,5 +1330,396 @@ mod tests {
             "series.count must survive decode — without it repeated identical events collapse \
              to a count of zero instead of the real occurrence count"
         );
+    }
+
+    // ---- Sentinel completeness ----
+    //
+    // Each test below builds a message with every field set to a value no zero/empty-elision
+    // check in this file's gen_*_to_json functions could mistake for "unset" (see
+    // u7s_sentinel::Sentinel), decodes it through the real decode_*_proto_gen entry point, and
+    // asserts every field name shows up somewhere in the resulting JSON. A name that never
+    // appears means some gen_*_to_json function never reads that field from the decoded
+    // protobuf struct at all — this is exactly how IngressBackend.resource,
+    // IngressClassSpec.parameters, EndpointHints.forNodes, CertificateSigningRequestSpec.extra,
+    // and Event's deprecatedSource/deprecatedFirstTimestamp/deprecatedLastTimestamp were found
+    // missing from this file.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+
+    // selfLink is a legacy field the system no longer populates — permanently omitted.
+    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
+    // pending a separate investigation into gen_object_meta_to_json's correct handling of
+    // them (this file's copy has the same omissions as every other gen_adapter's); do not
+    // guess at the fix here.
+    const OBJECT_META_EXPECTED: &[&str] = &[
+        "name",
+        "generateName",
+        "namespace",
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "labels",
+        "annotations",
+        "ownerReferences",
+        "finalizers",
+    ];
+
+    const LABEL_SELECTOR_EXPECTED: &[&str] = &[
+        "matchLabels",
+        "matchExpressions",
+        "key",
+        "operator",
+        "values",
+    ];
+
+    #[test]
+    fn sentinel_completeness_decode_ingress_proto_gen() {
+        let obj = networking_v1::Ingress {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::IngressSpec::sentinel()),
+            status: Some(networking_v1::IngressStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_ingress_proto_gen(&buf)
+            .expect("sentinel Ingress must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "ingressClassName",
+            "defaultBackend",
+            "service",
+            "port",
+            "number",
+            "resource",
+            // apiGroup/kind on IngressBackend.resource: apiGroup is unique and tested; kind is
+            // deliberately excluded — masked by the envelope's own top-level "kind": "Ingress".
+            "apiGroup",
+            "tls",
+            "hosts",
+            "secretName",
+            "rules",
+            "host",
+            "http",
+            "paths",
+            "path",
+            "pathType",
+            "backend",
+            "status",
+            "loadBalancer",
+            "ingress",
+            "ip",
+            "hostname",
+            "ports",
+            "protocol",
+            "error",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_ingressclass_proto_gen() {
+        let ic = networking_v1::IngressClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::IngressClassSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        ic.encode(&mut buf).unwrap();
+        let result = decode_ingressclass_proto_gen(&buf)
+            .expect("sentinel IngressClass must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "controller",
+            "parameters",
+            "apiGroup",
+            "scope",
+            // "kind"/"namespace" on IngressClassParametersReference deliberately excluded:
+            // kind is masked by the envelope's top-level "kind": "IngressClass" literal, and
+            // namespace is masked by metadata.namespace already being sentinel-populated.
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_ipaddress_proto_gen() {
+        let obj = networking_v1::IpAddress {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::IpAddressSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_ipaddress_proto_gen(&buf)
+            .expect("sentinel IPAddress must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(["spec", "parentRef", "group", "resource"]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_servicecidr_proto_gen() {
+        let obj = networking_v1::ServiceCidr {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::ServiceCidrSpec::sentinel()),
+            status: Some(networking_v1::ServiceCidrStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_servicecidr_proto_gen(&buf)
+            .expect("sentinel ServiceCIDR must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "cidrs",
+            "status",
+            "conditions",
+            "type",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_endpointslice_proto_gen() {
+        let es = discovery_v1::EndpointSlice {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            address_type: Some("IPv4".to_string()),
+            endpoints: vec![discovery_v1::Endpoint::sentinel()],
+            ports: vec![discovery_v1::EndpointPort::sentinel()],
+        };
+        let mut buf = Vec::new();
+        es.encode(&mut buf).unwrap();
+        let result = decode_endpointslice_proto_gen(&buf)
+            .expect("sentinel EndpointSlice must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "addressType",
+            "endpoints",
+            "addresses",
+            "conditions",
+            "ready",
+            "serving",
+            "terminating",
+            "hostname",
+            // targetRef.kind/apiVersion deliberately excluded — masked by the envelope's own
+            // top-level "kind"/"apiVersion" literals. fieldPath is the one ObjectReference
+            // field with no such collision, so it is the meaningful check here.
+            "targetRef",
+            "fieldPath",
+            "nodeName",
+            "zone",
+            "hints",
+            "forZones",
+            "forNodes",
+            "ports",
+            "port",
+            "protocol",
+            "appProtocol",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_csr_proto_gen() {
+        let csr = certs_v1::CertificateSigningRequest {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(certs_v1::CertificateSigningRequestSpec::sentinel()),
+            status: Some(certs_v1::CertificateSigningRequestStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        csr.encode(&mut buf).unwrap();
+        let result = decode_csr_proto_gen(&buf)
+            .expect("sentinel CertificateSigningRequest must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "spec",
+            "request",
+            "signerName",
+            "expirationSeconds",
+            "usages",
+            "username",
+            "groups",
+            "extra",
+            "status",
+            "conditions",
+            "type",
+            "reason",
+            "message",
+            "lastUpdateTime",
+            "lastTransitionTime",
+            "certificate",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_poddisruptionbudget_proto_gen() {
+        let pdb = policy_v1::PodDisruptionBudget {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(policy_v1::PodDisruptionBudgetSpec::sentinel()),
+            status: Some(policy_v1::PodDisruptionBudgetStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        pdb.encode(&mut buf).unwrap();
+        let result = decode_poddisruptionbudget_proto_gen(&buf)
+            .expect("sentinel PodDisruptionBudget must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend(LABEL_SELECTOR_EXPECTED);
+        expected.extend([
+            "spec",
+            "minAvailable",
+            "selector",
+            "maxUnavailable",
+            "unhealthyPodEvictionPolicy",
+            "status",
+            "observedGeneration",
+            "disruptedPods",
+            "disruptionsAllowed",
+            "currentHealthy",
+            "desiredHealthy",
+            "expectedPods",
+            "conditions",
+            "type",
+            "reason",
+            "message",
+            "lastTransitionTime",
+        ]);
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_events_v1_event_proto_gen() {
+        let ev = events_v1::Event {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            event_time: Some(meta_v1::MicroTime::sentinel()),
+            series: Some(events_v1::EventSeries::sentinel()),
+            reporting_controller: Some("kubernetes.io/kubelet".to_string()),
+            reporting_instance: Some("kubelet-abc".to_string()),
+            action: Some("Started".to_string()),
+            reason: Some("Started".to_string()),
+            regarding: Some(
+                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference::sentinel(),
+            ),
+            related: Some(
+                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference::sentinel(),
+            ),
+            note: Some("a note".to_string()),
+            r#type: Some("Normal".to_string()),
+            deprecated_source: Some(
+                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::EventSource::sentinel(),
+            ),
+            deprecated_first_timestamp: Some(meta_v1::Time::sentinel()),
+            deprecated_last_timestamp: Some(meta_v1::Time::sentinel()),
+            deprecated_count: Some(3),
+        };
+        let mut buf = Vec::new();
+        ev.encode(&mut buf).unwrap();
+        let result = decode_events_v1_event_proto_gen(&buf)
+            .expect("sentinel events.k8s.io/v1 Event must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let mut expected = OBJECT_META_EXPECTED.to_vec();
+        expected.extend([
+            "eventTime",
+            "series",
+            "count",
+            "lastObservedTime",
+            "reportingController",
+            "reportingInstance",
+            "action",
+            "reason",
+            // regarding/related.kind/apiVersion deliberately excluded — masked by the
+            // envelope's own top-level "kind"/"apiVersion" literals.
+            "regarding",
+            "related",
+            "fieldPath",
+            "note",
+            "type",
+            "deprecatedCount",
+            "deprecatedSource",
+            "component",
+            "host",
+            "deprecatedFirstTimestamp",
+            "deprecatedLastTimestamp",
+        ]);
+        assert_fields_present(&paths, &expected);
     }
 }
