@@ -3415,6 +3415,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
