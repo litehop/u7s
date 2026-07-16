@@ -132,6 +132,29 @@ pub struct HyperApiClient {
     pub bearer: Option<String>,
 }
 
+/// Total budget for a non-watch request/response cycle (connect through body
+/// collection), and for a watch's connect+handshake+send-request setup phase.
+/// Neither is long-lived, so a hung apiserver must fail fast rather than block
+/// the caller forever — for the scheduler, an unbounded hang here also leaks
+/// the pod's key in its in-flight dedup set, permanently orphaning that pod.
+/// 30s is generous for a slow-but-alive apiserver while still failing well
+/// before a caller-side watchdog would notice.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle timeout for a single `watch_stream` frame read, reset on every frame
+/// received. A healthy watch — even one that never receives a bookmark — can
+/// stay open indefinitely; only a connection silent for this long trips it.
+/// That silence is the half-open-socket failure mode: the peer stops sending
+/// but never closes, so without this timeout `body.frame().await` blocks
+/// forever and the caller's reconnect loop never runs.
+///
+/// The apiserver's optional periodic watch bookmark (`allowWatchBookmarks=true`)
+/// ticks every 60s (crates/apiserver/src/handlers/watch.rs); 5 minutes gives 5x
+/// headroom above that cadence so a bookmark-subscribed watch never trips this
+/// spuriously, while still bounding detection of a truly stuck connection to a
+/// few minutes instead of never.
+const WATCH_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 impl HyperApiClient {
     /// Parse `server` + `path` into (host, port) for TCP connect.
     fn parse_addr(server: &str, path: &str) -> anyhow::Result<(String, u16, String)> {
@@ -189,54 +212,76 @@ impl HyperApiClient {
         body: Option<String>,
         content_type: &str,
     ) -> anyhow::Result<(hyper::StatusCode, String)> {
-        let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
-        let io = self.connect(&host, &addr).await?;
-
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        self.request_with_content_type_timeout(method, path, body, content_type, REQUEST_TIMEOUT)
             .await
-            .context("HTTP/1.1 handshake")?;
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                error!("HTTP connection error: {e}");
-            }
-        });
+    }
 
-        let body_bytes = body
-            .as_deref()
-            .map(|s| bytes::Bytes::from(s.to_owned()))
-            .unwrap_or_default();
+    /// [`request_with_content_type`], but with the request timeout as an explicit
+    /// parameter rather than the hardcoded [`REQUEST_TIMEOUT`]. This lets tests
+    /// exercise the timeout path (a hung apiserver) in milliseconds instead of
+    /// waiting out the real 30s budget.
+    async fn request_with_content_type_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<String>,
+        content_type: &str,
+        request_timeout: std::time::Duration,
+    ) -> anyhow::Result<(hyper::StatusCode, String)> {
+        let call = async move {
+            let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
+            let io = self.connect(&host, &addr).await?;
 
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("Host", &host)
-            .header("Accept", "application/json");
-        if body.is_some() {
-            builder = builder
-                .header("Content-Type", content_type)
-                .header("Content-Length", body_bytes.len().to_string());
-        }
-        if let Some(tok) = &self.bearer {
-            builder = builder.header("Authorization", format!("Bearer {tok}"));
-        }
-        let req = builder
-            .body(http_body_util::Full::new(body_bytes))
-            .context("build request")?;
-
-        use http_body_util::BodyExt;
-        let resp: hyper::Response<hyper::body::Incoming> =
-            sender.send_request(req).await.context("send request")?;
-        let status = resp.status();
-        let text = String::from_utf8_lossy(
-            &resp
-                .into_body()
-                .collect()
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
                 .await
-                .context("read body")?
-                .to_bytes(),
-        )
-        .into_owned();
-        Ok((status, text))
+                .context("HTTP/1.1 handshake")?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    error!("HTTP connection error: {e}");
+                }
+            });
+
+            let body_bytes = body
+                .as_deref()
+                .map(|s| bytes::Bytes::from(s.to_owned()))
+                .unwrap_or_default();
+
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("Host", &host)
+                .header("Accept", "application/json");
+            if body.is_some() {
+                builder = builder
+                    .header("Content-Type", content_type)
+                    .header("Content-Length", body_bytes.len().to_string());
+            }
+            if let Some(tok) = &self.bearer {
+                builder = builder.header("Authorization", format!("Bearer {tok}"));
+            }
+            let req = builder
+                .body(http_body_util::Full::new(body_bytes))
+                .context("build request")?;
+
+            use http_body_util::BodyExt;
+            let resp: hyper::Response<hyper::body::Incoming> =
+                sender.send_request(req).await.context("send request")?;
+            let status = resp.status();
+            let text = String::from_utf8_lossy(
+                &resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .context("read body")?
+                    .to_bytes(),
+            )
+            .into_owned();
+            anyhow::Ok((status, text))
+        };
+
+        tokio::time::timeout(request_timeout, call)
+            .await
+            .with_context(|| format!("request to {path} timed out after {request_timeout:?}"))?
     }
 
     /// Stream newline-delimited JSON events from a watch endpoint.
@@ -247,63 +292,109 @@ impl HyperApiClient {
     pub async fn watch_stream(
         &self,
         path: &str,
-        mut on_event: impl FnMut(Value),
+        on_event: impl FnMut(Value),
     ) -> anyhow::Result<()> {
-        let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
-        let io = self.connect(&host, &addr).await?;
+        // Connecting and sending the initial watch request is not long-lived,
+        // so it gets the same bounded treatment as a normal request. Only the
+        // frame-read loop below — the watch itself — is allowed to run
+        // indefinitely, guarded instead by the per-frame idle timeout.
+        let setup = async move {
+            let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
+            let io = self.connect(&host, &addr).await?;
 
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .context("HTTP/1.1 handshake")?;
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                error!("watch connection error: {e}");
-            }
-        });
-
-        let mut builder = Request::builder()
-            .method(Method::GET)
-            .uri(path)
-            .header("Host", &host)
-            .header("Accept", "application/json");
-        if let Some(tok) = &self.bearer {
-            builder = builder.header("Authorization", format!("Bearer {tok}"));
-        }
-        let req = builder
-            .body(http_body_util::Empty::<bytes::Bytes>::new())
-            .context("build watch request")?;
-
-        use http_body_util::BodyExt;
-        let resp: hyper::Response<hyper::body::Incoming> = sender
-            .send_request(req)
-            .await
-            .context("send watch request")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("watch returned HTTP {}", resp.status());
-        }
-
-        let mut body = resp.into_body();
-        let mut buf = String::new();
-
-        loop {
-            match body.frame().await {
-                None => break,
-                Some(Err(e)) => {
-                    warn!("watch stream error: {e}");
-                    break;
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                .await
+                .context("HTTP/1.1 handshake")?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    error!("watch connection error: {e}");
                 }
-                Some(Ok(frame)) => {
-                    let frame: hyper::body::Frame<bytes::Bytes> = frame;
-                    if let Ok(data) = frame.into_data() {
-                        buf.push_str(&String::from_utf8_lossy(&data));
-                        drain_watch_buffer(&mut buf, &mut on_event);
-                    }
-                }
-            }
-        }
+            });
 
-        Ok(())
+            let mut builder = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header("Host", &host)
+                .header("Accept", "application/json");
+            if let Some(tok) = &self.bearer {
+                builder = builder.header("Authorization", format!("Bearer {tok}"));
+            }
+            let req = builder
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                .context("build watch request")?;
+
+            let resp: hyper::Response<hyper::body::Incoming> = sender
+                .send_request(req)
+                .await
+                .context("send watch request")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("watch returned HTTP {}", resp.status());
+            }
+            anyhow::Ok(resp)
+        };
+
+        let resp = tokio::time::timeout(REQUEST_TIMEOUT, setup)
+            .await
+            .with_context(|| {
+                format!("watch connect to {path} timed out after {REQUEST_TIMEOUT:?}")
+            })??;
+
+        read_watch_frames(resp.into_body(), WATCH_IDLE_TIMEOUT, path, on_event).await
     }
+}
+
+/// Read frames from a watch response body until it ends or errors, feeding
+/// complete newline-delimited JSON lines to `on_event`.
+///
+/// `idle_timeout` guards a single `frame()` read and resets every time one
+/// arrives — it is not a deadline on the whole call. A healthy watch (even one
+/// that never receives a bookmark) can therefore stay open indefinitely; only
+/// a connection silent for `idle_timeout` trips it. That silence is the
+/// half-open-socket failure mode: the peer stops sending but never closes, so
+/// without this timeout a read blocks forever and a caller's reconnect loop
+/// never runs.
+///
+/// Takes `idle_timeout` as a parameter (rather than reading `WATCH_IDLE_TIMEOUT`
+/// directly) so tests can exercise the timeout path in milliseconds instead of
+/// waiting out the real 5-minute budget.
+async fn read_watch_frames<B>(
+    mut body: B,
+    idle_timeout: std::time::Duration,
+    path: &str,
+    mut on_event: impl FnMut(Value),
+) -> anyhow::Result<()>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    use http_body_util::BodyExt;
+    let mut buf = String::new();
+
+    loop {
+        match tokio::time::timeout(idle_timeout, body.frame()).await {
+            Err(_) => {
+                warn!(
+                    "watch stream on {path} idle for {idle_timeout:?} with no frames; \
+                     treating as a half-open connection and disconnecting"
+                );
+                anyhow::bail!("watch stream idle timeout after {idle_timeout:?}");
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                warn!("watch stream error: {e}");
+                break;
+            }
+            Ok(Some(Ok(frame))) => {
+                let frame: hyper::body::Frame<bytes::Bytes> = frame;
+                if let Ok(data) = frame.into_data() {
+                    buf.push_str(&String::from_utf8_lossy(&data));
+                    drain_watch_buffer(&mut buf, &mut on_event);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Drain all complete newline-terminated JSON lines from `buf`, calling
@@ -668,6 +759,77 @@ mod tests {
         );
     }
 
+    /// HyperApiClient::request_with_content_type must return Err once the request
+    /// timeout elapses against a peer that accepts the TCP connection but then
+    /// never sends a byte back — a live-but-hung apiserver, not a refused or
+    /// closed connection.
+    ///
+    /// Before request timeouts existed, this exact scenario hung the scheduler's
+    /// bind_pod/patch_pod_status/emit_scheduling_event calls indefinitely; via
+    /// the scheduler's in-flight dedup set, a hung call permanently orphaned the
+    /// pod being processed. Uses the crate-private `_timeout` variant with a
+    /// short duration so the test doesn't wait out the real 30s production
+    /// budget; an outer real-time guard fails the test loudly if the fix
+    /// regresses instead of hanging `cargo test` forever.
+    #[tokio::test]
+    async fn request_with_content_type_returns_err_after_request_timeout_on_stalled_peer() {
+        let (ca_pem, cert_pem, key_pem) = make_test_certs();
+        let yaml = make_kubeconfig_yaml("https://127.0.0.1:6443", &ca_pem, &cert_pem, &key_pem);
+        let path = write_temp_file(&yaml, "client-stalled-peer");
+        let creds = parse_kubeconfig(path.to_str().unwrap()).expect("parse must succeed");
+        let connector = build_tls_connector(&creds).expect("connector must build");
+        let _ = std::fs::remove_file(&path);
+
+        // A bare TCP listener that accepts the connection and then holds it open
+        // forever without writing anything back. The client's TLS handshake blocks
+        // waiting for a ServerHello that never arrives — a half-open connection,
+        // not a refused or reset one.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let client = HyperApiClient {
+            server: format!("https://127.0.0.1:{port}"),
+            connector,
+            bearer: None,
+        };
+
+        let request_timeout = std::time::Duration::from_millis(100);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.request_with_content_type_timeout(
+                hyper::Method::GET,
+                "/api/v1/nodes",
+                None,
+                "application/json",
+                request_timeout,
+            ),
+        )
+        .await
+        .expect(
+            "request_with_content_type must return within 5s of a 100ms request timeout; a \
+             hang here means a stalled apiserver would wedge the scheduler task (and, via \
+             in-flight dedup, permanently orphan the pod) forever",
+        );
+
+        assert!(
+            result.is_err(),
+            "a request to a peer that accepts but never responds must return Err after the \
+             request timeout instead of hanging; got Ok"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("timed out"),
+            "error must describe a timeout, not some other failure; got: {msg}"
+        );
+    }
+
     /// HyperApiClient::watch_stream with an in-process TLS mock server must
     /// deliver all newline-delimited JSON events to the on_event callback.
     ///
@@ -831,6 +993,61 @@ mod tests {
         );
         assert_eq!(received[0]["type"], "ADDED");
         assert_eq!(received[1]["type"], "MODIFIED");
+    }
+
+    /// A fake watch body whose `poll_frame` never resolves — no data, no end,
+    /// no error — simulating a half-open connection where the peer stops
+    /// sending frames but never closes the socket.
+    struct StalledBody;
+
+    impl hyper::body::Body for StalledBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// read_watch_frames must return Err once idle_timeout elapses against a
+    /// body that never yields a frame and never ends, instead of hanging.
+    ///
+    /// This is the exact failure mode that, before the idle timeout existed,
+    /// wedged the scheduler's entire pod-discovery loop forever: watch_stream
+    /// never returns, so main.rs's 5s-reconnect fallback (which only runs
+    /// after the watch call returns) never fires, and no pod is ever scheduled
+    /// again until the process is restarted. The outer real-time timeout means
+    /// a regression here fails this test loudly instead of hanging `cargo test`
+    /// forever.
+    #[tokio::test]
+    async fn read_watch_frames_returns_err_after_idle_timeout_on_stalled_body() {
+        let idle_timeout = std::time::Duration::from_millis(50);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_watch_frames(
+                StalledBody,
+                idle_timeout,
+                "/api/v1/pods?watch=true",
+                |_: Value| {
+                    panic!("StalledBody never yields a frame; on_event must not be called");
+                },
+            ),
+        )
+        .await
+        .expect(
+            "read_watch_frames must return within 5s of a 50ms idle timeout; a hang here means \
+             a half-open watch (peer silent, socket never closed) would wedge the scheduler's \
+             entire pod-discovery loop forever",
+        );
+
+        assert!(
+            result.is_err(),
+            "a stalled frame source must yield Err after idle_timeout so the caller's \
+             reconnect loop fires instead of blocking forever; got Ok"
+        );
     }
 
     /// HyperApiClient::watch_stream with a plain-HTTP mock server must deliver
