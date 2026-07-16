@@ -1503,13 +1503,23 @@ pub fn delete_pod_path(namespace: &str, pod_name: &str) -> String {
 }
 
 /// Check a pod-eviction DELETE response status, returning Err on failures other
-/// than "already gone".
+/// than "already gone" or "already changing".
 ///
 /// A 404 means the pod was already removed — by a previous retry of this same
 /// eviction, or another actor — which is the outcome preemption wants, so it
 /// must be treated as success rather than aborting the eviction loop.
+///
+/// A 409 means the eviction's own soft-delete PUT lost an optimistic-concurrency
+/// race against a concurrent write to the same victim (e.g. the kubelet's
+/// routine status sync while the pod is being torn down, or another scheduling
+/// attempt evicting the same victim). `delete_pod` issues this DELETE twice
+/// (soft-delete then force-delete) specifically to drive the pod to gone, so a
+/// 409 here just means the current attempt lost that race, not that eviction
+/// failed — the pod is already moving toward deletion. Treating it as fatal
+/// would abort the whole preemption cycle via `?` and leave the preemptor
+/// pod stuck Pending.
 pub fn check_delete_response(status: u16) -> anyhow::Result<()> {
-    if (200..300).contains(&status) || status == 404 {
+    if (200..300).contains(&status) || status == 404 || status == 409 {
         return Ok(());
     }
     bail!("evict failed with HTTP {status}")
@@ -4315,6 +4325,23 @@ mod tests {
     fn check_delete_response_ok_on_2xx() {
         assert!(check_delete_response(200).is_ok());
         assert!(check_delete_response(202).is_ok());
+    }
+
+    /// `delete_pod` issues DELETE twice (soft-delete then force-delete) to drive a
+    /// victim to gone; the second call races the first's resourceVersion bump
+    /// against any concurrent write to the same pod (e.g. the kubelet's routine
+    /// status sync while it terminates) and can lose with a 409. That is a benign
+    /// "already changing" signal, not a real failure — treating it as a hard
+    /// error aborts the entire preemption `?`-chain in main.rs's eviction loop,
+    /// leaving the higher-priority preemptor pod stuck Pending until a passive
+    /// watch reconnect minutes later, well past conformance test timeouts.
+    #[test]
+    fn check_delete_response_ok_on_409_conflict() {
+        assert!(
+            check_delete_response(409).is_ok(),
+            "409 from delete_pod's own double-DELETE race must be tolerated, or a single \
+             benign conflict aborts the whole preemption cycle and strands the preemptor"
+        );
     }
 
     /// A genuine failure (e.g. 500, or 403 if RBAC forbids the scheduler from
