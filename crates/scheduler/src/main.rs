@@ -27,7 +27,8 @@ use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event, find_preemption_plan,
     needs_scheduling, patch_pod_status, pick_node, scheduling_gate_status_patch,
-    scheduling_gate_status_reset, should_schedule, stream_watch_events, NodeTally, PendingPod,
+    scheduling_gate_status_reset, should_retry_without_preempting, should_schedule,
+    stream_watch_events, NodeTally, PendingPod,
 };
 
 /// Reserve `pending`'s slot on `node` in `tally` before binding, so a
@@ -234,9 +235,31 @@ async fn main() -> anyhow::Result<()> {
                 // `kubectl describe pod` and the SchedulerPredicates e2e suite's
                 // observeEventAfterAction watch never see a Scheduled/FailedScheduling
                 // event and the watch times out (mayor-lafgk).
+                let first_pick =
+                    pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await;
+                if let Err(e) = &first_pick {
+                    if should_retry_without_preempting(e) {
+                        // A GET /api/v1/nodes failure (or an unparseable
+                        // response) says nothing about whether the cluster
+                        // actually has room — unlike a genuine NoCapacity,
+                        // treating it as one would run preemption (evicting
+                        // real lower-priority pods) or mark this pod
+                        // FailedScheduling off a transient infra hiccup.
+                        // Leave the pod Pending: the watch redelivers a
+                        // MODIFIED event for it, so pick_node simply runs
+                        // again on the next tick.
+                        error!(
+                            "pick_node could not reach the API server while scheduling {key}: {e} — retrying on next watch tick"
+                        );
+                        in_flight_clone
+                            .lock()
+                            .expect("in_flight lock poisoned")
+                            .remove(&key);
+                        return;
+                    }
+                }
                 let outcome: anyhow::Result<String> = async {
-                    match pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await
-                    {
+                    match first_pick {
                         Ok(node) => {
                             assume_and_bind(
                                 &connector_clone,

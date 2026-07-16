@@ -1336,6 +1336,27 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
         .context("no nodes available")
 }
 
+/// Why `pick_node` failed to find a node for a pending pod.
+///
+/// The caller must treat these two causes very differently. `NoCapacity`
+/// means every qualifying node was actually checked and none had room — a
+/// legitimate reason to fall back to preemption (see `find_preemption_plan`).
+/// `ApiError` means the GET /api/v1/nodes call itself failed, or its body
+/// could not be parsed — no node was actually checked, so this says nothing
+/// about real capacity. Collapsing `ApiError` into `NoCapacity` (the bug this
+/// type replaces) would run preemption — evicting real lower-priority pods —
+/// or mark the pod FailedScheduling, off a transient infra hiccup that the
+/// next watch tick would otherwise have retried cleanly.
+#[derive(Debug, thiserror::Error)]
+pub enum PickNodeError {
+    #[error(
+        "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)"
+    )]
+    NoCapacity,
+    #[error(transparent)]
+    ApiError(#[from] anyhow::Error),
+}
+
 /// Return the name of the first node that qualifies for `pod`
 /// (see `node_qualifies_for_pod`), has at least one free pod slot, and has
 /// enough uncommitted cpu/memory/ephemeral-storage for `pod.requests`
@@ -1354,24 +1375,44 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
 /// `NodeTally::assume`).
 ///
 /// A node at or above its `status.allocatable.pods` limit, or that cannot fit
-/// `pod.requests` alongside what's already tallied, is skipped.  Returns
-/// `Err` when no suitable node exists so that the caller can skip binding and
-/// leave the pod Pending (mayor-bbxr: without this check, pods are bound to
-/// full nodes and the kubelet fails them
-/// OutOfpods/OutOfcpu/OutOfephemeral-storage).
+/// `pod.requests` alongside what's already tallied, is skipped. Returns
+/// `Err(PickNodeError::NoCapacity)` when no suitable node exists so the
+/// caller can skip binding and leave the pod Pending (mayor-bbxr: without
+/// this check, pods are bound to full nodes and the kubelet fails them
+/// OutOfpods/OutOfcpu/OutOfephemeral-storage). Returns
+/// `Err(PickNodeError::ApiError(_))` when the GET or its response body is
+/// itself unusable — see `PickNodeError` for why the caller must not treat
+/// that the same as `NoCapacity`.
 pub async fn pick_node(
     connector: &TlsConnector,
     server: &str,
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
-) -> anyhow::Result<String> {
+) -> Result<String, PickNodeError> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
-        bail!("GET /api/v1/nodes returned {status}: {body}");
+        return Err(PickNodeError::ApiError(anyhow::anyhow!(
+            "GET /api/v1/nodes returned {status}: {body}"
+        )));
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
     let node_usage = tally.lock().expect("tally lock poisoned").usage_by_node();
-    select_node_with_capacity(list, pod, &node_usage)
+    select_node_with_capacity(list, pod, &node_usage).map_err(|_| PickNodeError::NoCapacity)
+}
+
+/// Whether a `pick_node` failure should be treated as "leave this pod
+/// Pending and let the watch retry" instead of falling through to
+/// preemption.
+///
+/// Pure predicate over the typed error — no networking — so the exact
+/// branch that was bugged before `PickNodeError` existed (every `pick_node`
+/// failure fell through to preemption, so a transient GET failure could
+/// evict real lower-priority pods, or mark an otherwise-healthy pod
+/// FailedScheduling, for no actual capacity reason) can be unit-tested
+/// without a fake API server — `main.rs`'s tokio::spawn body that acts on
+/// this isn't otherwise reachable from a unit test.
+pub fn should_retry_without_preempting(err: &PickNodeError) -> bool {
+    matches!(err, PickNodeError::ApiError(_))
 }
 
 /// A viable preemption outcome: the node to bind the pending pod to, and the
@@ -1887,6 +1928,40 @@ mod tests {
         // 500 Internal Server Error must not be silently swallowed.
         let result = check_bind_response(500, "internal error");
         assert!(result.is_err(), "500 must return Err");
+    }
+
+    // should_retry_without_preempting tests — before PickNodeError existed, a
+    // transient GET /api/v1/nodes failure and a genuine full cluster produced
+    // the same untyped Err, so main.rs treated an apiserver hiccup exactly
+    // like "no capacity" and fell through to preemption: it could evict real
+    // lower-priority pods, or mark the pod FailedScheduling, over a blip the
+    // next watch tick would have retried cleanly.
+
+    #[test]
+    fn should_retry_without_preempting_is_false_for_no_capacity() {
+        // A genuine NoCapacity means every qualifying node was actually
+        // checked and none had room. If this returned true (retry instead of
+        // preempt), a higher-priority pod stuck behind lower-priority ones
+        // on a truly full cluster would stay Pending forever, since nothing
+        // would ever try to preempt for it.
+        assert!(
+            !should_retry_without_preempting(&PickNodeError::NoCapacity),
+            "a real NoCapacity must fall through to preemption, not a bare retry"
+        );
+    }
+
+    #[test]
+    fn should_retry_without_preempting_is_true_for_api_error() {
+        // The GET /api/v1/nodes call itself failed — no node was actually
+        // checked, so this says nothing about real cluster capacity. If this
+        // returned false (the pre-fix behavior), main.rs would preempt real
+        // lower-priority pods, or mark this pod FailedScheduling, over a
+        // transient apiserver hiccup instead of just retrying next tick.
+        let err = PickNodeError::ApiError(anyhow::anyhow!("GET /api/v1/nodes returned 503"));
+        assert!(
+            should_retry_without_preempting(&err),
+            "a transient API error must not trigger preemption or FailedScheduling"
+        );
     }
 
     // should_schedule tests — the dedup guard for concurrent bind_pod spawns.
