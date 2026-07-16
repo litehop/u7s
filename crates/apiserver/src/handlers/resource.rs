@@ -2799,8 +2799,108 @@ async fn strip_owner_from_resources<S: Store>(
     }
 }
 
-/// Delete all pods in `namespace` whose `ownerReferences` contain an entry with
-/// `kind == owner_kind` and `uid == owner_uid`.
+/// Returns true if `owner_ref` (an ownerReference entry: apiVersion/kind/name/uid)
+/// still points at an object that exists in `namespace` under that exact uid.
+///
+/// Backs the "does this dependent have another live owner" check in the explicit-cascade
+/// helpers below. A dependent can carry more than one ownerReference — e.g. the GC
+/// conformance spec "should not delete dependents that have both valid owner and owner
+/// that's waiting for dependents to be deleted" patches a second, unrelated
+/// ReplicationController onto half of the first RC's pods. A reference whose uid no
+/// longer matches the object currently stored at that name (the name was reused by an
+/// unrelated object) does not count as live.
+async fn owner_ref_is_live<S: Store>(
+    state: &crate::state::AppState<S>,
+    namespace: &str,
+    owner_ref: &serde_json::Value,
+) -> bool {
+    let kind = owner_ref["kind"].as_str().unwrap_or("");
+    let uid = owner_ref["uid"].as_str().unwrap_or("");
+    let name = owner_ref["name"].as_str().unwrap_or("");
+    if kind.is_empty() || uid.is_empty() || name.is_empty() {
+        return false;
+    }
+    let api_version = owner_ref["apiVersion"].as_str().unwrap_or("");
+    let group = api_version.split_once('/').map(|(g, _)| g).unwrap_or("");
+
+    let plural = match state
+        .resource_registry
+        .iter()
+        .find(|(rk, meta)| rk.group == group && meta.kind == kind)
+    {
+        Some((rk, _)) => rk.plural.clone(),
+        None => return false,
+    };
+
+    let key = crate::keys::group_object_key(group, &plural, Some(namespace), name);
+    let stored = match state.store.get(&key).await {
+        Ok(Some(obj)) => obj,
+        _ => return false,
+    };
+    let stored: serde_json::Value = match serde_json::from_slice(&stored.value) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    stored["metadata"]["uid"].as_str() == Some(uid)
+}
+
+/// Removes `owner_uid`'s entry from `refs` and persists the result at `key` if the
+/// dependent has another live owner; otherwise hard-deletes the object at `key`.
+///
+/// Returns true if the object was hard-deleted, false if it survived with the reference
+/// stripped — callers use this to decide whether to keep cascading to grandchildren
+/// (e.g. a surviving ReplicaSet's pods must not be touched).
+///
+/// Shared by every explicit-cascade helper below (pods, ReplicaSets, Jobs): deleting one
+/// owner must only remove that owner's reference from a dependent, never destroy a
+/// dependent that another live owner still legitimately references. Without this check,
+/// a foreground/background cascade from any of RC/DaemonSet/StatefulSet/ReplicaSet/Job
+/// silently destroys still-owned dependents — the exact failure the GC conformance spec
+/// above asserts against.
+async fn strip_or_delete_dependent<S: Store>(
+    state: &crate::state::AppState<S>,
+    namespace: &str,
+    key: &str,
+    mut obj: serde_json::Value,
+    refs: Vec<serde_json::Value>,
+    owner_uid: &str,
+    label: &str,
+) -> bool {
+    let mut other_live = false;
+    for other in refs.iter().filter(|r| r["uid"].as_str() != Some(owner_uid)) {
+        if owner_ref_is_live(state, namespace, other).await {
+            other_live = true;
+            break;
+        }
+    }
+
+    if !other_live {
+        if let Err(e) = state.store.delete(key, None).await {
+            tracing::warn!("cascade-delete {label}: {e}");
+        }
+        return true;
+    }
+
+    let filtered: Vec<serde_json::Value> = refs
+        .into_iter()
+        .filter(|r| r["uid"].as_str() != Some(owner_uid))
+        .collect();
+    obj["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
+    match serde_json::to_vec(&obj) {
+        Ok(b) => {
+            if let Err(e) = state.store.put(key, bytes::Bytes::from(b), None).await {
+                tracing::warn!("cascade-delete {label}: strip owner ref failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("cascade-delete {label}: serialize failed: {e}"),
+    }
+    false
+}
+
+/// Delete pods in `namespace` whose `ownerReferences` contain an entry with
+/// `kind == owner_kind` and `uid == owner_uid` — unless the pod has another owner that
+/// still exists, in which case only that matching ownerReference is stripped and the pod
+/// survives (see `strip_or_delete_dependent`).
 ///
 /// Called after a DaemonSet hard-delete to cascade-delete owned pods immediately.
 /// Without this, DaemonSet pods linger for the full pod GC timeout (10+ minutes),
@@ -2829,14 +2929,13 @@ async fn delete_pods_owned_by<S: Store>(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let owned = pod["metadata"]["ownerReferences"]
-            .as_array()
-            .map(|refs| {
-                refs.iter().any(|r| {
-                    r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some(owner_kind)
-                })
-            })
-            .unwrap_or(false);
+        let refs = match pod["metadata"]["ownerReferences"].as_array() {
+            Some(r) => r.clone(),
+            None => continue,
+        };
+        let owned = refs.iter().any(|r| {
+            r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some(owner_kind)
+        });
         if !owned {
             continue;
         }
@@ -2845,9 +2944,16 @@ async fn delete_pods_owned_by<S: Store>(
             continue;
         }
         let pod_key = crate::keys::group_object_key("", "pods", Some(namespace), &pod_name);
-        if let Err(e) = state.store.delete(&pod_key, None).await {
-            tracing::warn!("cascade-delete pod {namespace}/{pod_name}: {e}");
-        }
+        strip_or_delete_dependent(
+            state,
+            namespace,
+            &pod_key,
+            pod,
+            refs,
+            owner_uid,
+            &format!("pod {namespace}/{pod_name}"),
+        )
+        .await;
     }
 }
 
@@ -2855,6 +2961,10 @@ async fn delete_pods_owned_by<S: Store>(
 /// Without this, orphaned ReplicaSets keep their desired-replica count active and continue
 /// creating pods indefinitely — observed: RS with desired=1337 created 14000+ pods after
 /// its Deployment was deleted.
+///
+/// A ReplicaSet with another live owner besides this Deployment survives with only the
+/// Deployment's reference stripped (see `strip_or_delete_dependent`), and its pods are
+/// left untouched since the RS itself is still alive.
 async fn delete_replicasets_owned_by<S: Store>(
     state: &crate::state::AppState<S>,
     namespace: &str,
@@ -2878,14 +2988,13 @@ async fn delete_replicasets_owned_by<S: Store>(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let owned = rs["metadata"]["ownerReferences"]
-            .as_array()
-            .map(|refs| {
-                refs.iter().any(|r| {
-                    r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some("Deployment")
-                })
-            })
-            .unwrap_or(false);
+        let refs = match rs["metadata"]["ownerReferences"].as_array() {
+            Some(r) => r.clone(),
+            None => continue,
+        };
+        let owned = refs.iter().any(|r| {
+            r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some("Deployment")
+        });
         if !owned {
             continue;
         }
@@ -2896,12 +3005,20 @@ async fn delete_replicasets_owned_by<S: Store>(
         let rs_uid = rs["metadata"]["uid"].as_str().unwrap_or("").to_string();
         let rs_key =
             crate::keys::group_object_key("apps", "replicasets", Some(namespace), &rs_name);
-        if let Err(e) = state.store.delete(&rs_key, None).await {
-            tracing::warn!("cascade-delete replicaset {namespace}/{rs_name}: {e}");
-        }
+        let deleted = strip_or_delete_dependent(
+            state,
+            namespace,
+            &rs_key,
+            rs,
+            refs,
+            owner_uid,
+            &format!("replicaset {namespace}/{rs_name}"),
+        )
+        .await;
         // Cascade-delete pods owned by this RS — without this, RS-owned pods linger
-        // against the 110-pod node cap and cause OutOfpods saturation.
-        if !rs_uid.is_empty() {
+        // against the 110-pod node cap and cause OutOfpods saturation. Skipped when the
+        // RS itself survived: its pods are still legitimately owned by it.
+        if deleted && !rs_uid.is_empty() {
             delete_pods_owned_by(state, namespace, &rs_uid, "ReplicaSet").await;
         }
     }
@@ -2913,7 +3030,9 @@ async fn delete_replicasets_owned_by<S: Store>(
 /// CronJob is deleted — the GC conformance spec "should delete jobs and pods created by
 /// cronjob" times out asserting both are gone.
 ///
-/// Each owned Job is hard-deleted, then its pods are cleaned up via the existing
+/// A Job with another live owner besides this CronJob survives with only the CronJob's
+/// reference stripped (see `strip_or_delete_dependent`), and its pods are left untouched.
+/// Otherwise the Job is hard-deleted, then its pods are cleaned up via the existing
 /// Job→pods helpers (remove_job_tracking_finalizer_from_pods + delete_pods_owned_by).
 async fn delete_jobs_owned_by<S: Store>(
     state: &crate::state::AppState<S>,
@@ -2938,14 +3057,13 @@ async fn delete_jobs_owned_by<S: Store>(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let owned = job["metadata"]["ownerReferences"]
-            .as_array()
-            .map(|refs| {
-                refs.iter().any(|r| {
-                    r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some("CronJob")
-                })
-            })
-            .unwrap_or(false);
+        let refs = match job["metadata"]["ownerReferences"].as_array() {
+            Some(r) => r.clone(),
+            None => continue,
+        };
+        let owned = refs
+            .iter()
+            .any(|r| r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some("CronJob"));
         if !owned {
             continue;
         }
@@ -2955,13 +3073,21 @@ async fn delete_jobs_owned_by<S: Store>(
         }
         let job_uid = job["metadata"]["uid"].as_str().unwrap_or("").to_string();
         let job_key = crate::keys::group_object_key("batch", "jobs", Some(namespace), &job_name);
-        if let Err(e) = state.store.delete(&job_key, None).await {
-            tracing::warn!("cascade-delete job {namespace}/{job_name}: {e}");
-        }
+        let deleted = strip_or_delete_dependent(
+            state,
+            namespace,
+            &job_key,
+            job,
+            refs,
+            owner_uid,
+            &format!("job {namespace}/{job_name}"),
+        )
+        .await;
         // Cascade-delete pods owned by this Job — two-level chain: CronJob→Job→Pod.
         // The job-tracking finalizer must be removed first (KCM sets it); then hard-delete
         // any pods that are now finalizer-free with a deletionTimestamp, and delete the rest.
-        if !job_uid.is_empty() {
+        // Skipped when the Job itself survived: its pods are still legitimately owned by it.
+        if deleted && !job_uid.is_empty() {
             remove_job_tracking_finalizer_from_pods(state, namespace, &job_uid).await;
             delete_pods_owned_by(state, namespace, &job_uid, "Job").await;
         }
@@ -5084,6 +5210,202 @@ mod tests {
         assert!(
             store.get(other_pod_key).await.unwrap().is_some(),
             "pod not owned by the deleted RC must not be affected"
+        );
+    }
+
+    /// A foreground GC cascade must not destroy a pod that still has another live owner.
+    ///
+    /// The k8s GC conformance spec "should not delete dependents that have both valid
+    /// owner and owner that's waiting for dependents to be deleted" (garbage_collector.go)
+    /// creates two ReplicationControllers, patches half of the first RC's pods to add the
+    /// second RC as a co-owner, deletes the first RC with Foreground propagation, and
+    /// asserts the co-owned pods survive with exactly one ownerReference (the second RC's)
+    /// left. delete_pods_owned_by previously matched pods by the deleted owner's uid+kind
+    /// and unconditionally hard-deleted them without checking for another live owner —
+    /// every foreground/background cascade from any RC/DaemonSet/StatefulSet/ReplicaSet/
+    /// Job silently destroyed dependents that were still legitimately owned by something
+    /// else. That is systemic data loss, not just a test failure: any workload adopted by
+    /// a second controller would vanish the moment either owner was deleted.
+    #[tokio::test]
+    async fn foreground_cascade_preserves_pod_with_another_live_owner() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = "default";
+        let owner_a_uid = "aaaaaaaa-0000-0000-0000-000000000001";
+        let owner_b_uid = "bbbbbbbb-0000-0000-0000-000000000002";
+
+        // Seed owner-A (about to be deleted) and owner-B (must stay alive throughout).
+        let owner_a = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "rc-to-be-deleted", "namespace": ns, "uid": owner_a_uid },
+            "spec": { "replicas": 2, "selector": { "app": "rc-to-be-deleted" } }
+        });
+        let owner_a_key = "/registry/replicationcontrollers/default/rc-to-be-deleted";
+        store
+            .put(
+                owner_a_key,
+                bytes::Bytes::from(serde_json::to_vec(&owner_a).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let owner_b = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "rc-to-stay", "namespace": ns, "uid": owner_b_uid },
+            "spec": { "replicas": 0, "selector": { "app": "rc-to-stay" } }
+        });
+        let owner_b_key = "/registry/replicationcontrollers/default/rc-to-stay";
+        store
+            .put(
+                owner_b_key,
+                bytes::Bytes::from(serde_json::to_vec(&owner_b).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let owner_a_ref = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "name": "rc-to-be-deleted",
+            "uid": owner_a_uid
+        });
+        let owner_b_ref = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "name": "rc-to-stay",
+            "uid": owner_b_uid
+        });
+
+        // Pod co-owned by both RCs — must survive with only owner-B's reference left.
+        let pod_both = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-both-owners",
+                "namespace": ns,
+                "ownerReferences": [owner_a_ref, owner_b_ref]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_both_key = "/registry/pods/default/pod-both-owners";
+        store
+            .put(
+                pod_both_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod_both).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Pod owned only by owner-A — must still be cascade-deleted (no regression to the
+        // ordinary single-owner cascade).
+        let pod_solo = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-solo-owner",
+                "namespace": ns,
+                "ownerReferences": [owner_a_ref]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_solo_key = "/registry/pods/default/pod-solo-owner";
+        store
+            .put(
+                pod_solo_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod_solo).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete owner-A with Foreground propagation, mirroring the conformance spec.
+        let fg_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Foreground"
+            }))
+            .unwrap(),
+        );
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "rc-to-be-deleted".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            fg_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // owner-A is gone; owner-B (never targeted) must be untouched.
+        assert!(
+            store.get(owner_a_key).await.unwrap().is_none(),
+            "the deleted ReplicationController itself must be removed"
+        );
+        assert!(
+            store.get(owner_b_key).await.unwrap().is_some(),
+            "owner-B was never deleted and must still exist — it is the live second owner \
+             that should keep pod-both-owners alive"
+        );
+
+        // The co-owned pod must survive: destroying it here would be exactly the bug — a
+        // foreground cascade must never delete a dependent through one owner while it is
+        // still legitimately referenced by another live owner.
+        let surviving = store.get(pod_both_key).await.unwrap().expect(
+            "pod co-owned by owner-A and owner-B must survive owner-A's foreground \
+                 cascade delete — deleting it would silently destroy a pod that is still \
+                 live and owned via owner-B, which is systemic data loss for any workload \
+                 adopted by a second controller",
+        );
+        let surviving: serde_json::Value = serde_json::from_slice(&surviving.value).unwrap();
+        assert!(
+            surviving["metadata"]["deletionTimestamp"].is_null(),
+            "surviving pod must not carry a deletionTimestamp — it was never actually \
+             targeted for deletion, only stripped of owner-A's reference"
+        );
+        let remaining_refs = surviving["metadata"]["ownerReferences"]
+            .as_array()
+            .expect("surviving pod must still have an ownerReferences array");
+        assert_eq!(
+            remaining_refs.len(),
+            1,
+            "owner-A's reference must be stripped, leaving exactly owner-B's — a stale \
+             reference to the deleted RC would make the pod incorrectly eligible for GC \
+             later"
+        );
+        assert_eq!(
+            remaining_refs[0]["uid"].as_str(),
+            Some(owner_b_uid),
+            "the one remaining ownerReference must point at owner-B, not owner-A"
+        );
+
+        // Non-regression: a pod owned ONLY by owner-A has no other live owner and must
+        // still be hard-deleted by the ordinary cascade path.
+        assert!(
+            store.get(pod_solo_key).await.unwrap().is_none(),
+            "pod owned solely by the deleted RC must still be cascade-deleted — the fix \
+             for co-owned dependents must not weaken the ordinary single-owner cascade"
         );
     }
 
