@@ -45,6 +45,99 @@ pub struct FieldSelector {
     pub negated: bool,
 }
 
+/// Resolve a dot-separated JSON path (e.g. "spec.nodeName") against `value` and test
+/// equality with `expected`.
+///
+/// A field missing anywhere along the path compares as its zero value ("" for strings,
+/// "false" for bools) rather than never matching — this mirrors Kubernetes' `fields.Set`
+/// semantics, where an absent key's `Get()` returns "". Without that fallback, a field
+/// selector like `spec.nodeName=` (matching un-scheduled pods) could never match anything,
+/// since newly-created pods have no `spec.nodeName` key at all yet.
+///
+/// Shared by the generic (non-indexed) field-selector scan in `sqlite.rs` and by CR field
+/// selectors (arbitrary CRD-declared JSON paths in apiserver), so both resolve values
+/// identically instead of drifting apart.
+pub fn json_path_equals(value: &serde_json::Value, field: &str, expected: &str) -> bool {
+    let mut cur = value;
+    for part in field.split('.') {
+        match cur.get(part) {
+            Some(next) => cur = next,
+            None => return expected.is_empty() || expected == "false",
+        }
+    }
+    match cur {
+        serde_json::Value::String(s) => s == expected,
+        serde_json::Value::Bool(b) => expected == if *b { "true" } else { "false" },
+        serde_json::Value::Null => expected.is_empty(),
+        serde_json::Value::Number(n) => expected == n.to_string(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod json_path_equals_tests {
+    use super::json_path_equals;
+    use serde_json::json;
+
+    // WHY: this function backs BOTH the store's own generic field-selector scan and every CR
+    // field selector (arbitrary CRD-declared JSON paths) — a regression here silently breaks
+    // field-selector filtering for every CRD author who declares `selectableFields`.
+
+    #[test]
+    fn matches_top_level_string_field() {
+        let obj = json!({"host": "host1"});
+        assert!(
+            json_path_equals(&obj, "host", "host1"),
+            "a single-segment path must resolve against the object root, since CRD selectable \
+             fields are commonly declared without a `spec` wrapper (e.g. `.host`)"
+        );
+        assert!(!json_path_equals(&obj, "host", "host2"));
+    }
+
+    #[test]
+    fn matches_nested_dot_path() {
+        let obj = json!({"spec": {"nodeName": "node-01"}});
+        assert!(
+            json_path_equals(&obj, "spec.nodeName", "node-01"),
+            "multi-segment paths must walk each dot-separated component from the root"
+        );
+    }
+
+    #[test]
+    fn absent_field_matches_only_empty_expectation() {
+        let obj = json!({"host": "host1"});
+        assert!(
+            json_path_equals(&obj, "port", ""),
+            "a field selector for an unset field (e.g. `port=` for a CR with no port key) must \
+             match the zero value, mirroring Kubernetes' fields.Set.Get() returning \"\" for a \
+             missing key — otherwise clients could never select 'field is unset'"
+        );
+        assert!(
+            !json_path_equals(&obj, "port", "80"),
+            "an absent field must never satisfy a non-empty expectation — a CR without a port \
+             key is not the same as one whose port equals 80"
+        );
+    }
+
+    #[test]
+    fn absent_intermediate_segment_is_treated_as_absent() {
+        let obj = json!({"host": "host1"});
+        assert!(
+            !json_path_equals(&obj, "spec.host", "host1"),
+            "when an intermediate path segment (spec) is missing entirely, the whole path must \
+             resolve as absent rather than panicking or matching by coincidence"
+        );
+    }
+
+    #[test]
+    fn matches_bool_and_number_by_string_representation() {
+        let obj = json!({"ready": true, "count": 3});
+        assert!(json_path_equals(&obj, "ready", "true"));
+        assert!(!json_path_equals(&obj, "ready", "false"));
+        assert!(json_path_equals(&obj, "count", "3"));
+    }
+}
+
 /// Options for a list operation.
 #[derive(Debug, Default, Clone)]
 pub struct ListOptions {

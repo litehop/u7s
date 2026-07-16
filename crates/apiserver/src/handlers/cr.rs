@@ -149,6 +149,11 @@ pub struct CrContext {
     /// Conversion configuration from the CRD spec. Present only when
     /// `spec.conversion.strategy == "Webhook"`.
     pub conversion_webhook_client_config: Option<serde_json::Value>,
+    /// Field paths (`x-kubernetes-selectable-fields`, leading '.' stripped) the matched
+    /// version declared selectable, e.g. `["host", "port"]`. Each version may declare a
+    /// different set, so this is scoped to the specific version a request named — never
+    /// the CRD as a whole.
+    pub selectable_fields: Vec<String>,
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
@@ -202,6 +207,13 @@ pub async fn find_crd<S: Store>(
             .as_ref()
             .and_then(|s| s.get("openAPIV3Schema"))
             .cloned();
+        // Selectable fields are declared per-version (see CrContext::selectable_fields) —
+        // only the version this request named, never the whole CRD.
+        let selectable_fields = matched_version
+            .selectable_fields
+            .iter()
+            .map(|f| f.json_path.trim_start_matches('.').to_string())
+            .collect();
         let namespaced = crd.spec.scope == "Namespaced";
         // A version has a status subresource when `subresources.status` is present
         // and non-null in the CRD spec. Check all versions; if any declares it, the
@@ -227,6 +239,7 @@ pub async fn find_crd<S: Store>(
             has_status_subresource,
             schema,
             conversion_webhook_client_config,
+            selectable_fields,
         });
     }
 
@@ -828,6 +841,48 @@ fn apply_cr_field_validation(
 }
 
 // ---------------------------------------------------------------------------
+// CR field selectors (CustomResourceFieldSelectors)
+// ---------------------------------------------------------------------------
+
+/// Test whether a CR object matches a `--field-selector` string, using the fields the CRD
+/// author declared selectable for the requested version (`ctx.selectable_fields`) plus the
+/// always-selectable `metadata.name`/`metadata.namespace`.
+///
+/// A field that is not in that allow-list resolves to "" regardless of what the object
+/// actually contains, matching upstream's `fields.Set.Get()` fallback for an unrecognized
+/// key: e.g. `spec.secret=x` on a field the CRD never declared selects nothing rather than
+/// erroring. This allow-list is load-bearing, not cosmetic — CRs are schemaless JSON blobs,
+/// so without it any body field an object happens to carry would become selectable, which
+/// defeats the reason CustomResourceFieldSelectors requires fields to be explicitly declared.
+fn cr_matches_field_selector(obj: &serde_json::Value, selector: &str, ctx: &CrContext) -> bool {
+    for term in selector.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let (field, expected, negated) = match term.split_once("!=") {
+            Some((f, v)) => (f.trim(), v.trim(), true),
+            None => match term.split_once('=') {
+                Some((f, v)) => (f.trim(), v.trim(), false),
+                None => continue,
+            },
+        };
+        let selectable = field == "metadata.name"
+            || (ctx.namespaced && field == "metadata.namespace")
+            || ctx.selectable_fields.iter().any(|f| f == field);
+        let equal = if selectable {
+            u7s_store::json_path_equals(obj, field, expected)
+        } else {
+            expected.is_empty()
+        };
+        if equal == negated {
+            return false;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Cluster-scoped CR handlers
 // ---------------------------------------------------------------------------
 
@@ -981,6 +1036,11 @@ pub async fn list_cr<S: Store>(
         .list(
             &prefix,
             ListOptions {
+                // CR field selectors can reference arbitrary CRD-declared JSON paths that only
+                // exist after per-item conversion (see convert_cr_list_items below) — the store
+                // has no way to evaluate those against raw stored bytes, so filtering happens
+                // in-memory afterward instead (cr_matches_field_selector), same as this codebase
+                // already does for "events" in resource.rs.
                 field_selector: None,
                 limit: query.limit,
                 continue_key,
@@ -1008,6 +1068,10 @@ pub async fn list_cr<S: Store>(
         for item in items.iter_mut() {
             apply_crd_schema_defaults(schema, item);
         }
+    }
+
+    if let Some(selector) = query.field_selector.as_deref() {
+        items.retain(|item| cr_matches_field_selector(item, selector, &ctx));
     }
 
     if pom {
@@ -1607,6 +1671,11 @@ pub async fn list_cr_namespaced<S: Store>(
         .list(
             &prefix,
             ListOptions {
+                // CR field selectors can reference arbitrary CRD-declared JSON paths that only
+                // exist after per-item conversion (see convert_cr_list_items below) — the store
+                // has no way to evaluate those against raw stored bytes, so filtering happens
+                // in-memory afterward instead (cr_matches_field_selector), same as this codebase
+                // already does for "events" in resource.rs.
                 field_selector: None,
                 limit: query.limit,
                 continue_key,
@@ -1634,6 +1703,10 @@ pub async fn list_cr_namespaced<S: Store>(
         for item in items.iter_mut() {
             apply_crd_schema_defaults(schema, item);
         }
+    }
+
+    if let Some(selector) = query.field_selector.as_deref() {
+        items.retain(|item| cr_matches_field_selector(item, selector, &ctx));
     }
 
     if pom {
@@ -3392,6 +3465,204 @@ mod tests {
         );
     }
 
+    /// Regression test: a CR LIST with `?fieldSelector=<CRD-declared field>=<value>` must
+    /// return only the CRs whose value at that path matches — not every CR in the namespace.
+    ///
+    /// Before this fix, `list_cr_namespaced` hardcoded `ListOptions { field_selector: None,
+    /// .. }` for the non-watch LIST path, silently discarding the client's selector. Clients
+    /// that rely on server-side filtering by a CRD's declared `x-kubernetes-selectable-fields`
+    /// — the CustomResourceFieldSelectors conformance suite, and any controller listing CRs
+    /// with a field selector instead of filtering client-side — got back every object instead
+    /// of the matching subset, either breaking outright (a watch+list pair built around the
+    /// same filter disagreeing) or silently over-fetching.
+    #[tokio::test]
+    async fn list_cr_namespaced_honors_field_selector_on_declared_selectable_field() {
+        let state = make_state();
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let ns = "default".to_string();
+        let plural = "gadgets".to_string();
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gadgets.example.io" },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": "gadgets",
+                        "singular": "gadget",
+                        "kind": "Gadget",
+                        "listKind": "GadgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": version,
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": {
+                                        "type": "object",
+                                        "properties": { "host": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        },
+                        "selectableFields": [{ "jsonPath": ".spec.host" }]
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        {
+            use crate::handlers::crd;
+            assert!(
+                crd::create_crd(
+                    State(state.clone()),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    crd_bytes,
+                )
+                .await
+                .is_ok(),
+                "install CRD with a declared selectable field"
+            );
+        }
+
+        let gadget_body = |name: &str, host: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Gadget",
+                    "metadata": { "name": name, "namespace": ns },
+                    "spec": { "host": host }
+                })
+                .to_string(),
+            )
+        };
+
+        for (name, host) in [
+            ("gadget-a", "host1"),
+            ("gadget-b", "host1"),
+            ("gadget-c", "host2"),
+        ] {
+            assert!(
+                create_cr_namespaced(
+                    State(state.clone()),
+                    Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    gadget_body(name, host),
+                )
+                .await
+                .is_ok(),
+                "create gadget {name} must succeed"
+            );
+        }
+
+        let query = super::super::generic::CollectionQuery {
+            field_selector: Some("spec.host=host1".to_string()),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural)),
+            axum::http::HeaderMap::new(),
+            query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("field-selected list must succeed, got {e:?}"));
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut names: Vec<&str> = val["items"]
+            .as_array()
+            .expect("items must be an array")
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().unwrap())
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec!["gadget-a", "gadget-b"],
+            "LIST with fieldSelector=spec.host=host1 must return only the CRs whose spec.host \
+             equals host1 — returning gadget-c (host2) too means the selector was ignored, and \
+             missing gadget-a/b means declared-field resolution is broken"
+        );
+    }
+
+    /// Regression test: a field selector on a path the CRD did NOT declare in
+    /// `selectableFields` must not leak that field's value into filtering — even though the
+    /// CR body actually contains it. Matches upstream's `fields.Set.Get()` fallback for an
+    /// unrecognized key ("", which then fails an equality against a non-empty expectation):
+    /// declaring `selectableFields` is how a CRD author opts specific fields into
+    /// server-side filtering, so an undeclared field must behave as if it were never there.
+    #[tokio::test]
+    async fn list_cr_namespaced_ignores_selector_on_undeclared_field() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body("app-one", &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // "destination.namespace" is a real field on the stored object (see app_body) but the
+        // installed CRD (namespaced_crd_bytes) declares no selectableFields at all.
+        let query = super::super::generic::CollectionQuery {
+            field_selector: Some("spec.destination.namespace=default".to_string()),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural)),
+            axum::http::HeaderMap::new(),
+            query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("list must succeed, got {e:?}"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            val["items"]
+                .as_array()
+                .expect("items must be an array")
+                .len(),
+            0,
+            "an undeclared field must resolve as absent regardless of the object's actual \
+             content, so a non-empty equality against it can never match — if this returns \
+             app-one, an arbitrary body field became selectable without the CRD author opting \
+             it in via selectableFields"
+        );
+    }
+
     // Delete then get must return 404.
     #[tokio::test]
     async fn delete_then_get_returns_404() {
@@ -4445,6 +4716,7 @@ mod tests {
             has_status_subresource: false,
             schema: Some(schema),
             conversion_webhook_client_config: None,
+            selectable_fields: vec![],
         };
         validate_cr_schema(obj, &ctx)
     }
