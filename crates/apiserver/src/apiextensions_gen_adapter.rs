@@ -624,6 +624,15 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             }
             if let Some(cc) = wh.client_config {
                 let mut ccm = serde_json::Map::new();
+                if let Some(ca) = cc.ca_bundle.filter(|b| !b.is_empty()) {
+                    ccm.insert(
+                        "caBundle".to_string(),
+                        serde_json::Value::String(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &ca,
+                        )),
+                    );
+                }
                 if let Some(url) = cc.url.filter(|s| !s.is_empty()) {
                     ccm.insert("url".to_string(), serde_json::Value::String(url));
                 }
@@ -817,13 +826,13 @@ mod tests {
                         conversion_review_versions: vec!["v1".to_string()],
                         client_config: Some(apiext_v1::WebhookClientConfig {
                             url: Some("https://example.com/convert".to_string()),
+                            ca_bundle: Some(b"test-ca-cert-bytes".to_vec()),
                             service: Some(apiext_v1::ServiceReference {
                                 namespace: Some("default".to_string()),
                                 name: Some("convert-svc".to_string()),
                                 path: Some("/convert".to_string()),
                                 port: Some(443),
                             }),
-                            ..Default::default()
                         }),
                     }),
                 }),
@@ -894,6 +903,17 @@ mod tests {
             result["spec"]["conversion"]["webhook"]["clientConfig"]["service"]["name"],
             "convert-svc",
             "webhook service reference must survive — a dropped conversion webhook breaks multi-version CRDs"
+        );
+        assert_eq!(
+            result["spec"]["conversion"]["webhook"]["clientConfig"]["caBundle"],
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"test-ca-cert-bytes"
+            ),
+            "caBundle must survive a protobuf-encoded CRD create/update (client-go's typed \
+             apiextensions clientset sends protobuf by default) — otherwise every conversion \
+             webhook registered via a real Kubernetes client loses its trust anchor and every \
+             call fails TLS verification against the apiserver's cluster-CA-only fallback"
         );
         assert_eq!(
             result["status"]["conditions"][0]["type"], "Established",

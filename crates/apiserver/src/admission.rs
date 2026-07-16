@@ -933,6 +933,47 @@ fn build_webhook_call_client(
     builder.build().unwrap_or_else(|_| fallback.clone())
 }
 
+/// Resolve a raw JSON webhook `clientConfig` (e.g. a CRD's
+/// `spec.conversion.webhook.clientConfig`) to a call URL and a `reqwest::Client` pinned to
+/// that webhook's own caBundle, with Service-based targets routed through the konnectivity
+/// proxy — the exact same rules `invoke_mutating_webhook`/validating webhooks apply via
+/// `webhook_url` + `build_webhook_call_client` above.
+///
+/// Every webhook (admission or CRD conversion) ships its own CA, not the u7s cluster CA,
+/// and pod IPs behind a Service are only reachable from the Mac host through konnectivity.
+/// CRD conversion webhooks previously bypassed both rules by calling the shared,
+/// cluster-CA-only `state.webhook_client` directly — making webhook-strategy CRD
+/// conversion fail its TLS handshake against any real backend.
+pub(crate) async fn prepare_webhook_call<S: Store>(
+    state: &AppState<S>,
+    client_config: &serde_json::Value,
+    webhook_name: &str,
+) -> Result<(String, reqwest::Client), String> {
+    let config: WebhookClientConfig = serde_json::from_value(client_config.clone())
+        .map_err(|e| format!("invalid clientConfig: {e}"))?;
+    let target = webhook_url(state, &config, webhook_name).await?;
+    let (effective_proxy, effective_identity) = match &target {
+        WebhookTarget::DirectUrl(_) => (None, None),
+        WebhookTarget::ServiceResolved { .. } => (
+            state.konnectivity_proxy_addr.as_deref(),
+            state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
+        ),
+    };
+    let url = match target {
+        WebhookTarget::DirectUrl(u) => u,
+        WebhookTarget::ServiceResolved { url } => url,
+    };
+    let client = build_webhook_call_client(
+        config.ca_bundle.as_deref(),
+        effective_proxy,
+        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        effective_identity,
+        &state.webhook_client,
+        None,
+    );
+    Ok((url, client))
+}
+
 /// Append `timeout=Ns` to a webhook URL, using `&` when the URL already has a query
 /// string and `?` otherwise.  A webhook's clientConfig.url is used verbatim and may
 /// already contain query parameters (e.g. `https://svc/hook?env=prod`); unconditionally
