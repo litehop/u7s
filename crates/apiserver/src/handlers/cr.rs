@@ -9,7 +9,7 @@ use u7s_store::{ListOptions, Store};
 
 use crate::{
     admission::{
-        run_mutating_webhooks, run_validating_webhooks, validate_webhook_url, AdmissionContext,
+        prepare_webhook_call, run_mutating_webhooks, run_validating_webhooks, AdmissionContext,
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
@@ -46,8 +46,14 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     objects: Vec<serde_json::Value>,
     desired_api_version: &str,
 ) -> Result<Vec<serde_json::Value>, crate::status::StatusError> {
-    // Resolve the URL from the clientConfig (same logic as admission webhook).
-    let url = resolve_conversion_webhook_url(state, client_config).await?;
+    // Resolve the URL and a client pinned to this webhook's own caBundle — every webhook
+    // ships its own CA (not the cluster CA), and Service-based targets are only reachable
+    // from the Mac host through the konnectivity proxy. Same rules as admission webhooks;
+    // see admission::prepare_webhook_call. Without this, every real conversion webhook
+    // fails its TLS handshake against the cluster-CA-only client.
+    let (url, wh_client) = prepare_webhook_call(state, client_config, "conversion webhook")
+        .await
+        .map_err(|e| Status::internal(format!("conversion webhook: {e}")))?;
 
     let uid = uuid::Uuid::new_v4().to_string();
     let review = serde_json::json!({
@@ -61,8 +67,7 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     });
 
     let body = serde_json::to_vec(&review).map_err(|e| Status::internal(e.to_string()))?;
-    let resp = state
-        .webhook_client
+    let resp = wh_client
         .post(&url)
         .header("Content-Type", "application/json")
         .body(body)
@@ -124,54 +129,6 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     }
 
     Ok(converted)
-}
-
-/// Resolve the conversion webhook URL from a clientConfig object.
-///
-/// Supports both `url` (direct URL) and `service` (in-cluster service reference).
-async fn resolve_conversion_webhook_url<S: Store>(
-    state: &AppState<S>,
-    client_config: &serde_json::Value,
-) -> Result<String, crate::status::StatusError> {
-    if let Some(url) = client_config["url"].as_str() {
-        validate_webhook_url(url)
-            .map_err(|e| Status::bad_request(format!("invalid conversion webhook url: {e}")))?;
-        return Ok(url.to_string());
-    }
-
-    if let Some(svc) = client_config.get("service").filter(|s| !s.is_null()) {
-        let ns = svc["namespace"].as_str().unwrap_or("default");
-        let name = svc["name"]
-            .as_str()
-            .ok_or_else(|| Status::internal("conversion webhook service has no name".into()))?;
-        let port = svc["port"].as_u64().unwrap_or(443);
-        let path = svc["path"].as_str().unwrap_or("/");
-
-        let key = format!("/registry/services/{ns}/{name}");
-        let obj = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| {
-                Status::internal(format!("conversion webhook service {ns}/{name} not found"))
-            })?;
-
-        let val: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-
-        let cluster_ip = val["spec"]["clusterIP"].as_str().ok_or_else(|| {
-            Status::internal(format!(
-                "conversion webhook service {ns}/{name} has no clusterIP"
-            ))
-        })?;
-
-        return Ok(format!("https://{cluster_ip}:{port}{path}"));
-    }
-
-    Err(Status::internal(
-        "conversion webhook clientConfig has neither url nor service".into(),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -6674,6 +6631,134 @@ mod tests {
         );
     }
 
+    /// call_conversion_webhook must trust the conversion webhook's OWN caBundle, not just
+    /// the u7s cluster CA. Real conversion webhooks (and the upstream conformance suite's
+    /// converter pod) serve TLS with a self-signed CA carried in
+    /// `clientConfig.caBundle` — if the conversion client only trusted the cluster CA (the
+    /// bug), the TLS handshake against every such webhook fails and CRD conversion is
+    /// 100% non-functional for any real backend, exactly as seen in the
+    /// CustomResourceConversionWebhook conformance failures (mayor-hjcgj).
+    #[tokio::test]
+    async fn call_conversion_webhook_trusts_webhook_ca_bundle_over_cluster_ca() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        // generate_tls() installs this at real startup; a test that builds a live
+        // rustls::ServerConfig directly needs it too. Idempotent (see tls.rs).
+        rustls_post_quantum::provider().install_default().ok();
+
+        // The webhook's own self-signed cert — what a real conversion webhook presents.
+        let webhook_cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("generate self-signed webhook cert");
+        let webhook_cert_der = webhook_cert.cert.der().to_vec();
+        let webhook_key_der = webhook_cert.signing_key.serialize_der();
+
+        // A *different* CA standing in for the u7s cluster CA. Pinning only to this one
+        // (the pre-fix bug) must NOT be sufficient to complete the handshake below.
+        let cluster_cert = generate_simple_self_signed(vec!["cluster.local".to_string()])
+            .expect("generate stand-in cluster CA cert");
+        let cluster_ca_der = cluster_cert.cert.der().to_vec();
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(webhook_cert_der.clone())],
+                PrivateKeyDer::try_from(webhook_key_der).expect("valid PKCS8 key"),
+            )
+            .expect("build server TLS config");
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept TCP");
+            let mut stream = acceptor.accept(tcp).await.expect("complete TLS handshake");
+            let mut buf = [0u8; 8192];
+            let _ = stream
+                .read(&mut buf)
+                .await
+                .expect("read ConversionReview request");
+
+            let body = serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "ConversionReview",
+                "response": {
+                    "uid": "test-uid",
+                    "result": {"status": "Success"},
+                    "convertedObjects": [{"apiVersion": "example.io/v2", "kind": "Widget"}]
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write ConversionReview response");
+        });
+
+        // Base64(PEM) — the exact shape of CustomResourceConversion.webhook.clientConfig.caBundle.
+        let pem = {
+            let b64_der = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &webhook_cert_der,
+            );
+            let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+            for chunk in b64_der.as_bytes().chunks(64) {
+                pem.push_str(std::str::from_utf8(chunk).unwrap());
+                pem.push('\n');
+            }
+            pem.push_str("-----END CERTIFICATE-----\n");
+            pem
+        };
+        let ca_bundle_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cluster_ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let client_config = serde_json::json!({
+            "url": format!("https://{addr}/convert"),
+            "caBundle": ca_bundle_b64,
+        });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+
+        assert!(
+            result.is_ok(),
+            "call_conversion_webhook must trust clientConfig.caBundle (the webhook's own \
+             CA), not only the cluster CA — otherwise every real conversion webhook (which \
+             ships its own serving cert) fails its TLS handshake and webhook-strategy CRD \
+             conversion is 100% non-functional: {:?}",
+            result.err()
+        );
+    }
+
     /// find_crd must NOT extract conversion config when strategy is None (no conversion).
     #[tokio::test]
     async fn find_crd_no_conversion_config_when_strategy_is_none() {
@@ -7133,20 +7218,28 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // resolve_conversion_webhook_url — service-based and error paths
+    // call_conversion_webhook clientConfig resolution — service-based and error paths
+    //
+    // These exercise the shared admission::prepare_webhook_call path (mayor-hjcgj):
+    // conversion webhooks now resolve clientConfig exactly like admission webhooks —
+    // no more bespoke store lookup for the `service` case.
     // ---------------------------------------------------------------------------
 
-    /// resolve_conversion_webhook_url must return an error when clientConfig has
-    /// neither a url nor a service field. Without a reachable endpoint the conversion
-    /// cannot proceed, and silently returning an empty URL would call a bogus address.
+    /// call_conversion_webhook must return an error when clientConfig has neither a url
+    /// nor a service field. Without a reachable endpoint the conversion cannot proceed,
+    /// and silently returning an empty URL would call a bogus address.
     #[tokio::test]
-    async fn resolve_webhook_url_empty_config_returns_err() {
+    async fn call_conversion_webhook_errs_when_client_config_has_neither_url_nor_service() {
         let state = make_state_for_conversion();
         let client_config = serde_json::json!({});
-        let result = resolve_conversion_webhook_url(&state, &client_config).await;
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
         assert!(
             result.is_err(),
-            "clientConfig with neither url nor service must return Err"
+            "clientConfig with neither url nor service must return Err, not silently \
+             proceed with an empty/invalid webhook target"
         );
         let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
         assert!(
@@ -7155,96 +7248,18 @@ mod tests {
         );
     }
 
-    /// resolve_conversion_webhook_url must return an error when the service field
-    /// is present but the service object does not exist in the store.
-    /// The error must surface as an internal error so the apiserver rejects the
-    /// request rather than attempting to connect to an unknown endpoint.
+    /// call_conversion_webhook must resolve `service`-based clientConfig into a service
+    /// DNS name (`<name>.<namespace>.svc:<port>`), exactly like admission webhooks — it
+    /// must NOT look up the Service object's clusterIP from the store. The old clusterIP
+    /// lookup produced a URL only reachable from inside the cluster network, never from
+    /// the Mac-hosted apiserver process, and bypassed the konnectivity proxy entirely.
+    ///
+    /// There is no CoreDNS in this unit test, so the call must still fail overall — but
+    /// it must fail as a *connection* error, not a "service/clusterIP not found in store"
+    /// error, proving the store is never consulted for Service-based conversion webhooks.
     #[tokio::test]
-    async fn resolve_webhook_url_service_not_found_returns_err() {
+    async fn call_conversion_webhook_service_config_resolves_without_store_lookup() {
         let state = make_state_for_conversion();
-        let client_config = serde_json::json!({
-            "service": {
-                "namespace": "kube-system",
-                "name": "webhook-svc",
-                "port": 443,
-                "path": "/convert"
-            }
-        });
-        let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(result.is_err(), "service not in store must return Err");
-        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
-        assert!(
-            err_msg.contains("not found"),
-            "error must mention service not found, got: {err_msg}"
-        );
-    }
-
-    /// resolve_conversion_webhook_url must return an error when the service exists
-    /// in the store but has no spec.clusterIP — without a clusterIP the URL cannot
-    /// be built and the webhook call must not proceed.
-    #[tokio::test]
-    async fn resolve_webhook_url_service_missing_cluster_ip_returns_err() {
-        let state = make_state_for_conversion();
-
-        // Seed a service object with no clusterIP.
-        let svc = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": { "name": "webhook-svc", "namespace": "kube-system" },
-            "spec": { "ports": [{"port": 443}] }
-            // no clusterIP field
-        });
-        state
-            .store
-            .put(
-                "/registry/services/kube-system/webhook-svc",
-                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let client_config = serde_json::json!({
-            "service": {
-                "namespace": "kube-system",
-                "name": "webhook-svc",
-                "port": 443,
-                "path": "/convert"
-            }
-        });
-        let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(result.is_err(), "service without clusterIP must return Err");
-        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
-        assert!(
-            err_msg.contains("clusterIP"),
-            "error must mention missing clusterIP, got: {err_msg}"
-        );
-    }
-
-    /// resolve_conversion_webhook_url must build the correct https URL from a
-    /// service reference. This is the primary in-cluster webhook path: the
-    /// conversion webhook is deployed as a Service with a known clusterIP.
-    #[tokio::test]
-    async fn resolve_webhook_url_service_path_returns_correct_url() {
-        let state = make_state_for_conversion();
-
-        // Seed a service object with a clusterIP.
-        let svc = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": { "name": "webhook-svc", "namespace": "kube-system" },
-            "spec": { "clusterIP": "10.96.0.50", "ports": [{"port": 9443}] }
-        });
-        state
-            .store
-            .put(
-                "/registry/services/kube-system/webhook-svc",
-                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
         let client_config = serde_json::json!({
             "service": {
                 "namespace": "kube-system",
@@ -7253,38 +7268,20 @@ mod tests {
                 "path": "/convert"
             }
         });
-        let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(
-            result.is_ok(),
-            "service with clusterIP must resolve successfully"
-        );
-        let url = match result {
-            Ok(u) => u,
-            Err(_) => panic!("expected Ok but got Err"),
-        };
-        assert_eq!(
-            url, "https://10.96.0.50:9443/convert",
-            "URL must use clusterIP and port from service, got: {url}"
-        );
-    }
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
 
-    /// resolve_conversion_webhook_url must return an error when the service field is
-    /// present but has no name. A nameless service reference cannot be looked up.
-    #[tokio::test]
-    async fn resolve_webhook_url_service_missing_name_returns_err() {
-        let state = make_state_for_conversion();
-        let client_config = serde_json::json!({
-            "service": {
-                "namespace": "kube-system"
-                // no "name" field
-            }
-        });
-        let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(result.is_err(), "service without name must return Err");
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "no CoreDNS/konnectivity is available in a unit test, so the call must fail"
+        );
         let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
         assert!(
-            err_msg.contains("no name"),
-            "error must mention missing service name, got: {err_msg}"
+            !err_msg.contains("not found") && !err_msg.contains("clusterIP"),
+            "error must not mention a store lookup failure (service/clusterIP) — the fixed \
+             path never queries the store for Service-based conversion webhooks, matching \
+             admission webhook parity; got: {err_msg}"
         );
     }
 
