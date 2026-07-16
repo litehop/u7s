@@ -146,9 +146,6 @@ pub struct CrContext {
     /// The `openAPIV3Schema` from the matched version's schema field, if present.
     /// Used for server-side CR body validation on CREATE and UPDATE.
     pub schema: Option<serde_json::Value>,
-    /// The storage version name (the CRD version with `storage: true`).
-    /// Objects are stored in the store under this version's key.
-    pub storage_version: String,
     /// Conversion configuration from the CRD spec. Present only when
     /// `spec.conversion.strategy == "Webhook"`.
     pub conversion_webhook_client_config: Option<serde_json::Value>,
@@ -216,14 +213,6 @@ pub async fn find_crd<S: Store>(
                 .map(|st| !st.is_null())
                 .unwrap_or(false)
         });
-        // Find the storage version (exactly one version should have storage: true).
-        let storage_version = crd
-            .spec
-            .versions
-            .iter()
-            .find(|v| v.storage)
-            .map(|v| v.name.clone())
-            .unwrap_or_else(|| version.to_string());
         // Extract conversion webhook clientConfig if strategy is Webhook.
         let conversion_webhook_client_config = crd
             .spec
@@ -237,7 +226,6 @@ pub async fn find_crd<S: Store>(
             namespaced,
             has_status_subresource,
             schema,
-            storage_version,
             conversion_webhook_client_config,
         });
     }
@@ -262,6 +250,65 @@ pub async fn find_crd<S: Store>(
         &format!("{group}/{version}/{plural}"),
         "Resource",
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Conversion webhook dispatch decision
+// ---------------------------------------------------------------------------
+
+/// Whether a stored CR must go through the conversion webhook to be served at
+/// `desired_api_version`.
+///
+/// This compares the OBJECT'S OWN stored `apiVersion` — never the CRD's current
+/// storage-version pointer (`spec.versions[].storage`) — because that pointer can
+/// move (e.g. a CRD patch flips `storage: true` from v1 to v2) after objects were
+/// already written under the old one. An object's stored bytes never move when that
+/// happens (see cr_store_key), so comparing against the live storage-version pointer
+/// instead of the object's own version would send an object that already matches the
+/// request through the webhook as a version-to-itself conversion — which real
+/// conversion webhooks (and the conformance suite's sample webhook) correctly reject
+/// as a client bug.
+fn object_needs_conversion(
+    obj: &serde_json::Value,
+    desired_api_version: &str,
+    ctx: &CrContext,
+) -> bool {
+    ctx.conversion_webhook_client_config.is_some()
+        && obj["apiVersion"].as_str() != Some(desired_api_version)
+}
+
+/// Convert only the LIST items whose own stored apiVersion differs from
+/// `desired_api_version`, leaving already-matching items untouched.
+///
+/// A LIST can be a non-homogeneous mix of objects written under different versions
+/// (e.g. some created before, some after a CRD storage-version change); see
+/// object_needs_conversion for why every item must be checked individually rather
+/// than converting (or skipping) the whole page based on one CRD-level flag.
+async fn convert_cr_list_items<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    items: &mut [serde_json::Value],
+    desired_api_version: &str,
+) -> Result<(), crate::status::StatusError> {
+    let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() else {
+        return Ok(());
+    };
+    let mut convert_indices = Vec::new();
+    let mut to_convert = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if object_needs_conversion(item, desired_api_version, ctx) {
+            convert_indices.push(i);
+            to_convert.push(item.clone());
+        }
+    }
+    if to_convert.is_empty() {
+        return Ok(());
+    }
+    let converted = call_conversion_webhook(state, cfg, to_convert, desired_api_version).await?;
+    for (i, converted_item) in convert_indices.into_iter().zip(converted) {
+        items[i] = converted_item;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -870,12 +917,6 @@ pub async fn list_cr<S: Store>(
         }
     };
 
-    // The key/prefix is version-independent (see cr_store_key); only whether the
-    // response needs webhook conversion depends on the requested version.
-    // Watch streams are not converted (watch conversion is out of scope).
-    let needs_conversion =
-        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
-
     // For namespaced CRDs, the cluster-wide path lists across all namespaces.
     // Namespaced CRs are stored as /registry/cr/{group}/{plural}/{ns}/{name},
     // so prefix without namespace matches all of them.
@@ -959,13 +1000,9 @@ pub async fn list_cr<S: Store>(
         items.push(v);
     }
 
-    // Convert all items if needed. Batch the conversion in a single webhook call.
-    if needs_conversion && !items.is_empty() {
-        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
-            let desired_api_version = format!("{group}/{version}");
-            items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
-        }
-    }
+    // Batch-convert only the items that actually need it (see convert_cr_list_items).
+    let desired_api_version = format!("{group}/{version}");
+    convert_cr_list_items(&state, &ctx, &mut items, &desired_api_version).await?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         for item in items.iter_mut() {
@@ -1021,11 +1058,6 @@ pub async fn get_cr<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // The key is version-independent (see cr_store_key); a conversion webhook is only
-    // consulted when the request targets a version other than the storage version.
-    let needs_conversion =
-        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
-
     let key = cr_store_key(&group, &plural, None, &name);
     let stored = state
         .store
@@ -1033,18 +1065,21 @@ pub async fn get_cr<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    if needs_conversion {
+    // The key is version-independent (see cr_store_key); a conversion webhook is only
+    // consulted when the object's own stored apiVersion differs from the request
+    // (see object_needs_conversion).
+    let desired_api_version = format!("{group}/{version}");
+    if object_needs_conversion(&obj, &desired_api_version, &ctx) {
         if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
-            let obj: serde_json::Value = serde_json::from_slice(&stored.value)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let desired_api_version = format!("{group}/{version}");
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
             let mut converted_obj = converted
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
-            converted_obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+            converted_obj["apiVersion"] = serde_json::Value::String(desired_api_version);
             converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
             if let Some(schema) = ctx.schema.as_ref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
@@ -1068,9 +1103,7 @@ pub async fn get_cr<S: Store>(
         }
     }
 
-    let mut obj: serde_json::Value =
-        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+    obj["apiVersion"] = serde_json::Value::String(desired_api_version);
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -1513,11 +1546,6 @@ pub async fn list_cr_namespaced<S: Store>(
         ));
     }
 
-    // The prefix is version-independent (see cr_store_key); a conversion webhook is only
-    // consulted when the request targets a version other than the storage version.
-    let needs_conversion =
-        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
-
     let prefix = cr_list_prefix(&group, &plural, Some(&ns));
 
     let pom = wants_partial_object_metadata(accept);
@@ -1598,12 +1626,9 @@ pub async fn list_cr_namespaced<S: Store>(
         items.push(v);
     }
 
-    if needs_conversion && !items.is_empty() {
-        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
-            let desired_api_version = format!("{group}/{version}");
-            items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
-        }
-    }
+    // Batch-convert only the items that actually need it (see convert_cr_list_items).
+    let desired_api_version = format!("{group}/{version}");
+    convert_cr_list_items(&state, &ctx, &mut items, &desired_api_version).await?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         for item in items.iter_mut() {
@@ -1659,11 +1684,6 @@ pub async fn get_cr_namespaced<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // The key is version-independent (see cr_store_key); a conversion webhook is only
-    // consulted when the request targets a version other than the storage version.
-    let needs_conversion =
-        version != ctx.storage_version && ctx.conversion_webhook_client_config.is_some();
-
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let stored = state
         .store
@@ -1671,18 +1691,21 @@ pub async fn get_cr_namespaced<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    if needs_conversion {
+    // The key is version-independent (see cr_store_key); a conversion webhook is only
+    // consulted when the object's own stored apiVersion differs from the request
+    // (see object_needs_conversion).
+    let desired_api_version = format!("{group}/{version}");
+    if object_needs_conversion(&obj, &desired_api_version, &ctx) {
         if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
-            let obj: serde_json::Value = serde_json::from_slice(&stored.value)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let desired_api_version = format!("{group}/{version}");
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
             let mut converted_obj = converted
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
-            converted_obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+            converted_obj["apiVersion"] = serde_json::Value::String(desired_api_version);
             converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
             if let Some(schema) = ctx.schema.as_ref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
@@ -1706,9 +1729,7 @@ pub async fn get_cr_namespaced<S: Store>(
         }
     }
 
-    let mut obj: serde_json::Value =
-        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+    obj["apiVersion"] = serde_json::Value::String(desired_api_version);
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -4423,7 +4444,6 @@ mod tests {
             namespaced: false,
             has_status_subresource: false,
             schema: Some(schema),
-            storage_version: "v1".into(),
             conversion_webhook_client_config: None,
         };
         validate_cr_schema(obj, &ctx)
@@ -6334,47 +6354,6 @@ mod tests {
         assert_eq!(
             body["spec"]["color"], "blue",
             "stored v1alpha1 object must be returned when no webhook is configured"
-        );
-    }
-
-    /// find_crd extracts the storage version correctly from the CRD spec.
-    /// If the storage version is wrong, conversion fallback uses the wrong key and
-    /// returns 404 or a wrong object instead of calling the webhook.
-    #[tokio::test]
-    async fn find_crd_extracts_storage_version() {
-        let state = make_state();
-
-        let crd = serde_json::json!({
-            "apiVersion": "apiextensions.k8s.io/v1",
-            "kind": "CustomResourceDefinition",
-            "metadata": {"name": "gadgets.example.com"},
-            "spec": {
-                "group": "example.com",
-                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget"},
-                "scope": "Cluster",
-                "versions": [
-                    {"name": "v1alpha1", "served": true, "storage": true},
-                    {"name": "v1", "served": true, "storage": false}
-                ]
-            }
-        });
-        state
-            .store
-            .put(
-                "/registry/apiextensions.k8s.io/customresourcedefinitions/gadgets.example.com",
-                bytes::Bytes::from(serde_json::to_vec(&crd).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let ctx = match find_crd(&state, "example.com", "v1", "gadgets").await {
-            Ok(c) => c,
-            Err(_) => panic!("find_crd must succeed for a matching CRD"),
-        };
-        assert_eq!(
-            ctx.storage_version, "v1alpha1",
-            "find_crd must extract the version marked storage:true as storage_version"
         );
     }
 
@@ -9900,6 +9879,455 @@ mod tests {
             patched["apiVersion"], "multiver.example.com/v2",
             "the response must reflect the version this request targeted, not whatever \
              stale version the object happened to be stamped with when first created"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: conversion webhook must not be called for a version-to-itself
+    // request after a CRD's storage version has moved on.
+    //
+    // Root cause: the "does this object need conversion" check compared the
+    // REQUESTED version against the CRD's CURRENTLY CONFIGURED storage version,
+    // not the object's OWN actually-stored apiVersion. A CR written while storage
+    // was v1, then requested again at v1 after the CRD's storage version moved to
+    // v2, needs no conversion (the request already matches the object's stored
+    // version) — but the old check compared against the new storage version (v2),
+    // saw "v1" != "v2", and wrongly invoked the webhook for a self-conversion. Real
+    // conversion webhooks (and the conformance suite's sample webhook) explicitly
+    // detect and reject that as a client bug, failing GET/LIST outright.
+    // ---------------------------------------------------------------------------
+
+    /// GET of a CR at its OWN already-stored version must not call the conversion
+    /// webhook, even after the CRD's storage version has since moved to a different
+    /// served version.
+    ///
+    /// WHY this matters: a real conversion webhook (including the k8s conformance
+    /// suite's sample webhook) rejects a "convert a version to itself" request as a
+    /// client bug. If the fix is reverted, this GET (at v1, now the non-storage
+    /// version) would call the mock webhook below — which is set up to succeed, so
+    /// the request would still return 200, but with the mock's canned body instead
+    /// of the real stored object, and the call counter would be nonzero. Both
+    /// assertions below catch that regression.
+    #[tokio::test]
+    async fn get_cr_at_its_own_stored_version_skips_conversion_webhook_after_storage_flip() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let router = Router::new().route(
+            "/convert",
+            post(move || {
+                let call_count_clone = Arc::clone(&call_count_clone);
+                async move {
+                    call_count_clone.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": {"status": "Success"},
+                            "convertedObjects": [{
+                                "apiVersion": "selfconv.example.com/v1",
+                                "kind": "Widget",
+                                "metadata": {"name": "cr-instance-1"}
+                            }]
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+
+        let state = make_state();
+        let group = "selfconv.example.com";
+        let plural = "widgets";
+        let ns = "default";
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.selfconv.example.com" },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": plural,
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true },
+                        { "name": "v2", "served": true, "storage": false }
+                    ],
+                    "conversion": {
+                        "strategy": "Webhook",
+                        "webhook": { "clientConfig": { "url": format!("{base_url}/convert") } }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_bytes,
+        )
+        .await
+        .expect("install multi-version CRD with conversion webhook");
+
+        // Create the CR while v1 is the storage version — its stored apiVersion is v1.
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "selfconv.example.com/v1",
+                "kind": "Widget",
+                "metadata": { "name": "cr-instance-1", "namespace": ns },
+                "data": { "marker": "original" }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await
+        .expect("create CR via v1 (storage version)");
+
+        // Flip the CRD's storage version: v1 no longer storage, v2 becomes storage.
+        // The object's bytes — and its own stored apiVersion — do not change.
+        let storage_flip = Bytes::from(
+            serde_json::json!({
+                "spec": {
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": false },
+                        { "name": "v2", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let mut strategic_headers = axum::http::HeaderMap::new();
+        strategic_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        crd::patch_crd(
+            State(state.clone()),
+            Path("widgets.selfconv.example.com".to_string()),
+            test_user(),
+            strategic_headers,
+            storage_flip,
+        )
+        .await
+        .expect("flip CRD storage version from v1 to v2");
+
+        // GET at v1 — the object's OWN stored version — even though v2 is now the
+        // CRD's configured storage version.
+        let resp = get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "cr-instance-1".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("GET at the object's own stored version must succeed")
+        .into_response();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "GET at v1 must NOT call the conversion webhook: the object's own stored \
+             apiVersion already IS v1, so this is a version-to-itself request, which \
+             real conversion webhooks (and the conformance suite's sample webhook) \
+             reject as a client bug — comparing against the CRD's *current* storage \
+             version (now v2) instead of the object's own version wrongly triggers it"
+        );
+
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read GET response body");
+        let obj: serde_json::Value = serde_json::from_slice(&body).expect("parse GET response");
+        assert_eq!(
+            obj["apiVersion"], "selfconv.example.com/v1",
+            "the object must be returned exactly as stored, not replaced by whatever \
+             the (incorrectly invoked) webhook would have returned"
+        );
+        assert_eq!(
+            obj["data"]["marker"], "original",
+            "the object's data must be untouched — a spurious webhook round-trip would \
+             have replaced it with the mock webhook's canned response"
+        );
+    }
+
+    /// LIST across a non-homogeneous set of CRs — one written before, one written
+    /// after a CRD storage-version change — must send only the item whose OWN stored
+    /// apiVersion differs from the requested one through the conversion webhook.
+    ///
+    /// WHY this matters: this is the exact upstream "should be able to convert a non
+    /// homogeneous list of CRs" conformance scenario. Deciding once for the whole
+    /// page (based on the CRD's current storage-version pointer) instead of per item
+    /// sends an item that already matches the request through the webhook as a
+    /// version-to-itself conversion — which real webhooks reject outright, failing
+    /// the entire list response instead of just converting the one item that needed it.
+    #[tokio::test]
+    async fn list_cr_only_converts_items_whose_own_version_differs_from_requested() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let objects_seen: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let objects_seen_clone = Arc::clone(&objects_seen);
+        let router = Router::new().route(
+            "/convert",
+            post(move |axum::Json(review): axum::Json<serde_json::Value>| {
+                let call_count_clone = Arc::clone(&call_count_clone);
+                let objects_seen_clone = Arc::clone(&objects_seen_clone);
+                async move {
+                    call_count_clone.fetch_add(1, Ordering::SeqCst);
+                    let objects = review["request"]["objects"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    objects_seen_clone.fetch_add(objects.len(), Ordering::SeqCst);
+                    let desired = review["request"]["desiredAPIVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    // Echo the objects back, relabeled, so converted items are
+                    // distinguishable in the test's assertions below.
+                    let converted: Vec<serde_json::Value> = objects
+                        .into_iter()
+                        .map(|mut o| {
+                            o["apiVersion"] = serde_json::Value::String(desired.clone());
+                            o["webhookTouched"] = serde_json::Value::Bool(true);
+                            o
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": {"status": "Success"},
+                            "convertedObjects": converted
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+
+        let state = make_state();
+        let group = "nonhomog.example.com";
+        let plural = "widgets";
+        let ns = "default";
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.nonhomog.example.com" },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": plural,
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true },
+                        { "name": "v2", "served": true, "storage": false }
+                    ],
+                    "conversion": {
+                        "strategy": "Webhook",
+                        "webhook": { "clientConfig": { "url": format!("{base_url}/convert") } }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_bytes,
+        )
+        .await
+        .expect("install multi-version CRD with conversion webhook");
+
+        // cr-a: written while v1 is the storage version — its own stored apiVersion is v1.
+        let cr_a = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "nonhomog.example.com/v1",
+                "kind": "Widget",
+                "metadata": { "name": "cr-a", "namespace": ns },
+                "data": { "marker": "a" }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_a,
+        )
+        .await
+        .expect("create cr-a via v1");
+
+        // Flip the CRD's storage version: v1 no longer storage, v2 becomes storage.
+        let storage_flip = Bytes::from(
+            serde_json::json!({
+                "spec": {
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": false },
+                        { "name": "v2", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let mut strategic_headers = axum::http::HeaderMap::new();
+        strategic_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        crd::patch_crd(
+            State(state.clone()),
+            Path("widgets.nonhomog.example.com".to_string()),
+            test_user(),
+            strategic_headers,
+            storage_flip,
+        )
+        .await
+        .expect("flip CRD storage version from v1 to v2");
+
+        // cr-b: written via v2 AFTER the flip — its own stored apiVersion is v2.
+        let cr_b = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "nonhomog.example.com/v2",
+                "kind": "Widget",
+                "metadata": { "name": "cr-b", "namespace": ns },
+                "data": { "marker": "b" }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            cr_b,
+        )
+        .await
+        .expect("create cr-b via v2");
+
+        // LIST at v1: a non-homogeneous mix of one object already at v1 (cr-a) and
+        // one still stored at v2 (cr-b).
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            no_watch_query(),
+            "test-user".into(),
+        )
+        .await
+        .expect("LIST at v1 over a non-homogeneous set must succeed")
+        .into_response();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "the webhook must be called exactly once (one batched call carrying only \
+             cr-b) — calling it again for cr-a (already at v1) would be a \
+             version-to-itself conversion that real webhooks reject as a client bug"
+        );
+        assert_eq!(
+            objects_seen.load(Ordering::SeqCst),
+            1,
+            "only cr-b (stored at v2) may ever be sent to the webhook; cr-a already \
+             matches the requested v1 and must never appear in a conversion request"
+        );
+
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read LIST response body");
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("parse LIST response");
+        let items = list["items"].as_array().expect("items must be an array");
+        assert_eq!(
+            items.len(),
+            2,
+            "both cr-a and cr-b must be present in the list"
+        );
+
+        let a = items
+            .iter()
+            .find(|it| it["metadata"]["name"] == "cr-a")
+            .expect("cr-a must be in the list");
+        assert!(
+            a.get("webhookTouched").is_none(),
+            "cr-a already matched the requested version v1 and must be returned as-is, \
+             never routed through the conversion webhook"
+        );
+        assert_eq!(
+            a["data"]["marker"], "a",
+            "cr-a's data must be unchanged since it required no conversion"
+        );
+
+        let b = items
+            .iter()
+            .find(|it| it["metadata"]["name"] == "cr-b")
+            .expect("cr-b must be in the list");
+        assert_eq!(
+            b["webhookTouched"], true,
+            "cr-b was stored at v2 and requested at v1, so it must have gone through \
+             the conversion webhook"
+        );
+        assert_eq!(
+            b["apiVersion"], "nonhomog.example.com/v1",
+            "cr-b must be relabeled to the requested version by the conversion webhook"
         );
     }
 
