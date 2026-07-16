@@ -1372,6 +1372,60 @@ pub async fn node_proxy<S: Store>(
 // /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path} — forward to pod IP
 // ---------------------------------------------------------------------------
 
+/// Parse the `[<scheme>:]<name>[:<port-or-portName>]` addressing form shared by the
+/// pod and service proxy subresources (e.g. `pods/my-pod:8080/proxy/`,
+/// `services/http:my-svc:web/proxy/`).
+///
+/// Pod and Service names are DNS-1123 labels (no colons), so a leading `http:` or
+/// `https:` token is only scheme syntax when a name and port still follow it — i.e.
+/// there is a second colon. Without that check, a 2-part id like `http:8080` (a
+/// literal name `http` with a numeric port suffix) would be misparsed as the bare
+/// scheme `http` with name `8080`. Returns (bare_name, Some(port_or_name)) when a
+/// port suffix is present, or (full_id, None) when the id is a bare name.
+pub fn split_scheme_name_port(id: &str) -> (&str, Option<&str>) {
+    let unscoped = id
+        .strip_prefix("http:")
+        .or_else(|| id.strip_prefix("https:"))
+        .filter(|rest| rest.contains(':'))
+        .unwrap_or(id);
+    match unscoped.rsplit_once(':') {
+        Some((bare, port)) => (bare, Some(port)),
+        None => (unscoped, None),
+    }
+}
+
+/// Resolve a pod's target containerPort using an optional port spec parsed from the
+/// proxy URL (e.g. the `8080` in `pods/<name>:8080/proxy/`, or a named port).
+///
+/// Mirrors `resolve_eps_port`'s numeric/name handling for Service ports:
+/// - None → the first container's first declared port (existing bare
+///   `pods/<name>/proxy/` behavior).
+/// - Some(spec) that parses as u16 → used directly; kube-apiserver's pod proxy does
+///   not require a numeric port spec to match a declared containerPort.
+/// - Some(spec) that is a name → the containerPort of the port entry (searched across
+///   all containers) whose `name` field matches.
+pub fn resolve_pod_container_port(
+    containers: &serde_json::Value,
+    port_spec: Option<&str>,
+) -> Option<u16> {
+    match port_spec {
+        None => containers[0]["ports"][0]["containerPort"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok()),
+        Some(spec) => match spec.parse::<u16>() {
+            Ok(num) => Some(num),
+            Err(_) => containers.as_array()?.iter().find_map(|c| {
+                c["ports"].as_array()?.iter().find_map(|p| {
+                    (p["name"].as_str() == Some(spec))
+                        .then(|| p["containerPort"].as_u64())
+                        .flatten()
+                        .and_then(|n| u16::try_from(n).ok())
+                })
+            }),
+        },
+    }
+}
+
 /// Resolve pod IP and container port for the pod proxy subresource.
 ///
 /// Returns (pod_ip, port, konnectivity_proxy_addr) for the caller to build the
@@ -1381,13 +1435,18 @@ pub async fn resolve_pod_proxy_target<S: Store>(
     ns: &str,
     pod_name: &str,
 ) -> Result<(String, u16, Option<String>), crate::status::StatusError> {
-    let pod_key = object_key("pods", ns, pod_name);
+    // Strip an optional scheme prefix and :<port-or-portName> suffix — kubectl and
+    // client-go address pod proxy targets as `pods/[<scheme>:]<name>[:<port>]/proxy/`,
+    // the same convention the service proxy subresource uses.
+    let (bare_name, port_spec) = split_scheme_name_port(pod_name);
+
+    let pod_key = object_key("pods", ns, bare_name);
     let stored = state
         .store
         .get(&pod_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+        .ok_or_else(|| Status::not_found(bare_name, "Pod"))?;
 
     let pod: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
@@ -1402,10 +1461,7 @@ pub async fn resolve_pod_proxy_target<S: Store>(
         })?
         .to_owned();
 
-    let port = pod["spec"]["containers"][0]["ports"][0]["containerPort"]
-        .as_u64()
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(80);
+    let port = resolve_pod_container_port(&pod["spec"]["containers"], port_spec).unwrap_or(80);
 
     let proxy_addr = state.konnectivity_proxy_addr.clone();
 
@@ -1747,17 +1803,15 @@ pub async fn pod_proxy_root<S: Store>(
 ///
 /// Returns (endpoint_ip, port, konnectivity_proxy_addr). Separated from the
 /// handler so the resolution logic can be unit-tested without a live network.
-/// Strip the `:<port-or-portName>` suffix from a service proxy URL name segment.
+/// Strip the `:<port-or-portName>` suffix (and an optional `http:`/`https:` scheme
+/// prefix) from a service proxy URL name segment.
 ///
-/// k8s proxy URLs allow `services/<name>:<port-or-portName>/proxy/` to target a
-/// specific port. Service names are DNS-1123 labels (no colons), so a single
-/// rsplit_once(':') on the last colon is safe. Returns (bare_name, Some(port_spec))
-/// when a suffix is present, or (full_name, None) when absent.
+/// k8s proxy URLs allow `services/[<scheme>:]<name>:<port-or-portName>/proxy/` to
+/// target a specific port. Delegates to `split_scheme_name_port`, the same parser
+/// used by the pod proxy subresource. Returns (bare_name, Some(port_spec)) when a
+/// suffix is present, or (full_name, None) when absent.
 pub fn split_service_port(svc_name: &str) -> (&str, Option<&str>) {
-    match svc_name.rsplit_once(':') {
-        Some((bare, port)) => (bare, Some(port)),
-        None => (svc_name, None),
-    }
+    split_scheme_name_port(svc_name)
 }
 
 /// Resolve the port number from an EndpointSlice's ports array using an optional
@@ -3307,6 +3361,100 @@ mod tests {
             Some("127.0.0.1:8132"),
             "pod proxy must thread the konnectivity_proxy_addr from state — \
              without it, pod IPs unreachable from the host produce 502 instead of succeeding"
+        );
+    }
+
+    /// resolve_pod_proxy_target with a `:port` suffix must resolve the pod and use
+    /// the URL-supplied port, not the pod spec's declared containerPort.
+    ///
+    /// Before this fix resolve_pod_proxy_target did zero parsing of the name segment:
+    /// any `name:port` pod-proxy URL looked up a pod literally named "name:port" and
+    /// always 404'd. This is the exact "Proxy version v1 should proxy through a
+    /// service and a pod" conformance failure: `pods/proxy-test:8080/proxy/` -> 404
+    /// 'Pod "proxy-test:8080" not found'.
+    #[tokio::test]
+    async fn pod_proxy_name_port_suffix_resolves_pod_and_uses_url_port() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "proxy-test", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "agnhost", "image": "agnhost", "ports": [{"containerPort": 9376}]}]
+            },
+            "status": {"podIP": "10.5.6.7"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "proxy-test"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "proxy-test:8080")
+            .await
+            .expect(
+                "'name:port' pod proxy must resolve — 404 means the bare name was not \
+                 extracted and the store lookup used the raw 'proxy-test:8080' key",
+            );
+        assert_eq!(
+            ip, "10.5.6.7",
+            "must resolve to the pod's IP, not fail the lookup"
+        );
+        assert_eq!(
+            port, 8080,
+            "the URL-supplied port (8080) must win over the pod spec's declared \
+             containerPort (9376) — a pod proxy request names its target port explicitly"
+        );
+    }
+
+    /// resolve_pod_proxy_target with a `scheme:name:port` prefix must strip the
+    /// scheme AND the port, not leak the scheme into the name lookup.
+    ///
+    /// This is the second half of the Proxy conformance failure:
+    /// `pods/http:proxy-test:8080/proxy/` -> 404 'Pod "http:proxy-test:8080" not found'.
+    /// kubectl and client-go's REST proxy helpers address pods this way; a wrong split
+    /// here breaks any client using the scheme-qualified proxy form.
+    #[tokio::test]
+    async fn pod_proxy_scheme_name_port_strips_scheme_and_resolves_pod() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "proxy-test", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "agnhost", "image": "agnhost", "ports": [{"containerPort": 9376}]}]
+            },
+            "status": {"podIP": "10.5.6.7"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "proxy-test"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "http:proxy-test:8080")
+            .await
+            .expect(
+                "'scheme:name:port' pod proxy must resolve — a naive suffix-only split \
+                 leaves 'http:proxy-test' as the bare name and 404s",
+            );
+        assert_eq!(
+            ip, "10.5.6.7",
+            "must resolve to the pod's IP, not fail the lookup"
+        );
+        assert_eq!(
+            port, 8080,
+            "the URL-supplied port must still be honored once the scheme prefix is stripped"
         );
     }
 
@@ -5991,6 +6139,115 @@ mod tests {
         );
     }
 
+    /// split_service_port must strip a leading http/https scheme AND the port suffix.
+    ///
+    /// Before this fix, rsplit_once(':') split on the LAST colon only: for
+    /// "http:proxy-test-svc:web" that produced bare_name = "http:proxy-test-svc" — the
+    /// scheme leaked into the name lookup and the Proxy conformance test 404'd on
+    /// 'Service "http:proxy-test-svc" not found'.
+    #[test]
+    fn split_service_port_strips_scheme_and_port_suffix() {
+        assert_eq!(
+            super::split_service_port("http:proxy-test-svc:web"),
+            ("proxy-test-svc", Some("web")),
+            "the scheme token must be stripped before the name/port split, not folded \
+             into the bare name"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // split_scheme_name_port unit tests — the shared parser behind both
+    // split_service_port and resolve_pod_proxy_target.
+    //
+    // kubectl and client-go's REST proxy helpers address pod/service proxy
+    // targets as [<scheme>:]<name>[:<port>]. Prior to this, only the 2-part
+    // <name>:<port> suffix was handled anywhere (services only); a
+    // scheme-prefixed 3-part id always 404'd, and pods had no suffix parsing
+    // at all.
+    // -----------------------------------------------------------------------
+
+    /// A bare name (no colon) must pass through unchanged.
+    ///
+    /// This is the most common proxy form (`pods/<name>/proxy/`,
+    /// `services/<name>/proxy/`); misparsing it would break nearly every
+    /// existing proxy request.
+    #[test]
+    fn split_scheme_name_port_bare_name_unchanged() {
+        assert_eq!(
+            super::split_scheme_name_port("my-pod"),
+            ("my-pod", None),
+            "a bare name must pass through unchanged — splitting it would 404 the \
+             overwhelming majority of pod/service proxy requests, which carry no port"
+        );
+    }
+
+    /// The 2-part `name:port` form must split off the port with no scheme involved.
+    #[test]
+    fn split_scheme_name_port_strips_name_port_suffix() {
+        assert_eq!(
+            super::split_scheme_name_port("my-pod:8080"),
+            ("my-pod", Some("8080")),
+            "the 2-part name:port form must split off the port — without this, \
+             'pods/my-pod:8080/proxy/' 404s looking up a pod literally named 'my-pod:8080'"
+        );
+    }
+
+    /// The 3-part `http:name:port` form must strip BOTH the scheme and the port.
+    ///
+    /// Splitting on only the last colon (the pre-fix behavior) leaves "http:my-pod"
+    /// as the name, which never matches a stored object.
+    #[test]
+    fn split_scheme_name_port_strips_http_scheme_and_port_suffix() {
+        assert_eq!(
+            super::split_scheme_name_port("http:my-pod:8080"),
+            ("my-pod", Some("8080")),
+            "the scheme:name:port form must strip both segments — leaving 'http:my-pod' \
+             as the bare name 404s even though the pod exists"
+        );
+    }
+
+    /// The https scheme must be recognized too, not just http.
+    #[test]
+    fn split_scheme_name_port_strips_https_scheme_and_named_port_suffix() {
+        assert_eq!(
+            super::split_scheme_name_port("https:my-svc:web"),
+            ("my-svc", Some("web")),
+            "kubectl proxy can address either scheme — only handling 'http:' would \
+             still 404 every 'https:'-prefixed proxy URL"
+        );
+    }
+
+    /// A name that merely starts with "http" (not the exact "http:" scheme token)
+    /// must not be truncated.
+    ///
+    /// A prefix check without a trailing colon would strip "http" out of
+    /// "http-proxy-test", silently proxying to a different (possibly nonexistent) pod.
+    #[test]
+    fn split_scheme_name_port_does_not_misparse_name_starting_with_http() {
+        assert_eq!(
+            super::split_scheme_name_port("http-proxy-test:8080"),
+            ("http-proxy-test", Some("8080")),
+            "a name that merely starts with 'http' must not be mistaken for the scheme \
+             token — that would silently proxy to the wrong pod"
+        );
+    }
+
+    /// A 2-part id must always be treated as name:port, even when the name happens to
+    /// equal a scheme keyword.
+    ///
+    /// Only a 3-part id (a colon on both sides of the middle segment) is unambiguous
+    /// scheme syntax; guessing that a 2-part "http:8080" means bare-scheme-only would
+    /// silently drop the name and try to look up port "8080" as if it were the resource.
+    #[test]
+    fn split_scheme_name_port_two_part_form_never_treated_as_bare_scheme() {
+        assert_eq!(
+            super::split_scheme_name_port("http:8080"),
+            ("http", Some("8080")),
+            "a 2-part id must always parse as name:port — treating 'http' as a bare \
+             scheme here would silently discard the resource name"
+        );
+    }
+
     /// resolve_eps_port with None picks the first port entry.
     ///
     /// This is the fallback for bare services/<name>/proxy/ — removing it regresses
@@ -6039,6 +6296,81 @@ mod tests {
             Some(80),
             "numeric port spec must resolve to the matching port — using the wrong port \
              silently routes to the wrong backend"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_pod_container_port unit tests — the pod-side analogue of
+    // resolve_eps_port, used once resolve_pod_proxy_target has split off a
+    // port spec via split_scheme_name_port.
+    // -----------------------------------------------------------------------
+
+    /// resolve_pod_container_port with None picks the first container's first port.
+    ///
+    /// This is the fallback for bare pods/<name>/proxy/ — removing it regresses every
+    /// existing pod proxy request that doesn't specify a port.
+    #[test]
+    fn resolve_pod_container_port_none_returns_first_port() {
+        let containers = serde_json::json!([
+            {"name": "app", "ports": [{"name": "http", "containerPort": 8080}]}
+        ]);
+        assert_eq!(
+            super::resolve_pod_container_port(&containers, None),
+            Some(8080),
+            "bare pod proxy (no port spec) must use the first container's first port — \
+             returning None or a wrong port breaks every pod proxy request without a \
+             port suffix"
+        );
+    }
+
+    /// resolve_pod_container_port with a numeric spec uses it directly, without
+    /// requiring it to match a declared containerPort.
+    ///
+    /// A container may listen on a port it never declared in its spec; kube-apiserver's
+    /// pod proxy resolution honors the URL's port as given.
+    #[test]
+    fn resolve_pod_container_port_numeric_spec_used_directly() {
+        let containers = serde_json::json!([
+            {"name": "app", "ports": [{"name": "http", "containerPort": 9090}]}
+        ]);
+        assert_eq!(
+            super::resolve_pod_container_port(&containers, Some("8080")),
+            Some(8080),
+            "a numeric port spec from the URL must be used as-is, not the pod's declared \
+             port — 'pods/<name>:8080/proxy/' must reach 8080 even though the container \
+             declares containerPort 9090"
+        );
+    }
+
+    /// resolve_pod_container_port with a named spec matches across ALL containers, not
+    /// just the first.
+    #[test]
+    fn resolve_pod_container_port_named_spec_matches_across_containers() {
+        let containers = serde_json::json!([
+            {"name": "sidecar", "ports": [{"name": "metrics", "containerPort": 9100}]},
+            {"name": "app", "ports": [{"name": "web", "containerPort": 8080}]}
+        ]);
+        assert_eq!(
+            super::resolve_pod_container_port(&containers, Some("web")),
+            Some(8080),
+            "a named port spec must resolve by matching the containerPort name across \
+             all containers — matching only the first container would miss named ports \
+             declared on sidecars"
+        );
+    }
+
+    /// resolve_pod_container_port with an unmatched named spec returns None so the
+    /// caller can decide how to fail, instead of silently matching the wrong port.
+    #[test]
+    fn resolve_pod_container_port_unknown_name_returns_none() {
+        let containers = serde_json::json!([
+            {"name": "app", "ports": [{"name": "web", "containerPort": 8080}]}
+        ]);
+        assert_eq!(
+            super::resolve_pod_container_port(&containers, Some("nonexistent")),
+            None,
+            "an unknown named port must return None, not fall back to an arbitrary port — \
+             silently picking a different port would route to the wrong container port"
         );
     }
 
@@ -6179,6 +6511,77 @@ mod tests {
             port, 9090,
             "numeric port suffix must select the matching endpoint port — returning the wrong \
              port silently proxies to the wrong backend"
+        );
+    }
+
+    /// resolve_service_proxy_target with a scheme-prefixed `scheme:name:port` suffix
+    /// must strip the scheme AND resolve the service.
+    ///
+    /// Before this fix, split_service_port's rsplit_once(':') split on only the LAST
+    /// colon: "http:proxy-test-svc:web" produced bare_name = "http:proxy-test-svc",
+    /// which never matches a stored Service. This is the exact form the Proxy
+    /// conformance test exercises: `services/http:proxy-test-svc:web/proxy/` -> 404
+    /// 'Service "http:proxy-test-svc" not found'.
+    #[tokio::test]
+    async fn service_proxy_scheme_name_port_strips_scheme_and_resolves_service() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "proxy-test-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"name": "web", "port": 80, "targetPort": 8080}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "proxy-test-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "proxy-test-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "proxy-test-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.9.9.9"], "conditions": {"ready": true}}],
+            "ports": [{"name": "web", "port": 8080, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "proxy-test-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let (ip, port, _) =
+            resolve_service_proxy_target(&state, "default", "http:proxy-test-svc:web")
+                .await
+                .expect(
+                    "'scheme:name:port' service proxy must resolve — leaking the scheme into \
+                     the name lookup 404s on a service literally named 'http:proxy-test-svc'",
+                );
+        assert_eq!(ip, "10.9.9.9", "must return the ready endpoint address");
+        assert_eq!(
+            port, 8080,
+            "named port 'web' must resolve via the EndpointSlice ports array once the \
+             scheme prefix is stripped"
         );
     }
 
