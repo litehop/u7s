@@ -751,16 +751,6 @@ fn sum_container_requests(containers: &[ContainerSpec]) -> ResourceRequests {
     total
 }
 
-/// Minimal typed view of a pod list item needed to summarize a node's usage:
-/// its phase (to exclude terminated pods) and its containers' resource
-/// requests (reuses `PodSpec`, which already parses `spec.containers`).
-#[derive(Deserialize)]
-struct PodListItem {
-    #[serde(default)]
-    spec: PodSpec,
-    status: PodListItemStatus,
-}
-
 #[derive(Deserialize, Default)]
 struct PodListItemStatus {
     #[serde(default)]
@@ -770,38 +760,11 @@ struct PodListItemStatus {
 /// A node's already-committed usage from its non-terminated pods: the pod
 /// count (against `status.allocatable.pods`) and summed cpu/memory/
 /// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`).
+/// Computed by `NodeTally::usage_by_node`.
 #[derive(Debug, Default, Clone)]
 pub struct NodeUsage {
     pub pod_count: u32,
     pub requests: ResourceRequests,
-}
-
-/// Summarize a node's already-committed usage from a raw JSON pod list
-/// response body (GET /api/v1/pods?fieldSelector=spec.nodeName=<node>).
-///
-/// "Non-terminated" means phase is not Succeeded or Failed.  This matches the
-/// upstream NodeResourcesFit predicate: running and pending pods consume a
-/// slot and their resource requests count against allocatable; completed pods
-/// do neither. One parse of the body produces both the pod count AND the
-/// resource sum, avoiding a second network round-trip or a second JSON parse.
-///
-/// Returns Err if the body cannot be parsed as a pod list.
-pub fn summarize_node_pods(body: &str) -> anyhow::Result<NodeUsage> {
-    #[derive(Deserialize)]
-    struct PodList {
-        items: Vec<PodListItem>,
-    }
-    let list: PodList = serde_json::from_str(body).context("parse pod list for node capacity")?;
-    let mut usage = NodeUsage::default();
-    for p in list
-        .items
-        .iter()
-        .filter(|p| p.status.phase != "Succeeded" && p.status.phase != "Failed")
-    {
-        usage.pod_count += 1;
-        usage.requests = usage.requests + sum_container_requests(&p.spec.containers);
-    }
-    Ok(usage)
 }
 
 /// A pod already on a node, as needed by preemption victim selection: its
@@ -816,9 +779,10 @@ pub struct NodePod {
     pub requests: ResourceRequests,
 }
 
-/// Minimal typed view of a pod list item needed for preemption: unlike
-/// `PodListItem` (used by `summarize_node_pods`), this retains identity
-/// (namespace/name) and priority instead of collapsing to a count.
+/// Minimal typed view of a pod watch event's object needed to maintain
+/// `NodeTally`: identity (to key the tally), phase (to exclude terminated
+/// pods), `spec.nodeName` (which node, if any, it occupies a slot on), and
+/// its containers' resource requests.
 #[derive(Deserialize)]
 struct PreemptionPodListItem {
     metadata: PodMetadata,
@@ -828,38 +792,160 @@ struct PreemptionPodListItem {
     status: PodListItemStatus,
 }
 
-/// Parse a raw pod-list JSON response body (GET /api/v1/pods?fieldSelector=...)
-/// into the non-terminated pods on that node, keyed for preemption eviction.
+/// One pod's contribution to `NodeTally`: which node it currently occupies a
+/// slot on, its priority (preemption eligibility), and its resource requests.
+#[derive(Debug, Clone)]
+struct TalliedPod {
+    node_name: String,
+    priority: i32,
+    requests: ResourceRequests,
+}
+
+/// An in-memory, watch-maintained running tally of every bound, non-terminal
+/// pod's resource requests, keyed by "namespace/name".
 ///
-/// Mirrors `summarize_node_pods`'s terminal-phase filter (Succeeded/Failed
-/// pods are not occupying a slot and so can never be preemption victims) but
-/// keeps each pod's namespace/name and priority instead of reducing to a count.
+/// Replaces a design where `pick_node`/`find_preemption_plan` issued a live
+/// GET /api/v1/pods?fieldSelector=spec.nodeName=<node> per candidate node on
+/// every scheduling decision. Besides being O(qualifying nodes) HTTP+DB round
+/// trips per pod scheduled, that GET raced the scheduler's own writes: under
+/// concurrent scheduling load, a just-committed bind's resource request was
+/// not always visible to the very next GET (a read-after-write race between
+/// the bind and the immediately-following capacity check), so a node could
+/// look emptier than it really was and receive a second pod it did not
+/// actually have room for — the kubelet then rejected it with OutOfcpu.
 ///
-/// Returns Err if the body cannot be parsed as a pod list.
-pub fn parse_node_pods(body: &str) -> anyhow::Result<Vec<NodePod>> {
-    #[derive(Deserialize)]
-    struct PodList {
-        items: Vec<PreemptionPodListItem>,
-    }
-    let list: PodList =
-        serde_json::from_str(body).context("parse pod list for preemption victim selection")?;
-    Ok(list
-        .items
-        .into_iter()
-        .filter(|p| p.status.phase != "Succeeded" && p.status.phase != "Failed")
-        .map(|p| {
-            let requests = sum_container_requests(&p.spec.containers);
-            NodePod {
-                key: format!(
-                    "{}/{}",
-                    p.metadata.namespace.unwrap_or_else(|| "default".to_owned()),
-                    p.metadata.name.unwrap_or_default()
-                ),
-                priority: p.spec.priority.unwrap_or(0),
-                requests,
+/// `main.rs` keeps this current two ways: (1) every pod watch event is fed
+/// through `apply_event`, so the tally converges to cluster state the same
+/// way a real kube-scheduler's informer cache does; (2) the scheduler's own
+/// `assume`/`remove` calls update it immediately when it decides to bind or
+/// evict a pod, before the HTTP call that makes the change durable even
+/// completes — so a scheduling decision (possibly running concurrently, in a
+/// different spawned task) can never read a snapshot older than the most
+/// recent decision this process itself already made.
+#[derive(Debug, Default)]
+pub struct NodeTally {
+    pods: std::collections::HashMap<String, TalliedPod>,
+}
+
+impl NodeTally {
+    /// Update the tally from one raw pod watch event.
+    ///
+    /// A DELETED event, or an ADDED/MODIFIED event for a pod that is unbound
+    /// (`spec.nodeName` empty) or in a terminal phase (Succeeded/Failed —
+    /// mirrors the NodeResourcesFit predicate: a completed pod is not
+    /// occupying a slot), removes any prior entry for that pod. Any other
+    /// ADDED/MODIFIED event overwrites (never adds to) the entry, so
+    /// replaying the same event twice — e.g. after a watch reconnect —
+    /// is idempotent.
+    pub fn apply_event(&mut self, event: &Value) {
+        let Ok(watch_event) =
+            serde_json::from_value::<WatchEvent<PreemptionPodListItem>>(event.clone())
+        else {
+            return;
+        };
+        let name = watch_event.object.metadata.name.unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
+        let namespace = watch_event
+            .object
+            .metadata
+            .namespace
+            .unwrap_or_else(|| "default".to_owned());
+        let key = format!("{namespace}/{name}");
+
+        if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+            self.pods.remove(&key);
+            return;
+        }
+        let terminal = matches!(
+            watch_event.object.status.phase.as_str(),
+            "Succeeded" | "Failed"
+        );
+        let priority = watch_event.object.spec.priority.unwrap_or(0);
+        let requests = sum_container_requests(&watch_event.object.spec.containers);
+        let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
+        match node_name {
+            Some(node_name) if !terminal => {
+                self.pods.insert(
+                    key,
+                    TalliedPod {
+                        node_name,
+                        priority,
+                        requests,
+                    },
+                );
             }
-        })
-        .collect())
+            _ => {
+                self.pods.remove(&key);
+            }
+        }
+    }
+
+    /// Record that `namespace/pod_name` now occupies a slot on `node_name` —
+    /// called the instant the scheduler decides to bind, before the bind's
+    /// HTTP call even completes. `remove` undoes this if the bind then fails.
+    pub fn assume(
+        &mut self,
+        namespace: &str,
+        pod_name: &str,
+        node_name: &str,
+        priority: i32,
+        requests: ResourceRequests,
+    ) {
+        self.pods.insert(
+            format!("{namespace}/{pod_name}"),
+            TalliedPod {
+                node_name: node_name.to_owned(),
+                priority,
+                requests,
+            },
+        );
+    }
+
+    /// Remove `namespace/pod_name` from the tally — called immediately after
+    /// a preemption eviction succeeds (freeing its resources for the re-fit
+    /// check that follows), or to roll back an `assume` when the bind it
+    /// anticipated does not actually go through.
+    pub fn remove(&mut self, namespace: &str, pod_name: &str) {
+        self.pods.remove(&format!("{namespace}/{pod_name}"));
+    }
+
+    /// Drop all tallied state. Called on watch reconnect: the reconnected
+    /// watch always replays the full ring-buffer history from scratch, and
+    /// without clearing first, a pod deleted while disconnected (and since
+    /// aged out of the ring buffer) would leave a phantom entry this tally
+    /// could never otherwise correct.
+    pub fn clear(&mut self) {
+        self.pods.clear();
+    }
+
+    /// Non-terminal pod count and summed resource requests per node — the
+    /// shape `select_node_with_capacity` consumes in place of a live GET.
+    pub fn usage_by_node(&self) -> std::collections::HashMap<String, NodeUsage> {
+        let mut usage: std::collections::HashMap<String, NodeUsage> =
+            std::collections::HashMap::new();
+        for pod in self.pods.values() {
+            let entry = usage.entry(pod.node_name.clone()).or_default();
+            entry.pod_count += 1;
+            entry.requests = entry.requests.clone() + pod.requests.clone();
+        }
+        usage
+    }
+
+    /// Every tallied pod currently on `node_name`, for preemption victim
+    /// selection — in place of a live GET.
+    pub fn pods_on(&self, node_name: &str) -> Vec<NodePod> {
+        self.pods
+            .iter()
+            .filter(|(_, p)| p.node_name == node_name)
+            .map(|(key, p)| NodePod {
+                key: key.clone(),
+                priority: p.priority,
+                requests: p.requests.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Return true when `node` is eligible to host `pod` at all, independent of
@@ -922,10 +1008,9 @@ fn resource_fits(
 /// `pod.requests` (NodeResourcesFit).
 ///
 /// `node_usage` maps node name → current non-terminated pod count and summed
-/// resource requests (from a prior GET
-/// /api/v1/pods?fieldSelector=spec.nodeName=<node>).  If a node's name is
-/// absent from `node_usage`, its usage is treated as zero (conservative:
-/// schedule).
+/// resource requests, as computed by `NodeTally::usage_by_node`.  If a node's
+/// name is absent from `node_usage`, its usage is treated as zero
+/// (conservative: schedule).
 ///
 /// Pod-count capacity is read from `status.allocatable.pods`, falling back to
 /// `status.capacity.pods`.  A capacity of 0 (field absent / unparseable) means
@@ -1256,60 +1341,36 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
 /// enough uncommitted cpu/memory/ephemeral-storage for `pod.requests`
 /// (NodeResourcesFit predicate).
 ///
-/// Fetches the node list from the API server, then — for each qualifying
-/// candidate — summarizes non-terminated pods already assigned to it via
-/// GET /api/v1/pods?fieldSelector=spec.nodeName%3D<node> (pod count AND
-/// summed resource requests, see `summarize_node_pods`).  A node at or above
-/// its `status.allocatable.pods` limit, or that cannot fit `pod.requests`
-/// alongside what's already committed, is skipped.  Returns `Err` when no
-/// suitable node exists so that the caller can skip binding and leave the pod
-/// Pending (mayor-bbxr: without this check, pods are bound to full nodes and
-/// the kubelet fails them OutOfpods/OutOfcpu/OutOfephemeral-storage).
+/// Fetches the node list from the API server; per-node usage comes from
+/// `tally` (see `NodeTally`) — an in-memory tally the scheduler's own pod
+/// watch keeps current, not a live GET. A prior version issued a GET
+/// /api/v1/pods?fieldSelector=spec.nodeName%3D<node> per qualifying candidate
+/// node on every scheduling decision; besides being O(qualifying nodes) per
+/// decision, that GET could read a just-committed bind's resource request as
+/// stale (a read-after-write race under concurrent scheduling load), letting
+/// a pod be bound onto a node that was actually already full. `tally` cannot
+/// observe that race: the scheduler updates it synchronously the moment it
+/// decides to bind, before the bind's HTTP call even completes (see
+/// `NodeTally::assume`).
+///
+/// A node at or above its `status.allocatable.pods` limit, or that cannot fit
+/// `pod.requests` alongside what's already tallied, is skipped.  Returns
+/// `Err` when no suitable node exists so that the caller can skip binding and
+/// leave the pod Pending (mayor-bbxr: without this check, pods are bound to
+/// full nodes and the kubelet fails them
+/// OutOfpods/OutOfcpu/OutOfephemeral-storage).
 pub async fn pick_node(
     connector: &TlsConnector,
     server: &str,
     pod: &PendingPod,
+    tally: &std::sync::Mutex<NodeTally>,
 ) -> anyhow::Result<String> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
         bail!("GET /api/v1/nodes returned {status}: {body}");
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
-
-    // Build per-node usage for every candidate node (qualifying nodes only).
-    // We only query nodes that pass the selector/affinity/taints to avoid
-    // unnecessary API calls.
-    let mut node_usage: std::collections::HashMap<String, NodeUsage> =
-        std::collections::HashMap::new();
-    for node in &list.items {
-        if !node_qualifies_for_pod(node, pod) {
-            continue;
-        }
-        let node_name = &node.metadata.name;
-        let pods_path = format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{node_name}");
-        match http_get(connector, server, &pods_path).await {
-            Ok((ps, pb)) if ps.is_success() => match summarize_node_pods(&pb) {
-                Ok(usage) => {
-                    node_usage.insert(node_name.clone(), usage);
-                }
-                Err(e) => {
-                    // Treat usage as zero (allow scheduling) rather than failing
-                    // the entire pick_node call — a parse error here is not
-                    // grounds to leave the pod unscheduled indefinitely.
-                    tracing::warn!("failed to summarize pods on {node_name}: {e} — treating as 0");
-                }
-            },
-            Ok((ps, pb)) => {
-                tracing::warn!(
-                    "GET pods for node {node_name} returned {ps}: {pb} — treating usage as 0"
-                );
-            }
-            Err(e) => {
-                tracing::warn!("GET pods for node {node_name} failed: {e} — treating usage as 0");
-            }
-        }
-    }
-
+    let node_usage = tally.lock().expect("tally lock poisoned").usage_by_node();
     select_node_with_capacity(list, pod, &node_usage)
 }
 
@@ -1329,6 +1390,16 @@ pub struct PreemptionPlan {
 /// this is the fallback that stops a higher-priority pod from staying Pending
 /// forever just because lower-priority pods claimed every slot first (mayor-rsei).
 ///
+/// Per-node pod identity/priority/requests come from `tally` (see
+/// `NodeTally`), not a live GET — see `pick_node`'s doc comment for why. This
+/// also means the caller MUST re-check fit (e.g. by calling `pick_node`
+/// again) after evicting `victims` and before binding: evicting a victim
+/// updates `tally` immediately, but nothing stops a concurrently-running
+/// scheduling decision from claiming the freed capacity during the
+/// eviction's own (real, wall-clock) DELETE round trips — this plan is a
+/// snapshot from before those evictions ran, not a guarantee about the state
+/// after them.
+///
 /// Among nodes where preemption would work, the node requiring the FEWEST
 /// victims is chosen (cheapest disruption); ties keep the API server's node-list
 /// order. Returns `Err` when no candidate node — even after preempting every
@@ -1337,6 +1408,7 @@ pub async fn find_preemption_plan(
     connector: &TlsConnector,
     server: &str,
     pod: &PendingPod,
+    tally: &std::sync::Mutex<NodeTally>,
 ) -> anyhow::Result<PreemptionPlan> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
@@ -1363,28 +1435,10 @@ pub async fn find_preemption_plan(
         let capacity = parse_pod_capacity(cap_str);
 
         let node_name = &node.metadata.name;
-        let pods_path = format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{node_name}");
-        let node_pods = match http_get(connector, server, &pods_path).await {
-            Ok((ps, pb)) if ps.is_success() => match parse_node_pods(&pb) {
-                Ok(pods) => pods,
-                Err(e) => {
-                    tracing::warn!("failed to parse pods on {node_name} for preemption: {e}");
-                    continue;
-                }
-            },
-            Ok((ps, pb)) => {
-                tracing::warn!(
-                    "GET pods for node {node_name} returned {ps}: {pb} — skipping for preemption"
-                );
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "GET pods for node {node_name} failed: {e} — skipping for preemption"
-                );
-                continue;
-            }
-        };
+        let node_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .pods_on(node_name);
 
         let victims = select_preemption_victims(
             pod.priority,
@@ -3421,89 +3475,167 @@ mod tests {
         assert_eq!(parse_pod_capacity("not-a-number"), 0);
     }
 
-    /// summarize_node_pods counts pods correctly, excluding Succeeded and Failed.
+    /// A watch ADDED event for a pod bound (`spec.nodeName` set) to `node`,
+    /// at `phase`, requesting `cpu` (a quantity string, or "" for none) —
+    /// the shape `NodeTally::apply_event` consumes.
+    fn bound_pod_added_event(name: &str, node: &str, phase: &str, cpu: &str) -> Value {
+        let requests = if cpu.is_empty() {
+            json!({})
+        } else {
+            json!({ "cpu": cpu })
+        };
+        json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": name, "namespace": "default" },
+                "spec": {
+                    "nodeName": node,
+                    "containers": [{ "resources": { "requests": requests } }]
+                },
+                "status": { "phase": phase }
+            }
+        })
+    }
+
+    /// NodeTally counts pods correctly, excluding Succeeded and Failed.
     ///
     /// This is the NodeResourcesFit predicate: running/pending pods consume a slot;
     /// completed pods do not.  Reverting to count all pods would over-count and
     /// block scheduling when completed pods have not yet been GC'd.
     #[test]
-    fn summarize_node_pods_excludes_terminal_phases_from_pod_count() {
-        let body = serde_json::json!({
-            "items": [
-                { "status": { "phase": "Running" } },
-                { "status": { "phase": "Pending" } },
-                { "status": { "phase": "Succeeded" } },
-                { "status": { "phase": "Failed" } },
-                { "status": {} },  // missing phase → not terminal → counts
-            ]
-        })
-        .to_string();
-        let usage = summarize_node_pods(&body).expect("should parse");
+    fn node_tally_excludes_terminal_phases_from_pod_count() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&bound_pod_added_event("a", "worker-0", "Running", ""));
+        tally.apply_event(&bound_pod_added_event("b", "worker-0", "Pending", ""));
+        tally.apply_event(&bound_pod_added_event("c", "worker-0", "Succeeded", ""));
+        tally.apply_event(&bound_pod_added_event("d", "worker-0", "Failed", ""));
+        tally.apply_event(&bound_pod_added_event("e", "worker-0", "", "")); // missing phase → not terminal → counts
+
+        let usage = tally.usage_by_node();
         assert_eq!(
-            usage.pod_count, 3,
+            usage["worker-0"].pod_count, 3,
             "Running + Pending + unknown-phase count as consuming a slot; \
              Succeeded and Failed do not (NodeResourcesFit predicate, mayor-bbxr)"
         );
     }
 
-    /// summarize_node_pods also excludes terminal-phase pods' resource requests
-    /// from the sum — a completed pod that requested 4 CPUs must not still count
+    /// NodeTally also excludes terminal-phase pods' resource requests from the
+    /// sum — a completed pod that requested 4 CPUs must not still count
     /// against the node's allocatable cpu, or a saturated-but-idle node would
     /// wrongly reject new pods forever.
     #[test]
-    fn summarize_node_pods_excludes_terminal_phases_from_resource_sum() {
-        let body = serde_json::json!({
-            "items": [
-                {
-                    "spec": { "containers": [{ "resources": { "requests": { "cpu": "1" } } }] },
-                    "status": { "phase": "Running" }
-                },
-                {
-                    "spec": { "containers": [{ "resources": { "requests": { "cpu": "4" } } }] },
-                    "status": { "phase": "Succeeded" }
-                },
-            ]
-        })
-        .to_string();
-        let usage = summarize_node_pods(&body).expect("should parse");
+    fn node_tally_excludes_terminal_phases_from_resource_sum() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&bound_pod_added_event(
+            "running", "worker-0", "Running", "1",
+        ));
+        tally.apply_event(&bound_pod_added_event("done", "worker-0", "Succeeded", "4"));
+
+        let usage = tally.usage_by_node();
         assert_eq!(
-            usage.requests.cpu_milli, 1000,
+            usage["worker-0"].requests.cpu_milli, 1000,
             "a Succeeded pod's cpu request must not count against the node's usage"
         );
     }
 
-    /// summarize_node_pods sums cpu/memory/ephemeral-storage requests across
-    /// all non-terminated pods on the node — the exact input pick_node needs to
-    /// decide whether a pending pod's own requests still fit.
+    /// NodeTally sums cpu requests across all non-terminated pods on the same
+    /// node — the exact input pick_node needs to decide whether a pending
+    /// pod's own requests still fit.
     #[test]
-    fn summarize_node_pods_sums_resource_requests_across_pods() {
-        let body = serde_json::json!({
-            "items": [
-                {
-                    "spec": { "containers": [{ "resources": { "requests": {
-                        "cpu": "500m", "memory": "1Gi", "ephemeral-storage": "1Gi"
-                    } } }] },
-                    "status": { "phase": "Running" }
-                },
-                {
-                    "spec": { "containers": [{ "resources": { "requests": {
-                        "cpu": "500m", "memory": "1Gi", "ephemeral-storage": "1Gi"
-                    } } }] },
-                    "status": { "phase": "Pending" }
-                },
-            ]
-        })
-        .to_string();
-        let usage = summarize_node_pods(&body).expect("should parse");
-        assert_eq!(usage.pod_count, 2);
+    fn node_tally_sums_resource_requests_across_pods_on_the_same_node() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&bound_pod_added_event("a", "worker-0", "Running", "500m"));
+        tally.apply_event(&bound_pod_added_event("b", "worker-0", "Pending", "500m"));
+
+        let usage = tally.usage_by_node();
+        assert_eq!(usage["worker-0"].pod_count, 2);
         assert_eq!(
-            usage.requests.cpu_milli, 1000,
-            "two 500m-cpu pods must sum to 1000 milli-cpu"
+            usage["worker-0"].requests.cpu_milli, 1000,
+            "two 500m-cpu pods on the same node must sum to 1000 milli-cpu"
         );
-        assert_eq!(
-            usage.requests.memory_milli,
-            2 * 1024 * 1024 * 1024 * 1000,
-            "two 1Gi-memory pods must sum to 2Gi (in milli-bytes)"
+    }
+
+    /// The exact regression this tally exists to fix: a live
+    /// per-node GET fan-out could read a just-committed bind's resource
+    /// request as stale, undercounting the node's usage and letting the
+    /// scheduler bind a second pod onto a node that was already full — the
+    /// kubelet then rejected it with OutOfcpu. `assume` (called immediately
+    /// after a bind decision, before the bind's HTTP call even completes)
+    /// must make that bind visible to the very next capacity check, with no
+    /// window where it can be read as stale.
+    #[test]
+    fn node_tally_assume_reflects_just_bound_pod_before_next_scheduling_decision() {
+        let mut tally = NodeTally::default();
+        // Mirrors main.rs's assume_and_bind: the tally is updated the instant
+        // the first pod's bind is decided, not after its HTTP call returns.
+        tally.assume("default", "filler", "worker-0", 0, requests(5600, 0, 0));
+
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "8".to_owned(); // 8000m allocatable
+        let list = NodeList { items: vec![node] };
+
+        let mut pod = empty_pending_pod();
+        pod.requests.cpu_milli = 4000; // 5600 (tallied) + 4000 > 8000 allocatable
+
+        let usage = tally.usage_by_node();
+        let result = select_node_with_capacity(list, &pod, &usage);
+
+        assert!(
+            result.is_err(),
+            "a node whose tally already reflects a just-bound 5600m-cpu pod must \
+             reject a second 4000m pod on an 8000m-cpu node — reading stale (zero) \
+             usage here is exactly the bug that let the scheduler bind onto an \
+             already-full node, which the kubelet then OutOfcpu-rejected; got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// `remove` must actually free the capacity it removes — used both to
+    /// roll back a failed bind's `assume` and to account for a preemption
+    /// eviction. If a removal were silently dropped, the tally would
+    /// permanently overcount that node and leave pods Pending that could
+    /// legitimately fit.
+    #[test]
+    fn node_tally_remove_frees_capacity_for_the_next_decision() {
+        let mut tally = NodeTally::default();
+        tally.assume("default", "filler", "worker-0", 0, requests(8000, 0, 0));
+        tally.remove("default", "filler");
+
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "8".to_owned();
+        let list = NodeList { items: vec![node] };
+        let mut pod = empty_pending_pod();
+        pod.requests.cpu_milli = 4000;
+
+        let usage = tally.usage_by_node();
+        let result = select_node_with_capacity(list, &pod, &usage);
+        assert!(
+            result.is_ok(),
+            "removing the filler pod's reservation must free its 8000m cpu — \
+             a leaked reservation would leave this node wrongly looking full forever"
+        );
+    }
+
+    /// A DELETED watch event must remove the pod from the tally — this is how
+    /// a preemption victim's eviction becomes visible cluster-wide (not just
+    /// via main.rs's own immediate `remove` call), and how any other actor's
+    /// pod deletion is picked up.
+    #[test]
+    fn node_tally_apply_event_deleted_removes_the_pod() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&bound_pod_added_event("a", "worker-0", "Running", "1"));
+        assert_eq!(tally.usage_by_node()["worker-0"].pod_count, 1);
+
+        tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": { "metadata": { "name": "a", "namespace": "default" } }
+        }));
+
+        assert!(
+            !tally.usage_by_node().contains_key("worker-0"),
+            "a DELETED event must remove the pod's tallied usage — otherwise a \
+             real pod deletion would leave a phantom reservation that blocks \
+             scheduling onto a node that actually has room"
         );
     }
 
@@ -3881,7 +4013,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Preemption (mayor-rsei): needs_scheduling priority extraction,
-    // parse_node_pods, and select_preemption_victims.
+    // NodeTally.pods_on, and select_preemption_victims.
     //
     // Without priority-aware preemption, a higher-priority pod stays Pending
     // forever whenever lower-priority pods already claimed every slot on every
@@ -3931,23 +4063,35 @@ mod tests {
         );
     }
 
-    // parse_node_pods tests — the per-node pod listing that drives preemption
-    // victim selection. Unlike summarize_node_pods, this retains identity
-    // (to DELETE the victim) and priority (to decide if it's a legal victim).
+    // NodeTally.pods_on tests — the per-node pod listing that drives
+    // preemption victim selection. Unlike usage_by_node, this retains
+    // identity (to DELETE the victim) and priority (to decide if it's a
+    // legal victim).
 
-    /// parse_node_pods excludes terminal-phase pods (they are not occupying a
-    /// slot, so evicting them would help nobody) and extracts each pod's key and
-    /// priority.
+    /// NodeTally excludes terminal-phase pods from `pods_on` (they are not
+    /// occupying a slot, so evicting them would help nobody) and extracts
+    /// each pod's key and priority.
     #[test]
-    fn parse_node_pods_excludes_terminal_phases_and_extracts_priority() {
-        let body = serde_json::json!({
-            "items": [
-                { "metadata": {"name": "a", "namespace": "ns1"}, "spec": {"priority": 100}, "status": {"phase": "Running"} },
-                { "metadata": {"name": "b", "namespace": "ns1"}, "spec": {"priority": 5}, "status": {"phase": "Succeeded"} },
-            ]
-        })
-        .to_string();
-        let pods = parse_node_pods(&body).expect("should parse");
+    fn node_tally_pods_on_excludes_terminal_phases_and_extracts_priority() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "a", "namespace": "ns1"},
+                "spec": {"nodeName": "worker-0", "priority": 100},
+                "status": {"phase": "Running"}
+            }
+        }));
+        tally.apply_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "b", "namespace": "ns1"},
+                "spec": {"nodeName": "worker-0", "priority": 5},
+                "status": {"phase": "Succeeded"}
+            }
+        }));
+
+        let pods = tally.pods_on("worker-0");
         assert_eq!(
             pods.len(),
             1,
@@ -3958,47 +4102,52 @@ mod tests {
         assert_eq!(pods[0].priority, 100);
     }
 
-    /// A pod with no spec.priority must default to 0 in parse_node_pods too —
-    /// the same default needs_scheduling applies, so a pending pod at priority 1
-    /// can still legally preempt it.
+    /// A pod with no spec.priority must default to 0 via `pods_on` too — the
+    /// same default `needs_scheduling` applies, so a pending pod at priority
+    /// 1 can still legally preempt it.
     #[test]
-    fn parse_node_pods_defaults_priority_to_zero_when_absent() {
-        let body = serde_json::json!({
-            "items": [
-                { "metadata": {"name": "a", "namespace": "default"}, "spec": {}, "status": {"phase": "Running"} },
-            ]
-        })
-        .to_string();
-        let pods = parse_node_pods(&body).expect("should parse");
+    fn node_tally_pods_on_defaults_priority_to_zero_when_absent() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "a", "namespace": "default"},
+                "spec": {"nodeName": "worker-0"},
+                "status": {"phase": "Running"}
+            }
+        }));
+
+        let pods = tally.pods_on("worker-0");
         assert_eq!(
             pods[0].priority, 0,
             "a node-resident pod with no priority set must default to 0"
         );
     }
 
-    /// parse_node_pods must also capture each pod's own resource requests
+    /// NodeTally must also capture each pod's own resource requests
     /// (including extended resources) — without this, select_preemption_victims
     /// has no way to know how much capacity evicting a given pod would
     /// actually free, and can never select victims by resource shortage, only
     /// by pod-count.
     #[test]
-    fn parse_node_pods_captures_resource_requests() {
-        let body = serde_json::json!({
-            "items": [
-                {
-                    "metadata": {"name": "victim", "namespace": "default"},
-                    "spec": {
-                        "priority": 1,
-                        "containers": [
-                            { "resources": { "requests": { "scheduling.k8s.io/foo": "1" } } }
-                        ]
-                    },
-                    "status": {"phase": "Running"}
+    fn node_tally_pods_on_captures_resource_requests() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "victim", "namespace": "default"},
+                "spec": {
+                    "nodeName": "worker-0",
+                    "priority": 1,
+                    "containers": [
+                        { "resources": { "requests": { "scheduling.k8s.io/foo": "1" } } }
+                    ]
                 },
-            ]
-        })
-        .to_string();
-        let pods = parse_node_pods(&body).expect("should parse");
+                "status": {"phase": "Running"}
+            }
+        }));
+
+        let pods = tally.pods_on("worker-0");
         assert_eq!(
             pods[0].requests.extended.get("scheduling.k8s.io/foo"),
             Some(&1000),
