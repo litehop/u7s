@@ -1,13 +1,26 @@
 use super::*;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, Mutex};
 
 const RING_CAPACITY: usize = 1000;
 const BROADCAST_CAPACITY: usize = 2048;
+
+/// Deletion-log storage: `by_key` gives O(1) lookup for evict-on-recreate and the
+/// prefix-scan replay watchers use; `by_revision` mirrors it as a revision-sorted index
+/// so the lowest-revision entry can be evicted in O(log n) via `pop_first()` instead of
+/// an O(n) scan over `by_key`. The two maps are always mutated together. Revisions are
+/// unique and monotonically assigned by the single global write-connection-guarded
+/// counter (see `push_event_locked`'s doc comment), so `by_revision` never has two
+/// entries collide on the same revision key.
+#[derive(Default)]
+struct DeletionLog {
+    by_key: HashMap<String, Arc<InternalEvent>>,
+    by_revision: BTreeMap<u64, String>,
+}
 
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
@@ -28,7 +41,7 @@ pub struct SqliteStore {
     /// Keyed by store key: each key maps to its latest DELETED event. This means tombstones
     /// are never evicted by unrelated writes — a namespace deleted early in a long conformance
     /// run will still deliver its DELETED event even after 10 000+ subsequent writes.
-    deletion_log: Arc<RwLock<HashMap<String, Arc<InternalEvent>>>>,
+    deletion_log: Arc<RwLock<DeletionLog>>,
     /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
     compaction_horizon: Arc<AtomicU64>,
     /// Revision of the most recently committed write. List reads are compared against
@@ -81,7 +94,7 @@ impl SqliteStore {
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
-        let deletion_log = Arc::new(RwLock::new(HashMap::new()));
+        let deletion_log = Arc::new(RwLock::new(DeletionLog::default()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
 
@@ -146,7 +159,7 @@ impl SqliteStore {
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
     ring: &RwLock<VecDeque<Arc<InternalEvent>>>,
-    deletion_log: &RwLock<HashMap<String, Arc<InternalEvent>>>,
+    deletion_log: &RwLock<DeletionLog>,
     compaction_horizon: &AtomicU64,
     event: Arc<InternalEvent>,
 ) {
@@ -182,22 +195,24 @@ fn push_event_locked(
     {
         let mut guard = deletion_log.write().expect("deletion_log poisoned");
         if event.value.is_none() {
-            // Deletion: insert tombstone then cap the map.
-            guard.insert(event.key.clone(), Arc::clone(&event));
+            // Deletion: insert tombstone (indexed by revision too) then cap the map.
+            guard.by_key.insert(event.key.clone(), Arc::clone(&event));
+            guard.by_revision.insert(event.revision, event.key.clone());
             const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
-            if guard.len() > DELETION_LOG_CAP {
-                // Find and remove the entry with the smallest revision.
-                if let Some(oldest_key) = guard
-                    .iter()
-                    .min_by_key(|(_, e)| e.revision)
-                    .map(|(k, _)| k.clone())
-                {
-                    guard.remove(&oldest_key);
+            if guard.by_key.len() > DELETION_LOG_CAP {
+                // Evict the entry with the smallest revision. `by_revision` keeps
+                // revision -> key sorted, so this is O(log n) via pop_first() instead
+                // of an O(n) linear scan over `by_key`.
+                if let Some((_, oldest_key)) = guard.by_revision.pop_first() {
+                    guard.by_key.remove(&oldest_key);
                 }
             }
         } else {
-            // Creation/update: evict any stale tombstone for this key.
-            guard.remove(&event.key);
+            // Creation/update: evict any stale tombstone for this key, keeping the
+            // revision index in sync too.
+            if let Some(old) = guard.by_key.remove(&event.key) {
+                guard.by_revision.remove(&old.revision);
+            }
         }
     }
     // Best-effort broadcast of the specific event.
@@ -1030,6 +1045,7 @@ impl Store for SqliteStore {
                 let tombstones: Vec<Arc<InternalEvent>> = {
                     let guard = deletion_log_arc.read().expect("deletion_log poisoned");
                     guard
+                        .by_key
                         .values()
                         .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
                         .cloned()
@@ -1163,6 +1179,7 @@ impl Store for SqliteStore {
                             let tombstones: Vec<Arc<InternalEvent>> = {
                                 let guard = deletion_log_arc.read().expect("deletion_log poisoned");
                                 guard
+                                    .by_key
                                     .values()
                                     .filter(|e| {
                                         e.key.starts_with(&prefix_owned)
@@ -1463,7 +1480,7 @@ mod tests {
     /// Without the fix: get() returns None directly → assertion fails → test fails on revert.
     #[tokio::test(flavor = "multi_thread")]
     async fn get_returns_some_when_stale_read_snapshot_misses_creation() {
-        use std::collections::{HashMap, VecDeque};
+        use std::collections::VecDeque;
         use std::sync::RwLock;
         use tokio::sync::broadcast;
 
@@ -1519,7 +1536,7 @@ mod tests {
             read_conn,
             tx,
             ring: Arc::new(RwLock::new(VecDeque::new())),
-            deletion_log: Arc::new(RwLock::new(HashMap::new())),
+            deletion_log: Arc::new(RwLock::new(DeletionLog::default())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
         };
@@ -1721,7 +1738,7 @@ mod tests {
         {
             let guard = store.deletion_log.read().expect("deletion_log poisoned");
             assert!(
-                guard.contains_key(key),
+                guard.by_key.contains_key(key),
                 "deletion_log must contain tombstone for deleted key; test setup broken"
             );
         }
@@ -1735,7 +1752,7 @@ mod tests {
         {
             let guard = store.deletion_log.read().expect("deletion_log poisoned");
             assert!(
-                !guard.contains_key(key),
+                !guard.by_key.contains_key(key),
                 "deletion_log must NOT retain tombstone after key is re-created; retaining it \
                  causes watchers reconnecting after compaction to receive a spurious DELETED event \
                  for the live object, making controllers stop reconciling the re-created resource"
@@ -1777,12 +1794,141 @@ mod tests {
         for i in 0..5u32 {
             let key = format!("/registry/core/namespaces/ns-{i}");
             assert!(
-                guard.contains_key(&key),
+                guard.by_key.contains_key(&key),
                 "deletion_log must retain tombstone for ns-{i} (not re-created); evicting it \
                  would cause a reconnecting watcher to miss the DELETED event, deadlocking any \
                  controller waiting for the namespace deletion to complete"
             );
         }
+    }
+
+    /// Eviction over the deletion_log cap must remove the tombstone with the globally lowest
+    /// revision — not the first-inserted, last-inserted, or HashMap-iteration-order entry.
+    ///
+    /// Why it matters: eviction is now driven by a `by_revision: BTreeMap<u64, String>`
+    /// auxiliary index (`pop_first()`) instead of an O(n) `.iter().min_by_key()` scan over
+    /// `by_key`, so the O(n) scan no longer runs while every concurrent writer is blocked on
+    /// the global write lock. If that index were ever built from insertion order instead of
+    /// `event.revision`, eviction would remove the wrong tombstone: an active watcher could
+    /// lose the DELETED event for an object it is still waiting on (deadlock), while a
+    /// tombstone for a key deleted long ago and needed by no one keeps consuming memory.
+    ///
+    /// This test plants the lowest-revision tombstone in the MIDDLE of the insertion
+    /// sequence (not first or last), so it only passes if eviction genuinely orders by
+    /// revision rather than by insertion order.
+    #[tokio::test]
+    async fn deletion_log_eviction_evicts_lowest_revision_not_insertion_order() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+        let victim_key = "/registry/core/namespaces/victim".to_string();
+
+        // Insert DELETION_LOG_CAP + 1 tombstones so the cap is exceeded exactly once, on
+        // the final insert. The victim gets the lowest revision (0) but is inserted at the
+        // MIDDLE index — an insertion-order-based (or desynced) eviction would pick a
+        // different key.
+        for i in 0..=DELETION_LOG_CAP {
+            let (key, revision) = if i == DELETION_LOG_CAP / 2 {
+                (victim_key.clone(), 0)
+            } else {
+                (format!("/registry/core/namespaces/ns-{i}"), (i as u64) + 1)
+            };
+            store.push_event(Arc::new(InternalEvent {
+                key,
+                revision,
+                value: None,
+                is_create: false,
+                deleted_body: None,
+            }));
+        }
+
+        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        assert_eq!(
+            guard.by_key.len(),
+            DELETION_LOG_CAP,
+            "deletion_log must shrink back to the cap after exactly one entry is evicted"
+        );
+        assert!(
+            !guard.by_key.contains_key(&victim_key),
+            "eviction must remove the globally lowest-revision tombstone (revision=0, planted \
+             mid-sequence); if eviction instead used insertion order or a desynced index, a \
+             different (wrong) tombstone would be evicted and this one would incorrectly survive"
+        );
+    }
+
+    /// The evict-on-recreate path must remove a tombstone's entry from BOTH `by_key` and the
+    /// `by_revision` index — not just `by_key`.
+    ///
+    /// Why it matters: eviction walks `by_revision` to find the lowest-revision victim in
+    /// O(log n) (`pop_first()`). If evict-on-recreate only cleared `by_key` (forgetting
+    /// `by_revision`), a stale revision->key entry for the recreated key would linger in
+    /// `by_revision` forever at its old, no-longer-valid revision. Because that revision is
+    /// typically far lower than any still-tombstoned key, the next cap eviction would keep
+    /// picking that stale entry: `by_key.remove` on it would be a no-op, so the log would
+    /// never actually shrink back under the cap (unbounded growth), and the real
+    /// lowest-revision tombstone — which a reconnecting watcher may still need — would
+    /// incorrectly survive instead of being evicted.
+    #[tokio::test]
+    async fn deletion_log_recreate_keeps_revision_index_in_sync_with_later_eviction() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let recreated_key = "/registry/core/namespaces/recreate-me".to_string();
+
+        // 1. Tombstone "recreate-me" at the lowest possible revision (0).
+        store.push_event(Arc::new(InternalEvent {
+            key: recreated_key.clone(),
+            revision: 0,
+            value: None,
+            is_create: false,
+            deleted_body: None,
+        }));
+
+        // 2. Recreate it — must evict the tombstone from both by_key and by_revision.
+        store.push_event(Arc::new(InternalEvent {
+            key: recreated_key.clone(),
+            revision: 1,
+            value: Some(Bytes::from(
+                r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"recreate-me"}}"#,
+            )),
+            is_create: true,
+            deleted_body: None,
+        }));
+
+        // 3. Push DELETION_LOG_CAP + 1 fresh tombstones, all at revisions strictly above the
+        // stale revision=0 left behind by step 1 if the index were desynced. The lowest
+        // revision among this fresh batch (revision=2, key "ns-0") is what a correctly
+        // synced index must evict when the cap is exceeded on the final insert.
+        const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+        let true_victim = "/registry/core/namespaces/ns-0".to_string();
+        for i in 0..=DELETION_LOG_CAP {
+            store.push_event(Arc::new(InternalEvent {
+                key: format!("/registry/core/namespaces/ns-{i}"),
+                revision: (i as u64) + 2,
+                value: None,
+                is_create: false,
+                deleted_body: None,
+            }));
+        }
+
+        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        assert_eq!(
+            guard.by_key.len(),
+            DELETION_LOG_CAP,
+            "deletion_log must shrink back to the cap after the cap-triggering insert; a stale \
+             by_revision entry left behind by evict-on-recreate would make eviction a no-op \
+             (removing a key that no longer exists in by_key), leaving the log permanently over \
+             cap and growing without bound"
+        );
+        assert!(
+            !guard.by_key.contains_key(&true_victim),
+            "eviction must remove the tombstone with the lowest CURRENT revision (ns-0, \
+             revision=2); if the recreate path left a stale, lower revision->key entry in \
+             by_revision, eviction would instead try to evict the already-gone recreated key \
+             (a no-op) and this tombstone would incorrectly survive"
+        );
+        assert!(
+            !guard.by_key.contains_key(&recreated_key),
+            "the recreated key must never re-appear as a tombstone in deletion_log; it is live"
+        );
     }
 
     /// Batch namespace delete must emit a distinct watch DELETED event per object.
