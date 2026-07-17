@@ -1605,49 +1605,7 @@ mod tests {
     use std::collections::BTreeSet;
     use u7s_sentinel::Sentinel;
 
-    fn collect_leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
-        match value {
-            serde_json::Value::Object(map) if !map.is_empty() => {
-                for (k, v) in map {
-                    let path = if prefix.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{prefix}.{k}")
-                    };
-                    collect_leaf_paths(v, &path, out);
-                }
-            }
-            serde_json::Value::Array(items) if !items.is_empty() => {
-                for item in items {
-                    collect_leaf_paths(item, prefix, out);
-                }
-            }
-            _ => {
-                out.insert(prefix.to_string());
-            }
-        }
-    }
-
-    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
-        leaf_paths
-            .iter()
-            .any(|p| p.split('.').any(|seg| seg == field))
-    }
-
-    fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
-        let missing: Vec<&str> = expected
-            .iter()
-            .filter(|f| !has_field(leaf_paths, f))
-            .copied()
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
-             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
-             the omission is deliberate, document why and drop the field from this test's \
-             `expected` list)"
-        );
-    }
+    use crate::util::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
 
     // selfLink is a legacy field the system no longer populates — permanently omitted.
     // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
