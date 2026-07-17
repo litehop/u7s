@@ -229,6 +229,74 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// Shared helpers for the Sentinel protobuf-decode completeness tests duplicated across every
+/// `*_gen_adapter.rs` module: each one builds a message with every field set to a value no
+/// zero/empty-elision check in a `gen_*_to_json`/`decode_*_proto_gen` function could mistake for
+/// "unset" (see `u7s_sentinel::Sentinel`), decodes it through the real entry point, and asserts
+/// every field name shows up somewhere in the resulting JSON. A name that never appears means
+/// some function never reads that field from the decoded protobuf struct at all.
+#[cfg(test)]
+pub(crate) mod sentinel_test_util {
+    use std::collections::BTreeSet;
+
+    /// Recursively collects every leaf key path in a JSON value tree, joining nested object
+    /// keys with '.'. Arrays contribute their elements' own leaf paths without an index: an
+    /// array's length and content depend on how many synthetic elements a sentinel produced,
+    /// so indexing would make the expected path set depend on that count instead of just on
+    /// which fields exist.
+    pub(crate) fn collect_leaf_paths(
+        value: &serde_json::Value,
+        prefix: &str,
+        out: &mut BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    collect_leaf_paths(v, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    collect_leaf_paths(item, prefix, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    /// True if `field` appears as a whole path segment somewhere in `leaf_paths` — i.e. it was
+    /// decoded at some level, regardless of nesting depth. Segment (not full-path) matching is
+    /// deliberate: this only cares whether a field survived decode at all, matching the
+    /// historical bug shape of a field dropped entirely from a gen_*_to_json function.
+    fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        leaf_paths
+            .iter()
+            .any(|p| p.split('.').any(|seg| seg == field))
+    }
+
+    pub(crate) fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|f| !has_field(leaf_paths, f))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "sentinel completeness: field(s) {missing:?} never appear in the decoded JSON — \
+             add handling in the corresponding gen_*_to_json/decode_*_proto_gen function (or, if \
+             the omission is deliberate, document why and drop the field from this test's \
+             `expected` list)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
