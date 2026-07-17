@@ -126,7 +126,7 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
@@ -143,7 +143,7 @@ if [ -n "$FOCUS" ]; then
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
 else
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=non-disruptive-conformance || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=certified-conformance || SONOBUOY_EXIT=$?
 fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
