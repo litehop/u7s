@@ -31,26 +31,18 @@ use u7s_scheduler::{
     stream_watch_events, NodeTally, PendingPod,
 };
 
-/// Reserve `pending`'s slot on `node` in `tally` before binding, so a
-/// concurrently-running scheduling decision cannot read stale (too-low)
-/// usage for `node` while this bind's HTTP call is in flight — this is what
-/// closes the read-after-write race a live per-node GET fan-out had. Rolls
-/// the reservation back if the bind itself fails, so a failed bind never
-/// permanently overcounts `node`'s tallied usage.
-async fn assume_and_bind(
+/// Bind `pending` to `node`, which `pick_node` has already reserved in
+/// `tally` atomically with its fit check (see `pick_node`'s doc comment for
+/// why the reservation must not happen in a second, later lock acquisition
+/// here instead). Rolls the reservation back if the bind itself fails, so a
+/// failed bind never permanently overcounts `node`'s tallied usage.
+async fn bind_reserved_node(
     connector: &TlsConnector,
     server: &str,
     tally: &Mutex<NodeTally>,
     pending: &PendingPod,
     node: &str,
 ) -> anyhow::Result<()> {
-    tally.lock().expect("tally lock poisoned").assume(
-        &pending.namespace,
-        &pending.pod_name,
-        node,
-        pending.priority,
-        pending.requests.clone(),
-    );
     if let Err(e) = bind_pod(
         connector,
         server,
@@ -65,6 +57,109 @@ async fn assume_and_bind(
             .expect("tally lock poisoned")
             .remove(&pending.namespace, &pending.pod_name);
         return Err(e);
+    }
+    Ok(())
+}
+
+/// Maximum number of times `preempt_and_pick_node` re-plans preemption for
+/// the same pending pod before giving up — bounds the retry below so a
+/// pathological cluster that keeps recreating evicted pods can't stall this
+/// pod's scheduling task forever.
+const MAX_PREEMPTION_ATTEMPTS: u32 = 5;
+
+/// Plan and execute preemption for `pending`, retrying up to
+/// `MAX_PREEMPTION_ATTEMPTS` times if `find_preemption_plan`'s atomic
+/// reservation loses to a fresher read, and returning the node name once one
+/// succeeds.
+///
+/// `find_preemption_plan` reserves `pending` on the chosen node before this
+/// function evicts anyone (see its doc comment for why: reserving only
+/// AFTER eviction leaves a window where a third, concurrently-scheduled pod —
+/// e.g. a controller's replacement for a pod just evicted — can repeatedly
+/// claim each freed slot first; reproduced live against the
+/// PreemptionExecutionPath conformance scenario, fast enough that even a
+/// several-attempt "evict, then re-check" retry never won). So once a plan
+/// comes back here, `pending`'s slot is already safely held — eviction
+/// failing partway through is the only way this loop needs to retry, and if
+/// it does, the reservation is rolled back first so the failed attempt does
+/// not permanently strand that capacity.
+async fn preempt_and_pick_node(
+    connector: &TlsConnector,
+    server: &str,
+    pending: &PendingPod,
+    tally: &Mutex<NodeTally>,
+    namespace: &str,
+    pod_name: &str,
+) -> anyhow::Result<String> {
+    let mut last_err = None;
+    for _ in 0..MAX_PREEMPTION_ATTEMPTS {
+        let plan = match find_preemption_plan(connector, server, pending, tally).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        info!(
+            "preempting {} pod(s) on {} to schedule higher-priority pod {namespace}/{pod_name}",
+            plan.victims.len(),
+            plan.node_name
+        );
+        match evict_victims(connector, server, &plan.victims, tally, pod_name).await {
+            Ok(()) => return Ok(plan.node_name),
+            Err(e) => {
+                tally
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .remove(&pending.namespace, &pending.pod_name);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once, so this is always Some")).context(
+        "no node still fits after preemption, even after retrying \
+         (capacity kept being claimed concurrently)",
+    )
+}
+
+/// Evict every pod in `victims` ("namespace/name" keys), stamping the
+/// DisruptionTarget condition on each first (best-effort, mirrors upstream
+/// kube-scheduler). Split out of `preempt_and_pick_node` so a mid-loop
+/// eviction failure is a single `?` there, making the reservation-rollback
+/// path easy to see.
+async fn evict_victims(
+    connector: &TlsConnector,
+    server: &str,
+    victims: &[String],
+    tally: &Mutex<NodeTally>,
+    pod_name: &str,
+) -> anyhow::Result<()> {
+    for victim in victims {
+        let Some((v_ns, v_name)) = victim.split_once('/') else {
+            continue;
+        };
+        // Best-effort: mirrors upstream kube-scheduler, which stamps
+        // DisruptionTarget on the victim before deleting it. A patch
+        // failure must not block the eviction itself — freeing the slot
+        // for the higher-priority pod matters more than the condition.
+        if let Err(e) = patch_pod_status(
+            connector,
+            server,
+            v_ns,
+            v_name,
+            &disruption_target_patch(pod_name),
+        )
+        .await
+        {
+            error!(
+                "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
+            );
+        }
+        delete_pod(connector, server, v_ns, v_name).await?;
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .remove(v_ns, v_name);
     }
     Ok(())
 }
@@ -261,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
                 let outcome: anyhow::Result<String> = async {
                     match first_pick {
                         Ok(node) => {
-                            assume_and_bind(
+                            bind_reserved_node(
                                 &connector_clone,
                                 &server_clone,
                                 &tally_clone,
@@ -275,66 +370,16 @@ async fn main() -> anyhow::Result<()> {
                             // No node has a free slot — try preemption before giving
                             // up: evict lower-priority pods to make room rather than
                             // leaving a higher-priority pod Pending forever (mayor-rsei).
-                            let plan = find_preemption_plan(
+                            let node = preempt_and_pick_node(
                                 &connector_clone,
                                 &server_clone,
                                 &pending,
                                 &tally_clone,
+                                &namespace,
+                                &pod_name,
                             )
                             .await?;
-                            info!(
-                                "preempting {} pod(s) on {} to schedule higher-priority pod {namespace}/{pod_name}",
-                                plan.victims.len(),
-                                plan.node_name
-                            );
-                            for victim in &plan.victims {
-                                let Some((v_ns, v_name)) = victim.split_once('/') else {
-                                    continue;
-                                };
-                                // Best-effort: mirrors upstream kube-scheduler, which
-                                // stamps DisruptionTarget on the victim before deleting
-                                // it. A patch failure must not block the eviction
-                                // itself — freeing the slot for the higher-priority
-                                // pod matters more than the condition.
-                                if let Err(e) = patch_pod_status(
-                                    &connector_clone,
-                                    &server_clone,
-                                    v_ns,
-                                    v_name,
-                                    &disruption_target_patch(&pod_name),
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
-                                    );
-                                }
-                                delete_pod(&connector_clone, &server_clone, v_ns, v_name).await?;
-                                tally_clone
-                                    .lock()
-                                    .expect("tally lock poisoned")
-                                    .remove(v_ns, v_name);
-                            }
-                            // Re-validate against the tally instead of trusting the
-                            // pre-eviction plan: the evictions above already updated
-                            // it, but a concurrently-running scheduling decision could
-                            // have claimed the freed capacity during the eviction's own
-                            // wall-clock DELETE round trips (see find_preemption_plan's
-                            // doc comment). pick_node is cheap here — no per-node GET
-                            // fan-out — so this re-check costs one extra
-                            // GET /api/v1/nodes, not O(nodes).
-                            let node = pick_node(
-                                &connector_clone,
-                                &server_clone,
-                                &pending,
-                                &tally_clone,
-                            )
-                            .await
-                            .context(
-                                "no node still fits after preemption \
-                                 (capacity may have been claimed concurrently)",
-                            )?;
-                            assume_and_bind(
+                            bind_reserved_node(
                                 &connector_clone,
                                 &server_clone,
                                 &tally_clone,

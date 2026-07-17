@@ -1360,7 +1360,8 @@ pub enum PickNodeError {
 /// Return the name of the first node that qualifies for `pod`
 /// (see `node_qualifies_for_pod`), has at least one free pod slot, and has
 /// enough uncommitted cpu/memory/ephemeral-storage for `pod.requests`
-/// (NodeResourcesFit predicate).
+/// (NodeResourcesFit predicate). On success, atomically reserves `pod` on
+/// the chosen node in `tally` (see `NodeTally::assume`) before returning it.
 ///
 /// Fetches the node list from the API server; per-node usage comes from
 /// `tally` (see `NodeTally`) — an in-memory tally the scheduler's own pod
@@ -1371,8 +1372,20 @@ pub enum PickNodeError {
 /// stale (a read-after-write race under concurrent scheduling load), letting
 /// a pod be bound onto a node that was actually already full. `tally` cannot
 /// observe that race: the scheduler updates it synchronously the moment it
-/// decides to bind, before the bind's HTTP call even completes (see
-/// `NodeTally::assume`).
+/// decides to bind, before the bind's HTTP call even completes.
+///
+/// The reservation happens under the SAME lock acquisition as the fit check,
+/// not in a later, separate lock taken by the caller: two pods racing for the
+/// same just-freed slot (e.g. a preemptor's post-eviction re-check racing a
+/// controller's replacement pod for the capacity a preemption just freed —
+/// reproduced live against the PreemptionExecutionPath conformance scenario)
+/// could otherwise both read the slot as free before either reserved it, and
+/// both bind — the kubelet then rejects whichever container it admits
+/// second. Splitting the check and the reservation across two lock
+/// acquisitions (as a prior version did, calling `NodeTally::assume`
+/// separately after `pick_node` returned) reopens exactly the read-after-write
+/// race this tally exists to close, just between two scheduling decisions
+/// instead of between a GET and a bind.
 ///
 /// A node at or above its `status.allocatable.pods` limit, or that cannot fit
 /// `pod.requests` alongside what's already tallied, is skipped. Returns
@@ -1396,8 +1409,30 @@ pub async fn pick_node(
         )));
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
-    let node_usage = tally.lock().expect("tally lock poisoned").usage_by_node();
-    select_node_with_capacity(list, pod, &node_usage).map_err(|_| PickNodeError::NoCapacity)
+    select_and_reserve_node(list, pod, tally)
+}
+
+/// The synchronous fit-check-and-reserve step behind `pick_node`, split out
+/// so its atomicity (one `tally` lock acquisition covers both the check and
+/// the reservation) can be exercised under real concurrent access in a unit
+/// test, without a live API server — `pick_node` itself cannot be unit
+/// tested that way since it needs a network round trip for the node list.
+fn select_and_reserve_node(
+    list: NodeList,
+    pod: &PendingPod,
+    tally: &std::sync::Mutex<NodeTally>,
+) -> Result<String, PickNodeError> {
+    let mut tally_guard = tally.lock().expect("tally lock poisoned");
+    let node = select_node_with_capacity(list, pod, &tally_guard.usage_by_node())
+        .map_err(|_| PickNodeError::NoCapacity)?;
+    tally_guard.assume(
+        &pod.namespace,
+        &pod.pod_name,
+        &node,
+        pod.priority,
+        pod.requests.clone(),
+    );
+    Ok(node)
 }
 
 /// Whether a `pick_node` failure should be treated as "leave this pod
@@ -1425,21 +1460,35 @@ pub struct PreemptionPlan {
 
 /// Search every node that qualifies for `pod` (see `node_qualifies_for_pod`)
 /// for a viable preemption target: a node where evicting some lower-priority
-/// pods would free a slot for `pod`.
+/// pods would free a slot for `pod`. On success, atomically reserves `pod`
+/// on the chosen node in `tally` (see `NodeTally::assume`) — BEFORE any of
+/// `victims` is actually evicted — so the caller can safely evict them and
+/// bind without a second fit check.
 ///
 /// Intended to run only after `pick_node` has already failed for the same pod —
 /// this is the fallback that stops a higher-priority pod from staying Pending
 /// forever just because lower-priority pods claimed every slot first (mayor-rsei).
 ///
 /// Per-node pod identity/priority/requests come from `tally` (see
-/// `NodeTally`), not a live GET — see `pick_node`'s doc comment for why. This
-/// also means the caller MUST re-check fit (e.g. by calling `pick_node`
-/// again) after evicting `victims` and before binding: evicting a victim
-/// updates `tally` immediately, but nothing stops a concurrently-running
-/// scheduling decision from claiming the freed capacity during the
-/// eviction's own (real, wall-clock) DELETE round trips — this plan is a
-/// snapshot from before those evictions ran, not a guarantee about the state
-/// after them.
+/// `NodeTally`), not a live GET — see `pick_node`'s doc comment for why.
+/// Reserving `pod` before eviction, rather than checking fit again after it,
+/// is deliberate: a live repro against the PreemptionExecutionPath
+/// conformance scenario showed that evicting victims first and only then
+/// re-checking leaves a window where a THIRD, concurrently-scheduled pod
+/// (there, a ReplicaSet controller's replacement for a pod just evicted)
+/// can repeatedly claim each freed slot before the actual preemptor's
+/// re-check runs — fast enough that even a several-attempt bounded retry of
+/// "evict, then re-check" never won. Reserving first means the tally already
+/// shows the node as occupied by `pod` — on top of the not-yet-evicted
+/// victims — for the entire eviction sequence, so no other scheduling
+/// decision ever observes a free slot to steal.
+///
+/// The reservation happens under a single, fresh lock acquisition that also
+/// re-verifies the plan against the CURRENT tally (not the possibly-stale
+/// per-node snapshots the search loop below used): if some other reservation
+/// has already consumed the room this plan counted on, this returns `Err` so
+/// the caller can re-plan from scratch, instead of reserving `pod` onto a
+/// node that a fresher read shows no longer fits.
 ///
 /// Among nodes where preemption would work, the node requiring the FEWEST
 /// victims is chosen (cheapest disruption); ties keep the API server's node-list
@@ -1457,24 +1506,12 @@ pub async fn find_preemption_plan(
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
 
-    let mut best: Option<PreemptionPlan> = None;
-    for node in &list.items {
+    let mut best: Option<(usize, PreemptionPlan)> = None;
+    for (index, node) in list.items.iter().enumerate() {
         if !node_qualifies_for_pod(node, pod) {
             continue;
         }
-        let cap_str = if !node.status.allocatable.pods.is_empty() {
-            &node.status.allocatable.pods
-        } else {
-            &node.status.capacity.pods
-        };
-        // Unlike the old pod-count-only model, a 0 (unknown/unlimited)
-        // pod-count capacity does NOT mean this node can be skipped: `pod`
-        // may still fail to fit on a cpu/memory/extended-resource dimension,
-        // which is exactly why `pick_node` rejected it.
-        // `select_preemption_victims` treats 0 as "pod-count never blocks",
-        // the same convention `resource_fits` already uses for cpu/memory.
-        let capacity = parse_pod_capacity(cap_str);
-
+        let capacity = pod_count_capacity(node);
         let node_name = &node.metadata.name;
         let node_pods = tally
             .lock()
@@ -1493,16 +1530,90 @@ pub async fn find_preemption_plan(
         }
         let is_cheaper = best
             .as_ref()
-            .is_none_or(|b| victims.len() < b.victims.len());
+            .is_none_or(|(_, b)| victims.len() < b.victims.len());
         if is_cheaper {
-            best = Some(PreemptionPlan {
-                node_name: node_name.clone(),
-                victims,
-            });
+            best = Some((
+                index,
+                PreemptionPlan {
+                    node_name: node_name.clone(),
+                    victims,
+                },
+            ));
         }
     }
 
-    best.context("no node can fit the pending pod even after preempting lower-priority pods")
+    let (index, plan) =
+        best.context("no node can fit the pending pod even after preempting lower-priority pods")?;
+    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)?;
+
+    Ok(plan)
+}
+
+/// Resolve a node's pod-count capacity, preferring `status.allocatable.pods`
+/// and falling back to `status.capacity.pods` — shared by
+/// `select_node_with_capacity` and `find_preemption_plan` so both agree on
+/// which field wins when both are present.
+fn pod_count_capacity(node: &NodeItem) -> u32 {
+    let cap_str = if !node.status.allocatable.pods.is_empty() {
+        &node.status.allocatable.pods
+    } else {
+        &node.status.capacity.pods
+    };
+    parse_pod_capacity(cap_str)
+}
+
+/// The synchronous re-verify-and-reserve step behind `find_preemption_plan`,
+/// split out so its atomicity (one `tally` lock acquisition covers both the
+/// fresh fit re-check and the reservation) can be exercised under real
+/// concurrent access in a unit test — mirrors `select_and_reserve_node`'s
+/// relationship to `pick_node`, for the same reason (see `find_preemption_plan`'s
+/// doc comment).
+///
+/// Re-derives remaining pod-count and resource usage on `node` from a FRESH
+/// `tally` read with `plan.victims`' contributions subtracted out (rather
+/// than trusting the possibly-stale snapshot the search loop in
+/// `find_preemption_plan` used), so a reservation some other decision made in
+/// the meantime is never missed.
+fn verify_and_reserve_preemption(
+    pod: &PendingPod,
+    node: &NodeItem,
+    plan: &PreemptionPlan,
+    tally: &std::sync::Mutex<NodeTally>,
+) -> anyhow::Result<()> {
+    let capacity = pod_count_capacity(node);
+    let mut tally_guard = tally.lock().expect("tally lock poisoned");
+    let current_pods = tally_guard.pods_on(&plan.node_name);
+    let mut remaining_pod_count = current_pods.len() as u32;
+    let mut remaining_requests = current_pods
+        .iter()
+        .fold(ResourceRequests::default(), |acc, p| {
+            acc + p.requests.clone()
+        });
+    for victim in &plan.victims {
+        // A victim already absent from the fresh read (e.g. some other actor
+        // deleted it independently) contributes nothing to subtract — its
+        // capacity is already free, which only helps this check succeed.
+        if let Some(p) = current_pods.iter().find(|p| &p.key == victim) {
+            remaining_pod_count -= 1;
+            subtract_requests(&mut remaining_requests, &p.requests);
+        }
+    }
+    let still_fits = (capacity == 0 || remaining_pod_count < capacity)
+        && resource_fits(&node.status.allocatable, &remaining_requests, &pod.requests);
+    if !still_fits {
+        bail!(
+            "no node still fits after preemption \
+             (capacity may have been claimed concurrently)"
+        );
+    }
+    tally_guard.assume(
+        &pod.namespace,
+        &pod.pod_name,
+        &plan.node_name,
+        pod.priority,
+        pod.requests.clone(),
+    );
+    Ok(())
 }
 
 /// The target of a Binding — identifies the node to bind to.
@@ -3651,8 +3762,8 @@ mod tests {
     #[test]
     fn node_tally_assume_reflects_just_bound_pod_before_next_scheduling_decision() {
         let mut tally = NodeTally::default();
-        // Mirrors main.rs's assume_and_bind: the tally is updated the instant
-        // the first pod's bind is decided, not after its HTTP call returns.
+        // Mirrors pick_node: the tally is updated the instant a pod's node is
+        // decided, not after its HTTP bind call returns.
         tally.assume("default", "filler", "worker-0", 0, requests(5600, 0, 0));
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -3672,6 +3783,137 @@ mod tests {
              usage here is exactly the bug that let the scheduler bind onto an \
              already-full node, which the kubelet then OutOfcpu-rejected; got: {:?}",
             result.ok()
+        );
+    }
+
+    /// The exact race reproduced live against the PreemptionExecutionPath
+    /// SchedulerPreemption conformance scenario: a preemption's post-eviction
+    /// re-check and a concurrently-scheduled pod (there, a ReplicaSet
+    /// controller's replacement for the pod preemption just evicted) run in
+    /// different tokio tasks, potentially on different OS threads, and both
+    /// end up calling `select_and_reserve_node` for the same just-freed slot.
+    ///
+    /// Before `pick_node` committed the reservation itself, the fit check
+    /// (`pick_node`) and the reservation (`NodeTally::assume`, called
+    /// separately by the caller after `pick_node` returned) were two
+    /// independent lock acquisitions. Two callers could each acquire the
+    /// tally lock for the check, both see the slot as free, and both then
+    /// separately commit — the kubelet then rejects whichever container it
+    /// admits second, since the node never actually had room for both. This
+    /// test spawns real OS threads racing for a slot that fits exactly one of
+    /// them; reverting to two separate lock acquisitions reopens the window
+    /// for more than one thread to see the slot as free before any of them
+    /// reserves it.
+    #[test]
+    fn select_and_reserve_node_never_double_books_a_single_free_slot() {
+        let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
+        const CONTENDERS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+
+        let handles: Vec<_> = (0..CONTENDERS)
+            .map(|i| {
+                let tally = std::sync::Arc::clone(&tally);
+                let barrier = std::sync::Arc::clone(&barrier);
+                // Room for exactly one 1000m-cpu pod on this node, not two —
+                // built fresh per thread rather than shared, since NodeList
+                // is not Clone.
+                let mut node = make_node_with_capacity("worker-0", &[], "110");
+                node.status.allocatable.cpu = "1".to_owned();
+                let list = NodeList { items: vec![node] };
+                let mut pod = empty_pending_pod();
+                pod.pod_name = format!("pod-{i}");
+                pod.requests.cpu_milli = 1000;
+                std::thread::spawn(move || {
+                    // Line every thread up so as many as possible call
+                    // select_and_reserve_node at the same instant — this is
+                    // what makes a split check/reserve likely to be caught,
+                    // not just theoretically possible.
+                    barrier.wait();
+                    select_and_reserve_node(list, &pod, &tally)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one of {CONTENDERS} pods racing for a single 1000m-cpu \
+             slot must win — splitting the fit check and the reservation \
+             across two lock acquisitions lets more than one thread see the \
+             slot as free and bind, which the kubelet then rejects; got \
+             {ok_count} winners: {results:?}"
+        );
+
+        let usage = tally.lock().expect("tally lock poisoned").usage_by_node();
+        assert_eq!(
+            usage["worker-0"].requests.cpu_milli, 1000,
+            "the tally must reflect exactly one reservation after the race \
+             settles, not zero (a lost update) or more than one (double-booked)"
+        );
+    }
+
+    /// The exact race reproduced live against the PreemptionExecutionPath
+    /// SchedulerPreemption conformance scenario, one level up from
+    /// `select_and_reserve_node_never_double_books_a_single_free_slot`:
+    /// several pending pods each independently plan to preempt the SAME two
+    /// victims on the SAME node (plausible when several pods are ready to
+    /// preempt around the same time — e.g. a controller recreating several
+    /// replacement pods at once). Before `find_preemption_plan` reserved the
+    /// pending pod itself, the caller evicted the victims and only THEN
+    /// re-checked fit — leaving a window where more than one such pod could
+    /// see the node as free before any of them committed. Reserving under
+    /// the SAME lock acquisition that re-reads current tally state (not the
+    /// stale pre-eviction snapshot) means only the first caller to reach
+    /// this function can ever win the shared capacity; every other caller's
+    /// fresh read already includes the winner's reservation.
+    #[test]
+    fn verify_and_reserve_preemption_never_double_books_shared_victims() {
+        let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.assume("default", "victim-a", "worker-0", 0, requests(1000, 0, 0));
+            guard.assume("default", "victim-b", "worker-0", 0, requests(1000, 0, 0));
+        }
+
+        const CONTENDERS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+        let handles: Vec<_> = (0..CONTENDERS)
+            .map(|i| {
+                let tally = std::sync::Arc::clone(&tally);
+                let barrier = std::sync::Arc::clone(&barrier);
+                // Capacity for exactly one 2000m-cpu pod once BOTH 1000m
+                // victims are gone — never for a victim's slot plus a new
+                // pod on top, so at most one contender can ever fit.
+                let mut node = make_node_with_capacity("worker-0", &[], "110");
+                node.status.allocatable.cpu = "2".to_owned();
+                let mut pod = empty_pending_pod();
+                pod.pod_name = format!("preemptor-{i}");
+                pod.requests.cpu_milli = 2000;
+                let plan = PreemptionPlan {
+                    node_name: "worker-0".to_owned(),
+                    victims: vec!["default/victim-a".to_owned(), "default/victim-b".to_owned()],
+                };
+                std::thread::spawn(move || {
+                    // Line every contender up so as many as possible call
+                    // verify_and_reserve_preemption at the same instant.
+                    barrier.wait();
+                    verify_and_reserve_preemption(&pod, &node, &plan, &tally)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one of {CONTENDERS} pods independently planning to \
+             preempt the same two victims must win — checking fit and \
+             reserving in two separate lock acquisitions lets more than one \
+             thread see the (not-yet-evicted) victims' capacity as enough \
+             and reserve, which strands the loser's evicted victims for \
+             nothing or double-books the node; got {ok_count} winners: \
+             {results:?}"
         );
     }
 
