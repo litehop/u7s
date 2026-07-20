@@ -31,10 +31,7 @@ LOG="$WORKDIR/scheduler.log"
 
 echo "=== [05] Start u7s-scheduler (on host) ==="
 
-if [ ! -f "$BINARY" ]; then
-  echo "Binary not found — building u7s-scheduler ..."
-  cargo build --release -p u7s-scheduler --manifest-path "$REPO/Cargo.toml"
-fi
+cargo build --release -p u7s-scheduler --manifest-path "$REPO/Cargo.toml"
 
 if [ ! -f "$WORKDIR/kubeconfig" ]; then
   echo "error: kubeconfig not found at $WORKDIR/kubeconfig" >&2
