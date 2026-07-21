@@ -984,74 +984,43 @@ pub async fn delete_namespace<S: Store>(
             rest: serde_json::Value::Object(Default::default()),
         })
         .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
-
-        // u7s has no namespace lifecycle controller, so we immediately remove the
-        // "kubernetes" finalizer (acting as the namespace controller). External
-        // controllers that added their own finalizers remain responsible for removing them.
-        let remaining: Vec<serde_json::Value> = soft["spec"]["finalizers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter(|f| f.as_str() != Some("kubernetes"))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        soft["spec"]["finalizers"] = serde_json::Value::Array(remaining.clone());
         obj.body = soft;
 
-        if remaining.is_empty() {
-            // Persist status.phase=Terminating to the store BEFORE running the drain
-            // cascade below. create_namespaced_resource's Terminating gate reads this
-            // stored value; if it were written only after the cascade (as before), the
-            // whole cascade would run against a namespace that still looks Active, letting
-            // racing controller creates land invisibly to the cascade's LIST snapshot and
-            // wedge the namespace in Terminating until the 15-minute watchdog force-deletes
-            // it (bd mayor-74j3.6).
-            let expected_rv = parse_resource_version(obj.resource_version())?;
-            let new_rv = state
-                .store
-                .put(&key, obj.to_bytes(), expected_rv)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
-            obj.set_resource_version(new_rv);
+        // spec.finalizers (including "kubernetes") is left untouched. deletionTimestamp +
+        // "kubernetes" in spec.finalizers is the real KCM namespace-controller's ONLY watch
+        // trigger for its v1.34+ ordered content-deletion sequence, which is what sets
+        // status.conditions (NamespaceDeletionContentFailure etc.) that OrderedNamespaceDeletion
+        // polls for. u7s used to self-clear "kubernetes" here, acting as its own namespace
+        // controller — but that erased the trigger before the real controller could ever
+        // observe it, so it never ran. The real controller now owns clearing spec.finalizers,
+        // via PUT .../finalize (finalize_namespace), once its drain completes.
 
-            // No remaining spec.finalizers — attempt hard-delete.
-            // But first cascade-delete contained objects, respecting their metadata.finalizers.
-            delete_namespace_scoped_crds(&state, &name).await;
-            let has_soft_deleted =
-                cascade_delete_namespace_resources_until_stable(&state, &name).await;
-            if !has_soft_deleted {
-                // Nothing left with finalizers pending — the namespace is already persisted
-                // as Terminating above, so just hard-delete it now that the drain is done.
-                state
-                    .store
-                    .delete(&key, None)
-                    .await
-                    .map_err(|e| store_err_to_status(e, &name))?;
-            }
-            // else: some contained objects have finalizers and were soft-deleted
-            // (Terminating). The namespace must stay alive until those objects' controllers
-            // clear their finalizers (OrderedNamespaceDeletion semantics) — it is already
-            // persisted as Terminating above; maybe_finalize_terminating_namespace will
-            // complete the deletion later.
-        } else {
-            // Persist Terminating state BEFORE cascading, for the same reason as above:
-            // create_namespaced_resource's gate must see Terminating for the whole cascade,
-            // not just after it completes.
-            let expected_rv = parse_resource_version(obj.resource_version())?;
-            let new_rv = state
-                .store
-                .put(&key, obj.to_bytes(), expected_rv)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
-            obj.set_resource_version(new_rv);
+        // Persist status.phase=Terminating to the store. create_namespaced_resource's
+        // Terminating gate reads this stored value, so a racing controller create is
+        // rejected the instant this write lands — before the real namespace controller
+        // (or anything else) does any further work (bd mayor-74j3.6).
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+        obj.set_resource_version(new_rv);
 
-            // External controllers still have finalizers — cascade-delete contained
-            // objects, respecting their metadata.finalizers.
-            delete_namespace_scoped_crds(&state, &name).await;
-            cascade_delete_namespace_resources(&state, &name).await;
-        }
+        // Content deletion itself is deliberately NOT done here anymore: it is the real
+        // KCM namespace-controller's job, and it runs its resource types in a specific
+        // order (pods first, then everything else — KEP-5080). u7s previously ran its own
+        // synchronous best-effort cascade in parallel, but that raced ahead of KCM and
+        // deleted later-phase objects (e.g. a plain ConfigMap) essentially at the same
+        // instant as the pod, collapsing the very ordering window
+        // OrderedNamespaceDeletion asserts on (namespace.go:581-610 polls for the
+        // ConfigMap to still exist while the pod already has deletionTimestamp set).
+        // delete_namespace_scoped_crds still runs: it deletes CRDs whose group embeds this
+        // namespace's name, a u7s-specific problem unrelated to ordinary namespace content
+        // (CRDs are cluster-scoped and KCM's namespace-controller has no notion of them
+        // belonging to this namespace) — without it KCM's discovery re-scan never settles.
+        delete_namespace_scoped_crds(&state, &name).await;
+
         return Ok(Json(obj.body).into_response());
     }
 
@@ -1638,13 +1607,20 @@ mod tests {
         );
     }
 
-    // delete_namespace on a namespace created via create_namespace must hard-delete
-    // immediately. u7s acts as its own namespace lifecycle controller: it removes the
-    // "kubernetes" finalizer and hard-deletes in a single request without waiting for KCM.
-    // Without this, the namespace stays Terminating forever because u7s has no KCM-style
-    // background controller to remove the finalizer.
+    // delete_namespace must leave the "kubernetes" finalizer (and deletionTimestamp) in
+    // place rather than self-clearing it. deletionTimestamp != nil && "kubernetes" in
+    // spec.finalizers is the real KCM namespace-controller's ONLY watch trigger for its
+    // ordered content-deletion sequence — the sequence that sets status.conditions like
+    // NamespaceDeletionContentFailure, which OrderedNamespaceDeletion polls for. If
+    // delete_namespace strips "kubernetes" itself (as it used to, acting as its own
+    // namespace controller), that trigger vanishes before the real controller ever
+    // observes it, so the controller — and the condition — never run.
+    //
+    // Fails on revert: reverting to the self-clear makes spec.finalizers empty and hard-deletes
+    // the namespace immediately here, instead of leaving it Terminating with "kubernetes"
+    // present for the real controller to finalize.
     #[tokio::test]
-    async fn delete_namespace_hard_deletes_immediately() {
+    async fn delete_namespace_leaves_kubernetes_finalizer_for_real_controller() {
         let state = make_state();
 
         assert!(
@@ -1670,25 +1646,47 @@ mod tests {
             "delete must succeed"
         );
 
-        // The namespace must be gone — u7s removes the kubernetes finalizer and hard-deletes
-        // immediately. Without this fix the namespace stays Terminating forever.
         let stored = state
             .store
             .get(&crate::keys::cluster_object_key("namespaces", "del-ns"))
             .await
-            .expect("store get must not error");
+            .expect("store get must not error")
+            .expect(
+                "namespace must NOT be hard-deleted by delete_namespace — only the real \
+                 namespace controller, via PUT /finalize, may remove the \"kubernetes\" \
+                 finalizer and complete the deletion",
+            );
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            body["status"]["phase"], "Terminating",
+            "namespace must be Terminating, awaiting the real namespace controller's drain"
+        );
         assert!(
-            stored.is_none(),
-            "namespace must be hard-deleted immediately — u7s has no background controller \
-             to remove the kubernetes finalizer, so delete_namespace must do it synchronously. \
-             Without this fix the namespace stays Terminating forever."
+            body["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be set — together with the \"kubernetes\" finalizer this \
+             is the real namespace controller's only watch trigger"
+        );
+        let finalizers = body["spec"]["finalizers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finalizers,
+            vec![Some("kubernetes")],
+            "delete_namespace must leave the \"kubernetes\" finalizer in place — self-clearing \
+             it erases the real namespace controller's watch trigger before it can ever \
+             observe deletionTimestamp != nil && \"kubernetes\" in spec.finalizers, so the \
+             controller (and its NamespaceDeletionContentFailure status condition) never runs"
         );
     }
 
-    // delete_namespace with external finalizers must remove only the "kubernetes" finalizer,
-    // persist in Terminating state, and let the external controller remove its own finalizer.
-    // Only after the external finalizer is also removed (via finalize endpoint) should the
-    // namespace hard-delete. This is the conformance test flow for "should apply a finalizer".
+    // delete_namespace must leave ALL spec.finalizers untouched, whether "kubernetes" or an
+    // external controller's own. Completion is driven entirely by PUT /finalize: each owning
+    // controller removes only its own finalizer once its own work is done, and the namespace
+    // hard-deletes only once every finalizer is gone. This is the conformance test flow for
+    // "should apply a finalizer to a namespace".
     #[tokio::test]
     async fn delete_namespace_with_external_finalizer_stays_terminating_until_cleared() {
         let state = make_state();
@@ -1728,8 +1726,8 @@ mod tests {
             "adding e2e finalizer must succeed"
         );
 
-        // Delete the namespace — kubernetes finalizer is removed, e2e finalizer remains.
-        // Namespace must stay in Terminating state.
+        // Delete the namespace — BOTH finalizers must remain; only their owning controllers
+        // may remove them, via PUT /finalize.
         assert!(
             delete_namespace(
                 State(state.clone()),
@@ -1746,26 +1744,60 @@ mod tests {
             .get(&crate::keys::cluster_object_key("namespaces", "ext-fin-ns"))
             .await
             .expect("store get must not error")
-            .expect("namespace must still exist — external finalizer keeps it alive");
+            .expect("namespace must still exist — its finalizers keep it alive");
         let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
             body["status"]["phase"], "Terminating",
-            "namespace must be Terminating while external finalizer is present"
+            "namespace must be Terminating while any finalizer is present"
         );
-        let finalizers = body["spec"]["finalizers"].as_array().unwrap();
+        let finalizers = body["spec"]["finalizers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            finalizers.len(),
-            1,
-            "only the external finalizer must remain after delete removes kubernetes"
-        );
-        assert_eq!(
-            finalizers[0].as_str(),
-            Some("e2e.example.com"),
-            "kubernetes finalizer must be removed by delete_namespace; external finalizer stays"
+            finalizers,
+            vec![Some("kubernetes"), Some("e2e.example.com")],
+            "delete_namespace must not remove \"kubernetes\" — only the real namespace \
+             controller may, via PUT /finalize, once its own drain completes"
         );
 
-        // External controller removes its finalizer via PUT /finalize.
-        let remove_body = Bytes::from(
+        // External controller removes only its own finalizer via PUT /finalize; "kubernetes"
+        // is left alone, so the namespace must still be alive.
+        let remove_ext_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "ext-fin-ns" },
+                "spec": { "finalizers": ["kubernetes"] }
+            })
+            .to_string(),
+        );
+        assert!(
+            finalize_namespace(
+                State(state.clone()),
+                Path("ext-fin-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                remove_ext_body,
+            )
+            .await
+            .is_ok(),
+            "removing external finalizer must succeed"
+        );
+        assert!(
+            state
+                .store
+                .get(&crate::keys::cluster_object_key("namespaces", "ext-fin-ns"))
+                .await
+                .expect("store get must not error")
+                .is_some(),
+            "namespace must still exist — the \"kubernetes\" finalizer is still present"
+        );
+
+        // The real namespace controller (KCM) removes "kubernetes" once its own content
+        // drain completes.
+        let remove_k8s_body = Bytes::from(
             serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Namespace",
@@ -1779,11 +1811,11 @@ mod tests {
                 State(state.clone()),
                 Path("ext-fin-ns".to_string()),
                 axum::http::HeaderMap::new(),
-                remove_body,
+                remove_k8s_body,
             )
             .await
             .is_ok(),
-            "removing external finalizer must succeed"
+            "removing kubernetes finalizer must succeed"
         );
 
         // Namespace must now be gone.
@@ -1794,9 +1826,9 @@ mod tests {
             .expect("store get must not error");
         assert!(
             after.is_none(),
-            "namespace must hard-delete once all finalizers are removed — \
+            "namespace must hard-delete once ALL finalizers are removed — \
              this is the conformance test flow: add external finalizer, delete namespace, \
-             remove external finalizer, namespace disappears"
+             remove external finalizer, remove kubernetes finalizer, namespace disappears"
         );
     }
 
@@ -2259,12 +2291,11 @@ mod tests {
         )
     }
 
-    // delete_namespace with the "kubernetes" finalizer must hard-delete immediately.
-    // u7s acts as its own namespace lifecycle controller — it removes the finalizer
-    // synchronously rather than waiting for KCM. Without this, the namespace stays
-    // Terminating forever because there is no background controller to drain it.
+    // delete_namespace with an explicit "kubernetes" finalizer (set at creation time rather
+    // than auto-stamped) must still leave it in place and keep the namespace Terminating —
+    // only the real namespace controller, via PUT /finalize, may remove it.
     #[tokio::test]
-    async fn delete_namespace_with_finalizers_hard_deletes_immediately() {
+    async fn delete_namespace_with_finalizers_stays_terminating() {
         let state = make_state();
 
         assert!(
@@ -2290,17 +2321,29 @@ mod tests {
             "delete with finalizers must not error"
         );
 
-        // The namespace must be gone — u7s removes the kubernetes finalizer and hard-deletes.
+        // The namespace must still exist, with "kubernetes" still in spec.finalizers — u7s
+        // must not act as the namespace controller and clear it synchronously.
         let stored = state
             .store
             .get(&crate::keys::cluster_object_key("namespaces", "fin-ns"))
             .await
-            .expect("store get must not error");
-        assert!(
-            stored.is_none(),
-            "namespace must be hard-deleted even when kubernetes finalizer is present — \
-             u7s acts as namespace lifecycle controller, removing the finalizer synchronously. \
-             Without this fix the namespace stays Terminating forever."
+            .expect("store get must not error")
+            .expect(
+                "namespace must NOT be hard-deleted when the kubernetes finalizer is present — \
+                 only the real namespace controller, via PUT /finalize, may remove it",
+            );
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let finalizers = body["spec"]["finalizers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finalizers,
+            vec![Some("kubernetes")],
+            "delete_namespace must not self-clear the kubernetes finalizer, regardless of \
+             whether it was auto-stamped or explicitly set at creation time"
         );
     }
 
@@ -2612,10 +2655,10 @@ mod tests {
     // finalize_namespace (PUT /api/v1/namespaces/{name}/finalize) must hard-delete
     // the namespace when deletionTimestamp is set and spec.finalizers is empty.
     //
-    // This endpoint still exists for KCM compatibility. Since u7s now removes the
-    // kubernetes finalizer synchronously in delete_namespace, KCM may still call it
-    // in some race scenarios or for non-kubernetes finalizers. The behavior must be
-    // correct regardless of how the namespace entered the Terminating state.
+    // This is the real completion path: delete_namespace no longer self-clears the
+    // "kubernetes" finalizer, so the real KCM namespace-controller calls this endpoint to
+    // remove it once its content-deletion sequence completes. The behavior must be correct
+    // regardless of how the namespace entered the Terminating state.
     #[tokio::test]
     async fn finalize_namespace_hard_deletes_when_spec_finalizers_empty_with_deletion_ts() {
         use u7s_store::Store;
@@ -3915,20 +3958,25 @@ mod tests {
         );
     }
 
-    /// Regression: namespace cascade delete must respect object metadata.finalizers.
+    /// Regression: cascade_delete_namespace_resources_until_stable must respect object
+    /// metadata.finalizers.
     ///
-    /// An object with non-empty metadata.finalizers must NOT be hard-deleted immediately
-    /// when its namespace is deleted. Instead it must receive deletionTimestamp and remain
-    /// in the store (Terminating) until its controller removes the finalizer.
+    /// An object with non-empty metadata.finalizers must NOT be hard-deleted immediately.
+    /// Instead it must receive deletionTimestamp and remain in the store (Terminating) until
+    /// its controller removes the finalizer. An object without finalizers must be
+    /// hard-deleted immediately (fast path preserved).
     ///
-    /// An object without finalizers must be hard-deleted immediately (fast path preserved).
+    /// delete_namespace no longer calls this cascade for "kubernetes"-finalized namespaces —
+    /// the real KCM namespace-controller owns draining those now, so that it (not u7s) can
+    /// run its resource types in KEP-5080 order (pods first). This cascade still runs for
+    /// namespaces that never received a "kubernetes" finalizer at all (e.g. direct store
+    /// writes bypassing create_namespace), so this test exercises it directly.
     ///
     /// Without the fix (cascade uses raw delete_namespace_resources):
     ///   - the finalizer'd object vanishes immediately → controller never sees the signal
-    ///   - OrderedNamespaceDeletion fails because the pod is gone before cleanup runs
     ///
     /// Fails on revert: reverting to delete_namespace_resources causes the finalizer'd object
-    /// to be absent from the store after namespace deletion instead of being in Terminating.
+    /// to be absent from the store after the cascade instead of being in Terminating.
     #[tokio::test]
     async fn cascade_delete_respects_object_finalizers() {
         use crate::keys::object_key;
@@ -3936,18 +3984,25 @@ mod tests {
 
         let state = make_state();
 
-        // Create the namespace via the proper handler (stamps spec.finalizers=["kubernetes"]).
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body("fin-cascade-ns"),
-            )
+        // Seed a Terminating namespace directly, with the "kubernetes" finalizer still
+        // present — the state a namespace is in while KCM (or, here, the cascade called
+        // directly) is still draining its content.
+        let ns_key = crate::keys::cluster_object_key("namespaces", "fin-cascade-ns");
+        let ns_seed = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "fin-cascade-ns",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_seed.to_string()), None)
             .await
-            .is_ok(),
-            "create must succeed"
-        );
+            .expect("namespace seed must succeed");
 
         // Seed a pod WITH metadata.finalizers in the namespace.
         let pod_key = object_key("pods", "fin-cascade-ns", "protected-pod");
@@ -3992,17 +4047,10 @@ mod tests {
             .await
             .expect("plain-pod write must succeed");
 
-        // Delete the namespace — triggers cascade with finalizer awareness.
-        assert!(
-            delete_namespace(
-                State(state.clone()),
-                Path("fin-cascade-ns".to_string()),
-                test_user()
-            )
-            .await
-            .is_ok(),
-            "namespace delete must succeed"
-        );
+        // Run the cascade directly (this is what the "no kubernetes finalizer" branch of
+        // delete_namespace still calls; for a "kubernetes"-finalized namespace, KCM would
+        // reach the same objects via its own DeleteCollection calls instead).
+        cascade_delete_namespace_resources_until_stable(&state, "fin-cascade-ns").await;
 
         // Pod WITH finalizer must still exist with deletionTimestamp set (Terminating).
         let stored_pod = state
@@ -4011,7 +4059,7 @@ mod tests {
             .await
             .expect("store get must not error")
             .expect(
-                "pod with metadata.finalizers must NOT be hard-deleted during namespace cascade — \
+                "pod with metadata.finalizers must NOT be hard-deleted during the cascade — \
                  it must remain in Terminating (deletionTimestamp set) until its controller \
                  removes the finalizer; without the fix, delete_namespace_resources erases it \
                  immediately and OrderedNamespaceDeletion fails",
@@ -4020,7 +4068,7 @@ mod tests {
             serde_json::from_slice(&stored_pod.value).expect("pod body must parse");
         assert!(
             pod_body["metadata"]["deletionTimestamp"].is_string(),
-            "pod with finalizer must have deletionTimestamp set after namespace cascade delete — \
+            "pod with finalizer must have deletionTimestamp set after the cascade — \
              the controller needs to observe this to trigger its cleanup logic"
         );
 
@@ -4032,42 +4080,12 @@ mod tests {
             .expect("store get must not error");
         assert!(
             plain_stored.is_none(),
-            "pod without finalizers must be hard-deleted immediately during namespace cascade — \
+            "pod without finalizers must be hard-deleted immediately by the cascade — \
              the finalizer-less fast path must not regress; objects without finalizers must still \
              be cleaned up promptly to avoid orphan accumulation"
         );
 
-        // Namespace itself must still exist (Terminating) — it must NOT hard-delete while
-        // contained objects with finalizers are still present. This is the
-        // OrderedNamespaceDeletion invariant: the namespace waits for all finalizer'd objects
-        // to be cleared before it disappears. Without this fix the namespace hard-deletes
-        // immediately, making the finalizer'd pod inaccessible via the API.
-        let ns_stored = state
-            .store
-            .get(&crate::keys::cluster_object_key(
-                "namespaces",
-                "fin-cascade-ns",
-            ))
-            .await
-            .expect("store get must not error")
-            .expect(
-                "namespace must still exist while it contains objects with metadata.finalizers — \
-                 without the fix the namespace hard-deletes immediately, cutting off API access \
-                 to the finalizer'd pod and breaking OrderedNamespaceDeletion",
-            );
-        let ns_body: serde_json::Value =
-            serde_json::from_slice(&ns_stored.value).expect("namespace body must parse");
-        assert_eq!(
-            ns_body["status"]["phase"], "Terminating",
-            "namespace must be in Terminating phase while it has finalizer'd contained objects"
-        );
-        assert!(
-            ns_body["metadata"]["deletionTimestamp"].is_string(),
-            "namespace must have deletionTimestamp set (Terminating) while contained objects have finalizers"
-        );
-
         // Now simulate the controller removing the pod's finalizer + hard-delete the pod.
-        // After this, maybe_finalize_terminating_namespace should complete the namespace deletion.
         // We directly remove the pod (simulating the controller clearing the finalizer):
         state
             .store
@@ -4077,7 +4095,49 @@ mod tests {
         // Trigger namespace completion check.
         maybe_finalize_terminating_namespace(&state, "fin-cascade-ns").await;
 
-        // Namespace must now be gone — all finalizer'd objects are cleared.
+        // The namespace must still exist: all contained objects are drained, but the
+        // "kubernetes" finalizer is still present — maybe_finalize_terminating_namespace must
+        // NOT treat "content is empty" as license to also clear spec.finalizers itself; only
+        // the real namespace controller may do that, via PUT /finalize.
+        assert!(
+            state
+                .store
+                .get(&crate::keys::cluster_object_key(
+                    "namespaces",
+                    "fin-cascade-ns",
+                ))
+                .await
+                .expect("store get must not error")
+                .is_some(),
+            "namespace must NOT hard-delete while spec.finalizers still contains \"kubernetes\", \
+             even once every contained object is drained — clearing \"kubernetes\" is the real \
+             namespace controller's job, not an automatic side effect of content being empty"
+        );
+
+        // The real namespace controller (KCM) finishes by calling PUT /finalize once its own
+        // content-deletion sequence confirms nothing remains.
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "fin-cascade-ns" },
+                "spec": { "finalizers": [] }
+            })
+            .to_string(),
+        );
+        assert!(
+            finalize_namespace(
+                State(state.clone()),
+                Path("fin-cascade-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                finalize_body,
+            )
+            .await
+            .is_ok(),
+            "KCM's finalize call must succeed"
+        );
+
+        // Namespace must now be gone — the real controller cleared "kubernetes" itself.
         let ns_after = state
             .store
             .get(&crate::keys::cluster_object_key(
@@ -4088,8 +4148,8 @@ mod tests {
             .expect("store get must not error");
         assert!(
             ns_after.is_none(),
-            "namespace must hard-delete once all finalizer'd contained objects are cleared — \
-             without maybe_finalize_terminating_namespace the namespace stays Terminating forever"
+            "namespace must hard-delete once the real controller clears the \"kubernetes\" \
+             finalizer via PUT /finalize"
         );
     }
 
@@ -4213,8 +4273,9 @@ mod tests {
         }
     }
 
-    /// Regression: a pod created in the window between a namespace-delete cascade's LIST
-    /// snapshot and the namespace's hard-delete must not be silently orphaned forever.
+    /// Regression: a pod created in the window between cascade_delete_namespace_resources's
+    /// LIST snapshot and its caller hard-deleting the namespace must not be silently
+    /// orphaned forever.
     ///
     /// `create_namespaced_resource` rejects writes once it observes the namespace as
     /// Terminating, but it checks-then-acts: a create already past that check can still
@@ -4225,9 +4286,14 @@ mod tests {
     /// the SchedulerPredicates/SchedulerPreemption conformance suite's "wait for stable
     /// cluster" timeout on leftover pods from unrelated namespaces; bd mayor-35zvy).
     ///
-    /// Fails on revert: reverting `delete_namespace` to call `cascade_delete_namespace_resources`
-    /// directly (no retry-until-stable) makes this test fail — the racer pod survives the
-    /// namespace hard-delete because the one-shot cascade's snapshot predates it.
+    /// delete_namespace no longer calls this cascade for "kubernetes"-finalized namespaces
+    /// (the real KCM namespace-controller owns that drain now), but it still calls it — and
+    /// is still exposed to this exact race — for namespaces with no finalizer at all, so
+    /// this test exercises the cascade helper directly.
+    ///
+    /// Fails on revert: reverting cascade_delete_namespace_resources_until_stable to call
+    /// cascade_delete_namespace_resources once (no retry-until-stable) makes this test fail —
+    /// the racer pod survives because the one-shot cascade's snapshot predates it.
     #[tokio::test]
     async fn delete_namespace_catches_pod_created_during_cascade_race() {
         let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
@@ -4247,31 +4313,10 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // Create the namespace through the real handler so it gets the "kubernetes" finalizer.
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body("race-ns"),
-            )
-            .await
-            .is_ok(),
-            "create must succeed"
-        );
-
-        // Delete it — the wrapped store injects a racer pod right after cascade's first LIST
-        // snapshot returns, simulating a concurrent create landing in the check-then-act window.
-        assert!(
-            delete_namespace(
-                State(state.clone()),
-                Path("race-ns".to_string()),
-                test_user()
-            )
-            .await
-            .is_ok(),
-            "namespace delete must succeed"
-        );
+        // Run the cascade directly — the wrapped store injects a racer pod right after its
+        // first LIST snapshot returns, simulating a concurrent create landing in the
+        // check-then-act window.
+        cascade_delete_namespace_resources_until_stable(&state, "race-ns").await;
 
         let racer_stored = inner
             .get(&racer_key)
@@ -4279,360 +4324,8 @@ mod tests {
             .expect("store get must not error");
         assert!(
             racer_stored.is_none(),
-            "a pod created during the namespace-delete cascade race must still be reaped by a \
-             retry pass — otherwise it is orphaned forever with no namespace left to ever \
-             re-drain it"
-        );
-    }
-
-    /// A store wrapper whose first `list_namespace_objects` call for a chosen namespace
-    /// races a REAL `create_namespaced_resource` call into that namespace immediately AFTER
-    /// taking its snapshot — simulating a controller's create landing during the drain
-    /// cascade and exercising the exact Terminating gate `create_namespaced_resource` reads
-    /// (resource.rs: rejects creates once the stored namespace's `status.phase` is
-    /// `"Terminating"`). The racer runs against a plain `AppState<SqliteStore>` pointed at
-    /// the same backing store, so it observes exactly what is persisted — not what
-    /// `delete_namespace` still holds in memory. Every other call, and every later
-    /// `list_namespace_objects` call, delegates straight to the inner SqliteStore.
-    struct TerminatingGateRaceStore {
-        inner: Arc<SqliteStore>,
-        target_ns: String,
-        injected: std::sync::atomic::AtomicBool,
-        racer_outcome: Arc<std::sync::OnceLock<(StatusCode, String)>>,
-    }
-
-    impl u7s_store::Store for TerminatingGateRaceStore {
-        fn get(
-            &self,
-            key: &str,
-        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
-        {
-            let inner = self.inner.clone();
-            let key = key.to_string();
-            async move { inner.get(&key).await }
-        }
-
-        fn list(
-            &self,
-            prefix: &str,
-            opts: u7s_store::ListOptions,
-        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
-        {
-            let inner = self.inner.clone();
-            let prefix = prefix.to_string();
-            async move { inner.list(&prefix, opts).await }
-        }
-
-        fn put(
-            &self,
-            key: &str,
-            value: Bytes,
-            expected_revision: Option<u64>,
-        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
-            let inner = self.inner.clone();
-            let key = key.to_string();
-            async move { inner.put(&key, value, expected_revision).await }
-        }
-
-        fn delete(
-            &self,
-            key: &str,
-            expected_revision: Option<u64>,
-        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
-            let inner = self.inner.clone();
-            let key = key.to_string();
-            async move { inner.delete(&key, expected_revision).await }
-        }
-
-        fn watch(
-            &self,
-            _prefix: &str,
-            _from_revision: u64,
-        ) -> impl std::future::Future<
-            Output = u7s_store::Result<
-                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
-            >,
-        > + Send {
-            std::future::ready(Ok(futures_util::stream::empty()))
-        }
-
-        fn list_namespace_objects(
-            &self,
-            namespace: &str,
-        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
-        {
-            let inner = self.inner.clone();
-            let ns = namespace.to_string();
-            let should_race = namespace == self.target_ns
-                && !self
-                    .injected
-                    .swap(true, std::sync::atomic::Ordering::SeqCst);
-            let racer_inner = self.inner.clone();
-            let racer_outcome = self.racer_outcome.clone();
-            async move {
-                let result = inner.list_namespace_objects(&ns).await;
-                if should_race {
-                    use crate::handlers::json_patch::CreateQuery;
-                    use crate::handlers::resource::create_namespaced_resource;
-
-                    // A plain AppState<SqliteStore> pointed at the same backing store: the
-                    // racer must observe exactly what's persisted, not go back through this
-                    // wrapper (which would just re-fire this same branch recursively).
-                    let racer_state = crate::state::AppState::new(
-                        racer_inner,
-                        None,
-                        None,
-                        std::collections::HashMap::new(),
-                        "https://localhost:6443".into(),
-                    );
-                    let headers = {
-                        let mut h = axum::http::HeaderMap::new();
-                        h.insert(
-                            axum::http::header::CONTENT_TYPE,
-                            axum::http::HeaderValue::from_static("application/json"),
-                        );
-                        h
-                    };
-                    let racer_body = Bytes::from(
-                        serde_json::json!({
-                            "apiVersion": "v1",
-                            "kind": "ConfigMap",
-                            "metadata": { "name": "racer-cm", "namespace": ns },
-                            "data": {}
-                        })
-                        .to_string(),
-                    );
-                    let outcome = match create_namespaced_resource(
-                        State(racer_state),
-                        Path((
-                            String::new(),
-                            "v1".to_string(),
-                            ns.clone(),
-                            "configmaps".to_string(),
-                        )),
-                        Query(CreateQuery::default()),
-                        test_user(),
-                        headers,
-                        racer_body,
-                    )
-                    .await
-                    {
-                        Ok(resp) => (resp.into_response().status(), String::new()),
-                        Err(e) => (e.0, e.1.message.clone()),
-                    };
-                    let _ = racer_outcome.set(outcome);
-                }
-                result
-            }
-        }
-
-        fn delete_namespace_resources(
-            &self,
-            namespace: &str,
-        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
-            let inner = self.inner.clone();
-            let ns = namespace.to_string();
-            async move { inner.delete_namespace_resources(&ns).await }
-        }
-
-        fn compaction_horizon(&self) -> u64 {
-            self.inner.compaction_horizon()
-        }
-
-        fn current_revision(&self) -> u64 {
-            self.inner.current_revision()
-        }
-    }
-
-    /// Regression: `delete_namespace` must persist `status.phase=Terminating` to the store
-    /// BEFORE running the drain cascade, not after — otherwise `create_namespaced_resource`'s
-    /// Terminating gate reads the pre-cascade (still-Active) namespace for the entire drain,
-    /// letting a racing controller create objects the cascade's LIST snapshot never sees.
-    /// Those objects can keep tripping the retry-until-stable loop until its budget is
-    /// exhausted, at which point the namespace is wedged in Terminating forever — nothing
-    /// re-checks it because no real finalizer is ever there to clear — until the 15-minute
-    /// watchdog force-deletes it (bd mayor-74j3.6).
-    ///
-    /// This races a REAL `create_namespaced_resource` call — the exact path a controller
-    /// uses — into the namespace right after the cascade's first LIST snapshot, and asserts
-    /// it is rejected with 403 "being terminated", proving the store already showed
-    /// Terminating before the cascade did anything.
-    ///
-    /// Fails on revert: if `delete_namespace` is reverted to persist Terminating only after
-    /// the cascade completes, the racing create's gate check reads the still-Active stored
-    /// namespace and succeeds (201 Created) instead of being rejected, failing the assertion
-    /// on the racer's captured status.
-    #[tokio::test]
-    async fn delete_namespace_persists_terminating_before_cascade_blocks_racing_create() {
-        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let racer_outcome = Arc::new(std::sync::OnceLock::new());
-        let race_store = Arc::new(TerminatingGateRaceStore {
-            inner: Arc::clone(&inner),
-            target_ns: "gate-race-ns".to_string(),
-            injected: std::sync::atomic::AtomicBool::new(false),
-            racer_outcome: Arc::clone(&racer_outcome),
-        });
-
-        let state = crate::state::AppState::new(
-            Arc::clone(&race_store),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Create via the real handler so it gets the "kubernetes" finalizer — deleting it
-        // drives delete_namespace's remaining.is_empty() branch, the one this bead's fix
-        // touches.
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body("gate-race-ns"),
-            )
-            .await
-            .is_ok(),
-            "create must succeed"
-        );
-
-        // Seed content so the cascade has something to walk, matching a real Terminating
-        // namespace with existing resources rather than an empty one.
-        state
-            .store
-            .put(
-                &crate::keys::object_key("configmaps", "gate-race-ns", "seed-cm"),
-                Bytes::from(
-                    serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "ConfigMap",
-                        "metadata": { "name": "seed-cm", "namespace": "gate-race-ns" },
-                        "data": {}
-                    })
-                    .to_string(),
-                ),
-                None,
-            )
-            .await
-            .expect("seed configmap write must succeed");
-
-        assert!(
-            delete_namespace(
-                State(state.clone()),
-                Path("gate-race-ns".to_string()),
-                test_user()
-            )
-            .await
-            .is_ok(),
-            "namespace delete must succeed"
-        );
-
-        let (status, message) = racer_outcome
-            .get()
-            .cloned()
-            .expect("cascade must call list_namespace_objects at least once, racing the create");
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "a create racing the cascade must be rejected because the namespace was already \
-             persisted as Terminating before the cascade ran; if Terminating is only \
-             persisted AFTER the cascade (the reverted bug) this create sees the namespace as \
-             still Active and succeeds, letting the racer slip past the cascade's LIST \
-             snapshot and risk wedging the namespace in Terminating forever"
-        );
-        assert!(
-            message.contains("being terminated"),
-            "rejection message must match kube-apiserver's Terminating-namespace error so \
-             controllers can recognize it and back off; got: {message}"
-        );
-    }
-
-    /// Same regression as above, but for the branch taken when the namespace still has an
-    /// external (non-"kubernetes") finalizer in `spec.finalizers`: that branch also cascades
-    /// before persisting Terminating and is exposed to the identical race.
-    ///
-    /// Fails on revert: reverting this branch's persist-then-cascade order makes the racing
-    /// create see a still-Active namespace and succeed instead of being rejected.
-    #[tokio::test]
-    async fn delete_namespace_persists_terminating_before_cascade_blocks_racing_create_external_finalizer(
-    ) {
-        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let racer_outcome = Arc::new(std::sync::OnceLock::new());
-        let race_store = Arc::new(TerminatingGateRaceStore {
-            inner: Arc::clone(&inner),
-            target_ns: "gate-race-ext-ns".to_string(),
-            injected: std::sync::atomic::AtomicBool::new(false),
-            racer_outcome: Arc::clone(&racer_outcome),
-        });
-
-        let state = crate::state::AppState::new(
-            Arc::clone(&race_store),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // An external controller's finalizer survives the "kubernetes" strip, so
-        // delete_namespace takes the else branch (external finalizers still present).
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body_with_finalizers(
-                    "gate-race-ext-ns",
-                    &["kubernetes", "test.io/protect"]
-                ),
-            )
-            .await
-            .is_ok(),
-            "create must succeed"
-        );
-
-        state
-            .store
-            .put(
-                &crate::keys::object_key("configmaps", "gate-race-ext-ns", "seed-cm"),
-                Bytes::from(
-                    serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "ConfigMap",
-                        "metadata": { "name": "seed-cm", "namespace": "gate-race-ext-ns" },
-                        "data": {}
-                    })
-                    .to_string(),
-                ),
-                None,
-            )
-            .await
-            .expect("seed configmap write must succeed");
-
-        assert!(
-            delete_namespace(
-                State(state.clone()),
-                Path("gate-race-ext-ns".to_string()),
-                test_user()
-            )
-            .await
-            .is_ok(),
-            "namespace delete must succeed"
-        );
-
-        let (status, message) = racer_outcome
-            .get()
-            .cloned()
-            .expect("cascade must call list_namespace_objects at least once, racing the create");
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "a create racing the cascade in the external-finalizer branch must also be \
-             rejected — this branch persists Terminating before cascading too, for the same \
-             reason as the remaining.is_empty() branch"
-        );
-        assert!(
-            message.contains("being terminated"),
-            "rejection message must match kube-apiserver's Terminating-namespace error; got: {message}"
+            "a pod created during the cascade race must still be reaped by a retry pass — \
+             otherwise it is orphaned forever with no namespace left to ever re-drain it"
         );
     }
 }

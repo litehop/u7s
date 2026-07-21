@@ -6362,8 +6362,10 @@ mod tests {
     /// sonobuoy cleanup sends DELETE /api/v1/namespaces/sonobuoy/pods?labelSelector=sonobuoy-run=<id>
     /// to remove all pods it created. The pods collection route previously only registered
     /// GET+POST, so axum returned 405. The fix adds DELETE via core_delete_collection_namespaced_resource.
-    /// The test verifies: 1) the route accepts DELETE (not 405), 2) matching pods are deleted,
-    /// 3) non-matching pods are preserved when labelSelector is applied.
+    /// The test verifies: 1) the route accepts DELETE (not 405), 2) a matching pod is
+    /// soft-deleted (delete_collection_pods mirrors delete_pod's soft-delete-first semantics —
+    /// mayor-859w — so a running pod is never yanked out from under the kubelet without a
+    /// graceful-termination signal), 3) labelSelector actually selects it.
     #[tokio::test]
     async fn delete_collection_namespaced_pods_returns_200_not_405() {
         use axum::body::to_bytes;
@@ -6434,10 +6436,21 @@ mod tests {
         assert_eq!(val["kind"], "Status");
         assert_eq!(val["status"], "Success");
 
-        let stored = store.get(&pod_key).await.expect("store.get must not fail");
+        let stored = store
+            .get(&pod_key)
+            .await
+            .expect("store.get must not fail")
+            .expect(
+                "pod 'sonobuoy/sonobuoy-worker' must still exist after collection DELETE with \
+                 matching labelSelector — DeleteCollection soft-deletes a running pod first \
+                 (deletionTimestamp), exactly like a single-pod DELETE, so the kubelet still \
+                 gets a chance to gracefully terminate the container",
+            );
+        let pod_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert!(
-            stored.is_none(),
-            "pod 'sonobuoy/sonobuoy-worker' must be deleted after collection DELETE with matching labelSelector"
+            pod_val["metadata"]["deletionTimestamp"].is_string(),
+            "pod 'sonobuoy/sonobuoy-worker' must have deletionTimestamp set after collection \
+             DELETE with matching labelSelector"
         );
     }
 

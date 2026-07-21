@@ -2602,6 +2602,23 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
                 let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
                 state.rbac_index.remove_object(&rbac_key);
             }
+
+            // Respect metadata.finalizers exactly like a single-object DELETE would: an
+            // object with finalizers must be soft-deleted (deletionTimestamp stamped, kept
+            // alive), not removed outright. The real KCM namespace-controller drains
+            // namespace content via this exact endpoint (DeleteCollection per resource
+            // type) — without this, it would silently bypass every object's finalizers,
+            // breaking OrderedNamespaceDeletion (e.g. a finalizer'd pod must survive with
+            // deletionTimestamp set while later resource types are still being processed).
+            let mut typed = Object { body: parsed };
+            if let Some(soft) = apply_delete_policy(&mut typed) {
+                state
+                    .store
+                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                continue;
+            }
         }
         // NotFound means another writer deleted this object concurrently — tolerate it.
         // Any other error (disk full, DB corruption, …) means some objects survived;
@@ -9789,6 +9806,121 @@ mod tests {
             "delete_collection must remove all objects in namespace — \
              lingering objects block namespace finalizer removal and prevent \
              namespace deletion from completing"
+        );
+    }
+
+    /// delete_collection_namespaced_resource must respect metadata.finalizers: an object
+    /// with a finalizer must be soft-deleted (deletionTimestamp stamped, kept alive), not
+    /// removed outright. The real KCM namespace-controller drains most namespace content
+    /// via this exact endpoint (DeleteCollection per resource type) as part of
+    /// OrderedNamespaceDeletion — an object with an unresolved finalizer must survive with
+    /// deletionTimestamp set, matching what a single-object DELETE already does.
+    ///
+    /// Fails on revert: reverting to an unconditional `state.store.delete` for every listed
+    /// object makes the finalizer'd configmap vanish from the store instead of remaining
+    /// with deletionTimestamp set — silently bypassing the finalizer KCM's namespace
+    /// controller relies on to sequence OrderedNamespaceDeletion.
+    #[tokio::test]
+    async fn delete_collection_namespaced_respects_object_finalizers() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store as _};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let finalizer_cm_key = crate::keys::object_key("configmaps", "test-ns", "protected-cm");
+        let finalizer_cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "protected-cm",
+                "namespace": "test-ns",
+                "finalizers": ["test.io/keep-me"]
+            },
+            "data": {}
+        });
+        store
+            .put(
+                &finalizer_cm_key,
+                bytes::Bytes::from(serde_json::to_vec(&finalizer_cm).unwrap()),
+                None,
+            )
+            .await
+            .expect("finalizer configmap seed must succeed");
+
+        let plain_cm_key = crate::keys::object_key("configmaps", "test-ns", "plain-cm");
+        let plain_cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "plain-cm", "namespace": "test-ns" },
+            "data": {}
+        });
+        store
+            .put(
+                &plain_cm_key,
+                bytes::Bytes::from(serde_json::to_vec(&plain_cm).unwrap()),
+                None,
+            )
+            .await
+            .expect("plain configmap seed must succeed");
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "test-ns".into(),
+                "configmaps".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete_collection must succeed: {e:?}"));
+
+        let stored_finalizer_cm = store
+            .get(&finalizer_cm_key)
+            .await
+            .expect("store get must not error")
+            .expect(
+                "configmap with metadata.finalizers must NOT be removed by DeleteCollection — \
+                 it must be soft-deleted (deletionTimestamp set) so its controller can observe \
+                 the deletion signal and clear the finalizer itself",
+            );
+        let finalizer_cm_body: serde_json::Value =
+            serde_json::from_slice(&stored_finalizer_cm.value).expect("configmap body must parse");
+        assert!(
+            finalizer_cm_body["metadata"]["deletionTimestamp"].is_string(),
+            "configmap with finalizer must have deletionTimestamp set after DeleteCollection — \
+             the real KCM namespace-controller polls for exactly this during \
+             OrderedNamespaceDeletion"
+        );
+
+        let stored_plain_cm = store
+            .get(&plain_cm_key)
+            .await
+            .expect("store get must not error");
+        assert!(
+            stored_plain_cm.is_none(),
+            "configmap without finalizers must still be hard-deleted immediately by \
+             DeleteCollection — the finalizer-less fast path must not regress"
         );
     }
 
