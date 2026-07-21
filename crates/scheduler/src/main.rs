@@ -26,9 +26,9 @@ use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event, find_preemption_plan,
-    needs_scheduling, patch_pod_status, pick_node, scheduling_gate_status_patch,
-    scheduling_gate_status_reset, should_retry_without_preempting, should_schedule,
-    stream_watch_events, NodeTally, PendingPod,
+    http_get, needs_scheduling, patch_pod_status, pick_node, pods_needing_resync,
+    scheduling_gate_status_patch, scheduling_gate_status_reset, should_retry_without_preempting,
+    should_schedule, stream_watch_events, NodeTally, PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -164,6 +164,221 @@ async fn evict_victims(
     Ok(())
 }
 
+/// How often the periodic resync (spawned in `main`) re-lists `/api/v1/pods`
+/// and re-attempts scheduling for anything still unscheduled, independent of
+/// whatever the watch stream has delivered. Matches upstream kube-scheduler's
+/// `flushUnschedulablePodsLeftover`, which runs on this same 30s cadence: a
+/// pod that fails a scheduling attempt (e.g. exhausts preemption retries)
+/// never generates another watch event by itself — FailedScheduling only
+/// emits a separate Event, it never patches the pod's own status — so
+/// without a timer independent of the watch, such a pod stays Pending
+/// forever even after capacity that would let it schedule frees up.
+const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Handle one pod watch event — a real one from the live watch, or a
+/// synthetic `{"type": "MODIFIED", "object": ...}` manufactured by the
+/// periodic resync loop from a fresh `/api/v1/pods` list (see
+/// `RESYNC_INTERVAL`). Both callers feed events through this same function
+/// so a resync-triggered scheduling attempt is handled identically to a
+/// watch-triggered one — in particular, the `in_flight` dedup below is
+/// shared between them, so a resync tick can never spawn a second,
+/// concurrent `bind_pod` for a pod the watch is already scheduling.
+fn handle_pod_event(
+    event: serde_json::Value,
+    connector: &TlsConnector,
+    server: &str,
+    in_flight: &Arc<Mutex<HashSet<String>>>,
+    tally: &Arc<Mutex<NodeTally>>,
+) {
+    // Every pod in the cluster passes through here now (not just
+    // unscheduled ones) so NodeTally can track already-bound pods'
+    // resource usage. Must run unconditionally, before the
+    // needs_scheduling early-return below, so a later event in this
+    // same stream never reads a tally missing an earlier one.
+    tally
+        .lock()
+        .expect("tally lock poisoned")
+        .apply_event(&event);
+
+    // A gated pod never enters the scheduling cycle below (needs_scheduling
+    // returns None for it) — without this, its PodScheduled condition never
+    // gets touched at all, and WaitForPodsSchedulingGated (which polls for
+    // {type: PodScheduled, reason: SchedulingGated}, not just "unscheduled")
+    // times out even though the pod correctly stays Pending.
+    if let Some(gated) = scheduling_gate_status_patch(&event) {
+        let connector_clone = connector.clone();
+        let server_clone = server.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = patch_pod_status(
+                &connector_clone,
+                &server_clone,
+                &gated.namespace,
+                &gated.pod_name,
+                &gated.patch,
+            )
+            .await
+            {
+                error!(
+                    "failed to set SchedulingGated status for {}/{}: {e}",
+                    gated.namespace, gated.pod_name
+                );
+            }
+        });
+    }
+    // Computed from this same event, before the pod potentially gets bound
+    // below — cleared once bound (needs_scheduling's already_scheduled check
+    // has no bearing here since this reads the same event, not a later one).
+    let stale_gate_reset = scheduling_gate_status_reset(&event);
+
+    let Some(pending) = needs_scheduling(&event) else {
+        return;
+    };
+
+    let key = format!("{}/{}", pending.namespace, pending.pod_name);
+
+    // Dedup: skip if a bind task for this pod is already in flight.
+    {
+        let mut guard = in_flight.lock().expect("in_flight lock poisoned");
+        if !should_schedule(&guard, &key) {
+            info!("skipping duplicate scheduling request for {key}");
+            return;
+        }
+        guard.insert(key.clone());
+    }
+
+    info!(
+        "unscheduled pod detected: {}/{}",
+        pending.namespace, pending.pod_name
+    );
+
+    // Schedule asynchronously — spawn a task so we don't block the stream.
+    let connector_clone = connector.clone();
+    let server_clone = server.to_string();
+    let in_flight_clone = in_flight.clone();
+    let tally_clone = tally.clone();
+    tokio::spawn(async move {
+        let namespace = pending.namespace.clone();
+        let pod_name = pending.pod_name.clone();
+        // Best-effort: clear the stale SchedulingGated reason before attempting
+        // to schedule below. Not folded into `outcome` via `?` — a transient
+        // failure here must not block the actual scheduling attempt that
+        // follows, since getting the pod running matters more than tidying up
+        // a status message.
+        if let Some(reset) = stale_gate_reset {
+            if let Err(e) = patch_pod_status(
+                &connector_clone,
+                &server_clone,
+                &namespace,
+                &pod_name,
+                &reset,
+            )
+            .await
+            {
+                error!(
+                    "failed to clear stale SchedulingGated status for {namespace}/{pod_name}: {e}"
+                );
+            }
+        }
+        // Ok(node_name) on a successful bind, Err on any failure to schedule
+        // (no node fits, even after preemption) or to bind. Distinguishing
+        // the two lets us emit the matching Event below — without it,
+        // `kubectl describe pod` and the SchedulerPredicates e2e suite's
+        // observeEventAfterAction watch never see a Scheduled/FailedScheduling
+        // event and the watch times out (mayor-lafgk).
+        let first_pick = pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await;
+        if let Err(e) = &first_pick {
+            if should_retry_without_preempting(e) {
+                // A GET /api/v1/nodes failure (or an unparseable
+                // response) says nothing about whether the cluster
+                // actually has room — unlike a genuine NoCapacity,
+                // treating it as one would run preemption (evicting
+                // real lower-priority pods) or mark this pod
+                // FailedScheduling off a transient infra hiccup.
+                // Leave the pod Pending: the watch redelivers a
+                // MODIFIED event for it, so pick_node simply runs
+                // again on the next tick.
+                error!(
+                    "pick_node could not reach the API server while scheduling {key}: {e} — retrying on next watch tick"
+                );
+                in_flight_clone
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .remove(&key);
+                return;
+            }
+        }
+        let outcome: anyhow::Result<String> = async {
+            match first_pick {
+                Ok(node) => {
+                    bind_reserved_node(
+                        &connector_clone,
+                        &server_clone,
+                        &tally_clone,
+                        &pending,
+                        &node,
+                    )
+                    .await?;
+                    Ok(node)
+                }
+                Err(_no_capacity) => {
+                    // No node has a free slot — try preemption before giving
+                    // up: evict lower-priority pods to make room rather than
+                    // leaving a higher-priority pod Pending forever (mayor-rsei).
+                    let node = preempt_and_pick_node(
+                        &connector_clone,
+                        &server_clone,
+                        &pending,
+                        &tally_clone,
+                        &namespace,
+                        &pod_name,
+                    )
+                    .await?;
+                    bind_reserved_node(
+                        &connector_clone,
+                        &server_clone,
+                        &tally_clone,
+                        &pending,
+                        &node,
+                    )
+                    .await?;
+                    Ok(node)
+                }
+            }
+        }
+        .await;
+        // Always remove the key, whether binding succeeded or failed.
+        in_flight_clone
+            .lock()
+            .expect("in_flight lock poisoned")
+            .remove(&key);
+
+        let (reason, message, event_type) = match &outcome {
+            Ok(node) => (
+                "Scheduled",
+                format!("Successfully assigned {namespace}/{pod_name} to {node}"),
+                "Normal",
+            ),
+            Err(e) => {
+                error!("scheduling error for {key}: {e}");
+                ("FailedScheduling", format!("{e}"), "Warning")
+            }
+        };
+        if let Err(e) = emit_scheduling_event(
+            &connector_clone,
+            &server_clone,
+            &namespace,
+            &pod_name,
+            reason,
+            &message,
+            event_type,
+        )
+        .await
+        {
+            error!("failed to emit {reason} event for {key}: {e}");
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -229,6 +444,46 @@ async fn main() -> anyhow::Result<()> {
     // replays the full history the store still holds.
     let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
 
+    // Periodic re-sync, independent of the watch stream below: every
+    // RESYNC_INTERVAL, re-list every pod and feed anything still unscheduled
+    // back through handle_pod_event, exactly as a live watch event would.
+    // This is what eventually retries a pod stranded by a failed scheduling
+    // attempt (see RESYNC_INTERVAL's doc comment for why the watch alone
+    // cannot be relied on to do that).
+    {
+        let connector = connector.clone();
+        let server = server.clone();
+        let in_flight = in_flight.clone();
+        let tally = tally.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RESYNC_INTERVAL).await;
+                let (status, body) = match http_get(&connector, &server, "/api/v1/pods").await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        error!("resync: GET /api/v1/pods failed: {e}");
+                        continue;
+                    }
+                };
+                if !status.is_success() {
+                    error!("resync: GET /api/v1/pods returned {status}");
+                    continue;
+                }
+                let list: PodList = match serde_json::from_str(&body) {
+                    Ok(list) => list,
+                    Err(e) => {
+                        error!("resync: failed to parse pod list: {e}");
+                        continue;
+                    }
+                };
+                let in_flight_snapshot = in_flight.lock().expect("in_flight lock poisoned").clone();
+                for event in pods_needing_resync(&list.items, &in_flight_snapshot) {
+                    handle_pod_event(event, &connector, &server, &in_flight, &tally);
+                }
+            }
+        });
+    }
+
     // Watch loop — reconnect on error with a short backoff.
     loop {
         info!("starting pod watch on /api/v1/pods?watch=true");
@@ -243,186 +498,7 @@ async fn main() -> anyhow::Result<()> {
         let tally_ref = &tally;
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
-            // Every pod in the cluster passes through here now (not just
-            // unscheduled ones) so NodeTally can track already-bound pods'
-            // resource usage. Must run unconditionally, before the
-            // needs_scheduling early-return below, so a later event in this
-            // same stream never reads a tally missing an earlier one.
-            tally_ref.lock().expect("tally lock poisoned").apply_event(&event);
-
-            // A gated pod never enters the scheduling cycle below (needs_scheduling
-            // returns None for it) — without this, its PodScheduled condition never
-            // gets touched at all, and WaitForPodsSchedulingGated (which polls for
-            // {type: PodScheduled, reason: SchedulingGated}, not just "unscheduled")
-            // times out even though the pod correctly stays Pending.
-            if let Some(gated) = scheduling_gate_status_patch(&event) {
-                let connector_clone = connector_ref.clone();
-                let server_clone = server_ref.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = patch_pod_status(
-                        &connector_clone,
-                        &server_clone,
-                        &gated.namespace,
-                        &gated.pod_name,
-                        &gated.patch,
-                    )
-                    .await
-                    {
-                        error!(
-                            "failed to set SchedulingGated status for {}/{}: {e}",
-                            gated.namespace, gated.pod_name
-                        );
-                    }
-                });
-            }
-            // Computed from this same event, before the pod potentially gets bound
-            // below — cleared once bound (needs_scheduling's already_scheduled check
-            // has no bearing here since this reads the same event, not a later one).
-            let stale_gate_reset = scheduling_gate_status_reset(&event);
-
-            let Some(pending) = needs_scheduling(&event) else {
-                return;
-            };
-
-            let key = format!("{}/{}", pending.namespace, pending.pod_name);
-
-            // Dedup: skip if a bind task for this pod is already in flight.
-            {
-                let mut guard = in_flight_ref.lock().expect("in_flight lock poisoned");
-                if !should_schedule(&guard, &key) {
-                    info!("skipping duplicate scheduling request for {key}");
-                    return;
-                }
-                guard.insert(key.clone());
-            }
-
-            info!(
-                "unscheduled pod detected: {}/{}",
-                pending.namespace, pending.pod_name
-            );
-
-            // Schedule asynchronously — spawn a task so we don't block the stream.
-            let connector_clone = connector_ref.clone();
-            let server_clone = server_ref.to_string();
-            let in_flight_clone = in_flight_ref.clone();
-            let tally_clone = tally_ref.clone();
-            tokio::spawn(async move {
-                let namespace = pending.namespace.clone();
-                let pod_name = pending.pod_name.clone();
-                // Best-effort: clear the stale SchedulingGated reason before attempting
-                // to schedule below. Not folded into `outcome` via `?` — a transient
-                // failure here must not block the actual scheduling attempt that
-                // follows, since getting the pod running matters more than tidying up
-                // a status message.
-                if let Some(reset) = stale_gate_reset {
-                    if let Err(e) =
-                        patch_pod_status(&connector_clone, &server_clone, &namespace, &pod_name, &reset)
-                            .await
-                    {
-                        error!(
-                            "failed to clear stale SchedulingGated status for {namespace}/{pod_name}: {e}"
-                        );
-                    }
-                }
-                // Ok(node_name) on a successful bind, Err on any failure to schedule
-                // (no node fits, even after preemption) or to bind. Distinguishing
-                // the two lets us emit the matching Event below — without it,
-                // `kubectl describe pod` and the SchedulerPredicates e2e suite's
-                // observeEventAfterAction watch never see a Scheduled/FailedScheduling
-                // event and the watch times out (mayor-lafgk).
-                let first_pick =
-                    pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await;
-                if let Err(e) = &first_pick {
-                    if should_retry_without_preempting(e) {
-                        // A GET /api/v1/nodes failure (or an unparseable
-                        // response) says nothing about whether the cluster
-                        // actually has room — unlike a genuine NoCapacity,
-                        // treating it as one would run preemption (evicting
-                        // real lower-priority pods) or mark this pod
-                        // FailedScheduling off a transient infra hiccup.
-                        // Leave the pod Pending: the watch redelivers a
-                        // MODIFIED event for it, so pick_node simply runs
-                        // again on the next tick.
-                        error!(
-                            "pick_node could not reach the API server while scheduling {key}: {e} — retrying on next watch tick"
-                        );
-                        in_flight_clone
-                            .lock()
-                            .expect("in_flight lock poisoned")
-                            .remove(&key);
-                        return;
-                    }
-                }
-                let outcome: anyhow::Result<String> = async {
-                    match first_pick {
-                        Ok(node) => {
-                            bind_reserved_node(
-                                &connector_clone,
-                                &server_clone,
-                                &tally_clone,
-                                &pending,
-                                &node,
-                            )
-                            .await?;
-                            Ok(node)
-                        }
-                        Err(_no_capacity) => {
-                            // No node has a free slot — try preemption before giving
-                            // up: evict lower-priority pods to make room rather than
-                            // leaving a higher-priority pod Pending forever (mayor-rsei).
-                            let node = preempt_and_pick_node(
-                                &connector_clone,
-                                &server_clone,
-                                &pending,
-                                &tally_clone,
-                                &namespace,
-                                &pod_name,
-                            )
-                            .await?;
-                            bind_reserved_node(
-                                &connector_clone,
-                                &server_clone,
-                                &tally_clone,
-                                &pending,
-                                &node,
-                            )
-                            .await?;
-                            Ok(node)
-                        }
-                    }
-                }
-                .await;
-                // Always remove the key, whether binding succeeded or failed.
-                in_flight_clone
-                    .lock()
-                    .expect("in_flight lock poisoned")
-                    .remove(&key);
-
-                let (reason, message, event_type) = match &outcome {
-                    Ok(node) => (
-                        "Scheduled",
-                        format!("Successfully assigned {namespace}/{pod_name} to {node}"),
-                        "Normal",
-                    ),
-                    Err(e) => {
-                        error!("scheduling error for {key}: {e}");
-                        ("FailedScheduling", format!("{e}"), "Warning")
-                    }
-                };
-                if let Err(e) = emit_scheduling_event(
-                    &connector_clone,
-                    &server_clone,
-                    &namespace,
-                    &pod_name,
-                    reason,
-                    &message,
-                    event_type,
-                )
-                .await
-                {
-                    error!("failed to emit {reason} event for {key}: {e}");
-                }
-            });
+            handle_pod_event(event, connector_ref, server_ref, in_flight_ref, tally_ref);
         })
         .await;
 

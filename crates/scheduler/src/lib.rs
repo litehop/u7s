@@ -545,6 +545,52 @@ pub fn should_schedule(in_flight: &std::collections::HashSet<String>, key: &str)
     !in_flight.contains(key)
 }
 
+/// Response body of `GET /api/v1/pods` — a full pod list, not a watch event.
+/// Items are kept as raw `Value` (not deserialized into a `PodObject` up
+/// front) so `pods_needing_resync` can wrap each one into the exact same
+/// `{"type": "MODIFIED", "object": ...}` envelope `needs_scheduling` already
+/// parses from a live watch event, without a second, parallel Pod type.
+#[derive(Deserialize)]
+pub struct PodList {
+    pub items: Vec<Value>,
+}
+
+/// From a raw `/api/v1/pods` list's items, build the synthetic
+/// `{"type": "MODIFIED", "object": <pod>}` watch events the periodic resync
+/// loop should feed through the same per-event handler the live watch uses.
+///
+/// A pod that fails a scheduling attempt (e.g. exhausts preemption retries)
+/// is otherwise stranded: `needs_scheduling` only fires on an ADDED/MODIFIED
+/// event for the pod itself, a failed attempt never patches the pod's own
+/// status, and the apiserver's watch replay is a bounded ring buffer that
+/// can rotate past a stale pod's last event under unrelated churn long
+/// before the next forced reconnect. The periodic resync exists to
+/// manufacture that missing event from a fresh list, on a timer, independent
+/// of whatever the watch stream has or hasn't delivered.
+///
+/// Delegates to `needs_scheduling`/`should_schedule` — the exact functions
+/// the watch path already uses — so this can never diverge from what a real
+/// watch event for the same pod would decide, and a pod already in
+/// `in_flight` (a bind already running, from the watch or an earlier resync
+/// tick) is excluded here exactly as it would be there. Pure so the
+/// resync's core decision — which stranded pods get retried this tick — is
+/// unit-testable without a live apiserver GET.
+pub fn pods_needing_resync(
+    items: &[Value],
+    in_flight: &std::collections::HashSet<String>,
+) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| serde_json::json!({"type": "MODIFIED", "object": item}))
+        .filter(|event| {
+            needs_scheduling(event).is_some_and(|pending| {
+                let key = format!("{}/{}", pending.namespace, pending.pod_name);
+                should_schedule(in_flight, &key)
+            })
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 pub struct NodeList {
     pub items: Vec<NodeItem>,
@@ -2129,6 +2175,73 @@ mod tests {
         assert!(
             should_schedule(&in_flight, "kube-system/coredns"),
             "same pod name in different namespace must be treated as a distinct key"
+        );
+    }
+
+    // pods_needing_resync tests — the periodic resync's core decision: which
+    // pods from a fresh /api/v1/pods list get a fresh scheduling attempt this
+    // tick. A pod that exhausts preemption retries and goes FailedScheduling
+    // never produces another watch event by itself (mayor-d2242) — resync is
+    // the only thing left that can ever pick it back up, so this decision
+    // dropping such a pod, or ignoring in_flight, reintroduces the exact
+    // stranding this fixes.
+
+    #[test]
+    fn pods_needing_resync_includes_a_still_unscheduled_pod() {
+        // Mirrors a pod that lost a scheduling race (e.g. exhausted
+        // preemption retries) and is still sitting Pending with no
+        // nodeName — the exact shape of the pod stranded by mayor-d2242. If
+        // this stopped returning such a pod, the periodic resync would never
+        // re-attempt it and the stranding bug would be back.
+        let items = vec![json!({
+            "metadata": { "name": "stranded-pod", "namespace": "kube-system" },
+            "spec": { "nodeName": "" }
+        })];
+        let in_flight = std::collections::HashSet::new();
+        let events = pods_needing_resync(&items, &in_flight);
+        assert_eq!(
+            events.len(),
+            1,
+            "the unscheduled pod must produce exactly one synthetic event"
+        );
+        assert_eq!(events[0]["type"], "MODIFIED");
+        assert_eq!(events[0]["object"]["metadata"]["name"], "stranded-pod");
+    }
+
+    #[test]
+    fn pods_needing_resync_excludes_an_already_scheduled_pod() {
+        // A pod that already has a nodeName is done. Resync must not keep
+        // re-wrapping it as a "needs scheduling" event on every tick, or the
+        // scheduler would spam pick_node calls and Scheduled/FailedScheduling
+        // events for every bound pod in the cluster every 30s, forever.
+        let items = vec![json!({
+            "metadata": { "name": "bound-pod", "namespace": "default" },
+            "spec": { "nodeName": "node-1" }
+        })];
+        let in_flight = std::collections::HashSet::new();
+        assert!(
+            pods_needing_resync(&items, &in_flight).is_empty(),
+            "an already-scheduled pod must not be re-submitted for scheduling"
+        );
+    }
+
+    #[test]
+    fn pods_needing_resync_excludes_a_pod_already_in_flight() {
+        // The watch may already have a bind task running for this exact pod
+        // (e.g. it re-triggered scheduling milliseconds before this resync
+        // tick fired). Without this check, resync would spawn a second,
+        // concurrent bind_pod call for the same pod, racing the watch's own
+        // attempt into a 409 Conflict — the exact double-schedule the
+        // in_flight guard exists to prevent.
+        let items = vec![json!({
+            "metadata": { "name": "stranded-pod", "namespace": "kube-system" },
+            "spec": { "nodeName": "" }
+        })];
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("kube-system/stranded-pod".to_owned());
+        assert!(
+            pods_needing_resync(&items, &in_flight).is_empty(),
+            "a pod already in in_flight must be skipped by resync, not double-scheduled"
         );
     }
 
