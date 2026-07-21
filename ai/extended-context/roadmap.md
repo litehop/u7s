@@ -7,8 +7,27 @@ metadata:
 
 # u7s Roadmap
 
-**North star:** Run a real Argo CD GitOps setup on u7s. That requires a kubectl-compatible
-API surface, working workload controllers, CRD support, and RBAC — all idle under 128 MB RAM.
+**North star:** A Kubernetes-conformant distro that runs the control plane on a *fraction*
+of the resources of existing distros. k3s/k0s are still garbage-collected Go — their
+apiserver can idle around ~1 GiB doing nothing, which is prohibitive for resource-starved
+targets (cheap VPS, edge). u7s (Rust) targets a Kubernetes-compliant control plane with a
+small, predictable memory/CPU footprint. Running a real Argo CD GitOps setup is a concrete
+milestone toward that, not the end goal.
+
+**Guiding principles (operator, 2026-07-21 — load-bearing for every dispatch):**
+1. **Conform, don't reinvent — especially at the API level.** Kubernetes' architecture is
+   proven; u7s *optimizes on* it, it does not fork it. This is what lets us run REAL upstream
+   components (KCM, kubelet, kube-scheduler) against u7s as conformance oracles. Diverging at
+   the API boundary would forfeit that. Concrete application: bead mayor-bpmz9 chose "let the
+   real KCM namespace-controller own the lifecycle" over "u7s re-implements the controller's
+   condition-setting" — the latter reinvents a wheel upstream already ships.
+2. **Correctness first, performance second.** Get a fully-passing conformance suite BEFORE the
+   performance journey (perf work on incorrect code optimizes the wrong thing). Then hunt
+   unnecessary allocations, sub-optimal algorithms, and needless memory copies — see Phase 5.
+3. **Order of attack:** apiserver to "good enough" → optimize the scheduler → possibly our own
+   kubelet/KCM eventually. "Eventually our own" is gated on conformance being locked AND each
+   replacement being validated against the SAME upstream oracle — never a near-term license to
+   reinvent while conformance is still red.
 
 **Project stance:** Pre-alpha/greenfield. No backward compat. Break freely.
 
@@ -131,6 +150,26 @@ restarts. **Stack is feature-complete and ready to run.**
 
 ---
 
+## Phase 5 — Performance (PLANNED, gated on a fully-green conformance suite)
+
+**Goal:** Realize the north star's resource advantage. Only starts once conformance is
+fully passing (principle #2 — do NOT optimize incorrect code).
+
+**Targets:** minimize apiserver (then scheduler) RSS and CPU. Hunt: unnecessary heap
+allocations, sub-optimal algorithms/data structures, memory copies that don't need to
+happen (clone-on-read, redundant serialize/deserialize round-trips), lock contention on
+hot paths. Establish a memory/CPU baseline first, then optimize against it with evidence
+(the same measure-before-change discipline as correctness work).
+
+**Method:** perf-audit → file beads → fix with before/after measurements. Reuse the
+audit→cluster→dispatch loop; every perf PR must show a measured delta, not a vibe.
+
+**Exit criteria (draft):** control-plane idle RSS well under existing Go distros (k3s/k0s
+apiserver ~1 GiB idle is the bar to beat by a large margin); no O(n²) or per-request
+allocation hotspots left on the LIST/watch/bind hot paths.
+
+---
+
 ## Perpetually deferred (revisit only on explicit trigger)
 
 | Bead | Title | Condition to undefer |
@@ -149,7 +188,7 @@ restarts. **Stack is feature-complete and ready to run.**
 | API server | From scratch in Rust (axum) | `docs/decisions/rust-api-server-from-scratch.md` |
 | State store | SQLite WAL (rusqlite bundled) | `docs/decisions/sqlite-over-lmdb.md` |
 | Container runtime | CRI-O + crun | `docs/decisions/crio-over-containerd.md` |
-| Scheduler | External kube-scheduler (Phase 3/4); custom bin-spread planned (Phase 4+) | `docs/decisions/custom-bin-spread-scheduler.md` |
+| Scheduler | Custom Rust scheduler (`crates/scheduler`) — in-memory NodeTally, preemption, periodic re-sync of unscheduled pods; validated against SchedulerPredicates/Preemption conformance | `docs/decisions/custom-bin-spread-scheduler.md` |
 | CRD validation | boon crate (full openAPIV3Schema) | `docs/decisions/boon-for-crd-schema-validation.md` |
 | Networking | WebSocket-only exec/attach/portforward (no SPDY) | operator confirmed 2026-05-28; k8s 1.34+ dropped SPDY |
 | TLS | aws-lc-rs (P-256 ECDSA) — known arm64/Lima compat issue; workaround: use CI | memory: local-lima-arm64-environment |
