@@ -602,6 +602,80 @@ fn build_kubelet_tls_config(
     Ok(std::sync::Arc::new(config))
 }
 
+/// A `ServerCertVerifier` that accepts any certificate — matches upstream kube-apiserver's
+/// `InsecureSkipVerify: true` for pod-proxy TLS targets. Unlike the kubelet (signed by the
+/// cluster CA and verified by `build_kubelet_tls_config`), pod/workload TLS certs are
+/// self-signed or issued by a CA the cluster has no way to know, so there is no trust
+/// anchor to pin to — verification is skipped entirely rather than pinned to the wrong CA.
+#[derive(Debug)]
+struct InsecureServerCertVerifier(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Build a rustls client config that skips server certificate verification entirely, for
+/// dialing a pod/service TLS listener over an already-established konnectivity tunnel (see
+/// `pod_proxy_via_connect_tunnel`). Unlike `build_kubelet_tls_config`, this takes no CA:
+/// there is no cluster-wide trust anchor to check an arbitrary workload's TLS cert against.
+fn build_insecure_tls_config() -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
+    // Idempotent: a second install (the server's startup path already did this once) is a
+    // no-op, so this function works standalone in tests too.
+    rustls_post_quantum::provider().install_default().ok();
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .ok_or_else(|| anyhow::anyhow!("no default rustls crypto provider installed"))?
+        .clone();
+
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    config
+        .dangerous()
+        .set_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier(provider)));
+    Ok(std::sync::Arc::new(config))
+}
+
 /// Open outbound WebSocket to kubelet and splice with inbound kubectl WebSocket.
 async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -1394,6 +1468,19 @@ pub fn split_scheme_name_port(id: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Returns true when `id` carries an explicit `https:` scheme prefix, using the same
+/// second-colon disambiguation as `split_scheme_name_port` (a 2-part id like `https:8080`
+/// is the literal name `https` with a numeric port, not a bare scheme with name `8080`).
+///
+/// A proxy target addressed this way must be dialed over TLS to the backend — upstream
+/// kube-apiserver's `net.SplitSchemeNamePort` uses the scheme for exactly this, not just
+/// to disambiguate the name/port split. Skipping this check would connect over plain HTTP
+/// to a TLS-only backend, which the backend correctly rejects with a 400.
+fn proxy_target_is_https(id: &str) -> bool {
+    id.strip_prefix("https:")
+        .is_some_and(|rest| rest.contains(':'))
+}
+
 /// Resolve a pod's target containerPort using an optional port spec parsed from the
 /// proxy URL (e.g. the `8080` in `pods/<name>:8080/proxy/`, or a named port).
 ///
@@ -1428,13 +1515,13 @@ pub fn resolve_pod_container_port(
 
 /// Resolve pod IP and container port for the pod proxy subresource.
 ///
-/// Returns (pod_ip, port, konnectivity_proxy_addr) for the caller to build the
+/// Returns (pod_ip, port, konnectivity_proxy_addr, is_https) for the caller to build the
 /// forward URL and HTTP client. Separated from the handler for unit-testability.
 pub async fn resolve_pod_proxy_target<S: Store>(
     state: &AppState<S>,
     ns: &str,
     pod_name: &str,
-) -> Result<(String, u16, Option<String>), crate::status::StatusError> {
+) -> Result<(String, u16, Option<String>, bool), crate::status::StatusError> {
     // Strip an optional scheme prefix and :<port-or-portName> suffix — kubectl and
     // client-go address pod proxy targets as `pods/[<scheme>:]<name>[:<port>]/proxy/`,
     // the same convention the service proxy subresource uses.
@@ -1464,20 +1551,29 @@ pub async fn resolve_pod_proxy_target<S: Store>(
     let port = resolve_pod_container_port(&pod["spec"]["containers"], port_spec).unwrap_or(80);
 
     let proxy_addr = state.konnectivity_proxy_addr.clone();
+    let is_https = proxy_target_is_https(pod_name);
 
-    Ok((pod_ip, port, proxy_addr))
+    Ok((pod_ip, port, proxy_addr, is_https))
 }
 
-/// Build a plain HTTP reqwest client for direct pod access (no konnectivity).
+/// Build a reqwest client for direct pod access (no konnectivity).
 ///
 /// Used when `konnectivity_proxy_addr` is not set and the apiserver can reach
 /// pod IPs directly (e.g. in tests or same-host setups).
+///
+/// `insecure_https` skips server certificate verification entirely instead of trusting
+/// `ca_der` — matches upstream kube-apiserver's `InsecureSkipVerify` for pod-proxy TLS
+/// targets, since pod/workload TLS certs are self-signed or issued by a CA the cluster
+/// has no way to know (unlike the kubelet, which is signed by the cluster CA).
 pub(crate) fn build_pod_proxy_client(
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
+    insecure_https: bool,
 ) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
-    if let Some(der) = ca_der {
+    if insecure_https {
+        builder = builder.use_rustls_tls().danger_accept_invalid_certs(true);
+    } else if let Some(der) = ca_der {
         if let Ok(cert) = reqwest::Certificate::from_der(der) {
             builder = builder.use_rustls_tls().tls_certs_only([cert]);
         }
@@ -1490,13 +1586,22 @@ pub(crate) fn build_pod_proxy_client(
     builder.build().unwrap_or_default()
 }
 
+/// A tunnel byte stream: either the plain konnectivity-to-pod tunnel, or (when the proxy
+/// target uses the `https:` scheme) that same tunnel wrapped in a second TLS session
+/// dialed to the pod/endpoint itself. Boxing erases the two concrete stream types so the
+/// hyper handshake in `pod_proxy_via_connect_tunnel` has one call site either way.
+trait TunnelStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> TunnelStream for T {}
+
 /// Proxy a pod request through a CONNECT tunnel to konnectivity-server.
 ///
 /// konnectivity-server accepts only the CONNECT verb. reqwest's Proxy::all() only
 /// issues CONNECT for https:// targets; for http:// targets it sends a plain forward-
 /// proxy GET which konnectivity rejects with 405. This function establishes the
-/// tunnel manually: TLS-connect to konnectivity, send CONNECT pod_ip:port, then
-/// speak plain HTTP to the pod over the tunneled byte stream.
+/// tunnel manually: TLS-connect to konnectivity, send CONNECT pod_ip:port, then speak
+/// HTTP to the pod over the tunneled byte stream — plain HTTP normally, or (when
+/// `is_https` is set) over a second TLS session dialed to the pod through the tunnel,
+/// matching upstream kube-apiserver's TLS handling for `https:`-scheme proxy targets.
 #[allow(clippy::too_many_arguments)]
 async fn pod_proxy_via_connect_tunnel(
     konnectivity_addr: &str,
@@ -1507,6 +1612,7 @@ async fn pod_proxy_via_connect_tunnel(
     body_bytes: bytes::Bytes,
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
+    is_https: bool,
 ) -> Result<(u16, axum::http::HeaderMap, bytes::Bytes), String> {
     use http_body_util::BodyExt as _;
     use hyper_util::rt::TokioIo;
@@ -1582,8 +1688,27 @@ async fn pod_proxy_via_connect_tunnel(
         ));
     }
 
-    // 6. The tunnel is open. Speak plain HTTP to the pod over the tunneled stream.
-    let io = TokioIo::new(tls_stream);
+    // 6. The tunnel is open. For an https-scheme target, dial a second TLS session to the
+    //    pod over the tunnel before speaking HTTP — pod/workload certs are self-signed or
+    //    unknown to any cluster CA, so this handshake skips verification (see
+    //    build_insecure_tls_config); it is a separate, inner session from the outer TLS
+    //    connection to konnectivity above, which stays fully verified against the cluster CA.
+    let io: Box<dyn TunnelStream> = if is_https {
+        let pod_tls_config =
+            build_insecure_tls_config().map_err(|e| format!("pod TLS config: {e}"))?;
+        let pod_connector = TlsConnector::from(pod_tls_config);
+        let pod_server_name = ServerName::try_from(pod_ip)
+            .map(|n| n.to_owned())
+            .map_err(|e| format!("invalid pod server name '{pod_ip}': {e}"))?;
+        let pod_tls_stream = pod_connector
+            .connect(pod_server_name, tls_stream)
+            .await
+            .map_err(|e| format!("pod TLS handshake over tunnel: {e}"))?;
+        Box::new(pod_tls_stream)
+    } else {
+        Box::new(tls_stream)
+    };
+    let io = TokioIo::new(io);
     let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(io)
         .await
         .map_err(|e| format!("hyper handshake over tunnel: {e}"))?;
@@ -1635,6 +1760,87 @@ fn append_query(path_suffix: &str, query: Option<&str>) -> String {
     }
 }
 
+/// Returns true when `headers`' Content-Type is `text/html` (ignoring any trailing
+/// `;charset=...` parameter) — matches upstream kube-apiserver's proxy Transport, which
+/// only rewrites links in HTML bodies and passes every other content type through as-is.
+fn is_html_content_type(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/html")
+        })
+}
+
+/// Rewrite root-relative `href="..."`/`src="..."` link targets in an HTML proxy response
+/// so they still resolve through the proxy instead of the apiserver's own root. A browser
+/// following `<a href="/foo">` on a proxied page would otherwise request `/foo` from the
+/// apiserver directly rather than `/foo` on the proxied pod/service — matching upstream
+/// kube-apiserver's proxy Transport, which performs the identical rewrite for exactly
+/// this reason (a client hitting the proxy must get links that stay within the proxy).
+///
+/// Only a single leading `/` counts as root-relative and gets rewritten; scheme-relative
+/// (`//host/...`) and absolute (`http://...`) URLs already name their own host and are
+/// left untouched, as are non-`href`/`src` occurrences of those substrings (an attribute
+/// must start at a preceding whitespace boundary, so "xhref" or plain text is never
+/// mistaken for the real attribute).
+fn rewrite_relative_links(html: &str, proxy_base: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut remaining = html;
+
+    loop {
+        let found = ["href=\"", "href='", "src=\"", "src='"]
+            .into_iter()
+            .filter_map(|pat| remaining.find(pat).map(|pos| (pos, pat)))
+            .min_by_key(|&(pos, _)| pos);
+
+        let Some((pos, pat)) = found else {
+            out.push_str(remaining);
+            return out;
+        };
+
+        let at_attr_boundary = remaining[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+
+        let value_start = pos + pat.len();
+        let quote = pat.as_bytes()[pat.len() - 1] as char;
+        let Some(value_len) = remaining[value_start..].find(quote) else {
+            // Unterminated attribute — pass the remainder through rather than risk
+            // corrupting malformed HTML.
+            out.push_str(remaining);
+            return out;
+        };
+        let value_end = value_start + value_len;
+        let value = &remaining[value_start..value_end];
+
+        out.push_str(&remaining[..value_start]);
+        if at_attr_boundary && value.starts_with('/') && !value.starts_with("//") {
+            out.push_str(proxy_base);
+        }
+        out.push_str(value);
+
+        remaining = &remaining[value_end..];
+    }
+}
+
+/// Rewrite an already-buffered text/html response body — used once the caller has
+/// confirmed the Content-Type and collected the full body (rewriting a partial chunk
+/// could split an href/src attribute across a chunk boundary). A body that is not valid
+/// UTF-8 passes through unmodified rather than risk corrupting binary content that was
+/// merely mislabeled as text/html.
+fn rewrite_html_body(body: bytes::Bytes, proxy_base: &str) -> bytes::Bytes {
+    match std::str::from_utf8(&body) {
+        Ok(html) => bytes::Bytes::from(rewrite_relative_links(html, proxy_base)),
+        Err(_) => body,
+    }
+}
+
 /// Proxy a request to the pod's IP and containerPort.
 ///
 /// Shared implementation for both the with-subpath and no-subpath pod proxy routes.
@@ -1646,7 +1852,13 @@ async fn pod_proxy_dispatch<S: Store>(
     path_suffix: &str,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let (pod_ip, port, proxy_addr) = resolve_pod_proxy_target(state, ns, pod_name).await?;
+    let (pod_ip, port, proxy_addr, is_https) =
+        resolve_pod_proxy_target(state, ns, pod_name).await?;
+    // The path a browser must stay within when following a relative link on the proxied
+    // page — see rewrite_relative_links. Built from the raw URL segments rather than the
+    // inbound request's own path so it excludes path_suffix (the proxy's PathPrepend never
+    // includes the backend-relative subpath, only namespaces/{ns}/pods/{pod_name}/proxy).
+    let proxy_base = format!("/api/v1/namespaces/{ns}/pods/{pod_name}/proxy");
 
     let method = req.method().clone();
     let query = req.uri().query().map(str::to_owned);
@@ -1658,7 +1870,7 @@ async fn pod_proxy_dispatch<S: Store>(
     if let Some(addr) = proxy_addr.as_deref() {
         // Route through konnectivity via an explicit CONNECT tunnel.
         // konnectivity-server accepts CONNECT only; a plain forward-proxy GET returns 405.
-        let (status, headers, body) = pod_proxy_via_connect_tunnel(
+        let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &pod_ip,
             port,
@@ -1670,6 +1882,7 @@ async fn pod_proxy_dispatch<S: Store>(
                 .kubelet_client_identity_pem
                 .as_deref()
                 .map(|v| v.as_slice()),
+            is_https,
         )
         .await
         .map_err(|e| {
@@ -1690,11 +1903,18 @@ async fn pod_proxy_dispatch<S: Store>(
 
         let status = axum::http::StatusCode::from_u16(status)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let body = if is_html_content_type(&headers) {
+            headers.remove(axum::http::header::CONTENT_LENGTH);
+            rewrite_html_body(body, &proxy_base)
+        } else {
+            body
+        };
         return proxied_response(status, &headers, Body::from(body));
     }
 
     // No konnectivity proxy — direct connection to pod IP.
-    let target_url = format!("http://{pod_ip}:{port}/{path_with_query}");
+    let scheme = if is_https { "https" } else { "http" };
+    let target_url = format!("{scheme}://{pod_ip}:{port}/{path_with_query}");
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -1704,6 +1924,7 @@ async fn pod_proxy_dispatch<S: Store>(
             .kubelet_client_identity_pem
             .as_deref()
             .map(|v| v.as_slice()),
+        is_https,
     );
 
     let pod_resp = client
@@ -1728,8 +1949,28 @@ async fn pod_proxy_dispatch<S: Store>(
         })?;
 
     let pod_status = pod_resp.status();
-    let upstream_headers = pod_resp.headers().clone();
-    let body = Body::from_stream(pod_resp.bytes_stream());
+    let mut upstream_headers = pod_resp.headers().clone();
+    let body = if is_html_content_type(&upstream_headers) {
+        let raw = pod_resp.bytes().await.map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("pod unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                    details: None,
+                },
+            )
+        })?;
+        upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+        Body::from(rewrite_html_body(raw, &proxy_base))
+    } else {
+        Body::from_stream(pod_resp.bytes_stream())
+    };
 
     proxied_response(pod_status, &upstream_headers, body)
 }
@@ -1801,7 +2042,7 @@ pub async fn pod_proxy_root<S: Store>(
 
 /// Resolve the IP and port of a ready endpoint backing the Service.
 ///
-/// Returns (endpoint_ip, port, konnectivity_proxy_addr). Separated from the
+/// Returns (endpoint_ip, port, konnectivity_proxy_addr, is_https). Separated from the
 /// handler so the resolution logic can be unit-tested without a live network.
 /// Strip the `:<port-or-portName>` suffix (and an optional `http:`/`https:` scheme
 /// prefix) from a service proxy URL name segment.
@@ -1851,7 +2092,7 @@ pub async fn resolve_service_proxy_target<S: Store>(
     state: &AppState<S>,
     ns: &str,
     svc_name: &str,
-) -> Result<(String, u16, Option<String>), crate::status::StatusError> {
+) -> Result<(String, u16, Option<String>, bool), crate::status::StatusError> {
     // Strip optional :<port-or-portName> suffix; Service names are DNS-1123 (no colons).
     let (bare_name, port_spec) = split_service_port(svc_name);
 
@@ -1897,7 +2138,12 @@ pub async fn resolve_service_proxy_target<S: Store>(
                     continue;
                 }
                 if let Some(addr) = ep["addresses"][0].as_str().filter(|s| !s.is_empty()) {
-                    return Ok((addr.to_owned(), port, state.konnectivity_proxy_addr.clone()));
+                    return Ok((
+                        addr.to_owned(),
+                        port,
+                        state.konnectivity_proxy_addr.clone(),
+                        proxy_target_is_https(svc_name),
+                    ));
                 }
             }
         }
@@ -1930,7 +2176,11 @@ async fn service_proxy_dispatch<S: Store>(
     path_suffix: &str,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let (ep_ip, port, proxy_addr) = resolve_service_proxy_target(state, ns, svc_name).await?;
+    let (ep_ip, port, proxy_addr, is_https) =
+        resolve_service_proxy_target(state, ns, svc_name).await?;
+    // See pod_proxy_dispatch's identical comment: the path a browser must stay within
+    // when following a relative link on the proxied page.
+    let proxy_base = format!("/api/v1/namespaces/{ns}/services/{svc_name}/proxy");
     // Reuse the pod_proxy_dispatch path: build the URL and forward the request.
     // Service endpoints are reached the same way as pod IPs — via konnectivity
     // when configured, or directly otherwise.
@@ -1942,7 +2192,7 @@ async fn service_proxy_dispatch<S: Store>(
     let path_with_query = append_query(path_suffix, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
-        let (status, headers, body) = pod_proxy_via_connect_tunnel(
+        let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &ep_ip,
             port,
@@ -1954,6 +2204,7 @@ async fn service_proxy_dispatch<S: Store>(
                 .kubelet_client_identity_pem
                 .as_deref()
                 .map(|v| v.as_slice()),
+            is_https,
         )
         .await
         .map_err(|e| {
@@ -1974,10 +2225,17 @@ async fn service_proxy_dispatch<S: Store>(
 
         let status = axum::http::StatusCode::from_u16(status)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let body = if is_html_content_type(&headers) {
+            headers.remove(axum::http::header::CONTENT_LENGTH);
+            rewrite_html_body(body, &proxy_base)
+        } else {
+            body
+        };
         return proxied_response(status, &headers, Body::from(body));
     }
 
-    let target_url = format!("http://{ep_ip}:{port}/{path_with_query}");
+    let scheme = if is_https { "https" } else { "http" };
+    let target_url = format!("{scheme}://{ep_ip}:{port}/{path_with_query}");
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -1987,6 +2245,7 @@ async fn service_proxy_dispatch<S: Store>(
             .kubelet_client_identity_pem
             .as_deref()
             .map(|v| v.as_slice()),
+        is_https,
     );
 
     let ep_resp = client
@@ -2011,8 +2270,28 @@ async fn service_proxy_dispatch<S: Store>(
         })?;
 
     let ep_status = ep_resp.status();
-    let upstream_headers = ep_resp.headers().clone();
-    let body = Body::from_stream(ep_resp.bytes_stream());
+    let mut upstream_headers = ep_resp.headers().clone();
+    let body = if is_html_content_type(&upstream_headers) {
+        let raw = ep_resp.bytes().await.map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("service endpoint unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                    details: None,
+                },
+            )
+        })?;
+        upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+        Body::from(rewrite_html_body(raw, &proxy_base))
+    } else {
+        Body::from_stream(ep_resp.bytes_stream())
+    };
 
     proxied_response(ep_status, &upstream_headers, body)
 }
@@ -3257,7 +3536,7 @@ mod tests {
             .await
             .expect("seed pod");
 
-        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "mypod")
+        let (ip, port, _, _) = resolve_pod_proxy_target(&state, "default", "mypod")
             .await
             .expect("resolve must succeed for a running pod with podIP");
         assert_eq!(
@@ -3299,7 +3578,7 @@ mod tests {
             .await
             .expect("seed pod");
 
-        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "mypod")
+        let (ip, port, _, _) = resolve_pod_proxy_target(&state, "default", "mypod")
             .await
             .expect("resolve must succeed");
         assert_eq!(ip, "10.1.2.3");
@@ -3353,7 +3632,7 @@ mod tests {
             .await
             .expect("seed pod");
 
-        let (_, _, proxy_addr) = resolve_pod_proxy_target(&state, "default", "mypod")
+        let (_, _, proxy_addr, _) = resolve_pod_proxy_target(&state, "default", "mypod")
             .await
             .expect("resolve must succeed");
         assert_eq!(
@@ -3395,7 +3674,7 @@ mod tests {
             .await
             .expect("seed pod");
 
-        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "proxy-test:8080")
+        let (ip, port, _, _) = resolve_pod_proxy_target(&state, "default", "proxy-test:8080")
             .await
             .expect(
                 "'name:port' pod proxy must resolve — 404 means the bare name was not \
@@ -3442,7 +3721,7 @@ mod tests {
             .await
             .expect("seed pod");
 
-        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "http:proxy-test:8080")
+        let (ip, port, _, _) = resolve_pod_proxy_target(&state, "default", "http:proxy-test:8080")
             .await
             .expect(
                 "'scheme:name:port' pod proxy must resolve — a naive suffix-only split \
@@ -3455,6 +3734,64 @@ mod tests {
         assert_eq!(
             port, 8080,
             "the URL-supplied port must still be honored once the scheme prefix is stripped"
+        );
+    }
+
+    /// resolve_pod_proxy_target with an `https:` scheme prefix must report `is_https = true`;
+    /// a bare name or an explicit `http:` prefix must report `false`.
+    ///
+    /// pod_proxy_dispatch uses this flag to decide whether to connect to the pod over TLS.
+    /// Before this fix the flag did not exist — an `https:`-prefixed pod proxy request to a
+    /// TLS-only container port connected over plain HTTP, and the TLS listener correctly
+    /// rejected it with 400 "Client sent an HTTP request to an HTTPS server" instead of
+    /// returning the proxied response (the exact conformance failure for tlsdest1/tlsdest2).
+    #[tokio::test]
+    async fn pod_proxy_https_scheme_reports_is_https_true() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "tls-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "agnhost"}]},
+            "status": {"podIP": "10.5.6.7"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "tls-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (_, _, _, is_https) = resolve_pod_proxy_target(&state, "default", "https:tls-pod:443")
+            .await
+            .expect("resolve must succeed");
+        assert!(
+            is_https,
+            "an 'https:'-scheme pod proxy target must report is_https=true — without it, \
+             pod_proxy_dispatch connects over plain HTTP and a TLS-only container port \
+             rejects the request with 400 instead of returning the proxied response"
+        );
+
+        let (_, _, _, is_https) = resolve_pod_proxy_target(&state, "default", "http:tls-pod:443")
+            .await
+            .expect("resolve must succeed");
+        assert!(
+            !is_https,
+            "an explicit 'http:' scheme must NOT be treated as https — misreporting it \
+             would connect a plain-HTTP backend over TLS and fail the handshake"
+        );
+
+        let (_, _, _, is_https) = resolve_pod_proxy_target(&state, "default", "tls-pod")
+            .await
+            .expect("resolve must succeed");
+        assert!(
+            !is_https,
+            "a bare pod name (no scheme) must default to plain HTTP, matching every \
+             pre-existing pod proxy request that carries no scheme prefix"
         );
     }
 
@@ -4405,8 +4742,62 @@ mod tests {
     /// directly, the client must build — pod proxy without a tunnel must work.
     #[test]
     fn build_pod_proxy_client_without_ca_succeeds() {
-        let client = build_pod_proxy_client(None, None);
+        let client = build_pod_proxy_client(None, None, false);
         drop(client); // just verify it was built
+    }
+
+    /// build_pod_proxy_client with `insecure_https=true` must accept a certificate no CA
+    /// trusts, matching upstream kube-apiserver's `InsecureSkipVerify` for pod-proxy TLS
+    /// targets — pod/workload TLS certs are self-signed, so pinning to any CA (or using
+    /// default system roots) would reject every real pod TLS listener.
+    ///
+    /// If `insecure_https` is ignored, this request fails certificate verification (the
+    /// mock server's self-signed cert is untrusted by any real root store) instead of
+    /// returning 200 — this is the exact 400 "Client sent an HTTP request to an HTTPS
+    /// server" / handshake-failure class of bug this flag exists to prevent.
+    #[tokio::test]
+    async fn build_pod_proxy_client_insecure_https_skips_cert_verification() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let server_cert = CertificateDer::from(cert_der);
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        // No CA is configured at all — only insecure_https=true should let this succeed.
+        let client = build_pod_proxy_client(None, None, true);
+        let resp = client.get(format!("https://{addr}/")).send().await.expect(
+            "insecure_https=true must accept the mock's self-signed, untrusted cert — \
+                 pod TLS certs are never signed by a CA the cluster trusts, so requiring \
+                 verification here would make every https-scheme pod/service proxy \
+                 request fail",
+        );
+        assert_eq!(resp.status(), 200);
     }
 
     // -----------------------------------------------------------------------
@@ -4509,6 +4900,7 @@ mod tests {
             bytes::Bytes::new(),
             Some(&cert_der),
             None,
+            false,
         )
         .await;
 
@@ -4537,6 +4929,576 @@ mod tests {
             "the pod's Content-Type must survive the konnectivity tunnel — a client \
              that defaults to protobuf when Content-Type is missing would otherwise \
              try (and fail) to decode this plain-text body as protobuf"
+        );
+    }
+
+    /// pod_proxy_via_connect_tunnel with `is_https=true` must dial a SECOND, independent
+    /// TLS session to the pod through the tunnel — not speak plain HTTP over it.
+    ///
+    /// The mock "pod" behind the tunnel only accepts a real TLS ClientHello as its first
+    /// bytes, using a cert that is never passed as `ca_der` anywhere (proving the inner
+    /// handshake succeeds by skipping verification, not by reusing the outer connection's
+    /// already-established trust). If `is_https` is ignored and the code always speaks
+    /// plain HTTP over the outer tunnel (the pre-fix behavior), the mock's inner TLS
+    /// accept fails to parse that plaintext request as a handshake and the connection is
+    /// dropped — reproducing the exact conformance symptom of a TLS-only backend refusing
+    /// a plaintext request — instead of returning the proxied body.
+    #[tokio::test]
+    async fn pod_proxy_via_connect_tunnel_is_https_dials_tls_to_pod_over_tunnel() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        // Outer cert: the konnectivity leg. Passed as `ca_der` so the outer handshake
+        // stays fully verified, exactly like the plain-HTTP tunnel case above.
+        let outer_cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let outer_cert_der = outer_cert.cert.der().to_vec();
+        let outer_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(outer_cert_der.clone())],
+                PrivateKeyDer::try_from(outer_cert.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let outer_acceptor = TlsAcceptor::from(Arc::new(outer_config));
+
+        // Inner cert: the pod leg. Deliberately a DIFFERENT, untrusted cert — is_https=true
+        // must still complete this handshake by skipping verification.
+        let inner_cert = generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let inner_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(inner_cert.cert.der().to_vec())],
+                PrivateKeyDer::try_from(inner_cert.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let inner_acceptor = TlsAcceptor::from(Arc::new(inner_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut outer = outer_acceptor.accept(tcp).await.unwrap();
+
+            // Accept and acknowledge CONNECT, exactly like the plain-HTTP tunnel test.
+            let mut buf = [0u8; 512];
+            let _ = outer.read(&mut buf).await.unwrap();
+            outer
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+
+            // is_https=true must now negotiate a second TLS session over this tunnel.
+            let mut inner = inner_acceptor.accept(outer).await.unwrap();
+            let mut buf2 = [0u8; 512];
+            let _ = inner.read(&mut buf2).await;
+            inner
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntls ok")
+                .await
+                .unwrap();
+        });
+
+        // Bounded so a revert that drops the TLS upgrade fails fast instead of hanging:
+        // the mock's inner TLS accept blocks forever waiting for a ClientHello that a
+        // plain-HTTP request never sends.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pod_proxy_via_connect_tunnel(
+                &proxy_addr,
+                "10.0.0.1",
+                443,
+                "/tls-check",
+                axum::http::Method::GET,
+                bytes::Bytes::new(),
+                Some(&outer_cert_der),
+                None,
+                true,
+            ),
+        )
+        .await
+        .expect(
+            "pod_proxy_via_connect_tunnel must not hang — a plain HTTP request against \
+             the mock's TLS-only inner listener would leave both sides waiting forever",
+        );
+
+        assert!(
+            result.is_ok(),
+            "is_https=true must complete a real TLS handshake to the pod over the \
+             tunnel: {:?}",
+            result.err()
+        );
+        let (status, _headers, body) = result.unwrap();
+        assert_eq!(
+            status, 200,
+            "the pod's TLS response must reach the caller as-is"
+        );
+        assert_eq!(
+            &body[..],
+            b"tls ok",
+            "the body served over the inner TLS session must reach the caller — if \
+             is_https were ignored, the mock's inner TLS accept would fail on the \
+             plaintext request and this call would return Err, never a body"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_html_content_type / rewrite_relative_links unit tests
+    //
+    // A browser hitting the pod/service proxy must get links that stay within the
+    // proxy — a relative link that resolves against the apiserver's own root instead
+    // of the proxy path silently takes the user (or any HTTP client) out of the proxy.
+    // -----------------------------------------------------------------------
+
+    /// An exact `text/html` Content-Type must be detected.
+    #[test]
+    fn is_html_content_type_true_for_exact_text_html() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/html".parse().unwrap(),
+        );
+        assert!(
+            super::is_html_content_type(&headers),
+            "an exact 'text/html' Content-Type must be recognized — missing it means \
+             the response body never gets its relative links rewritten"
+        );
+    }
+
+    /// `text/html; charset=utf-8` must still be detected — the charset parameter must
+    /// not defeat the match.
+    #[test]
+    fn is_html_content_type_true_for_text_html_with_charset() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/html; charset=utf-8".parse().unwrap(),
+        );
+        assert!(
+            super::is_html_content_type(&headers),
+            "real HTML servers almost always send a charset parameter — matching only \
+             the bare 'text/html' string would silently skip rewriting nearly every \
+             real HTML response"
+        );
+    }
+
+    /// A non-HTML Content-Type (e.g. JSON) must not be treated as HTML.
+    #[test]
+    fn is_html_content_type_false_for_json() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        assert!(
+            !super::is_html_content_type(&headers),
+            "a JSON response must never go through the HTML rewriter — scanning a JSON \
+             body for 'href='/'src=' substrings could corrupt an unrelated field"
+        );
+    }
+
+    /// A response with no Content-Type header at all must not be treated as HTML.
+    #[test]
+    fn is_html_content_type_false_when_header_absent() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(
+            !super::is_html_content_type(&headers),
+            "a missing Content-Type must default to no rewriting, matching upstream's \
+             behavior of only rewriting a response explicitly labeled text/html"
+        );
+    }
+
+    /// A root-relative `href` must be rewritten to include the proxy base path.
+    ///
+    /// This is the exact conformance assertion: the agnhost porter backend serves
+    /// `<a href="/rewriteme">test</a>`, and upstream kube-apiserver's proxy rewrites it
+    /// to `<a href=".../proxy/rewriteme">test</a>` so the link stays within the proxy.
+    #[test]
+    fn rewrite_relative_links_rewrites_root_relative_href() {
+        assert_eq!(
+            super::rewrite_relative_links(
+                r#"<a href="/rewriteme">test</a>"#,
+                "/api/v1/namespaces/default/pods/mypod/proxy"
+            ),
+            r#"<a href="/api/v1/namespaces/default/pods/mypod/proxy/rewriteme">test</a>"#,
+            "a root-relative href must gain the full proxy path prefix — without it, a \
+             client following the link hits the apiserver's own root at /rewriteme \
+             instead of the pod's"
+        );
+    }
+
+    /// A root-relative `src` must be rewritten the same way as `href`.
+    #[test]
+    fn rewrite_relative_links_rewrites_root_relative_src() {
+        assert_eq!(
+            super::rewrite_relative_links(
+                r#"<img src="/logo.png">"#,
+                "/api/v1/namespaces/default/pods/mypod/proxy"
+            ),
+            r#"<img src="/api/v1/namespaces/default/pods/mypod/proxy/logo.png">"#,
+            "src must be rewritten identically to href — upstream's proxy Transport \
+             rewrites both attributes for exactly this reason (img/script/etc. all use src)"
+        );
+    }
+
+    /// An absolute URL (with its own scheme and host) must be left untouched.
+    #[test]
+    fn rewrite_relative_links_leaves_absolute_url_untouched() {
+        let html = r#"<a href="http://example.com/elsewhere">test</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "an absolute URL already names its own host and must not be rewritten — \
+             prefixing it with the proxy path would break a legitimate external link"
+        );
+    }
+
+    /// A scheme-relative URL (`//host/...`) must be left untouched — it names its own
+    /// host even though it starts with `/`.
+    #[test]
+    fn rewrite_relative_links_leaves_scheme_relative_url_untouched() {
+        let html = r#"<a href="//example.com/elsewhere">test</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "a scheme-relative URL carries its own host despite the leading '/' — \
+             treating it as root-relative would prepend the proxy path onto \
+             '//example.com/elsewhere' instead of leaving it alone"
+        );
+    }
+
+    /// A document-relative path (no leading `/`) must be left untouched — it already
+    /// resolves correctly against the current proxied URL without rewriting.
+    #[test]
+    fn rewrite_relative_links_leaves_document_relative_path_untouched() {
+        let html = r#"<a href="rewriteme">test</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "a bare relative path resolves against the browser's current URL (already \
+             inside the proxy path) with no rewriting needed — prefixing it would \
+             double up the proxy path"
+        );
+    }
+
+    /// An attribute that merely ends in "href" (not the exact `href=` token) must not be
+    /// mistaken for a real href attribute.
+    #[test]
+    fn rewrite_relative_links_does_not_misparse_unrelated_attribute() {
+        let html = r#"<div xhref="/foo">test</div>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "an attribute name that merely ends in 'href' must not be mistaken for the \
+             real attribute — rewriting inside it would corrupt an unrelated attribute value"
+        );
+    }
+
+    /// Multiple links in the same document must each be rewritten independently.
+    #[test]
+    fn rewrite_relative_links_rewrites_multiple_links() {
+        let html = r#"<a href="/one">one</a><a href="/two">two</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/proxy"),
+            r#"<a href="/proxy/one">one</a><a href="/proxy/two">two</a>"#,
+            "every root-relative link in the document must be rewritten, not just the \
+             first — a page with multiple links must keep the user inside the proxy \
+             no matter which one they follow"
+        );
+    }
+
+    /// HTML with no href/src attributes at all must pass through byte-for-byte.
+    #[test]
+    fn rewrite_relative_links_leaves_plain_html_unchanged() {
+        let html = "<p>hello world</p>";
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "HTML with nothing to rewrite must be returned unchanged — this is the \
+             overwhelming majority of proxied HTML responses"
+        );
+    }
+
+    /// pod_proxy (direct, no konnectivity) must rewrite root-relative links in a
+    /// text/html response body so they keep resolving through the proxy.
+    ///
+    /// Before this fix, pod_proxy_dispatch streamed the backend body through
+    /// unmodified — a client following `<a href="/rewriteme">` on a proxied page would
+    /// land on the apiserver's own root instead of the pod's `/rewriteme`. This is the
+    /// exact "Proxy ... should proxy through a service and a pod" conformance failure
+    /// for the bare pod-proxy-root and named-port HTML cases.
+    #[tokio::test]
+    async fn pod_proxy_rewrites_relative_html_links() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pod_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            let html_body = r#"<a href="/rewriteme">test</a>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{html_body}",
+                html_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let state = make_state();
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
+            },
+            "status": {"podIP": "127.0.0.1"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/mypod/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let expected_body =
+            r#"<a href="/api/v1/namespaces/default/pods/mypod/proxy/rewriteme">test</a>"#;
+        // axum fills in Content-Length only when the header is absent (it never corrects
+        // an existing one), so the original (stale, pre-rewrite) Content-Length must have
+        // been removed — otherwise this would still show the backend's original byte
+        // count instead of the rewritten body's.
+        if let Some(cl) = resp.headers().get(axum::http::header::CONTENT_LENGTH) {
+            assert_eq!(
+                cl.to_str().unwrap(),
+                expected_body.len().to_string(),
+                "Content-Length must describe the rewritten body, not the original — a \
+                 client reading exactly the original (shorter) byte count would truncate \
+                 the rewritten href mid-attribute"
+            );
+        }
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, expected_body,
+            "the relative link must be rewritten to include the full proxy path — a \
+             client following the unrewritten link would hit the apiserver's own root \
+             instead of the pod's /rewriteme"
+        );
+    }
+
+    /// pod_proxy over a konnectivity tunnel must also rewrite relative HTML links.
+    ///
+    /// The tunnel branch builds its response body separately from the direct-HTTP
+    /// branch (pod_proxy_via_connect_tunnel returns already-buffered bytes rather than
+    /// a stream); fixing only the direct branch would leave every konnectivity-proxied
+    /// cluster — the common case once a real CNI is involved, and the path u7s's own
+    /// dev stack always takes — still returning unrewritten links.
+    #[tokio::test]
+    async fn pod_proxy_via_connect_tunnel_rewrites_relative_html_links() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut buf2 = [0u8; 512];
+            let _ = stream.read(&mut buf2).await;
+            let html_body = r#"<a href="/rewriteme">test</a>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{html_body}",
+                html_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}]},
+            "status": {"podIP": "10.0.0.1"}
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: Some(proxy_addr),
+            sa_public_key_pem: None,
+        });
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/mypod/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, r#"<a href="/api/v1/namespaces/default/pods/mypod/proxy/rewriteme">test</a>"#,
+            "the konnectivity-tunnel branch must also rewrite relative links — this is \
+             the path u7s's own dev stack always takes once konnectivity-server is \
+             configured"
+        );
+    }
+
+    /// service_proxy (direct, no konnectivity) must rewrite relative links using the
+    /// SERVICE's own proxy base path, not the pod's.
+    ///
+    /// service_proxy_dispatch computes its own `proxy_base` from `services/{name}/proxy`
+    /// independently from pod_proxy_dispatch's `pods/{name}/proxy` — a copy-paste error
+    /// here would silently rewrite links to the wrong (pod-shaped) path.
+    #[tokio::test]
+    async fn service_proxy_rewrites_relative_html_links() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            let html_body = r#"<a href="/rewriteme">test</a>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{html_body}",
+                html_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let state = make_state();
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}],
+            "ports": [{"name": "http", "port": ep_port, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/services/my-svc/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            r#"<a href="/api/v1/namespaces/default/services/my-svc/proxy/rewriteme">test</a>"#,
+            "service_proxy must rewrite links using its own services/<name>/proxy base \
+             path — rewriting to a pod-shaped path would send the client to a URL that \
+             404s"
         );
     }
 
@@ -5848,7 +6810,7 @@ mod tests {
             .await
             .expect("seed endpointslice");
 
-        let (ip, port, _) = resolve_service_proxy_target(&state, "default", "my-svc")
+        let (ip, port, _, _) = resolve_service_proxy_target(&state, "default", "my-svc")
             .await
             .expect("resolve must succeed for a service with a ready endpoint");
         assert_eq!(
@@ -6248,6 +7210,75 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // proxy_target_is_https unit tests
+    //
+    // pod_proxy_dispatch/service_proxy_dispatch use this to pick TLS vs plain HTTP for
+    // the backend connection. Getting it wrong either way breaks the proxy: connecting
+    // over TLS to a plain-HTTP backend fails the handshake, and connecting over plain
+    // HTTP to a TLS-only backend gets rejected with 400 "Client sent an HTTP request to
+    // an HTTPS server" — the exact conformance failure this fixes.
+    // -----------------------------------------------------------------------
+
+    /// An `https:name:port` target must report true.
+    #[test]
+    fn proxy_target_is_https_true_for_https_scheme() {
+        assert!(
+            super::proxy_target_is_https("https:my-pod:443"),
+            "an 'https:'-prefixed target must be dialed over TLS — reporting false here \
+             sends a plaintext request to what the URL explicitly names as a TLS backend"
+        );
+    }
+
+    /// An `http:name:port` target must report false, not just "not https".
+    #[test]
+    fn proxy_target_is_https_false_for_http_scheme() {
+        assert!(
+            !super::proxy_target_is_https("http:my-pod:443"),
+            "an explicit 'http:' scheme must never be treated as https — doing so would \
+             attempt a TLS handshake against a plain-HTTP backend and fail outright"
+        );
+    }
+
+    /// A bare name (no scheme) must report false — this is the overwhelming majority of
+    /// existing proxy requests.
+    #[test]
+    fn proxy_target_is_https_false_for_bare_name() {
+        assert!(
+            !super::proxy_target_is_https("my-pod"),
+            "a bare name carries no scheme and must default to plain HTTP — misreporting \
+             true here would break every existing proxy request with a spurious TLS \
+             handshake"
+        );
+    }
+
+    /// A 2-part `https:8080` id is the literal name `https` with a numeric port, not a
+    /// bare https scheme — matching `split_scheme_name_port`'s identical disambiguation.
+    ///
+    /// Without the second-colon check, a pod genuinely named "https" addressed as
+    /// `pods/https:8080/proxy/` would be misdialed over TLS instead of to the pod's
+    /// actual (plain HTTP) port 8080.
+    #[test]
+    fn proxy_target_is_https_two_part_form_never_treated_as_bare_scheme() {
+        assert!(
+            !super::proxy_target_is_https("https:8080"),
+            "a 2-part id must always parse as name:port, never a bare scheme — treating \
+             'https' as the scheme here would silently discard the resource name and \
+             dial the wrong protocol"
+        );
+    }
+
+    /// A name that merely starts with "https" (not the exact "https:" scheme token) must
+    /// not be mistaken for the scheme.
+    #[test]
+    fn proxy_target_is_https_does_not_misparse_name_starting_with_https() {
+        assert!(
+            !super::proxy_target_is_https("https-service:8080"),
+            "a name that merely starts with 'https' must not be mistaken for the scheme \
+             token — that would silently dial the wrong protocol against the wrong service"
+        );
+    }
+
     /// resolve_eps_port with None picks the first port entry.
     ///
     /// This is the fallback for bare services/<name>/proxy/ — removing it regresses
@@ -6435,7 +7466,7 @@ mod tests {
             .expect("seed endpointslice");
 
         // The svc_name as it arrives from the URL: includes the colon suffix.
-        let (ip, port, _) = resolve_service_proxy_target(&state, "default", "my-svc:portname1")
+        let (ip, port, _, _) = resolve_service_proxy_target(&state, "default", "my-svc:portname1")
             .await
             .expect(
                 "named-port service proxy must resolve — 404 means the bare name was not \
@@ -6501,7 +7532,7 @@ mod tests {
             .await
             .expect("seed endpointslice");
 
-        let (ip, port, _) = resolve_service_proxy_target(&state, "default", "num-svc:9090")
+        let (ip, port, _, _) = resolve_service_proxy_target(&state, "default", "num-svc:9090")
             .await
             .expect(
                 "numeric-port service proxy must resolve — 404 means bare name was not extracted",
@@ -6570,7 +7601,7 @@ mod tests {
             .await
             .expect("seed endpointslice");
 
-        let (ip, port, _) =
+        let (ip, port, _, _) =
             resolve_service_proxy_target(&state, "default", "http:proxy-test-svc:web")
                 .await
                 .expect(
@@ -6582,6 +7613,82 @@ mod tests {
             port, 8080,
             "named port 'web' must resolve via the EndpointSlice ports array once the \
              scheme prefix is stripped"
+        );
+    }
+
+    /// resolve_service_proxy_target with an `https:` scheme prefix must report
+    /// `is_https = true`; a bare name must report `false`.
+    ///
+    /// service_proxy_dispatch uses this flag the same way pod_proxy_dispatch does: to pick
+    /// TLS vs plain HTTP for the backend connection. This is the service-side half of the
+    /// conformance failure for tlsportname1/tlsportname2 (400 "Client sent an HTTP request
+    /// to an HTTPS server" instead of the proxied response).
+    #[tokio::test]
+    async fn service_proxy_https_scheme_reports_is_https_true() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "tls-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"name": "web", "port": 443}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "tls-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "tls-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "tls-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.9.9.9"], "conditions": {"ready": true}}],
+            "ports": [{"name": "web", "port": 443, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "tls-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let (_, _, _, is_https) =
+            resolve_service_proxy_target(&state, "default", "https:tls-svc:web")
+                .await
+                .expect("resolve must succeed");
+        assert!(
+            is_https,
+            "an 'https:'-scheme service proxy target must report is_https=true — without \
+             it, service_proxy_dispatch connects over plain HTTP and a TLS-only endpoint \
+             rejects the request with 400 instead of returning the proxied response"
+        );
+
+        let (_, _, _, is_https) = resolve_service_proxy_target(&state, "default", "tls-svc:web")
+            .await
+            .expect("resolve must succeed");
+        assert!(
+            !is_https,
+            "a service proxy target with no scheme prefix must default to plain HTTP, \
+             matching every pre-existing service proxy request"
         );
     }
 
