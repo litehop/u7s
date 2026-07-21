@@ -1614,6 +1614,126 @@ pub async fn delete_cr<S: Store>(
     .into_response())
 }
 
+/// DeleteCollection fallback for cluster-scoped custom resources — what
+/// `delete_collection_resource` calls when `plural` isn't a built-in registered type.
+///
+/// Mirrors `delete_collection_resource`'s inline per-object loop (admission, finalizer
+/// soft-delete) rather than looping over `delete_cr`, matching how this codebase already
+/// keeps collection-delete a self-contained loop instead of calling the single-object
+/// handler per item. Unlike `delete_cr` (which 404s for a namespaced CRD requested at the
+/// cluster route, since a bare name can't identify a namespaced object), this scans without
+/// a namespace segment regardless of `ctx.namespaced` — exactly like `list_cr` already does
+/// — because a collection scan matched by selector, not by name, is not ambiguous across
+/// namespaces.
+pub async fn delete_collection_cr<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, plural)): Path<(String, String, String)>,
+    Extension(user): Extension<UserInfo>,
+    query: super::generic::CollectionQuery,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+
+    let prefix = cr_list_prefix(&group, &plural, None);
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(super::generic::parse_label_selector)
+        .transpose()?;
+
+    // Field selectors can name fields that only exist once an object is converted to the
+    // requested version (see convert_cr_list_items) — build a converted+defaulted view purely
+    // to decide which objects match, exactly like list_cr does. The delete below always acts
+    // on the object's own stored bytes, never this converted view.
+    let desired_api_version = format!("{group}/{version}");
+    let mut filter_view: Vec<serde_json::Value> = resp
+        .items
+        .iter()
+        .map(|obj| serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null))
+        .collect();
+    convert_cr_list_items(
+        &state,
+        ctx.conversion_webhook_client_config.as_ref(),
+        &mut filter_view,
+        &desired_api_version,
+    )
+    .await?;
+    if let Some(schema) = ctx.schema.as_ref() {
+        for item in filter_view.iter_mut() {
+            apply_crd_schema_defaults(schema, item);
+        }
+    }
+
+    for (obj, filter_item) in resp.items.into_iter().zip(filter_view) {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            let name = parsed["metadata"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            if let Some(ref pairs) = label_pairs {
+                if super::generic::apply_label_selector(vec![filter_item.clone()], pairs).is_empty()
+                {
+                    continue;
+                }
+            }
+            if let Some(ref selector) = query.field_selector {
+                if !cr_matches_field_selector(
+                    &filter_item,
+                    selector,
+                    ctx.namespaced,
+                    &ctx.selectable_fields,
+                ) {
+                    continue;
+                }
+            }
+
+            let admission_ctx = AdmissionContext {
+                group: &group,
+                version: &version,
+                resource: &plural,
+                name: &name,
+                namespace: None,
+                operation: "DELETE",
+                user_info: Some(serde_json::json!({
+                    "username": user.username,
+                    "uid": user.uid,
+                    "groups": user.groups,
+                })),
+                dry_run: false,
+            };
+            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
+            let mut typed = Object { body: parsed };
+            if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut typed) {
+                state
+                    .store
+                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                continue;
+            }
+        }
+        match state.store.delete(&obj.key, None).await {
+            Ok(_) | Err(u7s_store::StoreError::NotFound { .. }) => {}
+            Err(e) => return Err(Status::internal(e.to_string())),
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    }))
+    .into_response())
+}
+
 // ---------------------------------------------------------------------------
 // Namespaced CR handlers
 // ---------------------------------------------------------------------------
@@ -2198,6 +2318,131 @@ pub async fn delete_cr_namespaced<S: Store>(
     if !owner_uid.is_empty() {
         let orphan = delete_opts.is_orphan();
         cascade_delete_cr_dependents(&state, &owner_uid, orphan).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    }))
+    .into_response())
+}
+
+/// DeleteCollection fallback for namespaced custom resources — what
+/// `delete_collection_namespaced_resource` calls when `plural` isn't a built-in registered
+/// type. Mirrors `delete_collection_namespaced_resource`'s inline per-object loop (admission,
+/// finalizer soft-delete via `apply_delete_policy`) so a finalizer'd CR survives with
+/// deletionTimestamp set exactly like a single `delete_cr_namespaced` call would — never
+/// hard-deleted outright. Also honors `query.field_selector` via `cr_matches_field_selector`,
+/// the same CRD-selectableFields-aware matcher LIST and watch already use, since the store's
+/// generic single-field selector can't express CRD-declared JSON paths the way CR semantics
+/// require.
+pub async fn delete_collection_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
+    query: super::generic::CollectionQuery,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+
+    if !ctx.namespaced {
+        return Err(Status::not_found(
+            &format!("{group}/{version}/{plural}"),
+            "Resource",
+        ));
+    }
+
+    let prefix = cr_list_prefix(&group, &plural, Some(&ns));
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(super::generic::parse_label_selector)
+        .transpose()?;
+
+    // Field selectors can name fields that only exist once an object is converted to the
+    // requested version (see convert_cr_list_items) — build a converted+defaulted view purely
+    // to decide which objects match, exactly like list_cr_namespaced does. The delete below
+    // always acts on the object's own stored bytes, never this converted view.
+    let desired_api_version = format!("{group}/{version}");
+    let mut filter_view: Vec<serde_json::Value> = resp
+        .items
+        .iter()
+        .map(|obj| serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null))
+        .collect();
+    convert_cr_list_items(
+        &state,
+        ctx.conversion_webhook_client_config.as_ref(),
+        &mut filter_view,
+        &desired_api_version,
+    )
+    .await?;
+    if let Some(schema) = ctx.schema.as_ref() {
+        for item in filter_view.iter_mut() {
+            apply_crd_schema_defaults(schema, item);
+        }
+    }
+
+    for (obj, filter_item) in resp.items.into_iter().zip(filter_view) {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            let name = parsed["metadata"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            if let Some(ref pairs) = label_pairs {
+                if super::generic::apply_label_selector(vec![filter_item.clone()], pairs).is_empty()
+                {
+                    continue;
+                }
+            }
+            if let Some(ref selector) = query.field_selector {
+                if !cr_matches_field_selector(
+                    &filter_item,
+                    selector,
+                    ctx.namespaced,
+                    &ctx.selectable_fields,
+                ) {
+                    continue;
+                }
+            }
+
+            let admission_ctx = AdmissionContext {
+                group: &group,
+                version: &version,
+                resource: &plural,
+                name: &name,
+                namespace: Some(&ns),
+                operation: "DELETE",
+                user_info: Some(serde_json::json!({
+                    "username": user.username,
+                    "uid": user.uid,
+                    "groups": user.groups,
+                })),
+                dry_run: false,
+            };
+            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
+            let mut typed = Object { body: parsed };
+            if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut typed) {
+                state
+                    .store
+                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                continue;
+            }
+        }
+        match state.store.delete(&obj.key, None).await {
+            Ok(_) | Err(u7s_store::StoreError::NotFound { .. }) => {}
+            Err(e) => return Err(Status::internal(e.to_string())),
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -4295,6 +4540,207 @@ mod tests {
              apiVersion/kind on the raw v2 body and filtered that against the v1 selector, so \
              a v2-stored CR never matched a v1 fieldSelector and was silently dropped, exactly \
              the CustomResourceFieldSelectors watch failure (got: {body_str})"
+        );
+    }
+
+    /// Regression test: delete_collection_cr_namespaced's field-selector filter must apply
+    /// the SAME conversion-before-filter step LIST already does
+    /// (list_cr_namespaced_watch_send_initial_events_converts_backlog_before_field_selector).
+    /// Without it, a DeleteCollection issued at a non-storage version with a field selector on
+    /// that version's declared field silently matches nothing, because the raw stored body
+    /// doesn't carry that field's name at all.
+    ///
+    /// Fails on revert: without the convert_cr_list_items call, gizmo-a's raw v2 body has no
+    /// "hostPort" key, cr_matches_field_selector never matches it, and DeleteCollection
+    /// deletes nothing instead of gizmo-a.
+    #[tokio::test]
+    async fn delete_collection_cr_namespaced_converts_before_field_selector() {
+        use crate::handlers::crd;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        for (name, host, port) in [("gizmo-a", "host1", "80"), ("gizmo-b", "host1", "8080")] {
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    HOSTPORT_CRD_GROUP.to_string(),
+                    "v2".to_string(),
+                    ns.to_string(),
+                    "gizmos".to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                gizmo_v2_body(name, ns, host, port),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {name} via v2 must succeed: {e:?}"));
+        }
+
+        let query = super::super::generic::CollectionQuery {
+            field_selector: Some("hostPort=host1:80".to_string()),
+            ..no_watch_query()
+        };
+        delete_collection_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            query,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v1 DeleteCollection with fieldSelector must succeed: {e:?}"));
+
+        assert!(
+            call_count.load(Ordering::SeqCst) > 0,
+            "gizmo-a/b are stored at v2 but DeleteCollection requested v1, so the conversion \
+             webhook must have been called to evaluate hostPort against the converted view"
+        );
+
+        let a_gone = get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+                "gizmo-a".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            a_gone.is_err(),
+            "gizmo-a (host1:80) must be deleted by v1 DeleteCollection \
+             fieldSelector=hostPort=host1:80"
+        );
+
+        let b_survives = get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+                "gizmo-b".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            b_survives.is_ok(),
+            "gizmo-b (host1:8080) must survive — it does not match hostPort=host1:80"
+        );
+    }
+
+    /// delete_collection_cr_namespaced must respect metadata.finalizers exactly like a single
+    /// delete_cr_namespaced call: a CR with finalizers must be soft-deleted (deletionTimestamp
+    /// stamped, kept alive), never hard-deleted outright. mayor-njkk1 tracks the analogous gap
+    /// for BUILT-IN resources' DeleteCollection; this locks in that the new CR DeleteCollection
+    /// path doesn't regress the guarantee single-object CR delete and the built-in
+    /// DeleteCollection loop already provide.
+    ///
+    /// Fails on revert: reverting to an unconditional store.delete for every matched CR
+    /// removes finalizer-app from the store instead of leaving it with deletionTimestamp set.
+    #[tokio::test]
+    async fn delete_collection_cr_namespaced_respects_finalizers() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let ns = "argocd";
+        let plural = "applications";
+
+        let finalizer_key = cr_store_key(group, plural, Some(ns), "finalizer-app");
+        let finalizer_body = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": "finalizer-app",
+                "namespace": ns,
+                "uid": "fin-uid-1",
+                "resourceVersion": "1",
+                "finalizers": ["example.io/protect"]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &finalizer_key,
+                Bytes::from(serde_json::to_vec(&finalizer_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.to_string(),
+                    version.to_string(),
+                    ns.to_string(),
+                    plural.to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body("plain-app", ns),
+            )
+            .await
+            .is_ok(),
+            "create plain-app must succeed"
+        );
+
+        delete_collection_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            no_watch_query(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete_collection_cr_namespaced must succeed: {e:?}"));
+
+        let after_finalizer = state.store.get(&finalizer_key).await.unwrap().expect(
+            "a CR with metadata.finalizers must NOT be removed by DeleteCollection — hard \
+                 delete would bypass its finalizer and break cleanup controllers",
+        );
+        let after_obj: serde_json::Value = serde_json::from_slice(&after_finalizer.value).unwrap();
+        assert!(
+            after_obj["metadata"]["deletionTimestamp"]
+                .as_str()
+                .is_some(),
+            "the finalizer'd CR must have deletionTimestamp set so its controller knows to \
+             run cleanup and remove the finalizer"
+        );
+
+        let plain_key = cr_store_key(group, plural, Some(ns), "plain-app");
+        assert!(
+            state.store.get(&plain_key).await.unwrap().is_none(),
+            "a CR without finalizers must be hard-deleted by DeleteCollection"
         );
     }
 
