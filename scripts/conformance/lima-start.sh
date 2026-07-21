@@ -162,6 +162,33 @@ else
   limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
 fi
 
+# Give this node its own disjoint pod-CIDR /24 out of the CRI-O default 10.85.0.0/16
+# (primary = .0, -2 = .1, -3 = .2, ...). The stock conflist hands every node the
+# identical flat /16, so nodes independently allocate overlapping pod IPs and every
+# node's route table treats the whole /16 as locally attached, which is why
+# cross-node pod traffic fails with "Host is unreachable" (fixed by the inter-node
+# routes added near the end of this script). Skip the crio restart + IPAM-lease
+# wipe when the subnet is already correct so a plain reconnect never risks
+# recycling an IP a live pod still holds.
+if [ -z "$NODE_SUFFIX" ]; then
+  POD_SUBNET_OCTET=0
+else
+  POD_SUBNET_OCTET=$(( ${NODE_SUFFIX#-} - 1 ))
+fi
+POD_SUBNET="10.85.${POD_SUBNET_OCTET}.0/24"
+CURRENT_POD_SUBNET=$(limactl shell "$VM_NAME" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
+if [ "$CURRENT_POD_SUBNET" != "$POD_SUBNET" ]; then
+  echo "Rewriting CNI bridge pod subnet: ${CURRENT_POD_SUBNET:-<unset>} -> ${POD_SUBNET}"
+  limactl shell "$VM_NAME" sudo bash -c "
+    jq --arg s '${POD_SUBNET}' '.plugins[0].ipam.ranges[0][0].subnet = \$s' /etc/cni/net.d/10-crio-bridge.conflist > /tmp/10-crio-bridge.conflist.new
+    mv /tmp/10-crio-bridge.conflist.new /etc/cni/net.d/10-crio-bridge.conflist
+    systemctl restart crio
+    rm -rf /var/lib/cni/networks/crio/*
+  "
+else
+  echo "CNI bridge pod subnet already ${POD_SUBNET}, skipping rewrite."
+fi
+
 # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
 # run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
 # (size-based) from the remaining logs (weekly). Written on every start so it survives
@@ -243,8 +270,14 @@ if [ -f "$CA_CERT" ]; then
 
   # Get the lima VM IP so it can be included as a SAN (needed if kubelet-preferred-address
   # is not set and the apiserver connects via the VM's InternalIP instead of 127.0.0.1).
-  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show lima0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
-  LIMA_VM_IP="${LIMA_VM_IP:-192.168.5.15}"
+  # eth0 is the VM's sole interface (the user-v2 network in lima/kubelet.yaml); its
+  # address is DHCP-assigned per node, so there is no sane hardcoded fallback — fail
+  # loud instead of silently signing a cert for an address the node doesn't have.
+  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show eth0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
+  if [ -z "$LIMA_VM_IP" ]; then
+    echo "error: could not determine ${VM_NAME}'s eth0 address for the kubelet serving cert SAN" >&2
+    exit 1
+  fi
 
   if [ ! -f "$KUBELET_TLS_KEY" ] || [ ! -f "$KUBELET_TLS_CRT" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$KUBELET_TLS_KEY"
@@ -594,6 +627,29 @@ fi
 echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
+
+# Inter-node pod routes: nothing else programs a path to a peer's pod subnet — no
+# CNI/BGP here, by design (static routes over the shared user-v2 network). Re-run
+# on every invocation, of this node OR a peer's, because routes don't survive a VM
+# reboot. A lone primary has no peers yet, so this loop is a no-op until a 2nd node
+# joins; whichever node's lima-start.sh runs re-asserts the pairing both ways, so a
+# stale route on either side self-heals the next time either node reconnects.
+PEERS=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+THIS_NODE_IP=$(limactl shell "$VM_NAME" ip -4 addr show eth0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
+for PEER in $PEERS; do
+  [ "$PEER" = "$VM_NAME" ] && continue
+  PEER_IP=$(limactl shell "$PEER" ip -4 addr show eth0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
+  PEER_SUBNET=$(limactl shell "$PEER" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
+  if [ -z "$PEER_IP" ] || [ -z "$PEER_SUBNET" ] || [ -z "$THIS_NODE_IP" ]; then
+    echo "WARNING: could not resolve route info for peer '${PEER}' — skipping inter-node route" >&2
+    continue
+  fi
+  echo "Routing ${VM_NAME} -> ${PEER_SUBNET} via ${PEER_IP} (${PEER})"
+  limactl shell "$VM_NAME" sudo ip route replace "$PEER_SUBNET" via "$PEER_IP"
+  echo "Routing ${PEER} -> ${POD_SUBNET} via ${THIS_NODE_IP} (${VM_NAME})"
+  limactl shell "$PEER" sudo ip route replace "$POD_SUBNET" via "$THIS_NODE_IP"
+done
+
 echo ""
 echo "Run kubectl commands with:"
 echo "  export KUBECONFIG=$KUBECONFIG_PATH"

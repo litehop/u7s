@@ -4,15 +4,20 @@
 # THIS SCRIPT MUST NEVER CALL 04-start-kcm.sh OR 05-start-scheduler.sh.
 # A 2nd kube-controller-manager would run every controller with no leader
 # election (04-start-kcm.sh:119-121) and double-write cluster state; the
-# scheduler must run exactly once for the whole cluster. This script only
-# provisions the VM and joins its kubelet — nothing else.
+# scheduler must run exactly once for the whole cluster. This script provisions
+# the VM, joins its kubelet, AND — via lima-start.sh reaching back over `limactl
+# shell` — programs inter-node pod routes on every already-registered peer
+# (including the primary). That reach-back is necessary: there is no CNI/BGP
+# giving nodes a path to each other's pod subnet, so the joining node's setup is
+# the only place that can teach the primary about the new node's subnet. It
+# still never touches KCM/scheduler; that invariant is unrelated and must hold.
 #
 # Usage:
 #   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>]
 #
 # Delegates to lima-start.sh --node-suffix "-2" so the joining node's per-node
-# resources (konnectivity-agent Pod/Secret, kubelet serving cert) don't collide
-# with the primary node's.
+# resources (konnectivity-agent Pod/Secret, kubelet serving cert, pod CIDR) don't
+# collide with the primary node's.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
