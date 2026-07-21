@@ -346,6 +346,25 @@ pub async fn create_pod<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
+
+    // Reject pod creation in a Terminating namespace — matches kube-apiserver behaviour and
+    // the same gate create_namespaced_resource already enforces for every other resource
+    // type. Without this, a ReplicationController/ReplicaSet controller can keep recreating
+    // pods in a namespace mid-deletion, forcing the real KCM namespace-controller's own
+    // DeleteCollection retries to repeatedly race new pods instead of converging quickly.
+    {
+        let ns_key = cluster_object_key("namespaces", ns.as_str());
+        if let Ok(Some(stored)) = state.store.get(&ns_key).await {
+            if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                    return Err(Status::forbidden(format!(
+                        "unable to create new content in namespace {ns} because it is being terminated"
+                    )));
+                }
+            }
+        }
+    }
+
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -646,13 +665,42 @@ pub async fn delete_collection_pods<S: Store>(
         .transpose()?;
 
     for obj in resp.items {
+        let mut soft_deleted = false;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             if let Some(ref pairs) = label_pairs {
-                let kept = super::generic::apply_label_selector(vec![parsed], pairs);
+                let kept = super::generic::apply_label_selector(vec![parsed.clone()], pairs);
                 if kept.is_empty() {
                     continue;
                 }
             }
+
+            // Mirror delete_pod's soft/hard-delete decision instead of always hard-deleting:
+            // a pod already Terminating with no finalizers left hard-deletes, every other pod
+            // (not yet Terminating, or still holding a finalizer) is soft-deleted so its
+            // kubelet/finalizer-owning controller observes deletionTimestamp instead of the
+            // pod vanishing outright. The real KCM namespace-controller drains pods via
+            // exactly this endpoint (DeleteCollection) during OrderedNamespaceDeletion —
+            // unconditionally hard-deleting here would silently bypass every pod's
+            // finalizers.
+            let meta: ObjectMeta =
+                serde_json::from_value(parsed["metadata"].clone()).unwrap_or_default();
+            let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+            let already_terminating = meta.deletion_timestamp.is_some();
+            if !already_terminating || has_finalizers {
+                let mut updated = parsed;
+                updated["metadata"]["deletionTimestamp"] =
+                    serde_json::Value::String(utc_now_rfc3339());
+                let current_gen = updated["metadata"]["generation"].as_i64().unwrap_or(1);
+                updated["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+                let _ = state
+                    .store
+                    .put(&obj.key, bytes::Bytes::from(updated.to_string()), None)
+                    .await;
+                soft_deleted = true;
+            }
+        }
+        if soft_deleted {
+            continue;
         }
         let _ = state.store.delete(&obj.key, None).await;
     }
@@ -7616,6 +7664,72 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    /// POST a pod into a Terminating namespace must return 403, matching
+    /// create_namespaced_resource's gate for every other resource type.
+    ///
+    /// Without this, a ReplicationController/ReplicaSet controller can keep recreating pods
+    /// in a namespace mid-deletion faster than the real KCM namespace-controller's own
+    /// DeleteCollection retries converge, since pods (unlike every other resource type) had
+    /// no Terminating check at all on their own dedicated create path.
+    ///
+    /// Fails on revert: reverting create_pod's Terminating check makes this return 201
+    /// Created instead of 403.
+    #[tokio::test]
+    async fn create_pod_rejects_when_namespace_terminating() {
+        let (state, store) = make_state();
+        let ns_key = "/registry/namespaces/terminating-ns";
+        let ns_val = serde_json::json!({
+            "kind": "Namespace",
+            "metadata": { "name": "terminating-ns" },
+            "status": { "phase": "Terminating" }
+        });
+        store
+            .put(
+                ns_key,
+                Bytes::from(serde_json::to_vec(&ns_val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "terminating-ns"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/terminating-ns/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "pod creation must be rejected once the namespace is Terminating — otherwise a \
+             controller can keep recreating pods faster than KCM's DeleteCollection retries \
+             can drain them"
+        );
+
+        let stored = store
+            .get("/registry/pods/terminating-ns/test-pod")
+            .await
+            .expect("store get must not error");
+        assert!(
+            stored.is_none(),
+            "rejected pod creation must not persist the pod"
+        );
+    }
+
     /// POST a pod with invalid JSON must return 400.
     #[tokio::test]
     async fn create_pod_returns_400_for_invalid_json() {
@@ -8733,6 +8847,141 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// DELETE on the pods collection endpoint must respect each pod's own soft/hard-delete
+    /// state exactly like a single-pod DELETE does, not hard-delete everything
+    /// unconditionally. The real KCM namespace-controller drains pods via exactly this
+    /// endpoint (DeleteCollection) during OrderedNamespaceDeletion; if it bypassed
+    /// finalizers, a pod's controller would never get to observe deletionTimestamp before
+    /// the pod vanished, breaking the pod-before-configmap ordering the conformance test
+    /// asserts.
+    ///
+    /// Fails on revert: reverting delete_collection_pods to unconditionally
+    /// `state.store.delete` every listed pod makes the finalizer'd and not-yet-terminating
+    /// pods vanish from the store instead of being soft-deleted.
+    #[tokio::test]
+    async fn delete_collection_pods_respects_finalizers_and_terminating_state() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // A pod with a finalizer, not yet terminating — must be soft-deleted, finalizer kept.
+        let finalized_key = "/registry/pods/default/finalized-pod";
+        let finalized_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(
+                finalized_key,
+                Bytes::from(serde_json::to_vec(&finalized_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A plain pod with no finalizer, not yet terminating — real Kubernetes soft-deletes
+        // it first too (grace period for SIGTERM); it must NOT vanish on the first DELETE.
+        let plain_key = "/registry/pods/default/plain-pod";
+        let plain_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "plain-pod", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(
+                plain_key,
+                Bytes::from(serde_json::to_vec(&plain_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A pod already Terminating with no finalizers — must hard-delete (the kubelet's
+        // "container stopped, gracePeriodSeconds=0" second DELETE).
+        let terminating_key = "/registry/pods/default/terminating-pod";
+        let terminating_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "terminating-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2026-01-01T00:00:00Z"
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(
+                terminating_key,
+                Bytes::from(serde_json::to_vec(&terminating_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "delete collection must return 200"
+        );
+
+        let stored_finalized = store.get(finalized_key).await.unwrap().expect(
+            "pod with a finalizer must NOT be removed by DeleteCollection — it must be \
+             soft-deleted so its controller can observe deletionTimestamp and clear the \
+             finalizer itself",
+        );
+        let finalized_body: serde_json::Value =
+            serde_json::from_slice(&stored_finalized.value).unwrap();
+        assert!(
+            finalized_body["metadata"]["deletionTimestamp"].is_string(),
+            "finalizer'd pod must have deletionTimestamp set after DeleteCollection"
+        );
+
+        let stored_plain = store.get(plain_key).await.unwrap().expect(
+            "a not-yet-terminating pod must NOT be hard-deleted on the first DeleteCollection \
+             pass — real Kubernetes always soft-deletes pods first so the kubelet can \
+             gracefully terminate the container",
+        );
+        let plain_body: serde_json::Value = serde_json::from_slice(&stored_plain.value).unwrap();
+        assert!(
+            plain_body["metadata"]["deletionTimestamp"].is_string(),
+            "plain pod must have deletionTimestamp stamped by DeleteCollection, matching \
+             delete_pod's single-object soft-delete behavior"
+        );
+
+        let stored_terminating = store.get(terminating_key).await.unwrap();
+        assert!(
+            stored_terminating.is_none(),
+            "a pod already Terminating with no finalizers must be hard-deleted by \
+             DeleteCollection — otherwise it lingers forever since nothing else removes it"
+        );
     }
 
     // -----------------------------------------------------------------------
