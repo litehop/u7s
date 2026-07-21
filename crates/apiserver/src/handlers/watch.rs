@@ -467,15 +467,21 @@ pub(crate) struct WatchConfig {
     pub timeout_seconds: Option<u64>,
 }
 
-/// CR-specific field-selector context for `watch_generic_for_cr`: the CRD-declared
-/// `selectableFields` for the matched version, plus whether the resource is namespaced
-/// (namespace is then also always selectable). Deliberately just the two fields
-/// `cr::cr_matches_field_selector` needs, not the whole `CrContext` — schema and conversion
-/// config are irrelevant to field-selector matching and would only add dead weight to a
-/// struct held for the lifetime of the watch stream.
+/// CR-specific context for `watch_generic_for_cr`: the CRD-declared `selectableFields` for
+/// the matched version and whether the resource is namespaced (namespace is then also
+/// always selectable) — both `cr::cr_matches_field_selector` needs — plus the conversion
+/// webhook config and the actually-requested `group/version`, needed to convert watched
+/// events to that version before the field-selector filter runs (see
+/// `convert_watched_cr_object`).
+///
+/// `desired_api_version` is independent of `WatchConfig::api_version`: the caller overrides
+/// that field to `meta.k8s.io/v1` for PartialObjectMetadata watches, but conversion must
+/// still target the real CR version underneath, not that presentation override.
 pub(crate) struct CrFieldSelectorContext {
     pub namespaced: bool,
     pub selectable_fields: Vec<String>,
+    pub conversion_webhook_client_config: Option<serde_json::Value>,
+    pub desired_api_version: String,
 }
 
 /// Stream watch events for a given store prefix in NDJSON format.
@@ -506,6 +512,35 @@ pub(crate) async fn watch_generic_for_cr<S: Store>(
     cr_fields: CrFieldSelectorContext,
 ) -> Result<Response, crate::status::StatusError> {
     watch_generic_impl(state, cfg, Some(cr_fields)).await
+}
+
+/// Convert a single watched CR object to `cr_fields`'s actually-requested version via the
+/// CRD's conversion webhook when its own stored apiVersion differs — reusing
+/// `cr::convert_cr_list_items` (with a one-element slice) for the exact per-item version
+/// check and webhook call the LIST path uses, so both delivery paths stay in lockstep.
+///
+/// A no-op for builtin-resource watches (`cr_fields` is `None`) and for same-version CR
+/// watches: `convert_cr_list_items` never calls the webhook when the object's own apiVersion
+/// already matches the target, so the common case (controllers watch the storage version)
+/// never pays for one.
+async fn convert_watched_cr_object<S: Store>(
+    state: &AppState<S>,
+    cr_fields: Option<&CrFieldSelectorContext>,
+    obj: serde_json::Value,
+) -> Result<serde_json::Value, crate::status::StatusError> {
+    let Some(ctx) = cr_fields else {
+        return Ok(obj);
+    };
+    let mut items = [obj];
+    super::cr::convert_cr_list_items(
+        state,
+        ctx.conversion_webhook_client_config.as_ref(),
+        &mut items,
+        &ctx.desired_api_version,
+    )
+    .await?;
+    let [converted] = items;
+    Ok(converted)
 }
 
 async fn watch_generic_impl<S: Store>(
@@ -584,6 +619,12 @@ async fn watch_generic_impl<S: Store>(
     // the client receives any data.
     let _store_keepalive = std::sync::Arc::clone(&state.store);
 
+    // Cloned so live/DELETED CR watch events can be converted via the CRD's conversion
+    // webhook mid-stream (see convert_watched_cr_object). The webhook call needs the full
+    // AppState (webhook client, cluster CA, konnectivity proxy config), not just the store,
+    // and `state` is otherwise unused for the rest of this function.
+    let state_for_conversion = state.clone();
+
     let label_selector = label_selector.unwrap_or_default();
     let field_selector = field_selector.unwrap_or_default();
     let chunk_stream = async_stream::stream! {
@@ -594,6 +635,7 @@ async fn watch_generic_impl<S: Store>(
         // Hold the store Arc for the duration of the stream so the broadcast sender
         // is never dropped while we are waiting for live events.
         let _store_keepalive = _store_keepalive;
+        let state_for_conversion = state_for_conversion;
 
         // For a CR watch with CRD-declared selectableFields, defer to the same CRD-aware
         // matcher LIST uses instead of the generic name/namespace/nodeName-only one, which
@@ -710,8 +752,30 @@ async fn watch_generic_impl<S: Store>(
                             if let WatchEvent::Added(obj) | WatchEvent::Modified(obj) = &event {
                                 let is_modified = matches!(&event, WatchEvent::Modified(_));
                                 if let Ok(s) = std::str::from_utf8(&obj.value) {
-                                    let mut parsed: serde_json::Value =
+                                    let parsed: serde_json::Value =
                                         serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+                                    // Convert to the actually-requested version BEFORE the
+                                    // field-selector filter below — filtering the unconverted
+                                    // body means a cross-version selector (e.g. v1's hostPort
+                                    // against a v2-stored host/port CR) never matches anything.
+                                    let mut parsed = match convert_watched_cr_object(
+                                        &state_for_conversion,
+                                        cr_fields.as_ref(),
+                                        parsed,
+                                    )
+                                    .await
+                                    {
+                                        Ok(converted) => converted,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                prefix = %prefix,
+                                                key = %obj.key,
+                                                err = %e.1.message,
+                                                "watch: CR conversion webhook failed, dropping live event"
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     if object_matches_label_selector(&parsed, &label_selector)
                                         && field_selector_matches(&parsed)
                                     {
@@ -784,14 +848,16 @@ async fn watch_generic_impl<S: Store>(
                                     let event_type = if is_modified { "MODIFIED" } else { "ADDED" };
                                     tracing::warn!("watch {event_type} event has invalid UTF-8, skipping");
                                 }
-                            } else if let WatchEvent::Deleted { key, body, .. } = &event {
-                                // For DELETED events: apply the label selector against the
-                                // last-known object body (if available). If the object never
-                                // matched the watch selector, do not send the DELETED — the
-                                // watcher never saw an ADDED for it and has nothing to clean up.
-                                // If no body is available, send unconditionally (conservative).
+                            } else if let WatchEvent::Deleted { key, revision, body } = &event {
+                                // For DELETED events: apply the label/field selector against the
+                                // last-known object body (if available), converted to the
+                                // actually-requested version first (see convert_watched_cr_object)
+                                // — the same ordering as Added/Modified above, so a cross-version
+                                // field selector is evaluated against the shape the client asked
+                                // for. If no body is available, send unconditionally (conservative).
                                 // Also skip if we already emitted a synthetic DELETED for this key
                                 // (locally_deleted tracks keys for which DELETED was already sent).
+                                let mut emit_body = body.clone();
                                 let should_send = if locally_deleted.contains(key.as_str()) {
                                     // Already sent a synthetic DELETED for this object; the real
                                     // DELETED is redundant for this watcher. Clear the tracking entry.
@@ -800,8 +866,31 @@ async fn watch_generic_impl<S: Store>(
                                 } else if let Some(body_bytes) = body {
                                     if let Ok(s) = std::str::from_utf8(body_bytes) {
                                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                                            object_matches_label_selector(&parsed, &label_selector)
-                                                && field_selector_matches(&parsed)
+                                            match convert_watched_cr_object(
+                                                &state_for_conversion,
+                                                cr_fields.as_ref(),
+                                                parsed,
+                                            )
+                                            .await
+                                            {
+                                                Ok(converted) => {
+                                                    let matches = object_matches_label_selector(&converted, &label_selector)
+                                                        && field_selector_matches(&converted);
+                                                    if matches {
+                                                        emit_body = serde_json::to_vec(&converted).ok().map(Bytes::from);
+                                                    }
+                                                    matches
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        prefix = %prefix,
+                                                        key = %key,
+                                                        err = %e.1.message,
+                                                        "watch: CR conversion webhook failed, dropping DELETED event"
+                                                    );
+                                                    false
+                                                }
+                                            }
                                         } else {
                                             true
                                         }
@@ -819,7 +908,12 @@ async fn watch_generic_impl<S: Store>(
                                     "watch: DELETED event reached handler"
                                 );
                                 if should_send {
-                                    if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
+                                    let emit_event = WatchEvent::Deleted {
+                                        key: key.clone(),
+                                        revision: *revision,
+                                        body: emit_body,
+                                    };
+                                    if let Some(chunk) = encode_watch_event(&emit_event, &api_version, &kind, as_partial_object_metadata) {
                                         yield Ok::<Bytes, axum::BoxError>(chunk);
                                     } else {
                                         tracing::debug!(prefix = %prefix, key = %key, "watch: DELETED event dropped by encode_watch_event");

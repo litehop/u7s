@@ -289,35 +289,45 @@ pub async fn find_crd<S: Store>(
 /// request through the webhook as a version-to-itself conversion — which real
 /// conversion webhooks (and the conformance suite's sample webhook) correctly reject
 /// as a client bug.
+///
+/// Takes the conversion config directly (rather than `&CrContext`) so callers that only
+/// carry that config — like the watch path's `CrFieldSelectorContext` — can share this
+/// exact check instead of re-deriving it.
 fn object_needs_conversion(
     obj: &serde_json::Value,
     desired_api_version: &str,
-    ctx: &CrContext,
+    conversion_webhook_client_config: Option<&serde_json::Value>,
 ) -> bool {
-    ctx.conversion_webhook_client_config.is_some()
+    conversion_webhook_client_config.is_some()
         && obj["apiVersion"].as_str() != Some(desired_api_version)
 }
 
-/// Convert only the LIST items whose own stored apiVersion differs from
-/// `desired_api_version`, leaving already-matching items untouched.
+/// Convert only the items whose own stored apiVersion differs from `desired_api_version`,
+/// leaving already-matching items untouched. Used for LIST pages and, via a one-element
+/// slice, for a single CR watch event (see `watch::convert_watched_cr_object`) — both need
+/// the identical per-item version check and batched webhook call.
 ///
-/// A LIST can be a non-homogeneous mix of objects written under different versions
-/// (e.g. some created before, some after a CRD storage-version change); see
-/// object_needs_conversion for why every item must be checked individually rather
-/// than converting (or skipping) the whole page based on one CRD-level flag.
-async fn convert_cr_list_items<S: Store>(
+/// A page (or a watch's sendInitialEvents backlog) can be a non-homogeneous mix of objects
+/// written under different versions (e.g. some created before, some after a CRD
+/// storage-version change); see object_needs_conversion for why every item must be checked
+/// individually rather than converting (or skipping) the whole batch based on one CRD-level
+/// flag.
+///
+/// Takes the conversion config directly (rather than `&CrContext`) so callers that only carry
+/// that config — like the watch path's `CrFieldSelectorContext` — don't need a full CrContext.
+pub(crate) async fn convert_cr_list_items<S: Store>(
     state: &AppState<S>,
-    ctx: &CrContext,
+    conversion_webhook_client_config: Option<&serde_json::Value>,
     items: &mut [serde_json::Value],
     desired_api_version: &str,
 ) -> Result<(), crate::status::StatusError> {
-    let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() else {
+    let Some(cfg) = conversion_webhook_client_config else {
         return Ok(());
     };
     let mut convert_indices = Vec::new();
     let mut to_convert = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if object_needs_conversion(item, desired_api_version, ctx) {
+        if object_needs_conversion(item, desired_api_version, Some(cfg)) {
             convert_indices.push(i);
             to_convert.push(item.clone());
         }
@@ -1024,7 +1034,7 @@ pub async fn list_cr<S: Store>(
         } else {
             (format!("{group}/{version}"), ctx.kind.clone())
         };
-        let initial_items = super::watch::fetch_initial_events(
+        let mut initial_items = super::watch::fetch_initial_events(
             &state,
             &prefix,
             query.send_initial_events == Some(true),
@@ -1032,6 +1042,21 @@ pub async fn list_cr<S: Store>(
             &plural,
         )
         .await?;
+        // Convert the sendInitialEvents backlog to the requested version — independent of
+        // `pom` (a PartialObjectMetadata watch still needs the full body converted first for
+        // schema-declared fields to exist) — the same way LIST converts items, before
+        // watch_generic_for_cr ever sees them. Without this, a field selector on a
+        // requested-version-only field matches nothing (see convert_cr_list_items).
+        let desired_api_version = format!("{group}/{version}");
+        if let Some((items, _)) = initial_items.as_mut() {
+            convert_cr_list_items(
+                &state,
+                ctx.conversion_webhook_client_config.as_ref(),
+                items,
+                &desired_api_version,
+            )
+            .await?;
+        }
         return super::watch::watch_generic_for_cr(
             state,
             super::watch::WatchConfig {
@@ -1052,6 +1077,8 @@ pub async fn list_cr<S: Store>(
             super::watch::CrFieldSelectorContext {
                 namespaced: ctx.namespaced,
                 selectable_fields: ctx.selectable_fields.clone(),
+                conversion_webhook_client_config: ctx.conversion_webhook_client_config.clone(),
+                desired_api_version,
             },
         )
         .await;
@@ -1102,7 +1129,13 @@ pub async fn list_cr<S: Store>(
 
     // Batch-convert only the items that actually need it (see convert_cr_list_items).
     let desired_api_version = format!("{group}/{version}");
-    convert_cr_list_items(&state, &ctx, &mut items, &desired_api_version).await?;
+    convert_cr_list_items(
+        &state,
+        ctx.conversion_webhook_client_config.as_ref(),
+        &mut items,
+        &desired_api_version,
+    )
+    .await?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         for item in items.iter_mut() {
@@ -1178,7 +1211,11 @@ pub async fn get_cr<S: Store>(
     // consulted when the object's own stored apiVersion differs from the request
     // (see object_needs_conversion).
     let desired_api_version = format!("{group}/{version}");
-    if object_needs_conversion(&obj, &desired_api_version, &ctx) {
+    if object_needs_conversion(
+        &obj,
+        &desired_api_version,
+        ctx.conversion_webhook_client_config.as_ref(),
+    ) {
         if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
@@ -1666,7 +1703,7 @@ pub async fn list_cr_namespaced<S: Store>(
         } else {
             (format!("{group}/{version}"), ctx.kind.clone())
         };
-        let initial_items = super::watch::fetch_initial_events(
+        let mut initial_items = super::watch::fetch_initial_events(
             &state,
             &prefix,
             query.send_initial_events == Some(true),
@@ -1674,6 +1711,21 @@ pub async fn list_cr_namespaced<S: Store>(
             &plural,
         )
         .await?;
+        // Convert the sendInitialEvents backlog to the requested version — independent of
+        // `pom` (a PartialObjectMetadata watch still needs the full body converted first for
+        // schema-declared fields to exist) — the same way LIST converts items, before
+        // watch_generic_for_cr ever sees them. Without this, a field selector on a
+        // requested-version-only field matches nothing (see convert_cr_list_items).
+        let desired_api_version = format!("{group}/{version}");
+        if let Some((items, _)) = initial_items.as_mut() {
+            convert_cr_list_items(
+                &state,
+                ctx.conversion_webhook_client_config.as_ref(),
+                items,
+                &desired_api_version,
+            )
+            .await?;
+        }
         return super::watch::watch_generic_for_cr(
             state,
             super::watch::WatchConfig {
@@ -1694,6 +1746,8 @@ pub async fn list_cr_namespaced<S: Store>(
             super::watch::CrFieldSelectorContext {
                 namespaced: ctx.namespaced,
                 selectable_fields: ctx.selectable_fields.clone(),
+                conversion_webhook_client_config: ctx.conversion_webhook_client_config.clone(),
+                desired_api_version,
             },
         )
         .await;
@@ -1744,7 +1798,13 @@ pub async fn list_cr_namespaced<S: Store>(
 
     // Batch-convert only the items that actually need it (see convert_cr_list_items).
     let desired_api_version = format!("{group}/{version}");
-    convert_cr_list_items(&state, &ctx, &mut items, &desired_api_version).await?;
+    convert_cr_list_items(
+        &state,
+        ctx.conversion_webhook_client_config.as_ref(),
+        &mut items,
+        &desired_api_version,
+    )
+    .await?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         for item in items.iter_mut() {
@@ -1820,7 +1880,11 @@ pub async fn get_cr_namespaced<S: Store>(
     // consulted when the object's own stored apiVersion differs from the request
     // (see object_needs_conversion).
     let desired_api_version = format!("{group}/{version}");
-    if object_needs_conversion(&obj, &desired_api_version, &ctx) {
+    if object_needs_conversion(
+        &obj,
+        &desired_api_version,
+        ctx.conversion_webhook_client_config.as_ref(),
+    ) {
         if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
@@ -3873,6 +3937,460 @@ mod tests {
              other than metadata.name/namespace/spec.nodeName as a no-op pass-through, which \
              regresses to exactly the live CustomResourceFieldSelectors watch failure if this \
              fix is reverted (got: {body_str})"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CR watch cross-version conversion (CustomResourceFieldSelectors root-cause-2)
+    //
+    // Fixture mirrors the real conformance CRD (crd_selectable_fields.go): v1 declares a
+    // root-level `hostPort` string field (selectable), v2 declares root-level `host`/`port`
+    // (both selectable), and a webhook converts between them. Every CR below is created via
+    // v2, exactly like the conformance test, which creates all CRs through its v2 client
+    // regardless of which version a given watch later targets.
+    // ---------------------------------------------------------------------------
+
+    const HOSTPORT_CRD_GROUP: &str = "fieldconv.example.com";
+
+    fn hostport_crd_bytes(base_url: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": format!("gizmos.{HOSTPORT_CRD_GROUP}") },
+                "spec": {
+                    "group": HOSTPORT_CRD_GROUP,
+                    "names": {
+                        "plural": "gizmos",
+                        "singular": "gizmo",
+                        "kind": "Gizmo",
+                        "listKind": "GizmoList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        {
+                            "name": "v1",
+                            "served": true,
+                            "storage": true,
+                            "schema": {
+                                "openAPIV3Schema": {
+                                    "type": "object",
+                                    "properties": { "hostPort": { "type": "string" } }
+                                }
+                            },
+                            "selectableFields": [{ "jsonPath": ".hostPort" }]
+                        },
+                        {
+                            "name": "v2",
+                            "served": true,
+                            "storage": false,
+                            "schema": {
+                                "openAPIV3Schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "host": { "type": "string" },
+                                        "port": { "type": "string" }
+                                    }
+                                }
+                            },
+                            "selectableFields": [{ "jsonPath": ".host" }, { "jsonPath": ".port" }]
+                        }
+                    ],
+                    "conversion": {
+                        "strategy": "Webhook",
+                        "webhook": { "clientConfig": { "url": format!("{base_url}/convert") } }
+                    }
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn gizmo_v2_body(name: &str, ns: &str, host: &str, port: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": format!("{HOSTPORT_CRD_GROUP}/v2"),
+                "kind": "Gizmo",
+                "metadata": { "name": name, "namespace": ns },
+                "host": host,
+                "port": port
+            })
+            .to_string(),
+        )
+    }
+
+    /// A conversion webhook that mirrors the real conformance suite's CRD converter closely
+    /// enough to exercise the exact hostPort<->host+port scenario: v1's `hostPort` is
+    /// `"{host}:{port}"`; converting to v2 splits it back apart.
+    fn hostport_conversion_router(call_count: Arc<std::sync::atomic::AtomicUsize>) -> axum::Router {
+        use axum::routing::post;
+        use std::sync::atomic::Ordering;
+
+        axum::Router::new().route(
+            "/convert",
+            post(move |axum::Json(review): axum::Json<serde_json::Value>| {
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    let desired = review["request"]["desiredAPIVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let objects = review["request"]["objects"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let converted: Vec<serde_json::Value> = objects
+                        .into_iter()
+                        .map(|mut o| {
+                            if desired.ends_with("/v1") {
+                                if let (Some(host), Some(port)) = (
+                                    o["host"].as_str().map(str::to_string),
+                                    o["port"].as_str().map(str::to_string),
+                                ) {
+                                    o["hostPort"] =
+                                        serde_json::Value::String(format!("{host}:{port}"));
+                                }
+                                if let Some(map) = o.as_object_mut() {
+                                    map.remove("host");
+                                    map.remove("port");
+                                }
+                            } else if desired.ends_with("/v2") {
+                                if let Some((host, port)) = o["hostPort"]
+                                    .as_str()
+                                    .and_then(|hp| hp.split_once(':'))
+                                    .map(|(h, p)| (h.to_string(), p.to_string()))
+                                {
+                                    o["host"] = serde_json::Value::String(host);
+                                    o["port"] = serde_json::Value::String(port);
+                                }
+                                if let Some(map) = o.as_object_mut() {
+                                    map.remove("hostPort");
+                                }
+                            }
+                            o["apiVersion"] = serde_json::Value::String(desired.clone());
+                            o
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": { "status": "Success" },
+                            "convertedObjects": converted
+                        }
+                    }))
+                }
+            }),
+        )
+    }
+
+    /// Regression test for CustomResourceFieldSelectors root-cause-2 (Hook A: the
+    /// sendInitialEvents backlog). A cross-version CR watch's initial backlog must be
+    /// converted to the REQUESTED version before the field-selector filter runs, not served
+    /// as raw stored bytes.
+    ///
+    /// Before this fix, `list_cr_namespaced`'s watch branch passed `fetch_initial_events`'s
+    /// items straight into `watch_generic_for_cr` unconverted; `cr_matches_field_selector`
+    /// (the #858 fix) then correctly evaluated `hostPort` — declared selectable on v1 — as
+    /// absent on the raw v2 body (no `hostPort` key at all) and dropped every CR. A v1 watch
+    /// with `fieldSelector=hostPort=host1:80` therefore delivered nothing: the exact
+    /// `crd_selectable_fields.go:259` failure. This fails on revert because reverting Hook A
+    /// removes the `convert_cr_list_items` call, so `hostPort` is never present on gizmo-a's
+    /// delivered body and the selector never matches it.
+    #[tokio::test]
+    async fn list_cr_namespaced_watch_send_initial_events_converts_backlog_before_field_selector() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        // Both CRs are created via v2 (their own stored apiVersion is v2) — only gizmo-a's
+        // host:port matches the v1 selector below.
+        for (name, host, port) in [("gizmo-a", "host1", "80"), ("gizmo-b", "host1", "8080")] {
+            assert!(
+                create_cr_namespaced(
+                    State(state.clone()),
+                    Path((
+                        HOSTPORT_CRD_GROUP.to_string(),
+                        "v2".to_string(),
+                        ns.to_string(),
+                        "gizmos".to_string(),
+                    )),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    gizmo_v2_body(name, ns, host, port),
+                )
+                .await
+                .is_ok(),
+                "create {name} via v2 must succeed"
+            );
+        }
+
+        let watch_query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            send_initial_events: Some(true),
+            field_selector: Some("hostPort=host1:80".to_string()),
+            timeout_seconds: Some(2),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            watch_query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v1 watch with sendInitialEvents must succeed, got {e:?}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream must complete within 15 seconds")
+        .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        assert!(
+            call_count.load(Ordering::SeqCst) > 0,
+            "gizmo-a/b are stored at v2 but the watch requested v1, so the conversion webhook \
+             must have been called to convert the sendInitialEvents backlog (got: {body_str})"
+        );
+        assert!(
+            body_str.contains("\"gizmo-a\"") && body_str.contains("\"hostPort\":\"host1:80\""),
+            "a v1 watch's sendInitialEvents backlog must deliver gizmo-a CONVERTED to v1 shape \
+             (with hostPort present) — if conversion is skipped, the field selector \
+             hostPort=host1:80 is evaluated against the raw v2 body (no hostPort key) and \
+             matches nothing, reproducing the CustomResourceFieldSelectors watch failure \
+             (got: {body_str})"
+        );
+        assert!(
+            !body_str.contains("\"gizmo-b\""),
+            "gizmo-b converts to hostPort=host1:8080, which must NOT match the v1 selector \
+             hostPort=host1:80 (got: {body_str})"
+        );
+    }
+
+    /// Regression test for CustomResourceFieldSelectors root-cause-2 (Hook B: live events).
+    /// A LIVE CR watch event — the broadcast path, not the sendInitialEvents backlog — must
+    /// also be converted to the requested version before the field-selector filter runs.
+    ///
+    /// The watch is opened BEFORE the matching CR exists, reproducing what the conformance
+    /// test's `v1hostPortWatch` does: it opens the v1 watch first, then the CRs are created
+    /// afterward and must arrive as live ADDED events, not backlog. Before this fix,
+    /// `watch_generic_impl`'s live-event handling restamped only apiVersion/kind on the raw
+    /// stored v2 body and filtered THAT against the v1 selector — hostPort is never present
+    /// on a v2 body, so nothing was ever delivered. This fails on revert because reverting
+    /// Hook B removes the `convert_watched_cr_object` call, so the live ADDED event is
+    /// filtered (and dropped) before conversion ever happens.
+    #[tokio::test]
+    async fn list_cr_namespaced_watch_converts_live_event_before_field_selector() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{timeout, Duration};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        // Open the v1 watch BEFORE the matching CR exists — a plain watch (no
+        // sendInitialEvents), so the only way gizmo-a can be delivered is the LIVE path.
+        let watch_query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            field_selector: Some("hostPort=host1:80".to_string()),
+            timeout_seconds: Some(2),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            watch_query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v1 watch must succeed, got {e:?}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Create the matching CR via v2 AFTER the watch is open, on a separate task so the
+        // watch body reader below can run concurrently (mirrors
+        // watch_generic_label_selector_newly_created_object_emits_added in watch.rs).
+        let state_clone = state.clone();
+        let ns_owned = ns.to_string();
+        tokio::spawn(async move {
+            create_cr_namespaced(
+                State(state_clone),
+                Path((
+                    HOSTPORT_CRD_GROUP.to_string(),
+                    "v2".to_string(),
+                    ns_owned.clone(),
+                    "gizmos".to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                gizmo_v2_body("gizmo-a", &ns_owned, "host1", "80"),
+            )
+            .await
+            .expect("create gizmo-a via v2 must succeed");
+        });
+
+        let body = timeout(
+            Duration::from_secs(15),
+            to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream must close within 15s")
+        .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        assert!(
+            call_count.load(Ordering::SeqCst) > 0,
+            "gizmo-a is stored at v2 but the watch requested v1, so the live event must have \
+             gone through the conversion webhook (got: {body_str})"
+        );
+        assert!(
+            body_str.contains("\"gizmo-a\"") && body_str.contains("\"hostPort\":\"host1:80\""),
+            "a live ADDED event on a cross-version CR watch must be delivered CONVERTED (with \
+             hostPort present) — before this fix, watch_generic_impl only restamped \
+             apiVersion/kind on the raw v2 body and filtered that against the v1 selector, so \
+             a v2-stored CR never matched a v1 fieldSelector and was silently dropped, exactly \
+             the CustomResourceFieldSelectors watch failure (got: {body_str})"
+        );
+    }
+
+    /// A watch at the SAME version the CR is stored at must never call the conversion
+    /// webhook — the free common case (controllers watch the storage version, not a
+    /// different one). Guards `convert_watched_cr_object`'s short-circuit: a naive "always
+    /// convert when a CRD has a webhook" implementation would call the webhook on every
+    /// event even when no conversion is needed, and real conversion webhooks (including the
+    /// conformance suite's) reject a version-to-itself conversion as a client bug — so
+    /// failing to short-circuit would break EVERY CR watch on a CRD with a conversion
+    /// webhook, not just cross-version ones. Fails on revert if the short-circuit check is
+    /// removed (e.g. converting unconditionally whenever a webhook is configured).
+    #[tokio::test]
+    async fn list_cr_namespaced_watch_same_version_does_not_call_conversion_webhook() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
+
+        let state = make_state();
+        let ns = "default";
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            hostport_crd_bytes(&base_url),
+        )
+        .await
+        .expect("install v1{hostPort}/v2{host,port} CRD with conversion webhook");
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    HOSTPORT_CRD_GROUP.to_string(),
+                    "v2".to_string(),
+                    ns.to_string(),
+                    "gizmos".to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                gizmo_v2_body("gizmo-a", ns, "host1", "80"),
+            )
+            .await
+            .is_ok(),
+            "create gizmo-a via v2 must succeed"
+        );
+
+        // Watch at v2 — the CR's own stored version — with sendInitialEvents so gizmo-a is
+        // delivered from the backlog (Hook A), the same phase Hook A's conversion runs in.
+        let watch_query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            send_initial_events: Some(true),
+            field_selector: Some("host=host1".to_string()),
+            timeout_seconds: Some(2),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                HOSTPORT_CRD_GROUP.to_string(),
+                "v2".to_string(),
+                ns.to_string(),
+                "gizmos".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            watch_query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v2 watch must succeed, got {e:?}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream must complete within 15 seconds")
+        .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        assert!(
+            body_str.contains("\"gizmo-a\"") && body_str.contains("\"host\":\"host1\""),
+            "a same-version watch must still deliver the matching CR (got: {body_str})"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "gizmo-a's own stored apiVersion already IS v2 — the requested version — so this \
+             is a version-to-itself request; calling the conversion webhook for it is both \
+             wasted work and something real conversion webhooks reject as a client bug \
+             (got: {body_str})"
         );
     }
 
