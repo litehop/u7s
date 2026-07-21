@@ -70,6 +70,14 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     let resp = wh_client
         .post(&url)
         .header("Content-Type", "application/json")
+        // Real conversion webhooks (including the k8s conformance suite's sample webhook)
+        // content-negotiate their response body from the Accept header, falling back to an
+        // arbitrary (even non-JSON, e.g. YAML) encoding when it doesn't name a type explicitly.
+        // Without this, reqwest's default `Accept: */*` leaves that choice up to the webhook,
+        // and a response we can't parse as JSON below is indistinguishable from a broken one.
+        // This mirrors upstream apiserver's own webhook client (client-go's RESTClient with
+        // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
+        .header("Accept", "application/json, */*")
         .body(body)
         .send()
         .await
@@ -7047,6 +7055,106 @@ mod tests {
             result.is_err(),
             "call_conversion_webhook must return Err when response is not valid JSON"
         );
+    }
+
+    /// call_conversion_webhook must ask the webhook for JSON via an explicit Accept header,
+    /// not rely on the HTTP client's default (reqwest sends a bare `Accept: */*`).
+    ///
+    /// WHY this matters: real conversion webhooks — including the k8s conformance suite's
+    /// sample webhook (test/images/agnhost/crd-conversion-webhook) — content-negotiate their
+    /// response encoding from Accept, and treat a bare `*/*` as license to reply in whatever
+    /// encoding they land on, including non-JSON (that webhook falls back to YAML). A LIST
+    /// across CR versions sends every non-matching item to the webhook in ONE call; if the
+    /// webhook picks a non-JSON encoding for that response, u7s can't parse it and the whole
+    /// LIST 500s with "conversion webhook response JSON parse error" — even though every
+    /// object was perfectly convertible. This is a live regression (mayor-11rsj): a v1 LIST
+    /// of CRs stored as v2 failed exactly this way. The mock below reproduces the real
+    /// webhook's negotiation fork (JSON only on an explicit `application/json` Accept) so
+    /// reverting the Accept header on the request re-triggers it here.
+    #[tokio::test]
+    async fn call_conversion_webhook_sends_explicit_json_accept_so_multi_object_list_conversion_succeeds(
+    ) {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(
+                |headers: HeaderMap, axum::Json(review): axum::Json<serde_json::Value>| async move {
+                    let accept = headers
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let desired = review["request"]["desiredAPIVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let objects = review["request"]["objects"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let converted: Vec<serde_json::Value> = objects
+                        .into_iter()
+                        .map(|mut o| {
+                            o["apiVersion"] = serde_json::Value::String(desired.clone());
+                            o
+                        })
+                        .collect();
+                    // Only reply JSON when Accept explicitly names it — same fork the real
+                    // sample webhook takes (it falls back to YAML for a bare `*/*`).
+                    if accept
+                        .split(',')
+                        .any(|p| p.trim().starts_with("application/json"))
+                    {
+                        axum::Json(serde_json::json!({
+                            "apiVersion": "apiextensions.k8s.io/v1",
+                            "kind": "ConversionReview",
+                            "response": {
+                                "uid": "test-uid",
+                                "result": {"status": "Success"},
+                                "convertedObjects": converted
+                            }
+                        }))
+                        .into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+                            "apiVersion: apiextensions.k8s.io/v1\nkind: ConversionReview\n"
+                                .to_string(),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        // Two objects — a LIST sends every item needing conversion in a single call.
+        let objects = vec![
+            serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget", "metadata": {"name": "a"}}),
+            serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget", "metadata": {"name": "b"}}),
+        ];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        let converted = result.expect(
+            "call_conversion_webhook must send an explicit JSON Accept header so a real \
+             webhook's content negotiation returns JSON instead of an arbitrary non-JSON \
+             encoding — without it, every cross-version CR LIST/GET 500s with a JSON parse \
+             error the moment the webhook picks something other than JSON",
+        );
+        assert_eq!(
+            converted.len(),
+            2,
+            "both objects sent for conversion must come back, not just the first — a LIST's \
+             conversion response covers every non-matching item in one call"
+        );
+        for obj in &converted {
+            assert_eq!(obj["apiVersion"], "example.io/v2");
+        }
     }
 
     /// call_conversion_webhook must return Err when the response body exceeds 1 MiB.
