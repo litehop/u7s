@@ -386,6 +386,11 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
 /// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
 /// (equality and inequality). Returns true if the selector is empty (pass-through) or all
 /// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
+///
+/// This is the matcher for built-in resources only. CR watches with a CRD-declared
+/// `selectableFields` go through `watch_generic_for_cr` instead, which consults
+/// `cr::cr_matches_field_selector` so a selector on a CRD-declared field (e.g. `host`) — which
+/// falls through the `_ => {}` catch-all below and is silently ignored — actually filters.
 pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
     if selector.is_empty() {
         return true;
@@ -462,6 +467,17 @@ pub(crate) struct WatchConfig {
     pub timeout_seconds: Option<u64>,
 }
 
+/// CR-specific field-selector context for `watch_generic_for_cr`: the CRD-declared
+/// `selectableFields` for the matched version, plus whether the resource is namespaced
+/// (namespace is then also always selectable). Deliberately just the two fields
+/// `cr::cr_matches_field_selector` needs, not the whole `CrContext` — schema and conversion
+/// config are irrelevant to field-selector matching and would only add dead weight to a
+/// struct held for the lifetime of the watch stream.
+pub(crate) struct CrFieldSelectorContext {
+    pub namespaced: bool,
+    pub selectable_fields: Vec<String>,
+}
+
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Sends a 60s bookmark heartbeat and closes after cfg.timeout_seconds (default 5 min).
 ///
@@ -475,6 +491,27 @@ pub(crate) struct WatchConfig {
 pub(crate) async fn watch_generic<S: Store>(
     state: AppState<S>,
     cfg: WatchConfig,
+) -> Result<Response, crate::status::StatusError> {
+    watch_generic_impl(state, cfg, None).await
+}
+
+/// Like `watch_generic`, but for a CR watch whose CRD declares `selectableFields`: every
+/// Added/Modified/Deleted event is matched against `field_selector` with
+/// `cr::cr_matches_field_selector` instead of `object_matches_field_selector`, so a selector
+/// on a CRD-declared field (e.g. `host`) actually excludes non-matching CRs instead of the
+/// generic matcher's `_ => {}` catch-all silently letting every object through.
+pub(crate) async fn watch_generic_for_cr<S: Store>(
+    state: AppState<S>,
+    cfg: WatchConfig,
+    cr_fields: CrFieldSelectorContext,
+) -> Result<Response, crate::status::StatusError> {
+    watch_generic_impl(state, cfg, Some(cr_fields)).await
+}
+
+async fn watch_generic_impl<S: Store>(
+    state: AppState<S>,
+    cfg: WatchConfig,
+    cr_fields: Option<CrFieldSelectorContext>,
 ) -> Result<Response, crate::status::StatusError> {
     let WatchConfig {
         prefix,
@@ -558,6 +595,21 @@ pub(crate) async fn watch_generic<S: Store>(
         // is never dropped while we are waiting for live events.
         let _store_keepalive = _store_keepalive;
 
+        // For a CR watch with CRD-declared selectableFields, defer to the same CRD-aware
+        // matcher LIST uses instead of the generic name/namespace/nodeName-only one, which
+        // treats any other field selector (e.g. a CRD-declared `host`) as a no-op pass-through.
+        let field_selector_matches = |obj: &serde_json::Value| -> bool {
+            match &cr_fields {
+                Some(ctx) => super::cr::cr_matches_field_selector(
+                    obj,
+                    &field_selector,
+                    ctx.namespaced,
+                    &ctx.selectable_fields,
+                ),
+                None => object_matches_field_selector(obj, &field_selector),
+            }
+        };
+
         let mut event_stream = pin!(event_stream);
         let mut bookmark_tick = interval(Duration::from_secs(60));
         bookmark_tick.tick().await; // skip initial immediate tick
@@ -589,7 +641,7 @@ pub(crate) async fn watch_generic<S: Store>(
                 // every object in the prefix as ADDED (which would cause the BOOKMARK to
                 // never be emitted for non-matching objects, hanging the watch).
                 if !object_matches_label_selector(&item, &label_selector)
-                    || !object_matches_field_selector(&item, &field_selector)
+                    || !field_selector_matches(&item)
                 {
                     continue;
                 }
@@ -661,7 +713,7 @@ pub(crate) async fn watch_generic<S: Store>(
                                     let mut parsed: serde_json::Value =
                                         serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
                                     if object_matches_label_selector(&parsed, &label_selector)
-                                        && object_matches_field_selector(&parsed, &field_selector)
+                                        && field_selector_matches(&parsed)
                                     {
                                         // When an object re-enters the watch scope after a synthetic
                                         // DELETED was sent (e.g. label was restored), emit ADDED so
@@ -749,7 +801,7 @@ pub(crate) async fn watch_generic<S: Store>(
                                     if let Ok(s) = std::str::from_utf8(body_bytes) {
                                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
                                             object_matches_label_selector(&parsed, &label_selector)
-                                                && object_matches_field_selector(&parsed, &field_selector)
+                                                && field_selector_matches(&parsed)
                                         } else {
                                             true
                                         }
