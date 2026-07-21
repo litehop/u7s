@@ -793,17 +793,28 @@ fn prune_cr_for_storage(schema: Option<&serde_json::Value>, obj: &mut serde_json
 /// Apply `?fieldValidation=` semantics against the CRD's structural schema, pruning `body`
 /// in place along the way.
 ///
-/// Mirrors `json_patch::apply_field_validation`'s Strict/Warn/Ignore contract and exact
-/// wording (`unknown field "<path>"`), but detects unknown fields by walking the CRD's own
-/// openAPIV3Schema instead of a hardcoded field list. Pruning itself happens regardless of
-/// `mode` (including `Ignore`/absent) — only whether the removed paths are surfaced as a
-/// 422 (`Strict`) or a `Warning` header (`Warn`) depends on `mode`. Returns `Ok(None)`
-/// without pruning when the CRD has no schema at all — without one there is nothing to prune
-/// or validate field names against, matching upstream's behaviour for schemaless CRDs.
+/// Detects unknown fields by walking the CRD's own openAPIV3Schema instead of a hardcoded
+/// field list. Pruning itself happens regardless of `mode` (including `Ignore`/absent) —
+/// only whether the removed paths are surfaced as a 422 (`Strict`) or a `Warning` header
+/// (`Warn`) depends on `mode`. Returns `Ok(None)` without pruning when the CRD has no schema
+/// at all — without one there is nothing to prune or validate field names against, matching
+/// upstream's behaviour for schemaless CRDs.
+///
+/// `is_ssa` branches the wording upstream itself branches on by request type: an SSA
+/// Apply-patch is validated by structured-merge-diff's typed-value walker, which reports
+/// `.<path>: field not declared in schema` (its `fieldpath.PathElement.String()` always
+/// renders a field name with a leading dot, so the accumulated path does too — see
+/// sigs.k8s.io/structured-merge-diff's `typed/validate.go` and `fieldpath/element.go`).
+/// Non-SSA Create/Update instead goes through strict decoding, mirrored by
+/// `json_patch::apply_field_validation`, which reports `unknown field "<path>"`. Both
+/// wordings are upstream-correct for their own request type — collapsing them to one
+/// regresses the other: CustomResourcePublishOpenAPI asserts the non-dotted wording for a
+/// plain create, while the FieldValidation Apply-patch tests assert the dotted one.
 fn apply_cr_field_validation(
     body: &mut serde_json::Value,
     schema: Option<&serde_json::Value>,
     mode: Option<&str>,
+    is_ssa: bool,
 ) -> Result<Option<HeaderValue>, crate::status::StatusError> {
     let Some(schema) = schema else {
         return Ok(None);
@@ -817,15 +828,22 @@ fn apply_cr_field_validation(
         return Ok(None);
     }
 
-    // Matches upstream's CR structural-schema strict-decoding error format, e.g.:
-    //   strict decoding error: unknown field "spec.foo"
-    let joined = unknown
-        .iter()
-        .map(|f| format!("unknown field \"{f}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let joined = if is_ssa {
+        unknown
+            .iter()
+            .map(|f| format!(".{f}: field not declared in schema"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        unknown
+            .iter()
+            .map(|f| format!("unknown field \"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
     match mode {
+        "Strict" if is_ssa => Err(Status::unprocessable_entity(joined)),
         "Strict" => Err(Status::unprocessable_entity(format!(
             "strict decoding error: {joined}"
         ))),
@@ -1211,6 +1229,7 @@ pub async fn create_cr<S: Store>(
         &mut obj,
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
+        false,
     )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
@@ -1860,6 +1879,7 @@ pub async fn create_cr_namespaced<S: Store>(
         &mut obj,
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
+        false,
     )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
@@ -2134,8 +2154,12 @@ pub async fn patch_cr<S: Store>(
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
-        let warn_header =
-            apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+        let warn_header = apply_cr_field_validation(
+            &mut obj,
+            ctx.schema.as_ref(),
+            field_validation.as_deref(),
+            is_ssa,
+        )?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
@@ -2219,8 +2243,12 @@ pub async fn patch_cr<S: Store>(
         }
     }
 
-    let warn_header =
-        apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+    let warn_header = apply_cr_field_validation(
+        &mut obj,
+        ctx.schema.as_ref(),
+        field_validation.as_deref(),
+        is_ssa,
+    )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -2300,8 +2328,12 @@ pub async fn patch_cr_namespaced<S: Store>(
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
-        let warn_header =
-            apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+        let warn_header = apply_cr_field_validation(
+            &mut obj,
+            ctx.schema.as_ref(),
+            field_validation.as_deref(),
+            is_ssa,
+        )?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         {
             let mut meta: crate::types::ObjectMeta =
@@ -2391,8 +2423,12 @@ pub async fn patch_cr_namespaced<S: Store>(
         }
     }
 
-    let warn_header =
-        apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+    let warn_header = apply_cr_field_validation(
+        &mut obj,
+        ctx.schema.as_ref(),
+        field_validation.as_deref(),
+        is_ssa,
+    )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -10913,7 +10949,9 @@ mod tests {
     }
 
     /// patch_cr's SSA-upsert path with fieldValidation=Strict must reject unknown metadata
-    /// fields both at the CR root and inside an x-kubernetes-embedded-resource object.
+    /// fields both at the CR root and inside an x-kubernetes-embedded-resource object, using
+    /// the dotted structured-merge-diff wording SSA requests report (not the quoted
+    /// strict-decoding wording Create/Update uses).
     ///
     /// WHY: ObjectMeta is a fixed structure; a CRD schema never enumerates its fields, so
     /// unknown-field detection cannot rely on `properties` alone here — it must fall back
@@ -10970,14 +11008,86 @@ mod tests {
         assert_eq!(json["code"], 422, "must return 422 Unprocessable Entity");
         let msg = err.1.message;
         assert!(
-            msg.contains("unknown field \"metadata.unknownMeta\""),
-            "must flag the unknown field on the CR's own (root) metadata, in upstream's \
-             exact wording (got: {msg})"
+            msg.contains(".metadata.unknownMeta: field not declared in schema"),
+            "must flag the unknown field on the CR's own (root) metadata, in the dotted \
+             structured-merge-diff wording upstream's SSA path reports (got: {msg})"
         );
         assert!(
-            msg.contains("unknown field \"spec.template.metadata.unknownSubMeta\""),
-            "must also flag the unknown field on the embedded object's metadata, in \
-             upstream's exact wording (got: {msg})"
+            msg.contains(".spec.template.metadata.unknownSubMeta: field not declared in schema"),
+            "must also flag the unknown field on the embedded object's metadata, in the \
+             dotted structured-merge-diff wording upstream's SSA path reports (got: {msg})"
+        );
+    }
+
+    /// `apply_cr_field_validation` must pick the unknown-field wording by request type, not
+    /// collapse to one wording for both: SSA Apply-patch is validated by
+    /// structured-merge-diff, which reports the dotted `.<path>: field not declared in
+    /// schema` form the FieldValidation conformance tests grep for; Create/Update goes
+    /// through strict decoding, which reports `unknown field "<path>"` the
+    /// CustomResourcePublishOpenAPI conformance test greps for instead.
+    ///
+    /// WHY: a prior fix made this wording SSA-vs-Create/Update-agnostic by always emitting
+    /// one of the two forms — whichever direction that blanket choice goes, it passes one
+    /// upstream conformance suite while silently breaking the other, because both wordings
+    /// are genuinely upstream-correct, just for different request types. This test fails
+    /// if the branch is ever collapsed back to a single wording in either direction.
+    #[test]
+    fn apply_cr_field_validation_wording_branches_on_ssa_vs_create_update() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": { "foo": { "type": "string" } }
+                }
+            }
+        });
+
+        let cr_with_unknown_field = || {
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "mytest" },
+                "spec": { "foo": "foo1" },
+                "unknownField": "unknown"
+            })
+        };
+
+        let mut ssa_body = cr_with_unknown_field();
+        let ssa_err = apply_cr_field_validation(&mut ssa_body, Some(&schema), Some("Strict"), true)
+            .expect_err("SSA apply of a CR with an unknown field must be rejected");
+        assert!(
+            ssa_err
+                .1
+                .message
+                .contains(".unknownField: field not declared in schema"),
+            "SSA Apply-patch must use upstream's dotted structured-merge-diff wording \
+             (got: {})",
+            ssa_err.1.message
+        );
+
+        // A fresh, unpruned body: `apply_cr_field_validation` prunes in place, so the SSA
+        // call above already stripped `unknownField` out of `ssa_body`.
+        let mut create_body = cr_with_unknown_field();
+        let create_err =
+            apply_cr_field_validation(&mut create_body, Some(&schema), Some("Strict"), false)
+                .expect_err("Create/Update of a CR with an unknown field must be rejected");
+        assert!(
+            create_err
+                .1
+                .message
+                .contains("unknown field \"unknownField\""),
+            "Create/Update must keep upstream's strict-decoding wording, which \
+             CustomResourcePublishOpenAPI asserts verbatim (got: {})",
+            create_err.1.message
+        );
+        assert!(
+            !create_err
+                .1
+                .message
+                .contains("field not declared in schema"),
+            "Create/Update must not regress to the SSA dotted wording (got: {})",
+            create_err.1.message
         );
     }
 
