@@ -793,17 +793,28 @@ fn prune_cr_for_storage(schema: Option<&serde_json::Value>, obj: &mut serde_json
 /// Apply `?fieldValidation=` semantics against the CRD's structural schema, pruning `body`
 /// in place along the way.
 ///
-/// Mirrors `json_patch::apply_field_validation`'s Strict/Warn/Ignore contract and exact
-/// wording (`unknown field "<path>"`), but detects unknown fields by walking the CRD's own
-/// openAPIV3Schema instead of a hardcoded field list. Pruning itself happens regardless of
-/// `mode` (including `Ignore`/absent) — only whether the removed paths are surfaced as a
-/// 422 (`Strict`) or a `Warning` header (`Warn`) depends on `mode`. Returns `Ok(None)`
-/// without pruning when the CRD has no schema at all — without one there is nothing to prune
-/// or validate field names against, matching upstream's behaviour for schemaless CRDs.
+/// Detects unknown fields by walking the CRD's own openAPIV3Schema instead of a hardcoded
+/// field list. Pruning itself happens regardless of `mode` (including `Ignore`/absent) —
+/// only whether the removed paths are surfaced as a 422 (`Strict`) or a `Warning` header
+/// (`Warn`) depends on `mode`. Returns `Ok(None)` without pruning when the CRD has no schema
+/// at all — without one there is nothing to prune or validate field names against, matching
+/// upstream's behaviour for schemaless CRDs.
+///
+/// `is_ssa` branches the wording upstream itself branches on by request type: an SSA
+/// Apply-patch is validated by structured-merge-diff's typed-value walker, which reports
+/// `.<path>: field not declared in schema` (its `fieldpath.PathElement.String()` always
+/// renders a field name with a leading dot, so the accumulated path does too — see
+/// sigs.k8s.io/structured-merge-diff's `typed/validate.go` and `fieldpath/element.go`).
+/// Non-SSA Create/Update instead goes through strict decoding, mirrored by
+/// `json_patch::apply_field_validation`, which reports `unknown field "<path>"`. Both
+/// wordings are upstream-correct for their own request type — collapsing them to one
+/// regresses the other: CustomResourcePublishOpenAPI asserts the non-dotted wording for a
+/// plain create, while the FieldValidation Apply-patch tests assert the dotted one.
 fn apply_cr_field_validation(
     body: &mut serde_json::Value,
     schema: Option<&serde_json::Value>,
     mode: Option<&str>,
+    is_ssa: bool,
 ) -> Result<Option<HeaderValue>, crate::status::StatusError> {
     let Some(schema) = schema else {
         return Ok(None);
@@ -817,15 +828,22 @@ fn apply_cr_field_validation(
         return Ok(None);
     }
 
-    // Matches upstream's CR structural-schema strict-decoding error format, e.g.:
-    //   strict decoding error: unknown field "spec.foo"
-    let joined = unknown
-        .iter()
-        .map(|f| format!("unknown field \"{f}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let joined = if is_ssa {
+        unknown
+            .iter()
+            .map(|f| format!(".{f}: field not declared in schema"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        unknown
+            .iter()
+            .map(|f| format!("unknown field \"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
     match mode {
+        "Strict" if is_ssa => Err(Status::unprocessable_entity(joined)),
         "Strict" => Err(Status::unprocessable_entity(format!(
             "strict decoding error: {joined}"
         ))),
@@ -845,7 +863,7 @@ fn apply_cr_field_validation(
 // ---------------------------------------------------------------------------
 
 /// Test whether a CR object matches a `--field-selector` string, using the fields the CRD
-/// author declared selectable for the requested version (`ctx.selectable_fields`) plus the
+/// author declared selectable for the requested version (`selectable_fields`) plus the
 /// always-selectable `metadata.name`/`metadata.namespace`.
 ///
 /// A field that is not in that allow-list resolves to "" regardless of what the object
@@ -854,7 +872,17 @@ fn apply_cr_field_validation(
 /// erroring. This allow-list is load-bearing, not cosmetic — CRs are schemaless JSON blobs,
 /// so without it any body field an object happens to carry would become selectable, which
 /// defeats the reason CustomResourceFieldSelectors requires fields to be explicitly declared.
-fn cr_matches_field_selector(obj: &serde_json::Value, selector: &str, ctx: &CrContext) -> bool {
+///
+/// Takes `namespaced`/`selectable_fields` rather than a whole `&CrContext` so the watch path
+/// (`watch::watch_generic_for_cr`) can reuse this exact matching logic for CR watches without
+/// pulling watch.rs's per-event filtering into a dependency on all of CrContext (schema,
+/// conversion config, etc. are irrelevant to field-selector matching).
+pub(crate) fn cr_matches_field_selector(
+    obj: &serde_json::Value,
+    selector: &str,
+    namespaced: bool,
+    selectable_fields: &[String],
+) -> bool {
     for term in selector.split(',') {
         let term = term.trim();
         if term.is_empty() {
@@ -868,8 +896,8 @@ fn cr_matches_field_selector(obj: &serde_json::Value, selector: &str, ctx: &CrCo
             },
         };
         let selectable = field == "metadata.name"
-            || (ctx.namespaced && field == "metadata.namespace")
-            || ctx.selectable_fields.iter().any(|f| f == field);
+            || (namespaced && field == "metadata.namespace")
+            || selectable_fields.iter().any(|f| f == field);
         let equal = if selectable {
             u7s_store::json_path_equals(obj, field, expected)
         } else {
@@ -996,7 +1024,7 @@ pub async fn list_cr<S: Store>(
             &plural,
         )
         .await?;
-        return super::watch::watch_generic(
+        return super::watch::watch_generic_for_cr(
             state,
             super::watch::WatchConfig {
                 prefix,
@@ -1012,6 +1040,10 @@ pub async fn list_cr<S: Store>(
                 group: group.clone(),
                 plural: plural.clone(),
                 timeout_seconds: query.timeout_seconds,
+            },
+            super::watch::CrFieldSelectorContext {
+                namespaced: ctx.namespaced,
+                selectable_fields: ctx.selectable_fields.clone(),
             },
         )
         .await;
@@ -1071,7 +1103,9 @@ pub async fn list_cr<S: Store>(
     }
 
     if let Some(selector) = query.field_selector.as_deref() {
-        items.retain(|item| cr_matches_field_selector(item, selector, &ctx));
+        items.retain(|item| {
+            cr_matches_field_selector(item, selector, ctx.namespaced, &ctx.selectable_fields)
+        });
     }
 
     if pom {
@@ -1211,6 +1245,7 @@ pub async fn create_cr<S: Store>(
         &mut obj,
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
+        false,
     )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
@@ -1631,7 +1666,7 @@ pub async fn list_cr_namespaced<S: Store>(
             &plural,
         )
         .await?;
-        return super::watch::watch_generic(
+        return super::watch::watch_generic_for_cr(
             state,
             super::watch::WatchConfig {
                 prefix,
@@ -1647,6 +1682,10 @@ pub async fn list_cr_namespaced<S: Store>(
                 group: group.clone(),
                 plural: plural.clone(),
                 timeout_seconds: query.timeout_seconds,
+            },
+            super::watch::CrFieldSelectorContext {
+                namespaced: ctx.namespaced,
+                selectable_fields: ctx.selectable_fields.clone(),
             },
         )
         .await;
@@ -1706,7 +1745,9 @@ pub async fn list_cr_namespaced<S: Store>(
     }
 
     if let Some(selector) = query.field_selector.as_deref() {
-        items.retain(|item| cr_matches_field_selector(item, selector, &ctx));
+        items.retain(|item| {
+            cr_matches_field_selector(item, selector, ctx.namespaced, &ctx.selectable_fields)
+        });
     }
 
     if pom {
@@ -1860,6 +1901,7 @@ pub async fn create_cr_namespaced<S: Store>(
         &mut obj,
         ctx.schema.as_ref(),
         field_validation_mode(&headers).as_deref(),
+        false,
     )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
@@ -2134,8 +2176,12 @@ pub async fn patch_cr<S: Store>(
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
-        let warn_header =
-            apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+        let warn_header = apply_cr_field_validation(
+            &mut obj,
+            ctx.schema.as_ref(),
+            field_validation.as_deref(),
+            is_ssa,
+        )?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
@@ -2219,8 +2265,12 @@ pub async fn patch_cr<S: Store>(
         }
     }
 
-    let warn_header =
-        apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+    let warn_header = apply_cr_field_validation(
+        &mut obj,
+        ctx.schema.as_ref(),
+        field_validation.as_deref(),
+        is_ssa,
+    )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -2300,8 +2350,12 @@ pub async fn patch_cr_namespaced<S: Store>(
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
-        let warn_header =
-            apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+        let warn_header = apply_cr_field_validation(
+            &mut obj,
+            ctx.schema.as_ref(),
+            field_validation.as_deref(),
+            is_ssa,
+        )?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         {
             let mut meta: crate::types::ObjectMeta =
@@ -2391,8 +2445,12 @@ pub async fn patch_cr_namespaced<S: Store>(
         }
     }
 
-    let warn_header =
-        apply_cr_field_validation(&mut obj, ctx.schema.as_ref(), field_validation.as_deref())?;
+    let warn_header = apply_cr_field_validation(
+        &mut obj,
+        ctx.schema.as_ref(),
+        field_validation.as_deref(),
+        is_ssa,
+    )?;
 
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
@@ -3660,6 +3718,153 @@ mod tests {
              content, so a non-empty equality against it can never match — if this returns \
              app-one, an arbitrary body field became selectable without the CRD author opting \
              it in via selectableFields"
+        );
+    }
+
+    /// Regression test: a CR watch with `?fieldSelector=<CRD-declared field>=<value>` must
+    /// exclude CRs that don't match — not stream every CR as ADDED regardless of its value.
+    ///
+    /// Before this fix, watch.rs's per-event filtering always used the generic
+    /// name/namespace/nodeName-only matcher, which silently passes any other field (its
+    /// `_ => {}` catch-all), so a CR watch with `fieldSelector=spec.host=host1` streamed
+    /// every CR in the namespace regardless of `spec.host`. This is the exact live
+    /// conformance mismatch: CustomResourceFieldSelectors' watch assertion expects only the
+    /// matching CRs as ADDED and got all of them instead. Mirrors
+    /// `list_cr_namespaced_honors_field_selector_on_declared_selectable_field`'s fixture but
+    /// exercises the watch path (`sendInitialEvents=true`, the phase the live failure was in)
+    /// instead of plain LIST.
+    #[tokio::test]
+    async fn list_cr_namespaced_watch_honors_field_selector_on_declared_selectable_field() {
+        let state = make_state();
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let ns = "default".to_string();
+        let plural = "gadgets".to_string();
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gadgets.example.io" },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": "gadgets",
+                        "singular": "gadget",
+                        "kind": "Gadget",
+                        "listKind": "GadgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": version,
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": {
+                                        "type": "object",
+                                        "properties": { "host": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        },
+                        "selectableFields": [{ "jsonPath": ".spec.host" }]
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        {
+            use crate::handlers::crd;
+            assert!(
+                crd::create_crd(
+                    State(state.clone()),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    crd_bytes,
+                )
+                .await
+                .is_ok(),
+                "install CRD with a declared selectable field"
+            );
+        }
+
+        let gadget_body = |name: &str, host: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Gadget",
+                    "metadata": { "name": name, "namespace": ns },
+                    "spec": { "host": host }
+                })
+                .to_string(),
+            )
+        };
+
+        for (name, host) in [
+            ("gadget-a", "host1"),
+            ("gadget-b", "host1"),
+            ("gadget-c", "host2"),
+        ] {
+            assert!(
+                create_cr_namespaced(
+                    State(state.clone()),
+                    Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    gadget_body(name, host),
+                )
+                .await
+                .is_ok(),
+                "create gadget {name} must succeed"
+            );
+        }
+
+        // sendInitialEvents=true relists the 3 already-created CRs as ADDED before the live
+        // phase — the exact shape of the live failure (all 3 delivered instead of the 2
+        // matching gadget-a/b). timeout_seconds=2 closes the stream so the test doesn't hang.
+        let watch_query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            send_initial_events: Some(true),
+            field_selector: Some("spec.host=host1".to_string()),
+            timeout_seconds: Some(2),
+            ..no_watch_query()
+        };
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural)),
+            axum::http::HeaderMap::new(),
+            watch_query,
+            "test-user".to_string(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("field-selected watch must succeed, got {e:?}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream must complete within 15 seconds")
+        .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        assert!(
+            body_str.contains("\"gadget-a\"") && body_str.contains("\"gadget-b\""),
+            "watch with fieldSelector=spec.host=host1 must still deliver the matching CRs \
+             (got: {body_str})"
+        );
+        assert!(
+            !body_str.contains("\"gadget-c\""),
+            "watch with fieldSelector=spec.host=host1 must NOT deliver gadget-c \
+             (spec.host=host2) as ADDED — the generic field-selector matcher treats any field \
+             other than metadata.name/namespace/spec.nodeName as a no-op pass-through, which \
+             regresses to exactly the live CustomResourceFieldSelectors watch failure if this \
+             fix is reverted (got: {body_str})"
         );
     }
 
@@ -10913,7 +11118,9 @@ mod tests {
     }
 
     /// patch_cr's SSA-upsert path with fieldValidation=Strict must reject unknown metadata
-    /// fields both at the CR root and inside an x-kubernetes-embedded-resource object.
+    /// fields both at the CR root and inside an x-kubernetes-embedded-resource object, using
+    /// the dotted structured-merge-diff wording SSA requests report (not the quoted
+    /// strict-decoding wording Create/Update uses).
     ///
     /// WHY: ObjectMeta is a fixed structure; a CRD schema never enumerates its fields, so
     /// unknown-field detection cannot rely on `properties` alone here — it must fall back
@@ -10970,14 +11177,86 @@ mod tests {
         assert_eq!(json["code"], 422, "must return 422 Unprocessable Entity");
         let msg = err.1.message;
         assert!(
-            msg.contains("unknown field \"metadata.unknownMeta\""),
-            "must flag the unknown field on the CR's own (root) metadata, in upstream's \
-             exact wording (got: {msg})"
+            msg.contains(".metadata.unknownMeta: field not declared in schema"),
+            "must flag the unknown field on the CR's own (root) metadata, in the dotted \
+             structured-merge-diff wording upstream's SSA path reports (got: {msg})"
         );
         assert!(
-            msg.contains("unknown field \"spec.template.metadata.unknownSubMeta\""),
-            "must also flag the unknown field on the embedded object's metadata, in \
-             upstream's exact wording (got: {msg})"
+            msg.contains(".spec.template.metadata.unknownSubMeta: field not declared in schema"),
+            "must also flag the unknown field on the embedded object's metadata, in the \
+             dotted structured-merge-diff wording upstream's SSA path reports (got: {msg})"
+        );
+    }
+
+    /// `apply_cr_field_validation` must pick the unknown-field wording by request type, not
+    /// collapse to one wording for both: SSA Apply-patch is validated by
+    /// structured-merge-diff, which reports the dotted `.<path>: field not declared in
+    /// schema` form the FieldValidation conformance tests grep for; Create/Update goes
+    /// through strict decoding, which reports `unknown field "<path>"` the
+    /// CustomResourcePublishOpenAPI conformance test greps for instead.
+    ///
+    /// WHY: a prior fix made this wording SSA-vs-Create/Update-agnostic by always emitting
+    /// one of the two forms — whichever direction that blanket choice goes, it passes one
+    /// upstream conformance suite while silently breaking the other, because both wordings
+    /// are genuinely upstream-correct, just for different request types. This test fails
+    /// if the branch is ever collapsed back to a single wording in either direction.
+    #[test]
+    fn apply_cr_field_validation_wording_branches_on_ssa_vs_create_update() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": { "foo": { "type": "string" } }
+                }
+            }
+        });
+
+        let cr_with_unknown_field = || {
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "mytest" },
+                "spec": { "foo": "foo1" },
+                "unknownField": "unknown"
+            })
+        };
+
+        let mut ssa_body = cr_with_unknown_field();
+        let ssa_err = apply_cr_field_validation(&mut ssa_body, Some(&schema), Some("Strict"), true)
+            .expect_err("SSA apply of a CR with an unknown field must be rejected");
+        assert!(
+            ssa_err
+                .1
+                .message
+                .contains(".unknownField: field not declared in schema"),
+            "SSA Apply-patch must use upstream's dotted structured-merge-diff wording \
+             (got: {})",
+            ssa_err.1.message
+        );
+
+        // A fresh, unpruned body: `apply_cr_field_validation` prunes in place, so the SSA
+        // call above already stripped `unknownField` out of `ssa_body`.
+        let mut create_body = cr_with_unknown_field();
+        let create_err =
+            apply_cr_field_validation(&mut create_body, Some(&schema), Some("Strict"), false)
+                .expect_err("Create/Update of a CR with an unknown field must be rejected");
+        assert!(
+            create_err
+                .1
+                .message
+                .contains("unknown field \"unknownField\""),
+            "Create/Update must keep upstream's strict-decoding wording, which \
+             CustomResourcePublishOpenAPI asserts verbatim (got: {})",
+            create_err.1.message
+        );
+        assert!(
+            !create_err
+                .1
+                .message
+                .contains("field not declared in schema"),
+            "Create/Update must not regress to the SSA dotted wording (got: {})",
+            create_err.1.message
         );
     }
 
