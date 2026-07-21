@@ -1760,6 +1760,87 @@ fn append_query(path_suffix: &str, query: Option<&str>) -> String {
     }
 }
 
+/// Returns true when `headers`' Content-Type is `text/html` (ignoring any trailing
+/// `;charset=...` parameter) — matches upstream kube-apiserver's proxy Transport, which
+/// only rewrites links in HTML bodies and passes every other content type through as-is.
+fn is_html_content_type(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/html")
+        })
+}
+
+/// Rewrite root-relative `href="..."`/`src="..."` link targets in an HTML proxy response
+/// so they still resolve through the proxy instead of the apiserver's own root. A browser
+/// following `<a href="/foo">` on a proxied page would otherwise request `/foo` from the
+/// apiserver directly rather than `/foo` on the proxied pod/service — matching upstream
+/// kube-apiserver's proxy Transport, which performs the identical rewrite for exactly
+/// this reason (a client hitting the proxy must get links that stay within the proxy).
+///
+/// Only a single leading `/` counts as root-relative and gets rewritten; scheme-relative
+/// (`//host/...`) and absolute (`http://...`) URLs already name their own host and are
+/// left untouched, as are non-`href`/`src` occurrences of those substrings (an attribute
+/// must start at a preceding whitespace boundary, so "xhref" or plain text is never
+/// mistaken for the real attribute).
+fn rewrite_relative_links(html: &str, proxy_base: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut remaining = html;
+
+    loop {
+        let found = ["href=\"", "href='", "src=\"", "src='"]
+            .into_iter()
+            .filter_map(|pat| remaining.find(pat).map(|pos| (pos, pat)))
+            .min_by_key(|&(pos, _)| pos);
+
+        let Some((pos, pat)) = found else {
+            out.push_str(remaining);
+            return out;
+        };
+
+        let at_attr_boundary = remaining[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+
+        let value_start = pos + pat.len();
+        let quote = pat.as_bytes()[pat.len() - 1] as char;
+        let Some(value_len) = remaining[value_start..].find(quote) else {
+            // Unterminated attribute — pass the remainder through rather than risk
+            // corrupting malformed HTML.
+            out.push_str(remaining);
+            return out;
+        };
+        let value_end = value_start + value_len;
+        let value = &remaining[value_start..value_end];
+
+        out.push_str(&remaining[..value_start]);
+        if at_attr_boundary && value.starts_with('/') && !value.starts_with("//") {
+            out.push_str(proxy_base);
+        }
+        out.push_str(value);
+
+        remaining = &remaining[value_end..];
+    }
+}
+
+/// Rewrite an already-buffered text/html response body — used once the caller has
+/// confirmed the Content-Type and collected the full body (rewriting a partial chunk
+/// could split an href/src attribute across a chunk boundary). A body that is not valid
+/// UTF-8 passes through unmodified rather than risk corrupting binary content that was
+/// merely mislabeled as text/html.
+fn rewrite_html_body(body: bytes::Bytes, proxy_base: &str) -> bytes::Bytes {
+    match std::str::from_utf8(&body) {
+        Ok(html) => bytes::Bytes::from(rewrite_relative_links(html, proxy_base)),
+        Err(_) => body,
+    }
+}
+
 /// Proxy a request to the pod's IP and containerPort.
 ///
 /// Shared implementation for both the with-subpath and no-subpath pod proxy routes.
@@ -1773,6 +1854,11 @@ async fn pod_proxy_dispatch<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     let (pod_ip, port, proxy_addr, is_https) =
         resolve_pod_proxy_target(state, ns, pod_name).await?;
+    // The path a browser must stay within when following a relative link on the proxied
+    // page — see rewrite_relative_links. Built from the raw URL segments rather than the
+    // inbound request's own path so it excludes path_suffix (the proxy's PathPrepend never
+    // includes the backend-relative subpath, only namespaces/{ns}/pods/{pod_name}/proxy).
+    let proxy_base = format!("/api/v1/namespaces/{ns}/pods/{pod_name}/proxy");
 
     let method = req.method().clone();
     let query = req.uri().query().map(str::to_owned);
@@ -1784,7 +1870,7 @@ async fn pod_proxy_dispatch<S: Store>(
     if let Some(addr) = proxy_addr.as_deref() {
         // Route through konnectivity via an explicit CONNECT tunnel.
         // konnectivity-server accepts CONNECT only; a plain forward-proxy GET returns 405.
-        let (status, headers, body) = pod_proxy_via_connect_tunnel(
+        let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &pod_ip,
             port,
@@ -1817,6 +1903,12 @@ async fn pod_proxy_dispatch<S: Store>(
 
         let status = axum::http::StatusCode::from_u16(status)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let body = if is_html_content_type(&headers) {
+            headers.remove(axum::http::header::CONTENT_LENGTH);
+            rewrite_html_body(body, &proxy_base)
+        } else {
+            body
+        };
         return proxied_response(status, &headers, Body::from(body));
     }
 
@@ -1857,8 +1949,28 @@ async fn pod_proxy_dispatch<S: Store>(
         })?;
 
     let pod_status = pod_resp.status();
-    let upstream_headers = pod_resp.headers().clone();
-    let body = Body::from_stream(pod_resp.bytes_stream());
+    let mut upstream_headers = pod_resp.headers().clone();
+    let body = if is_html_content_type(&upstream_headers) {
+        let raw = pod_resp.bytes().await.map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("pod unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                    details: None,
+                },
+            )
+        })?;
+        upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+        Body::from(rewrite_html_body(raw, &proxy_base))
+    } else {
+        Body::from_stream(pod_resp.bytes_stream())
+    };
 
     proxied_response(pod_status, &upstream_headers, body)
 }
@@ -2066,6 +2178,9 @@ async fn service_proxy_dispatch<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     let (ep_ip, port, proxy_addr, is_https) =
         resolve_service_proxy_target(state, ns, svc_name).await?;
+    // See pod_proxy_dispatch's identical comment: the path a browser must stay within
+    // when following a relative link on the proxied page.
+    let proxy_base = format!("/api/v1/namespaces/{ns}/services/{svc_name}/proxy");
     // Reuse the pod_proxy_dispatch path: build the URL and forward the request.
     // Service endpoints are reached the same way as pod IPs — via konnectivity
     // when configured, or directly otherwise.
@@ -2077,7 +2192,7 @@ async fn service_proxy_dispatch<S: Store>(
     let path_with_query = append_query(path_suffix, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
-        let (status, headers, body) = pod_proxy_via_connect_tunnel(
+        let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &ep_ip,
             port,
@@ -2110,6 +2225,12 @@ async fn service_proxy_dispatch<S: Store>(
 
         let status = axum::http::StatusCode::from_u16(status)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let body = if is_html_content_type(&headers) {
+            headers.remove(axum::http::header::CONTENT_LENGTH);
+            rewrite_html_body(body, &proxy_base)
+        } else {
+            body
+        };
         return proxied_response(status, &headers, Body::from(body));
     }
 
@@ -2149,8 +2270,28 @@ async fn service_proxy_dispatch<S: Store>(
         })?;
 
     let ep_status = ep_resp.status();
-    let upstream_headers = ep_resp.headers().clone();
-    let body = Body::from_stream(ep_resp.bytes_stream());
+    let mut upstream_headers = ep_resp.headers().clone();
+    let body = if is_html_content_type(&upstream_headers) {
+        let raw = ep_resp.bytes().await.map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("service endpoint unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                    details: None,
+                },
+            )
+        })?;
+        upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+        Body::from(rewrite_html_body(raw, &proxy_base))
+    } else {
+        Body::from_stream(ep_resp.bytes_stream())
+    };
 
     proxied_response(ep_status, &upstream_headers, body)
 }
@@ -4902,6 +5043,462 @@ mod tests {
             "the body served over the inner TLS session must reach the caller — if \
              is_https were ignored, the mock's inner TLS accept would fail on the \
              plaintext request and this call would return Err, never a body"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_html_content_type / rewrite_relative_links unit tests
+    //
+    // A browser hitting the pod/service proxy must get links that stay within the
+    // proxy — a relative link that resolves against the apiserver's own root instead
+    // of the proxy path silently takes the user (or any HTTP client) out of the proxy.
+    // -----------------------------------------------------------------------
+
+    /// An exact `text/html` Content-Type must be detected.
+    #[test]
+    fn is_html_content_type_true_for_exact_text_html() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/html".parse().unwrap(),
+        );
+        assert!(
+            super::is_html_content_type(&headers),
+            "an exact 'text/html' Content-Type must be recognized — missing it means \
+             the response body never gets its relative links rewritten"
+        );
+    }
+
+    /// `text/html; charset=utf-8` must still be detected — the charset parameter must
+    /// not defeat the match.
+    #[test]
+    fn is_html_content_type_true_for_text_html_with_charset() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/html; charset=utf-8".parse().unwrap(),
+        );
+        assert!(
+            super::is_html_content_type(&headers),
+            "real HTML servers almost always send a charset parameter — matching only \
+             the bare 'text/html' string would silently skip rewriting nearly every \
+             real HTML response"
+        );
+    }
+
+    /// A non-HTML Content-Type (e.g. JSON) must not be treated as HTML.
+    #[test]
+    fn is_html_content_type_false_for_json() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        assert!(
+            !super::is_html_content_type(&headers),
+            "a JSON response must never go through the HTML rewriter — scanning a JSON \
+             body for 'href='/'src=' substrings could corrupt an unrelated field"
+        );
+    }
+
+    /// A response with no Content-Type header at all must not be treated as HTML.
+    #[test]
+    fn is_html_content_type_false_when_header_absent() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(
+            !super::is_html_content_type(&headers),
+            "a missing Content-Type must default to no rewriting, matching upstream's \
+             behavior of only rewriting a response explicitly labeled text/html"
+        );
+    }
+
+    /// A root-relative `href` must be rewritten to include the proxy base path.
+    ///
+    /// This is the exact conformance assertion: the agnhost porter backend serves
+    /// `<a href="/rewriteme">test</a>`, and upstream kube-apiserver's proxy rewrites it
+    /// to `<a href=".../proxy/rewriteme">test</a>` so the link stays within the proxy.
+    #[test]
+    fn rewrite_relative_links_rewrites_root_relative_href() {
+        assert_eq!(
+            super::rewrite_relative_links(
+                r#"<a href="/rewriteme">test</a>"#,
+                "/api/v1/namespaces/default/pods/mypod/proxy"
+            ),
+            r#"<a href="/api/v1/namespaces/default/pods/mypod/proxy/rewriteme">test</a>"#,
+            "a root-relative href must gain the full proxy path prefix — without it, a \
+             client following the link hits the apiserver's own root at /rewriteme \
+             instead of the pod's"
+        );
+    }
+
+    /// A root-relative `src` must be rewritten the same way as `href`.
+    #[test]
+    fn rewrite_relative_links_rewrites_root_relative_src() {
+        assert_eq!(
+            super::rewrite_relative_links(
+                r#"<img src="/logo.png">"#,
+                "/api/v1/namespaces/default/pods/mypod/proxy"
+            ),
+            r#"<img src="/api/v1/namespaces/default/pods/mypod/proxy/logo.png">"#,
+            "src must be rewritten identically to href — upstream's proxy Transport \
+             rewrites both attributes for exactly this reason (img/script/etc. all use src)"
+        );
+    }
+
+    /// An absolute URL (with its own scheme and host) must be left untouched.
+    #[test]
+    fn rewrite_relative_links_leaves_absolute_url_untouched() {
+        let html = r#"<a href="http://example.com/elsewhere">test</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "an absolute URL already names its own host and must not be rewritten — \
+             prefixing it with the proxy path would break a legitimate external link"
+        );
+    }
+
+    /// A scheme-relative URL (`//host/...`) must be left untouched — it names its own
+    /// host even though it starts with `/`.
+    #[test]
+    fn rewrite_relative_links_leaves_scheme_relative_url_untouched() {
+        let html = r#"<a href="//example.com/elsewhere">test</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "a scheme-relative URL carries its own host despite the leading '/' — \
+             treating it as root-relative would prepend the proxy path onto \
+             '//example.com/elsewhere' instead of leaving it alone"
+        );
+    }
+
+    /// A document-relative path (no leading `/`) must be left untouched — it already
+    /// resolves correctly against the current proxied URL without rewriting.
+    #[test]
+    fn rewrite_relative_links_leaves_document_relative_path_untouched() {
+        let html = r#"<a href="rewriteme">test</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "a bare relative path resolves against the browser's current URL (already \
+             inside the proxy path) with no rewriting needed — prefixing it would \
+             double up the proxy path"
+        );
+    }
+
+    /// An attribute that merely ends in "href" (not the exact `href=` token) must not be
+    /// mistaken for a real href attribute.
+    #[test]
+    fn rewrite_relative_links_does_not_misparse_unrelated_attribute() {
+        let html = r#"<div xhref="/foo">test</div>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "an attribute name that merely ends in 'href' must not be mistaken for the \
+             real attribute — rewriting inside it would corrupt an unrelated attribute value"
+        );
+    }
+
+    /// Multiple links in the same document must each be rewritten independently.
+    #[test]
+    fn rewrite_relative_links_rewrites_multiple_links() {
+        let html = r#"<a href="/one">one</a><a href="/two">two</a>"#;
+        assert_eq!(
+            super::rewrite_relative_links(html, "/proxy"),
+            r#"<a href="/proxy/one">one</a><a href="/proxy/two">two</a>"#,
+            "every root-relative link in the document must be rewritten, not just the \
+             first — a page with multiple links must keep the user inside the proxy \
+             no matter which one they follow"
+        );
+    }
+
+    /// HTML with no href/src attributes at all must pass through byte-for-byte.
+    #[test]
+    fn rewrite_relative_links_leaves_plain_html_unchanged() {
+        let html = "<p>hello world</p>";
+        assert_eq!(
+            super::rewrite_relative_links(html, "/api/v1/namespaces/default/pods/mypod/proxy"),
+            html,
+            "HTML with nothing to rewrite must be returned unchanged — this is the \
+             overwhelming majority of proxied HTML responses"
+        );
+    }
+
+    /// pod_proxy (direct, no konnectivity) must rewrite root-relative links in a
+    /// text/html response body so they keep resolving through the proxy.
+    ///
+    /// Before this fix, pod_proxy_dispatch streamed the backend body through
+    /// unmodified — a client following `<a href="/rewriteme">` on a proxied page would
+    /// land on the apiserver's own root instead of the pod's `/rewriteme`. This is the
+    /// exact "Proxy ... should proxy through a service and a pod" conformance failure
+    /// for the bare pod-proxy-root and named-port HTML cases.
+    #[tokio::test]
+    async fn pod_proxy_rewrites_relative_html_links() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pod_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            let html_body = r#"<a href="/rewriteme">test</a>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{html_body}",
+                html_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let state = make_state();
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": pod_port}]}]
+            },
+            "status": {"podIP": "127.0.0.1"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/mypod/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let expected_body =
+            r#"<a href="/api/v1/namespaces/default/pods/mypod/proxy/rewriteme">test</a>"#;
+        // axum fills in Content-Length only when the header is absent (it never corrects
+        // an existing one), so the original (stale, pre-rewrite) Content-Length must have
+        // been removed — otherwise this would still show the backend's original byte
+        // count instead of the rewritten body's.
+        if let Some(cl) = resp.headers().get(axum::http::header::CONTENT_LENGTH) {
+            assert_eq!(
+                cl.to_str().unwrap(),
+                expected_body.len().to_string(),
+                "Content-Length must describe the rewritten body, not the original — a \
+                 client reading exactly the original (shorter) byte count would truncate \
+                 the rewritten href mid-attribute"
+            );
+        }
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, expected_body,
+            "the relative link must be rewritten to include the full proxy path — a \
+             client following the unrewritten link would hit the apiserver's own root \
+             instead of the pod's /rewriteme"
+        );
+    }
+
+    /// pod_proxy over a konnectivity tunnel must also rewrite relative HTML links.
+    ///
+    /// The tunnel branch builds its response body separately from the direct-HTTP
+    /// branch (pod_proxy_via_connect_tunnel returns already-buffered bytes rather than
+    /// a stream); fixing only the direct branch would leave every konnectivity-proxied
+    /// cluster — the common case once a real CNI is involved, and the path u7s's own
+    /// dev stack always takes — still returning unrewritten links.
+    #[tokio::test]
+    async fn pod_proxy_via_connect_tunnel_rewrites_relative_html_links() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut buf2 = [0u8; 512];
+            let _ = stream.read(&mut buf2).await;
+            let html_body = r#"<a href="/rewriteme">test</a>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{html_body}",
+                html_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}]},
+            "status": {"podIP": "10.0.0.1"}
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: Some(proxy_addr),
+            sa_public_key_pem: None,
+        });
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/mypod/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body, r#"<a href="/api/v1/namespaces/default/pods/mypod/proxy/rewriteme">test</a>"#,
+            "the konnectivity-tunnel branch must also rewrite relative links — this is \
+             the path u7s's own dev stack always takes once konnectivity-server is \
+             configured"
+        );
+    }
+
+    /// service_proxy (direct, no konnectivity) must rewrite relative links using the
+    /// SERVICE's own proxy base path, not the pod's.
+    ///
+    /// service_proxy_dispatch computes its own `proxy_base` from `services/{name}/proxy`
+    /// independently from pod_proxy_dispatch's `pods/{name}/proxy` — a copy-paste error
+    /// here would silently rewrite links to the wrong (pod-shaped) path.
+    #[tokio::test]
+    async fn service_proxy_rewrites_relative_html_links() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            let html_body = r#"<a href="/rewriteme">test</a>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{html_body}",
+                html_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let state = make_state();
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}],
+            "ports": [{"name": "http", "port": ep_port, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/services/my-svc/proxy/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            r#"<a href="/api/v1/namespaces/default/services/my-svc/proxy/rewriteme">test</a>"#,
+            "service_proxy must rewrite links using its own services/<name>/proxy base \
+             path — rewriting to a pod-shaped path would send the client to a URL that \
+             404s"
         );
     }
 
