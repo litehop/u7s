@@ -201,12 +201,18 @@ pub struct NodeSelectorSpec {
     pub node_selector_terms: Vec<NodeSelectorTerm>,
 }
 
-/// One term of a `NodeSelector`: its `matchExpressions` are ANDed together.
+/// One term of a `NodeSelector`: its `matchExpressions` and `matchFields` are
+/// ANDed together.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSelectorTerm {
     #[serde(default)]
     pub match_expressions: Vec<NodeSelectorRequirement>,
+    /// Kubernetes only ever populates this with `metadata.name` — it's how the
+    /// DaemonSet controller pins each per-node pod to a specific node while
+    /// leaving `spec.nodeName` empty for the scheduler to fill in.
+    #[serde(default)]
+    pub match_fields: Vec<NodeSelectorRequirement>,
 }
 
 /// A single `matchExpressions[]` entry: `key <operator> values`.
@@ -1004,7 +1010,11 @@ impl NodeTally {
 /// pending pod could not use anyway even after the eviction.
 fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
     node_selector_matches(&node.metadata.labels, &pod.node_selector)
-        && node_affinity_matches(&node.metadata.labels, pod.node_affinity.as_ref())
+        && node_affinity_matches(
+            &node.metadata.labels,
+            &node.metadata.name,
+            pod.node_affinity.as_ref(),
+        )
         && node_taints_tolerated(&node.spec.taints, &pod.tolerations)
 }
 
@@ -1281,18 +1291,23 @@ fn node_selector_requirement_matches(
     }
 }
 
-/// Return true when `labels` satisfy a required `nodeAffinity`.
+/// Return true when `labels`/`node_name` satisfy a required `nodeAffinity`.
 ///
 /// `nodeSelectorTerms` are ORed together (any one term matching is enough);
-/// `matchExpressions` within a single term are ANDed (every requirement in
-/// the term must hold) — mirroring Kubernetes' `NodeSelector` semantics.
-/// `None` (no nodeAffinity, or no `requiredDuringSchedulingIgnoredDuringExecution`,
-/// or an empty term list) matches any node — there is nothing to restrict on.
+/// within a single term, every `matchExpressions` requirement AND every
+/// `matchFields` requirement must hold — mirroring Kubernetes' `NodeSelector`
+/// semantics. `matchFields` is evaluated against a synthetic one-entry
+/// `{"metadata.name": node_name}` map — the only field Kubernetes ever
+/// populates `matchFields` with (it's how the DaemonSet controller pins each
+/// per-node pod). `None` (no nodeAffinity, or no
+/// `requiredDuringSchedulingIgnoredDuringExecution`, or an empty term list)
+/// matches any node — there is nothing to restrict on.
 ///
 /// Extracted as a pure function so the predicate can be unit-tested without
 /// network access — mirrors `node_selector_matches`.
 pub fn node_affinity_matches(
     labels: &std::collections::HashMap<String, String>,
+    node_name: &str,
     affinity: Option<&NodeAffinity>,
 ) -> bool {
     let Some(affinity) = affinity else {
@@ -1304,10 +1319,16 @@ pub fn node_affinity_matches(
     if required.node_selector_terms.is_empty() {
         return true;
     }
+    let field_values: std::collections::HashMap<String, String> =
+        [("metadata.name".to_owned(), node_name.to_owned())].into();
     required.node_selector_terms.iter().any(|term| {
         term.match_expressions
             .iter()
             .all(|req| node_selector_requirement_matches(labels, req))
+            && term
+                .match_fields
+                .iter()
+                .all(|req| node_selector_requirement_matches(&field_values, req))
     })
 }
 
@@ -3417,7 +3438,7 @@ mod tests {
     fn node_affinity_matches_true_when_no_affinity_set() {
         let labels: std::collections::HashMap<String, String> = Default::default();
         assert!(
-            node_affinity_matches(&labels, None),
+            node_affinity_matches(&labels, "node-1", None),
             "a pod with no nodeAffinity must be schedulable on any node"
         );
     }
@@ -3430,13 +3451,15 @@ mod tests {
         let affinity = required_affinity(vec![
             NodeSelectorTerm {
                 match_expressions: vec![requirement("foo", "In", &["bar", "value2"])],
+                match_fields: vec![],
             },
             NodeSelectorTerm {
                 match_expressions: vec![requirement("diffkey", "In", &["wrong", "value2"])],
+                match_fields: vec![],
             },
         ]);
         assert!(
-            !node_affinity_matches(&labels, Some(&affinity)),
+            !node_affinity_matches(&labels, "node-1", Some(&affinity)),
             "a node satisfying neither ORed nodeSelectorTerm must be rejected — \
              reverting this check binds the pod anyway, failing 'validates that \
              NodeAffinity is respected if not matching'"
@@ -3452,13 +3475,15 @@ mod tests {
         let affinity = required_affinity(vec![
             NodeSelectorTerm {
                 match_expressions: vec![requirement("foo", "In", &["bar", "value2"])],
+                match_fields: vec![],
             },
             NodeSelectorTerm {
                 match_expressions: vec![requirement("diffkey", "In", &["wrong", "value2"])],
+                match_fields: vec![],
             },
         ]);
         assert!(
-            node_affinity_matches(&labels, Some(&affinity)),
+            node_affinity_matches(&labels, "node-1", Some(&affinity)),
             "a node satisfying at least one ORed nodeSelectorTerm must be accepted"
         );
     }
@@ -3474,9 +3499,10 @@ mod tests {
                 requirement("foo", "In", &["bar"]),
                 requirement("other", "Exists", &[]),
             ],
+            match_fields: vec![],
         }]);
         assert!(
-            !node_affinity_matches(&labels, Some(&affinity)),
+            !node_affinity_matches(&labels, "node-1", Some(&affinity)),
             "matchExpressions in one term are ANDed — satisfying only one of two \
              must not be enough"
         );
@@ -3571,6 +3597,7 @@ mod tests {
         let mut pod = empty_pending_pod();
         pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
             match_expressions: vec![requirement("foo", "In", &["bar"])],
+            match_fields: vec![],
         }]));
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
         let result = select_node_with_capacity(list, &pod, &counts);
@@ -3591,6 +3618,7 @@ mod tests {
         let mut pod = empty_pending_pod();
         pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
             match_expressions: vec![requirement("foo", "In", &["bar"])],
+            match_fields: vec![],
         }]));
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
         let result = select_node_with_capacity(list, &pod, &counts);
@@ -3598,6 +3626,60 @@ mod tests {
             result.unwrap(),
             "worker-0",
             "a node whose labels satisfy the required nodeAffinity term must be selected"
+        );
+    }
+
+    /// The exact mechanism the DaemonSet controller uses to pin each per-node
+    /// pod: a matchFields-only term on metadata.name, with spec.nodeName left
+    /// empty for the scheduler to fill in. Before match_fields was modeled on
+    /// NodeSelectorTerm, serde silently dropped the field, match_expressions
+    /// was always empty, and `.all()` over an empty iterator is vacuously
+    /// true — so the pod matched every node and select_node_with_capacity
+    /// always returned the first one in list order, landing every DaemonSet
+    /// pod on the same node instead of one per node.
+    #[test]
+    fn select_node_with_capacity_selects_pinned_node_via_match_fields() {
+        let node_a = make_node_with_capacity("node-a", &[], "110");
+        let node_b = make_node_with_capacity("node-b", &[], "110");
+        let list = NodeList {
+            items: vec![node_a, node_b],
+        };
+        let mut pod = empty_pending_pod();
+        pod.node_affinity = Some(required_affinity(vec![NodeSelectorTerm {
+            match_expressions: vec![],
+            match_fields: vec![requirement("metadata.name", "In", &["node-b"])],
+        }]));
+        let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_eq!(
+            result.unwrap(),
+            "node-b",
+            "a matchFields term pinning metadata.name to node-b must select node-b \
+             even though it is listed after node-a — selecting node-a here means \
+             matchFields was silently dropped and every node vacuously matched"
+        );
+    }
+
+    /// A term with BOTH matchExpressions and matchFields must require both —
+    /// matchFields is ANDed into the same per-term requirement as
+    /// matchExpressions, not treated as an independent alternative that could
+    /// let a node through on a name match alone (or vice versa).
+    #[test]
+    fn node_affinity_matches_requires_both_match_expressions_and_match_fields() {
+        let labels: std::collections::HashMap<String, String> =
+            [("foo".to_owned(), "bar".to_owned())].into();
+        let affinity = required_affinity(vec![NodeSelectorTerm {
+            match_expressions: vec![requirement("foo", "In", &["bar"])],
+            match_fields: vec![requirement("metadata.name", "In", &["node-b"])],
+        }]);
+        assert!(
+            !node_affinity_matches(&labels, "node-a", Some(&affinity)),
+            "a node matching the label but not the pinned name must still fail \
+             the term — matchExpressions and matchFields are ANDed, not ORed"
+        );
+        assert!(
+            node_affinity_matches(&labels, "node-b", Some(&affinity)),
+            "a node matching both the label and the pinned name must satisfy the term"
         );
     }
 
