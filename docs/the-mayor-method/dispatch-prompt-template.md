@@ -414,14 +414,19 @@ limit: ~4 GiB RAM per VM).
 
 **Available VMs and their assigned ports:**
 
-| VM name | Host port | Kubelet port | Konnectivity | Notes |
-|---|---|---|---|---|
-| `lima-node` | `6443` | `10250` | `8135` | Mayor's VM — never assign to workers |
-| slot 1 | `6444` | `10251` | `8235` | |
-| slot 2 | `6445` | `10252` | `8335` | |
-| slot 3 | `6446` | `10253` | `8435` | |
-| slot 4 | `6447` | `10254` | `8535` | |
-| slot 5 | `6448` | `10255` | `8635` | |
+| VM name | Host port | Kubelet port | Companion kubelet port | Konnectivity | Notes |
+|---|---|---|---|---|---|
+| `lima-node` | `6443` | `10250` | `10260` | `8135` | Mayor's VM — never assign to workers |
+| slot 1 | `6444` | `10251` | `10261` | `8235` | |
+| slot 2 | `6445` | `10252` | `10262` | `8335` | |
+| slot 3 | `6446` | `10253` | `10263` | `8435` | |
+| slot 4 | `6447` | `10254` | `10264` | `8535` | |
+| slot 5 | `6448` | `10255` | `10265` | `8635` | |
+
+**Companion kubelet port** (`10260`-`10265`) is reserved for each slot's 2nd
+(companion) node in a two-node conformance run — pass it as `--extra-kubelet-port`
+alongside `--extra-node <vm>` to `run-all.sh` (see `scripts/conformance/add-node.sh`).
+Unused unless a slot is explicitly running a two-node stack.
 
 All workers bind to `127.0.0.1` — port is the isolation boundary between parallel
 workers. Different loopback IPs are NOT reliably reachable from inside Lima VMs via
