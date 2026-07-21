@@ -13,6 +13,7 @@
 #   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--stack-only] [--vm <name>]
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #                                  [--konnectivity-server-port <N>]
+#                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
 #                lima-node VM, and wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
@@ -49,6 +50,13 @@
 #   --workdir Directory for apiserver state (DB, certs, kubeconfig). Forwarded to
 #             u7s-start.sh and child scripts. Defaults to ./temp/u7s relative to CWD
 #             (the active worktree root when invoked from a worktree).
+#   --extra-node <vm>          Join a 2nd VM to the SAME cluster (delegates to
+#             add-node.sh, which never touches KCM/scheduler — those run once for
+#             the whole cluster). Must be paired with --extra-kubelet-port; absent,
+#             the stack stays single-node (today's behavior, unchanged). Works with
+#             --stack-only too (brings up a 2-node stack, still skips sonobuoy).
+#   --extra-kubelet-port <N>   Host-side kubelet port for the 2nd node (see
+#             --kubelet-port). Required together with --extra-node.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -62,6 +70,8 @@ BINARY=""
 PORT=""
 KUBELET_PORT=""
 KONNECTIVITY_SERVER_PORT=""
+EXTRA_NODE=""
+EXTRA_KUBELET_PORT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -76,12 +86,25 @@ while [[ $# -gt 0 ]]; do
     --konnectivity-server-port) KONNECTIVITY_SERVER_PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     --stack-only) STACK_ONLY=1; shift ;;
+    --extra-node) EXTRA_NODE="$2"; shift 2 ;;
+    --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 if [ "$STACK_ONLY" -eq 1 ] && [ -n "$FOCUS" ]; then
   echo "--focus ignored with --stack-only" >&2
+fi
+
+# Both flags are required together: a 2nd node needs its own kubelet port, and a
+# bare kubelet port with no VM to join is meaningless.
+if [ -n "$EXTRA_NODE" ] && [ -z "$EXTRA_KUBELET_PORT" ]; then
+  echo "error: --extra-node requires --extra-kubelet-port" >&2
+  exit 1
+fi
+if [ -z "$EXTRA_NODE" ] && [ -n "$EXTRA_KUBELET_PORT" ]; then
+  echo "error: --extra-kubelet-port requires --extra-node" >&2
+  exit 1
 fi
 
 banner() {
@@ -154,6 +177,15 @@ bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG}
 banner "Step 5/6: Start u7s-scheduler"
 # shellcheck disable=SC2086
 bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
+
+# Extra node: join a 2nd VM to the same cluster (opt-in). Runs after KCM/scheduler
+# are up (those must run exactly once) and before sonobuoy so the target tests see
+# both nodes.
+if [ -n "$EXTRA_NODE" ]; then
+  banner "Extra node: join $EXTRA_NODE"
+  # shellcheck disable=SC2086
+  bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG}
+fi
 
 # Step 06: Run sonobuoy.
 if [ "$STACK_ONLY" -eq 1 ]; then
