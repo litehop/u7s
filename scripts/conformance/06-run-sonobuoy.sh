@@ -97,9 +97,11 @@ watchdog_loop() {
 
       if [ "$should_delete" -eq 1 ]; then
         echo "[watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) force-deleting namespace '${ns}' (${reason})"
-        # Strip finalizers first so the API server will honour the delete.
+        # Strip finalizers first so the API server will honour the delete. Namespace
+        # finalizers live in spec.finalizers, not metadata.finalizers (unlike every other
+        # resource type) — patching the wrong field is a silent no-op.
         kubectl --kubeconfig="$kubeconfig" patch ns "$ns" \
-          -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+          -p '{"spec":{"finalizers":[]}}' --type=merge 2>/dev/null || true
         kubectl --kubeconfig="$kubeconfig" delete ns "$ns" \
           --grace-period=0 --force 2>/dev/null || true
       fi
