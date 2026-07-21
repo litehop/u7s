@@ -2414,15 +2414,41 @@ pub async fn delete_collection_resource<S: Store>(
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    // Verify the resource is known; return 404 for unknown resource types.
-    let _meta = lookup(&state, &group, &version, &plural)
-        .cloned()
-        .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
+    // Resources not in the static registry are CRD-backed; fall back to CR handling exactly
+    // like every other verb dispatched from this file (list_resource -> cr::list_cr,
+    // delete_resource -> cr::delete_cr, ...) — this was the one verb missing that fallback.
+    if lookup(&state, &group, &version, &plural).is_err() {
+        return super::cr::delete_collection_cr(
+            State(state),
+            Path((group, version, plural)),
+            Extension(user),
+            query,
+        )
+        .await
+        .map(IntoResponse::into_response);
+    }
 
     let prefix = group_list_prefix(&group, &plural, None);
+    // "events" needs multi-term, in-memory filtering (see list_resource); every other
+    // built-in resource can use the store's generic single-field selector directly.
+    let store_field_selector = if plural == "events" {
+        None
+    } else {
+        query
+            .field_selector
+            .as_deref()
+            .map(parse_field_selector)
+            .transpose()?
+    };
     let resp = state
         .store
-        .list(&prefix, u7s_store::ListOptions::default())
+        .list(
+            &prefix,
+            u7s_store::ListOptions {
+                field_selector: store_field_selector,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -2531,14 +2557,42 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
     Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    let _meta = lookup(&state, &group, &version, &plural)
-        .cloned()
-        .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
+    // Resources not in the static registry are CRD-backed; fall back to CR handling exactly
+    // like every other namespaced verb dispatched from this file (list_namespaced_resource ->
+    // cr::list_cr_namespaced, delete_namespaced_resource -> cr::delete_cr_namespaced, ...) —
+    // this was the one verb missing that fallback.
+    if lookup(&state, &group, &version, &plural).is_err() {
+        return super::cr::delete_collection_cr_namespaced(
+            State(state),
+            Path((group, version, ns, plural)),
+            Extension(user),
+            query,
+        )
+        .await
+        .map(IntoResponse::into_response);
+    }
 
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
+    // "events" needs multi-term, in-memory filtering (see list_namespaced_resource); every
+    // other built-in resource can use the store's generic single-field selector directly.
+    let store_field_selector = if plural == "events" {
+        None
+    } else {
+        query
+            .field_selector
+            .as_deref()
+            .map(parse_field_selector)
+            .transpose()?
+    };
     let resp = state
         .store
-        .list(&prefix, u7s_store::ListOptions::default())
+        .list(
+            &prefix,
+            u7s_store::ListOptions {
+                field_selector: store_field_selector,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -15689,6 +15743,417 @@ mod tests {
             2,
             "deletecollection denied by admission must leave every matched cluster-scoped \
              object in place"
+        );
+    }
+
+    /// delete_collection_namespaced_resource had no Custom Resource fallback at all — it
+    /// resolved the type via lookup() (the static built-in registry only), so ANY
+    /// DeleteCollection against a CRD-backed group/version/plural 404d unconditionally, and
+    /// query.field_selector was never consulted even once a fallback existed. This is exactly
+    /// what CustomResourceFieldSelectors' `v2Client.Namespace(ns).DeleteCollection(...,
+    /// ListOptions{FieldSelector: "host=host1,port=80"})` step exercises.
+    ///
+    /// Fails on revert two independent ways: (1) without the CR fallback this call returns
+    /// 404, so the `unwrap_or_else` below panics; (2) with a fallback but no field-selector
+    /// wiring, either all three widgets are removed (selector silently ignored) or none are
+    /// (selector misapplied as never-matching) instead of exactly the two whose host is
+    /// "host1".
+    #[tokio::test]
+    async fn delete_collection_namespaced_resource_falls_back_to_cr_and_honors_field_selector() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.custom.example.com" },
+            "spec": {
+                "group": "custom.example.com",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget",
+                    "listKind": "WidgetList"
+                },
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": { "host": { "type": "string" } }
+                        }
+                    },
+                    "selectableFields": [{ "jsonPath": ".host" }]
+                }]
+            }
+        });
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(crd.to_string()),
+        )
+        .await
+        .expect("install CRD");
+
+        for (name, host) in [
+            ("widget-a", "host1"),
+            ("widget-b", "host1"),
+            ("widget-c", "host2"),
+        ] {
+            let widget = serde_json::json!({
+                "apiVersion": "custom.example.com/v1",
+                "kind": "Widget",
+                "metadata": { "name": name, "namespace": "default" },
+                "host": host
+            });
+            crate::handlers::cr::create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "custom.example.com".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "widgets".into(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(widget.to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {name} must succeed: {e:?}"));
+        }
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: Some("host=host1".to_string()),
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "DeleteCollection on a CRD-backed resource must fall back to CR handling \
+                 instead of 404ing: {e:?}"
+            )
+        });
+
+        for (name, should_survive) in [("widget-a", false), ("widget-b", false), ("widget-c", true)]
+        {
+            let result = crate::handlers::cr::get_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "custom.example.com".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "widgets".into(),
+                    name.into(),
+                )),
+                axum::http::HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                should_survive,
+                "{name}'s survival after DeleteCollection(fieldSelector=host=host1) must \
+                 match whether its own host matched the selector"
+            );
+        }
+    }
+
+    /// Cluster-scoped counterpart of the namespaced test above: delete_collection_resource
+    /// must also fall back to CR handling (cr::delete_collection_cr) for a CRD-backed
+    /// group/version/plural, and honor field_selector there too — the cluster-scoped route
+    /// had the identical two gaps.
+    #[tokio::test]
+    async fn delete_collection_resource_falls_back_to_cr_and_honors_field_selector() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "gadgets.custom.example.com" },
+            "spec": {
+                "group": "custom.example.com",
+                "names": {
+                    "plural": "gadgets",
+                    "singular": "gadget",
+                    "kind": "Gadget",
+                    "listKind": "GadgetList"
+                },
+                "scope": "Cluster",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": { "host": { "type": "string" } }
+                        }
+                    },
+                    "selectableFields": [{ "jsonPath": ".host" }]
+                }]
+            }
+        });
+        crate::handlers::crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(crd.to_string()),
+        )
+        .await
+        .expect("install CRD");
+
+        for (name, host) in [("gadget-a", "host1"), ("gadget-b", "host2")] {
+            let gadget = serde_json::json!({
+                "apiVersion": "custom.example.com/v1",
+                "kind": "Gadget",
+                "metadata": { "name": name },
+                "host": host
+            });
+            crate::handlers::cr::create_cr(
+                State(state.clone()),
+                Path(("custom.example.com".into(), "v1".into(), "gadgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(gadget.to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create {name} must succeed: {e:?}"));
+        }
+
+        delete_collection_resource(
+            State(state.clone()),
+            Path(("custom.example.com".into(), "v1".into(), "gadgets".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: Some("host=host1".to_string()),
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("cluster-scoped DeleteCollection CR fallback must succeed: {e:?}")
+        });
+
+        let a_gone = crate::handlers::cr::get_cr(
+            State(state.clone()),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "gadgets".into(),
+                "gadget-a".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert!(a_gone.is_err(), "gadget-a (host1) must be deleted");
+
+        let b_survives = crate::handlers::cr::get_cr(
+            State(state.clone()),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "gadgets".into(),
+                "gadget-b".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert!(b_survives.is_ok(), "gadget-b (host2) must survive");
+    }
+
+    /// delete_collection_resource (cluster-scoped, built-in types) consulted only
+    /// label_selector in its per-object loop — query.field_selector was silently dropped, so
+    /// a DeleteCollection with a fieldSelector deleted every object regardless of the filter
+    /// instead of the requested subset.
+    ///
+    /// Fails on revert: without threading field_selector into the store's ListOptions, both
+    /// bindings are deleted regardless of roleRef.name.
+    #[tokio::test]
+    async fn delete_collection_resource_honors_field_selector() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        for (name, role) in [("binding-admin", "admin"), ("binding-viewer", "viewer")] {
+            let key = crate::keys::group_object_key(
+                "rbac.authorization.k8s.io",
+                "clusterrolebindings",
+                None,
+                name,
+            );
+            let val = serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRoleBinding",
+                "metadata": { "name": name },
+                "subjects": [{ "kind": "Group", "name": "some-group" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": role
+                }
+            });
+            state
+                .store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                    None,
+                )
+                .await
+                .expect("seed must succeed");
+        }
+
+        delete_collection_resource(
+            State(state.clone()),
+            Path((
+                "rbac.authorization.k8s.io".into(),
+                "v1".into(),
+                "clusterrolebindings".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: Some("roleRef.name=admin".to_string()),
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete_collection with field_selector must succeed: {e:?}"));
+
+        let prefix = crate::keys::group_list_prefix(
+            "rbac.authorization.k8s.io",
+            "clusterrolebindings",
+            None,
+        );
+        let remaining = state
+            .store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list must succeed");
+        let remaining_names: Vec<String> = remaining
+            .items
+            .iter()
+            .filter_map(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+            .map(|v| v["metadata"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            remaining_names,
+            vec!["binding-viewer".to_string()],
+            "DeleteCollection with fieldSelector=roleRef.name=admin must delete only \
+             binding-admin — if the selector is ignored, both bindings are deleted"
+        );
+    }
+
+    /// Namespaced counterpart of delete_collection_resource_honors_field_selector:
+    /// delete_collection_namespaced_resource also consulted only label_selector, silently
+    /// dropping query.field_selector for built-in resources.
+    #[tokio::test]
+    async fn delete_collection_namespaced_resource_honors_field_selector() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        for name in ["alpha", "beta"] {
+            let body = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": name, "namespace": "test-ns" },
+                "spec": { "holderIdentity": name }
+            });
+            create_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "test-ns".into(),
+                    "leases".into(),
+                )),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Lease create must succeed"));
+        }
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "test-ns".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: Some("spec.holderIdentity=alpha".to_string()),
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete_collection with field_selector must succeed: {e:?}"));
+
+        let prefix =
+            crate::keys::group_list_prefix("coordination.k8s.io", "leases", Some("test-ns"));
+        let remaining = state
+            .store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list must succeed");
+        assert_eq!(
+            remaining.items.len(),
+            1,
+            "fieldSelector=spec.holderIdentity=alpha must delete only the alpha Lease"
+        );
+        let remaining_obj: serde_json::Value =
+            serde_json::from_slice(&remaining.items[0].value).unwrap();
+        assert_eq!(
+            remaining_obj["metadata"]["name"], "beta",
+            "the surviving Lease must be beta (holderIdentity=beta doesn't match the selector)"
         );
     }
 }
