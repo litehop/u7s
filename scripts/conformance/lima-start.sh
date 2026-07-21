@@ -44,6 +44,7 @@ _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
+_NODE_SUFFIX_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
@@ -52,11 +53,16 @@ while [[ $# -gt 0 ]]; do
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
+    --node-suffix) _NODE_SUFFIX_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
+# Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
+# serving cert) so a 2nd node can join the same cluster without colliding with — or,
+# for the Pod's immutable spec.nodeName, 403'ing against — node 1's.
+NODE_SUFFIX="${_NODE_SUFFIX_OVERRIDE:-}"
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_SERVER_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
 else
@@ -231,9 +237,9 @@ if [ -f "$CA_CERT" ]; then
   # verify the kubelet's TLS cert on exec/log/attach connections (closes the MITM
   # vector that existed when AcceptAnyCert was used).
   CERT_DIR="$(dirname "$KUBECONFIG_PATH")"
-  KUBELET_TLS_KEY="$CERT_DIR/kubelet-serving.key"
-  KUBELET_TLS_CRT="$CERT_DIR/kubelet-serving.crt"
-  KUBELET_TLS_CSR="$CERT_DIR/kubelet-serving.csr"
+  KUBELET_TLS_KEY="$CERT_DIR/kubelet-serving${NODE_SUFFIX}.key"
+  KUBELET_TLS_CRT="$CERT_DIR/kubelet-serving${NODE_SUFFIX}.crt"
+  KUBELET_TLS_CSR="$CERT_DIR/kubelet-serving${NODE_SUFFIX}.csr"
 
   # Get the lima VM IP so it can be included as a SAN (needed if kubelet-preferred-address
   # is not set and the apiserver connects via the VM's InternalIP instead of 127.0.0.1).
@@ -310,7 +316,7 @@ fi
 
 # Create cert Secret for konnectivity-agent pod so the pod can mount the mTLS certs
 # without copying binaries or tokens into the VM host filesystem.
-kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent-certs \
+kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent-certs${NODE_SUFFIX} \
   --from-file=ca.crt="$WORKDIR/ca.pem" \
   --from-file=tls.crt="$WORKDIR/konnectivity-agent.crt" \
   --from-file=tls.key="$WORKDIR/konnectivity-agent.key" \
@@ -330,7 +336,7 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<PODEOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: konnectivity-agent
+  name: konnectivity-agent${NODE_SUFFIX}
   namespace: kube-system
   labels:
     app: konnectivity-agent
@@ -364,7 +370,7 @@ spec:
   volumes:
   - name: certs
     secret:
-      secretName: konnectivity-agent-certs
+      secretName: konnectivity-agent-certs${NODE_SUFFIX}
 PODEOF
 
 echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnectivity-agent)"
