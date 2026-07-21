@@ -543,6 +543,16 @@ async fn convert_watched_cr_object<S: Store>(
     Ok(converted)
 }
 
+/// Whether a filtered watch should emit a synthetic DELETED for a MODIFIED event whose new
+/// state no longer matches the label/field selector. Kubernetes semantics: an object that
+/// exits a filtered watch's scope produces a DELETE so the client's cache drops it — but that
+/// is only correct if the client's cache could actually contain the object, i.e. this watcher
+/// previously delivered it as matching. An object that never matched must not receive a
+/// phantom DELETE just because a later update leaves it in yet another non-matching state.
+fn should_emit_synthetic_delete(is_modified: bool, now_matches: bool, ever_matched: bool) -> bool {
+    is_modified && !now_matches && ever_matched
+}
+
 async fn watch_generic_impl<S: Store>(
     state: AppState<S>,
     cfg: WatchConfig,
@@ -662,6 +672,14 @@ async fn watch_generic_impl<S: Store>(
         // never entered the watch scope (body didn't match the selector).
         let mut locally_deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        // Track (namespace, name) pairs this watcher has delivered as matching — via live
+        // ADDED/MODIFIED or sendInitialEvents — so the synthetic-DELETE-on-MODIFIED-losing-
+        // match logic below only fires for objects actually in this watcher's cache. Without
+        // this, an object that never matched the selector gets a phantom DELETED the first
+        // time it's modified into another non-matching state, even though the watcher was
+        // never told ADDED for it.
+        let mut ever_matched: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
         // Use the client-requested timeout. When absent, default to 30 minutes
         // (1800s) to match the Kubernetes apiserver --min-request-timeout default.
         // The 5-minute value that was here caused watch streams to expire 6× more
@@ -687,6 +705,10 @@ async fn watch_generic_impl<S: Store>(
                 {
                     continue;
                 }
+                ever_matched.insert((
+                    item["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
+                    item["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                ));
                 let emit = if as_partial_object_metadata {
                     to_partial_object_metadata(&item)
                 } else {
@@ -776,9 +798,9 @@ async fn watch_generic_impl<S: Store>(
                                             continue;
                                         }
                                     };
-                                    if object_matches_label_selector(&parsed, &label_selector)
-                                        && field_selector_matches(&parsed)
-                                    {
+                                    let now_matches = object_matches_label_selector(&parsed, &label_selector)
+                                        && field_selector_matches(&parsed);
+                                    if now_matches {
                                         // When an object re-enters the watch scope after a synthetic
                                         // DELETED was sent (e.g. label was restored), emit ADDED so
                                         // the watcher treats it as a newly-appearing object.
@@ -792,6 +814,12 @@ async fn watch_generic_impl<S: Store>(
                                         };
                                         let obj_name = parsed["metadata"]["name"].as_str().unwrap_or("");
                                         let obj_ns = parsed["metadata"]["namespace"].as_str().unwrap_or("");
+                                        // Record that this watcher has now delivered the object as
+                                        // present, so a later MODIFIED that leaves the watch scope is
+                                        // known to be a real transition-out, not a phantom delete for
+                                        // an object the watcher was never told about (see
+                                        // should_emit_synthetic_delete).
+                                        ever_matched.insert((obj_ns.to_string(), obj_name.to_string()));
                                         tracing::debug!(
                                             prefix = %prefix,
                                             event_type,
@@ -809,40 +837,45 @@ async fn watch_generic_impl<S: Store>(
                                             parsed
                                         };
                                         yield Ok::<Bytes, axum::BoxError>(ndjson_event_value(event_type, &emit));
-                                    } else if is_modified && !locally_deleted.contains(&obj.key) {
-                                        // The object no longer matches the selector after this
-                                        // MODIFIED update. Emit a synthetic DELETED so watchers
-                                        // remove it from their cache. Without this, informers
-                                        // with a labelSelector would never learn that a previously-
-                                        // matching object exited their watch scope.
-                                        // Only emit once — if locally_deleted already contains
-                                        // this key, the watcher already sent a DELETED and a
-                                        // subsequent MODIFIED-without-match must be suppressed.
-                                        locally_deleted.insert(obj.key.clone());
-                                        let name = parsed["metadata"]["name"].as_str().unwrap_or("");
-                                        let ns = parsed["metadata"]["namespace"].as_str().unwrap_or("");
-                                        let rv = obj.revision.to_string();
-                                        let tombstone = if ns.is_empty() {
-                                            serde_json::json!({
-                                                "apiVersion": api_version,
-                                                "kind": kind,
-                                                "metadata": {
-                                                    "name": name,
-                                                    "resourceVersion": rv
-                                                }
-                                            })
-                                        } else {
-                                            serde_json::json!({
-                                                "apiVersion": api_version,
-                                                "kind": kind,
-                                                "metadata": {
-                                                    "name": name,
-                                                    "namespace": ns,
-                                                    "resourceVersion": rv
-                                                }
-                                            })
-                                        };
-                                        yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
+                                    } else {
+                                        // The object doesn't match the selector after this event.
+                                        // Only emit a synthetic DELETED if this watcher previously
+                                        // delivered it as matching — otherwise it was never told
+                                        // ADDED for this object and a DELETE would be a phantom event
+                                        // for an object outside its cache.
+                                        let name = parsed["metadata"]["name"].as_str().unwrap_or("").to_string();
+                                        let ns = parsed["metadata"]["namespace"].as_str().unwrap_or("").to_string();
+                                        let was_matched = ever_matched.remove(&(ns.clone(), name.clone()));
+                                        if !locally_deleted.contains(&obj.key)
+                                            && should_emit_synthetic_delete(is_modified, now_matches, was_matched)
+                                        {
+                                            // Only emit once — if locally_deleted already contains
+                                            // this key, the watcher already sent a DELETED and a
+                                            // subsequent MODIFIED-without-match must be suppressed.
+                                            locally_deleted.insert(obj.key.clone());
+                                            let rv = obj.revision.to_string();
+                                            let tombstone = if ns.is_empty() {
+                                                serde_json::json!({
+                                                    "apiVersion": api_version,
+                                                    "kind": kind,
+                                                    "metadata": {
+                                                        "name": name,
+                                                        "resourceVersion": rv
+                                                    }
+                                                })
+                                            } else {
+                                                serde_json::json!({
+                                                    "apiVersion": api_version,
+                                                    "kind": kind,
+                                                    "metadata": {
+                                                        "name": name,
+                                                        "namespace": ns,
+                                                        "resourceVersion": rv
+                                                    }
+                                                })
+                                            };
+                                            yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
+                                        }
                                     }
                                 } else {
                                     let event_type = if is_modified { "MODIFIED" } else { "ADDED" };
@@ -876,6 +909,14 @@ async fn watch_generic_impl<S: Store>(
                                                 Ok(converted) => {
                                                     let matches = object_matches_label_selector(&converted, &label_selector)
                                                         && field_selector_matches(&converted);
+                                                    // The object is gone either way; forget it so a
+                                                    // future create reusing this name/namespace starts
+                                                    // from a clean "never matched" state instead of
+                                                    // inheriting a stale ever_matched entry.
+                                                    ever_matched.remove(&(
+                                                        converted["metadata"]["namespace"].as_str().unwrap_or("").to_string(),
+                                                        converted["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                                                    ));
                                                     if matches {
                                                         emit_body = serde_json::to_vec(&converted).ok().map(Bytes::from);
                                                     }
@@ -2117,6 +2158,173 @@ mod tests {
         assert_eq!(
             modified_count, 0,
             "MODIFIED that exits scope must not appear as MODIFIED in stream; got {:?}",
+            lines
+        );
+    }
+
+    // -- should_emit_synthetic_delete --
+
+    /// An object that never matched this watcher's selector must not get a synthetic
+    /// DELETE just because it's modified into another non-matching state.
+    ///
+    /// Fails on revert: reverting to the old gate (`is_modified && !now_matches`, no
+    /// `ever_matched` term) makes this return true, reproducing the exact bug — an
+    /// informer that was never told ADDED for the object gets a phantom DELETED for it.
+    #[test]
+    fn should_emit_synthetic_delete_false_when_never_matched() {
+        assert!(
+            !should_emit_synthetic_delete(true, false, false),
+            "an object this watcher never delivered as matching must never get a \
+             synthetic DELETE — the client was never told the object exists, so a \
+             DELETE for it is a phantom event"
+        );
+    }
+
+    /// A previously-matching object that transitions out of scope must still get the
+    /// synthetic DELETE. Guards against over-correcting the fix above: if
+    /// `should_emit_synthetic_delete` ignored `ever_matched` (e.g. always returned
+    /// false), informers would keep stale cache entries for objects that no longer
+    /// satisfy their label/field selector.
+    ///
+    /// Fails on revert to an over-corrected implementation that drops this case.
+    #[test]
+    fn should_emit_synthetic_delete_true_when_previously_matched() {
+        assert!(
+            should_emit_synthetic_delete(true, false, true),
+            "an object this watcher previously delivered as matching must get a \
+             synthetic DELETE once it stops matching, so the client's cache drops it"
+        );
+    }
+
+    /// An ADDED event (an object's very first appearance) can never be a scope-exit
+    /// transition, so it must never emit a synthetic DELETE — even if `ever_matched` is
+    /// (implausibly) already true.
+    #[test]
+    fn should_emit_synthetic_delete_false_when_not_modified() {
+        assert!(
+            !should_emit_synthetic_delete(false, false, true),
+            "only a MODIFIED event can represent an object leaving watch scope; an \
+             ADDED event must never trigger a synthetic DELETE"
+        );
+    }
+
+    /// An object that still matches the selector is not leaving scope, so it must not
+    /// receive a synthetic DELETE regardless of history — that case is handled by the
+    /// ADDED/MODIFIED emission branch, not this one.
+    #[test]
+    fn should_emit_synthetic_delete_false_when_still_matches() {
+        assert!(
+            !should_emit_synthetic_delete(true, true, true),
+            "an object that still matches the selector must not receive a synthetic \
+             DELETE just because it was modified"
+        );
+    }
+
+    /// Regression test: a MODIFIED event for an object that never matched the watch's
+    /// selector must not produce a synthetic DELETED end-to-end through watch_generic.
+    ///
+    /// This is the exact failure from the CustomResourceFieldSelectors conformance test:
+    /// an informer that never received an object as ADDED (it never matched the
+    /// fieldSelector) later saw the object updated — still not matching — and the
+    /// watch wrongly emitted a synthetic DELETED for it, an object the informer's cache
+    /// never contained.
+    ///
+    /// This test would fail on revert: without the ever_matched gate, `deleted_count` is
+    /// 1 for an object this watcher was never told ADDED for.
+    #[tokio::test]
+    async fn watch_generic_modified_event_on_never_matched_object_emits_no_synthetic_deleted() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Create an object that does NOT match "app=frontend" from the start.
+        let obj_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-never-matched",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        let rv1 = store
+            .put(
+                "/registry/configmaps/default/cm-never-matched",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v1).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        // Update it — still does not match "app=frontend". This MODIFIED event is the
+        // one that triggered the phantom DELETE before the fix.
+        let obj_v2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-never-matched",
+                "namespace": "default",
+                "labels": { "app": "backend2" }
+            }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-never-matched",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Watch with "app=frontend". Ring buffer has ADDED (no match) then MODIFIED (no
+        // match). Neither should reach the client, and the MODIFIED must not produce a
+        // synthetic DELETED — the client was never told this object exists.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 0,
+            "never-matching object must not be delivered as ADDED; got {:?}",
+            lines
+        );
+
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
+        assert_eq!(
+            deleted_count, 0,
+            "MODIFIED event on an object that never matched the selector must not emit \
+             a synthetic DELETED — the watcher was never told ADDED for it, so a DELETE \
+             is a phantom event for an object outside its cache: got {:?}",
             lines
         );
     }
