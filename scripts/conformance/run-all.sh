@@ -16,7 +16,10 @@
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
-#                lima-node VM, and wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
+#                lima-node VM (and the --extra-node VM too, if one is given on
+#                the same command line, so a stale pre-existing extra node is
+#                never silently reused on a network config it predates), and
+#                wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
 #   --focus      Passed through to sonobuoy to narrow test selection.
 #                Also settable via SONOBUOY_FOCUS env var.
 #   --stack-only Bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler) and
@@ -126,6 +129,7 @@ _KONNECTIVITY_SERVER_PORT_ARG=""
 _WORKDIR_ARG=""
 _VM_ARG=""
 _KCM_V_ARG=""
+_EXTRA_NODE_ARG=""
 # When --verbose is set, raise kube-controller-manager verbosity to --v=4 so the
 # disruption controller logs its pod list / expectedCount decisions (V(4)) — the
 # view needed to diagnose why disruptedPods gets cleared.
@@ -135,11 +139,12 @@ _KCM_V_ARG=""
 [ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"
 _WORKDIR_ARG="--workdir $WORKDIR"
 [ -n "${U7S_VM_NAME:-}" ] && _VM_ARG="--vm $U7S_VM_NAME"
+[ -n "$EXTRA_NODE" ] && _EXTRA_NODE_ARG="--extra-node $EXTRA_NODE"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
   # shellcheck disable=SC2086
-  bash "$DIR/reset.sh" ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG}
+  bash "$DIR/reset.sh" ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_EXTRA_NODE_ARG}
 fi
 
 # Step 01: Build — skipped when --binary is supplied (caller provides the binary).
