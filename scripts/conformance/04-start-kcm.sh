@@ -56,7 +56,8 @@ set -euo pipefail
 
 WORKDIR="$WORKDIR"
 # Verbosity flag: when run-all.sh is invoked with --verbose it passes --kcm-v <N>,
-# which becomes "--v=<N>" here so the disruption controller's V(4) pod-list logs appear.
+# which becomes "--v=<N>" here to surface controller-decision logs (see run-all.sh
+# for the level chosen and why).
 KCM_V_FLAG="$([ -n "$KCM_V" ] && echo "--v=$KCM_V" || echo "")"
 CACHE_DIR="\${KCM_CACHE_DIR:-\${HOME}/.cache/u7s/kcm}"
 KCM_LOG="$KCM_LOG"
