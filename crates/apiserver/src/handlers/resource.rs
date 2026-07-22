@@ -653,6 +653,17 @@ pub async fn delete_resource<S: Store>(
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
+    // below) instead of stripping children ourselves. See add_orphan_finalizer for why.
+    if delete_opts.is_orphan() && !owner_uid.is_empty() {
+        add_orphan_finalizer(&mut obj);
+    }
+
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // Soft-delete: persist modified object, return it.
         // Evict from RBAC index immediately — permissions must not outlast the deletion
@@ -677,17 +688,6 @@ pub async fn delete_resource<S: Store>(
         let mut resp_body = Object { body: soft };
         resp_body.set_resource_version(new_rv);
         return Ok(Json(resp_body.body).into_response());
-    }
-
-    let owner_uid = obj.body["metadata"]["uid"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    if delete_opts.is_orphan() && !owner_uid.is_empty() {
-        // Orphan: strip ownerReferences pointing to this object from all children,
-        // then hard-delete the owner. Do NOT cascade-delete the children.
-        orphan_owned_resources(&state, &group, &plural, None, &owner_uid).await;
     }
 
     state
@@ -782,10 +782,19 @@ async fn complete_finalizer_drain<S: Store>(
     if group == APISERVICE_GROUP {
         state.refresh_apiservice_cache().await;
     }
-    // If this object lived in a namespace, check whether its namespace is now ready to
-    // complete deletion. This handles the OrderedNamespaceDeletion flow: after all
+    // If this object lived in a namespace, refresh quota usage and check whether the
+    // namespace is now ready to complete its own deletion.
+    //
+    // The quota refresh matters here specifically because of Orphan propagation: an
+    // Orphan-marked owner (see add_orphan_finalizer) no longer hard-deletes synchronously
+    // in the original DELETE request — it soft-deletes and waits for KCM to drain the
+    // `orphan` finalizer, so THIS is now the only place its hard-delete (and the quota
+    // recount that must follow it) actually happens.
+    //
+    // The namespace check handles the OrderedNamespaceDeletion flow: after all
     // finalizer'd objects are cleared, the Terminating namespace hard-deletes.
     if let Some(namespace) = ns {
+        quota::update_quota_status(state, namespace).await;
         super::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
     }
     Ok(())
@@ -2067,24 +2076,6 @@ pub async fn delete_namespaced_resource<S: Store>(
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
-    if let Some(soft) = apply_delete_policy(&mut obj) {
-        // Evict from RBAC index immediately on soft-delete — same rationale as
-        // delete_resource: permissions must not outlast the deletion request.
-        if group == RBAC_GROUP {
-            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
-            .store
-            .put(&key, obj.to_bytes(), expected_rv)
-            .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut resp_body = Object { body: soft };
-        resp_body.set_resource_version(new_rv);
-        return Ok(Json(resp_body.body).into_response());
-    }
-
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
         .unwrap_or("")
@@ -2108,27 +2099,28 @@ pub async fn delete_namespaced_resource<S: Store>(
             && plural == "replicationcontrollers"
             && !delete_opts.is_explicit_cascade());
 
+    // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
+    // below) instead of stripping children ourselves. See add_orphan_finalizer for why.
     if effective_orphan && !owner_uid.is_empty() {
-        // Orphan: strip ownerReferences pointing to this object from all namespaced children,
-        // then hard-delete the owner only. Do NOT cascade-delete the children.
-        orphan_owned_resources(&state, &group, &plural, Some(&ns), &owner_uid).await;
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        add_orphan_finalizer(&mut obj);
+    }
+
+    if let Some(soft) = apply_delete_policy(&mut obj) {
+        // Evict from RBAC index immediately on soft-delete — same rationale as
+        // delete_resource: permissions must not outlast the deletion request.
         if group == RBAC_GROUP {
             let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
             state.rbac_index.remove_object(&rbac_key);
         }
-        quota::update_quota_status(&state, &ns).await;
-        return Ok(Json(serde_json::json!({
-            "kind": "Status",
-            "apiVersion": "v1",
-            "status": "Success",
-            "code": 200
-        }))
-        .into_response());
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        let mut resp_body = Object { body: soft };
+        resp_body.set_resource_version(new_rv);
+        return Ok(Json(resp_body.body).into_response());
     }
 
     state
@@ -2742,130 +2734,47 @@ pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &
     format!("/apis/{group}/{version}/{plural}/{name}")
 }
 
-/// Strip the ownerReference entry for `owner_uid` from all child resources that may
-/// be owned by the deleted object.
+/// Mark `obj` for Orphan propagation by adding the `orphan` finalizer
+/// (`metav1.FinalizerOrphanDependents`), instead of stripping owned children ourselves.
+/// Idempotent — a no-op if the finalizer is already present; appends rather than replaces,
+/// so a pre-existing, unrelated finalizer survives untouched.
 ///
-/// Called on Orphan delete. The owner is hard-deleted by the caller; children survive
-/// with the ownerReference removed so GC does not later garbage-collect them.
+/// This mirrors real Kubernetes and must run BEFORE `apply_delete_policy` decides whether to
+/// soft- or hard-delete the object: with the finalizer present, `apply_delete_policy`
+/// naturally takes its soft-delete branch (deletionTimestamp set, object stays visible),
+/// which is exactly the signal every well-behaved controller — including the owner's own
+/// reconcile loop — needs to stop acting on it. u7s's real, unmodified KCM garbage collector
+/// strips each dependent's ownerReferences from its own consistent view of the cluster, then
+/// removes this finalizer; the existing finalizer-drain machinery (`finalizer_drain_complete`
+/// / `complete_finalizer_drain`) then completes the real hard-delete.
 ///
-/// Scans pods (for RC/DaemonSet/StatefulSet owners) and replicasets (for Deployment owners)
-/// in the same namespace. For cluster-scoped owners `namespace` is None.
+/// The previous implementation stripped dependents' ownerReferences synchronously here and
+/// hard-deleted the owner in the same request. That raced real KCM's garbage collector: KCM
+/// keeps a separate informer cache per resource type (owner vs. dependents — two independent
+/// watch streams with no cross-stream ordering guarantee), so it could process the owner's
+/// DELETE before catching up on a dependent's ownerRef-stripped MODIFIED event, and
+/// cascade-delete a dependent that should have survived (observed live: a 100-replica RC
+/// orphan-delete drained 100 -> 26 surviving pods).
 ///
-/// Conformance requirement: `propagationPolicy=Orphan` must leave owned resources alive
-/// and strip their ownerReferences — GC orphan specs fail if cascade deletes them instead.
-async fn orphan_owned_resources<S: Store>(
-    state: &crate::state::AppState<S>,
-    owner_group: &str,
-    owner_plural: &str,
-    namespace: Option<&str>,
-    owner_uid: &str,
-) {
-    // Determine which child resource types to scan based on the owner kind.
-    // Deployment → RSes (and pods, transitively, but GC conformance only checks RS survival).
-    // RC / DaemonSet / StatefulSet → pods.
-    let scan_replicasets = owner_group == "apps" && owner_plural == "deployments";
-    let scan_pods = !scan_replicasets;
-
-    let ns = namespace.unwrap_or("");
-
-    if scan_pods {
-        strip_owner_from_resources(
-            state,
-            &crate::keys::group_list_prefix("", "pods", namespace),
-            owner_uid,
-            ns,
-            "pods",
-        )
-        .await;
-    }
-
-    if scan_replicasets {
-        strip_owner_from_resources(
-            state,
-            &crate::keys::group_list_prefix("apps", "replicasets", namespace),
-            owner_uid,
-            ns,
-            "replicasets",
-        )
-        .await;
-    }
-}
-
-/// List all objects under `prefix`, find those with an ownerReference matching `owner_uid`,
-/// and remove that entry from their ownerReferences. Persists each updated object.
-async fn strip_owner_from_resources<S: Store>(
-    state: &crate::state::AppState<S>,
-    prefix: &str,
-    owner_uid: &str,
-    namespace: &str,
-    resource_label: &str,
-) {
-    let resp = match state
-        .store
-        .list(prefix, u7s_store::ListOptions::default())
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("orphan: list {resource_label} in {namespace}: {e}");
-            return;
-        }
-    };
-
-    for item in resp.items {
-        let mut child: serde_json::Value = match serde_json::from_slice(&item.value) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let refs = match child["metadata"]["ownerReferences"].as_array() {
-            Some(r) if r.iter().any(|r| r["uid"].as_str() == Some(owner_uid)) => r.clone(),
-            _ => continue,
-        };
-
-        // Remove entries matching owner_uid; keep all others.
-        let filtered: Vec<serde_json::Value> = refs
-            .into_iter()
-            .filter(|r| r["uid"].as_str() != Some(owner_uid))
-            .collect();
-
-        if filtered.is_empty() {
-            child["metadata"]
-                .as_object_mut()
-                .map(|m| m.remove("ownerReferences"));
-        } else {
-            child["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
-        }
-
-        let child_name = child["metadata"]["name"].as_str().unwrap_or("").to_string();
-        if child_name.is_empty() {
-            continue;
-        }
-        let child_ns = child["metadata"]["namespace"].as_str().unwrap_or(namespace);
-        let child_group = if child["apiVersion"].as_str().unwrap_or("").contains('/') {
-            child["apiVersion"]
-                .as_str()
-                .unwrap_or("")
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .to_string()
-        } else {
-            "".to_string()
-        };
-        let child_plural = resource_label.to_string();
-        let child_key =
-            crate::keys::group_object_key(&child_group, &child_plural, Some(child_ns), &child_name);
-
-        let updated_bytes = match serde_json::to_vec(&child) {
-            Ok(b) => bytes::Bytes::from(b),
-            Err(e) => {
-                tracing::warn!("orphan: serialize {resource_label}/{child_name}: {e}");
-                continue;
+/// Do NOT replace this with a delay between the strip and the hard-delete instead: keeping
+/// the owner alive in the store while dependents are stripped lets the owner's own
+/// controller (e.g. the ReplicationController controller) observe zero *owned* replicas and
+/// spawn genuine replacement dependents during the window — which then have intact
+/// ownerReferences and are correctly reaped when the owner is finally deleted, causing total
+/// (0/N) dependent loss instead of the original partial race. This was tried and reverted.
+fn add_orphan_finalizer(obj: &mut Object) {
+    const ORPHAN_FINALIZER: &str = "orphan";
+    match obj.body["metadata"]["finalizers"].as_array_mut() {
+        Some(finalizers) => {
+            if !finalizers
+                .iter()
+                .any(|f| f.as_str() == Some(ORPHAN_FINALIZER))
+            {
+                finalizers.push(serde_json::Value::String(ORPHAN_FINALIZER.to_string()));
             }
-        };
-        if let Err(e) = state.store.put(&child_key, updated_bytes, None).await {
-            tracing::warn!("orphan: update {resource_label}/{child_name}: {e}");
+        }
+        None => {
+            obj.body["metadata"]["finalizers"] = serde_json::json!([ORPHAN_FINALIZER]);
         }
     }
 }
@@ -5480,17 +5389,21 @@ mod tests {
         );
     }
 
-    /// Deleting a ReplicationController with nil propagationPolicy must orphan
-    /// (strip ownerReferences from) owned pods, not cascade-delete them.
+    /// Deleting a ReplicationController with nil propagationPolicy must orphan owned pods
+    /// (not cascade-delete them) via the same `orphan` finalizer signal as an explicit
+    /// Orphan delete — not by u7s stripping ownerReferences itself.
     ///
     /// The k8s GC conformance spec "should orphan pods created by rc if
     /// deleteOptions.OrphanDependents is nil" (garbage_collector.go:475) sends an
     /// empty DeleteOptions (only Preconditions) and asserts that the 2 pods
-    /// created by the RC still exist after 30 s.  In u7s, if pods keep their
-    /// ownerReferences pointing to the now-deleted RC, KCM's GC controller
-    /// garbage-collects them within seconds (dangling ownerRef = orphaned dependent).
-    /// We must strip ownerRefs upfront so GC does not collect them.  This matches the
-    /// "ORPHAN" semantics the spec title states — nil deleteOptions means orphan for RC.
+    /// created by the RC still exist after 30 s. Synchronously stripping ownerRefs and
+    /// hard-deleting the RC in the same request (the old implementation) raced real KCM's
+    /// garbage collector — KCM's owner and dependent informer caches are independent watch
+    /// streams with no cross-stream ordering guarantee, so it could see the RC's DELETE
+    /// before catching up on a pod's stripped-ownerRef MODIFIED event and cascade-delete
+    /// that pod anyway (live-reproduced: a 100-replica RC drained 100 -> 26 survivors).
+    /// Soft-deleting the RC with the `orphan` finalizer instead lets real, unmodified KCM do
+    /// the strip from its own consistent view before removing the finalizer.
     #[tokio::test]
     async fn nil_propagation_rc_delete_does_not_cascade_pods() {
         use std::sync::Arc;
@@ -5570,18 +5483,29 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
 
-        // RC itself must be gone.
+        // RC must be SOFT-deleted (deletionTimestamp + the "orphan" finalizer), staying
+        // visible until KCM's GC controller confirms dependents are stripped and drains the
+        // finalizer — NOT hard-deleted synchronously in this request.
+        let rc_stored = store.get(rc_key).await.unwrap().expect(
+            "RC must remain in the store (soft-deleted) immediately after a nil-policy delete",
+        );
+        let rc_val: serde_json::Value = serde_json::from_slice(&rc_stored.value).unwrap();
         assert!(
-            store.get(rc_key).await.unwrap().is_none(),
-            "ReplicationController itself must be hard-deleted"
+            rc_val["metadata"]["deletionTimestamp"].is_string(),
+            "nil-policy RC delete must stamp deletionTimestamp — this is what tells the RC's \
+             own reconcile loop to stop acting on it"
+        );
+        assert_eq!(
+            rc_val["metadata"]["finalizers"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec!["orphan"]),
+            "nil-policy RC delete must add the `orphan` finalizer so real KCM's GC controller \
+             strips dependents itself before the finalizer drains"
         );
 
-        // Pod must SURVIVE with ownerReferences stripped — nil policy RC delete must orphan pods
-        // (strip ownerRefs) so the KCM GC controller does not garbage-collect them.
-        // If this fails the conformance spec 'should orphan pods created by rc if
-        // deleteOptions.OrphanDependents is nil' (garbage_collector.go:475) will fail:
-        // KCM's GC sees pods with ownerRef pointing to deleted RC and deletes them within seconds,
-        // causing 'expect 2 pods, got 0 pods'.  Stripping ownerRefs prevents GC collection.
+        // Pod must SURVIVE, with its ownerReferences UNTOUCHED by u7s at this point — stripping
+        // is now exclusively real KCM's job, once it observes the `orphan` finalizer above.
         let pod_stored = store.get(pod_key).await.unwrap().unwrap();
         let pod_val: serde_json::Value = serde_json::from_slice(&pod_stored.value).unwrap();
         assert!(
@@ -5590,10 +5514,11 @@ mod tests {
         );
         let owner_refs = pod_val["metadata"]["ownerReferences"].as_array().cloned();
         assert!(
-            owner_refs.map(|r| r.is_empty()).unwrap_or(true),
-            "pod ownerReferences must be stripped on nil-policy RC delete — without stripping, \
-             KCM GC sees dangling ownerRef and garbage-collects the pod within 30 s, causing \
-             the GC conformance spec 'deleteOptions.OrphanDependents is nil' to fail"
+            owner_refs.is_some_and(|r| r.iter().any(|r| r["uid"].as_str() == Some(rc_uid))),
+            "u7s must NOT strip the pod's ownerReference itself at delete time — doing so \
+             synchronously, before the RC is confirmed gone, is exactly the race that dropped \
+             live pods in the real-KCM conformance run this fix addresses (100-replica RC \
+             orphan-delete drained 100 -> 26 survivors)"
         );
     }
 
@@ -5719,14 +5644,22 @@ mod tests {
         );
     }
 
-    /// Orphan delete of an RC must LEAVE owned pods alive and strip their ownerReferences.
+    /// Orphan delete of an RC must soft-delete the RC (deletionTimestamp + the `orphan`
+    /// finalizer) and must NOT synchronously strip or cascade-delete its pods.
     ///
     /// GC conformance specs "should orphan pods created by rc if delete options say so" and
     /// "should orphan pods created by rc if deleteOptions.OrphanDependents is nil" assert that
-    /// pods survive RC deletion with propagationPolicy=Orphan. If the cascade runs instead,
-    /// expected 50 pods becomes 0 — a data-loss regression visible to every kubectl --cascade=orphan user.
+    /// pods survive RC deletion with propagationPolicy=Orphan. Synchronously stripping
+    /// ownerRefs and hard-deleting the RC in the same request (the old implementation) raced
+    /// real KCM's garbage collector — separate informer caches per resource type (owner vs.
+    /// dependents) gave no cross-stream ordering guarantee, so KCM could process the RC's
+    /// DELETE before catching up on a pod's stripped-ownerRef MODIFIED event and
+    /// cascade-delete it anyway (live-reproduced: 100 replicas drained to 26 survivors).
+    /// The `orphan` finalizer instead lets real, unmodified KCM do the strip itself, from its
+    /// own consistent view, before removing the finalizer and letting the real hard-delete
+    /// complete via finalizer drain.
     #[tokio::test]
-    async fn orphan_delete_rc_leaves_pods_alive_strips_owner_refs() {
+    async fn orphan_delete_rc_soft_deletes_with_finalizer_and_does_not_strip_pods_synchronously() {
         use std::sync::Arc;
         use u7s_store::SqliteStore;
 
@@ -5811,10 +5744,27 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("orphan delete must succeed: {e:?}"));
 
-        // RC must be deleted.
+        // RC must be SOFT-deleted: still present, with deletionTimestamp and the `orphan`
+        // finalizer — NOT hard-deleted synchronously in this request.
+        let rc_stored = store.get(rc_key).await.unwrap().expect(
+            "RC must remain in the store (soft-deleted) immediately after an Orphan delete — \
+             hard-deleting it here, before KCM confirms dependents are stripped, is the exact \
+             race that let real KCM's GC controller cascade-delete pods that should survive",
+        );
+        let rc_val: serde_json::Value = serde_json::from_slice(&rc_stored.value).unwrap();
         assert!(
-            store.get(rc_key).await.unwrap().is_none(),
-            "RC itself must be hard-deleted on Orphan delete"
+            rc_val["metadata"]["deletionTimestamp"].is_string(),
+            "Orphan delete must stamp deletionTimestamp on the RC — this is what tells the \
+             RC's own reconcile loop (and every other controller) to stop acting on it"
+        );
+        assert_eq!(
+            rc_val["metadata"]["finalizers"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec!["orphan"]),
+            "Orphan delete must add the `orphan` finalizer (metav1.FinalizerOrphanDependents) \
+             so real KCM's GC controller knows to strip dependents itself before the finalizer \
+             drains and the RC is actually removed"
         );
 
         // Pod must SURVIVE — Orphan delete must not cascade.
@@ -5825,7 +5775,8 @@ mod tests {
              GC conformance specs 'should orphan pods created by rc if delete options say so' will fail"
         );
 
-        // Pod's ownerReferences must be stripped.
+        // Pod's ownerReferences must be UNTOUCHED by u7s at this point: stripping is now
+        // exclusively real KCM's job, once it observes the `orphan` finalizer above.
         let pod_stored = store.get(pod_key).await.unwrap().unwrap();
         let pod_val: serde_json::Value = serde_json::from_slice(&pod_stored.value).unwrap();
         let owner_refs = pod_val["metadata"]["ownerReferences"].as_array();
@@ -5833,19 +5784,24 @@ mod tests {
             .map(|refs| refs.iter().any(|r| r["uid"].as_str() == Some(rc_uid)))
             .unwrap_or(false);
         assert!(
-            !still_has_owner_ref,
-            "Orphan delete must strip ownerReference pointing to the RC — \
-             without this the GC will garbage-collect the pod later, defeating Orphan semantics"
+            still_has_owner_ref,
+            "u7s must NOT strip the pod's ownerReference itself at delete time — doing so \
+             synchronously, before the RC is confirmed gone, is exactly the race that dropped \
+             live pods in the real-KCM conformance run this fix addresses"
         );
     }
 
-    /// Orphan delete of a Deployment must leave owned ReplicaSets alive and strip their ownerReferences.
+    /// Orphan delete of a Deployment must soft-delete it (deletionTimestamp + the `orphan`
+    /// finalizer) and must NOT synchronously strip or cascade-delete its ReplicaSets — the
+    /// same `orphan_owned_resources`-based path RC orphan-delete used to take, and the same
+    /// fix (add_orphan_finalizer) applies here identically.
     ///
     /// GC conformance spec "should orphan RS created by deployment when deleteOptions.PropagationPolicy is Orphan"
     /// asserts RSes survive the Deployment deletion. If cascade runs instead, the RS count goes to 0
     /// (and so do its pods), breaking --cascade=orphan for Deployments.
     #[tokio::test]
-    async fn orphan_delete_deployment_leaves_replicasets_alive_strips_owner_refs() {
+    async fn orphan_delete_deployment_soft_deletes_with_finalizer_and_does_not_strip_rs_synchronously(
+    ) {
         use std::sync::Arc;
         use u7s_store::SqliteStore;
 
@@ -5929,10 +5885,25 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("orphan delete must succeed: {e:?}"));
 
-        // Deployment must be deleted.
+        // Deployment must be SOFT-deleted: still present, with deletionTimestamp and the
+        // `orphan` finalizer — NOT hard-deleted synchronously in this request.
+        let deploy_stored = store.get(deploy_key).await.unwrap().expect(
+            "Deployment must remain in the store (soft-deleted) immediately after an Orphan \
+             delete — hard-deleting it before KCM confirms RSes are stripped races real KCM's \
+             GC controller exactly like the RC case this fix addresses",
+        );
+        let deploy_val: serde_json::Value = serde_json::from_slice(&deploy_stored.value).unwrap();
         assert!(
-            store.get(deploy_key).await.unwrap().is_none(),
-            "Deployment itself must be hard-deleted on Orphan delete"
+            deploy_val["metadata"]["deletionTimestamp"].is_string(),
+            "Orphan delete must stamp deletionTimestamp on the Deployment"
+        );
+        assert_eq!(
+            deploy_val["metadata"]["finalizers"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec!["orphan"]),
+            "Orphan delete must add the `orphan` finalizer so real KCM's GC controller strips \
+             the owned ReplicaSets itself before the finalizer drains"
         );
 
         // RS must SURVIVE — Orphan delete must not cascade.
@@ -5943,7 +5914,8 @@ mod tests {
              GC conformance spec 'should orphan RS created by deployment...' will fail if this regresses"
         );
 
-        // RS's ownerReferences must be stripped.
+        // RS's ownerReferences must be UNTOUCHED by u7s at this point — stripping is now
+        // exclusively real KCM's job, once it observes the `orphan` finalizer above.
         let rs_stored = store.get(rs_key).await.unwrap().unwrap();
         let rs_val: serde_json::Value = serde_json::from_slice(&rs_stored.value).unwrap();
         let owner_refs = rs_val["metadata"]["ownerReferences"].as_array();
@@ -5951,9 +5923,10 @@ mod tests {
             .map(|refs| refs.iter().any(|r| r["uid"].as_str() == Some(deploy_uid)))
             .unwrap_or(false);
         assert!(
-            !still_has_owner_ref,
-            "Orphan delete must strip ownerReference pointing to the Deployment from its RSes — \
-             without this GC will garbage-collect the RS, defeating Orphan semantics"
+            still_has_owner_ref,
+            "u7s must NOT strip the RS's ownerReference itself at delete time — the strip must \
+             come from real KCM's GC controller after it observes the `orphan` finalizer, not \
+             from u7s racing ahead of KCM's own dependent-informer cache"
         );
     }
 
@@ -6059,6 +6032,158 @@ mod tests {
         assert!(
             store.get(rc_key).await.unwrap().is_none(),
             "RC itself must be hard-deleted on Background delete"
+        );
+    }
+
+    /// add_orphan_finalizer must add the "orphan" finalizer exactly once, and must never
+    /// drop finalizers a controller already placed on the object.
+    ///
+    /// This is the core of the Orphan-delete fix: real Kubernetes signals Orphan propagation
+    /// by adding `metav1.FinalizerOrphanDependents` ("orphan") to the object being deleted,
+    /// not by u7s stripping dependents itself. If this ever clobbered an existing finalizer
+    /// array instead of appending, an object with e.g. a storage-protection finalizer would
+    /// silently lose it on an Orphan delete, letting the object hard-delete before that
+    /// controller's own cleanup ran.
+    #[test]
+    fn add_orphan_finalizer_appends_without_duplicating_or_clobbering() {
+        // No finalizers yet: must create the array with just "orphan".
+        let mut obj = Object {
+            body: serde_json::json!({ "metadata": {} }),
+        };
+        add_orphan_finalizer(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["finalizers"],
+            serde_json::json!(["orphan"]),
+            "must add the orphan finalizer when the object has none yet"
+        );
+
+        // Already has the orphan finalizer (e.g. a retried DELETE): must not duplicate it.
+        add_orphan_finalizer(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["finalizers"],
+            serde_json::json!(["orphan"]),
+            "must be idempotent — a second call must not duplicate the finalizer entry, or \
+             the object would never reach empty finalizers no matter how many times KCM \
+             removes just one"
+        );
+
+        // Object already has an unrelated finalizer: must append, not replace.
+        let mut obj = Object {
+            body: serde_json::json!({ "metadata": { "finalizers": ["example.com/cleanup"] } }),
+        };
+        add_orphan_finalizer(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["finalizers"],
+            serde_json::json!(["example.com/cleanup", "orphan"]),
+            "must preserve a pre-existing, unrelated finalizer — clobbering it would let that \
+             controller's own cleanup be skipped entirely once this object hard-deletes"
+        );
+    }
+
+    /// Once real KCM finishes stripping an Orphan-marked owner's dependents and removes the
+    /// last (`orphan`) finalizer, the resulting PATCH must hard-delete the owner AND refresh
+    /// quota usage — the deferred completion of what used to be the immediate-hard-delete
+    /// branch (which called quota::update_quota_status synchronously) now happens here.
+    ///
+    /// Before this fix, only the initial DELETE path called update_quota_status; moving the
+    /// real hard-delete of an Orphan-marked owner to finalizer-drain (this bug's fix) without
+    /// also moving the quota refresh would leave status.used stale after every Orphan delete
+    /// until some unrelated write in the namespace happened to recompute it — silently
+    /// blocking (or wrongly permitting) new object creates against a quota that never learned
+    /// the owner was actually gone.
+    #[tokio::test]
+    async fn orphan_finalizer_drain_completion_hard_deletes_owner_and_refreshes_quota() {
+        let state = make_state();
+        let ns = "default";
+
+        // A quota with a deliberately stale status.used — update_quota_status is idempotent
+        // and recomputes from the live store, so a correct drain-completion call is the only
+        // thing that can fix this value.
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "drain-quota", "namespace": ns },
+            "spec": { "hard": { "pods": "10" } },
+            "status": { "hard": { "pods": "10" }, "used": { "pods": "99" } }
+        });
+        let quota_key =
+            crate::keys::group_object_key("", "resourcequotas", Some(ns), "drain-quota");
+        state
+            .store
+            .put(
+                &quota_key,
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed ResourceQuota");
+
+        // Seed an RC already in the post-orphan-delete state: soft-deleted with exactly the
+        // `orphan` finalizer pending, as add_orphan_finalizer + apply_delete_policy leave it
+        // for real KCM to act on.
+        let rc_key =
+            crate::keys::group_object_key("", "replicationcontrollers", Some(ns), "draining-rc");
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "draining-rc",
+                "namespace": ns,
+                "uid": "drain-uid-0001",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["orphan"]
+            },
+            "spec": { "replicas": 0, "selector": { "app": "draining-rc" } }
+        });
+        state
+            .store
+            .put(
+                &rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining RC");
+
+        // Real KCM's GC controller has finished stripping dependents and now removes the
+        // last finalizer via a merge-patch — the exact mechanism it uses to signal drain
+        // completion.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
+        patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "draining-rc".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain patch must succeed: {e:?}"));
+
+        assert!(
+            state.store.get(&rc_key).await.unwrap().is_none(),
+            "RC must be hard-deleted once its last finalizer (orphan) drains — this is how \
+             the deferred hard-delete of an Orphan-marked owner actually completes"
+        );
+
+        let stored_quota = state.store.get(&quota_key).await.unwrap().unwrap();
+        let quota_val: serde_json::Value = serde_json::from_slice(&stored_quota.value).unwrap();
+        assert_eq!(
+            quota_val["status"]["used"]["pods"].as_str(),
+            Some("0"),
+            "quota status.used must be refreshed when the finalizer-drain hard-delete \
+             completes, not left at its stale pre-drain value"
         );
     }
 
@@ -14527,8 +14652,9 @@ mod tests {
     /// Deleting a CronJob with propagationPolicy=Orphan must NOT cascade-delete its Jobs or Pods.
     ///
     /// Explicit Orphan semantics must be honored for CronJob just as for every other resource:
-    /// the owned Jobs (and their Pods) survive with ownerReferences stripped, so they are not
-    /// later garbage-collected as orphaned dependants.
+    /// the CronJob soft-deletes with the `orphan` finalizer (the gate is generic, not
+    /// RC/Deployment-specific — see add_orphan_finalizer) and its owned Jobs survive; real
+    /// KCM's GC controller is responsible for stripping their ownerReferences, not u7s.
     #[tokio::test]
     async fn delete_cronjob_with_orphan_policy_does_not_cascade() {
         let state = make_state();
@@ -14608,10 +14734,27 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("Orphan delete must succeed: {e:?}"));
 
-        // CronJob itself must be gone.
+        // CronJob must be SOFT-deleted (deletionTimestamp + "orphan" finalizer), not
+        // hard-deleted synchronously — same generic gate as RC/Deployment Orphan deletes.
+        let cj_stored = state
+            .store
+            .get(&cj_key)
+            .await
+            .unwrap()
+            .expect("CronJob must remain in the store (soft-deleted) after an Orphan delete");
+        let cj_val: serde_json::Value = serde_json::from_slice(&cj_stored.value).unwrap();
         assert!(
-            state.store.get(&cj_key).await.unwrap().is_none(),
-            "CronJob itself must be hard-deleted on Orphan delete"
+            cj_val["metadata"]["deletionTimestamp"].is_string(),
+            "Orphan delete must stamp deletionTimestamp on the CronJob"
+        );
+        assert_eq!(
+            cj_val["metadata"]["finalizers"]
+                .as_array()
+                .and_then(|f| f.first())
+                .and_then(|v| v.as_str()),
+            Some("orphan"),
+            "Orphan delete must add the `orphan` finalizer to the CronJob, same as any other \
+             resource type"
         );
 
         // Job must survive — Orphan means do NOT cascade.
