@@ -86,6 +86,24 @@ pub fn node_address(node: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Resolve the host-side kubelet port to dial for `node_name`.
+///
+/// VM InternalIPs are not host-routable from the apiserver, so every node's kubelet is
+/// reached through its own host port-forward to 127.0.0.1 — the primary's forward is
+/// `--kubelet-port`, and every other node's is `--node-kubelet-port <name>=<port>`. A
+/// node missing from `node_kubelet_ports` (every single-node deployment, and the primary
+/// itself once other nodes are mapped) falls back to `global`. Without this per-node
+/// lookup, a pod on any node but the primary would dial the primary's forward instead of
+/// its own node's, so exec/logs/attach/port-forward against it misroute — they either
+/// time out (websocket close 1006) or hit the wrong kubelet's pod state (404).
+pub fn kubelet_port_for_node(
+    node_name: &str,
+    node_kubelet_ports: &std::collections::HashMap<String, u16>,
+    global: u16,
+) -> u16 {
+    node_kubelet_ports.get(node_name).copied().unwrap_or(global)
+}
+
 // ---------------------------------------------------------------------------
 // /log handler
 // ---------------------------------------------------------------------------
@@ -191,7 +209,7 @@ async fn resolve_log_target<S: Store>(
 
     // 5. Build the kubelet URL.
     //    Kubelet log endpoint: https://<node-ip>:<port>/containerLogs/<ns>/<pod>/<container>
-    let kp = state.kubelet_port;
+    let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
     let mut kubelet_url =
         format!("https://{node_ip}:{kp}/containerLogs/{raw_ns}/{pod_name}/{container}");
 
@@ -430,7 +448,7 @@ pub async fn resolve_attach_target<S: Store>(
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
-    let kp = state.kubelet_port;
+    let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
     let kubelet_ws_url =
         format!("wss://{node_ip}:{kp}/attach/{raw_ns}/{pod_name}/{container}?{qs}");
 
@@ -873,7 +891,7 @@ pub async fn resolve_exec_target<S: Store>(
         params.push("tty=1".to_owned());
     }
     let qs = params.join("&");
-    let kp = state.kubelet_port;
+    let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
     let kubelet_ws_url = if qs.is_empty() {
         format!("wss://{node_ip}:{kp}/exec/{raw_ns}/{pod_name}/{container}")
     } else {
@@ -1198,7 +1216,7 @@ pub(crate) async fn validate_portforward<S: Store>(
 
     // 5. Build the kubelet portForward URL.
     //    wss://<node-ip>:<port>/portForward/<ns>/<pod>[?ports=<port>]
-    let kp = state.kubelet_port;
+    let kp = kubelet_port_for_node(&node_name, &state.node_kubelet_ports, state.kubelet_port);
     let ports_qs = ports.map(|p| format!("?ports={p}")).unwrap_or_default();
     let kubelet_url = format!("wss://{node_ip}:{kp}/portForward/{ns}/{pod_name}{ports_qs}");
 
@@ -1390,7 +1408,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
         Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
     })?;
 
-    let kp = state.kubelet_port;
+    let kp = kubelet_port_for_node(bare_name, &state.node_kubelet_ports, state.kubelet_port);
     let kubelet_url = format!("https://{node_ip}:{kp}/{path_suffix}");
     Ok((kubelet_url, client))
 }
@@ -2791,6 +2809,95 @@ mod tests {
         );
     }
 
+    /// A pod on a joined (non-primary) node must dial THAT node's mapped kubelet port,
+    /// not the primary's --kubelet-port, end to end through resolve_exec_target.
+    ///
+    /// This exercises the actual proxy call site (not just kubelet_port_for_node in
+    /// isolation): if a future change reverted the call site back to reading the global
+    /// `state.kubelet_port` directly — while leaving kubelet_port_for_node itself
+    /// correct — kubelet_port_for_node's own unit tests would keep passing even though
+    /// the real bug (kubectl exec/logs against a node-2 pod misrouting to node-1's
+    /// kubelet) would be back. Only a test through the real resolve fn like this one
+    /// catches that class of revert.
+    #[tokio::test]
+    async fn exec_target_dials_the_joined_nodes_mapped_port_not_the_primarys() {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let mut state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: Some("127.0.0.1".into()),
+            kubelet_port: 10250, // primary's forward
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+        state
+            .node_kubelet_ports
+            .insert("lima-node-3".to_string(), 10261); // joined node's forward
+
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "lima-node-3", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.2"}]}
+        });
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "testpod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "lima-node-3", "containers": [{"name": "app", "image": "busybox"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "lima-node-3"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "testpod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let target = resolve_exec_target(
+            &state,
+            "default",
+            "testpod",
+            Some("app"),
+            "command=echo&command=hi&stdout=1",
+        )
+        .await
+        .expect("resolve must succeed");
+
+        assert!(
+            target.kubelet_ws_url.contains(":10261/"),
+            "a pod on lima-node-3 must dial lima-node-3's mapped port (10261), not the \
+             primary's --kubelet-port: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            !target.kubelet_ws_url.contains(":10250/"),
+            "must NOT dial the primary's port (10250) for a pod scheduled on a different, \
+             mapped node — this is the exact misroute that breaks kubectl exec against a \
+             2nd node's pods: {}",
+            target.kubelet_ws_url
+        );
+    }
+
     // -----------------------------------------------------------------------
     // pod_attach: resolve_attach_target pure-function tests
     //
@@ -3359,6 +3466,60 @@ mod tests {
     fn node_address_missing_status_returns_none() {
         let node = serde_json::json!({"metadata": {"name": "node1"}});
         assert!(node_address(&node).is_none());
+    }
+
+    /// A pod scheduled on a non-primary node must dial THAT node's kubelet forward.
+    ///
+    /// VM InternalIPs are not host-routable, so every node's kubelet is reached via a
+    /// distinct host port-forward. Before this function existed, every proxy site read
+    /// the single global `kubelet_port`, so a pod on node-2 always dialed node-1's
+    /// forward — exec/logs/attach/port-forward against it either timed out (websocket
+    /// close 1006) or hit node-1's kubelet instead of node-2's.
+    #[test]
+    fn kubelet_port_for_node_uses_the_named_nodes_port_not_the_primarys() {
+        let mut ports: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        ports.insert("node-2".to_string(), 10261);
+        ports.insert("node-3".to_string(), 10262);
+        assert_eq!(
+            kubelet_port_for_node("node-2", &ports, 10250),
+            10261,
+            "a pod on node-2 must resolve to node-2's own kubelet forward, not the global port"
+        );
+        assert_eq!(
+            kubelet_port_for_node("node-3", &ports, 10250),
+            10262,
+            "each mapped node must resolve to its own port, not another mapped node's"
+        );
+    }
+
+    /// Single-node clusters never populate `node_kubelet_ports` (no --node-kubelet-port
+    /// flags are passed when there is no 2nd node), so this fallback must exactly
+    /// reproduce today's single-node behavior — the whole point of the fallback is that
+    /// adding per-node routing cannot regress the common, single-node case.
+    #[test]
+    fn kubelet_port_for_node_falls_back_to_global_when_map_is_empty() {
+        let ports: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        assert_eq!(
+            kubelet_port_for_node("lima-node", &ports, 10250),
+            10250,
+            "an empty map (single-node deployments) must use the global --kubelet-port"
+        );
+    }
+
+    /// The primary node is intentionally never added to `node_kubelet_ports` — only
+    /// joining nodes are. A pod scheduled on the primary must still resolve to the
+    /// global port even once other nodes are mapped, or the primary itself would break
+    /// the moment a 2nd node joins.
+    #[test]
+    fn kubelet_port_for_node_falls_back_to_global_for_unmapped_node_in_nonempty_map() {
+        let mut ports: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        ports.insert("node-2".to_string(), 10261);
+        assert_eq!(
+            kubelet_port_for_node("lima-node", &ports, 10250),
+            10250,
+            "a node missing from a non-empty map (e.g. the primary, once node-2 joins) \
+             must still fall back to the global port, not 0 or node-2's port"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -59,7 +59,10 @@
 #             the stack stays single-node (today's behavior, unchanged). Works with
 #             --stack-only too (brings up a 2-node stack, still skips sonobuoy).
 #   --extra-kubelet-port <N>   Host-side kubelet port for the 2nd node (see
-#             --kubelet-port). Required together with --extra-node.
+#             --kubelet-port). Required together with --extra-node. Passed to the
+#             apiserver as --node-kubelet-port at step 2 (before the node joins) so
+#             kubectl logs/exec/attach/port-forward against a pod on the 2nd node
+#             reach ITS kubelet forward instead of the primary's.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -130,6 +133,7 @@ _WORKDIR_ARG=""
 _VM_ARG=""
 _KCM_V_ARG=""
 _EXTRA_NODE_ARG=""
+_NODE_KUBELET_PORT_ARG=""
 # When --verbose is set, raise kube-controller-manager verbosity to --v=4 so the
 # disruption controller logs its pod list / expectedCount decisions (V(4)) — the
 # view needed to diagnose why disruptedPods gets cleared.
@@ -140,6 +144,11 @@ _EXTRA_NODE_ARG=""
 _WORKDIR_ARG="--workdir $WORKDIR"
 [ -n "${U7S_VM_NAME:-}" ] && _VM_ARG="--vm $U7S_VM_NAME"
 [ -n "$EXTRA_NODE" ] && _EXTRA_NODE_ARG="--extra-node $EXTRA_NODE"
+# The apiserver is started (step 2) before the extra node joins (after step 5) — but
+# run-all.sh already knows the extra node's name and kubelet port from its own CLI args,
+# so it tells the apiserver about that node's forward up front rather than needing any
+# restart/reload once the node actually joins. See --node-kubelet-port in u7s-apiserver.
+[ -n "$EXTRA_NODE" ] && _NODE_KUBELET_PORT_ARG="--node-kubelet-port ${EXTRA_NODE}=${EXTRA_KUBELET_PORT}"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -159,7 +168,7 @@ fi
 banner "Step 2/6: Start apiserver"
 # shellcheck source=02-start-apiserver.sh
 # shellcheck disable=SC2086
-source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG}
+source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG}
 
 # KUBECONFIG is now set (either from the running instance or newly started).
 if [ -z "${KUBECONFIG:-}" ]; then

@@ -231,6 +231,13 @@ pub struct AppState<S = SqliteStore> {
     /// the VM; this field carries the host port-forward target when it differs (per-worktree
     /// isolation). Default: 10250.
     pub kubelet_port: u16,
+    /// Per-node override of `kubelet_port`, keyed by node name (`spec.nodeName` /
+    /// the Node's `metadata.name`). VM InternalIPs are not host-routable, so every node's
+    /// kubelet is reached through its own host port-forward to 127.0.0.1; a node absent
+    /// from this map (every single-node deployment, and the primary once other nodes are
+    /// mapped) falls back to `kubelet_port`. Populated from `--node-kubelet-port
+    /// <name>=<port>`, one flag per non-primary node.
+    pub node_kubelet_ports: HashMap<String, u16>,
     /// Service CIDR allocator. None means auto-allocation is disabled.
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
     /// 32-byte HMAC-SHA256 signing key for continue tokens.
@@ -314,6 +321,7 @@ impl<S> Clone for AppState<S> {
             kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
             kubelet_preferred_address: self.kubelet_preferred_address.clone(),
             kubelet_port: self.kubelet_port,
+            node_kubelet_ports: self.node_kubelet_ports.clone(),
             service_ip_allocator: self.service_ip_allocator.clone(),
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
@@ -500,6 +508,12 @@ impl<S: Store> AppState<S> {
             kubelet_client_identity_pem: cfg.kubelet_client_identity_pem.map(Arc::new),
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
             kubelet_port: cfg.kubelet_port,
+            // Not part of AppStateConfig: no production or test caller needs a non-empty
+            // map at construction time. main.rs sets this field directly (it's pub) right
+            // after construction, once --node-kubelet-port has been parsed — every other
+            // caller (including every existing test) gets the empty map, which is exactly
+            // today's global-port-only behavior via kubelet_port_for_node's fallback.
+            node_kubelet_ports: HashMap::new(),
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,

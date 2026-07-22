@@ -116,9 +116,19 @@ struct Args {
     /// Host-side port the kubelet is reachable on for proxy requests (log, exec, attach,
     /// port-forward). The kubelet always serves on 10250 inside the VM; override this when
     /// the lima port-forward maps guest 10250 to a different host port for per-worktree
-    /// isolation. Must match the hostPort in lima/kubelet.yaml portForwards.
+    /// isolation. Must match the hostPort in lima/kubelet.yaml portForwards. This is the
+    /// PRIMARY node's port — every other node needs its own --node-kubelet-port entry.
     #[arg(long, default_value = "10250")]
     kubelet_port: u16,
+
+    /// Per-node override of --kubelet-port, for every node but the primary. Format:
+    /// <node-name>=<host-port>. Repeatable — pass one entry per additional node. VM
+    /// InternalIPs are not host-routable, so each node's kubelet is reached through its
+    /// own host port-forward to 127.0.0.1; without an entry here, proxy requests (log,
+    /// exec, attach, port-forward) for a pod on that node would dial --kubelet-port —
+    /// the PRIMARY's forward — instead of the node's own.
+    #[arg(long)]
+    node_kubelet_port: Vec<String>,
 
     /// Address of a konnectivity-server HTTP CONNECT proxy used to route admission webhook
     /// calls through the tunnel so that pod IPs inside the Lima VM are reachable from the
@@ -267,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
     let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
     kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
-    let state = state::AppState::new_with_config(state::AppStateConfig {
+    let mut state = state::AppState::new_with_config(state::AppStateConfig {
         store: Arc::clone(&store),
         sa_key: sa_encoding_key,
         sa_decoding_key,
@@ -283,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
         sa_public_key_pem,
     });
+    state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
 
     // 10a. Populate RBAC index from persisted objects before serving.
     state.init().await;
@@ -2166,6 +2177,26 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse repeated `--node-kubelet-port <node-name>=<host-port>` entries into a name -> port
+/// map. Errors loud on any malformed entry (missing '=', non-numeric port) rather than
+/// silently dropping it — a typo here would otherwise surface much later as a mysterious
+/// exec/log/attach misroute to the wrong node instead of a clear startup failure.
+fn parse_node_kubelet_ports(
+    entries: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, u16>> {
+    let mut map = std::collections::HashMap::new();
+    for entry in entries {
+        let (name, port_str) = entry.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--node-kubelet-port must be NAME=PORT, got {entry:?}")
+        })?;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--node-kubelet-port: invalid port in {entry:?}: {e}"))?;
+        map.insert(name.to_owned(), port);
+    }
+    Ok(map)
+}
+
 /// Parse "https://HOST:PORT" into (host, port). Returns ("127.0.0.1", 6443) on any parse error.
 fn parse_advertise_address(addr: &str) -> (String, u16) {
     let without_scheme = addr
@@ -3487,6 +3518,40 @@ mod tests {
             groups: vec![],
             extra: Default::default(),
         })
+    }
+
+    /// Multiple --node-kubelet-port flags must each contribute one entry to the map —
+    /// a real 2-node-or-more join needs one flag per non-primary node.
+    #[test]
+    fn parse_node_kubelet_ports_collects_multiple_entries() {
+        let entries = vec!["lima-node-2".to_string(), "lima-node-3".to_string()]
+            .into_iter()
+            .zip(["10261", "10262"])
+            .map(|(name, port)| format!("{name}={port}"))
+            .collect::<Vec<_>>();
+        let map = parse_node_kubelet_ports(&entries).expect("well-formed entries must parse");
+        assert_eq!(map.get("lima-node-2"), Some(&10261));
+        assert_eq!(map.get("lima-node-3"), Some(&10262));
+    }
+
+    /// A malformed --node-kubelet-port must fail the server at startup, not silently
+    /// misroute proxy requests for the intended node forever (the value would otherwise
+    /// just be dropped, and that node would fall back to the wrong global port with no
+    /// indication why exec/logs/attach for its pods keep hitting the primary instead).
+    #[test]
+    fn parse_node_kubelet_ports_rejects_entry_without_equals() {
+        let entries = vec!["lima-node-2-10261".to_string()];
+        assert!(
+            parse_node_kubelet_ports(&entries).is_err(),
+            "an entry missing '=' must be a hard startup error, not a silently dropped flag"
+        );
+    }
+
+    /// A non-numeric or out-of-range port must also fail loud, for the same reason.
+    #[test]
+    fn parse_node_kubelet_ports_rejects_non_numeric_port() {
+        let entries = vec!["lima-node-2=not-a-port".to_string()];
+        assert!(parse_node_kubelet_ports(&entries).is_err());
     }
 
     #[tokio::test]
