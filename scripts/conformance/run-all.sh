@@ -134,10 +134,11 @@ _VM_ARG=""
 _KCM_V_ARG=""
 _EXTRA_NODE_ARG=""
 _NODE_KUBELET_PORT_ARG=""
-# When --verbose is set, raise kube-controller-manager verbosity to --v=4 so the
-# disruption controller logs its pod list / expectedCount decisions (V(4)) — the
-# view needed to diagnose why disruptedPods gets cleared.
-[ "$VERBOSE" -eq 1 ] && _KCM_V_ARG="--kcm-v 4"
+# When --verbose is set, raise kube-controller-manager verbosity to --v=5 so both the
+# disruption controller's pod-list / expectedCount decisions (V(4)) and the DaemonSet
+# controller's replacement-reasoning lines ("candidate to replace" / "allowing
+# replacements", V(5)) are visible — V(5) is the ceiling here (no V(6) call sites exist).
+[ "$VERBOSE" -eq 1 ] && _KCM_V_ARG="--kcm-v 5"
 [ -n "$PORT" ]                    && _PORT_ARG="--port $PORT"
 [ -n "$KUBELET_PORT" ]            && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
 [ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"
