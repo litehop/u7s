@@ -157,6 +157,20 @@ if [ -d "$VM_DIR" ]; then
   else
     echo "VM '$VM_NAME' already running."
   fi
+
+  # Lima applies a yaml's `networks:` stanza only at instance CREATION, never on
+  # restart/resume — so a VM created before lima/kubelet.yaml declared
+  # `networks: - lima: user-v2` stays on its own private default network forever,
+  # with no route to any peer. Detect that by comparing against this instance's
+  # OWN recorded config (not a hardcoded address — the user-v2 subnet is
+  # DHCP-assigned) and fail loud instead of silently reusing a VM that can never
+  # reach another node, which otherwise surfaces as a cryptic `ip route` failure
+  # much later in this script.
+  if grep -q '^networks:' "$LIMA_YAML" && ! grep -q '^networks:' "$VM_DIR/lima.yaml" 2>/dev/null; then
+    echo "error: $VM_NAME predates the current lima/kubelet.yaml network config (no 'networks:' recorded at its creation)." >&2
+    echo "  Fix: limactl delete $VM_NAME   (or re-run with --reset, which now recreates a named --extra-node too)" >&2
+    exit 1
+  fi
 else
   echo "Provisioning VM '$VM_NAME' (first run, takes ~5 min)..."
   limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
@@ -187,6 +201,19 @@ if [ "$CURRENT_POD_SUBNET" != "$POD_SUBNET" ]; then
   "
 else
   echo "CNI bridge pod subnet already ${POD_SUBNET}, skipping rewrite."
+fi
+
+# The bridge CNI plugin does not re-address an already-existing cni0 device when
+# the conflist's subnet changes underneath it — only a freshly-created bridge
+# picks up a new range. So a VM whose conflist file above already says the right
+# subnet can still be carrying a live cni0 stuck on a stale one from before that
+# rewrite ever took effect. Fail loud rather than let an inter-node route get
+# programmed against an address this node's pods were never actually assigned.
+CNI0_LIVE=$(limactl shell "$VM_NAME" ip -4 addr show cni0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}/[0-9]+' | awk '{print $2}' | head -1 || true)
+if [ -n "$CNI0_LIVE" ] && [ "$CNI0_LIVE" != "10.85.${POD_SUBNET_OCTET}.1/24" ]; then
+  echo "error: $VM_NAME's cni0 bridge is still ${CNI0_LIVE}, not this node's assigned ${POD_SUBNET}." >&2
+  echo "  Fix: limactl delete $VM_NAME   (or re-run with --reset, which now recreates a named --extra-node too)" >&2
+  exit 1
 fi
 
 # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance

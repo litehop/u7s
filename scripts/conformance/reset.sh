@@ -4,10 +4,16 @@
 #
 # Usage:
 #   scripts/conformance/reset.sh [--vm <name>] [--workdir <path>] [--port <N>]
+#                                 [--extra-node <vm>]
 #
 # After this script:
 #   - ./temp/u7s/ is gone (DB, certs, kubeconfig, PID files all wiped)
-#   - The VM is deleted (full disk wipe — no stale certs/containers)
+#   - The VM is deleted (full disk wipe — no stale certs/containers). If
+#     --extra-node is given, that VM is deleted too — --reset means "fresh
+#     everything", not "fresh primary, stale peer" (Lima only applies a yaml's
+#     `networks:` stanza at instance creation, so an extra node left over from
+#     before that stanza existed would otherwise be silently reused on a
+#     network with no route to the freshly-recreated primary).
 #
 # To resume a fresh run:
 #   scripts/conformance/run-all.sh
@@ -16,12 +22,14 @@ set -euo pipefail
 WORKDIR="$PWD/temp/u7s"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 PORT="${U7S_PORT:-6443}"
+EXTRA_NODE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --workdir) WORKDIR="$2"; shift 2 ;;
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -96,25 +104,34 @@ else
   echo "[reset] $WORKDIR already absent"
 fi
 
-# ── 3. Kill in-VM processes (best-effort) ────────────────────────────────────
+# ── 3. Kill in-VM processes + delete the VM (best-effort) ───────────────────
+# Applied to the primary VM and, if named, the --extra-node VM — see the
+# --extra-node usage note above for why the extra node must not be skipped.
 
-if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
-  vm_status="$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")"
-  if [ "$vm_status" = "Running" ]; then
-    echo "[reset] Stopping processes inside $VM_NAME VM ..."
-    limactl shell "$VM_NAME" pkill -f kubelet                2>/dev/null || true
-    limactl shell "$VM_NAME" pkill -f kube-controller-manager 2>/dev/null || true
-    limactl shell "$VM_NAME" pkill -f sonobuoy              2>/dev/null || true
+teardown_vm() {
+  local vm="$1"
+  if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${vm}$"; then
+    local vm_status
+    vm_status="$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${vm} / {print \$2}")"
+    if [ "$vm_status" = "Running" ]; then
+      echo "[reset] Stopping processes inside $vm VM ..."
+      limactl shell "$vm" pkill -f kubelet                2>/dev/null || true
+      limactl shell "$vm" pkill -f kube-controller-manager 2>/dev/null || true
+      limactl shell "$vm" pkill -f sonobuoy              2>/dev/null || true
+    else
+      echo "[reset] $vm VM exists but is not running (status: $vm_status) — skipping in-VM kill"
+    fi
   else
-    echo "[reset] $VM_NAME VM exists but is not running (status: $vm_status) — skipping in-VM kill"
+    echo "[reset] $vm VM does not exist — skipping in-VM kill"
   fi
-else
-  echo "[reset] $VM_NAME VM does not exist — skipping in-VM kill"
+
+  echo "[reset] Deleting $vm VM (full disk wipe) ..."
+  limactl delete --force "$vm" 2>/dev/null || true
+}
+
+teardown_vm "$VM_NAME"
+if [ -n "$EXTRA_NODE" ]; then
+  teardown_vm "$EXTRA_NODE"
 fi
-
-# ── 4. Delete the VM ─────────────────────────────────────────────────────────
-
-echo "[reset] Deleting $VM_NAME VM (full disk wipe) ..."
-limactl delete --force "$VM_NAME" 2>/dev/null || true
 
 echo "[reset] Done. Run scripts/conformance/run-all.sh for a fresh conformance run."
