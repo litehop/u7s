@@ -7,6 +7,7 @@
 #
 # Usage:
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]
+#                        [--node-kubelet-port <name>=<N>]
 #                        [--konnectivity-server-port <N>]
 #
 #   --reset       Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
@@ -18,6 +19,10 @@
 #   --kubelet-port  Host-side port the kubelet is reachable on (default: 10250). Override
 #                 when the lima port-forward maps guest 10250 to a different host port
 #                 for per-worktree isolation.
+#   --node-kubelet-port  Host-side kubelet port for a non-primary node, as <name>=<port>.
+#                 Every node but the primary needs its own host port-forward; without an
+#                 entry here the apiserver dials --kubelet-port (the primary's forward)
+#                 for that node's pods too, and log/exec/attach/port-forward misroute.
 #   --konnectivity-server-port  Server-facing port for konnectivity-server (default: 8135).
 #                 The other three ports (agent, admin, health) are derived as
 #                 server_port-3, server_port-2, server_port-1 respectively.
@@ -41,6 +46,7 @@ BACKGROUND=0
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
+_NODE_KUBELET_PORT_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,12 +58,15 @@ while [[ $# -gt 0 ]]; do
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
+    --node-kubelet-port) _NODE_KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
+NODE_KUBELET_PORT_ARG=""
+[ -n "$_NODE_KUBELET_PORT_OVERRIDE" ] && NODE_KUBELET_PORT_ARG="--node-kubelet-port $_NODE_KUBELET_PORT_OVERRIDE"
 
 # Derive WORKDIR and runtime vars after arg parsing so flags override env.
 _VM="${U7S_VM_NAME:-lima-node}"
@@ -199,6 +208,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "$HOST_IP" \
     --kubelet-port "$KUBELET_PORT" \
+    $NODE_KUBELET_PORT_ARG \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -217,6 +227,7 @@ else
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "$HOST_IP" \
     --kubelet-port "$KUBELET_PORT" \
+    $NODE_KUBELET_PORT_ARG \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -304,6 +315,7 @@ EXTEOF
       --ca-cert    "$WORKDIR/ca.crt" \
       --kubelet-preferred-address "$HOST_IP" \
       --kubelet-port "$KUBELET_PORT" \
+      $NODE_KUBELET_PORT_ARG \
       --service-cluster-ip-range "10.96.0.0/12" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
       $ADVERTISE_ARG \
