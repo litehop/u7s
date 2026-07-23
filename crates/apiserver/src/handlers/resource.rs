@@ -720,7 +720,7 @@ pub async fn delete_resource<S: Store>(
 /// (pvc-protection, vac-protection, ...) remove their finalizer via a PUT, not a PATCH; the
 /// handler that applies that update must notice this and hard-delete instead of storing the
 /// update, or the object stays stuck Terminating forever.
-fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
+pub(crate) fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
     let meta: ObjectMeta = serde_json::from_value(body["metadata"].clone()).unwrap_or_default();
     let deletion_ts_set = meta.deletion_timestamp.is_some();
     let finalizers_empty = meta
@@ -859,6 +859,22 @@ pub(crate) async fn do_patch<S: Store>(
 
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
+        // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour
+        // and mirrors the same check in create_namespaced_resource/create_cr_namespaced/
+        // create_pod. Without this, `kubectl apply --server-side` can create new content in a
+        // namespace mid-deletion by going through PATCH+apply instead of POST+create.
+        if let Some(namespace) = ns {
+            let ns_key = cluster_object_key("namespaces", namespace);
+            if let Ok(Some(stored)) = state.store.get(&ns_key).await {
+                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                        return Err(Status::forbidden(format!(
+                            "unable to create new content in namespace {namespace} because it is being terminated"
+                        )));
+                    }
+                }
+            }
+        }
         // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side), which
         // Object::from_bytes (JSON-only) rejects outright — ssa_body_to_json handles both.
         let mut obj = Object {
@@ -2510,6 +2526,21 @@ pub async fn delete_collection_resource<S: Store>(
                     cluster_ip_to_release = Some(ip);
                 }
             }
+
+            // Respect metadata.finalizers exactly like a single-object DELETE would: a
+            // cluster-scoped object with finalizers (a CustomResourceDefinition, ClusterRole,
+            // or PersistentVolume with a legitimate finalizer) must be soft-deleted
+            // (deletionTimestamp stamped, kept alive), not removed outright — mirrors
+            // delete_collection_namespaced_resource below.
+            let mut typed = Object { body: parsed };
+            if let Some(soft) = apply_delete_policy(&mut typed) {
+                state
+                    .store
+                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                continue;
+            }
         }
         // NotFound means another writer deleted this object concurrently — tolerate it.
         // Any other error (disk full, DB corruption, …) means some objects survived;
@@ -2762,7 +2793,7 @@ pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &
 /// spawn genuine replacement dependents during the window — which then have intact
 /// ownerReferences and are correctly reaped when the owner is finally deleted, causing total
 /// (0/N) dependent loss instead of the original partial race. This was tried and reverted.
-fn add_orphan_finalizer(obj: &mut Object) {
+pub(crate) fn add_orphan_finalizer(obj: &mut Object) {
     const ORPHAN_FINALIZER: &str = "orphan";
     match obj.body["metadata"]["finalizers"].as_array_mut() {
         Some(finalizers) => {
@@ -4041,6 +4072,95 @@ mod tests {
 
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
         assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// SSA apply-create (do_patch's is_ssa && stored_opt.is_none() upsert branch) had no
+    /// Terminating-namespace gate, unlike create_namespaced_resource/create_pod — so
+    /// `kubectl apply --server-side` could inject a brand-new object into a namespace mid-
+    /// deletion by going through PATCH+apply instead of POST+create, reintroducing the
+    /// "controller keeps creating content mid-deletion" wedge class.
+    ///
+    /// Fails on revert: without the gate, this SSA apply-create of a not-yet-existing
+    /// ConfigMap into a Terminating namespace returns 201 instead of 403.
+    #[tokio::test]
+    async fn apply_patch_yaml_rejects_create_in_terminating_namespace() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns_key = "/registry/namespaces/dying-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "dying-ns" },
+            "status": { "phase": "Terminating" }
+        });
+        store
+            .put(
+                ns_key,
+                bytes::Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "new-cm", "namespace": "dying-ns" },
+            "data": { "k": "v" }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "dying-ns".to_string(),
+                "configmaps".to_string(),
+                "new-cm".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await;
+
+        match result {
+            Err(e) => assert_eq!(
+                e.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "SSA apply-create into a Terminating namespace must 403, matching what \
+                 POST-create already does — otherwise a controller can keep injecting new \
+                 content mid-deletion just by using server-side apply instead of POST"
+            ),
+            Ok(_) => panic!(
+                "SSA apply-create of a not-yet-existing object in a Terminating namespace \
+                 must be rejected, not silently create it"
+            ),
+        }
+
+        let key = "/registry/configmaps/dying-ns/new-cm";
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "the ConfigMap must not have been created in the store"
+        );
     }
 
     /// apply-patch+yaml PATCH must upsert (create if not found) and update if existing.
@@ -16220,6 +16340,73 @@ mod tests {
             vec!["binding-viewer".to_string()],
             "DeleteCollection with fieldSelector=roleRef.name=admin must delete only \
              binding-admin — if the selector is ignored, both bindings are deleted"
+        );
+    }
+
+    /// delete_collection_resource (cluster-scoped) hard-deleted every listed object
+    /// unconditionally, ignoring metadata.finalizers — a finalizer'd CustomResourceDefinition,
+    /// ClusterRole, or PersistentVolume removed via DeleteCollection lost its finalizer
+    /// protection even though a single-object DELETE of the same object honors it.
+    ///
+    /// Fails on revert: without threading the object through apply_delete_policy, a
+    /// finalizer'd cluster-scoped object is hard-deleted (gone from the store) instead of
+    /// soft-deleted (deletionTimestamp set, object still present).
+    #[tokio::test]
+    async fn delete_collection_resource_honors_finalizers() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let key = crate::keys::group_object_key("storage.k8s.io", "csinodes", None, "gc-node");
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "gc-node",
+                "finalizers": ["example.com/cleanup"]
+            },
+            "spec": { "drivers": [] }
+        });
+        state
+            .store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed must succeed");
+
+        delete_collection_resource(
+            State(state.clone()),
+            Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("DeleteCollection over finalizer'd object must succeed: {e:?}"));
+
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .expect("get must succeed")
+            .unwrap_or_else(|| panic!("finalizer'd object must survive DeleteCollection (soft-delete), not be hard-deleted"));
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "DeleteCollection must stamp deletionTimestamp on a finalizer'd object, exactly \
+             like a single-object DELETE does — controllers watch for this to run cleanup"
         );
     }
 
