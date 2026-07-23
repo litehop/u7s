@@ -19,7 +19,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context;
 use clap::Parser;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info};
@@ -28,8 +27,9 @@ use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
     failed_scheduling_status_patch, find_preemption_plan, http_get, needs_scheduling,
     patch_pod_status, pick_node, pods_needing_resync, scheduling_gate_status_patch,
-    scheduling_gate_status_reset, should_retry_without_preempting, should_schedule,
-    stream_watch_events, NodeTally, PendingPod, PodList,
+    scheduling_gate_status_reset, should_retry_after_preemption_plan_error,
+    should_retry_without_preempting, should_schedule, stream_watch_events, NodeTally, PendingPod,
+    PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -68,6 +68,21 @@ async fn bind_reserved_node(
 /// pod's scheduling task forever.
 const MAX_PREEMPTION_ATTEMPTS: u32 = 5;
 
+/// Distinguishes, once `preempt_and_pick_node` gives up, a genuine
+/// scheduling failure (`Fail` — no viable plan, or eviction itself failed;
+/// worth a `FailedScheduling` event) from a run whose every attempt's
+/// failure was `find_preemption_plan`'s own GET-nodes error (`Skip` — no
+/// node was ever actually checked, so the pod should stay Pending for the
+/// watch to retry instead of being marked unschedulable off a transient
+/// infra hiccup). Mirrors `PickNodeError`'s `NoCapacity`/`ApiError` split,
+/// but as its own type since the caller (`handle_pod_event`'s `outcome`
+/// block) needs to fold this in alongside a plain bind failure, one level
+/// deeper than where `PickNodeError` is consumed.
+enum PreemptionFailure {
+    Skip(anyhow::Error),
+    Fail(anyhow::Error),
+}
+
 /// Plan and execute preemption for `pending`, retrying up to
 /// `MAX_PREEMPTION_ATTEMPTS` times if `find_preemption_plan`'s atomic
 /// reservation loses to a fresher read, and returning the node name once one
@@ -91,13 +106,17 @@ async fn preempt_and_pick_node(
     tally: &Mutex<NodeTally>,
     namespace: &str,
     pod_name: &str,
-) -> anyhow::Result<String> {
-    let mut last_err = None;
+) -> Result<String, PreemptionFailure> {
+    let mut last_err: Option<PreemptionFailure> = None;
     for _ in 0..MAX_PREEMPTION_ATTEMPTS {
         let plan = match find_preemption_plan(connector, server, pending, tally).await {
             Ok(plan) => plan,
             Err(e) => {
-                last_err = Some(e);
+                last_err = Some(if should_retry_after_preemption_plan_error(&e) {
+                    PreemptionFailure::Skip(e.into())
+                } else {
+                    PreemptionFailure::Fail(e.into())
+                });
                 continue;
             }
         };
@@ -113,14 +132,17 @@ async fn preempt_and_pick_node(
                     .lock()
                     .expect("tally lock poisoned")
                     .remove(&pending.namespace, &pending.pod_name);
-                last_err = Some(e);
+                last_err = Some(PreemptionFailure::Fail(e));
             }
         }
     }
-    Err(last_err.expect("loop runs at least once, so this is always Some")).context(
-        "no node still fits after preemption, even after retrying \
-         (capacity kept being claimed concurrently)",
-    )
+    match last_err.expect("loop runs at least once, so this is always Some") {
+        PreemptionFailure::Skip(e) => Err(PreemptionFailure::Skip(e)),
+        PreemptionFailure::Fail(e) => Err(PreemptionFailure::Fail(e.context(
+            "no node still fits after preemption, even after retrying \
+             (capacity kept being claimed concurrently)",
+        ))),
+    }
 }
 
 /// Evict every pod in `victims` ("namespace/name" keys), stamping the
@@ -170,10 +192,11 @@ async fn evict_victims(
 /// whatever the watch stream has delivered. Matches upstream kube-scheduler's
 /// `flushUnschedulablePodsLeftover`, which runs on this same 30s cadence: a
 /// pod that fails a scheduling attempt (e.g. exhausts preemption retries)
-/// never generates another watch event by itself — FailedScheduling only
-/// emits a separate Event, it never patches the pod's own status — so
-/// without a timer independent of the watch, such a pod stays Pending
-/// forever even after capacity that would let it schedule frees up.
+/// now gets its own `PodScheduled=False` status PATCH, which echoes back
+/// through the watch and retries it almost immediately, but that PATCH is
+/// itself best-effort and can be dropped by a transient failure — this
+/// timer is the independent backstop that still catches such a pod even if
+/// its own retry-triggering event never arrives.
 const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Handle one pod watch event — a real one from the live watch, or a
@@ -308,24 +331,20 @@ fn handle_pod_event(
                 return;
             }
         }
-        let outcome: anyhow::Result<String> = async {
-            match first_pick {
-                Ok(node) => {
-                    bind_reserved_node(
-                        &connector_clone,
-                        &server_clone,
-                        &tally_clone,
-                        &pending,
-                        &node,
-                    )
-                    .await?;
-                    Ok(node)
-                }
+        // None means "skip silently, let the watch retry" — the preemption
+        // arm can hit that same transient-GET-failure case `first_pick`
+        // already handles above, but one level deeper (inside this
+        // async block, possibly after victims have already been evicted),
+        // where a bare early `return` doesn't type-check. Some(_) is a real
+        // outcome (success or genuine failure) worth an Event.
+        let outcome: Option<anyhow::Result<String>> = async {
+            let node = match first_pick {
+                Ok(node) => node,
                 Err(_no_capacity) => {
                     // No node has a free slot — try preemption before giving
                     // up: evict lower-priority pods to make room rather than
                     // leaving a higher-priority pod Pending forever (mayor-rsei).
-                    let node = preempt_and_pick_node(
+                    match preempt_and_pick_node(
                         &connector_clone,
                         &server_clone,
                         &pending,
@@ -333,25 +352,41 @@ fn handle_pod_event(
                         &namespace,
                         &pod_name,
                     )
-                    .await?;
-                    bind_reserved_node(
-                        &connector_clone,
-                        &server_clone,
-                        &tally_clone,
-                        &pending,
-                        &node,
-                    )
-                    .await?;
-                    Ok(node)
+                    .await
+                    {
+                        Ok(node) => node,
+                        Err(PreemptionFailure::Skip(e)) => {
+                            error!(
+                                "find_preemption_plan could not reach the API server while scheduling {key}: {e} — retrying on next watch tick"
+                            );
+                            return None;
+                        }
+                        Err(PreemptionFailure::Fail(e)) => return Some(Err(e)),
+                    }
                 }
-            }
+            };
+            Some(
+                bind_reserved_node(
+                    &connector_clone,
+                    &server_clone,
+                    &tally_clone,
+                    &pending,
+                    &node,
+                )
+                .await
+                .map(|()| node),
+            )
         }
         .await;
-        // Always remove the key, whether binding succeeded or failed.
+        // Always remove the key, whether binding succeeded, failed, or was skipped.
         in_flight_clone
             .lock()
             .expect("in_flight lock poisoned")
             .remove(&key);
+
+        let Some(outcome) = outcome else {
+            return;
+        };
 
         let (reason, message, event_type) = match &outcome {
             Ok(node) => (

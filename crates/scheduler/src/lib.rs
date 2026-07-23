@@ -1582,19 +1582,58 @@ pub struct PreemptionPlan {
 /// the caller can re-plan from scratch, instead of reserving `pod` onto a
 /// node that a fresher read shows no longer fits.
 ///
+/// Why `find_preemption_plan` failed to find a preemption plan for a pending
+/// pod.
+///
+/// Same distinction `PickNodeError` draws for `pick_node`, and for the same
+/// reason (see its doc comment): `NoViablePlan` means every qualifying node
+/// was actually checked and even preempting its lower-priority pods
+/// wouldn't free enough room — a genuine "this pod cannot be scheduled"
+/// outcome that stays that way until the cluster changes. `ApiError` means
+/// the GET /api/v1/nodes call itself failed, or its body could not be
+/// parsed — no node was actually checked, so it says nothing about whether
+/// preemption would have worked. Collapsing `ApiError` into `NoViablePlan`
+/// would mark a possibly-schedulable pod `FailedScheduling` off a transient
+/// infra hiccup that the next watch tick would otherwise have retried
+/// cleanly — the same bug `PickNodeError` fixed for `pick_node`.
+#[derive(Debug, thiserror::Error)]
+pub enum FindPreemptionPlanError {
+    #[error("no node can fit the pending pod even after preempting lower-priority pods")]
+    NoViablePlan,
+    #[error(transparent)]
+    ApiError(#[from] anyhow::Error),
+}
+
+/// Whether a `find_preemption_plan` failure should be treated as "leave this
+/// pod Pending and let the watch retry" instead of a genuine scheduling
+/// failure worth a `FailedScheduling` event.
+///
+/// Pure predicate over the typed error — no networking — so it can be unit
+/// tested without a fake API server, mirroring
+/// `should_retry_without_preempting`'s relationship to `pick_node`.
+pub fn should_retry_after_preemption_plan_error(err: &FindPreemptionPlanError) -> bool {
+    matches!(err, FindPreemptionPlanError::ApiError(_))
+}
+
 /// Among nodes where preemption would work, the node requiring the FEWEST
 /// victims is chosen (cheapest disruption); ties keep the API server's node-list
-/// order. Returns `Err` when no candidate node — even after preempting every
-/// eligible lower-priority pod on it — could fit the pending pod.
+/// order. Returns `Err(FindPreemptionPlanError::NoViablePlan)` when no
+/// candidate node — even after preempting every eligible lower-priority pod
+/// on it — could fit the pending pod. Returns
+/// `Err(FindPreemptionPlanError::ApiError(_))` when the GET or its response
+/// body is itself unusable — see `FindPreemptionPlanError` for why the
+/// caller must not treat that the same as `NoViablePlan`.
 pub async fn find_preemption_plan(
     connector: &TlsConnector,
     server: &str,
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
-) -> anyhow::Result<PreemptionPlan> {
+) -> Result<PreemptionPlan, FindPreemptionPlanError> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
-        bail!("GET /api/v1/nodes returned {status}: {body}");
+        return Err(FindPreemptionPlanError::ApiError(anyhow::anyhow!(
+            "GET /api/v1/nodes returned {status}: {body}"
+        )));
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
 
@@ -1634,9 +1673,9 @@ pub async fn find_preemption_plan(
         }
     }
 
-    let (index, plan) =
-        best.context("no node can fit the pending pod even after preempting lower-priority pods")?;
-    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)?;
+    let (index, plan) = best.ok_or(FindPreemptionPlanError::NoViablePlan)?;
+    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
+        .map_err(|_| FindPreemptionPlanError::NoViablePlan)?;
 
     Ok(plan)
 }
@@ -2164,6 +2203,41 @@ mod tests {
         assert!(
             should_retry_without_preempting(&err),
             "a transient API error must not trigger preemption or FailedScheduling"
+        );
+    }
+
+    // should_retry_after_preemption_plan_error tests — find_preemption_plan had
+    // the same untyped-Err gap pick_node did: a transient GET /api/v1/nodes
+    // failure and "no node fits even after preempting" both surfaced as a bare
+    // anyhow::Error, so main.rs's preemption arm treated an apiserver hiccup as
+    // a genuine "this pod cannot be scheduled" outcome and marked it
+    // FailedScheduling instead of leaving it Pending for the watch to retry.
+
+    #[test]
+    fn should_retry_after_preemption_plan_error_is_false_for_no_viable_plan() {
+        // A genuine NoViablePlan means every qualifying node was actually
+        // checked, including what preempting its lower-priority pods would
+        // free. If this returned true (skip silently), a pod that truly
+        // cannot fit anywhere would never get its FailedScheduling event.
+        assert!(
+            !should_retry_after_preemption_plan_error(&FindPreemptionPlanError::NoViablePlan),
+            "a real NoViablePlan must produce a FailedScheduling event, not a silent skip"
+        );
+    }
+
+    #[test]
+    fn should_retry_after_preemption_plan_error_is_true_for_api_error() {
+        // The GET /api/v1/nodes call itself failed — no node was actually
+        // checked, so nothing here says the pod is truly unschedulable. If
+        // this returned false (the pre-fix behavior), main.rs would mark the
+        // pod FailedScheduling over a transient apiserver hiccup instead of
+        // leaving it Pending for the next watch tick to retry.
+        let err =
+            FindPreemptionPlanError::ApiError(anyhow::anyhow!("GET /api/v1/nodes returned 503"));
+        assert!(
+            should_retry_after_preemption_plan_error(&err),
+            "a transient API error during preemption planning must not be treated as \
+             a genuine 'no viable plan' scheduling failure"
         );
     }
 
