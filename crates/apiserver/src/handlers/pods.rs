@@ -18,8 +18,8 @@ use crate::{
     limit_range::parse_quantity,
     state::AppState,
     status::Status,
-    types::{Binding, Namespace, Object, ObjectMeta, PodSpec},
-    util::{content_type, extract_body, parse_resource_version},
+    types::{Binding, DeleteOptions, Namespace, Object, ObjectMeta, PodSpec},
+    util::{content_type, extract_body, parse_resource_version, secs_to_rfc3339},
 };
 
 #[derive(Deserialize)]
@@ -69,11 +69,15 @@ pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
 
 /// Parse a `fieldSelector` query string and test a pod JSON value against it.
 ///
-/// Supported selectors (comma-separated):
-///   spec.nodeName=<value>    — include only if pod's spec.nodeName equals value
-///   spec.nodeName!=<value>   — include only if pod's spec.nodeName does not equal value
-///   status.phase=<value>     — include only if pod's status.phase equals value
-///   status.phase!=<value>    — include only if pod's status.phase does not equal value
+/// Supported selectors (comma-separated), matching upstream's SelectableFields
+/// in pkg/registry/core/pod/strategy.go:
+///   spec.nodeName=<value>              spec.nodeName!=<value>
+///   status.phase=<value>               status.phase!=<value>
+///   status.podIP=<value>               status.podIP!=<value>
+///   spec.restartPolicy=<value>         spec.restartPolicy!=<value>
+///   spec.serviceAccountName=<value>    spec.serviceAccountName!=<value>
+///   spec.schedulerName=<value>         spec.schedulerName!=<value>
+///   status.nominatedNodeName=<value>   status.nominatedNodeName!=<value>
 ///
 /// An empty or absent selector matches everything (pass-through).
 /// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
@@ -93,6 +97,11 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
     let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
     let node_name = spec.node_name.as_deref().unwrap_or("");
     let phase = pod["status"]["phase"].as_str().unwrap_or("");
+    let pod_ip = pod["status"]["podIP"].as_str().unwrap_or("");
+    let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("");
+    let service_account_name = pod["spec"]["serviceAccountName"].as_str().unwrap_or("");
+    let scheduler_name = pod["spec"]["schedulerName"].as_str().unwrap_or("");
+    let nominated_node_name = pod["status"]["nominatedNodeName"].as_str().unwrap_or("");
     for term in selector.split(',') {
         let term = term.trim();
         if term.is_empty() {
@@ -105,12 +114,42 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
             if field == "status.phase" && phase == value {
                 return false;
             }
+            if field == "status.podIP" && pod_ip == value {
+                return false;
+            }
+            if field == "spec.restartPolicy" && restart_policy == value {
+                return false;
+            }
+            if field == "spec.serviceAccountName" && service_account_name == value {
+                return false;
+            }
+            if field == "spec.schedulerName" && scheduler_name == value {
+                return false;
+            }
+            if field == "status.nominatedNodeName" && nominated_node_name == value {
+                return false;
+            }
             // Unknown fields: ignore (don't filter out)
         } else if let Some((field, value)) = term.split_once('=') {
             if field == "spec.nodeName" && node_name != value {
                 return false;
             }
             if field == "status.phase" && phase != value {
+                return false;
+            }
+            if field == "status.podIP" && pod_ip != value {
+                return false;
+            }
+            if field == "spec.restartPolicy" && restart_policy != value {
+                return false;
+            }
+            if field == "spec.serviceAccountName" && service_account_name != value {
+                return false;
+            }
+            if field == "spec.schedulerName" && scheduler_name != value {
+                return false;
+            }
+            if field == "status.nominatedNodeName" && nominated_node_name != value {
                 return false;
             }
             // Unknown fields: ignore (don't filter out)
@@ -649,6 +688,38 @@ pub async fn replace_pod<S: Store>(
     Ok(Json(obj.body))
 }
 
+/// Legacy `?gracePeriodSeconds=` query-param form of the grace period, for clients that
+/// still send it on the URL instead of (or as well as) in the DeleteOptions body.
+#[derive(Deserialize)]
+pub struct GracePeriodQuery {
+    #[serde(rename = "gracePeriodSeconds")]
+    pub grace_period_seconds: Option<i64>,
+}
+
+/// Resolve the grace period a delete should actually use: an explicit request value (body
+/// DeleteOptions takes precedence over the query param) beats the pod's own
+/// spec.terminationGracePeriodSeconds, which beats the upstream default of 30s. Without this
+/// fallback chain, a plain `kubectl delete pod` (no explicit --grace-period) would stamp
+/// deletionGracePeriodSeconds=0 even though the pod's own spec says the kubelet needs up to
+/// 30s to shut its containers down gracefully.
+fn effective_grace_period_seconds(requested: Option<i64>, pod: &serde_json::Value) -> i64 {
+    requested
+        .or_else(|| pod["spec"]["terminationGracePeriodSeconds"].as_i64())
+        .unwrap_or(30)
+}
+
+/// Compute the RFC3339 timestamp `grace_period_seconds` in the future from now, for stamping
+/// `metadata.deletionTimestamp`. Kubelet/controllers use this value (not "now") to know how
+/// long they have before the apiserver expects a hard delete.
+fn deletion_timestamp_after_grace(grace_period_seconds: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    secs_to_rfc3339(now_secs + grace_period_seconds)
+}
+
 /// DELETE /api/v1/namespaces/{ns}/pods — collection delete with optional labelSelector.
 ///
 /// sonobuoy cleanup sends this to remove all pods it created in a namespace.
@@ -657,8 +728,20 @@ pub async fn delete_collection_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<super::generic::CollectionQuery>,
+    Query(grace_query): Query<GracePeriodQuery>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let requested_grace = delete_opts
+        .grace_period_seconds
+        .or(grace_query.grace_period_seconds);
     let prefix = list_prefix("pods", ns.as_str());
 
     let resp = state
@@ -697,8 +780,10 @@ pub async fn delete_collection_pods<S: Store>(
             let already_terminating = meta.deletion_timestamp.is_some();
             if !already_terminating || has_finalizers {
                 let mut updated = parsed;
+                let grace = effective_grace_period_seconds(requested_grace, &updated);
                 updated["metadata"]["deletionTimestamp"] =
-                    serde_json::Value::String(utc_now_rfc3339());
+                    serde_json::Value::String(deletion_timestamp_after_grace(grace));
+                updated["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
                 let current_gen = updated["metadata"]["generation"].as_i64().unwrap_or(1);
                 updated["metadata"]["generation"] = serde_json::json!(current_gen + 1);
                 let _ = state
@@ -726,8 +811,20 @@ pub async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
+    Query(grace_query): Query<GracePeriodQuery>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let requested_grace = delete_opts
+        .grace_period_seconds
+        .or(grace_query.grace_period_seconds);
 
     let key = object_key("pods", ns.as_str(), &name);
 
@@ -797,7 +894,10 @@ pub async fn delete_pod<S: Store>(
     // Setting deletionTimestamp is always a real mutation — Kubernetes increments
     // metadata.generation on every graceful delete so that controllers can detect
     // the transition via observedGeneration (pods.go:573 conformance test).
-    obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    let grace = effective_grace_period_seconds(requested_grace, &obj.body);
+    obj.body["metadata"]["deletionTimestamp"] =
+        serde_json::Value::String(deletion_timestamp_after_grace(grace));
+    obj.body["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
     let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
     obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
     let expected_rv = parse_resource_version(obj.resource_version())?;
@@ -1428,6 +1528,53 @@ mod field_selector_tests {
         })
     }
 
+    fn pod_with_pod_ip(pod_ip: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {},
+            "status": {"podIP": pod_ip}
+        })
+    }
+
+    fn pod_with_restart_policy(restart_policy: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"restartPolicy": restart_policy}
+        })
+    }
+
+    fn pod_with_service_account_name(service_account_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"serviceAccountName": service_account_name}
+        })
+    }
+
+    fn pod_with_scheduler_name(scheduler_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"schedulerName": scheduler_name}
+        })
+    }
+
+    fn pod_with_nominated_node_name(nominated_node_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {},
+            "status": {"nominatedNodeName": nominated_node_name}
+        })
+    }
+
     /// Empty selector is a pass-through: all pods must be returned.
     /// Kubelet depends on this when fieldSelector is absent.
     #[test]
@@ -1532,6 +1679,132 @@ mod field_selector_tests {
         let pods = vec![pod_with_phase("Pending")];
         let result = filter_pods_by_field_selector(pods, "status.phase=Running");
         assert!(result.is_empty());
+    }
+
+    /// status.podIP=<ip> must select only the pod with that IP — kube-proxy's
+    /// endpoint reconciliation queries pods by podIP, and a missing match arm
+    /// here would make it silently see every pod as a match.
+    #[test]
+    fn eq_filter_matches_correct_pod_ip() {
+        let pods = vec![pod_with_pod_ip("10.0.0.1"), pod_with_pod_ip("10.0.0.2")];
+        let result = filter_pods_by_field_selector(pods, "status.podIP=10.0.0.1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["podIP"], "10.0.0.1");
+    }
+
+    /// status.podIP!=<ip> must exclude the pod with that IP and keep the rest —
+    /// the negated form must not fall through to the unknown-field passthrough.
+    #[test]
+    fn ne_filter_excludes_matching_pod_ip() {
+        let pods = vec![pod_with_pod_ip("10.0.0.1"), pod_with_pod_ip("10.0.0.2")];
+        let result = filter_pods_by_field_selector(pods, "status.podIP!=10.0.0.1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["podIP"], "10.0.0.2");
+    }
+
+    /// spec.restartPolicy=<policy> must select only matching pods — controllers
+    /// that distinguish Job pods (restartPolicy=Never/OnFailure) from Deployment
+    /// pods (Always) rely on this filter, not a client-side scan of every pod.
+    #[test]
+    fn eq_filter_matches_correct_restart_policy() {
+        let pods = vec![
+            pod_with_restart_policy("Never"),
+            pod_with_restart_policy("Always"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.restartPolicy=Never");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["restartPolicy"], "Never");
+    }
+
+    /// spec.restartPolicy!=<policy> must exclude the matching pod, proving the
+    /// negation arm (not just equality) is wired for this field.
+    #[test]
+    fn ne_filter_excludes_matching_restart_policy() {
+        let pods = vec![
+            pod_with_restart_policy("Never"),
+            pod_with_restart_policy("Always"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.restartPolicy!=Never");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["restartPolicy"], "Always");
+    }
+
+    /// spec.serviceAccountName=<name> must select only pods running as that
+    /// service account — RBAC auditing/debugging tools query pods this way to
+    /// find everything a given identity can affect.
+    #[test]
+    fn eq_filter_matches_correct_service_account_name() {
+        let pods = vec![
+            pod_with_service_account_name("sa-a"),
+            pod_with_service_account_name("sa-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.serviceAccountName=sa-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["serviceAccountName"], "sa-a");
+    }
+
+    /// spec.serviceAccountName!=<name> must exclude the matching pod.
+    #[test]
+    fn ne_filter_excludes_matching_service_account_name() {
+        let pods = vec![
+            pod_with_service_account_name("sa-a"),
+            pod_with_service_account_name("sa-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.serviceAccountName!=sa-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["serviceAccountName"], "sa-b");
+    }
+
+    /// spec.schedulerName=<name> must select only pods assigned to that
+    /// scheduler — a custom scheduler polling for its own pending/bound pods
+    /// would otherwise see pods owned by other schedulers.
+    #[test]
+    fn eq_filter_matches_correct_scheduler_name() {
+        let pods = vec![
+            pod_with_scheduler_name("custom-scheduler"),
+            pod_with_scheduler_name("default-scheduler"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.schedulerName=custom-scheduler");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["schedulerName"], "custom-scheduler");
+    }
+
+    /// spec.schedulerName!=<name> must exclude the matching pod.
+    #[test]
+    fn ne_filter_excludes_matching_scheduler_name() {
+        let pods = vec![
+            pod_with_scheduler_name("custom-scheduler"),
+            pod_with_scheduler_name("default-scheduler"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.schedulerName!=custom-scheduler");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["schedulerName"], "default-scheduler");
+    }
+
+    /// status.nominatedNodeName=<node> must select only pods nominated for that
+    /// node — preemption logic reads this to find pods already reserved on a
+    /// node before deciding to preempt further victims there.
+    #[test]
+    fn eq_filter_matches_correct_nominated_node_name() {
+        let pods = vec![
+            pod_with_nominated_node_name("node-a"),
+            pod_with_nominated_node_name("node-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "status.nominatedNodeName=node-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["nominatedNodeName"], "node-a");
+    }
+
+    /// status.nominatedNodeName!=<node> must exclude the matching pod.
+    #[test]
+    fn ne_filter_excludes_matching_nominated_node_name() {
+        let pods = vec![
+            pod_with_nominated_node_name("node-a"),
+            pod_with_nominated_node_name("node-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "status.nominatedNodeName!=node-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["nominatedNodeName"], "node-b");
     }
 
     /// Unknown selector fields must be ignored (pass-through) rather than dropping pods.
@@ -6620,6 +6893,37 @@ mod pure_logic_tests {
         assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
     }
 
+    /// set (replace) on an existing numeric array index overwrites that element in
+    /// place and leaves the array length unchanged. RFC 6902 §4.3 defines "replace"
+    /// as remove-then-add at the *same* location, not an insert: a client patching
+    /// EndpointSlice addresses[0] (or any array field) must get back a same-length
+    /// array with only the target index changed, not a corrupted, ever-growing array
+    /// with the old value pushed to the tail (the bug this test guards against).
+    #[test]
+    fn patch_set_numeric_index_overwrites_in_place() {
+        let mut obj = serde_json::json!({"items": ["9.9.9.9", "keep"]});
+        json_patch_set(&mut obj, "/items/0", serde_json::json!("8.8.8.8"))
+            .unwrap_or_else(|_| panic!("replace on an existing index must succeed"));
+        assert_eq!(
+            obj["items"],
+            serde_json::json!(["8.8.8.8", "keep"]),
+            "replace must overwrite index 0 in place, not insert and shift 'keep' along"
+        );
+    }
+
+    /// set (replace) with idx == arr.len() is rejected: RFC 6902 "replace" only
+    /// targets an existing element, unlike "add" which may append past the end.
+    /// Allowing this would let a corrupted patch silently grow an array via replace.
+    #[test]
+    fn patch_set_array_index_equal_len_returns_422() {
+        let mut obj = serde_json::json!({"items": [1]});
+        let result = json_patch_set(&mut obj, "/items/1", serde_json::json!(99));
+        assert!(
+            result.is_err(),
+            "replace past the end of the array must be rejected, not treated as an append"
+        );
+    }
+
     /// set with a numeric index beyond bounds returns 422.
     #[test]
     fn patch_set_array_oob_returns_422() {
@@ -9044,6 +9348,171 @@ mod handler_tests {
             "a pod already Terminating with no finalizers must be hard-deleted by \
              DeleteCollection — otherwise it lingers forever since nothing else removes it"
         );
+    }
+
+    /// An explicit `gracePeriodSeconds` in the DELETE body must push `deletionTimestamp`
+    /// into the future by that many seconds, and the value itself must be persisted as
+    /// `deletionGracePeriodSeconds` — otherwise the kubelet has no way to know how long it
+    /// has before the apiserver expects the pod gone, and controllers waiting on
+    /// deletionTimestamp treat a long-grace pod exactly like an already-due one.
+    ///
+    /// Fails on revert: stamping `deletionTimestamp` as bare `now()` (the pre-fix behavior)
+    /// would never match any of the `now+120s` candidate timestamps computed below.
+    #[tokio::test]
+    async fn delete_pod_with_explicit_grace_period_delays_deletion_timestamp() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/graceful-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "graceful-pod", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let grace = 120i64;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": grace
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/graceful-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("soft-deleted pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let ts = v["metadata"]["deletionTimestamp"]
+            .as_str()
+            .expect("deletionTimestamp must be set");
+        let candidates: Vec<String> = (before..=after)
+            .map(|s| crate::util::secs_to_rfc3339(s + grace))
+            .collect();
+        assert!(
+            candidates.contains(&ts.to_string()),
+            "deletionTimestamp {ts} must be now+{grace}s, not bare now — a client that asked \
+             for 120s of grace must get 120s, or its container is SIGKILLed before it can \
+             shut down cleanly"
+        );
+        assert_eq!(
+            v["metadata"]["deletionGracePeriodSeconds"], grace,
+            "deletionGracePeriodSeconds must be persisted so the kubelet/controllers know \
+             how long they have before a hard delete"
+        );
+    }
+
+    /// delete_collection_pods must apply the same gracePeriodSeconds handling as
+    /// single-pod delete_pod — a namespace-wide delete (e.g. `kubectl delete pods --all
+    /// --grace-period=N`) must not silently ignore the grace period just because it went
+    /// through the collection endpoint instead of the named-resource one.
+    #[tokio::test]
+    async fn delete_collection_pods_applies_grace_period_to_every_matched_pod() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key_a = "/registry/pods/default/pod-a";
+        let key_b = "/registry/pods/default/pod-b";
+        for (key, name) in [(key_a, "pod-a"), (key_b, "pod-b")] {
+            let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": name, "namespace": "default", "resourceVersion": "1" },
+                "spec": {},
+                "status": {}
+            });
+            store
+                .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let grace = 45i64;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": grace
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let candidates: Vec<String> = (before..=after)
+            .map(|s| crate::util::secs_to_rfc3339(s + grace))
+            .collect();
+
+        for key in [key_a, key_b] {
+            let stored = store
+                .get(key)
+                .await
+                .unwrap()
+                .expect("soft-deleted pod must still exist");
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            let ts = v["metadata"]["deletionTimestamp"]
+                .as_str()
+                .expect("deletionTimestamp must be set");
+            assert!(
+                candidates.contains(&ts.to_string()),
+                "{key}: deletionTimestamp {ts} must be now+{grace}s — DeleteCollection must \
+                 not silently drop the caller's requested grace period for any matched pod"
+            );
+            assert_eq!(
+                v["metadata"]["deletionGracePeriodSeconds"], grace,
+                "{key}: deletionGracePeriodSeconds must be persisted for every pod in the \
+                 collection, not just the first one"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
