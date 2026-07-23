@@ -2855,12 +2855,15 @@ async fn owner_ref_is_live<S: Store>(
     stored["metadata"]["uid"].as_str() == Some(uid)
 }
 
-/// Removes `owner_uid`'s entry from `refs` and persists the result at `key` if the
-/// dependent has another live owner; otherwise hard-deletes the object at `key`.
+/// Removes `owner_uid`'s entry from the dependent's ownerReferences and persists the
+/// result at `key` if it has another live owner; otherwise hard-deletes the object at
+/// `key`. Callers only use `key`/`owner_uid` to locate and identify the dependent — the
+/// object is always re-read fresh here, never trusted from the caller's LIST snapshot.
 ///
-/// Returns true if the object was hard-deleted, false if it survived with the reference
-/// stripped — callers use this to decide whether to keep cascading to grandchildren
-/// (e.g. a surviving ReplicaSet's pods must not be touched).
+/// Returns true if the object was hard-deleted (or already gone), false if it survived
+/// with the reference stripped (or the reference was already gone) — callers use this to
+/// decide whether to keep cascading to grandchildren (e.g. a surviving ReplicaSet's pods
+/// must not be touched).
 ///
 /// Shared by every explicit-cascade helper below (pods, ReplicaSets, Jobs): deleting one
 /// owner must only remove that owner's reference from a dependent, never destroy a
@@ -2868,44 +2871,81 @@ async fn owner_ref_is_live<S: Store>(
 /// a foreground/background cascade from any of RC/DaemonSet/StatefulSet/ReplicaSet/Job
 /// silently destroys still-owned dependents — the exact failure the GC conformance spec
 /// above asserts against.
+///
+/// The strip write is a fresh read-modify-write CAS, retried on `RevisionMismatch`,
+/// rather than an unconditional `put(.., None)` of the caller's LIST-time snapshot: a
+/// blind overwrite of stale data would silently discard any write a concurrent actor
+/// (e.g. the kubelet's routine pod-status PATCH) made to this object between the LIST
+/// and this write, with no error surfaced to either side. Mirrors delete_pod's
+/// retry-on-conflict loop, added for the same race class.
 async fn strip_or_delete_dependent<S: Store>(
     state: &crate::state::AppState<S>,
     namespace: &str,
     key: &str,
-    mut obj: serde_json::Value,
-    refs: Vec<serde_json::Value>,
     owner_uid: &str,
     label: &str,
 ) -> bool {
-    let mut other_live = false;
-    for other in refs.iter().filter(|r| r["uid"].as_str() != Some(owner_uid)) {
-        if owner_ref_is_live(state, namespace, other).await {
-            other_live = true;
-            break;
-        }
-    }
+    loop {
+        let stored = match state.store.get(key).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return true,
+            Err(e) => {
+                tracing::warn!("cascade-delete {label}: re-read failed: {e}");
+                return false;
+            }
+        };
+        let mut obj: serde_json::Value = match serde_json::from_slice(&stored.value) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("cascade-delete {label}: corrupt stored object: {e}");
+                return false;
+            }
+        };
+        let refs = match obj["metadata"]["ownerReferences"].as_array() {
+            Some(r) if r.iter().any(|r| r["uid"].as_str() == Some(owner_uid)) => r.clone(),
+            _ => return false,
+        };
 
-    if !other_live {
-        if let Err(e) = state.store.delete(key, None).await {
-            tracing::warn!("cascade-delete {label}: {e}");
-        }
-        return true;
-    }
-
-    let filtered: Vec<serde_json::Value> = refs
-        .into_iter()
-        .filter(|r| r["uid"].as_str() != Some(owner_uid))
-        .collect();
-    obj["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
-    match serde_json::to_vec(&obj) {
-        Ok(b) => {
-            if let Err(e) = state.store.put(key, bytes::Bytes::from(b), None).await {
-                tracing::warn!("cascade-delete {label}: strip owner ref failed: {e}");
+        let mut other_live = false;
+        for other in refs.iter().filter(|r| r["uid"].as_str() != Some(owner_uid)) {
+            if owner_ref_is_live(state, namespace, other).await {
+                other_live = true;
+                break;
             }
         }
-        Err(e) => tracing::warn!("cascade-delete {label}: serialize failed: {e}"),
+
+        if !other_live {
+            match state.store.delete(key, None).await {
+                Ok(_) | Err(StoreError::NotFound { .. }) => {}
+                Err(e) => tracing::warn!("cascade-delete {label}: {e}"),
+            }
+            return true;
+        }
+
+        let filtered: Vec<serde_json::Value> = refs
+            .into_iter()
+            .filter(|r| r["uid"].as_str() != Some(owner_uid))
+            .collect();
+        obj["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
+        let expected_rv = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok());
+        let bytes = match serde_json::to_vec(&obj) {
+            Ok(b) => bytes::Bytes::from(b),
+            Err(e) => {
+                tracing::warn!("cascade-delete {label}: serialize failed: {e}");
+                return false;
+            }
+        };
+        match state.store.put(key, bytes, expected_rv).await {
+            Ok(_) => return false,
+            Err(StoreError::RevisionMismatch { .. }) => continue,
+            Err(e) => {
+                tracing::warn!("cascade-delete {label}: strip owner ref failed: {e}");
+                return false;
+            }
+        }
     }
-    false
 }
 
 /// Delete pods in `namespace` whose `ownerReferences` contain an entry with
@@ -2959,8 +2999,6 @@ async fn delete_pods_owned_by<S: Store>(
             state,
             namespace,
             &pod_key,
-            pod,
-            refs,
             owner_uid,
             &format!("pod {namespace}/{pod_name}"),
         )
@@ -3020,8 +3058,6 @@ async fn delete_replicasets_owned_by<S: Store>(
             state,
             namespace,
             &rs_key,
-            rs,
-            refs,
             owner_uid,
             &format!("replicaset {namespace}/{rs_name}"),
         )
@@ -3088,8 +3124,6 @@ async fn delete_jobs_owned_by<S: Store>(
             state,
             namespace,
             &job_key,
-            job,
-            refs,
             owner_uid,
             &format!("job {namespace}/{job_name}"),
         )
@@ -15480,6 +15514,271 @@ mod tests {
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // MockStore that, on the first armed put(), writes an INDEPENDENT object
+    // (simulating a different concurrent writer, e.g. a status controller) instead
+    // of the caller's own value, then reports RevisionMismatch.
+    //
+    // Used by strip_or_delete_dependent's concurrent-write regression test only.
+    // ---------------------------------------------------------------------------
+
+    struct ConcurrentWriterStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        concurrent_write: bytes::Bytes,
+        inject_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl ConcurrentWriterStore {
+        fn new(
+            inner: std::sync::Arc<u7s_store::SqliteStore>,
+            concurrent_write: bytes::Bytes,
+        ) -> Self {
+            Self {
+                inner,
+                concurrent_write,
+                inject_next: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.inject_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for ConcurrentWriterStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .inject_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            let concurrent_write = self.concurrent_write.clone();
+            async move {
+                if inject {
+                    // A different writer's change lands here, independent of `value`
+                    // (the caller's own not-yet-persisted attempt).
+                    let _ = inner.put(&key, concurrent_write, None).await;
+                    Err(u7s_store::StoreError::RevisionMismatch {
+                        expected: 1,
+                        current: 99,
+                    })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// `strip_or_delete_dependent` must re-read the dependent fresh and retry on conflict
+    /// rather than blindly overwriting whatever the caller's LIST-time snapshot contained.
+    ///
+    /// If a concurrent writer (e.g. a status controller) updates the dependent between the
+    /// cascade helper's LIST and this strip write, an unconditional `put(.., None)` of the
+    /// stale snapshot would silently discard that write with no error to anyone — the
+    /// writer believes its update succeeded. This test fails on revert: without the
+    /// read-modify-write CAS retry, the concurrent write's `status.replicas` is clobbered
+    /// back to its pre-race value.
+    #[tokio::test]
+    async fn strip_or_delete_dependent_retries_past_concurrent_write_instead_of_clobbering_it() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let owner_uid = "aaaa0000-0000-0000-0000-000000000001";
+        let other_owner_uid = "bbbb0000-0000-0000-0000-000000000002";
+        let ns = "default";
+
+        // A second, still-live owner — keeps the dependent alive (strip path, not delete)
+        // once `owner_uid`'s reference is removed.
+        let other_owner_key = "/registry/apps/deployments/default/other-owner";
+        inner
+            .put(
+                other_owner_key,
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "other-owner",
+                            "namespace": ns,
+                            "uid": other_owner_uid
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let owner_refs = serde_json::json!([
+            {
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "name": "gone-owner", "uid": owner_uid, "controller": true
+            },
+            {
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "name": "other-owner", "uid": other_owner_uid
+            }
+        ]);
+
+        let rs_key = "/registry/apps/replicasets/default/my-rs";
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "my-rs",
+                "namespace": ns,
+                "ownerReferences": owner_refs
+            },
+            "status": { "replicas": 0 }
+        });
+        inner
+            .put(
+                rs_key,
+                bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // What a concurrent status controller's write lands as between strip's read and
+        // its first write attempt — same ownerReferences, but an updated status field a
+        // real client is relying on having durably persisted.
+        let concurrent_write = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "my-rs",
+                "namespace": ns,
+                "ownerReferences": owner_refs
+            },
+            "status": { "replicas": 3 }
+        });
+        let racing_store = Arc::new(ConcurrentWriterStore::new(
+            Arc::clone(&inner),
+            bytes::Bytes::from(serde_json::to_vec(&concurrent_write).unwrap()),
+        ));
+        racing_store.arm();
+
+        let state = crate::state::AppState::new(
+            racing_store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deleted = strip_or_delete_dependent(&state, ns, rs_key, owner_uid, "test-rs").await;
+
+        assert!(
+            !deleted,
+            "the ReplicaSet has another live owner besides owner_uid, so it must survive \
+             with only owner_uid's reference stripped, not be hard-deleted"
+        );
+
+        let stored = inner.get(rs_key).await.unwrap().unwrap();
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let refs = stored_val["metadata"]["ownerReferences"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !refs.iter().any(|r| r["uid"].as_str() == Some(owner_uid)),
+            "the deleted owner's reference must be stripped"
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r["uid"].as_str() == Some(other_owner_uid)),
+            "the other live owner's reference must survive the strip"
+        );
+        assert_eq!(
+            stored_val["status"]["replicas"], 3,
+            "a concurrent status write racing the owner-ref strip must survive — a strip \
+             that clobbers stale LIST-time data instead of retrying against the freshly \
+             re-read object would silently discard a status update the writer believes \
+             succeeded, with no error surfaced to either side"
+        );
     }
 
     /// delete_collection_resource must propagate a non-NotFound store error rather than
