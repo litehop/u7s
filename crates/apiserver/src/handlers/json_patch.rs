@@ -988,13 +988,17 @@ pub(crate) fn json_patch_set(
                 let idx: usize = key.parse().map_err(|_| {
                     Status::unprocessable_entity(format!("invalid array index '{key}'"))
                 })?;
-                if idx <= arr.len() {
-                    arr.insert(idx, value);
-                } else {
-                    return Err(Status::unprocessable_entity(format!(
-                        "array index {idx} out of bounds (len {})",
-                        arr.len()
-                    )));
+                // RFC 6902 §4.3: 'replace' overwrites an existing element in place; unlike
+                // 'add', it never grows the array, so idx == arr.len() (one past the end,
+                // "replace past the end") is out of bounds too.
+                match arr.get_mut(idx) {
+                    Some(slot) => *slot = value,
+                    None => {
+                        return Err(Status::unprocessable_entity(format!(
+                            "array index {idx} out of bounds (len {})",
+                            arr.len()
+                        )));
+                    }
                 }
             }
         }
