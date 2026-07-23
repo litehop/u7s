@@ -859,6 +859,22 @@ pub(crate) async fn do_patch<S: Store>(
 
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
+        // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour
+        // and mirrors the same check in create_namespaced_resource/create_cr_namespaced/
+        // create_pod. Without this, `kubectl apply --server-side` can create new content in a
+        // namespace mid-deletion by going through PATCH+apply instead of POST+create.
+        if let Some(namespace) = ns {
+            let ns_key = cluster_object_key("namespaces", namespace);
+            if let Ok(Some(stored)) = state.store.get(&ns_key).await {
+                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                        return Err(Status::forbidden(format!(
+                            "unable to create new content in namespace {namespace} because it is being terminated"
+                        )));
+                    }
+                }
+            }
+        }
         // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side), which
         // Object::from_bytes (JSON-only) rejects outright — ssa_body_to_json handles both.
         let mut obj = Object {
@@ -4056,6 +4072,95 @@ mod tests {
 
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
         assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// SSA apply-create (do_patch's is_ssa && stored_opt.is_none() upsert branch) had no
+    /// Terminating-namespace gate, unlike create_namespaced_resource/create_pod — so
+    /// `kubectl apply --server-side` could inject a brand-new object into a namespace mid-
+    /// deletion by going through PATCH+apply instead of POST+create, reintroducing the
+    /// "controller keeps creating content mid-deletion" wedge class.
+    ///
+    /// Fails on revert: without the gate, this SSA apply-create of a not-yet-existing
+    /// ConfigMap into a Terminating namespace returns 201 instead of 403.
+    #[tokio::test]
+    async fn apply_patch_yaml_rejects_create_in_terminating_namespace() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns_key = "/registry/namespaces/dying-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "dying-ns" },
+            "status": { "phase": "Terminating" }
+        });
+        store
+            .put(
+                ns_key,
+                bytes::Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "new-cm", "namespace": "dying-ns" },
+            "data": { "k": "v" }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "dying-ns".to_string(),
+                "configmaps".to_string(),
+                "new-cm".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await;
+
+        match result {
+            Err(e) => assert_eq!(
+                e.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "SSA apply-create into a Terminating namespace must 403, matching what \
+                 POST-create already does — otherwise a controller can keep injecting new \
+                 content mid-deletion just by using server-side apply instead of POST"
+            ),
+            Ok(_) => panic!(
+                "SSA apply-create of a not-yet-existing object in a Terminating namespace \
+                 must be rejected, not silently create it"
+            ),
+        }
+
+        let key = "/registry/configmaps/dying-ns/new-cm";
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "the ConfigMap must not have been created in the store"
+        );
     }
 
     /// apply-patch+yaml PATCH must upsert (create if not found) and update if existing.

@@ -2666,6 +2666,22 @@ pub async fn patch_cr_namespaced<S: Store>(
     // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
+        // Reject object creation in a Terminating namespace — matches
+        // create_cr_namespaced/create_namespaced_resource/create_pod. Without this,
+        // `kubectl apply --server-side` can create a new CR in a namespace mid-deletion by
+        // going through PATCH+apply instead of POST+create.
+        {
+            let ns_key = cluster_object_key("namespaces", &ns);
+            if let Ok(Some(stored)) = state.store.get(&ns_key).await {
+                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                        return Err(Status::forbidden(format!(
+                            "unable to create new content in namespace {ns} because it is being terminated"
+                        )));
+                    }
+                }
+            }
+        }
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
@@ -8889,6 +8905,84 @@ mod tests {
                 .unwrap_or("")
                 .contains("being terminated"),
             "error message must say namespace is being terminated"
+        );
+    }
+
+    /// patch_cr_namespaced's SSA-upsert branch (is_ssa && stored_opt.is_none()) had no
+    /// Terminating-namespace gate, unlike create_cr_namespaced — so `kubectl apply
+    /// --server-side` creating a brand-new CR instance could inject content into a namespace
+    /// mid-deletion just by going through PATCH+apply instead of POST+create.
+    ///
+    /// Fails on revert: without the gate, this SSA apply-create of a not-yet-existing CR into
+    /// a Terminating namespace returns 201 instead of 403.
+    #[tokio::test]
+    async fn patch_cr_namespaced_ssa_create_rejects_terminating_namespace() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let ns_key = "/registry/namespaces/dying-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "dying-ns" },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(
+                ns_key,
+                Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "dying-ns".to_string(),
+                "applications".to_string(),
+                "new-app".to_string(),
+            )),
+            test_user(),
+            headers,
+            app_body("new-app", "dying-ns"),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "SSA apply-create of a not-yet-existing CR in a Terminating namespace must be \
+                 rejected, matching what POST-create already does — otherwise a controller can \
+                 keep injecting new CRs mid-deletion just by using server-side apply"
+            ),
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 403,
+            "SSA apply-create into a Terminating namespace must 403"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("being terminated"),
+            "error message must say namespace is being terminated"
+        );
+
+        let key = cr_store_key("argoproj.io", "applications", Some("dying-ns"), "new-app");
+        assert!(
+            state.store.get(&key).await.unwrap().is_none(),
+            "the CR must not have been created in the store"
         );
     }
 
