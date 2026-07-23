@@ -48,7 +48,13 @@ milestone toward that, not the end goal.
 - Kubelet registration: CSR signing, Node object management, watch/list
 - Proto negotiation (protobuf response encoding for kubelet 1.36+)
 - Discovery endpoints (/api, /apis, /api/v1, /apis/GROUP/VERSION)
-- Strategic Merge Patch (SMP) including nested list merge-key handling
+- Strategic Merge Patch (SMP) including nested list merge-key handling for built-in types:
+  PodSpec/PodTemplateSpec-typed fields (containers, volumes, hostAliases, etc.) resolve by
+  suffix match on `.template.spec.<field>`, so any current or future built-in nesting depth
+  (CronJob's JobTemplateSpec wrapper included) works without a new table entry. CRD-schema-
+  driven merge keys (reading `x-kubernetes-patch-merge-key` from an installed CRD's OpenAPI
+  schema) remain a separate, open gap — tracked in the strategic-merge-patch upstream-parity
+  epic.
 - Server-Side Apply stub (remaps to merge patch; managedFields echo)
 
 ### Key decisions recorded

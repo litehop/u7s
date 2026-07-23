@@ -382,21 +382,45 @@ enum MergeKeyKind {
     Unknown,
 }
 
+/// Fields whose merge key is intrinsic to the PodSpec/PodTemplateSpec type (containers,
+/// volumes, hostAliases, etc.) are matched by suffix on ".template.spec.<field>" rather than
+/// by a full exact path. That way any current or future nesting depth of PodTemplateSpec —
+/// a Deployment/StatefulSet/DaemonSet/Job's "spec.template.spec.X" (one wrapper), a CronJob's
+/// "spec.jobTemplate.spec.template.spec.X" (two wrappers), or any future built-in type that
+/// wraps PodTemplateSpec deeper still — resolves correctly without adding a new table entry.
+/// Fields that are CRD-schema-defined (not one of this fixed built-in set) are not covered by
+/// this suffix rule and remain a separate, open gap.
 fn merge_key_for_path(path: &str) -> MergeKeyKind {
     match path {
+        // Bare Pod's own spec — a Pod is patched directly, with no PodTemplateSpec wrapper.
         "spec.containers"
         | "spec.initContainers"
         | "spec.ephemeralContainers"
         | "spec.volumes"
         | "spec.imagePullSecrets"
         | "spec.schedulingGates"
-        | "spec.resourceClaims"
-        | "spec.template.spec.containers"
-        | "spec.template.spec.initContainers"
-        | "spec.template.spec.volumes"
-        | "spec.template.spec.imagePullSecrets"
-        | "spec.template.spec.schedulingGates"
-        | "spec.template.spec.resourceClaims" => MergeKeyKind::Key("name"),
+        | "spec.resourceClaims" => MergeKeyKind::Key("name"),
+
+        // The same PodSpec-typed fields as above, but reached through a PodTemplateSpec
+        // wrapper. Upstream resolves these merge keys via reflection over the Go struct
+        // (PatchMetaFromStruct), so the key is intrinsic to PodSpec itself regardless of how
+        // deeply that PodSpec ends up embedded: a Deployment's path is
+        // "spec.template.spec.<field>" (one wrapper), a CronJob's is
+        // "spec.jobTemplate.spec.template.spec.<field>" (two wrappers — JobTemplateSpec then
+        // PodTemplateSpec), and any future built-in type could add a third. This codebase has
+        // no equivalent struct-tag reflection, so a suffix match on
+        // ".template.spec.<field>" is used instead — it matches PodTemplateSpec.Spec.<field>
+        // at ANY nesting depth without needing a new table entry per wrapper type.
+        path if path.ends_with(".template.spec.containers")
+            || path.ends_with(".template.spec.initContainers")
+            || path.ends_with(".template.spec.ephemeralContainers")
+            || path.ends_with(".template.spec.volumes")
+            || path.ends_with(".template.spec.imagePullSecrets")
+            || path.ends_with(".template.spec.schedulingGates")
+            || path.ends_with(".template.spec.resourceClaims") =>
+        {
+            MergeKeyKind::Key("name")
+        }
 
         // topologySpreadConstraints — upstream patchMergeKey is "topologyKey" (singular;
         // the second +listMapKey=whenUnsatisfiable doc annotation is only a composite-key
@@ -406,7 +430,8 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // zone-spread on top of an existing hostname-spread) falls through to
         // MergeKeyKind::Unknown, which silently replaces the whole array instead of
         // merging by topologyKey — losing every pre-existing constraint.
-        "spec.topologySpreadConstraints" | "spec.template.spec.topologySpreadConstraints" => {
+        "spec.topologySpreadConstraints" => MergeKeyKind::Key("topologyKey"),
+        path if path.ends_with(".template.spec.topologySpreadConstraints") => {
             MergeKeyKind::Key("topologyKey")
         }
 
@@ -415,7 +440,8 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // "spec.hostAliases" path was registered, so patching a Deployment's
         // spec.template.spec.hostAliases to add one entry dropped every other hostAlias in
         // the template.
-        "spec.hostAliases" | "spec.template.spec.hostAliases" => MergeKeyKind::Key("ip"),
+        "spec.hostAliases" => MergeKeyKind::Key("ip"),
+        path if path.ends_with(".template.spec.hostAliases") => MergeKeyKind::Key("ip"),
 
         // Nested list fields inside container objects.
         // These paths are relative to the container object (e.g. spec.containers.env).
@@ -849,6 +875,189 @@ mod tests {
         assert!(
             ips.contains(&"10.0.0.1") && ips.contains(&"10.0.0.2"),
             "both the original and newly-patched ip must survive; got: {ips:?}"
+        );
+    }
+
+    /// A CronJob nests its PodTemplateSpec one level deeper than a Deployment
+    /// ("spec.jobTemplate.spec.template.spec.containers" vs.
+    /// "spec.template.spec.containers"). `merge_key_for_path` resolves the merge key by
+    /// suffix match on ".template.spec.containers" specifically so this extra JobTemplateSpec
+    /// wrapper doesn't matter. Without that, `kubectl apply`-ing a CronJob a second time to
+    /// add a sidecar container would silently REPLACE the whole containers array instead of
+    /// merging by name — deleting the CronJob's original container every time the job spec is
+    /// reapplied, which upstream kube-apiserver does not do.
+    #[test]
+    fn test_smp_cronjob_job_template_containers_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": "worker", "image": "worker:1.0"}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": "sidecar", "image": "sidecar:latest"}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            containers.len(),
+            2,
+            "adding a sidecar to a CronJob's job template must not silently drop the \
+             original worker container — got: {containers:?}"
+        );
+        let names: Vec<&str> = containers
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"worker") && names.contains(&"sidecar"),
+            "both the original and newly-patched container must survive; got: {names:?}"
+        );
+    }
+
+    /// Same CronJob-depth nesting as the containers case above, but for `volumes` — proves
+    /// the suffix match isn't a one-field special case bolted on just for containers, and
+    /// that it covers every field in the shared ".template.spec.<field>" arm.
+    #[test]
+    fn test_smp_cronjob_job_template_volumes_merge_preserves_existing() {
+        let mut target = json!({
+            "spec": {
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "volumes": [
+                                    {"name": "config", "configMap": {"name": "job-config"}}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "volumes": [
+                                    {"name": "scratch", "emptyDir": {}}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let volumes = target["spec"]["jobTemplate"]["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            volumes.len(),
+            2,
+            "adding a scratch volume to a CronJob's job template must not silently drop the \
+             pre-existing config volume the container mounts — got: {volumes:?}"
+        );
+        let names: Vec<&str> = volumes
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"config") && names.contains(&"scratch"),
+            "both the original and newly-patched volume must survive; got: {names:?}"
+        );
+    }
+
+    /// Upstream resolves merge keys via reflection over the actual Go struct, so ANY built-in
+    /// type that wraps PodTemplateSpec — at any nesting depth, not just CronJob's currently
+    /// known depth-2 case — gets correct merge behavior automatically. This test proves the
+    /// suffix-match fix genuinely generalizes rather than merely papering over the one
+    /// currently-known CronJob gap: it fabricates a hypothetical depth-4 wrapper
+    /// ("spec.some.wrapper.template.spec.containers") that doesn't correspond to any real
+    /// resource today, to confirm a future built-in type nested one level deeper than CronJob
+    /// would resolve correctly with no further code change required.
+    #[test]
+    fn test_smp_hypothetical_fourth_level_template_spec_nesting_merges_by_name() {
+        let mut target = json!({
+            "spec": {
+                "some": {
+                    "wrapper": {
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": "existing", "image": "existing:1.0"}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "some": {
+                    "wrapper": {
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": "added", "image": "added:latest"}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["some"]["wrapper"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            containers.len(),
+            2,
+            "a hypothetical future built-in type nesting PodTemplateSpec one level deeper \
+             than CronJob must still merge by container name instead of atomically replacing \
+             the array — the merge key is intrinsic to PodSpec, not to any specific wrapper \
+             depth; got: {containers:?}"
+        );
+        let names: Vec<&str> = containers
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"existing") && names.contains(&"added"),
+            "both the original and newly-patched container must survive; got: {names:?}"
         );
     }
 
