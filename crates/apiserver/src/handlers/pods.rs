@@ -6620,6 +6620,37 @@ mod pure_logic_tests {
         assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
     }
 
+    /// set (replace) on an existing numeric array index overwrites that element in
+    /// place and leaves the array length unchanged. RFC 6902 §4.3 defines "replace"
+    /// as remove-then-add at the *same* location, not an insert: a client patching
+    /// EndpointSlice addresses[0] (or any array field) must get back a same-length
+    /// array with only the target index changed, not a corrupted, ever-growing array
+    /// with the old value pushed to the tail (the bug this test guards against).
+    #[test]
+    fn patch_set_numeric_index_overwrites_in_place() {
+        let mut obj = serde_json::json!({"items": ["9.9.9.9", "keep"]});
+        json_patch_set(&mut obj, "/items/0", serde_json::json!("8.8.8.8"))
+            .unwrap_or_else(|_| panic!("replace on an existing index must succeed"));
+        assert_eq!(
+            obj["items"],
+            serde_json::json!(["8.8.8.8", "keep"]),
+            "replace must overwrite index 0 in place, not insert and shift 'keep' along"
+        );
+    }
+
+    /// set (replace) with idx == arr.len() is rejected: RFC 6902 "replace" only
+    /// targets an existing element, unlike "add" which may append past the end.
+    /// Allowing this would let a corrupted patch silently grow an array via replace.
+    #[test]
+    fn patch_set_array_index_equal_len_returns_422() {
+        let mut obj = serde_json::json!({"items": [1]});
+        let result = json_patch_set(&mut obj, "/items/1", serde_json::json!(99));
+        assert!(
+            result.is_err(),
+            "replace past the end of the array must be rejected, not treated as an append"
+        );
+    }
+
     /// set with a numeric index beyond bounds returns 422.
     #[test]
     fn patch_set_array_oob_returns_422() {
