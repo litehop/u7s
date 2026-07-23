@@ -7,7 +7,12 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-BINARY="$REPO/target/release/u7s-scheduler"
+BINARY="${U7S_TARGET_DIR:-$REPO/target}/release/u7s-scheduler"
+
+TARGET_DIR_ARGS=()
+if [[ -n "${U7S_TARGET_DIR:-}" ]]; then
+  TARGET_DIR_ARGS=(--target-dir "$U7S_TARGET_DIR")
+fi
 
 WORKDIR="$PWD/temp/u7s"
 
@@ -31,7 +36,7 @@ LOG="$WORKDIR/scheduler.log"
 
 echo "=== [05] Start u7s-scheduler (on host) ==="
 
-cargo build --release -p u7s-scheduler --manifest-path "$REPO/Cargo.toml"
+cargo build --release -p u7s-scheduler --manifest-path "$REPO/Cargo.toml" "${TARGET_DIR_ARGS[@]+"${TARGET_DIR_ARGS[@]}"}"
 
 if [ ! -f "$WORKDIR/kubeconfig" ]; then
   echo "error: kubeconfig not found at $WORKDIR/kubeconfig" >&2
