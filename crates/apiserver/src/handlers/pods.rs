@@ -828,86 +828,101 @@ pub async fn delete_pod<S: Store>(
 
     let key = object_key("pods", ns.as_str(), &name);
 
-    // Fetch current object to check finalizers.
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
-    // Run exactly once here, before branching into soft-delete vs hard-delete below, so a
-    // Fail-policy webhook can deny whichever delete decision this request actually makes.
-    let admission_ctx = AdmissionContext {
-        group: "",
-        version: "v1",
-        resource: "pods",
-        name: &name,
-        namespace: Some(ns.as_str()),
-        operation: "DELETE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-        })),
-        dry_run: false,
-    };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
-
-    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
-    let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
-    let already_terminating = meta.deletion_timestamp.is_some();
-
-    // Real Kubernetes apiserver always soft-deletes pods first (sets deletionTimestamp)
-    // so the kubelet receives a MODIFIED event and gracefully terminates the container via SIGTERM.
-    // Hard-delete only when the pod is already in the Terminating state AND has no finalizers —
-    // this is the path taken when the kubelet calls DELETE a second time after stopping the container.
-    //
-    // Without this: pods are immediately hard-deleted, the kubelet only receives a DELETED event
-    // with a minimal tombstone (no spec), and the container is never sent SIGTERM — it keeps
-    // running indefinitely while the StatefulSet controller waits for the pod to terminate.
-    if already_terminating && !has_finalizers {
-        // Hard-delete: pod is already Terminating and all finalizers are gone.
-        state
+    // Retry loop: a plain DELETE with no resourceVersion precondition must never surface a
+    // concurrency conflict to the client. If a concurrent writer (e.g. the kubelet's routine
+    // pod-status PATCH) advances the stored resourceVersion between our read and our write,
+    // re-read the fresh object and redo the soft-delete decision rather than returning 409.
+    // Mirrors patch_pod's retry-on-RevisionMismatch loop above, added for the same race class.
+    loop {
+        // Fetch current object to check finalizers.
+        let stored = state
             .store
-            .delete(&key, None)
+            .get(&key)
             .await
-            .map_err(|e| store_err_to_status(e, &name))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(&name, "Pod"))?;
 
-        crate::quota::update_quota_status(&state, ns.as_str()).await;
+        let mut obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-        return Ok(Json(serde_json::json!({
-            "kind": "Status",
-            "apiVersion": "v1",
-            "status": "Success",
-            "code": 200
-        })));
+        // Admission webhook pipeline (validating only — mutating webhooks do not apply to
+        // DELETE). Run against the freshest read on every attempt, before branching into
+        // soft-delete vs hard-delete below, so a Fail-policy webhook can deny whichever delete
+        // decision this request actually makes.
+        let admission_ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: &name,
+            namespace: Some(ns.as_str()),
+            operation: "DELETE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
+            dry_run: false,
+        };
+        run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+
+        let meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+        let already_terminating = meta.deletion_timestamp.is_some();
+
+        // Real Kubernetes apiserver always soft-deletes pods first (sets deletionTimestamp)
+        // so the kubelet receives a MODIFIED event and gracefully terminates the container via SIGTERM.
+        // Hard-delete only when the pod is already in the Terminating state AND has no finalizers —
+        // this is the path taken when the kubelet calls DELETE a second time after stopping the container.
+        //
+        // Without this: pods are immediately hard-deleted, the kubelet only receives a DELETED event
+        // with a minimal tombstone (no spec), and the container is never sent SIGTERM — it keeps
+        // running indefinitely while the StatefulSet controller waits for the pod to terminate.
+        if already_terminating && !has_finalizers {
+            // Hard-delete: pod is already Terminating and all finalizers are gone. No
+            // resourceVersion precondition is passed here, so this path cannot RevisionMismatch.
+            state
+                .store
+                .delete(&key, None)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+
+            crate::quota::update_quota_status(&state, ns.as_str()).await;
+
+            return Ok(Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Success",
+                "code": 200
+            })));
+        }
+
+        // Soft-delete: stamp deletionTimestamp so the kubelet knows to gracefully terminate
+        // the container. Applies regardless of whether the pod has finalizers.
+        //
+        // Setting deletionTimestamp is always a real mutation — Kubernetes increments
+        // metadata.generation on every graceful delete so that controllers can detect
+        // the transition via observedGeneration (pods.go:573 conformance test).
+        let grace = effective_grace_period_seconds(requested_grace, &obj.body);
+        obj.body["metadata"]["deletionTimestamp"] =
+            serde_json::Value::String(deletion_timestamp_after_grace(grace));
+        obj.body["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
+        let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        match state.store.put(&key, obj.to_bytes(), expected_rv).await {
+            Ok(new_rv) => {
+                obj.set_resource_version(new_rv);
+                return Ok(Json(obj.body));
+            }
+            Err(StoreError::RevisionMismatch { .. }) => {
+                // A concurrent write advanced the stored revision between our read and write.
+                // Re-read the fresh object and redo the soft-delete decision.
+                continue;
+            }
+            Err(e) => return Err(store_err_to_status(e, &name)),
+        }
     }
-
-    // Soft-delete: stamp deletionTimestamp so the kubelet knows to gracefully terminate
-    // the container. Applies regardless of whether the pod has finalizers.
-    //
-    // Setting deletionTimestamp is always a real mutation — Kubernetes increments
-    // metadata.generation on every graceful delete so that controllers can detect
-    // the transition via observedGeneration (pods.go:573 conformance test).
-    let grace = effective_grace_period_seconds(requested_grace, &obj.body);
-    obj.body["metadata"]["deletionTimestamp"] =
-        serde_json::Value::String(deletion_timestamp_after_grace(grace));
-    obj.body["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
-    let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
-    obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
-    let expected_rv = parse_resource_version(obj.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
-    obj.set_resource_version(new_rv);
-    Ok(Json(obj.body))
 }
 
 pub async fn patch_pod<S: Store>(
@@ -12452,6 +12467,118 @@ mod handler_tests {
             "the concurrent status write must survive too — a patch_pod that clobbers on \
              retry (e.g. writing unconditionally, or reapplying against stale data) would \
              silently revert the kubelet's status update"
+        );
+    }
+
+    /// A plain `client.Delete(ctx, name, DeleteOptions{})` carries no resourceVersion
+    /// precondition at all — the client never asked the apiserver to enforce one. If the
+    /// kubelet's routine pod-status PATCH lands between delete_pod's read and its
+    /// soft-delete write, the internal CAS delete_pod uses to persist deletionTimestamp
+    /// conflicts; without a retry loop (mirroring patch_pod's, added in 1d4ec948 for the
+    /// same race class) that conflict leaked straight to the client as a spurious 409,
+    /// which is exactly what broke the CSIInlineVolumes conformance test's unconditional
+    /// pod delete. This test fails on revert: without the retry, the DELETE returns 409
+    /// instead of 200.
+    #[tokio::test]
+    async fn delete_pod_retries_past_concurrent_status_write_instead_of_409ing() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let ns_key = "/registry/namespaces/default";
+        inner
+            .put(
+                ns_key,
+                Bytes::from(
+                    serde_json::to_vec(
+                        &serde_json::json!({"kind":"Namespace","metadata":{"name":"default"}}),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_key = "/registry/pods/default/csi-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "csi-pod",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {},
+            "status": {"phase": "Pending"}
+        });
+        inner
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // What the kubelet's concurrent /status PATCH lands as between delete_pod's read
+        // and its first write attempt.
+        let concurrent_status_write = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "csi-pod",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {},
+            "status": {"phase": "Running"}
+        });
+        let racing_store = Arc::new(ConcurrentWriterStore::new(
+            Arc::clone(&inner),
+            Bytes::from(serde_json::to_vec(&concurrent_status_write).unwrap()),
+        ));
+        racing_store.arm();
+
+        let state = AppState::new(
+            Arc::clone(&racing_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/csi-pod")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a plain unconditional DELETE must retry past a concurrent status write and \
+             succeed with 200, never surface the apiserver's own internal CAS conflict as \
+             a 409 to a client that never specified any resourceVersion precondition"
+        );
+
+        let stored = inner.get(pod_key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_body["metadata"]["deletionTimestamp"].is_string(),
+            "the retried delete must still stamp deletionTimestamp so the kubelet sends \
+             SIGTERM — a retry that only avoided the 409 without completing the write \
+             would leave the pod running forever with the client believing DELETE succeeded"
+        );
+        assert_eq!(
+            stored_body["status"]["phase"], "Running",
+            "the concurrent status write must survive the retried delete — a delete that \
+             retries by clobbering with stale data instead of re-reading the fresh object \
+             would silently revert the kubelet's status update"
         );
     }
 }
