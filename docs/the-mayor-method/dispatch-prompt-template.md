@@ -417,11 +417,33 @@ limit: ~4 GiB RAM per VM).
 | VM name | Host port | Kubelet port | Companion kubelet port | Konnectivity | Notes |
 |---|---|---|---|---|---|
 | `lima-node` | `6443` | `10250` | `10260` | `8135` | Mayor's VM — never assign to workers |
-| slot 1 | `6444` | `10251` | `10261` | `8235` | |
-| slot 2 | `6445` | `10252` | `10262` | `8335` | |
-| slot 3 | `6446` | `10253` | `10263` | `8435` | |
-| slot 4 | `6447` | `10254` | `10264` | `8535` | |
-| slot 5 | `6448` | `10255` | `10265` | `8635` | |
+| slot 1 = `lima-node-2` | `6444` | `10251`* | `10261` | `8235` | *currently live on `10252` — see caveat below |
+| slot 2 = `lima-node-3` | `6445` | `10252` | `10262` | `8335` | often repurposed as the operator's 2-node companion node (paired with `lima-node`) — check `limactl list` / the dashboard before assuming it's free |
+| slot 3 = `lima-node-4` | `6446` | `10253` | `10263` | `8435` | |
+| slot 4 = `lima-node-5` | `6447` | `10254` | `10264` | `8535` | |
+| slot 5 = `lima-node-smoke` | `6448` | `10255` | `10265` | `8635` | fixed 2026-07-23 (mayor-1rlwt) — was misconfigured at `10251`, colliding with slot 1 |
+
+**Before assigning a slot, verify the LIVE port, not just this table**: run
+`grep -A1 guestPort ~/.lima/<vm-name>/lima.yaml` for the VM you're about to assign —
+this table records intent, but a VM's actual port can drift from it (see the
+`lima-node-2`/`lima-node-smoke` history below) and the table is not proven to
+self-correct. Treat a mismatch as a signal to reconcile, not to trust the table blindly.
+
+**History (mayor-1rlwt, 2026-07-23):** `lima-node-smoke` was found live-configured on
+port `10251` (slot 1's port) instead of its own `10255` — a previous provisioning
+mistake, not a documented reservation. This silently caused `lima-node-2` (slot 1) to
+lose the bind race whenever `lima-node-smoke` was already running, producing TLS/
+BadGateway failures that looked like a kubelet cert problem but were actually traffic
+reaching the WRONG VM's kubelet. Root-caused as a live port-forward collision, not a
+cert issue — see `mayor-1rlwt` and `mayor-pgm5q.6`'s notes for the full misdiagnosis
+trail. Fixed by reprovisioning `lima-node-smoke` onto `10255` (stop VM, edit
+`~/.lima/lima-node-smoke/lima.yaml`'s `portForwards[0].hostPort`, restart — `limactl`
+has no in-place port-edit command, and `worker-vm.sh start` only applies `--set` flags
+on FIRST provision, not on restarting an already-existing VM). `lima-node-2` itself
+was left on the workaround port `10252` from an earlier dispatch (mayor-6m0np) rather
+than reverted to `10251` — no live collision exists at `10252` today, so it wasn't
+worth the ~5 min reprovision to "fix" a non-problem (Rule 2). A future mayor MAY want
+to align it back to `10251` when convenient, but it is not urgent.
 
 **Companion kubelet port** (`10260`-`10265`) is reserved for each slot's 2nd
 (companion) node in a two-node conformance run — pass it as `--extra-kubelet-port`
