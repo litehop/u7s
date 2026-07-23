@@ -2113,12 +2113,7 @@ pub async fn create_cr_namespaced<S: Store>(
 
     validate_cr_schema(&obj, &ctx)?;
 
-    {
-        let mut meta: crate::types::ObjectMeta =
-            serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
-        meta.namespace = Some(ns.clone());
-        obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    }
+    obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
     let admission_ctx = AdmissionContext {
@@ -11167,6 +11162,137 @@ mod tests {
             dep_after.is_none(),
             "cascade must delete a dependent that was created via the API with ownerReferences — \
              if ownerRefs were dropped by create, cascade has nothing to match and the dependent leaks"
+        );
+    }
+
+    /// Creating a NAMESPACED CR via the API with ownerReferences in metadata must preserve
+    /// those references in storage. create_cr_namespaced round-trips metadata through
+    /// ObjectMeta a second time (to stamp namespace) BEFORE stamp_cr_fields's own
+    /// save+restore ever runs, so ownerReferences is already gone by the time stamp_cr_fields
+    /// tries to save it — cascade_delete_cr_dependents then can't find dependents and any
+    /// namespaced CR-owns-CR relationship silently loses its GC/cascade-delete link.
+    #[tokio::test]
+    async fn create_cr_namespaced_via_api_preserves_owner_references() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let plural = "applications";
+        let ns = "argocd";
+
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("ownerref-owner", ns),
+        )
+        .await
+        .expect("create owner");
+
+        let owner_uid = {
+            let s = state
+                .store
+                .get(&cr_store_key(group, plural, Some(ns), "ownerref-owner"))
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&s.value).unwrap()["metadata"]["uid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Create dependent with ownerReference via the create_cr_namespaced API handler.
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "argoproj.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": {
+                        "name": "ownerref-dep",
+                        "namespace": ns,
+                        "ownerReferences": [{
+                            "apiVersion": "argoproj.io/v1alpha1",
+                            "kind": "Application",
+                            "name": "ownerref-owner",
+                            "uid": owner_uid,
+                            "controller": true,
+                            "blockOwnerDeletion": true
+                        }]
+                    },
+                    "spec": { "destination": { "namespace": "default" } }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("create dependent");
+
+        // Read back the dependent and verify ownerReferences survived the create round-trip.
+        let dep_stored = state
+            .store
+            .get(&cr_store_key(group, plural, Some(ns), "ownerref-dep"))
+            .await
+            .unwrap()
+            .unwrap();
+        let dep_obj: serde_json::Value = serde_json::from_slice(&dep_stored.value).unwrap();
+        let refs = dep_obj["metadata"]["ownerReferences"].as_array();
+        assert!(
+            refs.is_some() && !refs.unwrap().is_empty(),
+            "ownerReferences must be preserved through create_cr_namespaced — the namespace-\
+             setting ObjectMeta round-trip runs before stamp_cr_fields's own save+restore, so \
+             without a fix ownerRefs are already gone by the time stamp_cr_fields tries to save \
+             them, and cascade_delete_cr_dependents can never find this dependent by uid"
+        );
+        assert_eq!(
+            refs.unwrap()[0]["uid"].as_str(),
+            Some(owner_uid.as_str()),
+            "the ownerReference uid must match the owner's uid"
+        );
+
+        // Delete owner — cascade must find the API-created dependent and delete it.
+        delete_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "ownerref-owner".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete owner");
+
+        let dep_after = state
+            .store
+            .get(&cr_store_key(group, plural, Some(ns), "ownerref-dep"))
+            .await
+            .unwrap();
+        assert!(
+            dep_after.is_none(),
+            "cascade must delete a namespaced dependent that was created via the API with \
+             ownerReferences — if ownerRefs were dropped by create, cascade has nothing to \
+             match and the dependent leaks"
         );
     }
 
