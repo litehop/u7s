@@ -252,12 +252,13 @@ struct PodMetadata {
 }
 
 /// A single `status.conditions[]` entry, as needed to read back whatever
-/// PodScheduled condition is currently stored — used only by the
-/// SchedulingGated status-patch bookkeeping (`scheduling_gate_status_patch` /
-/// `scheduling_gate_status_reset`) to decide whether a PATCH is still needed.
-/// `Option` (not `String` with `#[serde(default)]`) because a condition field
-/// can be present-but-`null`, not just absent — see `merge_conditions` in the
-/// apiserver, which can persist a literal `null` reason on first write.
+/// PodScheduled condition is currently stored — used by the SchedulingGated
+/// status-patch bookkeeping (`scheduling_gate_status_patch` /
+/// `scheduling_gate_status_reset`) and by `failed_scheduling_status_patch`
+/// to decide whether a PATCH is still needed. `Option` (not `String` with
+/// `#[serde(default)]`) because a condition field can be present-but-`null`,
+/// not just absent — see `merge_conditions` in the apiserver, which can
+/// persist a literal `null` reason on first write.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PodConditionView {
@@ -265,6 +266,7 @@ struct PodConditionView {
     condition_type: Option<String>,
     status: Option<String>,
     reason: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -532,6 +534,53 @@ pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
                 "type": POD_SCHEDULED,
                 "reason": UNSCHEDULABLE_REASON,
                 "message": UNSCHEDULABLE_MESSAGE,
+            }]
+        }
+    }))
+}
+
+/// Build the `status.conditions` PATCH for a pod that just failed a
+/// scheduling attempt (no node fit, even after preemption, or the bind
+/// itself failed) — `None` when `event` (the watch event that triggered
+/// this scheduling attempt) already shows this exact
+/// False/Unschedulable/`message` condition.
+///
+/// Mirrors upstream kube-scheduler, which patches `PodScheduled=False` with
+/// reason `Unschedulable` on EVERY failed scheduling cycle, not just the
+/// FailedScheduling Event `main.rs` already emits. Without this, a pod's
+/// `status.conditions` stays frozen at the pod-creation-time default
+/// forever, so anything polling for `{type: PodScheduled, reason:
+/// Unschedulable}` (some conformance waits do exactly this) can never
+/// observe the failure.
+///
+/// The idempotency check is load-bearing, not cosmetic: a status PATCH
+/// echoes back through the watch as a fresh MODIFIED event for the same
+/// still-unscheduled pod, which re-enters `needs_scheduling` and retries
+/// scheduling immediately — repeating this PATCH unconditionally on a pod
+/// that keeps failing with the SAME message every attempt (e.g. a
+/// permanently-unsatisfiable nodeSelector) would fire a tight, unbounded
+/// self-retrigger loop hammering the apiserver, rather than settling once
+/// the message stops changing. Mirrors `scheduling_gate_status_patch`'s
+/// identical guard for the identical reason.
+pub fn failed_scheduling_status_patch(event: &Value, message: &str) -> Option<Value> {
+    if let Ok(watch_event) = serde_json::from_value::<WatchEvent<PodObject>>(event.clone()) {
+        let already_marked = watch_event.object.status.conditions.iter().any(|c| {
+            c.condition_type.as_deref() == Some(POD_SCHEDULED)
+                && c.status.as_deref() == Some("False")
+                && c.reason.as_deref() == Some(UNSCHEDULABLE_REASON)
+                && c.message.as_deref() == Some(message)
+        });
+        if already_marked {
+            return None;
+        }
+    }
+    Some(serde_json::json!({
+        "status": {
+            "conditions": [{
+                "type": POD_SCHEDULED,
+                "status": "False",
+                "reason": UNSCHEDULABLE_REASON,
+                "message": message,
             }]
         }
     }))
@@ -1557,19 +1606,58 @@ pub struct PreemptionPlan {
 /// the caller can re-plan from scratch, instead of reserving `pod` onto a
 /// node that a fresher read shows no longer fits.
 ///
+/// Why `find_preemption_plan` failed to find a preemption plan for a pending
+/// pod.
+///
+/// Same distinction `PickNodeError` draws for `pick_node`, and for the same
+/// reason (see its doc comment): `NoViablePlan` means every qualifying node
+/// was actually checked and even preempting its lower-priority pods
+/// wouldn't free enough room — a genuine "this pod cannot be scheduled"
+/// outcome that stays that way until the cluster changes. `ApiError` means
+/// the GET /api/v1/nodes call itself failed, or its body could not be
+/// parsed — no node was actually checked, so it says nothing about whether
+/// preemption would have worked. Collapsing `ApiError` into `NoViablePlan`
+/// would mark a possibly-schedulable pod `FailedScheduling` off a transient
+/// infra hiccup that the next watch tick would otherwise have retried
+/// cleanly — the same bug `PickNodeError` fixed for `pick_node`.
+#[derive(Debug, thiserror::Error)]
+pub enum FindPreemptionPlanError {
+    #[error("no node can fit the pending pod even after preempting lower-priority pods")]
+    NoViablePlan,
+    #[error(transparent)]
+    ApiError(#[from] anyhow::Error),
+}
+
+/// Whether a `find_preemption_plan` failure should be treated as "leave this
+/// pod Pending and let the watch retry" instead of a genuine scheduling
+/// failure worth a `FailedScheduling` event.
+///
+/// Pure predicate over the typed error — no networking — so it can be unit
+/// tested without a fake API server, mirroring
+/// `should_retry_without_preempting`'s relationship to `pick_node`.
+pub fn should_retry_after_preemption_plan_error(err: &FindPreemptionPlanError) -> bool {
+    matches!(err, FindPreemptionPlanError::ApiError(_))
+}
+
 /// Among nodes where preemption would work, the node requiring the FEWEST
 /// victims is chosen (cheapest disruption); ties keep the API server's node-list
-/// order. Returns `Err` when no candidate node — even after preempting every
-/// eligible lower-priority pod on it — could fit the pending pod.
+/// order. Returns `Err(FindPreemptionPlanError::NoViablePlan)` when no
+/// candidate node — even after preempting every eligible lower-priority pod
+/// on it — could fit the pending pod. Returns
+/// `Err(FindPreemptionPlanError::ApiError(_))` when the GET or its response
+/// body is itself unusable — see `FindPreemptionPlanError` for why the
+/// caller must not treat that the same as `NoViablePlan`.
 pub async fn find_preemption_plan(
     connector: &TlsConnector,
     server: &str,
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
-) -> anyhow::Result<PreemptionPlan> {
+) -> Result<PreemptionPlan, FindPreemptionPlanError> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
-        bail!("GET /api/v1/nodes returned {status}: {body}");
+        return Err(FindPreemptionPlanError::ApiError(anyhow::anyhow!(
+            "GET /api/v1/nodes returned {status}: {body}"
+        )));
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
 
@@ -1609,9 +1697,9 @@ pub async fn find_preemption_plan(
         }
     }
 
-    let (index, plan) =
-        best.context("no node can fit the pending pod even after preempting lower-priority pods")?;
-    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)?;
+    let (index, plan) = best.ok_or(FindPreemptionPlanError::NoViablePlan)?;
+    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
+        .map_err(|_| FindPreemptionPlanError::NoViablePlan)?;
 
     Ok(plan)
 }
@@ -2139,6 +2227,41 @@ mod tests {
         assert!(
             should_retry_without_preempting(&err),
             "a transient API error must not trigger preemption or FailedScheduling"
+        );
+    }
+
+    // should_retry_after_preemption_plan_error tests — find_preemption_plan had
+    // the same untyped-Err gap pick_node did: a transient GET /api/v1/nodes
+    // failure and "no node fits even after preempting" both surfaced as a bare
+    // anyhow::Error, so main.rs's preemption arm treated an apiserver hiccup as
+    // a genuine "this pod cannot be scheduled" outcome and marked it
+    // FailedScheduling instead of leaving it Pending for the watch to retry.
+
+    #[test]
+    fn should_retry_after_preemption_plan_error_is_false_for_no_viable_plan() {
+        // A genuine NoViablePlan means every qualifying node was actually
+        // checked, including what preempting its lower-priority pods would
+        // free. If this returned true (skip silently), a pod that truly
+        // cannot fit anywhere would never get its FailedScheduling event.
+        assert!(
+            !should_retry_after_preemption_plan_error(&FindPreemptionPlanError::NoViablePlan),
+            "a real NoViablePlan must produce a FailedScheduling event, not a silent skip"
+        );
+    }
+
+    #[test]
+    fn should_retry_after_preemption_plan_error_is_true_for_api_error() {
+        // The GET /api/v1/nodes call itself failed — no node was actually
+        // checked, so nothing here says the pod is truly unschedulable. If
+        // this returned false (the pre-fix behavior), main.rs would mark the
+        // pod FailedScheduling over a transient apiserver hiccup instead of
+        // leaving it Pending for the next watch tick to retry.
+        let err =
+            FindPreemptionPlanError::ApiError(anyhow::anyhow!("GET /api/v1/nodes returned 503"));
+        assert!(
+            should_retry_after_preemption_plan_error(&err),
+            "a transient API error during preemption planning must not be treated as \
+             a genuine 'no viable plan' scheduling failure"
         );
     }
 
@@ -2716,6 +2839,88 @@ mod tests {
             patch["status"]["conditions"][0].get("status").is_none(),
             "the reset patch must never carry a \"status\" field — doing so risks \
              clobbering a concurrently-bound pod's True back to False"
+        );
+    }
+
+    #[test]
+    fn failed_scheduling_status_patch_sets_pod_scheduled_false() {
+        // Without this, a pod that fails every scheduling attempt keeps
+        // whatever PodScheduled condition it had at creation forever — the
+        // FailedScheduling Event main.rs emits is invisible to anything that
+        // polls status.conditions instead of watching Events (some
+        // conformance waits do exactly that), so this must actually flip the
+        // condition, not just log/emit.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "p", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let patch = failed_scheduling_status_patch(&event, "no node fits")
+            .expect("a pod with no matching condition yet must get one patched in");
+        let cond = &patch["status"]["conditions"][0];
+        assert_eq!(cond["type"], "PodScheduled");
+        assert_eq!(cond["status"], "False");
+        assert_eq!(
+            cond["reason"], "Unschedulable",
+            "reason must match v1.PodReasonUnschedulable — upstream kube-scheduler \
+             stamps this same reason on every failed scheduling cycle"
+        );
+        assert_eq!(cond["message"], "no node fits");
+    }
+
+    #[test]
+    fn failed_scheduling_status_patch_is_none_once_already_marked_with_same_message() {
+        // Load-bearing for a permanently-unschedulable pod (e.g. an
+        // impossible nodeSelector): this PATCH's own write echoes back
+        // through the watch as a fresh MODIFIED event, which re-enters
+        // needs_scheduling and retries scheduling immediately. Reproduced
+        // live: patching unconditionally on every retry fired an unbounded
+        // tight self-retrigger loop (hundreds of PATCH/watch round trips per
+        // second) instead of settling once the failure message stopped
+        // changing — this idempotency check is what breaks that loop.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "p", "namespace": "default" },
+                "spec": {},
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "no node fits"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            failed_scheduling_status_patch(&event, "no node fits").is_none(),
+            "an identical repeat failure must not re-issue the PATCH, or the pod's own \
+             watch echo retriggers scheduling in a tight, unbounded loop"
+        );
+    }
+
+    #[test]
+    fn failed_scheduling_status_patch_fires_again_when_message_changes() {
+        // A pod's failure reason CAN legitimately change between attempts
+        // (e.g. NoCapacity this tick, a different node's resource shortfall
+        // next tick) — the idempotency guard must only suppress an EXACT
+        // repeat, never mask a genuinely new failure reason from
+        // kubectl describe pod.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "p", "namespace": "default" },
+                "spec": {},
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "old reason"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            failed_scheduling_status_patch(&event, "new reason").is_some(),
+            "a changed failure message must still be patched in, not suppressed"
         );
     }
 
