@@ -448,41 +448,55 @@ pub async fn replace_resource<S: Store>(
         .as_str()
         .map(str::is_empty)
         .unwrap_or(true);
-    let needs_stored_read = is_priorityclass || meta.has_status_subresource || incoming_uid_blank;
-    let (stored_status, stored_uid) = if needs_stored_read {
-        let parsed = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+    // deletionTimestamp is also server-owned (see stored_deletion_timestamp below): a client
+    // whose PUT body omits it — including a protobuf-content-type PUT, since the wire decoder
+    // never emits this field — must not be trusted as "not being deleted".
+    let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
+    let needs_stored_read = is_priorityclass
+        || meta.has_status_subresource
+        || incoming_uid_blank
+        || incoming_deletion_timestamp_blank;
+    let (stored_status, stored_uid, stored_deletion_timestamp, stored_deletion_grace) =
+        if needs_stored_read {
+            let parsed = state
+                .store
+                .get(&key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
 
-        // Immutability check: PriorityClass.value drives scheduling/preemption ordering
-        // cluster-wide; allowing it to change post-create would silently reorder
-        // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
-        if is_priorityclass {
-            if let Some(ref stored_val) = parsed {
-                if obj.body["value"] != stored_val["value"] {
-                    return Err(Status::unprocessable_entity(format!(
-                        "{plural}/{name} .value is immutable and cannot be updated"
-                    )));
+            // Immutability check: PriorityClass.value drives scheduling/preemption ordering
+            // cluster-wide; allowing it to change post-create would silently reorder
+            // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
+            if is_priorityclass {
+                if let Some(ref stored_val) = parsed {
+                    if obj.body["value"] != stored_val["value"] {
+                        return Err(Status::unprocessable_entity(format!(
+                            "{plural}/{name} .value is immutable and cannot be updated"
+                        )));
+                    }
                 }
             }
-        }
 
-        let status = if meta.has_status_subresource {
-            parsed.as_ref().map(|v| v["status"].clone())
+            let status = if meta.has_status_subresource {
+                parsed.as_ref().map(|v| v["status"].clone())
+            } else {
+                None
+            };
+            // UID is immutable and system-assigned. Captured whenever we already have the
+            // stored object in hand so a blind PUT that omits it can be defended against,
+            // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
+            let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+            let deletion_timestamp = parsed
+                .as_ref()
+                .map(|v| v["metadata"]["deletionTimestamp"].clone());
+            let deletion_grace = parsed
+                .as_ref()
+                .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
+            (status, uid, deletion_timestamp, deletion_grace)
         } else {
-            None
+            (None, None, None, None)
         };
-        // UID is immutable and system-assigned. Captured whenever we already have the
-        // stored object in hand so a blind PUT that omits it can be defended against,
-        // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
-        let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
-        (status, uid)
-    } else {
-        (None, None)
-    };
 
     // UID is immutable; a client's blind PUT (built from a locally-held copy that never
     // repopulated system-assigned fields) can omit it. Real kube-apiserver's generic update
@@ -494,6 +508,21 @@ pub async fn replace_resource<S: Store>(
         if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
             if !uid.is_empty() {
                 obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            }
+        }
+    }
+
+    // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
+    // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
+    // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
+    // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
+    // of completing the delete — persisting the object with deletionTimestamp gone and
+    // finalizers empty, i.e. silently resurrecting it as a normal live object.
+    if incoming_deletion_timestamp_blank {
+        if let Some(ts) = stored_deletion_timestamp.as_ref().filter(|v| !v.is_null()) {
+            obj.body["metadata"]["deletionTimestamp"] = ts.clone();
+            if let Some(grace) = stored_deletion_grace.as_ref().filter(|v| !v.is_null()) {
+                obj.body["metadata"]["deletionGracePeriodSeconds"] = grace.clone();
             }
         }
     }
@@ -1806,78 +1835,104 @@ pub async fn replace_namespaced_resource<S: Store>(
     // Secrets/ConfigMaps, (b) generation tracking on workload resources and EndpointSlice,
     // (c) status restoration when the resource has a dedicated status subresource, and
     // (d) UID restoration (see stored_uid below) whenever we already have this object in hand.
+    // deletionTimestamp is also server-owned (see stored_deletion_timestamp below): a client
+    // whose PUT body omits it — including a protobuf-content-type PUT, since the wire decoder
+    // never emits this field — must not be trusted as "not being deleted".
+    let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
     let needs_stored_read = super::defaults::is_workload_resource(&group, &plural)
         || super::defaults::is_endpointslice(&group, &plural)
         || meta.has_status_subresource
-        || (group.is_empty() && (plural == "secrets" || plural == "configmaps"));
-    let (spec_before_replace, stored_status, stored_generation, stored_uid, eps_before_replace) =
-        if needs_stored_read {
-            let parsed = state
-                .store
-                .get(&key)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+        || (group.is_empty() && (plural == "secrets" || plural == "configmaps"))
+        || incoming_deletion_timestamp_blank;
+    let (
+        spec_before_replace,
+        stored_status,
+        stored_generation,
+        stored_uid,
+        eps_before_replace,
+        stored_deletion_timestamp,
+        stored_deletion_grace,
+    ) = if needs_stored_read {
+        let parsed = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
 
-            // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
-            // reject any update that modifies data/binaryData/stringData or clears the
-            // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
-            if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
-                if let Some(ref stored) = parsed {
-                    if stored["immutable"] == serde_json::Value::Bool(true) {
-                        let new_immutable = &obj.body["immutable"];
-                        let immutable_cleared = new_immutable == &serde_json::Value::Bool(false)
-                            || new_immutable.is_null();
-                        let data_changed = obj.body["data"] != stored["data"];
-                        let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
-                        let string_data_changed = obj.body["stringData"] != stored["stringData"];
-                        if immutable_cleared
-                            || data_changed
-                            || binary_data_changed
-                            || string_data_changed
-                        {
-                            return Err(Status::unprocessable_entity(format!(
-                                "{plural}/{name} is immutable and cannot be updated"
-                            )));
-                        }
+        // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
+        // reject any update that modifies data/binaryData/stringData or clears the
+        // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
+        if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
+            if let Some(ref stored) = parsed {
+                if stored["immutable"] == serde_json::Value::Bool(true) {
+                    let new_immutable = &obj.body["immutable"];
+                    let immutable_cleared =
+                        new_immutable == &serde_json::Value::Bool(false) || new_immutable.is_null();
+                    let data_changed = obj.body["data"] != stored["data"];
+                    let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
+                    let string_data_changed = obj.body["stringData"] != stored["stringData"];
+                    if immutable_cleared
+                        || data_changed
+                        || binary_data_changed
+                        || string_data_changed
+                    {
+                        return Err(Status::unprocessable_entity(format!(
+                            "{plural}/{name} is immutable and cannot be updated"
+                        )));
                     }
                 }
             }
+        }
 
-            let spec = if super::defaults::is_workload_resource(&group, &plural) {
-                parsed.as_ref().map(|v| v["spec"].clone())
-            } else {
-                None
-            };
-            let status = if meta.has_status_subresource {
-                parsed.as_ref().map(|v| v["status"].clone())
-            } else {
-                None
-            };
-            let generation = if super::defaults::is_workload_resource(&group, &plural)
-                || super::defaults::is_endpointslice(&group, &plural)
-            {
-                parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
-            } else {
-                None
-            };
-            // UID is immutable and system-assigned. Captured whenever we already have the
-            // stored object in hand (no extra read) so a blind PUT that omits it — see the
-            // restamp below — can be defended against for every resource type this read
-            // already covers, not just EndpointSlice.
-            let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
-            // Snapshot of the whole pre-update object, used by
-            // increment_endpointslice_generation_if_changed below to detect a real content
-            // change (EndpointSlice has no `.spec` to diff against).
-            let eps_before = if super::defaults::is_endpointslice(&group, &plural) {
-                parsed.clone()
-            } else {
-                None
-            };
-            (spec, status, generation, uid, eps_before)
+        let spec = if super::defaults::is_workload_resource(&group, &plural) {
+            parsed.as_ref().map(|v| v["spec"].clone())
         } else {
-            (None, None, None, None, None)
+            None
         };
+        let status = if meta.has_status_subresource {
+            parsed.as_ref().map(|v| v["status"].clone())
+        } else {
+            None
+        };
+        let generation = if super::defaults::is_workload_resource(&group, &plural)
+            || super::defaults::is_endpointslice(&group, &plural)
+        {
+            parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
+        } else {
+            None
+        };
+        // UID is immutable and system-assigned. Captured whenever we already have the
+        // stored object in hand (no extra read) so a blind PUT that omits it — see the
+        // restamp below — can be defended against for every resource type this read
+        // already covers, not just EndpointSlice.
+        let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+        // Snapshot of the whole pre-update object, used by
+        // increment_endpointslice_generation_if_changed below to detect a real content
+        // change (EndpointSlice has no `.spec` to diff against).
+        let eps_before = if super::defaults::is_endpointslice(&group, &plural) {
+            parsed.clone()
+        } else {
+            None
+        };
+        let deletion_timestamp = parsed
+            .as_ref()
+            .map(|v| v["metadata"]["deletionTimestamp"].clone());
+        let deletion_grace = parsed
+            .as_ref()
+            .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
+        (
+            spec,
+            status,
+            generation,
+            uid,
+            eps_before,
+            deletion_timestamp,
+            deletion_grace,
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
     // omits metadata.generation. Restamp the stored value onto the incoming body before
@@ -1908,6 +1963,21 @@ pub async fn replace_namespaced_resource<S: Store>(
         if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
             if !uid.is_empty() {
                 obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            }
+        }
+    }
+
+    // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
+    // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
+    // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
+    // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
+    // of completing the delete — persisting the object with deletionTimestamp gone and
+    // finalizers empty, i.e. silently resurrecting it as a normal live object.
+    if incoming_deletion_timestamp_blank {
+        if let Some(ts) = stored_deletion_timestamp.as_ref().filter(|v| !v.is_null()) {
+            obj.body["metadata"]["deletionTimestamp"] = ts.clone();
+            if let Some(grace) = stored_deletion_grace.as_ref().filter(|v| !v.is_null()) {
+                obj.body["metadata"]["deletionGracePeriodSeconds"] = grace.clone();
             }
         }
     }
@@ -7712,6 +7782,97 @@ mod tests {
         );
     }
 
+    /// replace_resource (PUT): a protobuf-content-type PUT never carries deletionTimestamp in
+    /// its decoded body (`gen_object_meta_to_json` never emits it), so a protection controller
+    /// finishing its finalizer drain via a protobuf PUT looks — from the decoded body alone —
+    /// identical to a plain update with a blank deletionTimestamp.
+    ///
+    /// Before the fix, `finalizer_drain_complete` read only the decoded body and saw no
+    /// deletionTimestamp, so it fell through to a literal `store.put`: the stored object would
+    /// have been overwritten with finalizers emptied AND deletionTimestamp gone — silently
+    /// resurrecting an object that was mid-deletion as an ordinary live object. This test
+    /// simulates the decode gap directly (a PUT body omitting deletionTimestamp) rather than
+    /// via the protobuf wire format, since the observable bug is the same regardless of how
+    /// the body ends up missing the field.
+    #[tokio::test]
+    async fn replace_resource_completes_finalizer_drain_when_put_body_omits_deletion_timestamp() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "proto-gc-node",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["kubernetes.io/pvc-protection"]
+            },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/proto-gc-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // No deletionTimestamp in the body — what a protobuf-decoded PUT looks like, since
+        // gen_object_meta_to_json never emits it, even though the real client-side object
+        // (and its protobuf wire encoding) did carry one.
+        let put_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "proto-gc-node",
+                "finalizers": []
+            },
+            "spec": { "drivers": [] }
+        });
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "proto-gc-node".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PUT draining the last finalizer off a soft-deleted object must succeed even when \
+             the body omits deletionTimestamp"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "object must be hard-deleted, not silently un-terminated: a decoded PUT body \
+             missing deletionTimestamp (protobuf decode never emits it) must not make the \
+             server forget the object was already mid-deletion — reverting this fix leaves \
+             the object persisted with finalizers emptied and no deletionTimestamp, i.e. a \
+             live, non-terminating object"
+        );
+    }
+
     /// replace_namespaced_resource (PUT): same regression as
     /// replace_resource_hard_deletes_when_finalizers_drained_via_put above, but for
     /// namespaced resources — this is the exact mechanism that stuck PVC and VAC deletes
@@ -7792,6 +7953,90 @@ mod tests {
              be hard-deleted immediately — this is the exact PVC/VAC finalizer-drain path used \
              by KCM's protection controllers; without it a PVC or VAC delete never completes \
              and stays stuck Terminating forever"
+        );
+    }
+
+    /// replace_namespaced_resource (PUT): the namespaced counterpart of
+    /// replace_resource_completes_finalizer_drain_when_put_body_omits_deletion_timestamp —
+    /// this is the exact PVC/VAC finalizer-drain path, so the un-terminate hazard on a
+    /// protobuf-content-type PUT applies to real, common controller traffic, not a
+    /// cluster-scoped edge case.
+    #[tokio::test]
+    async fn replace_namespaced_resource_completes_finalizer_drain_when_put_body_omits_deletion_timestamp(
+    ) {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let obj = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "proto-gc-lease",
+                "namespace": "default",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["kubernetes.io/pvc-protection"]
+            },
+            "spec": { "holderIdentity": "test-holder" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/default/proto-gc-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // No deletionTimestamp in the body — what a protobuf-decoded PUT looks like.
+        let put_body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "proto-gc-lease",
+                "namespace": "default",
+                "finalizers": []
+            },
+            "spec": { "holderIdentity": "test-holder" }
+        });
+
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "leases".into(),
+                "proto-gc-lease".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "namespaced PUT draining the last finalizer off a soft-deleted object must succeed \
+             even when the body omits deletionTimestamp"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "object must be hard-deleted, not silently un-terminated — reverting this fix \
+             leaves a PVC/VAC-style finalizer-drain PUT stuck as a live object with no \
+             deletionTimestamp whenever the request used protobuf content-type"
         );
     }
 
