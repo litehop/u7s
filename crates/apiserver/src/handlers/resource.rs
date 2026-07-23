@@ -2510,6 +2510,21 @@ pub async fn delete_collection_resource<S: Store>(
                     cluster_ip_to_release = Some(ip);
                 }
             }
+
+            // Respect metadata.finalizers exactly like a single-object DELETE would: a
+            // cluster-scoped object with finalizers (a CustomResourceDefinition, ClusterRole,
+            // or PersistentVolume with a legitimate finalizer) must be soft-deleted
+            // (deletionTimestamp stamped, kept alive), not removed outright — mirrors
+            // delete_collection_namespaced_resource below.
+            let mut typed = Object { body: parsed };
+            if let Some(soft) = apply_delete_policy(&mut typed) {
+                state
+                    .store
+                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                continue;
+            }
         }
         // NotFound means another writer deleted this object concurrently — tolerate it.
         // Any other error (disk full, DB corruption, …) means some objects survived;
@@ -16220,6 +16235,73 @@ mod tests {
             vec!["binding-viewer".to_string()],
             "DeleteCollection with fieldSelector=roleRef.name=admin must delete only \
              binding-admin — if the selector is ignored, both bindings are deleted"
+        );
+    }
+
+    /// delete_collection_resource (cluster-scoped) hard-deleted every listed object
+    /// unconditionally, ignoring metadata.finalizers — a finalizer'd CustomResourceDefinition,
+    /// ClusterRole, or PersistentVolume removed via DeleteCollection lost its finalizer
+    /// protection even though a single-object DELETE of the same object honors it.
+    ///
+    /// Fails on revert: without threading the object through apply_delete_policy, a
+    /// finalizer'd cluster-scoped object is hard-deleted (gone from the store) instead of
+    /// soft-deleted (deletionTimestamp set, object still present).
+    #[tokio::test]
+    async fn delete_collection_resource_honors_finalizers() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let key = crate::keys::group_object_key("storage.k8s.io", "csinodes", None, "gc-node");
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "gc-node",
+                "finalizers": ["example.com/cleanup"]
+            },
+            "spec": { "drivers": [] }
+        });
+        state
+            .store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed must succeed");
+
+        delete_collection_resource(
+            State(state.clone()),
+            Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("DeleteCollection over finalizer'd object must succeed: {e:?}"));
+
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .expect("get must succeed")
+            .unwrap_or_else(|| panic!("finalizer'd object must survive DeleteCollection (soft-delete), not be hard-deleted"));
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "DeleteCollection must stamp deletionTimestamp on a finalizer'd object, exactly \
+             like a single-object DELETE does — controllers watch for this to run cleanup"
         );
     }
 
