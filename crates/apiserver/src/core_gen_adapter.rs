@@ -3054,6 +3054,60 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     if let Some(v) = event.r#type.filter(|s| !s.is_empty()) {
         obj["type"] = serde_json::Value::String(v);
     }
+    // source/firstTimestamp/lastTimestamp/eventTime/action/related/reportingComponent/
+    // reportingInstance were dropped by this decoder entirely (never even read off the
+    // decoded proto message). Real kubelet posts core/v1 Events over protobuf with
+    // firstTimestamp/lastTimestamp/source always set — dropping them here made every
+    // kubelet-sourced Event look identical to a client that never set a timestamp,
+    // rendering as the Go zero-value "0001-01-01" wherever a core/v1 client (kubectl,
+    // e2e's DumpEventsInNamespace) reads it back.
+    if let Some(src) = event.source {
+        let mut srcj = serde_json::Map::new();
+        if let Some(v) = src.component.filter(|s| !s.is_empty()) {
+            srcj.insert("component".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = src.host.filter(|s| !s.is_empty()) {
+            srcj.insert("host".to_string(), serde_json::Value::String(v));
+        }
+        if !srcj.is_empty() {
+            obj["source"] = serde_json::Value::Object(srcj);
+        }
+    }
+    if let Some(t) = event.first_timestamp {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            obj["firstTimestamp"] = serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+        }
+    }
+    if let Some(t) = event.last_timestamp {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            obj["lastTimestamp"] = serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+        }
+    }
+    if let Some(t) = event.event_time {
+        // `seconds` must be explicitly present (not defaulted via unwrap_or(0)) — a
+        // MicroTime message with no seconds field on the wire is "not set".
+        if let Some(secs) = t.seconds {
+            obj["eventTime"] = serde_json::Value::String(gen_microtime_fields_to_rfc3339(
+                secs,
+                t.nanos.unwrap_or(0),
+            ));
+        }
+    }
+    if let Some(v) = event.action.filter(|s| !s.is_empty()) {
+        obj["action"] = serde_json::Value::String(v);
+    }
+    if let Some(r) = event.related {
+        let rj = gen_object_reference_to_json(r);
+        if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+            obj["related"] = rj;
+        }
+    }
+    if let Some(v) = event.reporting_component.filter(|s| !s.is_empty()) {
+        obj["reportingComponent"] = serde_json::Value::String(v);
+    }
+    if let Some(v) = event.reporting_instance.filter(|s| !s.is_empty()) {
+        obj["reportingInstance"] = serde_json::Value::String(v);
+    }
     if let Some(s) = event.series {
         let mut sm = serde_json::Map::new();
         if let Some(v) = s.count.filter(|&n| n != 0) {
@@ -5637,6 +5691,70 @@ mod tests {
             result["series"]["count"], 3,
             "series.count must survive decode — without it repeated identical events collapse \
              to a count of zero instead of the real occurrence count"
+        );
+    }
+
+    /// decode_event_proto_gen must preserve source/firstTimestamp/lastTimestamp — the exact
+    /// shape real kubelet sends for a core/v1 Event (kubelet's `record.EventRecorder` always
+    /// sets Source and both timestamps, and posts over protobuf by default).
+    ///
+    /// Before this fix, this decoder never read `event.source`, `event.first_timestamp`, or
+    /// `event.last_timestamp` off the decoded proto message at all — every kubelet-sourced
+    /// Event was stored with those fields entirely absent, so any core/v1 reader (kubectl,
+    /// the upstream e2e test's DumpEventsInNamespace) rendered the Go zero-value
+    /// "0001-01-01 00:00:00 +0000 UTC" instead of the real time kubelet recorded, making it
+    /// impossible to reconstruct an incident timeline from kubelet events sitting right next
+    /// to correctly-timestamped controller events in the same dump.
+    #[test]
+    fn decode_event_proto_gen_preserves_source_and_first_last_timestamp() {
+        let ev = core_v1::Event {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-node.17abc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            involved_object: Some(core_v1::ObjectReference {
+                kind: Some("Node".to_string()),
+                name: Some("my-node".to_string()),
+                ..Default::default()
+            }),
+            reason: Some("Starting".to_string()),
+            message: Some("Starting kubelet.".to_string()),
+            source: Some(core_v1::EventSource {
+                component: Some("kubelet".to_string()),
+                host: Some("my-node".to_string()),
+            }),
+            first_timestamp: Some(meta_v1::Time {
+                seconds: Some(1_700_000_000),
+                nanos: Some(0),
+            }),
+            last_timestamp: Some(meta_v1::Time {
+                seconds: Some(1_700_000_000),
+                nanos: Some(0),
+            }),
+            r#type: Some("Normal".to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ev.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_event_proto_gen(&buf).expect("Event must decode");
+
+        assert_eq!(
+            result["source"]["component"], "kubelet",
+            "source.component must survive decode — without it a kubelet-sourced Event is \
+             indistinguishable from one with no reporter at all"
+        );
+        assert_eq!(
+            result["firstTimestamp"], "2023-11-14T22:13:20Z",
+            "firstTimestamp must survive decode as a real timestamp — a dropped firstTimestamp \
+             renders as the Go zero-value 0001-01-01, making timeline reconstruction from \
+             kubelet events impossible"
+        );
+        assert_eq!(
+            result["lastTimestamp"], "2023-11-14T22:13:20Z",
+            "lastTimestamp must survive decode as a real timestamp for the same reason as \
+             firstTimestamp"
         );
     }
 
