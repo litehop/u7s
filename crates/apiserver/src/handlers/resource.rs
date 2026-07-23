@@ -720,7 +720,7 @@ pub async fn delete_resource<S: Store>(
 /// (pvc-protection, vac-protection, ...) remove their finalizer via a PUT, not a PATCH; the
 /// handler that applies that update must notice this and hard-delete instead of storing the
 /// update, or the object stays stuck Terminating forever.
-fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
+pub(crate) fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
     let meta: ObjectMeta = serde_json::from_value(body["metadata"].clone()).unwrap_or_default();
     let deletion_ts_set = meta.deletion_timestamp.is_some();
     let finalizers_empty = meta
@@ -2793,7 +2793,7 @@ pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &
 /// spawn genuine replacement dependents during the window — which then have intact
 /// ownerReferences and are correctly reaped when the owner is finally deleted, causing total
 /// (0/N) dependent loss instead of the original partial race. This was tried and reverted.
-fn add_orphan_finalizer(obj: &mut Object) {
+pub(crate) fn add_orphan_finalizer(obj: &mut Object) {
     const ORPHAN_FINALIZER: &str = "orphan";
     match obj.body["metadata"]["finalizers"].as_array_mut() {
         Some(finalizers) => {

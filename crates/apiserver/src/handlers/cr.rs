@@ -1433,22 +1433,24 @@ pub async fn replace_cr<S: Store>(
     Ok(Json(obj))
 }
 
-/// Scan all CRD-backed object storage and cascade-delete (or orphan-strip) dependents
-/// of the deleted owner identified by `owner_uid`.
+/// Scan all CRD-backed object storage and hard-delete dependents of the owner identified by
+/// `owner_uid` (Background cascade semantics only).
 ///
-/// Strategy:
-/// - Background / no explicit policy → hard-delete all matching dependents, then recurse.
-/// - Orphan → strip the matching ownerReference entry and keep the object alive.
+/// Orphan propagation does NOT go through this function: `delete_cr`/`delete_cr_namespaced`
+/// mark the owner with the `orphan` finalizer instead (see `add_orphan_finalizer`) and defer
+/// to KCM's real GC controller, which strips each dependent's ownerReferences from its own
+/// consistent view of the cluster before removing the finalizer — see `patch_cr`'s
+/// finalizer-drain-complete check. This function previously also had an orphan branch that
+/// stripped ownerReferences here, synchronously, right after the owner was already
+/// hard-deleted from the store — racing KCM's GC controller, which could cascade-delete a
+/// dependent before observing the ownerRef-stripped update (same class of bug already fixed
+/// for the built-in RC/Deployment orphan-delete path).
 ///
 /// All CRD instances are stored under `/registry/cr/`, so a single prefix scan finds
 /// every CR regardless of group, version, or scope. We recurse to handle ownership chains
 /// (owner → dependent → grand-dependent). Without recursion, orphaned intermediate nodes
 /// would be left behind, leaking resources and failing the GC conformance chain test.
-async fn cascade_delete_cr_dependents<S: Store>(
-    state: &AppState<S>,
-    owner_uid: &str,
-    orphan: bool,
-) {
+async fn cascade_delete_cr_dependents<S: Store>(state: &AppState<S>, owner_uid: &str) {
     const CR_ALL_PREFIX: &str = "/registry/cr/";
 
     let resp = match state
@@ -1482,45 +1484,42 @@ async fn cascade_delete_cr_dependents<S: Store>(
         let child_key = item.key.clone();
         let child_uid = obj["metadata"]["uid"].as_str().unwrap_or("").to_string();
 
-        if orphan {
-            // Strip the ownerReference pointing to our owner. Keep other entries.
-            let mut child = obj;
-            let refs = child["metadata"]["ownerReferences"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let filtered: Vec<serde_json::Value> = refs
-                .into_iter()
-                .filter(|r| r["uid"].as_str() != Some(owner_uid))
-                .collect();
-            if filtered.is_empty() {
-                child["metadata"]
-                    .as_object_mut()
-                    .map(|m| m.remove("ownerReferences"));
-            } else {
-                child["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
-            }
-            let updated = match serde_json::to_vec(&child) {
-                Ok(b) => bytes::Bytes::from(b),
-                Err(e) => {
-                    tracing::warn!("cascade_delete_cr: serialize {child_key}: {e}");
-                    continue;
-                }
-            };
-            if let Err(e) = state.store.put(&child_key, updated, None).await {
-                tracing::warn!("cascade_delete_cr: strip ownerRef {child_key}: {e}");
-            }
-        } else {
-            // Background cascade: delete the dependent then recurse for its own dependents.
-            if let Err(e) = state.store.delete(&child_key, None).await {
-                tracing::warn!("cascade_delete_cr: delete {child_key}: {e}");
-            }
-            // Recurse: this child may itself own other CRs.
-            if !child_uid.is_empty() {
-                Box::pin(cascade_delete_cr_dependents(state, &child_uid, false)).await;
-            }
+        // Background cascade: delete the dependent then recurse for its own dependents.
+        if let Err(e) = state.store.delete(&child_key, None).await {
+            tracing::warn!("cascade_delete_cr: delete {child_key}: {e}");
+        }
+        // Recurse: this child may itself own other CRs.
+        if !child_uid.is_empty() {
+            Box::pin(cascade_delete_cr_dependents(state, &child_uid)).await;
         }
     }
+}
+
+/// Hard-deletes a CR whose finalizer drain just completed (deletionTimestamp set, finalizers
+/// now empty) — mirrors resource.rs's `complete_finalizer_drain` for built-in resources.
+///
+/// This is what makes the `orphan` finalizer added by `delete_cr`/`delete_cr_namespaced`
+/// actually terminate: KCM's GC controller strips each dependent's ownerReferences, then
+/// removes the finalizer via PATCH; `patch_cr`/`patch_cr_namespaced` detect that the patch
+/// itself completed the drain and call this instead of storing the update — without it, the
+/// owner CR would sit stuck Terminating forever once the finalizer is cleared.
+async fn complete_cr_finalizer_drain<S: Store>(
+    state: &AppState<S>,
+    key: &str,
+    name: &str,
+    kind: &str,
+    ns: Option<&str>,
+) -> Result<(), crate::status::StatusError> {
+    state
+        .store
+        .delete(key, None)
+        .await
+        .map_err(|e| store_err_cr(e, name, kind))?;
+    if let Some(namespace) = ns {
+        crate::quota::update_quota_status(state, namespace).await;
+        crate::handlers::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
+    }
+    Ok(())
 }
 
 pub async fn delete_cr<S: Store>(
@@ -1575,7 +1574,23 @@ pub async fn delete_cr<S: Store>(
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
-    // apply_delete_policy: if the CR has finalizers, stamp deletionTimestamp and soft-delete.
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
+    // below) instead of stripping dependent CRs ourselves. Mirrors the fix already applied to
+    // the built-in RC/Deployment orphan-delete path — see add_orphan_finalizer for why:
+    // hard-deleting the owner immediately and stripping dependents synchronously afterward
+    // races KCM's real GC controller, which can cascade-delete a dependent whose
+    // ownerReference hasn't been stripped from its point of view yet.
+    if delete_opts.is_orphan() && !owner_uid.is_empty() {
+        crate::handlers::resource::add_orphan_finalizer(&mut obj);
+    }
+
+    // apply_delete_policy: if the CR has finalizers (including the `orphan` one just added),
+    // stamp deletionTimestamp and soft-delete instead of removing it outright.
     if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
@@ -1588,21 +1603,17 @@ pub async fn delete_cr<S: Store>(
         return Ok(Json(resp_body.body).into_response());
     }
 
-    let owner_uid = obj.body["metadata"]["uid"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
     state
         .store
         .delete(&key, None)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    // Cascade or orphan dependents after the owner is deleted.
+    // Background cascade-delete dependents after the owner is hard-deleted. Orphan-marked
+    // owners never reach here — they returned above via the soft-delete branch and defer to
+    // KCM's GC controller + patch_cr's finalizer-drain-complete check (complete_cr_finalizer_drain).
     if !owner_uid.is_empty() {
-        let orphan = delete_opts.is_orphan();
-        cascade_delete_cr_dependents(&state, &owner_uid, orphan).await;
+        cascade_delete_cr_dependents(&state, &owner_uid).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -2290,7 +2301,20 @@ pub async fn delete_cr_namespaced<S: Store>(
     };
     run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
-    // apply_delete_policy: if the CR has finalizers, stamp deletionTimestamp and soft-delete.
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
+    // below) instead of stripping dependent CRs ourselves — see delete_cr for the full
+    // rationale (mirrors the built-in RC/Deployment orphan-delete fix).
+    if delete_opts.is_orphan() && !owner_uid.is_empty() {
+        crate::handlers::resource::add_orphan_finalizer(&mut obj);
+    }
+
+    // apply_delete_policy: if the CR has finalizers (including the `orphan` one just added),
+    // stamp deletionTimestamp and soft-delete instead of removing it outright.
     if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
@@ -2303,21 +2327,17 @@ pub async fn delete_cr_namespaced<S: Store>(
         return Ok(Json(resp_body.body).into_response());
     }
 
-    let owner_uid = obj.body["metadata"]["uid"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
     state
         .store
         .delete(&key, None)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    // Cascade or orphan dependents after the owner is deleted.
+    // Background cascade-delete dependents after the owner is hard-deleted. Orphan-marked
+    // owners never reach here — they returned above via the soft-delete branch and defer to
+    // KCM's GC controller + patch_cr_namespaced's finalizer-drain-complete check.
     if !owner_uid.is_empty() {
-        let orphan = delete_opts.is_orphan();
-        cascade_delete_cr_dependents(&state, &owner_uid, orphan).await;
+        cascade_delete_cr_dependents(&state, &owner_uid).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -2595,6 +2615,15 @@ pub async fn patch_cr<S: Store>(
 
     validate_cr_schema(&obj, &ctx)?;
 
+    // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
+    // controller completes an Orphan-marked delete_cr: it strips ownerReferences from every
+    // dependent CR, then removes the owner's `orphan` finalizer via PATCH. Complete the delete
+    // instead of storing the update, or the CR stays stuck Terminating forever.
+    if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, None).await?;
+        return Ok(Json(obj).into_response());
+    }
+
     let admission_ctx = AdmissionContext {
         group: &group,
         version: &version,
@@ -2790,6 +2819,15 @@ pub async fn patch_cr_namespaced<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx)?;
+
+    // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
+    // controller completes an Orphan-marked delete_cr_namespaced: it strips ownerReferences
+    // from every dependent CR, then removes the owner's `orphan` finalizer via PATCH. Complete
+    // the delete instead of storing the update, or the CR stays stuck Terminating forever.
+    if crate::handlers::resource::finalizer_drain_complete(&obj) {
+        complete_cr_finalizer_drain(&state, &key, &name, &ctx.kind, Some(&ns)).await?;
+        return Ok(Json(obj).into_response());
+    }
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -10591,11 +10629,22 @@ mod tests {
         );
     }
 
-    /// Deleting a CR owner with Orphan propagationPolicy must leave the dependent alive
-    /// with its ownerReference stripped. Without this, an Orphan delete would accidentally
-    /// cascade and the GC orphan conformance spec would fail.
+    /// Deleting a CR owner with Orphan propagationPolicy must soft-delete the owner (stamp
+    /// deletionTimestamp, add the `orphan` finalizer) and must NOT synchronously hard-delete
+    /// it or strip the dependent's ownerReference itself.
+    ///
+    /// The old implementation hard-deleted the owner CR immediately, then stripped the
+    /// dependent's ownerReference afterward — worse than the equivalent bug already fixed for
+    /// built-in RC/Deployment orphan-delete (mirrored by
+    /// `orphan_delete_rc_soft_deletes_with_finalizer_and_does_not_strip_pods_synchronously`):
+    /// here the owner was already gone from the store before any dependent's ownerRef was
+    /// stripped, giving real KCM's GC controller a head start to cascade-delete a
+    /// not-yet-stripped dependent. The `orphan` finalizer instead lets real, unmodified KCM
+    /// strip dependents from its own consistent view before removing the finalizer, at which
+    /// point `patch_cr`'s finalizer-drain-complete check does the real hard-delete.
     #[tokio::test]
-    async fn delete_cr_with_orphan_policy_strips_owner_ref_not_cascade() {
+    async fn delete_cr_with_orphan_policy_soft_deletes_and_does_not_strip_owner_ref_synchronously()
+    {
         let state = make_state();
         install_cluster_crd(&state).await;
 
@@ -10687,21 +10736,116 @@ mod tests {
         .await
         .expect("orphan delete must succeed");
 
+        // Owner must be SOFT-deleted: still present, with deletionTimestamp and the `orphan`
+        // finalizer — NOT hard-deleted synchronously in this request.
+        let owner_key = cr_store_key(group, plural, None, "orphan-owner");
+        let owner_after = state.store.get(&owner_key).await.unwrap().expect(
+            "owner CR must remain in the store (soft-deleted) immediately after an Orphan \
+             delete — hard-deleting it here, before KCM confirms dependents are stripped, is \
+             the exact race that let real KCM's GC controller cascade-delete a dependent whose \
+             ownerReference hasn't been stripped from its point of view yet",
+        );
+        let owner_val: serde_json::Value = serde_json::from_slice(&owner_after.value).unwrap();
+        assert!(
+            owner_val["metadata"]["deletionTimestamp"].is_string(),
+            "Orphan delete must stamp deletionTimestamp on the owner CR"
+        );
+        assert_eq!(
+            owner_val["metadata"]["finalizers"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec!["orphan"]),
+            "Orphan delete must add the `orphan` finalizer so real KCM's GC controller knows \
+             to strip dependents itself before the finalizer drains"
+        );
+
         // Dependent must still exist (not cascade-deleted).
         let dep_after = state.store.get(&dep_key).await.unwrap().expect(
             "orphan delete of CR owner must leave dependent alive — cascade would be wrong",
         );
 
-        // The ownerReference to the deleted owner must be stripped.
+        // The ownerReference must be UNTOUCHED by u7s at this point: stripping is now
+        // exclusively real KCM's job, once it observes the `orphan` finalizer above.
         let dep_obj: serde_json::Value = serde_json::from_slice(&dep_after.value).unwrap();
         let refs = dep_obj["metadata"]["ownerReferences"].as_array();
         let still_has_ref = refs.map(|r| {
             r.iter()
                 .any(|entry| entry["uid"].as_str() == Some(&owner_uid))
         });
+        assert_eq!(
+            still_has_ref,
+            Some(true),
+            "u7s must NOT strip the dependent's ownerReference itself at delete time — doing \
+             so synchronously, before the owner is confirmed gone, is exactly the race this \
+             fix addresses"
+        );
+    }
+
+    /// Once real KCM's GC controller has stripped a dependent's ownerReference and removes the
+    /// owner CR's `orphan` finalizer via PATCH, patch_cr must complete the deferred hard-delete
+    /// instead of storing the update — otherwise the owner sits stuck Terminating forever.
+    #[tokio::test]
+    async fn cr_orphan_finalizer_drain_completion_hard_deletes_owner() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Seed a Widget already in the post-orphan-delete state: soft-deleted with exactly the
+        // `orphan` finalizer pending, as add_orphan_finalizer + apply_delete_policy leave it
+        // for real KCM to act on.
+        let owner_key = cr_store_key(group, plural, None, "draining-owner");
+        let owner = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "draining-owner",
+                "uid": "drain-uid-0002",
+                "deletionTimestamp": "2026-07-22T00:00:00Z",
+                "finalizers": ["orphan"]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &owner_key,
+                Bytes::from(serde_json::to_vec(&owner).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed draining owner CR");
+
+        // Real KCM's GC controller has finished stripping dependents and now removes the
+        // last finalizer via a merge-patch — the exact mechanism it uses to signal drain
+        // completion.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({ "metadata": { "finalizers": [] } });
+        patch_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "draining-owner".to_string(),
+            )),
+            test_user(),
+            headers,
+            Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("finalizer-drain patch must succeed: {e:?}"));
+
         assert!(
-            still_has_ref != Some(true),
-            "orphan delete must strip the ownerReference from the dependent so GC does not re-collect it"
+            state.store.get(&owner_key).await.unwrap().is_none(),
+            "owner CR must be hard-deleted once its last finalizer (orphan) drains — this is \
+             how the deferred hard-delete of an Orphan-marked owner actually completes"
         );
     }
 
