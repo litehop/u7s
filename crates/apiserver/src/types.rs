@@ -532,6 +532,11 @@ pub struct DeleteOptions {
     /// Legacy field. True maps to "Orphan". Nil/absent means "use propagationPolicy".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_dependents: Option<bool>,
+    /// Seconds to wait before hard-deleting after deletionTimestamp is stamped.
+    /// Absent/nil means: fall back to the object's own grace period (e.g. a pod's
+    /// spec.terminationGracePeriodSeconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_period_seconds: Option<i64>,
 }
 
 impl DeleteOptions {
