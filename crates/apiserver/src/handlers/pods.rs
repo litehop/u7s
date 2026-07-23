@@ -69,11 +69,15 @@ pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
 
 /// Parse a `fieldSelector` query string and test a pod JSON value against it.
 ///
-/// Supported selectors (comma-separated):
-///   spec.nodeName=<value>    — include only if pod's spec.nodeName equals value
-///   spec.nodeName!=<value>   — include only if pod's spec.nodeName does not equal value
-///   status.phase=<value>     — include only if pod's status.phase equals value
-///   status.phase!=<value>    — include only if pod's status.phase does not equal value
+/// Supported selectors (comma-separated), matching upstream's SelectableFields
+/// in pkg/registry/core/pod/strategy.go:
+///   spec.nodeName=<value>              spec.nodeName!=<value>
+///   status.phase=<value>               status.phase!=<value>
+///   status.podIP=<value>               status.podIP!=<value>
+///   spec.restartPolicy=<value>         spec.restartPolicy!=<value>
+///   spec.serviceAccountName=<value>    spec.serviceAccountName!=<value>
+///   spec.schedulerName=<value>         spec.schedulerName!=<value>
+///   status.nominatedNodeName=<value>   status.nominatedNodeName!=<value>
 ///
 /// An empty or absent selector matches everything (pass-through).
 /// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
@@ -93,6 +97,11 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
     let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
     let node_name = spec.node_name.as_deref().unwrap_or("");
     let phase = pod["status"]["phase"].as_str().unwrap_or("");
+    let pod_ip = pod["status"]["podIP"].as_str().unwrap_or("");
+    let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("");
+    let service_account_name = pod["spec"]["serviceAccountName"].as_str().unwrap_or("");
+    let scheduler_name = pod["spec"]["schedulerName"].as_str().unwrap_or("");
+    let nominated_node_name = pod["status"]["nominatedNodeName"].as_str().unwrap_or("");
     for term in selector.split(',') {
         let term = term.trim();
         if term.is_empty() {
@@ -105,12 +114,42 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
             if field == "status.phase" && phase == value {
                 return false;
             }
+            if field == "status.podIP" && pod_ip == value {
+                return false;
+            }
+            if field == "spec.restartPolicy" && restart_policy == value {
+                return false;
+            }
+            if field == "spec.serviceAccountName" && service_account_name == value {
+                return false;
+            }
+            if field == "spec.schedulerName" && scheduler_name == value {
+                return false;
+            }
+            if field == "status.nominatedNodeName" && nominated_node_name == value {
+                return false;
+            }
             // Unknown fields: ignore (don't filter out)
         } else if let Some((field, value)) = term.split_once('=') {
             if field == "spec.nodeName" && node_name != value {
                 return false;
             }
             if field == "status.phase" && phase != value {
+                return false;
+            }
+            if field == "status.podIP" && pod_ip != value {
+                return false;
+            }
+            if field == "spec.restartPolicy" && restart_policy != value {
+                return false;
+            }
+            if field == "spec.serviceAccountName" && service_account_name != value {
+                return false;
+            }
+            if field == "spec.schedulerName" && scheduler_name != value {
+                return false;
+            }
+            if field == "status.nominatedNodeName" && nominated_node_name != value {
                 return false;
             }
             // Unknown fields: ignore (don't filter out)
@@ -1428,6 +1467,53 @@ mod field_selector_tests {
         })
     }
 
+    fn pod_with_pod_ip(pod_ip: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {},
+            "status": {"podIP": pod_ip}
+        })
+    }
+
+    fn pod_with_restart_policy(restart_policy: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"restartPolicy": restart_policy}
+        })
+    }
+
+    fn pod_with_service_account_name(service_account_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"serviceAccountName": service_account_name}
+        })
+    }
+
+    fn pod_with_scheduler_name(scheduler_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"schedulerName": scheduler_name}
+        })
+    }
+
+    fn pod_with_nominated_node_name(nominated_node_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {},
+            "status": {"nominatedNodeName": nominated_node_name}
+        })
+    }
+
     /// Empty selector is a pass-through: all pods must be returned.
     /// Kubelet depends on this when fieldSelector is absent.
     #[test]
@@ -1532,6 +1618,132 @@ mod field_selector_tests {
         let pods = vec![pod_with_phase("Pending")];
         let result = filter_pods_by_field_selector(pods, "status.phase=Running");
         assert!(result.is_empty());
+    }
+
+    /// status.podIP=<ip> must select only the pod with that IP — kube-proxy's
+    /// endpoint reconciliation queries pods by podIP, and a missing match arm
+    /// here would make it silently see every pod as a match.
+    #[test]
+    fn eq_filter_matches_correct_pod_ip() {
+        let pods = vec![pod_with_pod_ip("10.0.0.1"), pod_with_pod_ip("10.0.0.2")];
+        let result = filter_pods_by_field_selector(pods, "status.podIP=10.0.0.1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["podIP"], "10.0.0.1");
+    }
+
+    /// status.podIP!=<ip> must exclude the pod with that IP and keep the rest —
+    /// the negated form must not fall through to the unknown-field passthrough.
+    #[test]
+    fn ne_filter_excludes_matching_pod_ip() {
+        let pods = vec![pod_with_pod_ip("10.0.0.1"), pod_with_pod_ip("10.0.0.2")];
+        let result = filter_pods_by_field_selector(pods, "status.podIP!=10.0.0.1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["podIP"], "10.0.0.2");
+    }
+
+    /// spec.restartPolicy=<policy> must select only matching pods — controllers
+    /// that distinguish Job pods (restartPolicy=Never/OnFailure) from Deployment
+    /// pods (Always) rely on this filter, not a client-side scan of every pod.
+    #[test]
+    fn eq_filter_matches_correct_restart_policy() {
+        let pods = vec![
+            pod_with_restart_policy("Never"),
+            pod_with_restart_policy("Always"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.restartPolicy=Never");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["restartPolicy"], "Never");
+    }
+
+    /// spec.restartPolicy!=<policy> must exclude the matching pod, proving the
+    /// negation arm (not just equality) is wired for this field.
+    #[test]
+    fn ne_filter_excludes_matching_restart_policy() {
+        let pods = vec![
+            pod_with_restart_policy("Never"),
+            pod_with_restart_policy("Always"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.restartPolicy!=Never");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["restartPolicy"], "Always");
+    }
+
+    /// spec.serviceAccountName=<name> must select only pods running as that
+    /// service account — RBAC auditing/debugging tools query pods this way to
+    /// find everything a given identity can affect.
+    #[test]
+    fn eq_filter_matches_correct_service_account_name() {
+        let pods = vec![
+            pod_with_service_account_name("sa-a"),
+            pod_with_service_account_name("sa-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.serviceAccountName=sa-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["serviceAccountName"], "sa-a");
+    }
+
+    /// spec.serviceAccountName!=<name> must exclude the matching pod.
+    #[test]
+    fn ne_filter_excludes_matching_service_account_name() {
+        let pods = vec![
+            pod_with_service_account_name("sa-a"),
+            pod_with_service_account_name("sa-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.serviceAccountName!=sa-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["serviceAccountName"], "sa-b");
+    }
+
+    /// spec.schedulerName=<name> must select only pods assigned to that
+    /// scheduler — a custom scheduler polling for its own pending/bound pods
+    /// would otherwise see pods owned by other schedulers.
+    #[test]
+    fn eq_filter_matches_correct_scheduler_name() {
+        let pods = vec![
+            pod_with_scheduler_name("custom-scheduler"),
+            pod_with_scheduler_name("default-scheduler"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.schedulerName=custom-scheduler");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["schedulerName"], "custom-scheduler");
+    }
+
+    /// spec.schedulerName!=<name> must exclude the matching pod.
+    #[test]
+    fn ne_filter_excludes_matching_scheduler_name() {
+        let pods = vec![
+            pod_with_scheduler_name("custom-scheduler"),
+            pod_with_scheduler_name("default-scheduler"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.schedulerName!=custom-scheduler");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["schedulerName"], "default-scheduler");
+    }
+
+    /// status.nominatedNodeName=<node> must select only pods nominated for that
+    /// node — preemption logic reads this to find pods already reserved on a
+    /// node before deciding to preempt further victims there.
+    #[test]
+    fn eq_filter_matches_correct_nominated_node_name() {
+        let pods = vec![
+            pod_with_nominated_node_name("node-a"),
+            pod_with_nominated_node_name("node-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "status.nominatedNodeName=node-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["nominatedNodeName"], "node-a");
+    }
+
+    /// status.nominatedNodeName!=<node> must exclude the matching pod.
+    #[test]
+    fn ne_filter_excludes_matching_nominated_node_name() {
+        let pods = vec![
+            pod_with_nominated_node_name("node-a"),
+            pod_with_nominated_node_name("node-b"),
+        ];
+        let result = filter_pods_by_field_selector(pods, "status.nominatedNodeName!=node-a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["status"]["nominatedNodeName"], "node-b");
     }
 
     /// Unknown selector fields must be ignored (pass-through) rather than dropping pods.
