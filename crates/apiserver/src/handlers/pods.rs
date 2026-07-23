@@ -655,6 +655,23 @@ pub async fn replace_pod<S: Store>(
     let stored_generation = stored_obj.body["metadata"]["generation"].clone();
     obj.body["metadata"]["generation"] = stored_generation;
 
+    // deletionTimestamp is server-owned, exactly like generation above: a protobuf-encoded PUT
+    // never round-trips this field (the wire decoder drops it — see the equivalent restoration
+    // in replace_resource/replace_namespaced_resource) and a JSON PUT built from a stale local
+    // copy can omit it too. Without restoring it here, the finalizer-drain check below would see
+    // a blank deletionTimestamp on an already-terminating pod and treat this PUT as a plain
+    // update, silently un-terminating it.
+    if obj.body["metadata"]["deletionTimestamp"].is_null() {
+        let stored_ts = stored_obj.body["metadata"]["deletionTimestamp"].clone();
+        if !stored_ts.is_null() {
+            obj.body["metadata"]["deletionTimestamp"] = stored_ts;
+            let stored_grace = stored_obj.body["metadata"]["deletionGracePeriodSeconds"].clone();
+            if !stored_grace.is_null() {
+                obj.body["metadata"]["deletionGracePeriodSeconds"] = stored_grace;
+            }
+        }
+    }
+
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
         group: "",
@@ -676,6 +693,21 @@ pub async fn replace_pod<S: Store>(
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
+
+    // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
+    // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
+    // remove their finalizer via PUT, not PATCH. Mirrors patch_pod's post-patch check below —
+    // complete the delete instead of storing an update, or the pod stays stuck Terminating
+    // forever.
+    if super::resource::finalizer_drain_complete(&obj.body) {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+        super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
+        return Ok(Json(obj.body));
+    }
 
     let new_rv = state
         .store
@@ -11107,6 +11139,282 @@ mod handler_tests {
             "stale resourceVersion on replace_pod must return 409 Conflict — \
              OCC prevents lost-update races when multiple controllers update the same pod"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod — deletionTimestamp+empty-finalizers path (PUT-based finalizer drain)
+    // -----------------------------------------------------------------------
+
+    /// PUT that clears a pod's last finalizer while deletionTimestamp is set must hard-delete
+    /// the pod, exactly like patch_pod's post-patch check does for PATCH.
+    ///
+    /// KCM's protection controllers (kubernetes.io/pvc-protection, vac-protection, ...) remove
+    /// their finalizer via PUT, not PATCH. Before this fix, replace_pod had no equivalent check
+    /// on the PUT path at all: the pod would be persisted as an ordinary update with an empty
+    /// finalizers list and deletionTimestamp still set, and the object would never disappear
+    /// from the store — a pod (and potentially the namespace containing it) stuck Terminating
+    /// forever.
+    #[tokio::test]
+    async fn replace_pod_put_draining_last_finalizer_hard_deletes() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/finalized-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        // PUT the object back with finalizers now empty — exactly what a protection
+        // controller does when it removes its finalizer via replace instead of patch.
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string(),
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": []
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/finalized-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT draining the last finalizer off a soft-deleted pod must succeed"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "pod with deletionTimestamp set and finalizers emptied via PUT must be hard-deleted \
+             immediately, exactly like the PATCH path — otherwise a protection controller can \
+             never complete a delete via PUT and the pod stays stuck Terminating forever"
+        );
+    }
+
+    /// PUT that omits deletionTimestamp entirely (what a protobuf-decoded body looks like,
+    /// since the wire decoder never emits this field) while the stored pod is already
+    /// soft-deleted must still complete the finalizer drain and hard-delete.
+    ///
+    /// Before this fix, replace_pod never restored deletionTimestamp from the stored object at
+    /// all, so a PUT body missing it (via protobuf decode, or any client that only copies
+    /// fields it knows about) would make finalizer_drain_complete see a blank timestamp and
+    /// treat this as a plain update — silently resurrecting the pod as live with its finalizers
+    /// stripped and no deletionTimestamp.
+    #[tokio::test]
+    async fn replace_pod_put_completes_finalizer_drain_when_body_omits_deletion_timestamp() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/proto-finalized-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "proto-finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        // No deletionTimestamp in the body at all — simulates a protobuf-decoded PUT.
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "proto-finalized-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string(),
+                "finalizers": []
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/proto-finalized-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT draining the last finalizer must succeed even when the body omits \
+             deletionTimestamp"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "pod must be hard-deleted, not silently un-terminated: a PUT body missing \
+             deletionTimestamp must not make the server forget the pod was already \
+             mid-deletion — reverting this fix leaves the pod persisted with finalizers \
+             emptied and no deletionTimestamp, i.e. a live, non-terminating pod"
+        );
+    }
+
+    /// PUT that removes SOME but not all finalizers while deletionTimestamp is set must NOT
+    /// hard-delete — an outstanding finalizer means another controller still needs to observe
+    /// and act on the pod before it can be removed.
+    #[tokio::test]
+    async fn replace_pod_put_partial_finalizer_removal_does_not_hard_delete() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/partially-finalized-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "partially-finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["my.io/cleanup-a", "my.io/cleanup-b"]
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+        let stored_rv = store.get(key).await.unwrap().unwrap().revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "partially-finalized-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string(),
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["my.io/cleanup-b"]
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/partially-finalized-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored =
+            store.get(key).await.unwrap().expect(
+                "pod must still exist — a finalizer (my.io/cleanup-b) is still outstanding",
+            );
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["finalizers"],
+            serde_json::json!(["my.io/cleanup-b"]),
+            "the PUT's finalizer list must persist as given, not be treated as drain-complete"
+        );
+    }
+
+    /// PUT on a pod with no deletionTimestamp at all must behave like an ordinary update.
+    ///
+    /// Guards against the finalizer-drain check being too aggressive: a pod that was never
+    /// being deleted must never be hard-deleted just because its finalizers list happens to
+    /// be empty (the common case for most pods, which have no finalizers at all).
+    #[tokio::test]
+    async fn replace_pod_put_without_deletion_timestamp_updates_normally() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "live-pod", serde_json::json!({})).await;
+        let stored_rv = store
+            .get("/registry/pods/default/live-pod")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "live-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string(),
+                "labels": {"updated": "true"}
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/live-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store
+            .get("/registry/pods/default/live-pod")
+            .await
+            .unwrap()
+            .expect(
+                "a pod with no deletionTimestamp must never be hard-deleted by an ordinary PUT",
+            );
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["metadata"]["labels"]["updated"], "true");
     }
 
     /// PUT /pods/:name/status with a stale resourceVersion must return 409 Conflict.
