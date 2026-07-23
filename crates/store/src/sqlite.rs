@@ -274,32 +274,75 @@ fn stamp_resource_version(
     Ok((Bytes::from(serde_json::to_vec(&obj)?), ns, obj_name))
 }
 
+/// Compares `new_value` against `stored_value` for semantic equality, ignoring
+/// `metadata.resourceVersion` — the only field the store itself unconditionally stamps on
+/// every write regardless of content (see `stamp_resource_version`). `metadata.generation`
+/// is deliberately NOT excluded: callers only bump it when the spec actually changes, so a
+/// generation difference is a real content change, not a write-path artifact.
+///
+/// This must be a value-level (parsed JSON) comparison rather than raw byte-equality: u7s
+/// does not control JSON key ordering the way upstream's protobuf/etcd3 encoding does, so
+/// two semantically-identical objects can serialize to different byte sequences.
+///
+/// Malformed JSON on either side compares as unequal — an unparsable stored value should
+/// never suppress a write, since we cannot prove the content is actually unchanged.
+fn semantically_equal_ignoring_resource_version(new_value: &[u8], stored_value: &[u8]) -> bool {
+    let (Ok(mut new_json), Ok(mut stored_json)) = (
+        serde_json::from_slice::<serde_json::Value>(new_value),
+        serde_json::from_slice::<serde_json::Value>(stored_value),
+    ) else {
+        return false;
+    };
+    if let Some(m) = new_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        m.remove("resourceVersion");
+    }
+    if let Some(m) = stored_json
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+    {
+        m.remove("resourceVersion");
+    }
+    new_json == stored_json
+}
+
 // Full write procedure — runs inside spawn_blocking.
-// Returns (new_revision, stamped_value, is_create).
+// Returns (new_revision, stamped_value, is_create, is_noop).
 fn put_sync(
     conn: &Connection,
     key: &str,
     value: Bytes,
     expected_revision: Option<u64>,
     last_written: &AtomicU64,
-) -> Result<(u64, Bytes, bool)> {
+) -> Result<(u64, Bytes, bool, bool)> {
     // 1. Begin exclusive write transaction.
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    // 2. Read current stored revision for optimistic concurrency check.
+    // 2. Read current stored revision AND value: the no-op check below (step 3.5) needs the
+    // value to compare against, and the optimistic concurrency check needs the revision.
     // SQLite stores integers as i64; cast to u64 (revisions fit in i63 range).
-    let stored: Option<u64> = conn
+    let stored: Option<(u64, Vec<u8>)> = conn
         .query_row(
-            "SELECT revision FROM objects WHERE key = ?1",
+            "SELECT revision, value FROM objects WHERE key = ?1",
             params![key],
-            |r| r.get::<_, i64>(0).map(|v| v as u64),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0).map(|v| v as u64)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                ))
+            },
         )
         .optional()?;
 
     let is_create = stored.is_none();
+    let stored_rv = stored.as_ref().map(|(rv, _)| *rv);
 
-    // 3. Optimistic concurrency check.
-    match (stored, expected_revision) {
+    // 3. Optimistic concurrency check. A precondition violation is a real conflict and takes
+    // priority over the no-op check below — mirroring real kube-apiserver, where the CAS
+    // check in the registry layer runs strictly before storage's GuaranteedUpdate ever
+    // compares bytes. Callers like patch_pod_status's RevisionMismatch retry loop depend on
+    // genuinely stale writes being rejected even when the writer's payload happens to be
+    // content-identical to what's currently stored.
+    match (stored_rv, expected_revision) {
         (_, None) => {}       // unconditional
         (None, Some(0)) => {} // create-only, absent: OK
         (Some(_), Some(0)) => {
@@ -322,6 +365,25 @@ fn put_sync(
                 expected: exp,
                 current: stored_rv,
             });
+        }
+    }
+
+    // 3.5. No-op short-circuit (mirrors etcd3's GuaranteedUpdate byte-equality check): if the
+    // precondition above passed AND this is an update (not a create — a first write for a key
+    // must never be treated as a no-op) AND the new content is semantically identical to what's
+    // already stored, skip the write entirely. Return the EXISTING revision so this looks like
+    // a normal successful put() to the caller, without bumping the global revision or firing a
+    // watch/MODIFIED event. This is what absorbs kubelet's routine, unchanged status re-PATCHes
+    // (every 10s per pod) without flooding every watcher in the cluster.
+    if let Some((existing_revision, existing_value)) = &stored {
+        if semantically_equal_ignoring_resource_version(&value, existing_value) {
+            conn.execute_batch("ROLLBACK")?;
+            return Ok((
+                *existing_revision,
+                Bytes::from(existing_value.clone()),
+                false,
+                true,
+            ));
         }
     }
 
@@ -363,7 +425,7 @@ fn put_sync(
     // load a stale last_written_revision from the async task queue — causing the list
     // guard to miss the stale-read and return an older resourceVersion to the reflector.
     last_written.fetch_max(new_revision, Ordering::Release);
-    Ok((new_revision, stamped_value, is_create))
+    Ok((new_revision, stamped_value, is_create, false))
 }
 
 fn delete_sync(
@@ -875,23 +937,29 @@ impl Store for SqliteStore {
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let (revision, stamped_value, is_create) =
+            let (revision, stamped_value, is_create, is_noop) =
                 put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
-            // Broadcast while still holding write_conn's guard — see push_event_locked's
-            // doc comment for why this ordering matters under concurrent writers.
-            push_event_locked(
-                &tx,
-                &ring,
-                &deletion_log,
-                &compaction_horizon,
-                Arc::new(InternalEvent {
-                    key: key_str,
-                    revision,
-                    value: Some(stamped_value),
-                    is_create,
-                    deleted_body: None,
-                }),
-            );
+            // Skip the broadcast entirely for no-op writes: no revision was bumped and no
+            // storage mutation happened, so notifying watchers would be a phantom MODIFIED
+            // event for content that never changed — exactly the flood this check exists to
+            // prevent. Broadcast while still holding write_conn's guard for real writes — see
+            // push_event_locked's doc comment for why this ordering matters under concurrent
+            // writers.
+            if !is_noop {
+                push_event_locked(
+                    &tx,
+                    &ring,
+                    &deletion_log,
+                    &compaction_horizon,
+                    Arc::new(InternalEvent {
+                        key: key_str,
+                        revision,
+                        value: Some(stamped_value),
+                        is_create,
+                        deleted_body: None,
+                    }),
+                );
+            }
             Ok::<u64, StoreError>(revision)
         })
         .await??;
@@ -2099,6 +2167,218 @@ mod tests {
              later-broadcast, higher-revision event on the same prefix advanced \
              last_replayed past it before it arrived (missing {} of {N})",
             N - seen.len()
+        );
+    }
+
+    // Regression tests: Store::put must suppress no-op writes so kubelet's routine, unchanged
+    // status re-PATCHes (every 10s, for every pod, forever) don't flood every watcher in the
+    // cluster with phantom MODIFIED events — `kubectl get pods -w` must stay quiet for a
+    // steady pod, matching real kube-apiserver's etcd3 GuaranteedUpdate byte-equality
+    // short-circuit.
+
+    /// A put() whose content is semantically identical to what's already stored (only
+    /// `metadata.resourceVersion` differs, exactly as patch_pod_status re-sends the fetched
+    /// object unchanged) must return the EXISTING revision, not write, not bump the revision,
+    /// and not notify watchers.
+    ///
+    /// Why it matters: kubelet re-asserts a steady pod's status every 10s regardless of
+    /// whether anything changed. Without this check, every one of those writes bumps the
+    /// global revision and fires a watch/MODIFIED event, so `kubectl get pods -w` (and every
+    /// controller's informer) sees a continuous stream of events with no real diff — at scale,
+    /// this multiplies write/broadcast cost across every steady pod in the cluster forever.
+    #[tokio::test]
+    async fn put_with_unchanged_content_does_not_bump_revision_or_notify_watcher() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/default/steady-pod";
+        let initial = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"steady-pod","namespace":"default"},"status":{"phase":"Running"}}"#,
+        );
+        let rv1 = store
+            .put(key, initial, None)
+            .await
+            .expect("create must succeed");
+
+        let stream = store
+            .watch("/registry/core/pods/", rv1)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // Mimics patch_pod_status exactly: fetch the stored object (already carrying
+        // resourceVersion=rv1), merge a patch that changes nothing, and write it back with
+        // expected_revision = the rv it was read at.
+        let stored = store.get(key).await.expect("get").expect("must exist");
+        let rv2 = store
+            .put(key, stored.value.clone(), Some(rv1))
+            .await
+            .expect("a no-op put must still report success to the caller, not error");
+
+        assert_eq!(
+            rv2, rv1,
+            "an unchanged re-write must return the EXISTING revision unchanged; bumping it here \
+             is exactly the bug that floods every pod watcher with meaningless MODIFIED events \
+             every kubelet status-sync cycle (10s), indefinitely, for every steady pod"
+        );
+
+        let result = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        assert!(
+            result.is_err(),
+            "no watch event may be emitted for a no-op write — a watcher observing an event \
+             here (even just a Bookmark) means the flood this fix exists to prevent is still \
+             happening"
+        );
+    }
+
+    /// A put() with genuinely different content must still write, bump the revision, and
+    /// notify watchers promptly — guards against the no-op check being too aggressive.
+    ///
+    /// Why it matters: if the equality check has a bug (e.g. comparing the wrong fields, or a
+    /// false-positive match), real status transitions like Pending -> Running would become
+    /// invisible to watchers, silently breaking every controller and `kubectl get -w` for
+    /// actual state changes — a far worse failure than occasionally missing a no-op.
+    #[tokio::test]
+    async fn put_with_genuine_content_change_still_bumps_revision_and_notifies() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/default/transitioning-pod";
+        let pending = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"transitioning-pod","namespace":"default"},"status":{"phase":"Pending"}}"#,
+        );
+        let rv1 = store
+            .put(key, pending, None)
+            .await
+            .expect("create must succeed");
+
+        let stream = store
+            .watch("/registry/core/pods/", rv1)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let running = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"transitioning-pod","namespace":"default","resourceVersion":"1"},"status":{"phase":"Running"}}"#,
+        );
+        let rv2 = store
+            .put(key, running, Some(rv1))
+            .await
+            .expect("genuine content change must succeed");
+
+        assert!(
+            rv2 > rv1,
+            "a real status transition (Pending -> Running) must bump the revision — treating it \
+             as a no-op would make the transition invisible to any watcher relying on \
+             resourceVersion ordering"
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect(
+                "a genuine content change must notify watchers promptly, not be swallowed \
+                      by the no-op check",
+            )
+            .expect("stream must not end");
+        match event {
+            WatchEvent::Modified(obj) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&obj.value).expect("stored value must be valid JSON");
+                assert_eq!(
+                    parsed["status"]["phase"], "Running",
+                    "the MODIFIED event must carry the new phase, not a stale/no-op body"
+                );
+            }
+            other => panic!("expected Modified event for a genuine change, got {other:?}"),
+        }
+    }
+
+    /// The FIRST write for a key (create) must never be treated as a no-op, even though there
+    /// is no prior value to differ from.
+    ///
+    /// Why it matters: the no-op check only compares against an EXISTING stored value: if a
+    /// future change to the check's `stored` handling accidentally treated "no prior value" as
+    /// vacuously equal, every create would silently vanish — no revision, no Added event, no
+    /// object ever actually stored. Every resource creation in the cluster would break.
+    #[tokio::test]
+    async fn put_first_write_for_new_key_is_never_treated_as_noop() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/default/brand-new-pod";
+
+        let stream = store
+            .watch("/registry/core/pods/", 0)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let value = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"brand-new-pod","namespace":"default"}}"#,
+        );
+        let rv = store
+            .put(key, value, None)
+            .await
+            .expect("create must succeed");
+
+        assert!(
+            rv > 0,
+            "a create must be assigned a real, positive revision — a no-op short-circuit \
+             misfiring on a create would return revision 0 or an unwritten value"
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect(
+                "a create must notify watchers — otherwise reflectors never learn the \
+                      object exists",
+            )
+            .expect("stream must not end");
+        assert!(
+            matches!(event, WatchEvent::Added(_)),
+            "the first write for a key must be delivered as Added, not silently dropped as a \
+             (nonsensical) no-op"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .expect("get must not error")
+            .expect("the object must actually be persisted, not skipped as a phantom no-op");
+        assert_eq!(stored.revision, rv);
+    }
+
+    /// A precondition violation (`expected_revision` not matching the stored revision) must
+    /// still return `RevisionMismatch`, even when the content being written would have been
+    /// unchanged had the precondition passed.
+    ///
+    /// Why it matters: the CAS check protects against lost updates — it must run before, and
+    /// take priority over, the no-op optimization. Real kube-apiserver's etcd3 store runs its
+    /// precondition check in the registry layer strictly before GuaranteedUpdate's own
+    /// byte-equality short-circuit ever compares data; letting a stale writer's
+    /// content-appears-unchanged payload silently "succeed" here would mask real conflicts —
+    /// e.g. patch_pod_status's RevisionMismatch retry loop depends on genuinely stale writes
+    /// being rejected so it re-reads and re-applies against current state.
+    #[tokio::test]
+    async fn put_with_stale_expected_revision_errors_even_when_content_unchanged() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/default/conflicted-pod";
+        let value = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"conflicted-pod","namespace":"default"},"status":{"phase":"Running"}}"#,
+        );
+        let rv1 = store
+            .put(key, value.clone(), None)
+            .await
+            .expect("create must succeed");
+
+        // Same content the store already holds, but the caller's expected_revision is stale
+        // (does not match the current stored revision) — a real optimistic-concurrency
+        // conflict, independent of whether the payload happens to be content-identical.
+        let result = store.put(key, value, Some(rv1 + 41)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::RevisionMismatch { expected, current })
+                    if expected == rv1 + 41 && current == rv1
+            ),
+            "a stale expected_revision must be rejected as RevisionMismatch even when the \
+             content would have been unchanged — the no-op optimization must never mask a real \
+             optimistic-concurrency conflict, got: {result:?}"
         );
     }
 }

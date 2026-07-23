@@ -1033,11 +1033,15 @@ mod tests {
         let name = "stale-rv-csr";
         seed_csr(&store, name, None).await;
 
-        // Advance the stored object so rv=1 is now stale.
+        // Advance the stored object so rv=1 is now stale, via a genuine change (a peer
+        // approver's condition) — the store suppresses no-op writes, so re-writing the same
+        // empty conditions list would not have advanced the revision at all.
         let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
         let stored = store.get(&key).await.unwrap().unwrap();
         let mut obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        obj["status"]["conditions"] = serde_json::json!([]);
+        obj["status"]["conditions"] = serde_json::json!([
+            {"type": "Approved", "status": "True", "reason": "peer", "message": ""}
+        ]);
         let rv1 = stored.revision;
         // Write a new revision so rv1 becomes stale.
         let rv2 = store
