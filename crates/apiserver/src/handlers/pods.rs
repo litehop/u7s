@@ -70,8 +70,10 @@ pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
 /// Parse a `fieldSelector` query string and test a pod JSON value against it.
 ///
 /// Supported selectors (comma-separated):
-///   spec.nodeName=<value>   — include only if pod's spec.nodeName equals value
-///   spec.nodeName!=<value>  — include only if pod's spec.nodeName does not equal value
+///   spec.nodeName=<value>    — include only if pod's spec.nodeName equals value
+///   spec.nodeName!=<value>   — include only if pod's spec.nodeName does not equal value
+///   status.phase=<value>     — include only if pod's status.phase equals value
+///   status.phase!=<value>    — include only if pod's status.phase does not equal value
 ///
 /// An empty or absent selector matches everything (pass-through).
 /// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
@@ -90,6 +92,7 @@ pub fn filter_pods_by_field_selector(
 fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
     let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
     let node_name = spec.node_name.as_deref().unwrap_or("");
+    let phase = pod["status"]["phase"].as_str().unwrap_or("");
     for term in selector.split(',') {
         let term = term.trim();
         if term.is_empty() {
@@ -99,9 +102,15 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
             if field == "spec.nodeName" && node_name == value {
                 return false;
             }
+            if field == "status.phase" && phase == value {
+                return false;
+            }
             // Unknown fields: ignore (don't filter out)
         } else if let Some((field, value)) = term.split_once('=') {
             if field == "spec.nodeName" && node_name != value {
+                return false;
+            }
+            if field == "status.phase" && phase != value {
                 return false;
             }
             // Unknown fields: ignore (don't filter out)
@@ -1409,6 +1418,16 @@ mod field_selector_tests {
         })
     }
 
+    fn pod_with_phase(phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {},
+            "status": {"phase": phase}
+        })
+    }
+
     /// Empty selector is a pass-through: all pods must be returned.
     /// Kubelet depends on this when fieldSelector is absent.
     #[test]
@@ -1470,6 +1489,49 @@ mod field_selector_tests {
             result.is_empty(),
             "unscheduled pods must not reach the kubelet"
         );
+    }
+
+    /// A Failed pod must be excluded by status.phase!=Failed,status.phase!=Succeeded —
+    /// DaemonSet/Deployment rollout controllers and the "should rollback without
+    /// unnecessary restarts" conformance test rely on this exclusion to know a
+    /// terminating pod is gone without waiting for its physical removal.
+    #[test]
+    fn ne_filter_excludes_failed_phase() {
+        let pods = vec![pod_with_phase("Failed")];
+        let result =
+            filter_pods_by_field_selector(pods, "status.phase!=Failed,status.phase!=Succeeded");
+        assert!(
+            result.is_empty(),
+            "a Failed pod must not be returned by status.phase!=Failed,!=Succeeded"
+        );
+    }
+
+    /// A Running pod must still pass status.phase!=Failed,status.phase!=Succeeded.
+    /// The exclusion must be precise: it must not over-filter healthy pods out of
+    /// a rollout controller's view of its managed pods.
+    #[test]
+    fn ne_filter_includes_running_phase() {
+        let pods = vec![pod_with_phase("Running")];
+        let result =
+            filter_pods_by_field_selector(pods, "status.phase!=Failed,status.phase!=Succeeded");
+        assert_eq!(result.len(), 1, "a Running pod must not be excluded");
+    }
+
+    /// status.phase=Running must match a Running pod — the positive-equality form
+    /// of the same phase selector must work, not just the negation form.
+    #[test]
+    fn eq_filter_matches_correct_phase() {
+        let pods = vec![pod_with_phase("Running")];
+        let result = filter_pods_by_field_selector(pods, "status.phase=Running");
+        assert_eq!(result.len(), 1);
+    }
+
+    /// status.phase=Running must not match a Pending pod.
+    #[test]
+    fn eq_filter_excludes_wrong_phase() {
+        let pods = vec![pod_with_phase("Pending")];
+        let result = filter_pods_by_field_selector(pods, "status.phase=Running");
+        assert!(result.is_empty());
     }
 
     /// Unknown selector fields must be ignored (pass-through) rather than dropping pods.
