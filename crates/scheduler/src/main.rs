@@ -25,10 +25,11 @@ use tokio_rustls::TlsConnector;
 use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
-    bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event, find_preemption_plan,
-    http_get, needs_scheduling, patch_pod_status, pick_node, pods_needing_resync,
-    scheduling_gate_status_patch, scheduling_gate_status_reset, should_retry_without_preempting,
-    should_schedule, stream_watch_events, NodeTally, PendingPod, PodList,
+    bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
+    failed_scheduling_status_patch, find_preemption_plan, http_get, needs_scheduling,
+    patch_pod_status, pick_node, pods_needing_resync, scheduling_gate_status_patch,
+    scheduling_gate_status_reset, should_retry_without_preempting, should_schedule,
+    stream_watch_events, NodeTally, PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -360,7 +361,24 @@ fn handle_pod_event(
             ),
             Err(e) => {
                 error!("scheduling error for {key}: {e}");
-                ("FailedScheduling", format!("{e}"), "Warning")
+                let message = format!("{e}");
+                // Best-effort, mirrors the DisruptionTarget/SchedulingGated
+                // patches elsewhere in this file: the FailedScheduling Event
+                // below is not enough on its own — upstream kube-scheduler
+                // also patches the pod's own PodScheduled condition on every
+                // failed cycle, which is what conformance waits actually poll.
+                if let Err(patch_err) = patch_pod_status(
+                    &connector_clone,
+                    &server_clone,
+                    &namespace,
+                    &pod_name,
+                    &failed_scheduling_status_patch(&message),
+                )
+                .await
+                {
+                    error!("failed to set PodScheduled=False status for {key}: {patch_err}");
+                }
+                ("FailedScheduling", message, "Warning")
             }
         };
         if let Err(e) = emit_scheduling_event(

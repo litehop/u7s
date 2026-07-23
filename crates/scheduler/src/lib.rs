@@ -537,6 +537,31 @@ pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
     }))
 }
 
+/// Build the `status.conditions` PATCH for a pod that just failed a
+/// scheduling attempt (no node fit, even after preemption, or the bind
+/// itself failed).
+///
+/// Mirrors upstream kube-scheduler, which patches `PodScheduled=False` with
+/// reason `Unschedulable` on EVERY failed scheduling cycle, not just the
+/// FailedScheduling Event `main.rs` already emits. Without this, a pod's
+/// `status.conditions` stays frozen at the pod-creation-time default
+/// forever, so anything polling for `{type: PodScheduled, reason:
+/// Unschedulable}` (some conformance waits do exactly this) can never
+/// observe the failure — and no self-generated MODIFIED event exists for it
+/// either, since a status-only PATCH is the only thing that produces one.
+pub fn failed_scheduling_status_patch(message: &str) -> Value {
+    serde_json::json!({
+        "status": {
+            "conditions": [{
+                "type": POD_SCHEDULED,
+                "status": "False",
+                "reason": UNSCHEDULABLE_REASON,
+                "message": message,
+            }]
+        }
+    })
+}
+
 /// Return `true` if a spawn for `key` ("namespace/name") should proceed.
 ///
 /// `key` must be absent from `in_flight` — the set of pod keys currently being
@@ -2717,6 +2742,26 @@ mod tests {
             "the reset patch must never carry a \"status\" field — doing so risks \
              clobbering a concurrently-bound pod's True back to False"
         );
+    }
+
+    #[test]
+    fn failed_scheduling_status_patch_sets_pod_scheduled_false() {
+        // Without this, a pod that fails every scheduling attempt keeps
+        // whatever PodScheduled condition it had at creation forever — the
+        // FailedScheduling Event main.rs emits is invisible to anything that
+        // polls status.conditions instead of watching Events (some
+        // conformance waits do exactly that), so this must actually flip the
+        // condition, not just log/emit.
+        let patch = failed_scheduling_status_patch("no node fits");
+        let cond = &patch["status"]["conditions"][0];
+        assert_eq!(cond["type"], "PodScheduled");
+        assert_eq!(cond["status"], "False");
+        assert_eq!(
+            cond["reason"], "Unschedulable",
+            "reason must match v1.PodReasonUnschedulable — upstream kube-scheduler \
+             stamps this same reason on every failed scheduling cycle"
+        );
+        assert_eq!(cond["message"], "no node fits");
     }
 
     // pod_status_path / check_status_patch_response tests — mirror the
