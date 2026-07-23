@@ -48,13 +48,29 @@ pub fn strategic_merge_patch(
     target: &mut serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<(), PatchError> {
-    strategic_merge_patch_at(target, patch, "")
+    strategic_merge_patch_at(target, patch, "", None)
+}
+
+/// Strategic-merge-patch a custom-resource instance, resolving merge keys from the CRD's own
+/// OpenAPI schema (`x-kubernetes-list-type: map` + `x-kubernetes-list-map-keys`) instead of the
+/// hardcoded built-in-type table `strategic_merge_patch` uses — a CRD's kind has no relationship
+/// to Pod/Service shapes, so built-in entries must never apply to it. `schema` is
+/// `ctx.schema` from `handlers::cr::find_crd`, i.e. the CRD version's raw `openAPIV3Schema`;
+/// `None` (a schemaless CRD) makes every list atomic-replace, matching upstream's behavior for
+/// CRDs with no structural schema.
+pub fn strategic_merge_patch_for_cr(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    schema: Option<&serde_json::Value>,
+) -> Result<(), PatchError> {
+    strategic_merge_patch_at(target, patch, "", schema)
 }
 
 fn strategic_merge_patch_at(
     target: &mut serde_json::Value,
     patch: &serde_json::Value,
     path: &str,
+    schema: Option<&serde_json::Value>,
 ) -> Result<(), PatchError> {
     let patch_obj = patch.as_object().ok_or(PatchError::NotAnObject)?;
 
@@ -108,12 +124,12 @@ fn strategic_merge_patch_at(
         };
 
         if value.is_array() {
-            match merge_key_for_path(&child_path) {
+            match merge_key_for_path(&child_path, schema) {
                 MergeKeyKind::Key(merge_key) => {
                     let entry = target_obj
                         .entry(key)
                         .or_insert(serde_json::Value::Array(vec![]));
-                    strategic_merge_array(entry, value, merge_key, &child_path)?;
+                    strategic_merge_array(entry, value, &merge_key, &child_path, schema)?;
                 }
                 MergeKeyKind::Replace | MergeKeyKind::Unknown => {
                     // $patch:delete can only be honored by matching a merge key; an array
@@ -143,7 +159,7 @@ fn strategic_merge_patch_at(
                 let entry = target_obj
                     .entry(key)
                     .or_insert(serde_json::Value::Object(Default::default()));
-                strategic_merge_patch_at(entry, value, &child_path)?;
+                strategic_merge_patch_at(entry, value, &child_path, schema)?;
             }
         } else {
             target_obj.insert(key.clone(), value.clone());
@@ -168,9 +184,9 @@ fn strategic_merge_patch_at(
         } else {
             format!("{path}.{field}")
         };
-        if let MergeKeyKind::Key(merge_key) = merge_key_for_path(&child_path) {
+        if let MergeKeyKind::Key(merge_key) = merge_key_for_path(&child_path, schema) {
             if let Some(target_arr) = target_obj.get_mut(field).and_then(|v| v.as_array_mut()) {
-                apply_set_element_order(target_arr, order_arr, merge_key);
+                apply_set_element_order(target_arr, order_arr, &merge_key);
             }
         }
     }
@@ -207,6 +223,7 @@ fn strategic_merge_array(
     patch: &serde_json::Value,
     merge_key: &str,
     path: &str,
+    schema: Option<&serde_json::Value>,
 ) -> Result<(), PatchError> {
     let patch_arr = match patch.as_array() {
         Some(a) => a,
@@ -271,7 +288,7 @@ fn strategic_merge_array(
                         // Deep-merge the patch element into the target element.
                         // Pass `path` (the array's own path) so nested lists like env,
                         // volumeMounts, ports resolve their merge keys correctly.
-                        strategic_merge_patch_at(target_elem, patch_elem, path)?;
+                        strategic_merge_patch_at(target_elem, patch_elem, path, schema)?;
                     }
                     None => {
                         target_arr.push(patch_elem.clone());
@@ -374,8 +391,9 @@ fn reorder_merged_array(
 }
 
 enum MergeKeyKind {
-    /// Array uses this field as the merge key.
-    Key(&'static str),
+    /// Array uses this field as the merge key. Owned (not `&'static str`) because a
+    /// CRD-derived key is borrowed from the CRD's own schema `Value`, not from a literal.
+    Key(String),
     /// Array has no merge key — always replace.
     Replace,
     /// Not a known strategic-merge path — last-write-wins.
@@ -388,9 +406,19 @@ enum MergeKeyKind {
 /// a Deployment/StatefulSet/DaemonSet/Job's "spec.template.spec.X" (one wrapper), a CronJob's
 /// "spec.jobTemplate.spec.template.spec.X" (two wrappers), or any future built-in type that
 /// wraps PodTemplateSpec deeper still — resolves correctly without adding a new table entry.
-/// Fields that are CRD-schema-defined (not one of this fixed built-in set) are not covered by
-/// this suffix rule and remain a separate, open gap.
-fn merge_key_for_path(path: &str) -> MergeKeyKind {
+/// Fields that are CRD-schema-defined (not one of this fixed built-in set) are handled
+/// entirely separately by `crd_merge_key_for_path` — see `schema`'s doc below.
+///
+/// `schema` is `Some` only for custom-resource instances (via `strategic_merge_patch_for_cr`),
+/// carrying the CRD's own `openAPIV3Schema`. When present, resolution defers ENTIRELY to
+/// `crd_merge_key_for_path` and never falls through to the table below: a CRD's own kind has
+/// nothing to do with the Pod/Service shapes this table encodes, so a coincidental path
+/// collision (e.g. a CRD that happens to have its own unrelated `spec.containers` field) must
+/// not silently inherit Pod's merge-by-name semantics.
+fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKeyKind {
+    if let Some(schema) = schema {
+        return crd_merge_key_for_path(schema, path);
+    }
     match path {
         // Bare Pod's own spec — a Pod is patched directly, with no PodTemplateSpec wrapper.
         "spec.containers"
@@ -399,7 +427,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         | "spec.volumes"
         | "spec.imagePullSecrets"
         | "spec.schedulingGates"
-        | "spec.resourceClaims" => MergeKeyKind::Key("name"),
+        | "spec.resourceClaims" => MergeKeyKind::Key("name".to_string()),
 
         // The same PodSpec-typed fields as above, but reached through a PodTemplateSpec
         // wrapper. Upstream resolves these merge keys via reflection over the Go struct
@@ -419,7 +447,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
             || path.ends_with(".template.spec.schedulingGates")
             || path.ends_with(".template.spec.resourceClaims") =>
         {
-            MergeKeyKind::Key("name")
+            MergeKeyKind::Key("name".to_string())
         }
 
         // topologySpreadConstraints — upstream patchMergeKey is "topologyKey" (singular;
@@ -430,9 +458,9 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // zone-spread on top of an existing hostname-spread) falls through to
         // MergeKeyKind::Unknown, which silently replaces the whole array instead of
         // merging by topologyKey — losing every pre-existing constraint.
-        "spec.topologySpreadConstraints" => MergeKeyKind::Key("topologyKey"),
+        "spec.topologySpreadConstraints" => MergeKeyKind::Key("topologyKey".to_string()),
         path if path.ends_with(".template.spec.topologySpreadConstraints") => {
-            MergeKeyKind::Key("topologyKey")
+            MergeKeyKind::Key("topologyKey".to_string())
         }
 
         // hostAliases inside a Pod template (Deployment/StatefulSet/DaemonSet/Job) — same
@@ -440,8 +468,8 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // "spec.hostAliases" path was registered, so patching a Deployment's
         // spec.template.spec.hostAliases to add one entry dropped every other hostAlias in
         // the template.
-        "spec.hostAliases" => MergeKeyKind::Key("ip"),
-        path if path.ends_with(".template.spec.hostAliases") => MergeKeyKind::Key("ip"),
+        "spec.hostAliases" => MergeKeyKind::Key("ip".to_string()),
+        path if path.ends_with(".template.spec.hostAliases") => MergeKeyKind::Key("ip".to_string()),
 
         // Nested list fields inside container objects.
         // These paths are relative to the container object (e.g. spec.containers.env).
@@ -449,10 +477,10 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
             || path.ends_with(".initContainers.env")
             || path.ends_with(".ephemeralContainers.env") =>
         {
-            MergeKeyKind::Key("name")
+            MergeKeyKind::Key("name".to_string())
         }
 
-        path if path.ends_with(".volumeMounts") => MergeKeyKind::Key("mountPath"),
+        path if path.ends_with(".volumeMounts") => MergeKeyKind::Key("mountPath".to_string()),
 
         // volumeDevices — same nested-inside-container shape as volumeMounts above
         // (Container.volumeDevices and EphemeralContainerCommon.volumeDevices both declare
@@ -460,26 +488,30 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // strategic-merge-patch adding one block device to a container that already has
         // volumeDevices entries silently replaces the whole array instead of merging by
         // devicePath, dropping every other device mapping.
-        path if path.ends_with(".volumeDevices") => MergeKeyKind::Key("devicePath"),
+        path if path.ends_with(".volumeDevices") => MergeKeyKind::Key("devicePath".to_string()),
 
         // allocatedResourcesStatus is nested inside a containerStatuses element (same shape
         // as volumeMounts/env above, but for ContainerStatus rather than Container). Upstream
         // declares patchMergeKey=name/patchStrategy=merge; without this entry a kubelet status
         // patch reporting a new allocated-resource health entry silently replaces the whole
         // array instead of merging by name.
-        path if path.ends_with(".allocatedResourcesStatus") => MergeKeyKind::Key("name"),
+        path if path.ends_with(".allocatedResourcesStatus") => {
+            MergeKeyKind::Key("name".to_string())
+        }
 
         // Service spec.ports uses "port" (integer) as the merge key, not "containerPort".
         // This exact match must come before the suffix match below.
-        "spec.ports" => MergeKeyKind::Key("port"),
+        "spec.ports" => MergeKeyKind::Key("port".to_string()),
 
-        path if path.ends_with(".ports") => MergeKeyKind::Key("containerPort"),
+        path if path.ends_with(".ports") => MergeKeyKind::Key("containerPort".to_string()),
 
         // conditions arrays use "type" as the merge key across all resource types
         // (Node, Pod, Deployment, PVC, Job, etc.).  Two paths are needed: "conditions"
         // when called from the /status subresource handler (path root is stripped to ""),
         // and "status.conditions" when patching the full object.
-        path if path == "conditions" || path.ends_with(".conditions") => MergeKeyKind::Key("type"),
+        path if path == "conditions" || path.ends_with(".conditions") => {
+            MergeKeyKind::Key("type".to_string())
+        }
 
         // Pod status arrays — merge key used by kubelet strategic-merge-patch.
         // "podIPs" is used when the status patch is applied with path root "" (status
@@ -488,7 +520,9 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // Without these entries, $patch:delete directives on podIPs accumulate as literal
         // objects in the array, causing the kubelet to see phantom podIP changes on every
         // reconcile and continuously recreate the pod sandbox (sandbox loop).
-        path if path == "podIPs" || path.ends_with(".podIPs") => MergeKeyKind::Key("ip"),
+        path if path == "podIPs" || path.ends_with(".podIPs") => {
+            MergeKeyKind::Key("ip".to_string())
+        }
 
         // resourceClaimStatuses — same top-level-PodStatus shape as podIPs above (DRA claim
         // allocation results the kubelet reports back). Upstream declares
@@ -496,7 +530,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // $patch:delete removing one claim's status returns 400 instead of removing just
         // that entry.
         path if path == "resourceClaimStatuses" || path.ends_with(".resourceClaimStatuses") => {
-            MergeKeyKind::Key("name")
+            MergeKeyKind::Key("name".to_string())
         }
 
         // NodeStatus.addresses — upstream declares patchMergeKey=type/patchStrategy=merge, but
@@ -512,14 +546,14 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // "status.addresses" (a full Node-object patch, computed transiently before the
         // main-endpoint handler restores the stored status — see handlers::resource's
         // has_status_subresource restore step).
-        "addresses" | "status.addresses" => MergeKeyKind::Key("type"),
+        "addresses" | "status.addresses" => MergeKeyKind::Key("type".to_string()),
 
         // ownerReferences is keyed by uid.  KCM releases a pod from a ReplicaSet/RC by
         // sending $patch:delete with the RS uid; without this entry the directive is stored
         // literally, leaving a garbage ownerReference {$patch:delete, uid:…} that causes
         // controllers and GC to dereference a nil .Controller field and panic.
         path if path == "metadata.ownerReferences" || path.ends_with(".ownerReferences") => {
-            MergeKeyKind::Key("uid")
+            MergeKeyKind::Key("uid".to_string())
         }
 
         path if path == "containerStatuses"
@@ -529,7 +563,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
             || path == "ephemeralContainerStatuses"
             || path.ends_with(".ephemeralContainerStatuses") =>
         {
-            MergeKeyKind::Key("name")
+            MergeKeyKind::Key("name".to_string())
         }
 
         // ServiceAccount.secrets is a top-level field directly on the object (ServiceAccount
@@ -537,7 +571,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // "secrets" path (root path is "" for a main-resource PATCH). Upstream declares
         // patchMergeKey=name/patchStrategy=merge; without this entry a strategic-merge-patch
         // adding a second secret reference silently replaces the whole list.
-        "secrets" => MergeKeyKind::Key("name"),
+        "secrets" => MergeKeyKind::Key("name".to_string()),
 
         // CSINodeSpec.drivers is the only "drivers" field across the vendored API surface
         // (verified: no other message declares a `drivers` field), so a suffix arm can't
@@ -545,7 +579,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // without this entry, installing a second CSI driver on a Node silently replaces the
         // whole CSINode.spec.drivers array instead of merging by name, unregistering every
         // other already-installed CSI driver on that node.
-        path if path.ends_with(".drivers") => MergeKeyKind::Key("name"),
+        path if path.ends_with(".drivers") => MergeKeyKind::Key("name".to_string()),
 
         // matchConditions is declared patchMergeKey=name/patchStrategy=merge on all four
         // messages that carry it (MutatingWebhook, ValidatingWebhook, and both
@@ -557,7 +591,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // spec, no array wrapper). Without this entry, adding one match condition to an
         // existing webhook or admission policy silently replaces the whole array instead of
         // merging by name, dropping every other match condition that gates when it applies.
-        path if path.ends_with(".matchConditions") => MergeKeyKind::Key("name"),
+        path if path.ends_with(".matchConditions") => MergeKeyKind::Key("name".to_string()),
 
         // {Mutating,Validating}WebhookConfiguration.webhooks — the .proto token is spelled
         // capitalized "Webhooks", but admissionreg_gen_adapter.rs's
@@ -570,12 +604,64 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // admissionReviewVersions, and sideEffects from that entry — leaving the webhook
         // registered but unusable, since invoke_mutating_webhook/run_validating_webhooks can't
         // resolve a dispatch target without clientConfig.
-        "webhooks" => MergeKeyKind::Key("name"),
+        "webhooks" => MergeKeyKind::Key("name".to_string()),
 
         "rules" | "subjects" => MergeKeyKind::Replace,
 
         _ => MergeKeyKind::Unknown,
     }
+}
+
+/// Resolves a CR list field's merge key purely from what the CRD author declared in their own
+/// OpenAPI schema — the documented, GA-since-1.16 `x-kubernetes-list-type: map` +
+/// `x-kubernetes-list-map-keys` structural-schema extension. Only that exact declaration yields
+/// a merge key; `x-kubernetes-list-type: set` (dedupe-by-value, not a keyed merge — tracked
+/// separately) and `"atomic"`, a missing annotation, or a malformed schema node all fall to
+/// `Unknown`, matching upstream's atomic-replace default for every case that isn't a declared
+/// map.
+fn crd_merge_key_for_path(schema: &serde_json::Value, path: &str) -> MergeKeyKind {
+    let Some(node) = find_schema_node(schema, path) else {
+        return MergeKeyKind::Unknown;
+    };
+    if node.get("x-kubernetes-list-type").and_then(|v| v.as_str()) != Some("map") {
+        return MergeKeyKind::Unknown;
+    }
+    match node
+        .get("x-kubernetes-list-map-keys")
+        .and_then(|v| v.as_array())
+        .and_then(|keys| keys.first())
+        .and_then(|v| v.as_str())
+    {
+        Some(key) => MergeKeyKind::Key(key.to_string()),
+        None => MergeKeyKind::Unknown,
+    }
+}
+
+/// Walks a CRD's `openAPIV3Schema` (mirroring `apply_crd_schema_defaults`/
+/// `prune_cr_unknown_fields`'s `properties`/`items` recursion convention) to the schema node at
+/// a dot-separated strategic-merge-patch `path`.
+///
+/// A path segment always names an object property, never an array index or literal "items" —
+/// `strategic_merge_array` passes an array's own path unchanged to elements nested inside it
+/// (see its call to `strategic_merge_patch_at`), so e.g. `spec.containers.env` addresses `env`
+/// on the *element* schema of the `containers` array, not a property of the array itself. So
+/// before matching each segment against `properties`, this transparently descends through
+/// `items` if the node resolved by the previous segment was itself a list schema.
+fn find_schema_node<'a>(
+    schema: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut node = schema;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(items) = node.get("items") {
+            node = items;
+        }
+        node = node.get("properties")?.get(segment)?;
+    }
+    Some(node)
 }
 
 /// Returns true for object-valued fields that must be replaced wholesale rather than
@@ -2416,7 +2502,10 @@ mod tests {
     #[test]
     fn mutating_admission_policy_variables_stays_atomic_replace_not_merged_by_name() {
         assert!(
-            matches!(merge_key_for_path("spec.variables"), MergeKeyKind::Unknown),
+            matches!(
+                merge_key_for_path("spec.variables", None),
+                MergeKeyKind::Unknown
+            ),
             "spec.variables must stay unregistered (Unknown -> whole-array replace) — if this \
              ever changes to MergeKeyKind::Key, it means someone registered a merge key at this \
              path to fix ValidatingAdmissionPolicySpec.variables, which would also incorrectly \
@@ -2713,9 +2802,9 @@ mod tests {
             format!("spec.template.spec.{field}"),
             format!("spec.containers.{field}"),
         ];
-        candidates
-            .iter()
-            .any(|p| matches!(merge_key_for_path(p), MergeKeyKind::Key(k) if k == expected_key))
+        candidates.iter().any(
+            |p| matches!(merge_key_for_path(p, None), MergeKeyKind::Key(k) if k == expected_key),
+        )
     }
 
     #[test]
@@ -2854,6 +2943,217 @@ mod tests {
              schema-declared +patchMergeKey fields — a strategic-merge-patch against them will \
              silently replace the whole array instead of merging by key (or 400 on \
              $patch:delete): {missing:#?}"
+        );
+    }
+
+    // --- CRD schema-driven merge keys for custom-resource instances ---
+    //
+    // strategic_merge_patch_for_cr resolves merge keys entirely from the CRD's own
+    // openAPIV3Schema (x-kubernetes-list-type/list-map-keys) rather than the built-in table
+    // above, which encodes Pod/Service shapes meaningless for a CRD's own kind.
+
+    /// A CRD author who follows the documented (GA since 1.16) x-kubernetes-list-type: map +
+    /// x-kubernetes-list-map-keys convention on a list nested inside an embedded
+    /// PodTemplateSpec-shaped field (the same "spec.template.spec.containers" shape Argo
+    /// Workflows, Tekton, and KEDA's ScaledJob CRDs all use) gets exactly the merge-by-key
+    /// behavior upstream promises for that declaration. Without schema-awareness, this CR would
+    /// silently fall through to atomic-replace regardless of the CRD's declaration — a real
+    /// kubectl apply against upstream would preserve the untouched container, so u7s must too.
+    #[test]
+    fn test_smp_for_cr_merges_nested_list_by_declared_map_key() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "template": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "containers": {
+                                            "type": "array",
+                                            "x-kubernetes-list-type": "map",
+                                            "x-kubernetes-list-map-keys": ["name"],
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "name": {"type": "string"},
+                                                    "image": {"type": "string"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut target = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": "worker", "image": "worker:1.0"}
+                        ]
+                    }
+                }
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": "sidecar", "image": "sidecar:latest"}
+                        ]
+                    }
+                }
+            }
+        });
+
+        strategic_merge_patch_for_cr(&mut target, &patch, Some(&schema)).unwrap();
+
+        let containers = target["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            containers.len(),
+            2,
+            "a CRD author who declared x-kubernetes-list-type: map + list-map-keys: [name] on \
+             this nested field must get merge-by-key semantics, exactly as upstream Kubernetes \
+             promises for that declaration — silently dropping the pre-existing \"worker\" \
+             container would be a correctness regression for any operator relying on this \
+             standard CRD feature; got: {containers:?}"
+        );
+        let names: Vec<&str> = containers
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"worker") && names.contains(&"sidecar"),
+            "both the original and newly-patched container must survive; got: {names:?}"
+        );
+    }
+
+    /// A CR list field the CRD schema declares with NO x-kubernetes-list-type annotation at
+    /// all must keep upstream's documented default of whole-array-replace — matching what
+    /// today's code (and real Kubernetes) already does for such a field. This is not a new
+    /// behavior to add; it's the boundary that proves schema-awareness only ever ADDS
+    /// merge-by-key where explicitly declared, never invents one for fields the CRD author
+    /// left unannotated.
+    #[test]
+    fn test_smp_for_cr_with_no_list_type_annotation_still_atomic_replaces() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "entries": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut target = json!({
+            "spec": {
+                "entries": [
+                    {"name": "kept-only-if-merged"},
+                    {"name": "also-kept-only-if-merged"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "entries": [
+                    {"name": "also-kept-only-if-merged"}
+                ]
+            }
+        });
+
+        strategic_merge_patch_for_cr(&mut target, &patch, Some(&schema)).unwrap();
+
+        let entries = target["spec"]["entries"].as_array().unwrap();
+        assert_eq!(
+            entries,
+            &vec![json!({"name": "also-kept-only-if-merged"})],
+            "an unannotated CRD list field must whole-array-replace, matching upstream's \
+             default for a field with no patch-merge annotation — if this started preserving \
+             \"kept-only-if-merged\" it would mean schema-awareness incorrectly invented a \
+             merge key nobody declared; got: {entries:?}"
+        );
+    }
+
+    /// x-kubernetes-list-type: set means dedupe-by-value, never merge-by-key — this is the
+    /// boundary case the CRD schema plumbing must get right rather than gloss over. A CRD
+    /// author who annotated a field "set" (even one whose elements happen to carry a "name"
+    /// field, and even if list-map-keys were also present, which real CRDs wouldn't pair with
+    /// "set" but a malformed one might) must still see atomic-replace, not have this code
+    /// mistake "set" for "map" and silently start merging by key — that would leave stale
+    /// elements the client meant to remove sitting in the array forever, e.g. a patch intended
+    /// to drop a stale set entry would instead be interpreted as "add a keyed entry", failing
+    /// to remove anything.
+    #[test]
+    fn test_smp_for_cr_list_type_set_is_not_treated_as_merge_key() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "x-kubernetes-list-type": "set",
+                            "x-kubernetes-list-map-keys": ["name"],
+                            "items": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut target = json!({
+            "spec": {
+                "tags": [
+                    {"name": "stale-tag-the-client-wants-removed"},
+                    {"name": "kept-tag"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "tags": [
+                    {"name": "kept-tag"}
+                ]
+            }
+        });
+
+        strategic_merge_patch_for_cr(&mut target, &patch, Some(&schema)).unwrap();
+
+        let tags = target["spec"]["tags"].as_array().unwrap();
+        assert_eq!(
+            tags,
+            &vec![json!({"name": "kept-tag"})],
+            "x-kubernetes-list-type: set must fall to atomic-replace (Unknown), never be \
+             mistaken for \"map\" even when a (non-standard) list-map-keys is also present — \
+             if \"stale-tag-the-client-wants-removed\" survived, it would mean \"set\" was \
+             silently treated as a merge key, defeating the client's whole-array-replace intent \
+             for this field; got: {tags:?}"
         );
     }
 }

@@ -2581,7 +2581,7 @@ pub async fn patch_cr<S: Store>(
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
         crate::handlers::json_patch::PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch(&mut obj, &patch)
+            crate::patch::strategic_merge_patch_for_cr(&mut obj, &patch, ctx.schema.as_ref())
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
         crate::handlers::json_patch::PatchType::Merge => {
@@ -2786,7 +2786,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
         crate::handlers::json_patch::PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch(&mut obj, &patch)
+            crate::patch::strategic_merge_patch_for_cr(&mut obj, &patch, ctx.schema.as_ref())
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
         crate::handlers::json_patch::PatchType::Merge => {
