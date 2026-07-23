@@ -81,7 +81,7 @@ scripts/conformance/06-run-sonobuoy.sh [--focus <regex>]
 
 | Script | What it does |
 |---|---|
-| `01-build.sh` | `cargo build --release -p u7s-apiserver` |
+| `01-build.sh` | `cargo build --release -p u7s-apiserver -p u7s-scheduler` |
 | `02-start-apiserver.sh` | Delegates to `scripts/u7s-start.sh --background`; exports KUBECONFIG |
 | `lima-start.sh` | Provisions/starts the lima VM and joins its kubelet to u7s |
 | `04-start-kcm.sh` | Downloads (if needed) and starts kube-controller-manager inside the lima VM |
