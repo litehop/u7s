@@ -402,16 +402,22 @@ fn handle_pod_event(
                 // below is not enough on its own — upstream kube-scheduler
                 // also patches the pod's own PodScheduled condition on every
                 // failed cycle, which is what conformance waits actually poll.
-                if let Err(patch_err) = patch_pod_status(
-                    &connector_clone,
-                    &server_clone,
-                    &namespace,
-                    &pod_name,
-                    &failed_scheduling_status_patch(&message),
-                )
-                .await
-                {
-                    error!("failed to set PodScheduled=False status for {key}: {patch_err}");
+                // None when the condition already reads this exact message
+                // (see failed_scheduling_status_patch's doc comment) — a
+                // pod that keeps failing identically must NOT keep
+                // self-retriggering via its own PATCH's watch echo.
+                if let Some(patch) = failed_scheduling_status_patch(&event, &message) {
+                    if let Err(patch_err) = patch_pod_status(
+                        &connector_clone,
+                        &server_clone,
+                        &namespace,
+                        &pod_name,
+                        &patch,
+                    )
+                    .await
+                    {
+                        error!("failed to set PodScheduled=False status for {key}: {patch_err}");
+                    }
                 }
                 ("FailedScheduling", message, "Warning")
             }

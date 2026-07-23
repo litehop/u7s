@@ -252,12 +252,13 @@ struct PodMetadata {
 }
 
 /// A single `status.conditions[]` entry, as needed to read back whatever
-/// PodScheduled condition is currently stored — used only by the
-/// SchedulingGated status-patch bookkeeping (`scheduling_gate_status_patch` /
-/// `scheduling_gate_status_reset`) to decide whether a PATCH is still needed.
-/// `Option` (not `String` with `#[serde(default)]`) because a condition field
-/// can be present-but-`null`, not just absent — see `merge_conditions` in the
-/// apiserver, which can persist a literal `null` reason on first write.
+/// PodScheduled condition is currently stored — used by the SchedulingGated
+/// status-patch bookkeeping (`scheduling_gate_status_patch` /
+/// `scheduling_gate_status_reset`) and by `failed_scheduling_status_patch`
+/// to decide whether a PATCH is still needed. `Option` (not `String` with
+/// `#[serde(default)]`) because a condition field can be present-but-`null`,
+/// not just absent — see `merge_conditions` in the apiserver, which can
+/// persist a literal `null` reason on first write.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PodConditionView {
@@ -265,6 +266,7 @@ struct PodConditionView {
     condition_type: Option<String>,
     status: Option<String>,
     reason: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -539,7 +541,9 @@ pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
 
 /// Build the `status.conditions` PATCH for a pod that just failed a
 /// scheduling attempt (no node fit, even after preemption, or the bind
-/// itself failed).
+/// itself failed) — `None` when `event` (the watch event that triggered
+/// this scheduling attempt) already shows this exact
+/// False/Unschedulable/`message` condition.
 ///
 /// Mirrors upstream kube-scheduler, which patches `PodScheduled=False` with
 /// reason `Unschedulable` on EVERY failed scheduling cycle, not just the
@@ -547,10 +551,30 @@ pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
 /// `status.conditions` stays frozen at the pod-creation-time default
 /// forever, so anything polling for `{type: PodScheduled, reason:
 /// Unschedulable}` (some conformance waits do exactly this) can never
-/// observe the failure — and no self-generated MODIFIED event exists for it
-/// either, since a status-only PATCH is the only thing that produces one.
-pub fn failed_scheduling_status_patch(message: &str) -> Value {
-    serde_json::json!({
+/// observe the failure.
+///
+/// The idempotency check is load-bearing, not cosmetic: a status PATCH
+/// echoes back through the watch as a fresh MODIFIED event for the same
+/// still-unscheduled pod, which re-enters `needs_scheduling` and retries
+/// scheduling immediately — repeating this PATCH unconditionally on a pod
+/// that keeps failing with the SAME message every attempt (e.g. a
+/// permanently-unsatisfiable nodeSelector) would fire a tight, unbounded
+/// self-retrigger loop hammering the apiserver, rather than settling once
+/// the message stops changing. Mirrors `scheduling_gate_status_patch`'s
+/// identical guard for the identical reason.
+pub fn failed_scheduling_status_patch(event: &Value, message: &str) -> Option<Value> {
+    if let Ok(watch_event) = serde_json::from_value::<WatchEvent<PodObject>>(event.clone()) {
+        let already_marked = watch_event.object.status.conditions.iter().any(|c| {
+            c.condition_type.as_deref() == Some(POD_SCHEDULED)
+                && c.status.as_deref() == Some("False")
+                && c.reason.as_deref() == Some(UNSCHEDULABLE_REASON)
+                && c.message.as_deref() == Some(message)
+        });
+        if already_marked {
+            return None;
+        }
+    }
+    Some(serde_json::json!({
         "status": {
             "conditions": [{
                 "type": POD_SCHEDULED,
@@ -559,7 +583,7 @@ pub fn failed_scheduling_status_patch(message: &str) -> Value {
                 "message": message,
             }]
         }
-    })
+    }))
 }
 
 /// Return `true` if a spawn for `key` ("namespace/name") should proceed.
@@ -2826,7 +2850,15 @@ mod tests {
         // polls status.conditions instead of watching Events (some
         // conformance waits do exactly that), so this must actually flip the
         // condition, not just log/emit.
-        let patch = failed_scheduling_status_patch("no node fits");
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "p", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let patch = failed_scheduling_status_patch(&event, "no node fits")
+            .expect("a pod with no matching condition yet must get one patched in");
         let cond = &patch["status"]["conditions"][0];
         assert_eq!(cond["type"], "PodScheduled");
         assert_eq!(cond["status"], "False");
@@ -2836,6 +2868,60 @@ mod tests {
              stamps this same reason on every failed scheduling cycle"
         );
         assert_eq!(cond["message"], "no node fits");
+    }
+
+    #[test]
+    fn failed_scheduling_status_patch_is_none_once_already_marked_with_same_message() {
+        // Load-bearing for a permanently-unschedulable pod (e.g. an
+        // impossible nodeSelector): this PATCH's own write echoes back
+        // through the watch as a fresh MODIFIED event, which re-enters
+        // needs_scheduling and retries scheduling immediately. Reproduced
+        // live: patching unconditionally on every retry fired an unbounded
+        // tight self-retrigger loop (hundreds of PATCH/watch round trips per
+        // second) instead of settling once the failure message stopped
+        // changing — this idempotency check is what breaks that loop.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "p", "namespace": "default" },
+                "spec": {},
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "no node fits"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            failed_scheduling_status_patch(&event, "no node fits").is_none(),
+            "an identical repeat failure must not re-issue the PATCH, or the pod's own \
+             watch echo retriggers scheduling in a tight, unbounded loop"
+        );
+    }
+
+    #[test]
+    fn failed_scheduling_status_patch_fires_again_when_message_changes() {
+        // A pod's failure reason CAN legitimately change between attempts
+        // (e.g. NoCapacity this tick, a different node's resource shortfall
+        // next tick) — the idempotency guard must only suppress an EXACT
+        // repeat, never mask a genuinely new failure reason from
+        // kubectl describe pod.
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "p", "namespace": "default" },
+                "spec": {},
+                "status": {
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "old reason"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            failed_scheduling_status_patch(&event, "new reason").is_some(),
+            "a changed failure message must still be patched in, not suppressed"
+        );
     }
 
     // pod_status_path / check_status_patch_response tests — mirror the
