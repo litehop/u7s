@@ -82,6 +82,18 @@ fn strategic_merge_patch_at(
             continue;
         }
 
+        // `$setElementOrder/<field>` communicates kubectl's desired full ordering for a
+        // registered merge-key list, and real kube-apiserver emits it on ANY diff to such
+        // a field during client-side three-way apply — not an edge case, routine traffic.
+        // It's a merge-time hint, never persisted upstream; storing it literally leaves a
+        // permanent garbage sibling key that survives every future GET, breaking
+        // fieldValidation=Strict and corrupting the client's next 3-way-apply diff.
+        // Skip it here (so it's never inserted) and reorder the already-merged array in
+        // the second pass below, once `field`'s own diff (if any) has been applied.
+        if key.starts_with("$setElementOrder/") {
+            continue;
+        }
+
         if value.is_null() {
             if key != "creationTimestamp" {
                 target_obj.remove(key);
@@ -138,7 +150,50 @@ fn strategic_merge_patch_at(
         }
     }
 
+    // Apply any `$setElementOrder/<field>` directives now that every field's own diff has
+    // been merged, so the reorder is computed from the final array contents. Only fields
+    // registered as merge-keyed lists are reordered — a directive for anything else has
+    // already been stripped above (never stored), matching how an unregistered array
+    // can't honor `$patch:delete` either: without a merge key there's no way to know which
+    // element the client meant by each ordering entry.
+    for (key, value) in patch_obj {
+        let Some(field) = key.strip_prefix("$setElementOrder/") else {
+            continue;
+        };
+        let Some(order_arr) = value.as_array() else {
+            continue;
+        };
+        let child_path = if path.is_empty() {
+            field.to_string()
+        } else {
+            format!("{path}.{field}")
+        };
+        if let MergeKeyKind::Key(merge_key) = merge_key_for_path(&child_path) {
+            if let Some(target_arr) = target_obj.get_mut(field).and_then(|v| v.as_array_mut()) {
+                apply_set_element_order(target_arr, order_arr, merge_key);
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Reorder `target_arr` (an already-merged array) to match the ordering `order_arr`
+/// requests, matching upstream's `$setElementOrder` semantics: elements whose merge-key
+/// value appears in `order_arr` are sorted into that order; elements the client didn't
+/// mention (e.g. added by another actor since the client's last read) keep their existing
+/// relative order and land after every ordered element (stable sort).
+fn apply_set_element_order(
+    target_arr: &mut [serde_json::Value],
+    order_arr: &[serde_json::Value],
+    merge_key: &str,
+) {
+    let order: Vec<Option<&serde_json::Value>> =
+        order_arr.iter().map(|v| v.get(merge_key)).collect();
+    target_arr.sort_by_key(|elem| {
+        let k = elem.get(merge_key);
+        order.iter().position(|o| *o == k).unwrap_or(usize::MAX)
+    });
 }
 
 /// Merge patch array into target array using `merge_key`.
@@ -1287,6 +1342,107 @@ mod tests {
             port443.unwrap()["targetPort"],
             8443,
             "port 443 targetPort must be unchanged"
+        );
+    }
+
+    /// Real kubectl (client-side three-way apply) emits `$setElementOrder/<field>`
+    /// alongside ANY diff to a registered merge-key list — this is routine `kubectl apply`
+    /// traffic for every resource with a merge-keyed list field, not a Pod-only edge case.
+    /// Before the generic strategic-merge-patch path handled it, the directive fell through
+    /// to plain object-key handling and was stored as a literal sibling of "ports" — a
+    /// permanent garbage key that breaks fieldValidation=Strict and corrupts the client's
+    /// next 3-way-apply diff (its own last-applied-configuration no longer matches a clean
+    /// object).
+    #[test]
+    fn test_smp_set_element_order_on_service_ports_is_stripped_and_reorders() {
+        let mut target = serde_json::json!({
+            "spec": {
+                "ports": [
+                    {"port": 80, "protocol": "TCP", "targetPort": 8080},
+                    {"port": 443, "protocol": "TCP", "targetPort": 8443}
+                ]
+            }
+        });
+        // Second apply changing only targetPort on port 80 — kubectl also sends the full
+        // desired ordering as $setElementOrder/ports, here requesting 443 before 80.
+        let patch = serde_json::json!({
+            "spec": {
+                "ports": [
+                    {"port": 80, "protocol": "TCP", "targetPort": 9090}
+                ],
+                "$setElementOrder/ports": [
+                    {"port": 443},
+                    {"port": 80}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        assert!(
+            target["spec"].get("$setElementOrder/ports").is_none(),
+            "the $setElementOrder directive must never be persisted as a literal key — a \
+             client-side merge hint stored as data corrupts every future GET and 3-way diff"
+        );
+        let ports = target["spec"]["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 2, "both ports must survive the patch");
+        assert_eq!(
+            ports[0]["port"], 443,
+            "ports must be reordered to match $setElementOrder — 443 must come first"
+        );
+        assert_eq!(
+            ports[1]["port"], 80,
+            "ports must be reordered to match $setElementOrder — 80 must come second"
+        );
+        assert_eq!(
+            ports[1]["targetPort"], 9090,
+            "the real diff (targetPort) must still be applied even though the element moved"
+        );
+    }
+
+    /// Same directive, applied to a completely unrelated resource kind
+    /// (ValidatingWebhookConfiguration.webhooks) to prove the fix is general — it lives in
+    /// the shared strategic_merge_patch_at path keyed off merge_key_for_path's registry, not
+    /// hardcoded to Service or to any single field name.
+    #[test]
+    fn test_smp_set_element_order_on_validating_webhook_configuration_is_stripped_and_reorders() {
+        let mut target = serde_json::json!({
+            "webhooks": [
+                {"name": "a.example.com", "clientConfig": {"url": "https://a.example.com"}},
+                {"name": "b.example.com", "clientConfig": {"url": "https://b.example.com"}}
+            ]
+        });
+        let patch = serde_json::json!({
+            "webhooks": [
+                {"name": "a.example.com", "failurePolicy": "Fail"}
+            ],
+            "$setElementOrder/webhooks": [
+                {"name": "b.example.com"},
+                {"name": "a.example.com"}
+            ]
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        assert!(
+            target.get("$setElementOrder/webhooks").is_none(),
+            "the $setElementOrder directive must never be persisted as a literal top-level \
+             key on ValidatingWebhookConfiguration — every non-Pod resource with a merge-key \
+             list previously leaked this directive because only Pod/PodStatus stripped it"
+        );
+        let webhooks = target["webhooks"].as_array().unwrap();
+        assert_eq!(webhooks.len(), 2, "both webhooks must survive the patch");
+        assert_eq!(
+            webhooks[0]["name"], "b.example.com",
+            "webhooks must be reordered to match $setElementOrder — b must come first"
+        );
+        assert_eq!(
+            webhooks[1]["name"], "a.example.com",
+            "webhooks must be reordered to match $setElementOrder — a must come second"
+        );
+        assert_eq!(
+            webhooks[1]["failurePolicy"], "Fail",
+            "the real diff (failurePolicy) must still be applied even though the element moved"
         );
     }
 
