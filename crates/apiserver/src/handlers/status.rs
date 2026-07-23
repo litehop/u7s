@@ -3037,9 +3037,12 @@ mod tests {
             )
             .await
             .unwrap();
-        // Second write advances to rv=2 (simulates a concurrent writer).
+        // Second write advances to rv=2 (simulates a concurrent writer actually changing the
+        // object — the store now suppresses no-op writes, so the payload must genuinely differ
+        // from what's stored or the revision would correctly stay at rv1).
         let mut obj2 = obj.clone();
         obj2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        obj2["spec"]["drivers"] = serde_json::json!([{"name": "example-driver"}]);
         let rv2 = store
             .put(
                 key,
@@ -3233,9 +3236,11 @@ mod tests {
             )
             .await
             .unwrap();
-        // Advance the store to rv2 (peer writer succeeded).
+        // Advance the store to rv2 (peer writer succeeded with a genuine change — the store
+        // suppresses no-op writes, so disruptedPods must actually differ from the first write).
         let mut pdb2 = pdb.clone();
         pdb2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        pdb2["status"] = serde_json::json!({"disruptedPods": {"pod-a": "2024-01-01T00:00:00Z"}});
         let rv2 = store
             .put(
                 key,

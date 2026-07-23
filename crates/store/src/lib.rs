@@ -247,6 +247,16 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// Returns the new global revision on success.
     /// The store stamps `metadata.resourceVersion` in the stored value before persisting.
+    ///
+    /// No-op suppression: if a precondition above is satisfied AND the key already has a
+    /// stored value AND the new value is semantically identical to it (ignoring
+    /// `metadata.resourceVersion`), the store does not write, does not bump the revision, and
+    /// does not emit a watch event — it returns the existing revision as if the write
+    /// succeeded. This mirrors real kube-apiserver's etcd3 `GuaranteedUpdate` byte-equality
+    /// short-circuit and exists so routine, unchanged re-writes (e.g. kubelet's periodic
+    /// status re-PATCH of a steady pod) don't flood every watcher with phantom MODIFIED
+    /// events. A precondition violation is still reported as `RevisionMismatch` even when the
+    /// content would have been unchanged — the CAS check runs first.
     fn put(
         &self,
         key: &str,

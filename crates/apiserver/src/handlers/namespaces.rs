@@ -4840,9 +4840,11 @@ mod namespace_status_cas_tests {
             .put(key, Bytes::from(serde_json::to_vec(&ns).unwrap()), None)
             .await
             .unwrap();
-        // Advance the store to rv2 (simulate a concurrent writer).
+        // Advance the store to rv2 (simulate a concurrent writer making a genuine change — the
+        // store suppresses no-op writes, so status must actually differ from the first write).
         let mut ns2 = ns.clone();
         ns2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        ns2["status"] = serde_json::json!({"phase": "Active"});
         let rv2 = store
             .put(
                 key,
