@@ -18,8 +18,8 @@ use crate::{
     limit_range::parse_quantity,
     state::AppState,
     status::Status,
-    types::{Binding, Namespace, Object, ObjectMeta, PodSpec},
-    util::{content_type, extract_body, parse_resource_version},
+    types::{Binding, DeleteOptions, Namespace, Object, ObjectMeta, PodSpec},
+    util::{content_type, extract_body, parse_resource_version, secs_to_rfc3339},
 };
 
 #[derive(Deserialize)]
@@ -688,6 +688,38 @@ pub async fn replace_pod<S: Store>(
     Ok(Json(obj.body))
 }
 
+/// Legacy `?gracePeriodSeconds=` query-param form of the grace period, for clients that
+/// still send it on the URL instead of (or as well as) in the DeleteOptions body.
+#[derive(Deserialize)]
+pub struct GracePeriodQuery {
+    #[serde(rename = "gracePeriodSeconds")]
+    pub grace_period_seconds: Option<i64>,
+}
+
+/// Resolve the grace period a delete should actually use: an explicit request value (body
+/// DeleteOptions takes precedence over the query param) beats the pod's own
+/// spec.terminationGracePeriodSeconds, which beats the upstream default of 30s. Without this
+/// fallback chain, a plain `kubectl delete pod` (no explicit --grace-period) would stamp
+/// deletionGracePeriodSeconds=0 even though the pod's own spec says the kubelet needs up to
+/// 30s to shut its containers down gracefully.
+fn effective_grace_period_seconds(requested: Option<i64>, pod: &serde_json::Value) -> i64 {
+    requested
+        .or_else(|| pod["spec"]["terminationGracePeriodSeconds"].as_i64())
+        .unwrap_or(30)
+}
+
+/// Compute the RFC3339 timestamp `grace_period_seconds` in the future from now, for stamping
+/// `metadata.deletionTimestamp`. Kubelet/controllers use this value (not "now") to know how
+/// long they have before the apiserver expects a hard delete.
+fn deletion_timestamp_after_grace(grace_period_seconds: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    secs_to_rfc3339(now_secs + grace_period_seconds)
+}
+
 /// DELETE /api/v1/namespaces/{ns}/pods — collection delete with optional labelSelector.
 ///
 /// sonobuoy cleanup sends this to remove all pods it created in a namespace.
@@ -696,8 +728,20 @@ pub async fn delete_collection_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<super::generic::CollectionQuery>,
+    Query(grace_query): Query<GracePeriodQuery>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let requested_grace = delete_opts
+        .grace_period_seconds
+        .or(grace_query.grace_period_seconds);
     let prefix = list_prefix("pods", ns.as_str());
 
     let resp = state
@@ -736,8 +780,10 @@ pub async fn delete_collection_pods<S: Store>(
             let already_terminating = meta.deletion_timestamp.is_some();
             if !already_terminating || has_finalizers {
                 let mut updated = parsed;
+                let grace = effective_grace_period_seconds(requested_grace, &updated);
                 updated["metadata"]["deletionTimestamp"] =
-                    serde_json::Value::String(utc_now_rfc3339());
+                    serde_json::Value::String(deletion_timestamp_after_grace(grace));
+                updated["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
                 let current_gen = updated["metadata"]["generation"].as_i64().unwrap_or(1);
                 updated["metadata"]["generation"] = serde_json::json!(current_gen + 1);
                 let _ = state
@@ -765,8 +811,20 @@ pub async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
+    Query(grace_query): Query<GracePeriodQuery>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let requested_grace = delete_opts
+        .grace_period_seconds
+        .or(grace_query.grace_period_seconds);
 
     let key = object_key("pods", ns.as_str(), &name);
 
@@ -836,7 +894,10 @@ pub async fn delete_pod<S: Store>(
     // Setting deletionTimestamp is always a real mutation — Kubernetes increments
     // metadata.generation on every graceful delete so that controllers can detect
     // the transition via observedGeneration (pods.go:573 conformance test).
-    obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    let grace = effective_grace_period_seconds(requested_grace, &obj.body);
+    obj.body["metadata"]["deletionTimestamp"] =
+        serde_json::Value::String(deletion_timestamp_after_grace(grace));
+    obj.body["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
     let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
     obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
     let expected_rv = parse_resource_version(obj.resource_version())?;
@@ -9256,6 +9317,171 @@ mod handler_tests {
             "a pod already Terminating with no finalizers must be hard-deleted by \
              DeleteCollection — otherwise it lingers forever since nothing else removes it"
         );
+    }
+
+    /// An explicit `gracePeriodSeconds` in the DELETE body must push `deletionTimestamp`
+    /// into the future by that many seconds, and the value itself must be persisted as
+    /// `deletionGracePeriodSeconds` — otherwise the kubelet has no way to know how long it
+    /// has before the apiserver expects the pod gone, and controllers waiting on
+    /// deletionTimestamp treat a long-grace pod exactly like an already-due one.
+    ///
+    /// Fails on revert: stamping `deletionTimestamp` as bare `now()` (the pre-fix behavior)
+    /// would never match any of the `now+120s` candidate timestamps computed below.
+    #[tokio::test]
+    async fn delete_pod_with_explicit_grace_period_delays_deletion_timestamp() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/graceful-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "graceful-pod", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let grace = 120i64;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": grace
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/graceful-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("soft-deleted pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let ts = v["metadata"]["deletionTimestamp"]
+            .as_str()
+            .expect("deletionTimestamp must be set");
+        let candidates: Vec<String> = (before..=after)
+            .map(|s| crate::util::secs_to_rfc3339(s + grace))
+            .collect();
+        assert!(
+            candidates.contains(&ts.to_string()),
+            "deletionTimestamp {ts} must be now+{grace}s, not bare now — a client that asked \
+             for 120s of grace must get 120s, or its container is SIGKILLed before it can \
+             shut down cleanly"
+        );
+        assert_eq!(
+            v["metadata"]["deletionGracePeriodSeconds"], grace,
+            "deletionGracePeriodSeconds must be persisted so the kubelet/controllers know \
+             how long they have before a hard delete"
+        );
+    }
+
+    /// delete_collection_pods must apply the same gracePeriodSeconds handling as
+    /// single-pod delete_pod — a namespace-wide delete (e.g. `kubectl delete pods --all
+    /// --grace-period=N`) must not silently ignore the grace period just because it went
+    /// through the collection endpoint instead of the named-resource one.
+    #[tokio::test]
+    async fn delete_collection_pods_applies_grace_period_to_every_matched_pod() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key_a = "/registry/pods/default/pod-a";
+        let key_b = "/registry/pods/default/pod-b";
+        for (key, name) in [(key_a, "pod-a"), (key_b, "pod-b")] {
+            let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": name, "namespace": "default", "resourceVersion": "1" },
+                "spec": {},
+                "status": {}
+            });
+            store
+                .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+                .await
+                .unwrap();
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let grace = 45i64;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": grace
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let candidates: Vec<String> = (before..=after)
+            .map(|s| crate::util::secs_to_rfc3339(s + grace))
+            .collect();
+
+        for key in [key_a, key_b] {
+            let stored = store
+                .get(key)
+                .await
+                .unwrap()
+                .expect("soft-deleted pod must still exist");
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            let ts = v["metadata"]["deletionTimestamp"]
+                .as_str()
+                .expect("deletionTimestamp must be set");
+            assert!(
+                candidates.contains(&ts.to_string()),
+                "{key}: deletionTimestamp {ts} must be now+{grace}s — DeleteCollection must \
+                 not silently drop the caller's requested grace period for any matched pod"
+            );
+            assert_eq!(
+                v["metadata"]["deletionGracePeriodSeconds"], grace,
+                "{key}: deletionGracePeriodSeconds must be persisted for every pod in the \
+                 collection, not just the first one"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
