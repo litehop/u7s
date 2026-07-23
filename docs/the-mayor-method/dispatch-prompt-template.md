@@ -464,13 +464,23 @@ scripts/conformance/run-all.sh --vm lima-node-smoke --port 6444 --workdir ./temp
 ```
 
 **⚠️ NEVER dispatch a bare `run-all.sh` (no `--focus`, no `--stack-only`).** A bare
-invocation runs the FULL conformance suite, which at the current state runs to the
-6h timeout — a scout dispatched to investigate one thing will silently burn the
-whole budget on a full run. Every VM dispatch prompt MUST tell the worker to use
-EITHER `--stack-only` (investigate via kubectl / direct DB, no sonobuoy at all) OR
-`--focus <regex>` (run one targeted test), and to reserve any `--focus` run for a
-FINAL confirmation gate — never a bare full run unless a full run is explicitly the
-stated goal of the bead.
+invocation runs the FULL conformance suite (~2h at current state — faster than the old
+~6h, but still far too slow to iterate on, and a runaway burn if unintended). Every VM
+dispatch prompt MUST tell the worker to use EITHER `--stack-only` (investigate via
+kubectl / direct DB, no sonobuoy at all) OR `--focus <regex>` (run one targeted test),
+and to reserve any `--focus` run for a FINAL confirmation gate — never a bare full run
+unless a full run is explicitly the stated goal of the bead.
+
+**CRITICAL — a bare command is a trap even in a REPRODUCTION step.** When you write the
+worker's "reproduce the failure" or "verify the stack comes up" step, that command MUST
+itself carry `--stack-only` (or `--focus`). Observed 2026-07-22 (pgm5q.13): a brief's
+repro step said `run-all.sh --reset ... --verbose` with no `--stack-only`; on the broken
+code it aborted early (safe), but after the fix it sailed past bring-up straight into the
+full sonobuoy suite. The worker followed the brief literally. The lesson is on the
+brief-author: never hand a worker a bare `run-all.sh`, not even to "just watch it start."
+Consider having the worker echo back which run modes it will use before its first
+`run-all`. (`sonobuoy --quick` exists as a fast single-test cluster-liveness check,
+not wired into `run-all.sh` today — an option when you only need "is the cluster live".)
 
 - **`--stack-only`** — brings up steps 1–5 (build, apiserver, kubelet, KCM,
   scheduler) and SKIPS sonobuoy entirely. The stack is left running; the worker uses
