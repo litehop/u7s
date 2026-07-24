@@ -129,6 +129,7 @@ pub async fn core_list_resource<S: Store>(
             .map(|t| decode_continue(t, state.store.current_revision(), &state.continue_token_key))
             .transpose()?;
         let continue_key = continue_decoded.as_ref().map(|(k, _)| k.clone());
+        let list_start = std::time::Instant::now();
         let resp = state
             .store
             .list(
@@ -141,6 +142,12 @@ pub async fn core_list_resource<S: Store>(
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        tracing::debug!(
+            prefix = %prefix,
+            item_count = resp.items.len(),
+            elapsed_ms = list_start.elapsed().as_millis() as u64,
+            "list: query completed"
+        );
         let list_revision = continue_decoded.map(|(_, rv)| rv).unwrap_or(resp.revision);
         let mut items = Vec::with_capacity(resp.items.len());
         for obj in &resp.items {
@@ -154,6 +161,7 @@ pub async fn core_list_resource<S: Store>(
         } else {
             items
         };
+        tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
         // `kubectl get pods -A` sends the same Accept: application/json;as=Table;... header
         // as `kubectl get pods -n <ns>` (list_pods, which already handles this). Without this,

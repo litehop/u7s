@@ -7,7 +7,7 @@ use hyper::{Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
-use tracing::info;
+use tracing::{debug, info};
 use u7s_kubeconfig::HyperApiClient;
 
 // ---------------------------------------------------------------------------
@@ -1538,9 +1538,13 @@ fn select_and_reserve_node(
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
 ) -> Result<String, PickNodeError> {
+    let candidates = list.items.len();
     let mut tally_guard = tally.lock().expect("tally lock poisoned");
-    let node = select_node_with_capacity(list, pod, &tally_guard.usage_by_node())
-        .map_err(|_| PickNodeError::NoCapacity)?;
+    let node =
+        select_node_with_capacity(list, pod, &tally_guard.usage_by_node()).map_err(|_| {
+            debug!(pod = %pod.pod_name, candidates, "pick_node: no node had capacity");
+            PickNodeError::NoCapacity
+        })?;
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
@@ -1683,6 +1687,12 @@ pub async fn find_preemption_plan(
         if victims.is_empty() {
             continue;
         }
+        debug!(
+            pod = %pod.pod_name,
+            node = %node_name,
+            victims = victims.len(),
+            "find_preemption_plan: candidate evaluated"
+        );
         let is_cheaper = best
             .as_ref()
             .is_none_or(|(_, b)| victims.len() < b.victims.len());
@@ -1756,6 +1766,10 @@ fn verify_and_reserve_preemption(
     let still_fits = (capacity == 0 || remaining_pod_count < capacity)
         && resource_fits(&node.status.allocatable, &remaining_requests, &pod.requests);
     if !still_fits {
+        debug!(
+            node = %plan.node_name,
+            "find_preemption_plan: re-verification failed, capacity claimed concurrently"
+        );
         bail!(
             "no node still fits after preemption \
              (capacity may have been claimed concurrently)"
@@ -1849,7 +1863,10 @@ pub async fn bind_pod(
     let path = binding_path(namespace, pod_name);
     let payload = binding_payload(namespace, pod_name, node_name);
 
+    let start = std::time::Instant::now();
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, node = %node_name, elapsed_ms, "bind_pod: POST completed");
     check_bind_response(status.as_u16(), &body)?;
     info!("bound pod {namespace}/{pod_name} → node {node_name}");
     Ok(())
@@ -2021,7 +2038,10 @@ pub async fn emit_scheduling_event(
         event_type,
     );
     let path = events_path(namespace);
+    let start = std::time::Instant::now();
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, reason, elapsed_ms, "emit_scheduling_event: POST completed");
     if !status.is_success() {
         bail!("POST event failed with HTTP {status}: {body}");
     }
@@ -2079,7 +2099,10 @@ pub async fn delete_pod(
 ) -> anyhow::Result<()> {
     let path = delete_pod_path(namespace, pod_name);
     for _ in 0..2 {
+        let start = std::time::Instant::now();
         let (status, body) = http_delete(connector, server, &path).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
         check_delete_response(status.as_u16())
             .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     }
@@ -2121,7 +2144,10 @@ pub async fn patch_pod_status(
     patch: &Value,
 ) -> anyhow::Result<()> {
     let path = pod_status_path(namespace, pod_name);
+    let start = std::time::Instant::now();
     let (status, body) = http_patch_status(connector, server, &path, patch).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, elapsed_ms, "patch_pod_status: PATCH completed");
     check_status_patch_response(status.as_u16(), &body)
         .with_context(|| format!("patching status for {namespace}/{pod_name}"))
 }

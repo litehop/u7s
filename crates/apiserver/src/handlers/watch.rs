@@ -666,6 +666,7 @@ async fn watch_generic_impl<S: Store>(
             crate::state::MAX_WATCHES_PER_CLIENT
         ))
     })?;
+    tracing::debug!(username = %username, "watch: permit acquired");
     // _watch_permit is held for the duration of the watch stream and released when
     // this function returns (RAII drop).
 
@@ -891,6 +892,7 @@ async fn watch_generic_impl<S: Store>(
                                     // field-selector filter below — filtering the unconverted
                                     // body means a cross-version selector (e.g. v1's hostPort
                                     // against a v2-stored host/port CR) never matches anything.
+                                    let conversion_start = std::time::Instant::now();
                                     let mut parsed = match convert_watched_cr_object(
                                         &state_for_conversion,
                                         cr_fields.as_ref(),
@@ -898,7 +900,15 @@ async fn watch_generic_impl<S: Store>(
                                     )
                                     .await
                                     {
-                                        Ok(converted) => converted,
+                                        Ok(converted) => {
+                                            tracing::debug!(
+                                                prefix = %prefix,
+                                                key = %obj.key,
+                                                elapsed_ms = conversion_start.elapsed().as_millis() as u64,
+                                                "watch: CR conversion webhook call completed"
+                                            );
+                                            converted
+                                        }
                                         Err(e) => {
                                             tracing::warn!(
                                                 prefix = %prefix,
@@ -1012,6 +1022,7 @@ async fn watch_generic_impl<S: Store>(
                                 } else if let Some(body_bytes) = body {
                                     if let Ok(s) = std::str::from_utf8(body_bytes) {
                                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                            let conversion_start = std::time::Instant::now();
                                             match convert_watched_cr_object(
                                                 &state_for_conversion,
                                                 cr_fields.as_ref(),
@@ -1020,6 +1031,12 @@ async fn watch_generic_impl<S: Store>(
                                             .await
                                             {
                                                 Ok(converted) => {
+                                                    tracing::debug!(
+                                                        prefix = %prefix,
+                                                        key = %key,
+                                                        elapsed_ms = conversion_start.elapsed().as_millis() as u64,
+                                                        "watch: CR conversion webhook call completed"
+                                                    );
                                                     let matches = object_matches_label_selector(&converted, &label_selector)
                                                         && field_selector_matches(&converted);
                                                     // The object is gone either way; forget it so a

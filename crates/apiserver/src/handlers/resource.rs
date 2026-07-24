@@ -133,6 +133,7 @@ pub async fn list_resource<S: Store>(
         .map(|t| decode_continue(t, state.store.current_revision(), &state.continue_token_key))
         .transpose()?;
     let continue_key = continue_decoded.as_ref().map(|(k, _)| k.clone());
+    let list_start = std::time::Instant::now();
     let resp = state
         .store
         .list(
@@ -145,6 +146,12 @@ pub async fn list_resource<S: Store>(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    tracing::debug!(
+        prefix = %prefix,
+        item_count = resp.items.len(),
+        elapsed_ms = list_start.elapsed().as_millis() as u64,
+        "list: query completed"
+    );
     // First page (no continue token yet): the fresh store revision becomes the pin for
     // subsequent pages. Continuation page: reuse the pin decoded above, not the store's
     // current (possibly-advanced) revision.
@@ -174,6 +181,7 @@ pub async fn list_resource<S: Store>(
     } else {
         items
     };
+    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     if pom {
         let pom_items: Vec<serde_json::Value> = items
@@ -338,7 +346,14 @@ pub async fn create_resource<S: Store>(
     }
 
     let key = group_object_key(&group, &plural, None, &name);
+    let put_start = std::time::Instant::now();
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    tracing::debug!(
+        key = %key,
+        elapsed_ms = put_start.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        "create_resource: store.put call completed"
+    );
     let new_rv = match result {
         Ok(rv) => rv,
         Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
@@ -590,11 +605,18 @@ pub async fn replace_resource<S: Store>(
         return Ok(Json(obj.body).into_response());
     }
 
-    let new_rv = state
+    let put_start = std::time::Instant::now();
+    let put_result = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .await;
+    tracing::debug!(
+        key = %key,
+        elapsed_ms = put_start.elapsed().as_millis() as u64,
+        ok = put_result.is_ok(),
+        "replace_resource: store.put call completed"
+    );
+    let new_rv = put_result.map_err(|e| store_err(e, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
     if group == RBAC_GROUP {

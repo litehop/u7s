@@ -338,6 +338,7 @@ pub async fn list_pods<S: Store>(
         .field_selector
         .as_deref()
         .and_then(pod_store_field_selector);
+    let list_start = std::time::Instant::now();
     let resp = state
         .store
         .list(
@@ -349,6 +350,12 @@ pub async fn list_pods<S: Store>(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    tracing::debug!(
+        prefix = %prefix,
+        item_count = resp.items.len(),
+        elapsed_ms = list_start.elapsed().as_millis() as u64,
+        "list: query completed"
+    );
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
@@ -369,6 +376,7 @@ pub async fn list_pods<S: Store>(
     } else {
         items
     };
+    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     // Return Table format when as=Table;v=v1 is requested (v1beta1 was rejected above).
     if super::table::wants_table(accept) {

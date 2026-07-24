@@ -173,6 +173,11 @@ fn push_event_locked(
             // Update compaction horizon to the revision of the oldest remaining entry.
             if let Some(oldest) = guard.front() {
                 compaction_horizon.store(oldest.revision, Ordering::Relaxed);
+                tracing::debug!(
+                    new_horizon = oldest.revision,
+                    ring_len = guard.len(),
+                    "push_event_locked: ring buffer compacted"
+                );
             }
         }
     }
@@ -205,6 +210,11 @@ fn push_event_locked(
                 // of an O(n) linear scan over `by_key`.
                 if let Some((_, oldest_key)) = guard.by_revision.pop_first() {
                     guard.by_key.remove(&oldest_key);
+                    tracing::debug!(
+                        evicted_key = %oldest_key,
+                        cap = DELETION_LOG_CAP,
+                        "push_event_locked: deletion tombstone log evicted oldest entry"
+                    );
                 }
             }
         } else {
@@ -378,6 +388,7 @@ fn put_sync(
     if let Some((existing_revision, existing_value)) = &stored {
         if semantically_equal_ignoring_resource_version(&value, existing_value) {
             conn.execute_batch("ROLLBACK")?;
+            tracing::debug!(key, existing_revision, "put_sync: no-op write suppressed");
             return Ok((
                 *existing_revision,
                 Bytes::from(existing_value.clone()),
@@ -935,7 +946,8 @@ impl Store for SqliteStore {
         let ring = Arc::clone(&self.ring);
         let deletion_log = Arc::clone(&self.deletion_log);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
-        let revision = tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let (revision, is_noop, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let (revision, stamped_value, is_create, is_noop) =
                 put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
@@ -960,9 +972,17 @@ impl Store for SqliteStore {
                     }),
                 );
             }
-            Ok::<u64, StoreError>(revision)
+            Ok::<(u64, bool, bool), StoreError>((revision, is_noop, is_create))
         })
         .await??;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            key,
+            elapsed_ms,
+            is_noop,
+            is_create,
+            "store: write committed"
+        );
 
         Ok(revision)
     }
@@ -975,6 +995,7 @@ impl Store for SqliteStore {
         let ring = Arc::clone(&self.ring);
         let deletion_log = Arc::clone(&self.deletion_log);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let start = std::time::Instant::now();
         let (revision, last_value) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let (revision, last_value) =
@@ -997,6 +1018,8 @@ impl Store for SqliteStore {
             Ok::<(u64, Bytes), StoreError>((revision, last_value))
         })
         .await??;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::debug!(key, elapsed_ms, "store: delete committed");
 
         Ok((revision, last_value))
     }
@@ -1090,6 +1113,7 @@ impl Store for SqliteStore {
             from_revision,
             horizon,
             replayed_count = replayed.len(),
+            receiver_count = self.tx.receiver_count(),
             "watch: stream opened"
         );
 
@@ -1233,6 +1257,15 @@ impl Store for SqliteStore {
                         // would never deliver its DELETED event: the client would reconnect after
                         // a relist, open a new Watch at the current revision, and wait forever.
                         let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
+                        let recovered = current_horizon <= last_replayed;
+                        tracing::debug!(
+                            prefix = %prefix_owned,
+                            missed = n,
+                            last_replayed,
+                            current_horizon,
+                            recovered,
+                            "watch: lag detected, ring-buffer recovery attempted"
+                        );
                         if current_horizon > last_replayed {
                             // Use from_revision (the watcher's original start) rather than
                             // last_replayed as the lower bound for deletion_log replay.
