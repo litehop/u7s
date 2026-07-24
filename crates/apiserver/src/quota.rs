@@ -705,6 +705,14 @@ pub async fn check_resource_quota<S: Store>(
                         .map(|o| service_quota_units(o, quota_resource))
                         .unwrap_or(0);
                     if existing + incoming > hard_limit {
+                        tracing::debug!(
+                            quota = %quota_name,
+                            resource = %quota_resource,
+                            requested = incoming,
+                            used = existing,
+                            limit = %limit_str,
+                            "quota: request rejected — hard limit exceeded"
+                        );
                         return Err(Status::forbidden(format!(
                             "exceeded quota: {quota_name}, requested: \
                              {quota_resource}={incoming}, used: {existing}, \
@@ -727,6 +735,14 @@ pub async fn check_resource_quota<S: Store>(
                         };
                     let current = count_objects(state, namespace, count_group, count_plural).await;
                     if current >= hard_limit {
+                        tracing::debug!(
+                            quota = %quota_name,
+                            resource = %quota_resource,
+                            requested = 1,
+                            used = current,
+                            limit = %limit_str,
+                            "quota: request rejected — hard limit exceeded"
+                        );
                         return Err(Status::forbidden(format!(
                             "exceeded quota: {quota_name}, requested: {quota_resource}=1, \
                              used: {current}, limited: {hard_limit}"
@@ -764,6 +780,14 @@ pub async fn check_resource_quota<S: Store>(
                                 "bytes" => format_milli_bytes(incoming_milli),
                                 _ => format_milli_integer(incoming_milli),
                             };
+                            tracing::debug!(
+                                quota = %quota_name,
+                                resource = %quota_resource,
+                                requested = %req_str,
+                                used = %used_str,
+                                limit = %limit_str,
+                                "quota: request rejected — hard limit exceeded"
+                            );
                             return Err(Status::forbidden(format!(
                                 "exceeded quota: {quota_name}, requested: \
                                  {quota_resource}={req_str}, used: {used_str}, \

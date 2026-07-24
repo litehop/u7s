@@ -994,37 +994,48 @@ async fn call_webhook(
     let Ok(body) = serde_json::to_vec(review) else {
         return (None, false);
     };
+    let start = std::time::Instant::now();
     let send_result = client
         .post(url)
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await;
-    let resp = match send_result {
-        Ok(r) => r,
-        Err(e) => return (None, e.is_timeout()),
-    };
-    // Bounded read: treat oversized responses as a network failure so the
-    // caller can apply failurePolicy (Fail or Ignore). This prevents a
-    // compromised webhook from exhausting apiserver memory.
-    let mut buf = Vec::with_capacity(4096);
-    let mut resp = resp;
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > MAX_WEBHOOK_RESPONSE_BYTES {
-                    return (None, false);
+    let (response, timed_out) = match send_result {
+        Ok(mut resp) => {
+            // Bounded read: treat oversized responses as a network failure so the
+            // caller can apply failurePolicy (Fail or Ignore). This prevents a
+            // compromised webhook from exhausting apiserver memory.
+            let mut buf = Vec::with_capacity(4096);
+            let read = loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        buf.extend_from_slice(&chunk);
+                        if buf.len() > MAX_WEBHOOK_RESPONSE_BYTES {
+                            break None;
+                        }
+                    }
+                    Ok(None) => break Some(&buf),
+                    Err(_) => break None,
                 }
-            }
-            Ok(None) => break,
-            Err(_) => return (None, false),
+            };
+            let response = read.and_then(|buf| {
+                serde_json::from_slice::<AdmissionReview>(buf)
+                    .ok()
+                    .and_then(|r| r.response)
+            });
+            (response, false)
         }
-    }
-    let response = serde_json::from_slice::<AdmissionReview>(&buf)
-        .ok()
-        .and_then(|r| r.response);
-    (response, false)
+        Err(e) => (None, e.is_timeout()),
+    };
+    tracing::debug!(
+        url = %url,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        timed_out,
+        ok = response.is_some(),
+        "admission: webhook HTTP call completed"
+    );
+    (response, timed_out)
 }
 
 /// Apply a JSON Patch (base64-encoded) from a mutating webhook to the object.
@@ -2566,13 +2577,23 @@ pub async fn run_mutating_webhooks<S: Store>(
         return Ok(object);
     }
 
+    let start = std::time::Instant::now();
+
     // CEL-based MutatingAdmissionPolicy runs before the webhook chain (Kubernetes ordering).
     object = run_cel_mutating_policies(state, object, ctx).await;
 
     // Already-flattened, typed webhook entries — the cache holds the parsed form so
     // this never re-serializes/re-parses a config per request (see parse_webhook_entries).
     let all_webhooks = fetch_mutating_configs(state).await;
+    tracing::debug!(
+        webhook_count = all_webhooks.len(),
+        "admission: run_mutating_webhooks entry"
+    );
     if all_webhooks.is_empty() {
+        tracing::debug!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "admission: run_mutating_webhooks exit"
+        );
         return Ok(object);
     }
 
@@ -2596,6 +2617,10 @@ pub async fn run_mutating_webhooks<S: Store>(
         }
     }
 
+    tracing::debug!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "admission: run_mutating_webhooks exit"
+    );
     Ok(object)
 }
 
@@ -2964,9 +2989,15 @@ pub async fn run_validating_webhooks<S: Store>(
         return Ok(());
     }
 
+    let start = std::time::Instant::now();
+
     // Already-flattened, typed webhook entries — the cache holds the parsed form so
     // this never re-serializes/re-parses a config per request (see parse_webhook_entries).
     let all_webhooks = fetch_validating_configs(state).await;
+    tracing::debug!(
+        webhook_count = all_webhooks.len(),
+        "admission: run_validating_webhooks entry"
+    );
 
     for webhook in all_webhooks.iter() {
         // Check rule match.
@@ -3126,7 +3157,12 @@ pub async fn run_validating_webhooks<S: Store>(
     }
 
     // Run CEL-based ValidatingAdmissionPolicy enforcement.
-    run_validating_admission_policies(state, object, ctx).await
+    let result = run_validating_admission_policies(state, object, ctx).await;
+    tracing::debug!(
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "admission: run_validating_webhooks exit"
+    );
+    result
 }
 
 // ---------------------------------------------------------------------------

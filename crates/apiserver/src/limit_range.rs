@@ -352,6 +352,11 @@ pub async fn apply_limit_ranges<S: Store>(
         return Ok(body);
     }
 
+    let pod_name = body["metadata"]["name"]
+        .as_str()
+        .unwrap_or("<unknown>")
+        .to_string();
+
     // Process init containers and regular containers.
     let container_keys = ["initContainers", "containers"];
     for key in &container_keys {
@@ -361,8 +366,23 @@ pub async fn apply_limit_ranges<S: Store>(
                     .as_str()
                     .unwrap_or("<unknown>")
                     .to_string();
+                let before = container["resources"].clone();
                 inject_defaults(container, &items);
-                validate_container_resources(&name, container, &items)?;
+                if container["resources"] != before {
+                    tracing::debug!(
+                        pod_name = %pod_name,
+                        container = %name,
+                        "limit_range: defaults injected"
+                    );
+                }
+                if let Err(e) = validate_container_resources(&name, container, &items) {
+                    tracing::debug!(
+                        container = %name,
+                        err = %e.1.message,
+                        "limit_range: container rejected"
+                    );
+                    return Err(e);
+                }
             }
         }
     }
