@@ -321,8 +321,8 @@ pub struct PendingPod {
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
 pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
-    let watch_event: WatchEvent<PodObject> =
-        serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
+    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event)
+        .unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
             object: PodObject::default(),
         });
@@ -421,7 +421,7 @@ pub struct GatedStatusPatch {
 /// re-PATCHing on every reconcile tick, including the tick triggered by this
 /// function's own prior PATCH echoing back through the watch).
 pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
-    let watch_event: WatchEvent<PodObject> = serde_json::from_value(event.clone()).ok()?;
+    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event).ok()?;
     if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
         return None;
     }
@@ -499,7 +499,7 @@ pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
 /// entirely means this patch can only ever touch `reason`/`message`, never
 /// `status`, so it can never contradict a real bind outcome.
 pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
-    let watch_event: WatchEvent<PodObject> = serde_json::from_value(event.clone()).ok()?;
+    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event).ok()?;
     if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
         return None;
     }
@@ -939,9 +939,7 @@ impl NodeTally {
     /// replaying the same event twice — e.g. after a watch reconnect —
     /// is idempotent.
     pub fn apply_event(&mut self, event: &Value) {
-        let Ok(watch_event) =
-            serde_json::from_value::<WatchEvent<PreemptionPodListItem>>(event.clone())
-        else {
+        let Ok(watch_event) = WatchEvent::<PreemptionPodListItem>::deserialize(event) else {
             return;
         };
         let name = watch_event.object.metadata.name.unwrap_or_default();
