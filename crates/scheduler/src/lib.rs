@@ -1081,7 +1081,11 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
 /// — otherwise a pod requesting a GPU (say) could be bound to a node with no
 /// GPU, which the kubelet would then reject anyway (as the SchedulerPreemption
 /// conformance suite's synthetic `scheduling.k8s.io/foo` resource does today).
-fn resource_fits(
+///
+/// `pub` (not module-private) so `benches/predicates.rs` can call it directly
+/// — a criterion bench is a separate crate that only ever sees this crate's
+/// public API.
+pub fn resource_fits(
     allocatable: &NodeAllocatable,
     used: &ResourceRequests,
     requested: &ResourceRequests,

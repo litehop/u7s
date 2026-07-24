@@ -214,8 +214,12 @@ pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::statu
 }
 
 /// A single term in a label selector.
+///
+/// `pub` (not `pub(crate)`) so `benches/list_filter.rs` — a separate crate
+/// linked against the `u7s-apiserver` lib target — can construct terms
+/// directly to drive `apply_label_selector`.
 #[derive(Debug, PartialEq)]
-pub(crate) enum LabelSelectorTerm<'a> {
+pub enum LabelSelectorTerm<'a> {
     Equality { key: &'a str, value: &'a str },
     NotEquals { key: &'a str, value: &'a str },
     Exists { key: &'a str },
@@ -342,7 +346,11 @@ pub(crate) fn parse_label_selector(
 
 /// Filter `items` by label selector terms. Keeps only items where all terms match
 /// the object's `metadata.labels` map.
-pub(crate) fn apply_label_selector(
+///
+/// `pub` (not `pub(crate)`) so `benches/list_filter.rs` can call it directly
+/// — a criterion bench is a separate crate that only ever sees this crate's
+/// public API.
+pub fn apply_label_selector(
     items: Vec<serde_json::Value>,
     terms: &[LabelSelectorTerm<'_>],
 ) -> Vec<serde_json::Value> {
