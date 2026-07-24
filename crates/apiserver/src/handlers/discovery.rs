@@ -4644,6 +4644,10 @@ mod tests {
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
         }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
     }
 
     /// Regression test: before this fix, `build_aggregated_discovery` resolved every

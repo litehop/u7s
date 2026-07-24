@@ -9,6 +9,7 @@ pub mod defaults;
 pub mod discovery;
 pub mod generic;
 pub mod json_patch;
+pub mod metrics;
 pub mod namespaces;
 pub mod oidc;
 pub mod pods;

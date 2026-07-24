@@ -1057,6 +1057,10 @@ mod tests {
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
         }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
     }
 
     /// The common case this bead is about: with zero `APIService` objects ever registered
