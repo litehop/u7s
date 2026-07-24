@@ -147,9 +147,9 @@ impl QuotaAdmissionLocks {
 /// fetch functions fall back to the store, preserving existing test behaviour.
 pub struct AdmissionConfigCache {
     /// MutatingWebhookConfiguration `webhooks[]` entries, flattened across all configs.
-    pub mutating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
+    pub(crate) mutating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
     /// ValidatingWebhookConfiguration `webhooks[]` entries, flattened across all configs.
-    pub validating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
+    pub(crate) validating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
     /// MutatingAdmissionPolicy objects.
     pub mutating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
     /// ValidatingAdmissionPolicy objects.

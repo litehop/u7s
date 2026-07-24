@@ -1,11 +1,11 @@
-//! `Args` on its own so both the `u7s-apiserver` binary (`main.rs`) and the
-//! additive `lib.rs` (which needs `Args` to compile `tls.rs` — see `lib.rs`'s
-//! module comment) can each declare `mod args;` against the same source,
-//! instead of risking two copies of the struct drifting apart.
+//! `Args` on its own so both `lib.rs` (which needs it for `run`/`tls.rs`)
+//! and the thin `main.rs` binary shell (which needs it to call
+//! `Args::parse()`) can share the same definition via `lib.rs`'s
+//! `pub use args::Args;` re-export.
 use clap::Parser;
 
 #[derive(Parser)]
-pub(crate) struct Args {
+pub struct Args {
     #[arg(long, default_value = "./state.db")]
     pub(crate) db: String,
 
