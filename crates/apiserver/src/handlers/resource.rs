@@ -255,7 +255,7 @@ pub async fn get_resource<S: Store>(
     Ok(Json(obj).into_response())
 }
 
-pub async fn create_resource<S: Store>(
+pub(crate) async fn create_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(create_query): Query<CreateQuery>,
@@ -398,7 +398,7 @@ pub async fn create_resource<S: Store>(
     Ok(resp)
 }
 
-pub async fn replace_resource<S: Store>(
+pub(crate) async fn replace_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(replace_query): Query<ReplaceQuery>,
@@ -1222,7 +1222,7 @@ pub(crate) async fn do_patch<S: Store>(
     }
 }
 
-pub async fn patch_resource<S: Store>(
+pub(crate) async fn patch_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
@@ -1499,7 +1499,7 @@ pub async fn get_namespaced_resource<S: Store>(
     Ok(Json(obj).into_response())
 }
 
-pub async fn create_namespaced_resource<S: Store>(
+pub(crate) async fn create_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(create_query): Query<CreateQuery>,
@@ -1794,7 +1794,7 @@ async fn propagate_rs_revision_to_deployment<S: Store>(
     }
 }
 
-pub async fn replace_namespaced_resource<S: Store>(
+pub(crate) async fn replace_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Query(replace_query): Query<ReplaceQuery>,
@@ -2320,7 +2320,7 @@ pub async fn delete_namespaced_resource<S: Store>(
     .into_response())
 }
 
-pub async fn patch_namespaced_resource<S: Store>(
+pub(crate) async fn patch_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
@@ -2393,7 +2393,7 @@ pub async fn patch_namespaced_resource<S: Store>(
 /// Applies the same patch body to every matched resource in the namespace.
 /// The conformance test "should list, patch and delete a collection of StatefulSets"
 /// uses this endpoint to batch-update a StatefulSet's image via labelSelector.
-pub async fn patch_collection_namespaced_resource<S: Store>(
+pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,

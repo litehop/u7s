@@ -208,7 +208,7 @@ pub async fn core_get_resource<S: Store>(
     .await
 }
 
-pub async fn core_create_resource<S: Store>(
+pub(crate) async fn core_create_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path(plural): Path<String>,
     Query(create_query): Query<CreateQuery>,
@@ -227,7 +227,7 @@ pub async fn core_create_resource<S: Store>(
     .await
 }
 
-pub async fn core_replace_resource<S: Store>(
+pub(crate) async fn core_replace_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     Query(replace_query): Query<ReplaceQuery>,
@@ -263,7 +263,7 @@ pub async fn core_delete_resource<S: Store>(
     .await
 }
 
-pub async fn core_patch_resource<S: Store>(
+pub(crate) async fn core_patch_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     Query(patch_query): Query<PatchQuery>,
@@ -364,7 +364,7 @@ pub async fn core_get_namespaced_resource<S: Store>(
     .await
 }
 
-pub async fn core_create_namespaced_resource<S: Store>(
+pub(crate) async fn core_create_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural)): Path<(String, String)>,
     Query(create_query): Query<CreateQuery>,
@@ -383,7 +383,7 @@ pub async fn core_create_namespaced_resource<S: Store>(
     .await
 }
 
-pub async fn core_replace_namespaced_resource<S: Store>(
+pub(crate) async fn core_replace_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     Query(replace_query): Query<ReplaceQuery>,
@@ -434,7 +434,7 @@ pub async fn core_delete_collection_namespaced_resource<S: Store>(
     .await
 }
 
-pub async fn core_patch_namespaced_resource<S: Store>(
+pub(crate) async fn core_patch_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     Query(patch_query): Query<PatchQuery>,

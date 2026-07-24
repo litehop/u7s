@@ -393,7 +393,7 @@ pub async fn list_pods<S: Store>(
     Ok(Json(body).into_response())
 }
 
-pub async fn create_pod<S: Store>(
+pub(crate) async fn create_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(create_query): Query<super::json_patch::CreateQuery>,
@@ -965,7 +965,7 @@ pub async fn delete_pod<S: Store>(
     }
 }
 
-pub async fn patch_pod<S: Store>(
+pub(crate) async fn patch_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Query(patch_query): Query<super::json_patch::PatchQuery>,
