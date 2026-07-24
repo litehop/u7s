@@ -29,11 +29,13 @@ pub static WATCH_BROADCAST_LAGGED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
 
 /// Total watch streams closed, broken out by reason.
 ///
-/// This crate can only observe one closure reason directly: `store_closed`, when the shared
-/// broadcast sender is torn down (store shutdown) and every subscriber gets
-/// `RecvError::Closed`. The apiserver crate increments the same counter for the reasons it
-/// alone can see (`timeout`, `compacted`, `client_limit_exceeded`) — both crates share this
-/// definition so `u7s_watch_closed_total` is one metric with all reasons, not two.
+/// All three reasons (`timeout`, `compacted`, `client_limit_exceeded`) are observed and
+/// incremented by the apiserver crate; this crate only defines and registers the metric so
+/// both crates share one `u7s_watch_closed_total` series instead of two independently
+/// registered ones. This crate does not increment it itself: a live watch stream's `Receiver`
+/// always shares a channel with a `Sender` clone that stream holds for its own entire
+/// lifetime (see `watch()`'s `RecvError::Closed` match arm), so a store shutting down can never
+/// be observed as a distinct "closed" reason from in here.
 pub static WATCH_CLOSED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -49,20 +51,20 @@ pub static WATCH_CLOSED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
-/// Pre-populate `u7s_watch_closed_total` with all four known `reason` values at zero.
+/// Pre-populate `u7s_watch_closed_total` with all three known `reason` values at zero.
 ///
 /// `reason` is a small, fixed set (unlike `u7s_watch_broadcast_lagged_total`'s open-ended
 /// `prefix`, which cannot be usefully pre-populated), so doing this is both possible and
 /// correct Prometheus practice: without it, a freshly started process that hasn't yet had a
 /// watch close for a given reason would omit that series entirely, which looks identical to
 /// "this metric doesn't exist" to a scraper or alerting rule — indistinguishable from zero.
+///
+/// `store_closed` is deliberately not in this list: it would prime a label that can never be
+/// incremented (see `WATCH_CLOSED_TOTAL`'s doc), which is worse than omitting it outright — an
+/// operator would see a permanent zero and could mistake "this failure mode never happens" for
+/// "this failure mode is being checked for and is fine," when in truth it's never checked at all.
 pub fn prime_watch_closed_total() {
-    for reason in [
-        "timeout",
-        "compacted",
-        "store_closed",
-        "client_limit_exceeded",
-    ] {
+    for reason in ["timeout", "compacted", "client_limit_exceeded"] {
         WATCH_CLOSED_TOTAL.with_label_values(&[reason]).inc_by(0);
     }
 }
@@ -73,10 +75,10 @@ mod tests {
 
     /// Without priming, a Prometheus CounterVec with zero children is indistinguishable from
     /// an unregistered metric in gathered output — this test fails on revert because it checks
-    /// the *gathered* metric family, not just that `WATCH_CLOSED_TOTAL` compiles and has four
+    /// the *gathered* metric family, not just that `WATCH_CLOSED_TOTAL` compiles and has three
     /// label values reachable via `with_label_values`.
     #[test]
-    fn prime_watch_closed_total_makes_all_four_reasons_visible_in_gather() {
+    fn prime_watch_closed_total_makes_all_three_reasons_visible_in_gather() {
         prime_watch_closed_total();
 
         let families = prometheus::gather();
@@ -97,17 +99,22 @@ mod tests {
             .map(|l| l.value())
             .collect();
 
-        for reason in [
-            "timeout",
-            "compacted",
-            "store_closed",
-            "client_limit_exceeded",
-        ] {
+        for reason in ["timeout", "compacted", "client_limit_exceeded"] {
             assert!(
                 seen_reasons.contains(reason),
                 "priming must pre-populate reason={reason} at zero so it is visible before the \
                  first watch ever closes for that reason; seen reasons: {seen_reasons:?}"
             );
         }
+
+        // `store_closed` must stay un-primed: it is structurally unreachable (see
+        // WATCH_CLOSED_TOTAL's doc), so priming it at zero would look to an operator like a
+        // failure mode that is monitored and healthy, when it is actually never checked at all.
+        assert!(
+            !seen_reasons.contains("store_closed"),
+            "store_closed must never be primed — it can never be incremented, so a zero for it \
+             would misrepresent an unmonitored condition as a monitored-and-healthy one; seen \
+             reasons: {seen_reasons:?}"
+        );
     }
 }

@@ -1278,12 +1278,20 @@ impl Store for SqliteStore {
                         // Ring buffer covered the gap; continue watching from last_replayed.
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        // Sender dropped; stop stream.
-                        crate::metrics::WATCH_CLOSED_TOTAL
-                            .with_label_values(&["store_closed"])
-                            .inc();
-                        tracing::debug!(prefix = %prefix_owned, "watch: broadcast sender closed, stopping stream");
-                        return;
+                        // Structurally unreachable: `tx_clone` (captured above) lives inside
+                        // this same generator for as long as this `rx.recv()` call is being
+                        // polled, so this stream always holds at least one Sender handle of
+                        // its own. The broadcast channel's sender count can therefore never
+                        // reach zero from this stream's point of view — dropping the
+                        // originating `SqliteStore` only releases `SqliteStore::tx`, never the
+                        // clone this stream is holding. Kept as an exhaustive match arm rather
+                        // than deleted so a future change to `tx_clone`'s capture strategy that
+                        // defeats this invariant fails loudly instead of silently leaking watch
+                        // streams that poll a dead channel forever.
+                        unreachable!(
+                            "watch() retains its own broadcast Sender clone for this stream's \
+                             entire lifetime, so RecvError::Closed can never be observed here"
+                        )
                     }
                 }
             }
@@ -2392,8 +2400,7 @@ mod tests {
         );
     }
 
-    // -- watch metrics: u7s_watch_broadcast_receivers / u7s_watch_broadcast_lagged_total /
-    //    u7s_watch_closed_total{reason="store_closed"} --
+    // -- watch metrics: u7s_watch_broadcast_receivers / u7s_watch_broadcast_lagged_total --
 
     /// `watch_receiver_count` backs the `u7s_watch_broadcast_receivers` gauge — it must track
     /// the number of *currently open* watch streams, not just the number ever opened. Without
@@ -2480,14 +2487,44 @@ mod tests {
         );
     }
 
-    // NOTE: RecvError::Closed (and its u7s_watch_closed_total{reason="store_closed"} counter)
-    // could not be exercised with a regression test here: `watch()` captures its own clone of
-    // `tx` (`tx_clone`, kept alive for lag-recovery re-subscription) inside the returned
-    // stream, so a live stream always holds at least one Sender handle and can never observe
-    // its *own* channel as closed — dropping the originating `SqliteStore` alone leaves the
-    // stream's `tx_clone` keeping the channel open indefinitely. This looks like a pre-existing
-    // architectural property (not introduced by this change) that likely makes the
-    // `RecvError::Closed` branch unreachable in production too; flagged for follow-up rather
-    // than fixed here, since changing `watch()`'s capture behavior is out of scope for adding
-    // metrics.
+    /// Dropping the store that created a watch stream must not end that stream: `watch()`
+    /// captures its own broadcast `Sender` clone (`tx_clone`, used for lag-recovery
+    /// re-subscription) for the entire lifetime of the returned stream, so the channel's
+    /// sender count can never reach zero while this same stream is the one polling
+    /// `rx.recv()`. This pins down the invariant the `RecvError::Closed` match arm's
+    /// `unreachable!()` relies on: if a future change to `tx_clone`'s capture strategy ever
+    /// broke it, a real store shutdown would either panic every open watch task (loud, this
+    /// test would start failing by panicking instead of timing out) or — if `unreachable!()`
+    /// were also reverted back to a plain `return` — silently end every open watch stream
+    /// clients still expect events from, instead of leaving them correctly pending forever
+    /// (the actual behavior for as long as the apiserver process is alive).
+    #[tokio::test]
+    async fn watch_stream_stays_pending_after_originating_store_is_dropped() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let stream = store
+            .watch("/registry/pods/", 0)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // Drop the only handle to the store, including its own `tx` broadcast::Sender field.
+        // The returned stream holds no reference back into `store` (its 'static bound
+        // requires that), so this compiles — and is exactly what makes this a meaningful test:
+        // it isolates whether losing the store's OWN Sender handle closes a stream opened
+        // before the drop.
+        drop(store);
+
+        // If `tx_clone` did not exist (or were dropped along with the store), the next
+        // rx.recv() would return RecvError::Closed and the stream would resolve — to `None`
+        // before this fix, or by panicking inside `unreachable!()` after it — well within this
+        // window instead of staying pending.
+        let outcome = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        assert!(
+            outcome.is_err(),
+            "a watch stream must remain pending after its originating store is dropped — \
+             resolving here means the channel was observed as closed, which should be \
+             structurally impossible while this stream holds its own Sender clone; got: \
+             {outcome:?}"
+        );
+    }
 }
