@@ -4271,6 +4271,10 @@ mod tests {
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
         }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
     }
 
     /// Regression: a pod created in the window between cascade_delete_namespace_resources's

@@ -1196,8 +1196,11 @@ impl Store for SqliteStore {
                         // always sees a stale RV and requeues indefinitely.
                         yield WatchEvent::Bookmark { revision: last_replayed };
                     }
-                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         // The broadcast channel dropped messages because this receiver was too slow.
+                        crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+                            .with_label_values(&[&prefix_owned])
+                            .inc_by(n);
                         // Attempt recovery: re-subscribe (to capture all future events) then
                         // re-scan the ring buffer for events missed during the lag.  This avoids
                         // terminating the stream with a 410 error for a transient slow-consumer
@@ -1276,6 +1279,9 @@ impl Store for SqliteStore {
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Sender dropped; stop stream.
+                        crate::metrics::WATCH_CLOSED_TOTAL
+                            .with_label_values(&["store_closed"])
+                            .inc();
                         tracing::debug!(prefix = %prefix_owned, "watch: broadcast sender closed, stopping stream");
                         return;
                     }
@@ -1292,6 +1298,10 @@ impl Store for SqliteStore {
 
     fn current_revision(&self) -> u64 {
         self.last_written_revision.load(Ordering::Acquire)
+    }
+
+    fn watch_receiver_count(&self) -> usize {
+        self.tx.receiver_count()
     }
 }
 
@@ -2381,4 +2391,103 @@ mod tests {
              optimistic-concurrency conflict, got: {result:?}"
         );
     }
+
+    // -- watch metrics: u7s_watch_broadcast_receivers / u7s_watch_broadcast_lagged_total /
+    //    u7s_watch_closed_total{reason="store_closed"} --
+
+    /// `watch_receiver_count` backs the `u7s_watch_broadcast_receivers` gauge — it must track
+    /// the number of *currently open* watch streams, not just the number ever opened. Without
+    /// this, an operator scraping /metrics could never tell "50 watches opened at startup and
+    /// still open" from "50 watches opened and long since closed", which is the whole point of
+    /// the gauge.
+    #[tokio::test]
+    async fn watch_receiver_count_reflects_open_streams_not_ever_opened() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        assert_eq!(
+            store.watch_receiver_count(),
+            0,
+            "a fresh store must report zero active watch receivers"
+        );
+
+        let stream_a = store.watch("/registry/pods/", 0).await.expect("watch a");
+        let stream_b = store.watch("/registry/pods/", 0).await.expect("watch b");
+        assert_eq!(
+            store.watch_receiver_count(),
+            2,
+            "two open watch streams must report receiver_count=2"
+        );
+
+        drop(stream_a);
+        assert_eq!(
+            store.watch_receiver_count(),
+            1,
+            "dropping one watch stream must decrement receiver_count back to 1 — a gauge that \
+             only ever grows would tell an operator every watch that ever connected is still \
+             open, hiding leaked or already-closed watchers"
+        );
+
+        drop(stream_b);
+        assert_eq!(
+            store.watch_receiver_count(),
+            0,
+            "dropping the last watch stream must bring receiver_count back to zero"
+        );
+    }
+
+    /// A real `RecvError::Lagged(n)` must add exactly `n` to
+    /// `u7s_watch_broadcast_lagged_total{prefix}` — this is the currently-discarded `_n` that
+    /// motivated the metric: without counting it, an operator has no way to see that a watcher
+    /// fell behind and silently missed events (recovered via ring-buffer catchup or a 410, but
+    /// only after the fact).
+    #[tokio::test]
+    async fn broadcast_lag_increments_lagged_total_by_exact_missed_count() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/lag-test-events/";
+
+        // Subscribe but do not poll the stream, so the receiver falls behind once the
+        // broadcast channel fills past its capacity.
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[prefix])
+            .get();
+
+        // Write one more than the broadcast capacity so the unpolled subscriber is guaranteed
+        // to have missed at least one message once it is finally polled.
+        let writes = BROADCAST_CAPACITY as u64 + 1;
+        for i in 0..writes {
+            let key = format!("{prefix}obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+
+        // Draining the ring buffer is not enough to observe Lagged — the ring buffer only
+        // holds RING_CAPACITY entries, but the broadcast channel itself dropped messages for
+        // this specific unpolled receiver once BROADCAST_CAPACITY was exceeded. Poll once to
+        // surface the Lagged error the receiver accumulated while unread.
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[prefix])
+            .get();
+        assert!(
+            after > before,
+            "a receiver that missed more than BROADCAST_CAPACITY messages must increment \
+             u7s_watch_broadcast_lagged_total for its prefix once polled; before={before} after={after}"
+        );
+    }
+
+    // NOTE: RecvError::Closed (and its u7s_watch_closed_total{reason="store_closed"} counter)
+    // could not be exercised with a regression test here: `watch()` captures its own clone of
+    // `tx` (`tx_clone`, kept alive for lag-recovery re-subscription) inside the returned
+    // stream, so a live stream always holds at least one Sender handle and can never observe
+    // its *own* channel as closed — dropping the originating `SqliteStore` alone leaves the
+    // stream's `tx_clone` keeping the channel open indefinitely. This looks like a pre-existing
+    // architectural property (not introduced by this change) that likely makes the
+    // `RecvError::Closed` branch unreachable in production too; flagged for follow-up rather
+    // than fixed here, since changing `watch()`'s capture behavior is out of scope for adding
+    // metrics.
 }

@@ -2015,6 +2015,10 @@ mod tests {
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
         }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
     }
 
     /// put_resource_status returns 409 Conflict when the store rejects the write

@@ -17,6 +17,7 @@ mod handlers;
 mod inflight;
 mod keys;
 mod limit_range;
+mod metrics;
 mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod patch;
@@ -411,6 +412,11 @@ fn build_router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/livez", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ok" }))
+        // Prometheus text-exposition metrics — RBAC-gated like every other route (NOT listed
+        // in auth::is_exempt), matching upstream kube-apiserver where /metrics requires the
+        // same bearer-token auth as any other endpoint. The bootstrap system:monitoring
+        // ClusterRole already grants nonResourceURLs access to it.
+        .route("/metrics", get(handlers::metrics::metrics))
         // Server version — no auth required (sonobuoy, kubectl version)
         .route("/version", get(handlers::discovery::version))
         // OIDC SA issuer discovery — RBAC-gated via system:service-account-issuer-discovery ClusterRole

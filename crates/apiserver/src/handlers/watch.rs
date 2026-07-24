@@ -553,6 +553,81 @@ fn should_emit_synthetic_delete(is_modified: bool, now_matches: bool, ever_match
     is_modified && !now_matches && ever_matched
 }
 
+/// Derive the RBAC/metrics `version` label from a watch's wire-format `apiVersion`
+/// ("v1" for core, "apps/v1" for grouped resources) — the last `/`-separated segment.
+///
+/// For PartialObjectMetadata watches `api_version` is overridden to "meta.k8s.io/v1" by the
+/// caller, so this yields "v1" rather than the CR's own requested version in that one case;
+/// acceptable for a metrics label, which only needs to be right in the common case.
+fn derive_watch_version(api_version: &str) -> &str {
+    api_version.rsplit('/').next().unwrap_or(api_version)
+}
+
+/// Derive the RBAC/metrics `scope` label ("cluster" or "namespace") from a watch's store
+/// prefix, mirroring upstream's `RequestInfo`-derived scope: it reflects whether the request
+/// URL named a specific namespace, not whether the resource type is namespaced. A prefix
+/// ending in exactly `/<plural>` (no trailing namespace segment) is either a cluster-scoped
+/// resource or a namespaced resource watched across all namespaces — both count as "cluster"
+/// scope upstream; anything with one more segment names a specific namespace.
+fn derive_watch_scope(prefix: &str, plural: &str) -> &'static str {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.ends_with(&format!("/{plural}")) {
+        "cluster"
+    } else {
+        "namespace"
+    }
+}
+
+/// RAII guard bracketing `apiserver_longrunning_requests{verb="watch",...}` for the real
+/// lifetime of an open watch stream — constructed inside the `async_stream::stream!` block
+/// below (not in the surrounding function) so its `Drop` fires only when the stream generator
+/// itself ends or is dropped (client disconnect, server timeout, or normal completion), not
+/// merely when `watch_generic_impl`'s synchronous setup returns.
+struct LongRunningWatchGuard {
+    group: String,
+    version: String,
+    resource: String,
+    scope: &'static str,
+}
+
+impl LongRunningWatchGuard {
+    fn new(group: String, version: String, resource: String, scope: &'static str) -> Self {
+        crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&[
+                "watch",
+                &group,
+                &version,
+                &resource,
+                "",
+                scope,
+                crate::metrics::COMPONENT,
+            ])
+            .inc();
+        Self {
+            group,
+            version,
+            resource,
+            scope,
+        }
+    }
+}
+
+impl Drop for LongRunningWatchGuard {
+    fn drop(&mut self) {
+        crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&[
+                "watch",
+                &self.group,
+                &self.version,
+                &self.resource,
+                "",
+                self.scope,
+                crate::metrics::COMPONENT,
+            ])
+            .dec();
+    }
+}
+
 async fn watch_generic_impl<S: Store>(
     state: AppState<S>,
     cfg: WatchConfig,
@@ -573,11 +648,19 @@ async fn watch_generic_impl<S: Store>(
         plural,
         timeout_seconds,
     } = cfg;
+    let watch_version = derive_watch_version(&api_version).to_string();
+    let watch_scope = derive_watch_scope(&prefix, &plural);
     // Enforce per-client watch concurrency limit. Try to acquire a permit from
     // this user's semaphore. If the semaphore is exhausted (client already has
     // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
     let sem = state.watch_limit.semaphore_for(&username);
     let _watch_permit = sem.try_acquire_owned().map_err(|_| {
+        crate::metrics::REQUEST_TOTAL
+            .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
+            .inc();
+        u7s_store::metrics::WATCH_CLOSED_TOTAL
+            .with_label_values(&["client_limit_exceeded"])
+            .inc();
         crate::status::Status::too_many_requests(format!(
             "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
             crate::state::MAX_WATCHES_PER_CLIENT
@@ -594,6 +677,9 @@ async fn watch_generic_impl<S: Store>(
     if from_revision > 0 && initial_items.is_none() {
         let horizon = state.store.compaction_horizon();
         if from_revision < horizon {
+            crate::metrics::REQUEST_TOTAL
+                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "410"])
+                .inc();
             return Err(Status::expired(format!(
                 "too old resource version: {from_revision} (current compaction horizon: {horizon})"
             )));
@@ -616,6 +702,13 @@ async fn watch_generic_impl<S: Store>(
         .watch(&prefix, watch_from_rv)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // From this point the watch is committed to opening — count it as a successful request
+    // now, matching upstream's counting of the initial HTTP response code for watch requests
+    // (the eventual stream-close reason is tracked separately by u7s_watch_closed_total).
+    crate::metrics::REQUEST_TOTAL
+        .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "200"])
+        .inc();
 
     // Keep the store alive for the entire watch stream lifetime.
     //
@@ -646,6 +739,11 @@ async fn watch_generic_impl<S: Store>(
         // is never dropped while we are waiting for live events.
         let _store_keepalive = _store_keepalive;
         let state_for_conversion = state_for_conversion;
+        // Brackets apiserver_longrunning_requests{verb="watch",...} for the stream's real
+        // lifetime — see LongRunningWatchGuard's doc for why it must be constructed here,
+        // inside the generator, rather than in the enclosing function.
+        let _longrunning_guard =
+            LongRunningWatchGuard::new(group.clone(), watch_version.clone(), plural.clone(), watch_scope);
 
         // For a CR watch with CRD-declared selectableFields, defer to the same CRD-aware
         // matcher LIST uses instead of the generic name/namespace/nodeName-only one, which
@@ -660,6 +758,14 @@ async fn watch_generic_impl<S: Store>(
                 ),
                 None => object_matches_field_selector(obj, &field_selector),
             }
+        };
+
+        // Counts every NDJSON line actually written to the client's HTTP body (events and
+        // bookmarks alike) — "an event was actually delivered", per apiserver_watch_events_total.
+        let record_watch_event = || {
+            crate::metrics::WATCH_EVENTS_TOTAL
+                .with_label_values(&[&group, &watch_version, &plural])
+                .inc();
         };
 
         let mut event_stream = pin!(event_stream);
@@ -717,8 +823,10 @@ async fn watch_generic_impl<S: Store>(
                     v["kind"] = serde_json::Value::String(kind.clone());
                     v
                 };
+                record_watch_event();
                 yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &emit));
             }
+            record_watch_event();
             yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
         }
 
@@ -764,6 +872,9 @@ async fn watch_generic_impl<S: Store>(
                                 let error_line = Bytes::from(format!(
                                     "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
                                 ));
+                                u7s_store::metrics::WATCH_CLOSED_TOTAL
+                                    .with_label_values(&["compacted"])
+                                    .inc();
                                 yield Ok::<Bytes, axum::BoxError>(error_line);
                                 break;
                             }
@@ -836,6 +947,7 @@ async fn watch_generic_impl<S: Store>(
                                             parsed["kind"] = serde_json::Value::String(kind.clone());
                                             parsed
                                         };
+                                        record_watch_event();
                                         yield Ok::<Bytes, axum::BoxError>(ndjson_event_value(event_type, &emit));
                                     } else {
                                         // The object doesn't match the selector after this event.
@@ -874,6 +986,7 @@ async fn watch_generic_impl<S: Store>(
                                                     }
                                                 })
                                             };
+                                            record_watch_event();
                                             yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
                                         }
                                     }
@@ -955,6 +1068,7 @@ async fn watch_generic_impl<S: Store>(
                                         body: emit_body,
                                     };
                                     if let Some(chunk) = encode_watch_event(&emit_event, &api_version, &kind, as_partial_object_metadata) {
+                                        record_watch_event();
                                         yield Ok::<Bytes, axum::BoxError>(chunk);
                                     } else {
                                         tracing::debug!(prefix = %prefix, key = %key, "watch: DELETED event dropped by encode_watch_event");
@@ -962,6 +1076,7 @@ async fn watch_generic_impl<S: Store>(
                                 }
                             } else if !matches!(&event, WatchEvent::Bookmark { .. }) || allow_watch_bookmarks {
                                 if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
+                                    record_watch_event();
                                     yield Ok::<Bytes, axum::BoxError>(chunk);
                                 }
                             }
@@ -978,14 +1093,19 @@ async fn watch_generic_impl<S: Store>(
                         // StatefulSet watch only sees StatefulSet events, so last_rv stays
                         // stale relative to pod writes — causing endless requeue loops.
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
+                        record_watch_event();
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
                 }
 
                 _ = &mut max_duration => {
                     tracing::debug!(prefix = %prefix, last_rv, stream_timeout_secs, "watch: max_duration elapsed, closing response body");
+                    u7s_store::metrics::WATCH_CLOSED_TOTAL
+                        .with_label_values(&["timeout"])
+                        .inc();
                     if allow_watch_bookmarks {
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
+                        record_watch_event();
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
                     break;
@@ -3986,6 +4106,304 @@ mod tests {
                 "watch-this-configmap in (multiple-watchers-A)"
             ),
             "a configmap without the watcher label must not match"
+        );
+    }
+
+    // -- watch metrics: apiserver_longrunning_requests / apiserver_watch_events_total /
+    //    apiserver_request_total / u7s_watch_closed_total{client_limit_exceeded} --
+
+    /// derive_watch_version must extract just the version, not the group, for both core
+    /// (no group prefix) and grouped apiVersions — a wrong version label would silently merge
+    /// unrelated resource types' watch metrics under the wrong series.
+    #[test]
+    fn derive_watch_version_strips_group_prefix() {
+        assert_eq!(
+            derive_watch_version("v1"),
+            "v1",
+            "a core apiVersion (no '/') must be used as-is"
+        );
+        assert_eq!(
+            derive_watch_version("apps/v1"),
+            "v1",
+            "a grouped apiVersion must report only the version segment, matching upstream's \
+             apiserver_longrunning_requests `version` label semantics"
+        );
+    }
+
+    /// derive_watch_scope must classify by whether the request named a specific namespace, not
+    /// by whether the resource type is namespaced — mirroring upstream's RequestInfo-derived
+    /// `scope` label. A namespaced resource watched across all namespaces is still "cluster"
+    /// scope; only a namespace-suffixed prefix is "namespace" scope.
+    #[test]
+    fn derive_watch_scope_distinguishes_all_namespaces_from_one_namespace() {
+        assert_eq!(
+            derive_watch_scope("/registry/pods/", "pods"),
+            "cluster",
+            "watching a namespaced resource across all namespaces must report scope=cluster, \
+             matching upstream semantics where scope reflects the request URL, not the resource \
+             type's namespacing"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/pods/default/", "pods"),
+            "namespace",
+            "watching pods in one namespace must report scope=namespace"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/apps/deployments/", "deployments"),
+            "cluster",
+            "a grouped resource watched across all namespaces must also report scope=cluster"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/apps/deployments/default/", "deployments"),
+            "namespace",
+            "a grouped resource watched in one namespace must report scope=namespace"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/nodes/", "nodes"),
+            "cluster",
+            "a genuinely cluster-scoped resource (no namespace concept at all) must also \
+             report scope=cluster"
+        );
+    }
+
+    /// Opening a watch must increment apiserver_longrunning_requests{verb="watch",...} for the
+    /// real duration the stream is open, and dropping the stream (client disconnect, in this
+    /// test) must decrement it back down — the whole point of the gauge is to answer "how many
+    /// watches are open right now", which is wrong if it only ever grows or never grows at all.
+    #[tokio::test]
+    async fn watch_open_and_drop_brackets_longrunning_gauge() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Unique label values so concurrently-running tests in this same binary cannot
+        // perturb this test's before/after comparison for this exact label combination.
+        let group = "u7s-test-metrics-group";
+        let plural = "u7s-test-metrics-longrunning-resources";
+        let label_values = [
+            "watch",
+            group,
+            "v1",
+            plural,
+            "",
+            "cluster",
+            crate::metrics::COMPONENT,
+        ];
+        let before = crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&label_values)
+            .get();
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: format!("/registry/{group}/{plural}/"),
+                api_version: "v1".into(),
+                kind: "Widget".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "longrunning-gauge-test-user".into(),
+                as_partial_object_metadata: false,
+                group: group.into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        use futures_util::StreamExt;
+        let mut body = resp.into_body().into_data_stream();
+        // Drive the stream generator's first poll (up to its first suspension point), which
+        // runs the guard construction synchronously before any await completes.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), body.next()).await;
+
+        let during = crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            during,
+            before + 1,
+            "opening a watch must increment apiserver_longrunning_requests{{verb=\"watch\"}}"
+        );
+
+        drop(body);
+
+        let after = crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            after, before,
+            "dropping the watch stream must decrement apiserver_longrunning_requests back down; \
+             a gauge that never decrements would falsely report every watch ever opened as \
+             still active"
+        );
+    }
+
+    /// The (MAX_WATCHES_PER_CLIENT + 1)th watch from the same user must count as a 429 request
+    /// and a client_limit_exceeded closure — operators need to see rejected watch attempts in
+    /// apiserver_request_total and u7s_watch_closed_total just as much as successful ones,
+    /// otherwise a client stuck retrying against the per-user limit is invisible in metrics.
+    #[tokio::test]
+    async fn watch_limit_429_increments_request_total_and_closed_total() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let username = "watch-429-metrics-test-user";
+        let group = "u7s-test-metrics-429-group";
+        let plural = "u7s-test-metrics-429-resources";
+
+        let sem = state.watch_limit.semaphore_for(username);
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem.clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        let request_total_before = crate::metrics::REQUEST_TOTAL
+            .with_label_values(&["watch", group, "v1", plural, "cluster", "429"])
+            .get();
+        let closed_total_before = u7s_store::metrics::WATCH_CLOSED_TOTAL
+            .with_label_values(&["client_limit_exceeded"])
+            .get();
+
+        let result = watch_generic(
+            state.clone(),
+            WatchConfig {
+                prefix: format!("/registry/{group}/{plural}/"),
+                api_version: "v1".into(),
+                kind: "Widget".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: username.into(),
+                as_partial_object_metadata: false,
+                group: group.into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await;
+        assert!(result.is_err(), "the 429th watch attempt must be rejected");
+
+        let request_total_after = crate::metrics::REQUEST_TOTAL
+            .with_label_values(&["watch", group, "v1", plural, "cluster", "429"])
+            .get();
+        assert_eq!(
+            request_total_after,
+            request_total_before + 1,
+            "a 429 watch rejection must be counted in apiserver_request_total{{code=\"429\"}}"
+        );
+
+        let closed_total_after = u7s_store::metrics::WATCH_CLOSED_TOTAL
+            .with_label_values(&["client_limit_exceeded"])
+            .get();
+        assert_eq!(
+            closed_total_after,
+            closed_total_before + 1,
+            "a 429 watch rejection must be counted in \
+             u7s_watch_closed_total{{reason=\"client_limit_exceeded\"}}"
+        );
+    }
+
+    /// Every ADDED item and the terminating BOOKMARK sent during sendInitialEvents must be
+    /// counted in apiserver_watch_events_total — this is the "an event was actually written to
+    /// the client's HTTP body" signal, and sendInitialEvents is the simplest, fully
+    /// deterministic path to exercise it (no timing dependency on live broadcast delivery).
+    #[tokio::test]
+    async fn send_initial_events_increments_watch_events_total_per_item_and_bookmark() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "u7s-test-metrics-events-group";
+        let plural = "u7s-test-metrics-events-resources";
+        let label_values = [group, "v1", plural];
+        let before = crate::metrics::WATCH_EVENTS_TOTAL
+            .with_label_values(&label_values)
+            .get();
+
+        let items = vec![
+            serde_json::json!({"metadata": {"name": "a", "namespace": "default"}}),
+            serde_json::json!({"metadata": {"name": "b", "namespace": "default"}}),
+        ];
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: format!("/registry/{group}/{plural}/"),
+                api_version: "v1".into(),
+                kind: "Widget".into(),
+                from_revision: 0,
+                initial_items: Some((items, 5)),
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "watch-events-metrics-test-user".into(),
+                as_partial_object_metadata: false,
+                group: group.into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        use futures_util::StreamExt;
+        let mut body = resp.into_body().into_data_stream();
+        // Drain exactly the 2 ADDED items + 1 initial-events-end BOOKMARK; sendInitialEvents
+        // emits these synchronously before ever touching the live broadcast stream.
+        for _ in 0..3 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), body.next())
+                .await
+                .expect("must not time out draining sendInitialEvents output")
+                .expect("stream must not end before sendInitialEvents output is drained")
+                .expect("chunk must not be an error");
+            assert!(!chunk.is_empty());
+        }
+
+        let after = crate::metrics::WATCH_EVENTS_TOTAL
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            after,
+            before + 3,
+            "2 ADDED items + 1 initial-events-end BOOKMARK must each increment \
+             apiserver_watch_events_total exactly once"
         );
     }
 }

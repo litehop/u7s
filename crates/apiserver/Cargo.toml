@@ -47,6 +47,7 @@ prost           = "0.14"
 hmac            = "0.13"
 sha2            = "0.11"
 u7s-sentinel    = { path = "../sentinel" }
+prometheus      = { version = "0.14", default-features = false }
 
 [build-dependencies]
 prost-build              = "0.14"

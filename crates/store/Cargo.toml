@@ -13,6 +13,7 @@ thiserror       = "2"
 tracing         = "0.1"
 async-stream    = "0.3"
 futures-core    = "0.3"
+prometheus      = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 futures-util    = "0.3"
