@@ -46,6 +46,7 @@ use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
 use u7s_store::SqliteStore;
 
+pub use admission::{build_review, AdmissionContext, AdmissionReview};
 pub use args::Args;
 use auth::{AuthLayer, PeerCertificate};
 use content_type::ContentTypeLayer;

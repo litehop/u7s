@@ -53,9 +53,12 @@ pub struct AdmissionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub operation: String,
-    pub object: serde_json::Value,
+    // Arc, not Value: build_review is called once per configured webhook on the same
+    // admitted write, and only `uid` differs between calls. Arc::clone is a refcount
+    // bump; serializes identically to Value since serde's Arc<T> impl delegates to T.
+    pub object: Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_object: Option<serde_json::Value>,
+    pub old_object: Option<Arc<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_info: Option<serde_json::Value>,
 }
@@ -793,17 +796,20 @@ fn split_subresource(resource: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn build_review(
+/// `pub` (not `pub(crate)`), and re-exported from the crate root, so
+/// `benches/admission_review.rs` can call it directly — a criterion bench is a
+/// separate crate that only ever sees this crate's public API.
+pub fn build_review(
     uid: &str,
     ctx: &AdmissionContext<'_>,
-    object: &serde_json::Value,
-    old_object: Option<&serde_json::Value>,
+    object: &Arc<serde_json::Value>,
+    old_object: Option<&Arc<serde_json::Value>>,
 ) -> AdmissionReview {
     // Populate oldObject for UPDATE and DELETE so policy engines (Kyverno, OPA Gatekeeper)
     // can enforce immutability rules and detect what changed. Without oldObject, immutability
     // checks silently pass on every UPDATE because there is nothing to compare against.
     let old_object = match ctx.operation {
-        "UPDATE" | "DELETE" => old_object.cloned(),
+        "UPDATE" | "DELETE" => old_object.map(Arc::clone),
         _ => None,
     };
     let (base_resource, sub_resource) = split_subresource(ctx.resource);
@@ -829,7 +835,7 @@ fn build_review(
             name: ctx.name.to_string(),
             namespace: ctx.namespace.map(|s| s.to_string()),
             operation: ctx.operation.to_string(),
-            object: object.clone(),
+            object: Arc::clone(object),
             old_object,
             user_info: ctx.user_info.clone(),
         }),
@@ -1057,14 +1063,14 @@ fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Resul
 async fn invoke_mutating_webhook<S: Store>(
     state: &AppState<S>,
     webhook: &WebhookEntry,
-    object: &serde_json::Value,
-    old_object: Option<&serde_json::Value>,
+    object: &Arc<serde_json::Value>,
+    old_object: Option<&Arc<serde_json::Value>>,
     ctx: &AdmissionContext<'_>,
     is_reinvocation: bool,
 ) -> Result<(serde_json::Value, bool), StatusError> {
     // During reinvocation, skip webhooks that don't opt in.
     if is_reinvocation && webhook.reinvocation_policy != "IfNeeded" {
-        return Ok((object.clone(), false));
+        return Ok((object.as_ref().clone(), false));
     }
 
     // Check if this webhook matches any rule.
@@ -1080,7 +1086,7 @@ async fn invoke_mutating_webhook<S: Store>(
             )
         });
         if !has_match {
-            return Ok((object.clone(), false));
+            return Ok((object.as_ref().clone(), false));
         }
     }
 
@@ -1094,7 +1100,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     "admission: mutating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
                     webhook.name, ns
                 );
-                return Ok((object.clone(), false));
+                return Ok((object.as_ref().clone(), false));
             }
         }
     }
@@ -1114,7 +1120,7 @@ async fn invoke_mutating_webhook<S: Store>(
                 "admission: mutating webhook \"{}\" skipped: object does not match objectSelector",
                 webhook.name
             );
-            return Ok((object.clone(), false));
+            return Ok((object.as_ref().clone(), false));
         }
     }
 
@@ -1127,7 +1133,7 @@ async fn invoke_mutating_webhook<S: Store>(
                 "admission: mutating webhook \"{}\" skipped: matchCondition evaluated false",
                 webhook.name
             );
-            return Ok((object.clone(), false));
+            return Ok((object.as_ref().clone(), false));
         }
     }
 
@@ -1139,7 +1145,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     "admission: mutating webhook \"{}\" skipped (service not found, failurePolicy=Ignore): {e}",
                     webhook.name
                 );
-                return Ok((object.clone(), false));
+                return Ok((object.as_ref().clone(), false));
             } else {
                 return Err(Status::internal(format!(
                     "admission webhook \"{}\": {e}",
@@ -1206,12 +1212,12 @@ async fn invoke_mutating_webhook<S: Store>(
             // Apply patch if present.
             if let Some(patch_b64) = resp.patch.as_deref() {
                 if !patch_b64.is_empty() {
-                    let mut mutated = object.clone();
+                    let mut mutated = object.as_ref().clone();
                     apply_webhook_patch(&mut mutated, patch_b64)?;
                     return Ok((mutated, true));
                 }
             }
-            Ok((object.clone(), false))
+            Ok((object.as_ref().clone(), false))
         }
         None => {
             // Webhook call failed (network/timeout/parse error).
@@ -1220,7 +1226,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     "admission: mutating webhook \"{}\" failed, ignoring (failurePolicy=Ignore)",
                     webhook.name
                 );
-                Ok((object.clone(), false))
+                Ok((object.as_ref().clone(), false))
             } else if timed_out {
                 // Include the full URL (with ?timeout=Ns) so the client error message
                 // matches what the conformance test checks: the URL path + "timeout".
@@ -2597,23 +2603,30 @@ pub async fn run_mutating_webhooks<S: Store>(
         return Ok(object);
     }
 
+    // Share object/old_object across all N webhook calls below via Arc instead of
+    // deep-cloning the JSON tree into every AdmissionRequest — only uid varies per call.
+    let mut object = Arc::new(object);
+    let old_object = old_object.map(|v| Arc::new(v.clone()));
+
     // First pass: run all webhooks.
     let mut any_patched = false;
     for webhook in all_webhooks.iter() {
         let (new_obj, patched) =
-            invoke_mutating_webhook(state, webhook, &object, old_object, ctx, false).await?;
+            invoke_mutating_webhook(state, webhook, &object, old_object.as_ref(), ctx, false)
+                .await?;
         if patched {
             any_patched = true;
         }
-        object = new_obj;
+        object = Arc::new(new_obj);
     }
 
     // Reinvocation pass: if any patch was applied, re-run IfNeeded webhooks once.
     if any_patched {
         for webhook in all_webhooks.iter() {
             let (new_obj, _) =
-                invoke_mutating_webhook(state, webhook, &object, old_object, ctx, true).await?;
-            object = new_obj;
+                invoke_mutating_webhook(state, webhook, &object, old_object.as_ref(), ctx, true)
+                    .await?;
+            object = Arc::new(new_obj);
         }
     }
 
@@ -2621,7 +2634,7 @@ pub async fn run_mutating_webhooks<S: Store>(
         elapsed_ms = start.elapsed().as_millis() as u64,
         "admission: run_mutating_webhooks exit"
     );
-    Ok(object)
+    Ok(Arc::try_unwrap(object).unwrap_or_else(|shared| (*shared).clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2999,6 +3012,17 @@ pub async fn run_validating_webhooks<S: Store>(
         "admission: run_validating_webhooks entry"
     );
 
+    // Share object/old_object across all N webhook calls below via Arc instead of
+    // deep-cloning the JSON tree into every AdmissionRequest — only uid varies per call.
+    // Skipped entirely when there are no webhooks configured (the conformance default).
+    let has_webhooks = !all_webhooks.is_empty();
+    let object_arc = has_webhooks.then(|| Arc::new(object.clone()));
+    let old_object_arc = if has_webhooks {
+        old_object.map(|v| Arc::new(v.clone()))
+    } else {
+        None
+    };
+
     for webhook in all_webhooks.iter() {
         // Check rule match.
         if !webhook.rules.is_empty() {
@@ -3090,7 +3114,14 @@ pub async fn run_validating_webhooks<S: Store>(
         let call_url = webhook_url_with_timeout(base_url, secs);
 
         let uid = uuid::Uuid::new_v4().to_string();
-        let review = build_review(&uid, ctx, object, old_object);
+        let review = build_review(
+            &uid,
+            ctx,
+            object_arc
+                .as_ref()
+                .expect("all_webhooks is non-empty inside this loop, so object_arc was built"),
+            old_object_arc.as_ref(),
+        );
 
         // DirectUrl webhooks go to an external endpoint: do not route through the
         // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
@@ -4036,7 +4067,7 @@ mod tests {
         let review = build_review(
             "uid-1",
             &ctx,
-            &json!({"kind": "Deployment", "metadata": {"name": "test-deploy"}}),
+            &Arc::new(json!({"kind": "Deployment", "metadata": {"name": "test-deploy"}})),
             None,
         );
         let resp = mock_call_webhook(allow_handler(), &review).await;
@@ -4063,7 +4094,7 @@ mod tests {
         let review = build_review(
             "uid-2",
             &ctx,
-            &json!({"kind": "Deployment", "metadata": {"name": "test-deploy"}}),
+            &Arc::new(json!({"kind": "Deployment", "metadata": {"name": "test-deploy"}})),
             None,
         );
         let resp = mock_call_webhook(deny_handler(), &review).await;
@@ -4080,7 +4111,7 @@ mod tests {
     /// parseable and applicable to the object.
     #[tokio::test]
     async fn mock_patch_webhook_returns_applicable_patch() {
-        let obj = json!({"kind": "Pod", "metadata": {"name": "test"}});
+        let obj = Arc::new(json!({"kind": "Pod", "metadata": {"name": "test"}}));
         let ctx = AdmissionContext {
             group: "",
             version: "v1",
@@ -4099,7 +4130,7 @@ mod tests {
         assert!(r.patch.is_some(), "patch webhook must include a patch");
 
         // Apply the patch to the object and verify the label was injected.
-        let mut mutated = obj.clone();
+        let mut mutated = obj.as_ref().clone();
         apply_webhook_patch(&mut mutated, r.patch.as_deref().unwrap())
             .unwrap_or_else(|_| panic!("webhook patch must apply successfully"));
         assert_eq!(
@@ -5765,11 +5796,11 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let obj = serde_json::json!({
+        let obj = Arc::new(serde_json::json!({
             "apiVersion": "apps/v1",
             "kind": "Deployment",
             "metadata": {"name": "my-deploy"}
-        });
+        }));
         let review = build_review("uid-kind-test", &ctx, &obj, None);
         let req = review.request.expect("request must be set");
         assert_eq!(
@@ -5805,7 +5836,7 @@ mod tests {
             dry_run: false,
         };
         // Object without a "kind" field.
-        let obj = serde_json::json!({"metadata": {"name": "my-pod"}});
+        let obj = Arc::new(serde_json::json!({"metadata": {"name": "my-pod"}}));
         let review = build_review("uid-no-kind", &ctx, &obj, None);
         let req = review.request.expect("request must be set");
         assert_eq!(
@@ -5835,7 +5866,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let obj = serde_json::json!({"kind": "Pod", "apiVersion": "v1"});
+        let obj = Arc::new(serde_json::json!({"kind": "Pod", "apiVersion": "v1"}));
         let review = build_review("uid-plain-resource", &ctx, &obj, None);
         let req = review.request.expect("request must be set");
         assert_eq!(
@@ -5852,6 +5883,50 @@ mod tests {
             wire.get("subResource").is_none(),
             "the serialized AdmissionRequest must not contain a subResource key at all \
              for a plain resource request, matching upstream's `omitempty` wire format: {wire}"
+        );
+    }
+
+    /// build_review's wire output must be byte-identical whether `object`/`oldObject`
+    /// are represented as `Arc<Value>` or a plain `Value`.
+    ///
+    /// object/oldObject are `Arc<serde_json::Value>` purely so N webhook calls can share
+    /// one clone instead of paying a deep clone each — a webhook receiving different JSON
+    /// bytes than before (e.g. an extra wrapper layer from a naive Arc serialize impl)
+    /// would silently break every policy engine that parses the AdmissionReview body.
+    #[test]
+    fn admission_review_wire_format_is_stable_across_arc_refactor() {
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "UPDATE",
+            user_info: Some(
+                serde_json::json!({"username": "alice", "groups": ["system:authenticated"]}),
+            ),
+            dry_run: false,
+        };
+        let object = Arc::new(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "my-deploy"},
+            "spec": {"replicas": 3}
+        }));
+        let old_object = Arc::new(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "my-deploy"},
+            "spec": {"replicas": 1}
+        }));
+        let review = build_review("wire-stability-uid", &ctx, &object, Some(&old_object));
+
+        let actual = serde_json::to_string(&review).expect("AdmissionReview must serialize");
+        let expected = "{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"request\":{\"uid\":\"wire-stability-uid\",\"kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"resource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"name\":\"my-deploy\",\"namespace\":\"default\",\"operation\":\"UPDATE\",\"object\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":3}},\"oldObject\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":1}},\"userInfo\":{\"groups\":[\"system:authenticated\"],\"username\":\"alice\"}}}";
+        assert_eq!(
+            actual, expected,
+            "AdmissionReview wire bytes changed — a webhook consumer parsing a fixed \
+             schema would break silently; Arc<Value> must serialize exactly like Value"
         );
     }
 
@@ -9012,7 +9087,7 @@ mod tests {
             Some(1), // 1s timeout so the test doesn't hang
         );
 
-        let obj = json!({"kind": "Pod", "metadata": {"name": "test"}});
+        let obj = Arc::new(json!({"kind": "Pod", "metadata": {"name": "test"}}));
         let ctx = AdmissionContext {
             group: "",
             version: "v1",
