@@ -132,6 +132,7 @@ _KONNECTIVITY_SERVER_PORT_ARG=""
 _WORKDIR_ARG=""
 _VM_ARG=""
 _KCM_V_ARG=""
+_VERBOSE_ARG=""
 _EXTRA_NODE_ARG=""
 _NODE_KUBELET_PORT_ARG=""
 # When --verbose is set, raise kube-controller-manager verbosity to --v=5 so both the
@@ -139,6 +140,10 @@ _NODE_KUBELET_PORT_ARG=""
 # controller's replacement-reasoning lines ("candidate to replace" / "allowing
 # replacements", V(5)) are visible — V(5) is the ceiling here (no V(6) call sites exist).
 [ "$VERBOSE" -eq 1 ] && _KCM_V_ARG="--kcm-v 5"
+# Forwarded to lima-start.sh (and, via add-node.sh, to a 2nd node's lima-start.sh),
+# which raises kubelet to --v=5 (PLEG relist detail) and flips CRI-O's crio.conf.d
+# drop-in to log_level=debug — see lima-start.sh for why both live behind one flag.
+[ "$VERBOSE" -eq 1 ] && _VERBOSE_ARG="--verbose"
 [ -n "$PORT" ]                    && _PORT_ARG="--port $PORT"
 [ -n "$KUBELET_PORT" ]            && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
 [ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"
@@ -181,7 +186,7 @@ echo "Using KUBECONFIG=$KUBECONFIG"
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG}
+bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}
 
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
@@ -199,7 +204,7 @@ bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
 if [ -n "$EXTRA_NODE" ]; then
   banner "Extra node: join $EXTRA_NODE"
   # shellcheck disable=SC2086
-  bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG}
+  bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}
 fi
 
 # Step 06: Run sonobuoy.
@@ -209,7 +214,7 @@ else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
-  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG}
 fi
 
 banner "Done"
