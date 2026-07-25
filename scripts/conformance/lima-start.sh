@@ -26,6 +26,7 @@
 #     limactl shell lima-node sudo journalctl -u kubelet --no-pager -n 50
 #   CRI-O issues:
 #     limactl shell lima-node sudo journalctl -u crio --no-pager -n 30
+#     (pass --verbose to raise both kubelet --v and CRI-O's log_level to debug)
 #   Container sandbox failures ("unknown version specified"):
 #     Two possible causes:
 #     1. System crun used instead of CRI-O's bundled one (10-crun.conf drop-in):
@@ -45,6 +46,7 @@ _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _NODE_SUFFIX_OVERRIDE=""
+VERBOSE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
@@ -54,9 +56,15 @@ while [[ $# -gt 0 ]]; do
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --node-suffix) _NODE_SUFFIX_OVERRIDE="$2"; shift 2 ;;
+    --verbose) VERBOSE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+# Kubelet --v level and CRI-O log_level both derive from this one flag: --v=5 is the
+# ceiling that surfaces PLEG relist detail (see the crio.conf.d drop-in below), and
+# --v=2 is today's unchanged default so a non-verbose run's log volume never grows.
+KUBELET_V=2
+[ "$VERBOSE" -eq 1 ] && KUBELET_V=5
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
@@ -216,6 +224,32 @@ if [ -n "$CNI0_LIVE" ] && [ "$CNI0_LIVE" != "10.85.${POD_SUBNET_OCTET}.1/24" ]; 
   exit 1
 fi
 
+# Toggle CRI-O debug logging via a crio.conf.d drop-in, controlled by --verbose. A
+# PLEG-relist-miss (kubelet never sees ContainerStarted even though CRI-O did start
+# the container) is undiagnosable without CRI-O's own log at debug — but debug-level
+# CRI-O writes far too much to leave on for every run, so read-detect the drop-in's
+# current presence and only touch it (and restart crio) when it doesn't already match
+# this invocation's --verbose, so re-running --verbose twice never restarts crio for
+# no reason, and a later non-verbose run always removes a stale drop-in rather than
+# leaving debug logging on forever.
+CRIO_VERBOSE_CONF="/etc/crio/crio.conf.d/99-verbose.conf"
+CRIO_VERBOSE_PRESENT=0
+if limactl shell "$VM_NAME" test -f "$CRIO_VERBOSE_CONF" 2>/dev/null; then
+  CRIO_VERBOSE_PRESENT=1
+fi
+if [ "$VERBOSE" -eq 1 ] && [ "$CRIO_VERBOSE_PRESENT" -eq 0 ]; then
+  echo "Enabling CRI-O debug logging (${CRIO_VERBOSE_CONF})..."
+  limactl shell "$VM_NAME" sudo bash -c "cat > $CRIO_VERBOSE_CONF" <<'CRIOEOF'
+[crio.runtime]
+log_level = "debug"
+CRIOEOF
+  limactl shell "$VM_NAME" sudo systemctl restart crio
+elif [ "$VERBOSE" -eq 0 ] && [ "$CRIO_VERBOSE_PRESENT" -eq 1 ]; then
+  echo "Disabling CRI-O debug logging (removing ${CRIO_VERBOSE_CONF})..."
+  limactl shell "$VM_NAME" sudo rm -f "$CRIO_VERBOSE_CONF"
+  limactl shell "$VM_NAME" sudo systemctl restart crio
+fi
+
 # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
 # run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
 # (size-based) from the remaining logs (weekly). Written on every start so it survives
@@ -340,7 +374,7 @@ ExecStart=/usr/bin/kubelet \\\\
   --tls-cert-file=/etc/kubelet-tls.crt \\\\
   --tls-private-key-file=/etc/kubelet-tls.key \\\\
   --hostname-override=${VM_NAME} \\\\
-  --v=2
+  --v=${KUBELET_V}
 EOF"
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
   echo "Kubelet client-ca-file and TLS serving cert configured."

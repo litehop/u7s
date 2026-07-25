@@ -12,6 +12,7 @@ FOCUS="${SONOBUOY_FOCUS:-}"
 WORKDIR="$PWD/temp/u7s"
 UNPACK=1
 PORT="${U7S_PORT:-6443}"
+EXTRA_NODE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -20,6 +21,7 @@ while [[ $# -gt 0 ]]; do
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
+    --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -204,16 +206,27 @@ limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"
 echo "Results: $OUTFILE"
 
 # Collect host-side and VM-side logs into <run>/host-logs/ for post-run diagnosis.
-# Kubelet runs as a systemd unit on the Lima VM — its log is in the journal, not a file.
-# Without this, a kubelet crash-loop (as in run 0705-1409) is undiagnosable post-hoc.
+# Kubelet and CRI-O both run as systemd units on the Lima VM — their logs are in the
+# journal, not a file. Without this, a kubelet crash-loop (as in run 0705-1409) or a
+# PLEG-relist-miss needing CRI-O's own timeline is undiagnosable post-hoc. Collected
+# for every node in the run (not just the primary) — KCM/scheduler run once for the
+# whole cluster so they stay unlisted here.
 RUN_DIR="${OUTFILE%.tar.gz}"
 HOST_LOGS_DIR="$RUN_DIR/host-logs"
 mkdir -p "$HOST_LOGS_DIR"
 [ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
 [ -f "$WORKDIR/scheduler.log" ]              && cp "$WORKDIR/scheduler.log"   "$HOST_LOGS_DIR/scheduler.log"
 [ -f "$WORKDIR/konnectivity-server.log" ]    && cp "$WORKDIR/konnectivity-server.log" "$HOST_LOGS_DIR/konnectivity-server.log"
-limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager \
-  > "$HOST_LOGS_DIR/kubelet.log" 2>/dev/null || true
+NODES=("$VM_NAME")
+[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+for NODE in "${NODES[@]}"; do
+  SUFFIX=""
+  [ "$NODE" != "$VM_NAME" ] && SUFFIX="-${NODE}"
+  limactl shell "$NODE" sudo journalctl -u kubelet --no-pager \
+    > "$HOST_LOGS_DIR/kubelet${SUFFIX}.log" 2>/dev/null || true
+  limactl shell "$NODE" sudo journalctl -u crio --no-pager \
+    > "$HOST_LOGS_DIR/crio${SUFFIX}.log" 2>/dev/null || true
+done
 limactl shell "$VM_NAME" sudo cat /tmp/kcm.log \
   > "$HOST_LOGS_DIR/kcm.log" 2>/dev/null || true
 echo "Host logs: $HOST_LOGS_DIR"
