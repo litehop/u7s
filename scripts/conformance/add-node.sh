@@ -13,7 +13,7 @@
 # still never touches KCM/scheduler; that invariant is unrelated and must hold.
 #
 # Usage:
-#   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>]
+#   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--verbose]
 #
 # Delegates to lima-start.sh --node-suffix "-2" so the joining node's per-node
 # resources (konnectivity-agent Pod/Secret, kubelet serving cert, pod CIDR) don't
@@ -23,7 +23,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ $# -lt 2 ]; then
-  echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--workdir <path>]" >&2
+  echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--verbose]" >&2
   exit 1
 fi
 VM_NAME="$1"
@@ -32,10 +32,12 @@ shift 2
 
 _PORT_OVERRIDE=""
 _WORKDIR_OVERRIDE=""
+_VERBOSE_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
+    --verbose) _VERBOSE_ARG="--verbose"; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -61,4 +63,4 @@ _WORKDIR_ARG=""
 [ -n "$_WORKDIR_OVERRIDE" ] && _WORKDIR_ARG="--workdir $_WORKDIR_OVERRIDE"
 
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} --node-suffix "-2"
+bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} --node-suffix "-2" ${_VERBOSE_ARG}
