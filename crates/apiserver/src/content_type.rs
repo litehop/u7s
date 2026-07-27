@@ -114,9 +114,29 @@ where
             // with the pre-failure status code instead of the one actually returned.
             let status = resp.status().as_u16();
             let request_id_str = request_id.to_string();
-            if let Ok(value) = HeaderValue::from_str(&request_id_str) {
-                resp.headers_mut()
-                    .insert(HeaderName::from_static("x-request-id"), value);
+
+            // Watch/streaming responses (Transfer-Encoding: chunked) must be passed
+            // through with headers completely untouched, matching the guarantee the
+            // chunked branch above already gives the body: the response's `Body` here
+            // is a long-lived stream backed by a broadcast receiver that was subscribed
+            // before this middleware ever ran, so any per-response bookkeeping added
+            // here must not touch it. Mutating the header map is header-only and would
+            // never touch body bytes, but every other response class on this server is
+            // fully buffered by the time it reaches here, and watch is the one case
+            // where "the response" is still an in-progress operation rather than a
+            // finished value — so it gets the same "leave it alone" treatment the
+            // is_chunked check above already applies to body re-encoding.
+            let is_streaming = resp
+                .headers()
+                .get(header::TRANSFER_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .map(|te| te.eq_ignore_ascii_case("chunked"))
+                .unwrap_or(false);
+            if !is_streaming {
+                if let Ok(value) = HeaderValue::from_str(&request_id_str) {
+                    resp.headers_mut()
+                        .insert(HeaderName::from_static("x-request-id"), value);
+                }
             }
             tracing::info!(
                 method = %method,
@@ -1174,6 +1194,69 @@ mod tests {
             "expected exactly one access-log line per request (2 requests made), each \
              carrying request_id — extra or missing lines mean the consolidation to a single \
              log point regressed; log was: {log}"
+        );
+    }
+
+    /// A chunked watch response must come out of ContentTypeLayer with its header set
+    /// completely untouched, including no added `x-request-id`.
+    ///
+    /// A watch's `Body` is a long-lived stream already wired to a broadcast receiver that
+    /// was subscribed before this middleware ever ran (see `SqliteStore::watch`) — by the
+    /// time headers reach this layer, "the response" is an in-progress kubelet/controller
+    /// watch connection, not a finished value. Every other branch of this middleware treats
+    /// such streams as untouchable (the is_chunked check in `reencode_proto_response` skips
+    /// re-encoding for exactly this reason); the access-log header injection introduced
+    /// alongside the request_id feature must honour the same rule. If this regresses, kubelet
+    /// and controller watches pick up a header mutation on every open that pre-040855f1 never
+    /// performed, which is one of the two concrete structural risks flagged by the conformance
+    /// bisection that isolated the access-log commit as the sole differentiator between a
+    /// clean 446/446 pass and repeated multi-spec failures.
+    #[tokio::test]
+    async fn chunked_watch_response_headers_are_not_mutated_by_access_log() {
+        #[derive(Clone)]
+        struct ChunkedService;
+        impl Service<Request<Body>> for ChunkedService {
+            type Response = Response<Body>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                Box::pin(async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("transfer-encoding", "chunked")
+                        .body(Body::from(
+                            r#"{"type":"ADDED","object":{"kind":"Pod","apiVersion":"v1","metadata":{"name":"p"}}}"#,
+                        ))
+                        .unwrap())
+                })
+            }
+        }
+        let mut layer_svc = ContentTypeLayer.layer(ChunkedService);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/pods?watch=true")
+            .header("accept", "application/json")
+            .header("user-agent", "kubelet/v1.34.0")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+
+        assert!(
+            resp.headers().get("x-request-id").is_none(),
+            "a chunked watch response must not gain an x-request-id header: the body is a \
+             live stream already subscribed to the store's broadcast channel before this \
+             middleware ran, so this response is not a finished value the way every other \
+             response class is — headers must pass through exactly as the handler set them"
+        );
+        assert_eq!(
+            resp.headers().get("transfer-encoding").unwrap(),
+            "chunked",
+            "transfer-encoding must be preserved unchanged on a watch response"
         );
     }
 }
