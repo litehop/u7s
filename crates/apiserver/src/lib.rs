@@ -312,7 +312,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
-            Arc::clone(&state.revoked_jtis),
+            Arc::clone(&state.store),
         ))
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -5025,7 +5025,7 @@ mod tests {
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
-            std::sync::Arc::clone(&state.revoked_jtis),
+            std::sync::Arc::clone(&state.store),
         ));
 
         for path in ["/openapi/v2", "/openapi/v3"] {
@@ -5680,8 +5680,9 @@ mod tests {
             &std::collections::HashMap::new(),
             Some(&dec_key),
             &[],
-            &std::collections::HashSet::new(),
+            store.as_ref(),
         )
+        .await
         .expect("minted SA token must authenticate successfully — round-trip broken if None");
 
         // Username must be the service account identity.

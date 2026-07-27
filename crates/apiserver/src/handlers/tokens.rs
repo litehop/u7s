@@ -3,13 +3,16 @@
 // Mints an RS256 JWT for the named ServiceAccount and returns a Kubernetes
 // TokenRequest response (201 Created).
 //
-// Safety net for projected-token refresh failures (mayor-tq5y): the JWT lifetime
-// is floored at MIN_JWT_LIFETIME_SECS (24 h) regardless of the requested
-// expirationSeconds.  The response still echoes the *requested* expirationSeconds
-// so that kubelet's token_manager schedules refreshes at the normal interval (≈80%
-// of the requested TTL).  If a refresh call fails (e.g. transient VM network
-// hiccup), the existing JWT stays valid for up to 24 h instead of expiring after
-// the short requested window.
+// Safety net for projected-token refresh failures: pod-bound tokens minted for the default
+// kube-native audience get a JWT lifetime extended to POD_BOUND_TOKEN_EXTENSION_SECS (8 h)
+// regardless of the requested expirationSeconds. Kubelet's token_manager refreshes a
+// projected SA token volume well before the requested window elapses; if a refresh attempt
+// fails (transient network partition, apiserver restart, etc.) the already-mounted JWT stays
+// valid for up to 8 h instead of expiring at the short requested TTL, giving kubelet more
+// chances to retry before the pod loses authentication entirely. The response still echoes
+// the *requested* expirationSeconds so kubelet schedules refreshes at the normal interval.
+// Unbound tokens and tokens requesting a non-default audience are minted with exactly the
+// requested (clamped) lifetime — no extension.
 
 use axum::{
     extract::{Path, State},
@@ -54,15 +57,20 @@ fn default_expiration() -> u64 {
     3607
 }
 
-/// Minimum actual JWT lifetime regardless of the requested expirationSeconds.
+/// Extended JWT lifetime applied only to pod-bound tokens minted for the default
+/// kube-native audience (see the scope check in `create_token`).
 ///
 /// Kubelet's token_manager schedules token refreshes based on `spec.expirationSeconds`
-/// from the TokenRequest *response* (not the JWT `exp` claim).  By flooring the JWT
-/// lifetime at 24 h we ensure that if kubelet fails to deliver a refresh (transient
-/// network partition, apiserver restart, etc.) the existing JWT remains valid for the
-/// full duration of a typical conformance run without requiring a successful refresh
-/// every ~48 min.
-pub(crate) const MIN_JWT_LIFETIME_SECS: u64 = 86_400; // 24 h
+/// from the TokenRequest *response* (not the JWT `exp` claim). Extending the JWT lifetime
+/// for this narrow, security-relevant scope means that if kubelet fails to deliver a
+/// refresh (transient network partition, apiserver restart, etc.) the existing JWT stays
+/// valid for longer than the short requested window, giving kubelet more chances to retry
+/// before the pod loses authentication. This deliberately does not extend to unbound
+/// tokens or non-default audiences, and deliberately uses a much shorter duration than
+/// upstream Kubernetes' own equivalent safety net (which defaults to one year) — the
+/// project judges a multi-hour window sufficient headroom for a refresh retry without
+/// leaving a long-lived credential valid far past its intended window.
+pub(crate) const POD_BOUND_TOKEN_EXTENSION_SECS: u64 = 8 * 60 * 60; // 8 h
 
 // ---------------------------------------------------------------------------
 // JWT claims
@@ -94,6 +102,13 @@ struct KubernetesClaimsExt {
     /// `authentication.kubernetes.io/node-{name,uid}` extra fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<ClaimRef>,
+    /// Unix timestamp of the *originally requested* expiration, present only when the
+    /// POD_BOUND_TOKEN_EXTENSION_SECS safety net has extended the real `exp` beyond it.
+    /// The token authenticator does not reject a token past this timestamp (the real
+    /// `exp` is what governs validity) but emits a warning + increments a stale-token
+    /// metric, mirroring upstream Kubernetes' `kubernetes.io.warnafter` claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warnafter: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -236,19 +251,31 @@ pub async fn create_token<S: Store>(
 
     // 7. Mint JWT.
     //
-    // The JWT `exp` is floored at MIN_JWT_LIFETIME_SECS (24 h) as a safety net for
-    // transient refresh failures (mayor-tq5y).  The response still returns the
-    // caller-requested `expirationSeconds` so that kubelet's token_manager schedules
-    // refreshes at the normal short interval.  If a refresh attempt fails, the
-    // existing JWT stays valid for up to 24 h.
+    // The expiration-extension safety net (see POD_BOUND_TOKEN_EXTENSION_SECS) applies only
+    // when BOTH conditions hold: the token is bound to a Pod, and it was requested with the
+    // default kube-native audience. Unlike upstream Kubernetes, this does not also require
+    // the requested expirationSeconds to equal a specific historical magic value — the scope
+    // check alone (pod-bound + kube-native audience) decides whether the extension applies.
+    let is_pod_bound = pod_ref.is_some();
+    let is_kube_native_audience = spec.audiences == ["https://kubernetes.default.svc".to_owned()];
+    let extension_applies = is_pod_bound && is_kube_native_audience;
+
     let now = unix_now();
-    let jwt_lifetime = spec.expiration_seconds.max(MIN_JWT_LIFETIME_SECS);
+    let (jwt_lifetime, warnafter) = if extension_applies {
+        (
+            POD_BOUND_TOKEN_EXTENSION_SECS,
+            Some(now + spec.expiration_seconds),
+        )
+    } else {
+        (spec.expiration_seconds, None)
+    };
     let jwt_exp = now + jwt_lifetime;
     tracing::debug!(
         ns = ns.as_str(),
         sa = %sa_name,
         requested_secs = spec.expiration_seconds,
         jwt_lifetime_secs = jwt_lifetime,
+        extension_applied = extension_applies,
         "TokenRequest: minting SA JWT"
     );
     let claims = KubernetesClaims {
@@ -266,6 +293,7 @@ pub async fn create_token<S: Store>(
             },
             pod: pod_ref,
             node: node_ref,
+            warnafter,
         },
     };
 
@@ -281,7 +309,8 @@ pub async fn create_token<S: Store>(
     // access BoundObjectRef.UID without a nil-pointer dereference (token_manager.go:139).
     //
     // expirationTimestamp uses the requested (short) lifetime so kubelet computes the
-    // correct refresh window.  The JWT itself uses jwt_exp (≥ 24 h) as the safety net.
+    // correct refresh window. The JWT itself uses jwt_exp, which is extended to
+    // POD_BOUND_TOKEN_EXTENSION_SECS when the safety net's scope conditions are met.
     let expiration_timestamp = secs_to_rfc3339((now + spec.expiration_seconds) as i64);
     let mut spec_resp = serde_json::json!({
         "audiences": claims.aud,
@@ -385,6 +414,7 @@ mod tests {
                 },
                 pod: None,
                 node: None,
+                warnafter: None,
             },
         };
 
@@ -430,6 +460,7 @@ mod tests {
                 },
                 pod: None,
                 node: None,
+                warnafter: None,
             },
         };
 
@@ -1312,10 +1343,9 @@ mod handler_tests {
 
     /// Every minted SA JWT must contain a non-empty jti (JWT ID) claim.
     ///
-    /// The jti claim uniquely identifies each minted token. Without it, a leaked token
-    /// cannot be invalidated before its 24 h expiry — the entire token space for a given
-    /// SA within its TTL is a single credential. With jti, a revocation store can
-    /// reject individual tokens by ID. This test fails if jti is removed from the claims.
+    /// The jti claim uniquely identifies each minted token; TokenReview surfaces it as
+    /// `authentication.kubernetes.io/credential-id` so callers and audit logs can tell which
+    /// specific token was used. This test fails if jti is removed from the claims.
     #[tokio::test]
     async fn create_token_jwt_has_jti_claim() {
         let (state, store) = make_state_with_key();
@@ -1342,7 +1372,7 @@ mod handler_tests {
         assert!(
             !jti.is_empty(),
             "minted SA JWT must contain a non-empty jti claim — \
-             without jti, leaked tokens cannot be individually revoked before expiry"
+             without it, TokenReview cannot report a stable credential-id for audit logs"
         );
         assert_eq!(
             jti.len(),
@@ -1353,9 +1383,9 @@ mod handler_tests {
 
     /// Two successive token requests must produce JWTs with different jti values.
     ///
-    /// If two tokens share the same jti, a revocation store cannot distinguish them —
-    /// revoking one would revoke the other, or neither. Each token must be individually
-    /// addressable. This test fails if jti is a constant or derived from non-random data.
+    /// If two tokens shared the same jti, TokenReview's credential-id could not distinguish
+    /// which mint an audit log entry actually referred to. This test fails if jti is a
+    /// constant or derived from non-random data.
     #[tokio::test]
     async fn create_token_successive_mints_have_unique_jti() {
         let (state, store) = make_state_with_key();
@@ -1388,28 +1418,102 @@ mod handler_tests {
         assert_ne!(
             jti1, jti2,
             "successive token mints for the same SA must produce different jti values — \
-             duplicate jti values prevent individual token revocation"
+             duplicate jti values would make TokenReview's credential-id ambiguous"
         );
     }
 
-    /// Regression test for mayor-tq5y: JWT lifetime must be floored at 24 h even when
-    /// a shorter expirationSeconds is requested.
+    /// A pod-bound token minted for the default kube-native audience must get its real JWT
+    /// lifetime extended to POD_BOUND_TOKEN_EXTENSION_SECS (8 h) regardless of the requested
+    /// expirationSeconds. Kubelet schedules token refreshes based on spec.expirationSeconds
+    /// from the response; if a refresh call fails (transient VM network partition, apiserver
+    /// restart), the pod continues using the existing token from the volume. Without the
+    /// extension a short-TTL request (e.g. 600 s) would leave the pod Unauthorized within
+    /// minutes of a single missed refresh — the extension buys kubelet more retry headroom.
     ///
-    /// Kubelet schedules token refreshes based on spec.expirationSeconds from the response.
-    /// If a refresh call fails (transient VM network partition, apiserver restart), the pod
-    /// continues using the existing token from the volume.  With a 3607 s JWT the pod would
-    /// get Unauthorized within ~1 h of a failed refresh.  By flooring the JWT exp at 24 h
-    /// the pod stays authenticated for a full conformance run even if kubelet misses every
-    /// single refresh attempt.
-    ///
-    /// This test fails if the floor is removed: exp - iat would equal 3607 instead of ≥ 86400.
+    /// This test fails if the extension is removed: exp - iat would equal 600 instead of 28800,
+    /// and it must NOT depend on the requested value being exactly the historical 3607 s
+    /// default — 600 s is used here specifically to prove that.
     #[tokio::test]
-    async fn create_token_jwt_lifetime_floored_at_24h() {
+    async fn create_token_pod_bound_kube_audience_gets_8h_extension() {
         let (state, store) = make_state_with_key();
         seed_namespace(&store, "default").await;
-        seed_serviceaccount(&store, "default", "my-sa", "uid-tq5y").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-ext-1").await;
+        seed_pod(&store, "default", "my-pod", "pod-uid-ext-1", "node-a").await;
 
-        // Request the Kubernetes-default projected-volume TTL (what kubelet typically sends).
+        let req_body = serde_json::json!({
+            "spec": {
+                "expirationSeconds": 600,
+                "audiences": ["https://kubernetes.default.svc"],
+                "boundObjectRef": {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": "my-pod",
+                    "uid": "pod-uid-ext-1"
+                }
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        // The response spec.expirationSeconds must still be the requested 600 s so that
+        // kubelet schedules refreshes at the normal short interval.
+        let resp_exp_secs = resp_body["spec"]["expirationSeconds"]
+            .as_u64()
+            .expect("spec.expirationSeconds must be present");
+        assert_eq!(
+            resp_exp_secs, 600,
+            "spec.expirationSeconds in response must equal the requested value \
+             so kubelet schedules refreshes at the right interval"
+        );
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("status.token must be present");
+        let claims = decode_jwt_claims(token);
+        let iat = claims["iat"].as_u64().expect("iat must be present");
+        let exp = claims["exp"].as_u64().expect("exp must be present");
+        assert_eq!(
+            exp - iat,
+            POD_BOUND_TOKEN_EXTENSION_SECS,
+            "pod-bound token with kube-native audience must get the full 8h extension \
+             regardless of the 600s requested value, not the requested TTL"
+        );
+
+        // warnafter must be set to iat + the originally requested window, so the
+        // authenticator can flag reliance on the extension once that window elapses.
+        let warnafter = claims["kubernetes.io"]["warnafter"]
+            .as_u64()
+            .expect("warnafter must be present when the extension applies");
+        assert_eq!(
+            warnafter,
+            iat + 600,
+            "warnafter must equal iat + the originally requested expirationSeconds"
+        );
+    }
+
+    /// An unbound token (no boundObjectRef) requested with the default kube-native audience
+    /// must NOT get the pod-bound extension — the extension exists to bridge kubelet's
+    /// projected-volume refresh cycle for a specific pod, which does not exist for unbound
+    /// tokens. Extending every token's lifetime unconditionally (the pre-fix behavior) left
+    /// leaked unbound tokens usable for far longer than the caller ever requested.
+    #[tokio::test]
+    async fn create_token_unbound_kube_audience_gets_no_extension() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-noext-1").await;
+
         let req_body = serde_json::json!({
             "spec": {
                 "expirationSeconds": 3607,
@@ -1431,44 +1535,74 @@ mod handler_tests {
             ),
         };
 
-        // The response spec.expirationSeconds must still be the requested 3607 s so that
-        // kubelet schedules refreshes at the normal ~48-min interval.
-        let resp_exp_secs = resp_body["spec"]["expirationSeconds"]
-            .as_u64()
-            .expect("spec.expirationSeconds must be present");
-        assert_eq!(
-            resp_exp_secs, 3607,
-            "spec.expirationSeconds in response must equal the requested value \
-             so kubelet schedules refreshes at the right interval"
-        );
-
-        // The JWT exp must be at least 86400 s (24 h) from iat regardless of the requested
-        // expirationSeconds.  If this fails, reverted MIN_JWT_LIFETIME_SECS means the pod
-        // gets Unauthorized within ~1 h if kubelet fails to refresh (mayor-tq5y).
         let token = resp_body["status"]["token"]
             .as_str()
             .expect("status.token must be present");
         let claims = decode_jwt_claims(token);
         let iat = claims["iat"].as_u64().expect("iat must be present");
         let exp = claims["exp"].as_u64().expect("exp must be present");
-        assert!(
-            exp - iat >= MIN_JWT_LIFETIME_SECS,
-            "JWT lifetime (exp-iat={}) must be >= MIN_JWT_LIFETIME_SECS={} even when \
-             expirationSeconds={} was requested — removing this floor re-exposes mayor-tq5y",
+        assert_eq!(
             exp - iat,
-            MIN_JWT_LIFETIME_SECS,
-            resp_exp_secs
+            3607,
+            "an unbound token must get exactly the requested lifetime, not an extension — \
+             extending unbound tokens would let a leaked one outlive its intended TTL"
         );
-
-        // The status.expirationTimestamp must reflect the SHORT requested window (3607 s),
-        // not the longer JWT lifetime, so kubelet computes the correct refresh schedule.
-        // (kubelet uses expirationTimestamp + spec.expirationSeconds to derive the refresh window)
-        let exp_ts = resp_body["status"]["expirationTimestamp"]
-            .as_str()
-            .expect("status.expirationTimestamp must be present");
         assert!(
-            exp_ts.contains('T') && exp_ts.ends_with('Z'),
-            "expirationTimestamp must be in RFC3339 format, got: {exp_ts}"
+            claims["kubernetes.io"]["warnafter"].is_null(),
+            "warnafter must be absent when no extension applied"
+        );
+    }
+
+    /// A pod-bound token requested with a custom (non-kube-native) audience must NOT get the
+    /// extension, mirroring upstream's scope restriction to the default audience. A token
+    /// scoped to a third-party audience is not something kubelet's token_manager schedules
+    /// refreshes for the same way, so silently extending it would be an unreviewed lifetime
+    /// increase for a credential handed to an external service.
+    #[tokio::test]
+    async fn create_token_pod_bound_custom_audience_gets_no_extension() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-noext-2").await;
+        seed_pod(&store, "default", "my-pod", "pod-uid-noext-2", "node-a").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "expirationSeconds": 3607,
+                "audiences": ["https://my-app.example.com"],
+                "boundObjectRef": {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": "my-pod",
+                    "uid": "pod-uid-noext-2"
+                }
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("status.token must be present");
+        let claims = decode_jwt_claims(token);
+        let iat = claims["iat"].as_u64().expect("iat must be present");
+        let exp = claims["exp"].as_u64().expect("exp must be present");
+        assert_eq!(
+            exp - iat,
+            3607,
+            "a pod-bound token with a non-default audience must get exactly the requested \
+             lifetime — the extension is scoped to the default kube-native audience only"
         );
     }
 }

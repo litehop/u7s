@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -250,10 +250,6 @@ pub struct AppState<S = SqliteStore> {
     /// Stored here so the per-webhook reqwest::Client can present the same identity as the shared
     /// webhook_client when talking to the konnectivity proxy (which requires mTLS).
     pub webhook_identity_pem: Option<Arc<Vec<u8>>>,
-    /// JTI (JWT ID) revocation set. JTIs inserted here are rejected by the SA JWT verifier
-    /// even if the token is otherwise valid and has not yet expired. Shared across all clones
-    /// of AppState so a revocation is immediately visible on all request-handling threads.
-    pub revoked_jtis: Arc<Mutex<HashSet<String>>>,
     /// PEM-encoded RSA public key for the SA signing key.
     /// Stored so the OIDC JWKS endpoint can serve the public key material without
     /// holding a reference to the private key. None when SA key is unavailable.
@@ -326,7 +322,6 @@ impl<S> Clone for AppState<S> {
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
             webhook_identity_pem: self.webhook_identity_pem.clone(),
-            revoked_jtis: self.revoked_jtis.clone(),
             sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
@@ -518,7 +513,6 @@ impl<S: Store> AppState<S> {
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
             webhook_identity_pem: cfg.webhook_identity_pem.map(Arc::new),
-            revoked_jtis: Arc::new(Mutex::new(HashSet::new())),
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),
