@@ -4,11 +4,11 @@
 // RS256 JWT verification for service-account tokens, and x509 client
 // certificate authentication.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{BufRead as _, BufReader};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -17,10 +17,19 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tower::Layer;
 use tower_service::Service;
+use u7s_store::{SqliteStore, Store};
 
+use crate::keys::object_key;
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::status::Status;
-use crate::util::validate_cli_path;
+use crate::util::{rfc3339_to_unix_secs, validate_cli_path};
+
+/// Grace period after `metadata.deletionTimestamp` during which a token bound to that object
+/// remains valid — mirrors upstream Kubernetes' `jwt.DefaultLeeway` (60s) used by the
+/// bound-object liveness check in `pkg/serviceaccount/claims.go`. This is not a revocation
+/// delay: it exists so a pod's own graceful-shutdown window doesn't race its own SA token
+/// going invalid mid-termination.
+const DELETION_LEEWAY_SECS: i64 = 60;
 
 // ---------------------------------------------------------------------------
 // PeerCertificate — DER bytes of the TLS client certificate leaf cert
@@ -54,28 +63,41 @@ pub struct UserInfo {
 /// Must match the fields minted by `handlers::tokens::create_token`.
 #[derive(Debug, Deserialize)]
 struct SaClaims {
-    /// Unique token ID. Checked against the revocation set before accepting the token.
+    /// Unique token ID, surfaced to TokenReview as `authentication.kubernetes.io/credential-id`
+    /// for audit-log correlation. Not used for revocation — see module-level notes.
     jti: Option<String>,
     /// Subject — format: "system:serviceaccount:<namespace>:<name>"
     sub: String,
-    /// The `kubernetes.io` private claim carrying pod/node binding info for
-    /// bound (projected) service-account tokens. Absent on legacy tokens.
+    /// The `kubernetes.io` private claim carrying the token's ServiceAccount identity and
+    /// optional pod/node binding info. Absent (all-default) on hand-crafted legacy tokens
+    /// that predate this claim; every token minted by `handlers::tokens::create_token`
+    /// carries `namespace`/`serviceaccount` unconditionally and `pod`/`node` when bound.
     #[serde(rename = "kubernetes.io", default)]
     kubernetes_io: KubernetesIoClaims,
 }
 
-/// Bound-object claims embedded by `handlers::tokens::create_token` under the
-/// `kubernetes.io` claim. Both fields are `None` for legacy (unbound) tokens.
+/// Bound-object + identity claims embedded by `handlers::tokens::create_token` under the
+/// `kubernetes.io` claim. `pod`/`node` are `None` for unbound tokens; `warnafter` is `None`
+/// unless the pod-bound-token expiration extension applied at mint time.
 #[derive(Debug, Deserialize, Default)]
 struct KubernetesIoClaims {
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    serviceaccount: ClaimRef,
     #[serde(default)]
     pod: Option<ClaimRef>,
     #[serde(default)]
     node: Option<ClaimRef>,
+    /// Unix timestamp past which the token is running on the pod-bound expiration-extension
+    /// safety net rather than its originally requested window. Not a rejection condition —
+    /// see the liveness-check call site in `try_verify_sa_jwt`.
+    #[serde(default)]
+    warnafter: Option<u64>,
 }
 
 /// A `{name, uid}` reference embedded in a bound SA token's `kubernetes.io` claim.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ClaimRef {
     #[serde(default)]
     name: String,
@@ -182,15 +204,18 @@ enum AuthnResult {
     BadToken,
 }
 
-fn authenticate(
-    req: &Request<Body>,
+// `auth_header` is passed as an already-extracted `Option<&str>` rather than `&Request<Body>`:
+// holding a borrow of `Request<Body>` (which wraps a `!Sync` boxed body) across this
+// function's internal `.await` (the store-backed liveness check) would make the generated
+// future `!Send`, which Tower's `Service::Future: Send` bound requires. Extracting the header
+// value before calling keeps this function decoupled from the Request type entirely.
+async fn authenticate<S: Store>(
+    auth_header: Option<&str>,
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
     peer_cert: Option<&PeerCertificate>,
-    revoked_jtis: &HashSet<String>,
+    store: &S,
 ) -> AuthnResult {
-    let auth_header = req.headers().get("authorization");
-
     match auth_header {
         None => {
             // No Authorization header — try x509 client cert before anonymous fallback.
@@ -209,7 +234,6 @@ fn authenticate(
             })
         }
         Some(value) => {
-            let value = value.to_str().unwrap_or("");
             if let Some(token) = value.strip_prefix("Bearer ") {
                 // 1. Check static token map first using constant-time comparison.
                 // HashMap.get() can leak timing information about token prefixes
@@ -228,7 +252,7 @@ fn authenticate(
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
                 if let Some(key) = sa_decoding_key {
-                    if let Some(user) = try_verify_sa_jwt(token, key, &[], revoked_jtis) {
+                    if let Some(user) = try_verify_sa_jwt(token, key, &[], store).await {
                         return AuthnResult::Identified(user);
                     }
                 }
@@ -327,12 +351,12 @@ fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
 ///
 /// Returns `Some(UserInfo)` if the token is recognized, `None` if it is not.
 /// This is exposed for use by the TokenReview handler.
-pub fn authenticate_token_with_audiences(
+pub async fn authenticate_token_with_audiences<S: Store>(
     token: &str,
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
     audiences: &[String],
-    revoked_jtis: &HashSet<String>,
+    store: &S,
 ) -> Option<UserInfo> {
     if let Some(info) = ct_token_lookup(token_map, token) {
         let mut user = info.clone();
@@ -346,24 +370,80 @@ pub fn authenticate_token_with_audiences(
     }
     if let Some(key) = sa_decoding_key {
         // try_verify_sa_jwt already appends system:authenticated.
-        if let Some(user) = try_verify_sa_jwt(token, key, audiences, revoked_jtis) {
+        if let Some(user) = try_verify_sa_jwt(token, key, audiences, store).await {
             return Some(user);
         }
     }
     None
 }
 
+/// Return the current Unix time in seconds. Used by the bound-object liveness check's
+/// deletion-grace-period arithmetic and by the stale-token (`warnafter`) check below.
+fn unix_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Verify that the store object at `key` still exists, has `metadata.uid == expected_uid`,
+/// and — if it has been marked for deletion — that the deletion happened no more than
+/// `DELETION_LEEWAY_SECS` ago.
+///
+/// This is the bound-object liveness primitive behind `try_verify_sa_jwt`'s ServiceAccount
+/// and Pod checks: mirrors upstream Kubernetes' `Validator.Validate` (pkg/serviceaccount/
+/// claims.go), which re-verifies the bound object on every single authentication attempt
+/// rather than relying on a revocation list. A missing object, a UID mismatch (the name was
+/// deleted and recreated), or a deletion older than the leeway window all fail the check.
+async fn object_is_live<S: Store>(store: &S, key: &str, expected_uid: &str) -> bool {
+    let obj = match store.get(key).await {
+        Ok(Some(obj)) => obj,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!("SA JWT liveness check: store error looking up {key}: {e}");
+            return false;
+        }
+    };
+    let val: serde_json::Value = match serde_json::from_slice(&obj.value) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("SA JWT liveness check: failed to parse stored object {key}: {e}");
+            return false;
+        }
+    };
+    let meta: crate::types::ObjectMeta =
+        serde_json::from_value(val["metadata"].clone()).unwrap_or_default();
+    if meta.uid.as_deref() != Some(expected_uid) {
+        return false;
+    }
+    if let Some(ts) = meta.deletion_timestamp {
+        match rfc3339_to_unix_secs(&ts) {
+            Some(deleted_at) if (unix_now() as i64) - deleted_at > DELETION_LEEWAY_SECS => {
+                return false;
+            }
+            Some(_) => {} // deleted, but still within the grace period
+            None => {
+                tracing::warn!(
+                    "SA JWT liveness check: unparseable deletionTimestamp {ts:?} on {key}"
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Attempt to decode and verify a bearer token as an RS256 SA JWT.
-/// Returns `Some(UserInfo)` on success, `None` if the token is invalid or revoked.
+/// Returns `Some(UserInfo)` on success, `None` if the token is invalid, expired, or bound to
+/// a ServiceAccount/Pod that is no longer live.
 /// `audiences` is the list of acceptable audiences; defaults to
 /// ["https://kubernetes.default.svc"] when empty.
-/// `revoked_jtis` is the set of revoked JTI values; a token whose `jti` claim
-/// appears in this set is rejected even if the signature and expiry are valid.
-pub(crate) fn try_verify_sa_jwt(
+pub(crate) async fn try_verify_sa_jwt<S: Store>(
     token: &str,
     key: &DecodingKey,
     audiences: &[String],
-    revoked_jtis: &HashSet<String>,
+    store: &S,
 ) -> Option<UserInfo> {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&["https://kubernetes.default.svc"]);
@@ -376,95 +456,136 @@ pub(crate) fn try_verify_sa_jwt(
     // No leeway: reject tokens that are even 1 second past expiry.
     validation.leeway = 0;
 
-    match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
-        Ok(data) => {
-            // Check revocation before accepting the token. A revoked JTI is rejected
-            // even if the signature and expiry are otherwise valid — this allows
-            // immediate token invalidation without waiting for the 24h JWT expiry.
-            let jti = data.claims.jti;
-            if let Some(jti) = &jti {
-                if revoked_jtis.contains(jti.as_str()) {
-                    tracing::debug!("SA JWT rejected: jti={jti} is in the revocation list");
-                    return None;
-                }
-            }
-            let sub = data.claims.sub;
-            tracing::debug!("SA JWT verified: sub={sub}");
-            // sub format: system:serviceaccount:{ns}:{name}
-            // Validate before use: a malformed sub silently omits the
-            // namespace-scoped group, causing RBAC policies on
-            // system:serviceaccounts:{ns} to silently fail.
-            let parts: Vec<&str> = sub.splitn(4, ':').collect();
-            if parts.len() != 4 || parts[0] != "system" || parts[1] != "serviceaccount" {
-                tracing::warn!(
-                    "SA JWT rejected: sub does not match \
-                     system:serviceaccount:{{ns}}:{{name}} format: sub={sub}"
-                );
-                return None;
-            }
-            let groups = {
-                let mut g = vec!["system:serviceaccounts".to_owned()];
-                g.push(format!("system:serviceaccounts:{}", parts[2]));
-                // Real Kubernetes always adds system:authenticated to every
-                // successfully identified user so that ClusterRoleBindings on
-                // that group (e.g. system:basic-user) apply universally.
-                g.push("system:authenticated".to_owned());
-                g
-            };
-            // Surface the token's unique ID as authentication.kubernetes.io/credential-id
-            // so that TokenReview callers can verify which specific token was used.
-            // Upstream format: "JTI=" + the jti claim value.
-            let mut extra = HashMap::new();
-            if let Some(jti) = jti {
-                extra.insert(
-                    "authentication.kubernetes.io/credential-id".to_owned(),
-                    vec![format!("JTI={jti}")],
-                );
-            }
-            // Bound (projected) SA tokens carry pod/node binding info under the
-            // kubernetes.io claim (see handlers::tokens::create_token). Conformance
-            // ([sig-auth] ServiceAccounts "should mount an API token into pods")
-            // calls TokenReview on such a token and asserts these extra entries are
-            // present with values matching the actual bound pod/node — omit them
-            // entirely for legacy tokens that carry no binding rather than fabricate.
-            if let Some(pod) = data.claims.kubernetes_io.pod {
-                if !pod.name.is_empty() && !pod.uid.is_empty() {
-                    extra.insert(
-                        "authentication.kubernetes.io/pod-name".to_owned(),
-                        vec![pod.name],
-                    );
-                    extra.insert(
-                        "authentication.kubernetes.io/pod-uid".to_owned(),
-                        vec![pod.uid],
-                    );
-                }
-            }
-            if let Some(node) = data.claims.kubernetes_io.node {
-                if !node.name.is_empty() {
-                    extra.insert(
-                        "authentication.kubernetes.io/node-name".to_owned(),
-                        vec![node.name],
-                    );
-                    if !node.uid.is_empty() {
-                        extra.insert(
-                            "authentication.kubernetes.io/node-uid".to_owned(),
-                            vec![node.uid],
-                        );
-                    }
-                }
-            }
-            Some(UserInfo {
-                username: sub,
-                uid: String::new(),
-                groups,
-                extra,
-            })
-        }
+    let data = match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
+        Ok(data) => data,
         Err(e) => {
             tracing::debug!("SA JWT verification failed: {e}");
-            None
+            return None;
+        }
+    };
+
+    let jti = data.claims.jti;
+    let sub = data.claims.sub;
+    tracing::debug!("SA JWT verified: sub={sub}");
+    // sub format: system:serviceaccount:{ns}:{name}
+    // Validate before use: a malformed sub silently omits the
+    // namespace-scoped group, causing RBAC policies on
+    // system:serviceaccounts:{ns} to silently fail.
+    let parts: Vec<&str> = sub.splitn(4, ':').collect();
+    if parts.len() != 4 || parts[0] != "system" || parts[1] != "serviceaccount" {
+        tracing::warn!(
+            "SA JWT rejected: sub does not match \
+             system:serviceaccount:{{ns}}:{{name}} format: sub={sub}"
+        );
+        return None;
+    }
+
+    // Bound-object liveness check — see `object_is_live` for the mechanism. Deleting the
+    // ServiceAccount (or, for a pod-bound token, the Pod) it was minted for is the only way
+    // to invalidate a u7s SA token before its JWT `exp`; there is no JTI-based revocation
+    // list (upstream Kubernetes doesn't have one either — see module-level notes).
+    let kio = &data.claims.kubernetes_io;
+    if !object_is_live(
+        store,
+        &object_key("serviceaccounts", &kio.namespace, &kio.serviceaccount.name),
+        &kio.serviceaccount.uid,
+    )
+    .await
+    {
+        tracing::debug!(
+            "SA JWT rejected: ServiceAccount {}/{} is not live",
+            kio.namespace,
+            kio.serviceaccount.name
+        );
+        return None;
+    }
+    if let Some(pod) = &kio.pod {
+        if !object_is_live(
+            store,
+            &object_key("pods", &kio.namespace, &pod.name),
+            &pod.uid,
+        )
+        .await
+        {
+            tracing::debug!(
+                "SA JWT rejected: bound Pod {}/{} is not live",
+                kio.namespace,
+                pod.name
+            );
+            return None;
         }
     }
+    // Stale-token observability: a token past its `warnafter` timestamp is still accepted
+    // (the real `exp` claim, already validated above, governs actual validity) but its
+    // continued use signals reliance on the pod-bound-token expiration extension rather than
+    // a timely kubelet refresh — mirrors upstream's stale-projected-token audit signal.
+    if let Some(warnafter) = kio.warnafter {
+        if unix_now() > warnafter {
+            tracing::warn!(
+                "SA JWT for sub={sub} accepted past its warnafter timestamp — relying on the \
+                 pod-bound-token expiration extension instead of a timely refresh"
+            );
+            crate::metrics::STALE_SA_TOKENS_TOTAL.inc();
+        }
+    }
+
+    let groups = {
+        let mut g = vec!["system:serviceaccounts".to_owned()];
+        g.push(format!("system:serviceaccounts:{}", parts[2]));
+        // Real Kubernetes always adds system:authenticated to every
+        // successfully identified user so that ClusterRoleBindings on
+        // that group (e.g. system:basic-user) apply universally.
+        g.push("system:authenticated".to_owned());
+        g
+    };
+    // Surface the token's unique ID as authentication.kubernetes.io/credential-id
+    // so that TokenReview callers can verify which specific token was used.
+    // Upstream format: "JTI=" + the jti claim value.
+    let mut extra = HashMap::new();
+    if let Some(jti) = jti {
+        extra.insert(
+            "authentication.kubernetes.io/credential-id".to_owned(),
+            vec![format!("JTI={jti}")],
+        );
+    }
+    // Bound (projected) SA tokens carry pod/node binding info under the
+    // kubernetes.io claim (see handlers::tokens::create_token). Conformance
+    // ([sig-auth] ServiceAccounts "should mount an API token into pods")
+    // calls TokenReview on such a token and asserts these extra entries are
+    // present with values matching the actual bound pod/node — omit them
+    // entirely for legacy tokens that carry no binding rather than fabricate.
+    if let Some(pod) = data.claims.kubernetes_io.pod {
+        if !pod.name.is_empty() && !pod.uid.is_empty() {
+            extra.insert(
+                "authentication.kubernetes.io/pod-name".to_owned(),
+                vec![pod.name],
+            );
+            extra.insert(
+                "authentication.kubernetes.io/pod-uid".to_owned(),
+                vec![pod.uid],
+            );
+        }
+    }
+    if let Some(node) = data.claims.kubernetes_io.node {
+        if !node.name.is_empty() {
+            extra.insert(
+                "authentication.kubernetes.io/node-name".to_owned(),
+                vec![node.name],
+            );
+            if !node.uid.is_empty() {
+                extra.insert(
+                    "authentication.kubernetes.io/node-uid".to_owned(),
+                    vec![node.uid],
+                );
+            }
+        }
+    }
+    Some(UserInfo {
+        username: sub,
+        uid: String::new(),
+        groups,
+        extra,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +847,7 @@ pub struct AuthLayer {
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
     sa_decoding_key: Option<Arc<DecodingKey>>,
-    revoked_jtis: Arc<Mutex<HashSet<String>>>,
+    store: Arc<SqliteStore>,
 }
 
 impl AuthLayer {
@@ -734,13 +855,13 @@ impl AuthLayer {
         rbac_index: Arc<RbacIndex>,
         token_map: HashMap<String, UserInfo>,
         sa_decoding_key: Option<Arc<DecodingKey>>,
-        revoked_jtis: Arc<Mutex<HashSet<String>>>,
+        store: Arc<SqliteStore>,
     ) -> Self {
         AuthLayer {
             rbac_index,
             token_map: Arc::new(token_map),
             sa_decoding_key,
-            revoked_jtis,
+            store,
         }
     }
 }
@@ -754,7 +875,7 @@ impl<S> Layer<S> for AuthLayer {
             rbac_index: Arc::clone(&self.rbac_index),
             token_map: Arc::clone(&self.token_map),
             sa_decoding_key: self.sa_decoding_key.clone(),
-            revoked_jtis: Arc::clone(&self.revoked_jtis),
+            store: Arc::clone(&self.store),
         }
     }
 }
@@ -769,7 +890,7 @@ pub struct AuthService<S> {
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
     sa_decoding_key: Option<Arc<DecodingKey>>,
-    revoked_jtis: Arc<Mutex<HashSet<String>>>,
+    store: Arc<SqliteStore>,
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -796,173 +917,187 @@ where
             return Box::pin(self.inner.call(req));
         }
 
-        // 1. Authenticate.
-        let peer_cert = req.extensions().get::<PeerCertificate>().cloned();
-        let revoked_jtis_guard = self.revoked_jtis.lock().unwrap();
-        let authenticated_user = match authenticate(
-            &req,
-            &self.token_map,
-            self.sa_decoding_key.as_deref(),
-            peer_cert.as_ref(),
-            &revoked_jtis_guard,
-        ) {
-            AuthnResult::Identified(u) => u,
-            AuthnResult::BadToken => {
-                return Box::pin(async move { Ok(unauthorized_response()) });
-            }
-        };
+        // Authentication now needs to re-verify bound-object liveness against the store on
+        // every request (see try_verify_sa_jwt), so the whole authn+authz+dispatch sequence
+        // runs inside one async block. `inner` is cloned rather than called in place — the
+        // same clone-then-.await idiom InflightService uses — since Service::call can only be
+        // invoked once we're past the awaited authenticate() call.
+        let rbac_index = Arc::clone(&self.rbac_index);
+        let token_map = Arc::clone(&self.token_map);
+        let sa_decoding_key = self.sa_decoding_key.clone();
+        let store = Arc::clone(&self.store);
+        let mut inner = self.inner.clone();
 
-        // 1a. Impersonation — Kubernetes-style Impersonate-User / Impersonate-Group headers.
-        //
-        // When present, the authenticated user is requesting to act as a different identity.
-        // We must verify that the authenticated user has the `impersonate` verb on the
-        // target resources before substituting the impersonated identity.
-        //
-        // The impersonated groups replace the authenticated user's groups entirely; real
-        // Kubernetes always adds system:authenticated to any impersonated non-system user,
-        // but if the caller explicitly supplies groups we use those verbatim (just like the
-        // real apiserver does when Impersonate-Group headers are provided).
-        let user = if let Some(impersonate_user) = req
-            .headers()
-            .get("Impersonate-User")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_owned())
-        {
-            // Collect all Impersonate-Group header values (may be repeated).
-            let impersonate_groups: Vec<String> = req
+        Box::pin(async move {
+            // 1. Authenticate. Extract the header value up front (see authenticate's doc
+            // comment for why it takes Option<&str> rather than &Request<Body>).
+            let peer_cert = req.extensions().get::<PeerCertificate>().cloned();
+            let auth_header = req
                 .headers()
-                .get_all("Impersonate-Group")
-                .iter()
-                .filter_map(|v| v.to_str().ok())
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
+            let authenticated_user = match authenticate(
+                auth_header,
+                &token_map,
+                sa_decoding_key.as_deref(),
+                peer_cert.as_ref(),
+                store.as_ref(),
+            )
+            .await
+            {
+                AuthnResult::Identified(u) => u,
+                AuthnResult::BadToken => return Ok(unauthorized_response()),
+            };
+
+            // 1a. Impersonation — Kubernetes-style Impersonate-User / Impersonate-Group headers.
+            //
+            // When present, the authenticated user is requesting to act as a different identity.
+            // We must verify that the authenticated user has the `impersonate` verb on the
+            // target resources before substituting the impersonated identity.
+            //
+            // The impersonated groups replace the authenticated user's groups entirely; real
+            // Kubernetes always adds system:authenticated to any impersonated non-system user,
+            // but if the caller explicitly supplies groups we use those verbatim (just like the
+            // real apiserver does when Impersonate-Group headers are provided).
+            let user = if let Some(impersonate_user) = req
+                .headers()
+                .get("Impersonate-User")
+                .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_owned())
-                .collect();
+            {
+                // Collect all Impersonate-Group header values (may be repeated).
+                let impersonate_groups: Vec<String> = req
+                    .headers()
+                    .get_all("Impersonate-Group")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .map(|s| s.to_owned())
+                    .collect();
 
-            // Verify the authenticated caller may impersonate this user.
-            if !self.rbac_index.is_allowed(&AuthzRequest {
-                username: &authenticated_user.username,
-                groups: &authenticated_user.groups,
-                verb: "impersonate",
-                api_group: "",
-                resource: "users",
-                subresource: "",
-                namespace: None,
-                name: Some(&impersonate_user),
-                non_resource_url: None,
-            }) {
-                let username = authenticated_user.username.clone();
-                let target = impersonate_user.clone();
-                return Box::pin(async move {
-                    Ok(forbidden_response(&username, "impersonate", &target))
-                });
-            }
-
-            // Verify the authenticated caller may impersonate each requested group.
-            for group in &impersonate_groups {
-                if !self.rbac_index.is_allowed(&AuthzRequest {
+                // Verify the authenticated caller may impersonate this user.
+                if !rbac_index.is_allowed(&AuthzRequest {
                     username: &authenticated_user.username,
                     groups: &authenticated_user.groups,
                     verb: "impersonate",
                     api_group: "",
-                    resource: "groups",
+                    resource: "users",
                     subresource: "",
                     namespace: None,
-                    name: Some(group),
+                    name: Some(&impersonate_user),
                     non_resource_url: None,
                 }) {
-                    let username = authenticated_user.username.clone();
-                    let target = group.clone();
-                    return Box::pin(async move {
-                        Ok(forbidden_response(&username, "impersonate", &target))
-                    });
+                    return Ok(forbidden_response(
+                        &authenticated_user.username,
+                        "impersonate",
+                        &impersonate_user,
+                    ));
                 }
-            }
 
-            // All impersonation checks passed — substitute impersonated identity.
-            // If the caller supplied explicit groups, use them verbatim.
-            // If no groups were provided, add system:authenticated as Kubernetes does.
-            let groups = if impersonate_groups.is_empty() {
-                vec!["system:authenticated".to_owned()]
+                // Verify the authenticated caller may impersonate each requested group.
+                for group in &impersonate_groups {
+                    if !rbac_index.is_allowed(&AuthzRequest {
+                        username: &authenticated_user.username,
+                        groups: &authenticated_user.groups,
+                        verb: "impersonate",
+                        api_group: "",
+                        resource: "groups",
+                        subresource: "",
+                        namespace: None,
+                        name: Some(group),
+                        non_resource_url: None,
+                    }) {
+                        return Ok(forbidden_response(
+                            &authenticated_user.username,
+                            "impersonate",
+                            group,
+                        ));
+                    }
+                }
+
+                // All impersonation checks passed — substitute impersonated identity.
+                // If the caller supplied explicit groups, use them verbatim.
+                // If no groups were provided, add system:authenticated as Kubernetes does.
+                let groups = if impersonate_groups.is_empty() {
+                    vec!["system:authenticated".to_owned()]
+                } else {
+                    impersonate_groups
+                };
+
+                UserInfo {
+                    username: impersonate_user,
+                    uid: String::new(),
+                    groups,
+                    extra: HashMap::new(),
+                }
             } else {
-                impersonate_groups
+                authenticated_user
             };
 
-            UserInfo {
-                username: impersonate_user,
-                uid: String::new(),
-                groups,
-                extra: HashMap::new(),
-            }
-        } else {
-            authenticated_user
-        };
+            // 2. Authorize.
+            let parsed = parse_path(&path);
 
-        // 2. Authorize.
-        let parsed = parse_path(&path);
+            // Detect non-resource URL requests: paths not rooted in /api or /apis
+            // (i.e. parse_path returned an empty resource) are non-resource requests.
+            // Examples: GET /version, GET /openapi/v2, GET /openapi/v3/apis/<group>/<ver>.
+            let non_resource_url: Option<&str> =
+                if parsed.resource.is_empty() && !path.starts_with("/api") {
+                    Some(&path)
+                } else {
+                    None
+                };
 
-        // Detect non-resource URL requests: paths not rooted in /api or /apis
-        // (i.e. parse_path returned an empty resource) are non-resource requests.
-        // Examples: GET /version, GET /openapi/v2, GET /openapi/v3/apis/<group>/<ver>.
-        let non_resource_url: Option<&str> =
-            if parsed.resource.is_empty() && !path.starts_with("/api") {
-                Some(&path)
+            // Non-resource URL verbs map directly from the HTTP method ("get", "post", ...).
+            // get_verb's list/get/watch distinction only applies to resource requests.
+            let verb = if non_resource_url.is_some() {
+                method_to_verb(req.method())
+            } else if req.method() == axum::http::Method::GET {
+                get_verb(parsed.name.as_deref(), req.uri().query())
+            } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
+                "deletecollection"
+            } else {
+                method_to_verb(req.method())
+            };
+
+            // RBAC `resourceNames` restrictions must also recognize the LIST/WATCH-with-
+            // `fieldSelector=metadata.name=<name>` pattern used by every client-go informer
+            // that watches a single named object — e.g. the built-in
+            // `extension-apiserver-authentication-reader` Role grants access to the
+            // extension-apiserver-authentication ConfigMap this way, and every aggregated
+            // apiserver (including the "sample-apiserver" conformance test) reads it through
+            // exactly this informer pattern, never a plain named GET. Real Kubernetes derives
+            // RequestInfo.Name from such an exact-match field selector for authorization
+            // purposes even though the verb stays list/watch (see requestinfo.go). Without this,
+            // a resourceNames-restricted Role can never grant informer-style access — the
+            // ConfigMap read is Forbidden forever, regardless of how long the RoleBinding has
+            // existed, which is why the aggregator conformance test's sample-apiserver pod
+            // crash-loops indefinitely instead of eventually recovering.
+            let fs_name = if parsed.name.is_none() && (verb == "list" || verb == "watch") {
+                field_selector_name(req.uri().query())
             } else {
                 None
             };
+            let authz_name = parsed.name.as_deref().or(fs_name.as_deref());
 
-        // Non-resource URL verbs map directly from the HTTP method ("get", "post", ...).
-        // get_verb's list/get/watch distinction only applies to resource requests.
-        let verb = if non_resource_url.is_some() {
-            method_to_verb(req.method())
-        } else if req.method() == axum::http::Method::GET {
-            get_verb(parsed.name.as_deref(), req.uri().query())
-        } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
-            "deletecollection"
-        } else {
-            method_to_verb(req.method())
-        };
+            let allowed = rbac_index.is_allowed(&AuthzRequest {
+                username: &user.username,
+                groups: &user.groups,
+                verb,
+                api_group: &parsed.api_group,
+                resource: &parsed.resource,
+                subresource: &parsed.subresource,
+                namespace: parsed.namespace.as_deref(),
+                name: authz_name,
+                non_resource_url,
+            });
 
-        // RBAC `resourceNames` restrictions must also recognize the LIST/WATCH-with-
-        // `fieldSelector=metadata.name=<name>` pattern used by every client-go informer
-        // that watches a single named object — e.g. the built-in
-        // `extension-apiserver-authentication-reader` Role grants access to the
-        // extension-apiserver-authentication ConfigMap this way, and every aggregated
-        // apiserver (including the "sample-apiserver" conformance test) reads it through
-        // exactly this informer pattern, never a plain named GET. Real Kubernetes derives
-        // RequestInfo.Name from such an exact-match field selector for authorization
-        // purposes even though the verb stays list/watch (see requestinfo.go). Without this,
-        // a resourceNames-restricted Role can never grant informer-style access — the
-        // ConfigMap read is Forbidden forever, regardless of how long the RoleBinding has
-        // existed, which is why the aggregator conformance test's sample-apiserver pod
-        // crash-loops indefinitely instead of eventually recovering.
-        let fs_name = if parsed.name.is_none() && (verb == "list" || verb == "watch") {
-            field_selector_name(req.uri().query())
-        } else {
-            None
-        };
-        let authz_name = parsed.name.as_deref().or(fs_name.as_deref());
+            if !allowed {
+                return Ok(forbidden_response(&user.username, verb, &parsed.resource));
+            }
 
-        let allowed = self.rbac_index.is_allowed(&AuthzRequest {
-            username: &user.username,
-            groups: &user.groups,
-            verb,
-            api_group: &parsed.api_group,
-            resource: &parsed.resource,
-            subresource: &parsed.subresource,
-            namespace: parsed.namespace.as_deref(),
-            name: authz_name,
-            non_resource_url,
-        });
-
-        if !allowed {
-            let username = user.username.clone();
-            let verb = verb.to_owned();
-            let resource = parsed.resource.clone();
-            return Box::pin(async move { Ok(forbidden_response(&username, &verb, &resource)) });
-        }
-
-        // 3. Attach UserInfo to request extensions and pass through.
-        req.extensions_mut().insert(user);
-        Box::pin(self.inner.call(req))
+            // 3. Attach UserInfo to request extensions and pass through.
+            req.extensions_mut().insert(user);
+            inner.call(req).await
+        })
     }
 }
 
@@ -981,6 +1116,15 @@ mod tests {
             b = b.header("authorization", a);
         }
         b.body(Body::empty()).unwrap()
+    }
+
+    /// Extract the Authorization header as `Option<&str>`, matching what `AuthService::call`
+    /// passes to `authenticate` (see its doc comment for why it takes this instead of
+    /// `&Request<Body>` directly).
+    fn auth_header(req: &Request<Body>) -> Option<&str> {
+        req.headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
     }
 
     /// Generate a DER cert with given CN and org using rcgen.
@@ -1005,14 +1149,68 @@ mod tests {
         cert.der().to_vec()
     }
 
+    /// Build an empty in-memory store for tests that don't exercise the SA-token
+    /// bound-object liveness check (static-token, x509, or reject-before-liveness paths).
+    fn make_test_store() -> SqliteStore {
+        SqliteStore::new(":memory:").expect("open in-memory store")
+    }
+
+    /// Seed a ServiceAccount object so a minted token's bound-object liveness check
+    /// (try_verify_sa_jwt) finds a live, UID-matching ServiceAccount at namespace/name.
+    async fn seed_service_account(store: &SqliteStore, ns: &str, name: &str, uid: &str) {
+        let key = object_key("serviceaccounts", ns, name);
+        let val = serde_json::json!({
+            "kind": "ServiceAccount",
+            "metadata": {"name": name, "namespace": ns, "uid": uid}
+        });
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed serviceaccount");
+    }
+
+    /// Seed a Pod object, optionally soft-deleted `deletion_age_secs` ago, so a
+    /// pod-bound token's liveness check can find (or fail to find) a live Pod.
+    async fn seed_pod_with_deletion(
+        store: &SqliteStore,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        deletion_age_secs: Option<i64>,
+    ) {
+        let key = object_key("pods", ns, name);
+        let mut meta = serde_json::json!({"name": name, "namespace": ns, "uid": uid});
+        if let Some(age) = deletion_age_secs {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            meta["deletionTimestamp"] =
+                serde_json::Value::String(crate::util::secs_to_rfc3339(now - age));
+        }
+        let val = serde_json::json!({"kind": "Pod", "metadata": meta});
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed pod");
+    }
+
     // --- authenticate() ---
 
-    #[test]
-    fn test_authn_no_header_is_anonymous() {
+    #[tokio::test]
+    async fn test_authn_no_header_is_anonymous() {
         // Without an Authorization header, caller must be anonymous.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        let result = authenticate(&req, &map, None, None, &HashSet::new());
+        let result = authenticate(auth_header(&req), &map, None, None, &make_test_store()).await;
         match result {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
@@ -1022,8 +1220,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_authn_valid_token_resolves_user() {
+    #[tokio::test]
+    async fn test_authn_valid_token_resolves_user() {
         // A known token must resolve to the correct UserInfo.
         let mut map = HashMap::new();
         map.insert(
@@ -1036,20 +1234,20 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(&req, &map, None, None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
             AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
             AuthnResult::BadToken => panic!("expected Identified"),
         }
     }
 
-    #[test]
-    fn test_authn_unknown_token_is_bad() {
+    #[tokio::test]
+    async fn test_authn_unknown_token_is_bad() {
         // An unrecognized token must produce BadToken, not anonymous.
         // This is critical: callers presenting a bad credential must not be
         // silently downgraded to anonymous access.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer wrong-token"));
-        match authenticate(&req, &map, None, None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
@@ -1408,7 +1606,16 @@ mod tests {
         (enc, dec)
     }
 
-    /// Mint a minimal SA JWT using the provided encoding key.
+    /// UID embedded in every ServiceAccount `mint_sa_jwt`/`mint_sa_jwt_with_jti` mint — tests
+    /// that expect a minted token to authenticate must seed a matching ServiceAccount with
+    /// this same UID via `seed_service_account`, since try_verify_sa_jwt now re-verifies the
+    /// bound ServiceAccount against the live store on every authentication attempt.
+    const TEST_SA_UID: &str = "test-sa-uid";
+
+    /// Mint a minimal SA JWT using the provided encoding key. Embeds a `kubernetes.io`
+    /// namespace/serviceaccount claim derived from `sub` (using `TEST_SA_UID`) so the
+    /// resulting token can pass the ServiceAccount liveness check once the caller seeds a
+    /// matching ServiceAccount object via `seed_service_account`.
     fn mint_sa_jwt(enc: &jsonwebtoken::EncodingKey, sub: &str, exp_offset_secs: i64) -> String {
         use serde_json::json;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1416,29 +1623,42 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
+        let parts: Vec<&str> = sub.splitn(4, ':').collect();
+        let (namespace, name) = if parts.len() == 4 {
+            (parts[2], parts[3])
+        } else {
+            ("", "")
+        };
         let claims = json!({
             "iss": "https://kubernetes.default.svc",
             "sub": sub,
             "aud": ["https://kubernetes.default.svc"],
             "iat": now,
             "exp": now + exp_offset_secs,
+            "kubernetes.io": {
+                "namespace": namespace,
+                "serviceaccount": {"name": name, "uid": TEST_SA_UID},
+            },
         });
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         jsonwebtoken::encode(&header, &claims, enc).expect("mint JWT")
     }
 
-    #[test]
-    fn test_authn_valid_sa_jwt_authenticates() {
-        // A valid SA JWT signed by the SA key must identify the subject.
-        // This is the primary fix: SA JWTs are now verified, not rejected.
+    #[tokio::test]
+    async fn test_authn_valid_sa_jwt_authenticates() {
+        // A valid SA JWT signed by the SA key, bound to a live ServiceAccount, must
+        // identify the subject. This is the primary fix: SA JWTs are now verified against
+        // both the signature AND the live ServiceAccount, not just the signature.
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
         let req = make_req(
             Method::GET,
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &HashMap::new(), Some(&dec), None, &store).await {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:serviceaccount:default:my-sa");
                 assert!(
@@ -1446,23 +1666,25 @@ mod tests {
                     "SA group must be present"
                 );
             }
-            AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),
+            AuthnResult::BadToken => panic!("valid SA JWT bound to a live SA must not be rejected"),
         }
     }
 
     /// SA JWT authentication must produce both the broad group (system:serviceaccounts)
     /// and the namespace-scoped group (system:serviceaccounts:{ns}). The namespace-scoped
     /// group is required for RBAC policies that grant access to SAs in a specific namespace.
-    #[test]
-    fn test_sa_jwt_namespace_scoped_group() {
+    #[tokio::test]
+    async fn test_sa_jwt_namespace_scoped_group() {
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "kube-system", "coredns", TEST_SA_UID).await;
         let token = mint_sa_jwt(&enc, "system:serviceaccount:kube-system:coredns", 3600);
         let req = make_req(
             Method::GET,
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &HashMap::new(), Some(&dec), None, &store).await {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:serviceaccounts".to_owned()),
@@ -1478,10 +1700,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_authn_tampered_sa_jwt_rejected() {
+    #[tokio::test]
+    async fn test_authn_tampered_sa_jwt_rejected() {
         // A JWT with a tampered signature must be rejected — not silently allowed.
-        // Tampering: replace last 8 chars of the token (signature portion).
+        // Tampering: replace last 8 chars of the token (signature portion). Signature
+        // verification fails before the store is ever consulted, so an empty store
+        // (no seeded ServiceAccount) is sufficient here.
         let (enc, dec) = test_rsa_keypair();
         let mut token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
         let len = token.len();
@@ -1491,15 +1715,24 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
+        match authenticate(
+            auth_header(&req),
+            &HashMap::new(),
+            Some(&dec),
+            None,
+            &make_test_store(),
+        )
+        .await
+        {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("tampered JWT must not succeed"),
         }
     }
 
-    #[test]
-    fn test_authn_expired_sa_jwt_rejected() {
-        // An expired JWT must be rejected — not silently allowed.
+    #[tokio::test]
+    async fn test_authn_expired_sa_jwt_rejected() {
+        // An expired JWT must be rejected — not silently allowed. Expiry is checked
+        // before the store is consulted, so an empty store is sufficient here.
         let (enc, dec) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", -1);
         let req = make_req(
@@ -1507,16 +1740,25 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
+        match authenticate(
+            auth_header(&req),
+            &HashMap::new(),
+            Some(&dec),
+            None,
+            &make_test_store(),
+        )
+        .await
+        {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("expired JWT must not succeed"),
         }
     }
 
-    #[test]
-    fn test_authn_sa_jwt_wrong_key_rejected() {
+    #[tokio::test]
+    async fn test_authn_sa_jwt_wrong_key_rejected() {
         // A JWT signed by a different key must be rejected.
-        // This prevents accepting tokens from a different cluster.
+        // This prevents accepting tokens from a different cluster. Signature verification
+        // fails before the store is consulted, so an empty store is sufficient here.
         let (enc, _dec) = test_rsa_keypair();
         let (_enc2, dec2) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
@@ -1525,19 +1767,29 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec2), None, &HashSet::new()) {
+        match authenticate(
+            auth_header(&req),
+            &HashMap::new(),
+            Some(&dec2),
+            None,
+            &make_test_store(),
+        )
+        .await
+        {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("JWT from wrong key must not succeed"),
         }
     }
 
-    #[test]
-    fn token_review_custom_audience_accepted() {
+    #[tokio::test]
+    async fn token_review_custom_audience_accepted() {
         // A SA JWT with a non-default audience (e.g. system:konnectivity-server)
         // must be accepted by authenticate_token_with_audiences when that audience
         // is explicitly requested.  Without this, the konnectivity-server cannot
         // validate agent tokens via TokenReview, blocking the tunnel connection.
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "kube-system", "konnectivity-agent", "ka-uid").await;
         use serde_json::json;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -1550,18 +1802,18 @@ mod tests {
             "aud": ["system:konnectivity-server"],
             "iat": now,
             "exp": now + 3600,
+            "kubernetes.io": {
+                "namespace": "kube-system",
+                "serviceaccount": {"name": "konnectivity-agent", "uid": "ka-uid"},
+            },
         });
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
 
         // Must fail with default (https://kubernetes.default.svc) audience.
-        let result_default = authenticate_token_with_audiences(
-            &token,
-            &HashMap::new(),
-            Some(&dec),
-            &[],
-            &HashSet::new(),
-        );
+        let result_default =
+            authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &[], &store)
+                .await;
         assert!(
             result_default.is_none(),
             "token with non-default audience must NOT authenticate when no audiences specified"
@@ -1569,13 +1821,9 @@ mod tests {
 
         // Must succeed when the correct audience is explicitly requested.
         let aud = vec!["system:konnectivity-server".to_owned()];
-        let result = authenticate_token_with_audiences(
-            &token,
-            &HashMap::new(),
-            Some(&dec),
-            &aud,
-            &HashSet::new(),
-        );
+        let result =
+            authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &aud, &store)
+                .await;
         let user = result.expect(
             "token with system:konnectivity-server audience must authenticate \
              when that audience is explicitly requested via TokenReview spec.audiences — \
@@ -1592,18 +1840,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sa_jwt_with_malformed_sub_is_rejected() {
+    #[tokio::test]
+    async fn sa_jwt_with_malformed_sub_is_rejected() {
         // A JWT whose sub is missing the name segment (only 3 colon-separated
         // parts) must be rejected entirely. Before this fix, the missing segment
         // caused the namespace-scoped group (system:serviceaccounts:{ns}) to be
         // silently omitted, making RBAC policies on that group silently fail.
         // Rejecting the token is the correct response: a well-formed SA JWT must
-        // always have sub = system:serviceaccount:{ns}:{name}.
+        // always have sub = system:serviceaccount:{ns}:{name}. The sub-format check
+        // runs before the store is consulted, so an empty store is sufficient here.
         let (enc, dec) = test_rsa_keypair();
         // Only three parts — missing the service account name.
         let token = mint_sa_jwt(&enc, "system:serviceaccount:only-three", 3600);
-        let result = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new());
+        let result = try_verify_sa_jwt(&token, &dec, &[], &make_test_store()).await;
         assert!(
             result.is_none(),
             "JWT with malformed sub (missing name segment) must be rejected, \
@@ -1616,9 +1865,12 @@ mod tests {
     /// token into pods" test asserts via TokenReview.Status.User.Extra. Before
     /// this fix, `kubernetes.io.pod`/`kubernetes.io.node` claims were decoded
     /// nowhere, so bound tokens looked identical to legacy tokens to any caller.
-    #[test]
-    fn bound_sa_jwt_extra_includes_pod_and_node_info() {
+    #[tokio::test]
+    async fn bound_sa_jwt_extra_includes_pod_and_node_info() {
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", "sa-uid-1").await;
+        seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", None).await;
         use serde_json::json;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -1642,8 +1894,9 @@ mod tests {
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
 
-        let user = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new())
-            .expect("bound SA JWT with valid signature must authenticate");
+        let user = try_verify_sa_jwt(&token, &dec, &[], &store)
+            .await
+            .expect("bound SA JWT with valid signature and a live SA+Pod must authenticate");
 
         assert_eq!(
             user.extra.get("authentication.kubernetes.io/pod-name"),
@@ -1672,12 +1925,15 @@ mod tests {
     /// NOT have pod/node extra fields fabricated. Only the credential-id extra
     /// (from `jti`) may be present; inventing pod/node info for a token that
     /// never carried it would let TokenReview lie about binding provenance.
-    #[test]
-    fn unbound_sa_jwt_extra_omits_pod_and_node_info() {
+    #[tokio::test]
+    async fn unbound_sa_jwt_extra_omits_pod_and_node_info() {
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
-        let user = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new())
-            .expect("valid unbound SA JWT must authenticate");
+        let user = try_verify_sa_jwt(&token, &dec, &[], &store)
+            .await
+            .expect("valid unbound SA JWT with a live SA must authenticate");
         assert!(
             !user
                 .extra
@@ -1699,10 +1955,215 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // JTI revocation tests
+    // Bound-object liveness check (mirrors upstream Kubernetes' BoundServiceAccountToken
+    // authenticator — see try_verify_sa_jwt/object_is_live for the mechanism this replaces
+    // the removed JTI revocation list with).
     // ---------------------------------------------------------------------------
 
-    /// Mint a JWT that includes a `jti` claim for testing revocation.
+    /// Mint a pod-bound SA JWT with explicit ServiceAccount/pod identity, for exercising the
+    /// bound-object liveness check with deliberately mismatched or absent store objects.
+    fn mint_pod_bound_sa_jwt(
+        enc: &jsonwebtoken::EncodingKey,
+        ns: &str,
+        sa_name: &str,
+        sa_uid: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> String {
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "iss": "https://kubernetes.default.svc",
+            "sub": format!("system:serviceaccount:{ns}:{sa_name}"),
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + 3600,
+            "kubernetes.io": {
+                "namespace": ns,
+                "serviceaccount": {"name": sa_name, "uid": sa_uid},
+                "pod": {"name": pod_name, "uid": pod_uid},
+            },
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        jsonwebtoken::encode(&header, &claims, enc).expect("mint pod-bound JWT")
+    }
+
+    /// A token whose embedded ServiceAccount UID does not match the live SA's UID must be
+    /// rejected. Without this, deleting and recreating a ServiceAccount by the same name
+    /// (which gets a new UID) would not invalidate tokens minted for the old SA.
+    #[tokio::test]
+    async fn sa_jwt_rejected_when_serviceaccount_uid_does_not_match_live_object() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        // Live SA has a DIFFERENT uid than the one embedded in the token.
+        seed_service_account(&store, "default", "my-sa", "live-uid-actual").await;
+        let token = mint_pod_bound_sa_jwt(
+            &enc,
+            "default",
+            "my-sa",
+            "stale-uid-from-token",
+            "my-pod",
+            "pod-uid-1",
+        );
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_none(),
+            "a token whose ServiceAccount UID doesn't match the live object must be rejected \
+             — otherwise deleting and recreating a ServiceAccount would not invalidate its \
+             old tokens"
+        );
+    }
+
+    /// A token bound to a Pod that has been hard-deleted (no longer present in the store at
+    /// all) must be rejected — the only real remediation for a leaked pod-bound token today
+    /// is deleting the pod it was bound to, so this must actually work.
+    #[tokio::test]
+    async fn sa_jwt_rejected_when_bound_pod_is_hard_deleted() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", "sa-uid-1").await;
+        // No pod seeded at all — simulates the pod having been hard-deleted.
+        let token =
+            mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_none(),
+            "a token bound to a Pod that no longer exists must be rejected — without this, \
+             deleting the pod a leaked token was bound to would not invalidate that token"
+        );
+    }
+
+    /// A token bound to a Pod that was soft-deleted less than 60s ago must still
+    /// authenticate — this grace period (mirroring upstream's jwt.DefaultLeeway) exists so
+    /// a pod's own SA token doesn't go invalid mid-graceful-shutdown, before the pod has
+    /// actually finished terminating and the kubelet has torn down its workload.
+    #[tokio::test]
+    async fn sa_jwt_still_accepted_when_bound_pod_deleted_within_grace_period() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", "sa-uid-1").await;
+        seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", Some(10)).await;
+        let token =
+            mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_some(),
+            "a token bound to a pod deleted less than 60s ago must still authenticate — \
+             without this grace period, a pod's own SA token would go invalid mid-graceful-\
+             shutdown, before the pod has actually finished terminating"
+        );
+    }
+
+    /// A token bound to a Pod that was soft-deleted more than 60s ago must be rejected — the
+    /// grace period exists for graceful shutdown, not to keep a token valid indefinitely
+    /// once the pod is long gone.
+    #[tokio::test]
+    async fn sa_jwt_rejected_when_bound_pod_deleted_past_grace_period() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", "sa-uid-1").await;
+        seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", Some(120)).await;
+        let token =
+            mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_none(),
+            "a token bound to a pod deleted more than 60s ago must be rejected — otherwise a \
+             leaked token bound to a long-gone pod would remain usable for its full JWT \
+             lifetime, defeating the only real remediation for a leaked bound token"
+        );
+    }
+
+    /// A token bound to a Pod that still exists with a matching UID must authenticate — the
+    /// liveness check must not regress the ordinary happy path of a running pod's mounted
+    /// projected SA token.
+    #[tokio::test]
+    async fn sa_jwt_accepted_when_bound_pod_is_live_with_matching_uid() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", "sa-uid-1").await;
+        seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", None).await;
+        let token =
+            mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_some(),
+            "a pod-bound token whose pod is alive with a matching UID must authenticate — \
+             the liveness check must not break the ordinary case of a running pod's mounted \
+             token"
+        );
+    }
+
+    /// An unbound (no pod claim) token with a live, UID-matching ServiceAccount must still
+    /// authenticate — the bound-object liveness check must not regress plain legacy tokens
+    /// that were never bound to a specific pod.
+    #[tokio::test]
+    async fn sa_jwt_accepted_for_unbound_token_with_live_matching_serviceaccount() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_some(),
+            "an unbound token with a live, UID-matching ServiceAccount must authenticate — \
+             the SA liveness check must not incorrectly require a pod binding"
+        );
+    }
+
+    /// A token still within its real `exp` but past its `warnafter` timestamp must still
+    /// authenticate — the pod-bound-token extension is a safety net, not a rejection
+    /// trigger — but accepting it must increment the stale-token metric so operators can
+    /// observe reliance on the extension instead of a timely kubelet refresh, mirroring
+    /// upstream Kubernetes' stale-projected-token audit signal.
+    #[tokio::test]
+    async fn sa_jwt_past_warnafter_still_accepted_and_increments_stale_metric() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", "sa-uid-warn").await;
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "iss": "https://kubernetes.default.svc",
+            "sub": "system:serviceaccount:default:my-sa",
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + 3600, // still valid for another hour
+            "kubernetes.io": {
+                "namespace": "default",
+                "serviceaccount": {"name": "my-sa", "uid": "sa-uid-warn"},
+                "warnafter": now - 10, // already past warnafter
+            },
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+
+        let before = crate::metrics::STALE_SA_TOKENS_TOTAL.get();
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        assert!(
+            result.is_some(),
+            "a token past its warnafter timestamp but still within its real exp must still \
+             authenticate — warnafter is an observability signal, not a rejection condition"
+        );
+        let after = crate::metrics::STALE_SA_TOKENS_TOTAL.get();
+        assert_eq!(
+            after,
+            before + 1,
+            "accepting a token past its warnafter must increment the stale-token metric so \
+             operators can detect reliance on the pod-bound-token expiration extension"
+        );
+    }
+
+    /// Mint a JWT that includes a `jti` claim, plus the same `kubernetes.io`
+    /// namespace/serviceaccount claim `mint_sa_jwt` embeds (see `TEST_SA_UID`).
     fn mint_sa_jwt_with_jti(
         enc: &jsonwebtoken::EncodingKey,
         sub: &str,
@@ -1715,6 +2176,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
+        let parts: Vec<&str> = sub.splitn(4, ':').collect();
+        let (namespace, name) = if parts.len() == 4 {
+            (parts[2], parts[3])
+        } else {
+            ("", "")
+        };
         let claims = json!({
             "jti": jti,
             "iss": "https://kubernetes.default.svc",
@@ -1722,82 +2189,17 @@ mod tests {
             "aud": ["https://kubernetes.default.svc"],
             "iat": now,
             "exp": now + exp_offset_secs,
+            "kubernetes.io": {
+                "namespace": namespace,
+                "serviceaccount": {"name": name, "uid": TEST_SA_UID},
+            },
         });
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         jsonwebtoken::encode(&header, &claims, enc).expect("mint JWT with jti")
     }
 
-    /// A token whose JTI is in the revocation set must be rejected by try_verify_sa_jwt
-    /// even though the signature and expiry are valid.
-    ///
-    /// Without this check, a compromised or leaked SA token remains usable for the full
-    /// 24-hour JWT lifetime. JTI revocation allows immediate invalidation before expiry.
-    #[test]
-    fn revoked_jti_is_rejected_by_try_verify_sa_jwt() {
-        let (enc, dec) = test_rsa_keypair();
-        let jti = "revoked-jti-abc-123";
-        let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
-
-        let mut revoked = HashSet::new();
-        revoked.insert(jti.to_owned());
-
-        let result = try_verify_sa_jwt(&token, &dec, &[], &revoked);
-        assert!(
-            result.is_none(),
-            "a token whose JTI is in the revocation set must be rejected — \
-             without this, revoked SA tokens remain usable for up to 24h after revocation"
-        );
-    }
-
-    /// A token whose JTI is NOT in the revocation set must pass verification normally.
-    ///
-    /// Revocation must only block tokens with explicitly revoked JTIs. An unrevoked token
-    /// with a valid signature and unexpired exp must authenticate successfully.
-    #[test]
-    fn unrevoked_jti_passes_try_verify_sa_jwt() {
-        let (enc, dec) = test_rsa_keypair();
-        let jti = "live-jti-xyz-456";
-        let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
-
-        // Revocation set contains a DIFFERENT jti — this token's jti is not revoked.
-        let mut revoked = HashSet::new();
-        revoked.insert("some-other-revoked-jti".to_owned());
-
-        let result = try_verify_sa_jwt(&token, &dec, &[], &revoked);
-        assert!(
-            result.is_some(),
-            "a token whose JTI is not in the revocation set must authenticate — \
-             revocation must not block valid unrevoked tokens"
-        );
-        let user = result.unwrap();
-        assert_eq!(
-            user.username, "system:serviceaccount:default:my-sa",
-            "authenticated username must match the token subject"
-        );
-    }
-
-    /// A token without a jti claim (legacy tokens from before this change) must
-    /// still authenticate if the revocation set is non-empty. The jti field is
-    /// optional in SaClaims so old tokens without it are not broken.
-    #[test]
-    fn token_without_jti_authenticates_despite_nonempty_revocation_set() {
-        let (enc, dec) = test_rsa_keypair();
-        // mint_sa_jwt produces a token WITHOUT a jti claim (legacy format).
-        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:legacy-sa", 3600);
-
-        let mut revoked = HashSet::new();
-        revoked.insert("some-revoked-jti".to_owned());
-
-        let result = try_verify_sa_jwt(&token, &dec, &[], &revoked);
-        assert!(
-            result.is_some(),
-            "a token without a jti claim must not be blocked by a non-empty revocation set — \
-             the jti field is optional and absence means it cannot be revoked via JTI"
-        );
-    }
-
-    #[test]
-    fn test_authn_static_token_takes_priority_over_jwt() {
+    #[tokio::test]
+    async fn test_authn_static_token_takes_priority_over_jwt() {
         // If a token happens to be in the static map, it must use static auth,
         // not fall through to JWT parsing (which would fail on a non-JWT string).
         let mut map = HashMap::new();
@@ -1813,7 +2215,15 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         // Use a static token string — not a JWT — to confirm static path fires.
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer static-tok"));
-        match authenticate(&req, &map, Some(&dec), None, &HashSet::new()) {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            Some(&dec),
+            None,
+            &make_test_store(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => assert_eq!(u.username, "static-user"),
             AuthnResult::BadToken => panic!("static token must resolve"),
         }
@@ -1889,15 +2299,23 @@ mod tests {
         assert!(user.groups.contains(&"some-org".to_owned()));
     }
 
-    #[test]
-    fn test_x509_cert_injected_into_authn_no_header() {
+    #[tokio::test]
+    async fn test_x509_cert_injected_into_authn_no_header() {
         // When no Authorization header is present but a PeerCertificate is
         // available, the caller must be identified via x509 — not as anonymous.
         let der = make_cert_der("alice", &["system:masters"]);
         let cert = PeerCertificate(der);
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        match authenticate(&req, &map, None, Some(&cert), &HashSet::new()) {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            Some(&cert),
+            &make_test_store(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "alice");
                 assert!(u.groups.contains(&"system:masters".to_owned()));
@@ -1906,8 +2324,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_x509_auth_does_not_override_bearer_token() {
+    #[tokio::test]
+    async fn test_x509_auth_does_not_override_bearer_token() {
         // A bearer token in Authorization must take priority over a client
         // cert; the caller explicitly chose token auth.
         let mut map = HashMap::new();
@@ -1923,7 +2341,15 @@ mod tests {
         let der = make_cert_der("alice", &["system:masters"]);
         let cert = PeerCertificate(der);
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer tok"));
-        match authenticate(&req, &map, None, Some(&cert), &HashSet::new()) {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            Some(&cert),
+            &make_test_store(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => assert_eq!(u.username, "bob"),
             AuthnResult::BadToken => panic!("static token must resolve"),
         }
@@ -1935,18 +2361,20 @@ mod tests {
     // those bindings are invisible to every authenticated user, causing permission
     // discovery failures on startup.
 
-    #[test]
-    fn test_sa_jwt_includes_system_authenticated() {
+    #[tokio::test]
+    async fn test_sa_jwt_includes_system_authenticated() {
         // SA JWTs must carry system:authenticated so that ClusterRoleBindings
         // targeting that group (like system:basic-user) apply to service accounts.
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
         let req = make_req(
             Method::GET,
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &HashMap::new(), Some(&dec), None, &store).await {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:authenticated".to_owned()),
@@ -1973,8 +2401,8 @@ mod tests {
         assert!(user.groups.contains(&"engineering".to_owned()));
     }
 
-    #[test]
-    fn test_static_token_includes_system_authenticated() {
+    #[tokio::test]
+    async fn test_static_token_includes_system_authenticated() {
         // Static bearer token auth must add system:authenticated so that
         // ClusterRoleBindings targeting that group apply to token-authed users.
         let mut map = HashMap::new();
@@ -1988,7 +2416,7 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(&req, &map, None, None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:authenticated".to_owned()),
@@ -2002,13 +2430,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_anonymous_does_not_get_system_authenticated() {
+    #[tokio::test]
+    async fn test_anonymous_does_not_get_system_authenticated() {
         // Anonymous users must NOT receive system:authenticated — they are
         // unauthenticated and must only get system:unauthenticated.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        match authenticate(&req, &map, None, None, &HashSet::new()) {
+        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
                 assert!(
@@ -2193,7 +2621,7 @@ mod tests {
                 Arc::clone(&idx),
                 token_map,
                 None,
-                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(make_test_store()),
             ));
 
         // Request as alice, impersonating bob.
@@ -2253,7 +2681,7 @@ mod tests {
                 Arc::clone(&idx),
                 token_map,
                 None,
-                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(make_test_store()),
             ));
 
         let req = Request::builder()
@@ -2302,7 +2730,7 @@ mod tests {
                 Arc::clone(&idx),
                 token_map,
                 None,
-                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(make_test_store()),
             ));
 
         let req = Request::builder()
@@ -2341,14 +2769,16 @@ mod tests {
     /// single item starting with "JTI=". Without this, the conformance test fails
     /// with: "expected single authentication.kubernetes.io/credential-id extra info
     /// item starting with JTI=, got []".
-    #[test]
-    fn sa_jwt_with_jti_carries_credential_id_in_extra() {
+    #[tokio::test]
+    async fn sa_jwt_with_jti_carries_credential_id_in_extra() {
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
         let jti = "test-jti-conformance-abc";
         let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
 
-        let result = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new());
-        let user = result.expect("valid SA JWT with jti must authenticate");
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let user = result.expect("valid SA JWT with jti and a live SA must authenticate");
 
         let cred_id_key = "authentication.kubernetes.io/credential-id";
         let cred_ids = user.extra.get(cred_id_key).expect(
@@ -2374,14 +2804,16 @@ mod tests {
     ///
     /// This preserves compatibility with tokens minted before jti was required.
     /// Extra must be empty (not contain credential-id) when jti is not present.
-    #[test]
-    fn sa_jwt_without_jti_authenticates_with_empty_extra() {
+    #[tokio::test]
+    async fn sa_jwt_without_jti_authenticates_with_empty_extra() {
         let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "legacy-sa", TEST_SA_UID).await;
         // mint_sa_jwt produces a token WITHOUT a jti claim (legacy format).
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:legacy-sa", 3600);
 
-        let result = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new());
-        let user = result.expect("SA JWT without jti must still authenticate");
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let user = result.expect("SA JWT without jti and a live SA must still authenticate");
 
         assert!(
             user.extra.is_empty(),
@@ -2513,7 +2945,7 @@ mod tests {
                 Arc::clone(&idx),
                 token_map,
                 None,
-                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(make_test_store()),
             ));
 
         // Exactly the request client-go's ConfigMap informer issues: a LIST (not watch)
@@ -2590,7 +3022,7 @@ mod tests {
                 Arc::clone(&idx),
                 token_map,
                 None,
-                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(make_test_store()),
             ));
 
         let req = Request::builder()

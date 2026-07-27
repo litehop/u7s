@@ -200,6 +200,43 @@ pub fn normalize_rfc3339_to_micro(s: &str) -> String {
     s.to_string()
 }
 
+/// Parse an RFC3339 timestamp of the exact shape produced by `secs_to_rfc3339`/
+/// `utc_now_rfc3339` (`YYYY-MM-DDThh:mm:ss[.ffffff]Z`) back into Unix seconds.
+/// Returns `None` if the string doesn't match that shape. Uses only `std::time` — no
+/// chrono dependency, mirroring `secs_to_rfc3339`.
+///
+/// Needed by the SA-token bound-object liveness check (auth.rs): comparing "now" against a
+/// stored `metadata.deletionTimestamp` requires converting that RFC3339 string back to a
+/// Unix offset so the 60s grace-period leeway can be computed as plain integer arithmetic.
+pub fn rfc3339_to_unix_secs(s: &str) -> Option<i64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let time = time.split('.').next()?; // drop fractional seconds if present
+    let mut date_parts = date.splitn(3, '-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.splitn(3, ':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    let days = ymd_to_days(year, month, day);
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Inverse of `days_to_ymd`: proleptic-Gregorian year/month/day to days since 1970-01-01.
+/// Howard Hinnant's `days_from_civil` (public domain) — see `days_to_ymd` for the matching
+/// forward transform and the shared March-based-year rationale.
+fn ymd_to_days(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
 fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     // Shift epoch from 1970-01-01 to 0000-03-01 so that the leap day (Feb 29)
     // falls at the end of each year in the shifted representation, eliminating
@@ -450,6 +487,33 @@ mod tests {
     #[test]
     fn rfc3339_leap_year_feb29() {
         assert_eq!(secs_to_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// rfc3339_to_unix_secs must invert secs_to_rfc3339 exactly — the SA-token bound-object
+    /// liveness check (auth.rs) parses a stored `deletionTimestamp` this way to compute how
+    /// long ago an object was deleted; a wrong offset would make the 60s grace-period leeway
+    /// either reject a token too early (breaking graceful pod shutdown) or accept a token
+    /// long after it should have been invalidated.
+    #[test]
+    fn rfc3339_to_unix_secs_round_trips_with_secs_to_rfc3339() {
+        for secs in [0i64, 1, 59, 3600, 86_399, 1_704_067_200, 951_782_400] {
+            let s = secs_to_rfc3339(secs);
+            assert_eq!(
+                rfc3339_to_unix_secs(&s),
+                Some(secs),
+                "round-trip through secs_to_rfc3339({secs}) = {s:?} must recover {secs}"
+            );
+        }
+    }
+
+    /// rfc3339_to_unix_secs must reject strings that don't match the expected shape rather
+    /// than panicking or silently returning a wrong value — a malformed or corrupted
+    /// deletionTimestamp must not crash the auth path for every request.
+    #[test]
+    fn rfc3339_to_unix_secs_rejects_malformed_input() {
+        assert_eq!(rfc3339_to_unix_secs(""), None);
+        assert_eq!(rfc3339_to_unix_secs("not-a-timestamp"), None);
+        assert_eq!(rfc3339_to_unix_secs("2024-01-01T00:00:00"), None); // missing 'Z'
     }
 
     /// secs_to_rfc3339 must render pre-1970 (negative Unix seconds) dates correctly instead

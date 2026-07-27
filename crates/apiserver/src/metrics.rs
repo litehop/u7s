@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use prometheus::{IntCounterVec, IntGauge, IntGaugeVec, Opts};
+use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts};
 
 /// Identifies this apiserver in the `component` label of upstream-named metrics — mirrors
 /// real kube-apiserver's `component="apiserver"` self-identification so a client scraping
@@ -88,4 +88,24 @@ pub static WATCH_BROADCAST_RECEIVERS: LazyLock<IntGauge> = LazyLock::new(|| {
         .register(Box::new(gauge.clone()))
         .expect("u7s_watch_broadcast_receivers is registered exactly once per process");
     gauge
+});
+
+/// Counter of SA JWT authentications accepted past their `kubernetes.io.warnafter` claim —
+/// i.e. tokens that are only still valid because of the pod-bound-token expiration-extension
+/// safety net (see `handlers::tokens::POD_BOUND_TOKEN_EXTENSION_SECS`), well past the window
+/// the caller actually requested. A steady non-zero rate means real workloads are relying on
+/// the extension rather than refreshing tokens on schedule — mirrors upstream Kubernetes'
+/// stale-projected-token audit-annotation/metric pattern, which exists so operators can decide
+/// whether the safety net is still needed before ever considering narrowing or removing it.
+pub static STALE_SA_TOKENS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "u7s_stale_sa_tokens_total",
+        "Total number of SA JWT authentications accepted after the token's kubernetes.io.warnafter \
+         timestamp has passed, indicating reliance on the pod-bound-token expiration extension.",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_stale_sa_tokens_total is registered exactly once per process");
+    counter
 });

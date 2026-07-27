@@ -628,15 +628,14 @@ pub async fn token_review<S: Store>(
         }
     };
     let token = req.spec.token;
-    let revoked_jtis_guard = state.revoked_jtis.lock().unwrap();
     let user_info = crate::auth::authenticate_token_with_audiences(
         &token,
         &state.token_map,
         state.sa_decoding_key.as_deref(),
         &req.spec.audiences,
-        &revoked_jtis_guard,
-    );
-    drop(revoked_jtis_guard);
+        state.store.as_ref(),
+    )
+    .await;
 
     let status = match user_info {
         Some(u) => TokenReviewStatus {
@@ -894,8 +893,8 @@ mod tests {
     // TokenReview tests
     // ---------------------------------------------------------------------------
 
-    #[test]
-    fn test_authenticate_token_static_map_match() {
+    #[tokio::test]
+    async fn test_authenticate_token_static_map_match() {
         // A token present in the static map must resolve to the correct UserInfo.
         // This is the primary use-case for TokenReview with --token-auth-file.
         use crate::auth::{authenticate_token_with_audiences, UserInfo};
@@ -912,28 +911,25 @@ mod tests {
             },
         );
 
+        let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store");
         let result =
-            authenticate_token_with_audiences("argocd-token", &map, None, &[], &Default::default());
+            authenticate_token_with_audiences("argocd-token", &map, None, &[], &store).await;
         let user = result.expect("known token must resolve to a user");
         assert_eq!(user.username, "argocd-admin");
         assert!(user.groups.contains(&"system:authenticated".to_owned()));
     }
 
-    #[test]
-    fn test_authenticate_token_unknown_returns_none() {
+    #[tokio::test]
+    async fn test_authenticate_token_unknown_returns_none() {
         // An unrecognized token must return None — TokenReview will respond with
         // authenticated: false. A bad token must NEVER return a user.
         use crate::auth::authenticate_token_with_audiences;
         use std::collections::HashMap;
 
         let map = HashMap::new();
-        let result = authenticate_token_with_audiences(
-            "unknown-token",
-            &map,
-            None,
-            &[],
-            &Default::default(),
-        );
+        let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store");
+        let result =
+            authenticate_token_with_audiences("unknown-token", &map, None, &[], &store).await;
         assert!(result.is_none(), "unrecognized token must not authenticate");
     }
 
