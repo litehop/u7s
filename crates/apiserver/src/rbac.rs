@@ -432,24 +432,18 @@ fn subject_matches(binding: &RbacBinding, username: &str, groups: &[String]) -> 
             // Kubernetes encodes ServiceAccount usernames as
             // "system:serviceaccount:<namespace>:<name>" — that prefix is the only
             // unforgeable marker of ServiceAccount identity, and exists precisely so
-            // the ServiceAccount and User identity spaces can never collide.
+            // the ServiceAccount and User identity spaces can never collide. Only the
+            // fully-encoded form may match.
             //
-            // u7s does not default subjects[].namespace for ServiceAccount subjects at
-            // RoleBinding/ClusterRoleBinding creation time (unlike upstream, which
-            // defaults a namespace-less RoleBinding subject to the binding's own
-            // namespace), so a subject can genuinely reach here with s.namespace ==
-            // None. The raw-name fallback below only exists for that case, and is
-            // gated so it can NEVER match a plain User: the compared username must
-            // itself already be SA-shaped. Without this gate, a plain User whose
-            // username happens to equal a bound ServiceAccount's bare name (e.g. a
-            // User named "argocd" colliding with ServiceAccount default/argocd) would
-            // silently inherit every permission granted to that ServiceAccount.
+            // A raw `username == s.name` fallback (even gated on s.namespace.is_none())
+            // must NOT be added back: ServiceAccount names are validated as DNS-1123
+            // labels (lowercase alphanumeric + hyphens, no colons), so s.name can never
+            // equal a colon-containing username — a plain User whose username happens
+            // to equal a bound ServiceAccount's bare name (e.g. a User named "argocd"
+            // colliding with ServiceAccount default/argocd) must never match here.
             let ns = s.namespace.as_deref().unwrap_or("");
             let encoded = format!("system:serviceaccount:{ns}:{}", s.name);
             username == encoded
-                || (s.namespace.is_none()
-                    && username.starts_with("system:serviceaccount:")
-                    && username == s.name)
         }
         _ => false,
     })
