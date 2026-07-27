@@ -394,50 +394,65 @@ enum WebhookTarget {
     ServiceResolved { url: String },
 }
 
+/// Returns why `octets` falls in a range this function blocks, or `None` if it doesn't.
+///
+/// Shared between the direct-IPv4-host path and the IPv4-mapped/compatible-IPv6 path in
+/// `validate_webhook_url` so both see identical range coverage — a range added to one and
+/// not the other is exactly the kind of gap that let IPv6-mapped addresses bypass the IPv4
+/// checks in the first place.
+fn blocked_ipv4_range(octets: [u8; 4]) -> Option<&'static str> {
+    if octets[0] == 169 && octets[1] == 254 {
+        Some("link-local address (169.254.0.0/16)")
+    } else if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+        Some("shared address space (100.64.0.0/10)")
+    } else if octets[0] == 10 {
+        Some("private address (10.0.0.0/8)")
+    } else if octets[0] == 172 && (octets[1] & 0xF0) == 16 {
+        Some("private address (172.16.0.0/12)")
+    } else if octets[0] == 192 && octets[1] == 168 {
+        Some("private address (192.168.0.0/16)")
+    } else {
+        None
+    }
+}
+
 /// Validate a webhook URL to prevent SSRF via non-https schemes or reserved hosts.
 ///
 /// Rejects:
 /// - Non-https:// schemes (http://, ftp://, etc.)
-/// - localhost and 127.0.0.0/8 (loopback)
+/// - localhost
 /// - 169.254.0.0/16 (link-local / cloud IMDS)
 /// - 100.64.0.0/10 (shared address space, used by some cloud providers for metadata)
 /// - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918 private ranges)
 /// - IPv6 loopback (::1), unspecified (::), unique-local (fc00::/7), and link-local (fe80::/10)
 /// - IPv6 bracket notation [::1] which previously bypassed the ::1 check
+/// - IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) IPv6 literals carrying a
+///   blocked IPv4 payload in their low 32 bits, e.g. [::ffff:169.254.169.254]
+///
+/// The host is parsed exactly once via `reqwest::Url::parse` — the same WHATWG URL Standard
+/// parser reqwest itself uses before opening the connection — so non-canonical numeric IPv4
+/// encodings (decimal `2130706433`, octal `0177.0.0.1`, hex `0x7f.0.0.1`, short `127.1`) are
+/// normalized to dotted-quad here exactly as reqwest will normalize them, instead of silently
+/// skipping every check the way hand-splitting the raw URL string did.
 pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
-    // Extract the scheme and host.
-    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
-        ("https", r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        ("http", r)
-    } else {
-        return Err(format!("webhook url must use https scheme, got: {url}"));
-    };
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| format!("webhook url is not a valid URL: {url} ({e})"))?;
 
-    // Extract the host portion.  For IPv6 bracket notation (e.g. [::1]:8443/path),
-    // RFC 3986 §3.2.2 requires the host to be enclosed in '[' ... ']'.
-    // Scanning naively for the first ':' would land inside the address itself,
-    // so we handle the bracket case explicitly.
-    let host: &str;
-    let ipv6: Option<std::net::Ipv6Addr>;
-    if rest.starts_with('[') {
-        // Find the closing bracket.
-        let bracket_end = rest
-            .find(']')
-            .ok_or_else(|| format!("webhook url has unclosed '[' in host: {url}"))?;
-        let bare = &rest[1..bracket_end];
-        let addr = bare
-            .parse::<std::net::Ipv6Addr>()
-            .map_err(|_| format!("webhook url has invalid IPv6 address '{bare}': {url}"))?;
-        host = bare;
-        ipv6 = Some(addr);
-    } else {
-        let host_end = rest.find(['/', ':', '?', '#']).unwrap_or(rest.len());
-        host = &rest[..host_end];
-        ipv6 = host.parse::<std::net::Ipv6Addr>().ok();
+    let scheme = parsed.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err(format!("webhook url must use https scheme, got: {url}"));
     }
 
-    // Parse as IPv4 to check reserved ranges.
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("webhook url has no host: {url}"))?;
+    // `Url::host_str()` returns IPv6 hosts bracketed (e.g. "[::1]"); strip for address parsing.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let ipv6 = host.parse::<std::net::Ipv6Addr>().ok();
     let ipv4 = host.parse::<std::net::Ipv4Addr>().ok();
 
     // Reject non-https unless the host is an IPv4 loopback address (127.0.0.0/8).
@@ -472,38 +487,43 @@ pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
                 "webhook url must not target IPv6 link-local address (fe80::/10): {url}"
             ));
         }
+
+        // IPv4-mapped (::ffff:a.b.c.d, RFC 4291 §2.5.5.2) and the older IPv4-compatible
+        // (::a.b.c.d) forms both carry an IPv4 address in the low 32 bits while every check
+        // above only inspects the high bytes, which are zero for both forms. Unwrap and
+        // re-run the IPv4 range checks against the embedded address. Bare dotted-decimal
+        // 127.0.0.1 is intentionally NOT blocked below (it's the documented loopback
+        // exemption for in-process test webhook servers) but a caller has no legitimate
+        // reason to write loopback as an IPv6-mapped literal, so it is blocked here.
+        let embedded_v4 = addr.to_ipv4_mapped().or_else(|| {
+            let segments = addr.segments();
+            let is_ipv4_compatible =
+                segments[0..6] == [0, 0, 0, 0, 0, 0] && (segments[6] != 0 || segments[7] != 0);
+            if is_ipv4_compatible {
+                let o = addr.octets();
+                Some(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+            } else {
+                None
+            }
+        });
+        if let Some(v4) = embedded_v4 {
+            if v4.octets()[0] == 127 {
+                return Err(format!(
+                    "webhook url must not target IPv4 loopback via IPv6-mapped/compatible \
+                     address: {url}"
+                ));
+            }
+            if let Some(reason) = blocked_ipv4_range(v4.octets()) {
+                return Err(format!(
+                    "webhook url must not target {reason} via IPv6-mapped/compatible address: {url}"
+                ));
+            }
+        }
     }
 
     if let Some(octets) = ipv4.map(|a| a.octets()) {
-        // 169.254.0.0/16 — link-local / cloud IMDS (e.g. AWS/GCP metadata service)
-        if octets[0] == 169 && octets[1] == 254 {
-            return Err(format!(
-                "webhook url must not target link-local address (169.254.0.0/16): {url}"
-            ));
-        }
-        // 100.64.0.0/10 — shared address space (used by some cloud providers for metadata)
-        if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
-            return Err(format!(
-                "webhook url must not target shared address space (100.64.0.0/10): {url}"
-            ));
-        }
-        // 10.0.0.0/8 — RFC1918 private range (cluster-internal)
-        if octets[0] == 10 {
-            return Err(format!(
-                "webhook url must not target private address (10.0.0.0/8): {url}"
-            ));
-        }
-        // 172.16.0.0/12 — RFC1918 private range
-        if octets[0] == 172 && (octets[1] & 0xF0) == 16 {
-            return Err(format!(
-                "webhook url must not target private address (172.16.0.0/12): {url}"
-            ));
-        }
-        // 192.168.0.0/16 — RFC1918 private range
-        if octets[0] == 192 && octets[1] == 168 {
-            return Err(format!(
-                "webhook url must not target private address (192.168.0.0/16): {url}"
-            ));
+        if let Some(reason) = blocked_ipv4_range(octets) {
+            return Err(format!("webhook url must not target {reason}: {url}"));
         }
     }
 
@@ -9304,6 +9324,167 @@ mod tests {
             result.is_err(),
             "https://192.168.1.1 must be rejected — \
              unblocked RFC1918 lets webhooks reach cluster-internal services"
+        );
+    }
+
+    // -- IPv4-mapped/compatible IPv6 SSRF bypass tests --
+
+    /// https://[::ffff:127.0.0.1]/ must be rejected even though no IPv6 check (loopback,
+    /// unspecified, unique-local, link-local) matches its zeroed high bytes.
+    ///
+    /// ::ffff:127.0.0.1 is valid IPv6 text syntax (RFC 4291 §2.5.5.2 IPv4-mapped address) that
+    /// carries loopback in its low 32 bits. Before this fix, octets[0] == 0 failed every IPv6
+    /// range check and the IPv4 loopback exemption only ran when the whole host parsed as
+    /// Ipv4Addr, which a bracketed IPv6 literal never does — so this URL sailed through as Ok(())
+    /// and could route the apiserver's authenticated webhook POST to a service on its own
+    /// loopback interface.
+    #[test]
+    fn validate_webhook_url_rejects_ipv4_mapped_loopback() {
+        let result = validate_webhook_url("https://[::ffff:127.0.0.1]/");
+        assert!(
+            result.is_err(),
+            "https://[::ffff:127.0.0.1]/ must be rejected — \
+             IPv4-mapped IPv6 loopback bypassed every existing IPv6 and IPv4 range check"
+        );
+    }
+
+    /// https://[::ffff:169.254.169.254]/ must be rejected: this is the cloud-IMDS bypass that
+    /// motivated the fix. An attacker with RBAC to create a webhook config could set
+    /// clientConfig.url to this literal, self-sign a cert for it via their own caBundle, and
+    /// have the apiserver's admission webhook call exfiltrate instance credentials from IMDS —
+    /// defeating the 169.254.0.0/16 block that already exists for the plain-IPv4 form.
+    #[test]
+    fn validate_webhook_url_rejects_ipv4_mapped_imds_address() {
+        let result = validate_webhook_url("https://[::ffff:169.254.169.254]/");
+        assert!(
+            result.is_err(),
+            "https://[::ffff:169.254.169.254]/ must be rejected — \
+             the IPv4-mapped encoding must not bypass the cloud-IMDS block"
+        );
+    }
+
+    /// The other RFC1918 ranges must be blocked in IPv4-mapped form too, not just 169.254/16 —
+    /// otherwise a caller could still reach cluster-internal 10.x/172.16.x/192.168.x services by
+    /// wrapping the address in ::ffff: instead of writing it as plain IPv4.
+    #[test]
+    fn validate_webhook_url_rejects_ipv4_mapped_rfc1918_10_range() {
+        let result = validate_webhook_url("https://[::ffff:10.0.0.1]/");
+        assert!(
+            result.is_err(),
+            "https://[::ffff:10.0.0.1]/ must be rejected — \
+             IPv4-mapped encoding must not bypass the 10.0.0.0/8 block"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv4_mapped_rfc1918_172_range() {
+        let result = validate_webhook_url("https://[::ffff:172.16.0.1]/");
+        assert!(
+            result.is_err(),
+            "https://[::ffff:172.16.0.1]/ must be rejected — \
+             IPv4-mapped encoding must not bypass the 172.16.0.0/12 block"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv4_mapped_rfc1918_192_range() {
+        let result = validate_webhook_url("https://[::ffff:192.168.0.1]/");
+        assert!(
+            result.is_err(),
+            "https://[::ffff:192.168.0.1]/ must be rejected — \
+             IPv4-mapped encoding must not bypass the 192.168.0.0/16 block"
+        );
+    }
+
+    /// The older IPv4-compatible form (::a.b.c.d, no ::ffff: prefix) must also be blocked.
+    ///
+    /// `Ipv6Addr::to_ipv4_mapped()` only recognizes the ::ffff:0:0/96 form; it returns None for
+    /// this historical form, so a fix that relies solely on to_ipv4_mapped() would still leave
+    /// this encoding open even after closing the ::ffff: bypass.
+    #[test]
+    fn validate_webhook_url_rejects_ipv4_compatible_rfc1918_10_range() {
+        let result = validate_webhook_url("https://[::10.0.0.1]/");
+        assert!(
+            result.is_err(),
+            "https://[::10.0.0.1]/ must be rejected — \
+             the legacy IPv4-compatible IPv6 form must not bypass the 10.0.0.0/8 block \
+             just because to_ipv4_mapped() doesn't recognize it"
+        );
+    }
+
+    /// A public IPv4-mapped IPv6 address must still be accepted.
+    ///
+    /// The fix must distinguish "carries a blocked IPv4 payload" from "is IPv4-mapped at all" —
+    /// over-blocking every ::ffff: literal would reject legitimate external webhook endpoints
+    /// that happen to be reached over an IPv4-mapped IPv6 socket.
+    #[test]
+    fn validate_webhook_url_accepts_public_ipv4_mapped_address() {
+        let result = validate_webhook_url("https://[::ffff:8.8.8.8]/");
+        assert!(
+            result.is_ok(),
+            "https://[::ffff:8.8.8.8]/ must be accepted — \
+             the IPv4-mapped fix must not block public addresses that merely look mapped"
+        );
+    }
+
+    // -- Non-canonical IPv4 host encoding SSRF bypass tests --
+
+    /// A decimal-integer host (2130706433 == 127.0.0.1) must not bypass validation.
+    ///
+    /// std::net::Ipv4Addr::from_str rejects this syntax, so a naive `host.parse::<Ipv4Addr>()`
+    /// check silently skips every range check for it — yet reqwest's own URL parser (the WHATWG
+    /// URL Standard host parser) normalizes it to canonical dotted-quad before connecting, so the
+    /// address that validate_webhook_url sees must match the one reqwest actually calls.
+    /// Verified empirically: `url::Url::parse("https://2852039166/").host_str()` returns
+    /// `"169.254.169.254"`.
+    #[test]
+    fn validate_webhook_url_rejects_decimal_encoded_imds_address() {
+        let result = validate_webhook_url("https://2852039166/");
+        assert!(
+            result.is_err(),
+            "https://2852039166/ (decimal for 169.254.169.254) must be rejected — \
+             reqwest normalizes this to the IMDS address before connecting, so skipping the \
+             check here would let this exact bypass reach cloud instance credentials"
+        );
+    }
+
+    /// An octal-encoded host (0251.0376.0251.0376 == 169.254.169.254) must not bypass validation.
+    #[test]
+    fn validate_webhook_url_rejects_octal_encoded_imds_address() {
+        let result = validate_webhook_url("https://0251.0376.0251.0376/");
+        assert!(
+            result.is_err(),
+            "https://0251.0376.0251.0376/ (octal for 169.254.169.254) must be rejected — \
+             reqwest normalizes octal dotted-quad components before connecting"
+        );
+    }
+
+    /// A hex-encoded host (0xA9.0xFE.0xA9.0xFE == 169.254.169.254) must not bypass validation.
+    #[test]
+    fn validate_webhook_url_rejects_hex_encoded_imds_address() {
+        let result = validate_webhook_url("https://0xA9.0xFE.0xA9.0xFE/");
+        assert!(
+            result.is_err(),
+            "https://0xA9.0xFE.0xA9.0xFE/ (hex for 169.254.169.254) must be rejected — \
+             reqwest normalizes hex dotted-quad components before connecting"
+        );
+    }
+
+    /// A short-form host (127.1 == 127.0.0.1 per the WHATWG host parser) must resolve to the
+    /// same address the plain dotted-quad form does, not to a different, unvalidated one.
+    ///
+    /// This isn't a new blocked range — bare 127.0.0.1 is an intentional loopback exemption for
+    /// test servers — but it proves the short-form syntax is canonicalized by the same code path
+    /// as the other encodings rather than being treated as an opaque, unparseable hostname.
+    #[test]
+    fn validate_webhook_url_accepts_short_form_loopback_like_plain_form() {
+        let short_form = validate_webhook_url("http://127.1:8080/admit");
+        let plain_form = validate_webhook_url("http://127.0.0.1:8080/admit");
+        assert_eq!(
+            short_form.is_ok(),
+            plain_form.is_ok(),
+            "127.1 and 127.0.0.1 must be treated identically — \
+             both are the loopback address once canonicalized by the URL parser"
         );
     }
 
