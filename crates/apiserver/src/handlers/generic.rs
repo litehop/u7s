@@ -214,8 +214,12 @@ pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::statu
 }
 
 /// A single term in a label selector.
+///
+/// `pub` (not `pub(crate)`) so `benches/list_filter.rs` — a separate crate
+/// linked against the `u7s-apiserver` lib target — can construct terms
+/// directly to drive `apply_label_selector`.
 #[derive(Debug, PartialEq)]
-pub(crate) enum LabelSelectorTerm<'a> {
+pub enum LabelSelectorTerm<'a> {
     Equality { key: &'a str, value: &'a str },
     NotEquals { key: &'a str, value: &'a str },
     Exists { key: &'a str },
@@ -342,7 +346,11 @@ pub(crate) fn parse_label_selector(
 
 /// Filter `items` by label selector terms. Keeps only items where all terms match
 /// the object's `metadata.labels` map.
-pub(crate) fn apply_label_selector(
+///
+/// `pub` (not `pub(crate)`) so `benches/list_filter.rs` can call it directly
+/// — a criterion bench is a separate crate that only ever sees this crate's
+/// public API.
+pub fn apply_label_selector(
     items: Vec<serde_json::Value>,
     terms: &[LabelSelectorTerm<'_>],
 ) -> Vec<serde_json::Value> {
@@ -352,25 +360,27 @@ pub(crate) fn apply_label_selector(
     items
         .into_iter()
         .filter(|item| {
-            let meta: ObjectMeta =
-                serde_json::from_value(item["metadata"].clone()).unwrap_or_default();
-            let labels = meta.labels.unwrap_or_default();
+            // Read labels directly off the JSON tree — skips a full ObjectMeta
+            // reparse per item just to reach this one sub-map.
+            let labels = item["metadata"]["labels"].as_object();
             terms.iter().all(|term| match term {
                 LabelSelectorTerm::Equality { key, value } => {
-                    labels.get(*key).map(|s| s.as_str()) == Some(value)
+                    labels.and_then(|l| l.get(*key)).and_then(|v| v.as_str()) == Some(value)
                 }
                 LabelSelectorTerm::NotEquals { key, value } => {
-                    labels.get(*key).map(|s| s.as_str()) != Some(value)
+                    labels.and_then(|l| l.get(*key)).and_then(|v| v.as_str()) != Some(value)
                 }
-                LabelSelectorTerm::Exists { key } => labels.contains_key(*key),
-                LabelSelectorTerm::DoesNotExist { key } => !labels.contains_key(*key),
+                LabelSelectorTerm::Exists { key } => labels.is_some_and(|l| l.contains_key(*key)),
+                LabelSelectorTerm::DoesNotExist { key } => {
+                    !labels.is_some_and(|l| l.contains_key(*key))
+                }
                 LabelSelectorTerm::In { key, values } => labels
-                    .get(*key)
-                    .map(|s| s.as_str())
+                    .and_then(|l| l.get(*key))
+                    .and_then(|v| v.as_str())
                     .is_some_and(|v| values.contains(&v)),
                 LabelSelectorTerm::NotIn { key, values } => !labels
-                    .get(*key)
-                    .map(|s| s.as_str())
+                    .and_then(|l| l.get(*key))
+                    .and_then(|v| v.as_str())
                     .is_some_and(|v| values.contains(&v)),
             })
         })
@@ -3380,6 +3390,91 @@ mod set_based_selector_tests {
             2,
             "NotIn filter must keep green and the object with absent key; \
              set-based-selector LIST filters out all non-listed values"
+        );
+    }
+
+    /// A field elsewhere in `metadata` that can't typecheck as `ObjectMeta` (here,
+    /// `creationTimestamp` given as a number instead of a string) must not affect
+    /// label-based selection.
+    ///
+    /// Deserializing the whole `ObjectMeta` per item made a single bad field
+    /// anywhere in metadata fall back to `default()`, silently discarding real
+    /// labels along with it — so a single malformed object could make a LIST with
+    /// a label selector drop (or wrongly keep) that object for every caller in a
+    /// namespace, and every well-formed object paid a full re-deserialize to boot.
+    #[test]
+    fn apply_label_selector_never_allocates_full_objectmeta() {
+        let item = serde_json::json!({
+            "metadata": {
+                "name": "cm-1",
+                "creationTimestamp": 12345,
+                "labels": {"app": "bench"}
+            }
+        });
+        let terms = vec![LabelSelectorTerm::Equality {
+            key: "app",
+            value: "bench",
+        }];
+        let result = apply_label_selector(vec![item], &terms);
+        assert_eq!(
+            result.len(),
+            1,
+            "an item with a non-string field elsewhere in metadata must still be \
+             selectable by its label, because otherwise a single malformed field \
+             on one object breaks LIST filtering for a whole namespace"
+        );
+    }
+
+    /// An item with no `metadata` key at all must not panic and must be treated
+    /// as having no labels.
+    ///
+    /// Controllers rely on label-selector LIST calls degrading safely on
+    /// malformed objects instead of 500ing the whole request or misreporting
+    /// unrelated objects in the result set.
+    #[test]
+    fn apply_label_selector_handles_missing_metadata_gracefully() {
+        let item = serde_json::json!({"spec": {}});
+
+        let equality_terms = vec![LabelSelectorTerm::Equality {
+            key: "app",
+            value: "bench",
+        }];
+        let result = apply_label_selector(vec![item.clone()], &equality_terms);
+        assert!(
+            result.is_empty(),
+            "an object with no metadata has no labels, so an Equality term must exclude it \
+             rather than panic on the missing metadata/labels path"
+        );
+
+        let does_not_exist_terms = vec![LabelSelectorTerm::DoesNotExist { key: "app" }];
+        let result = apply_label_selector(vec![item], &does_not_exist_terms);
+        assert_eq!(
+            result.len(),
+            1,
+            "an object with no metadata has no labels, so DoesNotExist for any key must \
+             include it"
+        );
+    }
+
+    /// `metadata.labels: null` (explicit JSON null, as opposed to an absent key)
+    /// must not panic and must be treated as no labels.
+    ///
+    /// kubectl and controllers occasionally round-trip objects with explicit
+    /// nulls for unset map fields; the selector path must degrade to "no
+    /// labels" the same way the old `unwrap_or_default()` did, not crash the
+    /// LIST handler for the whole namespace.
+    #[test]
+    fn apply_label_selector_handles_null_labels_field() {
+        let item = serde_json::json!({"metadata": {"name": "cm-1", "labels": null}});
+        let terms = vec![LabelSelectorTerm::Equality {
+            key: "app",
+            value: "bench",
+        }];
+        let result = apply_label_selector(vec![item], &terms);
+        assert!(
+            result.is_empty(),
+            "metadata.labels: null must degrade to \"no labels\", not panic or match \
+             every selector"
         );
     }
 }

@@ -395,7 +395,7 @@ pub async fn replace_namespace<S: Store>(
     Ok(Json(obj.body).into_response())
 }
 
-pub async fn patch_namespace<S: Store>(
+pub(crate) async fn patch_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     Query(patch_query): Query<PatchQuery>,
@@ -4270,6 +4270,10 @@ mod tests {
 
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
         }
     }
 

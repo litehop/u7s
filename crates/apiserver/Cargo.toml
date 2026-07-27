@@ -3,6 +3,11 @@ name    = "u7s-apiserver"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name    = "u7s_apiserver"
+path    = "src/lib.rs"
+doctest = false
+
 [[bin]]
 name = "u7s-apiserver"
 path = "src/main.rs"
@@ -22,7 +27,7 @@ tokio-rustls    = "0.26"
 rcgen           = "0.14"
 rustls-pemfile  = "2"
 schemars        = { version = "1.0", features = ["derive"] }
-serde           = { version = "1", features = ["derive"] }
+serde           = { version = "1", features = ["derive", "rc"] }
 serde_json      = "1"
 bytes           = "1"
 thiserror       = "2"
@@ -34,7 +39,7 @@ anyhow          = "1"
 async-stream    = "0.3"
 futures-core    = "0.3"
 futures-util    = "0.3"
-jsonwebtoken    = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken    = { version = "11", features = ["rust_crypto"] }
 rsa             = "0.9"
 x509-cert = { version = "0.3", features = ["pem"] }
 uuid        = { version = "1", features = ["v4"] }
@@ -47,7 +52,23 @@ prost           = "0.14"
 hmac            = "0.13"
 sha2            = "0.11"
 u7s-sentinel    = { path = "../sentinel" }
+prometheus      = { version = "0.14", default-features = false }
 
 [build-dependencies]
 prost-build              = "0.14"
 protoc-bin-vendored      = "3.2"
+
+[dev-dependencies]
+criterion       = "0.8"
+
+[[bench]]
+name    = "list_filter"
+harness = false
+
+[[bench]]
+name    = "watch_fanout"
+harness = false
+
+[[bench]]
+name    = "admission_review"
+harness = false

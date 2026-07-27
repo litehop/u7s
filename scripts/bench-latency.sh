@@ -60,26 +60,53 @@ for i in $(seq 1 "$REQUESTS"); do
         https://127.0.0.1:6443/api
 done > "$TIMINGS_FILE"
 
-# Compute p50 and p99 using sort + awk (no Python, no bc)
+# Compute p50, p99, and mean using sort + awk (no Python, no bc)
 # time_total from curl is in seconds (e.g. 0.003142); convert to ms
 P50=$(sort -n "$TIMINGS_FILE" | awk -v n="$REQUESTS" 'NR==int(n*0.50) {printf "%.2f", $1*1000}')
 P99=$(sort -n "$TIMINGS_FILE" | awk -v n="$REQUESTS" 'NR==int(n*0.99) {printf "%.2f", $1*1000}')
+# One extra unsorted pass over the same timings file for the mean (order does
+# not matter for a sum), so a compare-baseline.sh regression is judged on more
+# than just two percentile points.
+MEAN=$(awk -v n="$REQUESTS" '{sum+=$1} END {printf "%.2f", (sum/n)*1000}' "$TIMINGS_FILE")
 
-echo "p50: ${P50}ms  p99: ${P99}ms"
+echo "p50: ${P50}ms  p99: ${P99}ms  mean: ${MEAN}ms"
+
+# git_sha falls back to "unknown" rather than failing under set -e: this
+# script's own conformance/CI runs always execute inside the repo, but a
+# stray manual run from an extracted tarball should still produce a usable
+# (if unattributable) JSON summary instead of aborting.
+GIT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+TIMESTAMP_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Save timestamped results
 RESULTS_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/ai/perf"
 mkdir -p "$RESULTS_DIR"
-RESULT_FILE="$RESULTS_DIR/latency-$(date +%Y%m%d-%H%M%S).txt"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+RESULT_FILE="$RESULTS_DIR/latency-$TIMESTAMP.txt"
+JSON_FILE="$RESULTS_DIR/latency-$TIMESTAMP.json"
 {
     echo "u7s-apiserver latency benchmark"
     echo "Date: $(date -u)"
     echo "Requests: $REQUESTS"
     echo "p50: ${P50}ms"
     echo "p99: ${P99}ms"
+    echo "mean: ${MEAN}ms"
     echo ""
     echo "Raw timings (seconds):"
     cat "$TIMINGS_FILE"
 } > "$RESULT_FILE"
 
+# Machine-readable twin of the .txt above, for scripts/compare-baseline.sh —
+# the .txt stays the eyeballed form, this is the diffable form.
+jq -n \
+    --argjson p50_ms "$P50" \
+    --argjson p99_ms "$P99" \
+    --argjson mean_ms "$MEAN" \
+    --argjson n "$REQUESTS" \
+    --arg git_sha "$GIT_SHA" \
+    --arg timestamp_utc "$TIMESTAMP_UTC" \
+    '{p50_ms: $p50_ms, p99_ms: $p99_ms, mean_ms: $mean_ms, n: $n, git_sha: $git_sha, timestamp_utc: $timestamp_utc}' \
+    > "$JSON_FILE"
+
 echo "Results saved to: $RESULT_FILE"
+echo "JSON results saved to: $JSON_FILE"

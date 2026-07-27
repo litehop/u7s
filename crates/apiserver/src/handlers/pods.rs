@@ -338,6 +338,7 @@ pub async fn list_pods<S: Store>(
         .field_selector
         .as_deref()
         .and_then(pod_store_field_selector);
+    let list_start = std::time::Instant::now();
     let resp = state
         .store
         .list(
@@ -349,6 +350,12 @@ pub async fn list_pods<S: Store>(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    tracing::debug!(
+        prefix = %prefix,
+        item_count = resp.items.len(),
+        elapsed_ms = list_start.elapsed().as_millis() as u64,
+        "list: query completed"
+    );
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
@@ -369,6 +376,7 @@ pub async fn list_pods<S: Store>(
     } else {
         items
     };
+    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     // Return Table format when as=Table;v=v1 is requested (v1beta1 was rejected above).
     if super::table::wants_table(accept) {
@@ -385,7 +393,7 @@ pub async fn list_pods<S: Store>(
     Ok(Json(body).into_response())
 }
 
-pub async fn create_pod<S: Store>(
+pub(crate) async fn create_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(create_query): Query<super::json_patch::CreateQuery>,
@@ -957,7 +965,7 @@ pub async fn delete_pod<S: Store>(
     }
 }
 
-pub async fn patch_pod<S: Store>(
+pub(crate) async fn patch_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Query(patch_query): Query<super::json_patch::PatchQuery>,
@@ -12438,6 +12446,10 @@ mod handler_tests {
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
         }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
     }
 
     /// patch_pod must retry internally on RevisionMismatch rather than returning 409 to the
@@ -12659,6 +12671,10 @@ mod handler_tests {
 
         fn current_revision(&self) -> u64 {
             self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
         }
     }
 

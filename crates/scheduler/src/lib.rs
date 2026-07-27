@@ -7,7 +7,7 @@ use hyper::{Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
-use tracing::info;
+use tracing::{debug, info};
 use u7s_kubeconfig::HyperApiClient;
 
 // ---------------------------------------------------------------------------
@@ -321,8 +321,8 @@ pub struct PendingPod {
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
 pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
-    let watch_event: WatchEvent<PodObject> =
-        serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
+    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event)
+        .unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
             object: PodObject::default(),
         });
@@ -421,7 +421,7 @@ pub struct GatedStatusPatch {
 /// re-PATCHing on every reconcile tick, including the tick triggered by this
 /// function's own prior PATCH echoing back through the watch).
 pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
-    let watch_event: WatchEvent<PodObject> = serde_json::from_value(event.clone()).ok()?;
+    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event).ok()?;
     if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
         return None;
     }
@@ -499,7 +499,7 @@ pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
 /// entirely means this patch can only ever touch `reason`/`message`, never
 /// `status`, so it can never contradict a real bind outcome.
 pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
-    let watch_event: WatchEvent<PodObject> = serde_json::from_value(event.clone()).ok()?;
+    let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event).ok()?;
     if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
         return None;
     }
@@ -939,9 +939,7 @@ impl NodeTally {
     /// replaying the same event twice — e.g. after a watch reconnect —
     /// is idempotent.
     pub fn apply_event(&mut self, event: &Value) {
-        let Ok(watch_event) =
-            serde_json::from_value::<WatchEvent<PreemptionPodListItem>>(event.clone())
-        else {
+        let Ok(watch_event) = WatchEvent::<PreemptionPodListItem>::deserialize(event) else {
             return;
         };
         let name = watch_event.object.metadata.name.unwrap_or_default();
@@ -1081,7 +1079,11 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
 /// — otherwise a pod requesting a GPU (say) could be bound to a node with no
 /// GPU, which the kubelet would then reject anyway (as the SchedulerPreemption
 /// conformance suite's synthetic `scheduling.k8s.io/foo` resource does today).
-fn resource_fits(
+///
+/// `pub` (not module-private) so `benches/predicates.rs` can call it directly
+/// — a criterion bench is a separate crate that only ever sees this crate's
+/// public API.
+pub fn resource_fits(
     allocatable: &NodeAllocatable,
     used: &ResourceRequests,
     requested: &ResourceRequests,
@@ -1538,9 +1540,13 @@ fn select_and_reserve_node(
     pod: &PendingPod,
     tally: &std::sync::Mutex<NodeTally>,
 ) -> Result<String, PickNodeError> {
+    let candidates = list.items.len();
     let mut tally_guard = tally.lock().expect("tally lock poisoned");
-    let node = select_node_with_capacity(list, pod, &tally_guard.usage_by_node())
-        .map_err(|_| PickNodeError::NoCapacity)?;
+    let node =
+        select_node_with_capacity(list, pod, &tally_guard.usage_by_node()).map_err(|_| {
+            debug!(pod = %pod.pod_name, candidates, "pick_node: no node had capacity");
+            PickNodeError::NoCapacity
+        })?;
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
@@ -1683,6 +1689,12 @@ pub async fn find_preemption_plan(
         if victims.is_empty() {
             continue;
         }
+        debug!(
+            pod = %pod.pod_name,
+            node = %node_name,
+            victims = victims.len(),
+            "find_preemption_plan: candidate evaluated"
+        );
         let is_cheaper = best
             .as_ref()
             .is_none_or(|(_, b)| victims.len() < b.victims.len());
@@ -1756,6 +1768,10 @@ fn verify_and_reserve_preemption(
     let still_fits = (capacity == 0 || remaining_pod_count < capacity)
         && resource_fits(&node.status.allocatable, &remaining_requests, &pod.requests);
     if !still_fits {
+        debug!(
+            node = %plan.node_name,
+            "find_preemption_plan: re-verification failed, capacity claimed concurrently"
+        );
         bail!(
             "no node still fits after preemption \
              (capacity may have been claimed concurrently)"
@@ -1849,7 +1865,10 @@ pub async fn bind_pod(
     let path = binding_path(namespace, pod_name);
     let payload = binding_payload(namespace, pod_name, node_name);
 
+    let start = std::time::Instant::now();
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, node = %node_name, elapsed_ms, "bind_pod: POST completed");
     check_bind_response(status.as_u16(), &body)?;
     info!("bound pod {namespace}/{pod_name} → node {node_name}");
     Ok(())
@@ -2021,7 +2040,10 @@ pub async fn emit_scheduling_event(
         event_type,
     );
     let path = events_path(namespace);
+    let start = std::time::Instant::now();
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, reason, elapsed_ms, "emit_scheduling_event: POST completed");
     if !status.is_success() {
         bail!("POST event failed with HTTP {status}: {body}");
     }
@@ -2079,7 +2101,10 @@ pub async fn delete_pod(
 ) -> anyhow::Result<()> {
     let path = delete_pod_path(namespace, pod_name);
     for _ in 0..2 {
+        let start = std::time::Instant::now();
         let (status, body) = http_delete(connector, server, &path).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
         check_delete_response(status.as_u16())
             .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     }
@@ -2121,7 +2146,10 @@ pub async fn patch_pod_status(
     patch: &Value,
 ) -> anyhow::Result<()> {
     let path = pod_status_path(namespace, pod_name);
+    let start = std::time::Instant::now();
     let (status, body) = http_patch_status(connector, server, &path, patch).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, elapsed_ms, "patch_pod_status: PATCH completed");
     check_status_patch_response(status.as_u16(), &body)
         .with_context(|| format!("patching status for {namespace}/{pod_name}"))
 }

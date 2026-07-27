@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use thiserror::Error;
 
+pub mod metrics;
 pub mod sqlite;
 
 pub use sqlite::SqliteStore;
@@ -315,4 +316,11 @@ pub trait Store: Send + Sync + 'static {
     /// Used by watch BOOKMARK heartbeats to advance informer sync RVs across
     /// resource types (KCM ConsistencyStore checks informer RV >= last written RV).
     fn current_revision(&self) -> u64;
+
+    /// Return the number of currently active subscribers on the shared watch broadcast
+    /// channel — i.e. how many watch streams are open right now, across every resource type.
+    /// Backs the `u7s_watch_broadcast_receivers` gauge; read on demand at scrape time since
+    /// `tokio::sync::broadcast::Sender::receiver_count` already tracks this lock-free with no
+    /// extra bookkeeping needed here.
+    fn watch_receiver_count(&self) -> usize;
 }

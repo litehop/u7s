@@ -62,21 +62,53 @@ fn ndjson_initial_events_bookmark(api_version: &str, kind: &str, revision: u64) 
     Bytes::from(buf)
 }
 
+/// Apply defaults and produce the final NDJSON bytes for an object already confirmed to match
+/// this watcher's label/field selector (and, for CRs, already converted to the requested
+/// served version). This is the tail shared by `prepare_live_event` (which parses raw bytes
+/// and checks the selector itself first) and the CR/selector-filtered arms of the live watch
+/// loop (which must parse and convert before they know whether the object matches, so they
+/// call this directly on the already-parsed value instead of round-tripping through
+/// `prepare_live_event`'s raw-bytes entry point).
+#[allow(clippy::too_many_arguments)]
+fn finish_live_event(
+    mut parsed: serde_json::Value,
+    event_type: &str,
+    group: &str,
+    plural: &str,
+    api_version: &str,
+    kind: &str,
+    as_partial_object_metadata: bool,
+) -> Bytes {
+    super::defaults::apply_defaults(group, plural, &mut parsed);
+    let emit = if as_partial_object_metadata {
+        to_partial_object_metadata(&parsed)
+    } else {
+        parsed["apiVersion"] = serde_json::Value::String(api_version.to_owned());
+        parsed["kind"] = serde_json::Value::String(kind.to_owned());
+        parsed
+    };
+    ndjson_event_value(event_type, &emit)
+}
+
 /// Deserialize, filter, default, and re-serialize one Added/Modified watch event.
 ///
 /// Returns `None` when:
-/// - `raw` is not valid UTF-8 (corrupt store entry — caller logs and skips).
+/// - `raw` is not valid UTF-8, or is not valid JSON (corrupt store entry — caller logs and
+///   skips).
 /// - The parsed object does not match `label_selector` or `field_selector`.
 ///
 /// Otherwise returns pre-built NDJSON bytes (`{"type":"...","object":...}\n`).
 ///
 /// Deserialization and `apply_defaults` happen exactly once per call regardless of how many
-/// watchers share the same event source.  Each watcher calls this once; sharing the returned
+/// watchers share the same event source. Each watcher calls this once; sharing the returned
 /// `Bytes` across callers (same event, multiple watchers) is safe because `Bytes` is `Clone`
-/// and the allocation is reference-counted.
-#[cfg(test)]
+/// and the allocation is reference-counted. Used directly by the live watch loop's fast path
+/// (a builtin resource watch with no label/field selector, where no per-watcher bookkeeping
+/// depends on the parsed value); selector-filtered and CR watches instead call
+/// `finish_live_event` after their own parse+convert+match, to avoid re-parsing bytes this
+/// function already validated just to recover the metadata that bookkeeping needs.
 #[allow(clippy::too_many_arguments)]
-fn prepare_live_event(
+pub fn prepare_live_event(
     raw: &[u8],
     event_type: &str,
     group: &str,
@@ -88,21 +120,21 @@ fn prepare_live_event(
     field_selector: &str,
 ) -> Option<Bytes> {
     let s = std::str::from_utf8(raw).ok()?;
-    let mut parsed: serde_json::Value = serde_json::from_str(s).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(s).ok()?;
     if !object_matches_label_selector(&parsed, label_selector)
         || !object_matches_field_selector(&parsed, field_selector)
     {
         return None;
     }
-    super::defaults::apply_defaults(group, plural, &mut parsed);
-    let emit = if as_partial_object_metadata {
-        to_partial_object_metadata(&parsed)
-    } else {
-        parsed[&"apiVersion"] = serde_json::Value::String(api_version.to_owned());
-        parsed[&"kind"] = serde_json::Value::String(kind.to_owned());
-        parsed
-    };
-    Some(ndjson_event_value(event_type, &emit))
+    Some(finish_live_event(
+        parsed,
+        event_type,
+        group,
+        plural,
+        api_version,
+        kind,
+        as_partial_object_metadata,
+    ))
 }
 
 /// Transform a full CR JSON object into a PartialObjectMetadata object.
@@ -113,6 +145,23 @@ pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json:
         "kind": "PartialObjectMetadata",
         "metadata": obj.get("metadata").cloned().unwrap_or_default()
     })
+}
+
+/// Stamp resourceVersion and apiVersion/kind onto an already-parsed DELETED tombstone body
+/// and serialize it. Shared by `encode_watch_event` (which parses the raw stored body itself)
+/// and callers that already hold a parsed-and-converted Value (CR conversion for a DELETED
+/// event) and would otherwise pay a wasteful reserialize-then-reparse round trip to hand it
+/// to `encode_watch_event`.
+fn finish_deleted_event(
+    mut obj: serde_json::Value,
+    revision: u64,
+    api_version: &str,
+    kind: &str,
+) -> Bytes {
+    obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
+    obj["apiVersion"] = serde_json::Value::String(api_version.to_owned());
+    obj["kind"] = serde_json::Value::String(kind.to_owned());
+    ndjson_event_value("DELETED", &obj)
 }
 
 /// Serialise a single watch event to NDJSON bytes (including trailing newline).
@@ -173,9 +222,7 @@ pub(crate) fn encode_watch_event(
         } => {
             if let Some(body_bytes) = body {
                 if let Ok(s) = std::str::from_utf8(body_bytes) {
-                    if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(s) {
-                        obj["metadata"]["resourceVersion"] =
-                            serde_json::Value::String(revision.to_string());
+                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(s) {
                         // Re-stamp apiVersion/kind unconditionally, mirroring the ADDED/MODIFIED
                         // path (chunk_stream sets these on every emitted event). The stored body
                         // is not guaranteed to carry them: a PUT/Update sent through the dynamic
@@ -188,9 +235,7 @@ pub(crate) fn encode_watch_event(
                         // the watch's ResultChan — RetryWatcher reconnects (without ever having
                         // extracted a resourceVersion from the failed event) and repeats forever,
                         // wedging any caller waiting on a DELETED event.
-                        obj["apiVersion"] = serde_json::Value::String(api_version.to_owned());
-                        obj["kind"] = serde_json::Value::String(kind.to_owned());
-                        return Some(ndjson_event_value("DELETED", &obj));
+                        return Some(finish_deleted_event(obj, *revision, api_version, kind));
                     }
                 }
             }
@@ -553,6 +598,81 @@ fn should_emit_synthetic_delete(is_modified: bool, now_matches: bool, ever_match
     is_modified && !now_matches && ever_matched
 }
 
+/// Derive the RBAC/metrics `version` label from a watch's wire-format `apiVersion`
+/// ("v1" for core, "apps/v1" for grouped resources) — the last `/`-separated segment.
+///
+/// For PartialObjectMetadata watches `api_version` is overridden to "meta.k8s.io/v1" by the
+/// caller, so this yields "v1" rather than the CR's own requested version in that one case;
+/// acceptable for a metrics label, which only needs to be right in the common case.
+fn derive_watch_version(api_version: &str) -> &str {
+    api_version.rsplit('/').next().unwrap_or(api_version)
+}
+
+/// Derive the RBAC/metrics `scope` label ("cluster" or "namespace") from a watch's store
+/// prefix, mirroring upstream's `RequestInfo`-derived scope: it reflects whether the request
+/// URL named a specific namespace, not whether the resource type is namespaced. A prefix
+/// ending in exactly `/<plural>` (no trailing namespace segment) is either a cluster-scoped
+/// resource or a namespaced resource watched across all namespaces — both count as "cluster"
+/// scope upstream; anything with one more segment names a specific namespace.
+fn derive_watch_scope(prefix: &str, plural: &str) -> &'static str {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.ends_with(&format!("/{plural}")) {
+        "cluster"
+    } else {
+        "namespace"
+    }
+}
+
+/// RAII guard bracketing `apiserver_longrunning_requests{verb="watch",...}` for the real
+/// lifetime of an open watch stream — constructed inside the `async_stream::stream!` block
+/// below (not in the surrounding function) so its `Drop` fires only when the stream generator
+/// itself ends or is dropped (client disconnect, server timeout, or normal completion), not
+/// merely when `watch_generic_impl`'s synchronous setup returns.
+struct LongRunningWatchGuard {
+    group: String,
+    version: String,
+    resource: String,
+    scope: &'static str,
+}
+
+impl LongRunningWatchGuard {
+    fn new(group: String, version: String, resource: String, scope: &'static str) -> Self {
+        crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&[
+                "watch",
+                &group,
+                &version,
+                &resource,
+                "",
+                scope,
+                crate::metrics::COMPONENT,
+            ])
+            .inc();
+        Self {
+            group,
+            version,
+            resource,
+            scope,
+        }
+    }
+}
+
+impl Drop for LongRunningWatchGuard {
+    fn drop(&mut self) {
+        crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&[
+                "watch",
+                &self.group,
+                &self.version,
+                &self.resource,
+                "",
+                self.scope,
+                crate::metrics::COMPONENT,
+            ])
+            .dec();
+    }
+}
+
 async fn watch_generic_impl<S: Store>(
     state: AppState<S>,
     cfg: WatchConfig,
@@ -573,16 +693,25 @@ async fn watch_generic_impl<S: Store>(
         plural,
         timeout_seconds,
     } = cfg;
+    let watch_version = derive_watch_version(&api_version).to_string();
+    let watch_scope = derive_watch_scope(&prefix, &plural);
     // Enforce per-client watch concurrency limit. Try to acquire a permit from
     // this user's semaphore. If the semaphore is exhausted (client already has
     // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
     let sem = state.watch_limit.semaphore_for(&username);
     let _watch_permit = sem.try_acquire_owned().map_err(|_| {
+        crate::metrics::REQUEST_TOTAL
+            .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
+            .inc();
+        u7s_store::metrics::WATCH_CLOSED_TOTAL
+            .with_label_values(&["client_limit_exceeded"])
+            .inc();
         crate::status::Status::too_many_requests(format!(
             "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
             crate::state::MAX_WATCHES_PER_CLIENT
         ))
     })?;
+    tracing::debug!(username = %username, "watch: permit acquired");
     // _watch_permit is held for the duration of the watch stream and released when
     // this function returns (RAII drop).
 
@@ -594,6 +723,9 @@ async fn watch_generic_impl<S: Store>(
     if from_revision > 0 && initial_items.is_none() {
         let horizon = state.store.compaction_horizon();
         if from_revision < horizon {
+            crate::metrics::REQUEST_TOTAL
+                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "410"])
+                .inc();
             return Err(Status::expired(format!(
                 "too old resource version: {from_revision} (current compaction horizon: {horizon})"
             )));
@@ -616,6 +748,13 @@ async fn watch_generic_impl<S: Store>(
         .watch(&prefix, watch_from_rv)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // From this point the watch is committed to opening — count it as a successful request
+    // now, matching upstream's counting of the initial HTTP response code for watch requests
+    // (the eventual stream-close reason is tracked separately by u7s_watch_closed_total).
+    crate::metrics::REQUEST_TOTAL
+        .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "200"])
+        .inc();
 
     // Keep the store alive for the entire watch stream lifetime.
     //
@@ -646,6 +785,11 @@ async fn watch_generic_impl<S: Store>(
         // is never dropped while we are waiting for live events.
         let _store_keepalive = _store_keepalive;
         let state_for_conversion = state_for_conversion;
+        // Brackets apiserver_longrunning_requests{verb="watch",...} for the stream's real
+        // lifetime — see LongRunningWatchGuard's doc for why it must be constructed here,
+        // inside the generator, rather than in the enclosing function.
+        let _longrunning_guard =
+            LongRunningWatchGuard::new(group.clone(), watch_version.clone(), plural.clone(), watch_scope);
 
         // For a CR watch with CRD-declared selectableFields, defer to the same CRD-aware
         // matcher LIST uses instead of the generic name/namespace/nodeName-only one, which
@@ -660,6 +804,14 @@ async fn watch_generic_impl<S: Store>(
                 ),
                 None => object_matches_field_selector(obj, &field_selector),
             }
+        };
+
+        // Counts every NDJSON line actually written to the client's HTTP body (events and
+        // bookmarks alike) — "an event was actually delivered", per apiserver_watch_events_total.
+        let record_watch_event = || {
+            crate::metrics::WATCH_EVENTS_TOTAL
+                .with_label_values(&[&group, &watch_version, &plural])
+                .inc();
         };
 
         let mut event_stream = pin!(event_stream);
@@ -717,8 +869,10 @@ async fn watch_generic_impl<S: Store>(
                     v["kind"] = serde_json::Value::String(kind.clone());
                     v
                 };
+                record_watch_event();
                 yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &emit));
             }
+            record_watch_event();
             yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
         }
 
@@ -764,6 +918,9 @@ async fn watch_generic_impl<S: Store>(
                                 let error_line = Bytes::from(format!(
                                     "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
                                 ));
+                                u7s_store::metrics::WATCH_CLOSED_TOTAL
+                                    .with_label_values(&["compacted"])
+                                    .inc();
                                 yield Ok::<Bytes, axum::BoxError>(error_line);
                                 break;
                             }
@@ -773,21 +930,71 @@ async fn watch_generic_impl<S: Store>(
                             // Bookmark and Compacted are handled above.
                             if let WatchEvent::Added(obj) | WatchEvent::Modified(obj) = &event {
                                 let is_modified = matches!(&event, WatchEvent::Modified(_));
-                                if let Ok(s) = std::str::from_utf8(&obj.value) {
+                                if cr_fields.is_none()
+                                    && label_selector.is_empty()
+                                    && field_selector.is_empty()
+                                {
+                                    // Fast path: builtin resource, no selector to enforce, so
+                                    // there is no CR conversion to splice in and no
+                                    // ever_matched/locally_deleted bookkeeping this watcher can
+                                    // ever read back (should_emit_synthetic_delete needs
+                                    // now_matches to go false, which cannot happen when every
+                                    // event trivially matches an empty selector). The whole
+                                    // parse+filter+default+serialize pipeline collapses into the
+                                    // one call the semantics-oracle tests below already pin down.
+                                    let locally_was_deleted = locally_deleted.remove(&obj.key);
+                                    let event_type = if is_modified && locally_was_deleted {
+                                        "ADDED"
+                                    } else if is_modified {
+                                        "MODIFIED"
+                                    } else {
+                                        "ADDED"
+                                    };
+                                    match prepare_live_event(
+                                        &obj.value,
+                                        event_type,
+                                        &group,
+                                        &plural,
+                                        &api_version,
+                                        &kind,
+                                        as_partial_object_metadata,
+                                        "",
+                                        "",
+                                    ) {
+                                        Some(bytes) => {
+                                            record_watch_event();
+                                            yield Ok::<Bytes, axum::BoxError>(bytes);
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "watch {event_type} event has invalid UTF-8 or JSON, skipping"
+                                            );
+                                        }
+                                    }
+                                } else if let Ok(s) = std::str::from_utf8(&obj.value) {
                                     let parsed: serde_json::Value =
                                         serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
                                     // Convert to the actually-requested version BEFORE the
                                     // field-selector filter below — filtering the unconverted
                                     // body means a cross-version selector (e.g. v1's hostPort
                                     // against a v2-stored host/port CR) never matches anything.
-                                    let mut parsed = match convert_watched_cr_object(
+                                    let conversion_start = std::time::Instant::now();
+                                    let parsed = match convert_watched_cr_object(
                                         &state_for_conversion,
                                         cr_fields.as_ref(),
                                         parsed,
                                     )
                                     .await
                                     {
-                                        Ok(converted) => converted,
+                                        Ok(converted) => {
+                                            tracing::debug!(
+                                                prefix = %prefix,
+                                                key = %obj.key,
+                                                elapsed_ms = conversion_start.elapsed().as_millis() as u64,
+                                                "watch: CR conversion webhook call completed"
+                                            );
+                                            converted
+                                        }
                                         Err(e) => {
                                             tracing::warn!(
                                                 prefix = %prefix,
@@ -828,15 +1035,21 @@ async fn watch_generic_impl<S: Store>(
                                             rv = obj.revision,
                                             "watch: emitting event"
                                         );
-                                        super::defaults::apply_defaults(&group, &plural, &mut parsed);
-                                        let emit = if as_partial_object_metadata {
-                                            to_partial_object_metadata(&parsed)
-                                        } else {
-                                            parsed["apiVersion"] = serde_json::Value::String(api_version.clone());
-                                            parsed["kind"] = serde_json::Value::String(kind.clone());
-                                            parsed
-                                        };
-                                        yield Ok::<Bytes, axum::BoxError>(ndjson_event_value(event_type, &emit));
+                                        // Downstream of the CR conversion/selector check above:
+                                        // finish_live_event is the same apply_defaults+wrap-or-
+                                        // stamp+serialize tail prepare_live_event's fast path uses,
+                                        // shared here instead of duplicated inline.
+                                        let bytes = finish_live_event(
+                                            parsed,
+                                            event_type,
+                                            &group,
+                                            &plural,
+                                            &api_version,
+                                            &kind,
+                                            as_partial_object_metadata,
+                                        );
+                                        record_watch_event();
+                                        yield Ok::<Bytes, axum::BoxError>(bytes);
                                     } else {
                                         // The object doesn't match the selector after this event.
                                         // Only emit a synthetic DELETED if this watcher previously
@@ -874,6 +1087,7 @@ async fn watch_generic_impl<S: Store>(
                                                     }
                                                 })
                                             };
+                                            record_watch_event();
                                             yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
                                         }
                                     }
@@ -890,7 +1104,12 @@ async fn watch_generic_impl<S: Store>(
                                 // for. If no body is available, send unconditionally (conservative).
                                 // Also skip if we already emitted a synthetic DELETED for this key
                                 // (locally_deleted tracks keys for which DELETED was already sent).
-                                let mut emit_body = body.clone();
+                                let emit_body = body.clone();
+                                // Set only when CR conversion already produced the final,
+                                // matching, per-version Value in memory — lets the yield below
+                                // serialize it once directly instead of round-tripping it back
+                                // to Bytes here just so encode_watch_event can reparse it.
+                                let mut prebuilt: Option<Bytes> = None;
                                 let should_send = if locally_deleted.contains(key.as_str()) {
                                     // Already sent a synthetic DELETED for this object; the real
                                     // DELETED is redundant for this watcher. Clear the tracking entry.
@@ -899,6 +1118,7 @@ async fn watch_generic_impl<S: Store>(
                                 } else if let Some(body_bytes) = body {
                                     if let Ok(s) = std::str::from_utf8(body_bytes) {
                                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                            let conversion_start = std::time::Instant::now();
                                             match convert_watched_cr_object(
                                                 &state_for_conversion,
                                                 cr_fields.as_ref(),
@@ -907,6 +1127,12 @@ async fn watch_generic_impl<S: Store>(
                                             .await
                                             {
                                                 Ok(converted) => {
+                                                    tracing::debug!(
+                                                        prefix = %prefix,
+                                                        key = %key,
+                                                        elapsed_ms = conversion_start.elapsed().as_millis() as u64,
+                                                        "watch: CR conversion webhook call completed"
+                                                    );
                                                     let matches = object_matches_label_selector(&converted, &label_selector)
                                                         && field_selector_matches(&converted);
                                                     // The object is gone either way; forget it so a
@@ -918,7 +1144,12 @@ async fn watch_generic_impl<S: Store>(
                                                         converted["metadata"]["name"].as_str().unwrap_or("").to_string(),
                                                     ));
                                                     if matches {
-                                                        emit_body = serde_json::to_vec(&converted).ok().map(Bytes::from);
+                                                        prebuilt = Some(finish_deleted_event(
+                                                            converted,
+                                                            *revision,
+                                                            &api_version,
+                                                            &kind,
+                                                        ));
                                                     }
                                                     matches
                                                 }
@@ -949,12 +1180,19 @@ async fn watch_generic_impl<S: Store>(
                                     "watch: DELETED event reached handler"
                                 );
                                 if should_send {
-                                    let emit_event = WatchEvent::Deleted {
-                                        key: key.clone(),
-                                        revision: *revision,
-                                        body: emit_body,
+                                    let chunk = match prebuilt {
+                                        Some(bytes) => Some(bytes),
+                                        None => {
+                                            let emit_event = WatchEvent::Deleted {
+                                                key: key.clone(),
+                                                revision: *revision,
+                                                body: emit_body,
+                                            };
+                                            encode_watch_event(&emit_event, &api_version, &kind, as_partial_object_metadata)
+                                        }
                                     };
-                                    if let Some(chunk) = encode_watch_event(&emit_event, &api_version, &kind, as_partial_object_metadata) {
+                                    if let Some(chunk) = chunk {
+                                        record_watch_event();
                                         yield Ok::<Bytes, axum::BoxError>(chunk);
                                     } else {
                                         tracing::debug!(prefix = %prefix, key = %key, "watch: DELETED event dropped by encode_watch_event");
@@ -962,6 +1200,7 @@ async fn watch_generic_impl<S: Store>(
                                 }
                             } else if !matches!(&event, WatchEvent::Bookmark { .. }) || allow_watch_bookmarks {
                                 if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
+                                    record_watch_event();
                                     yield Ok::<Bytes, axum::BoxError>(chunk);
                                 }
                             }
@@ -978,14 +1217,19 @@ async fn watch_generic_impl<S: Store>(
                         // StatefulSet watch only sees StatefulSet events, so last_rv stays
                         // stale relative to pod writes — causing endless requeue loops.
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
+                        record_watch_event();
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
                 }
 
                 _ = &mut max_duration => {
                     tracing::debug!(prefix = %prefix, last_rv, stream_timeout_secs, "watch: max_duration elapsed, closing response body");
+                    u7s_store::metrics::WATCH_CLOSED_TOTAL
+                        .with_label_values(&["timeout"])
+                        .inc();
                     if allow_watch_bookmarks {
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
+                        record_watch_event();
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
                     break;
@@ -3870,6 +4114,111 @@ mod tests {
         );
     }
 
+    /// Two independent watch streams on the same resource, both subscribed before a live
+    /// write, must receive byte-identical NDJSON for that write. Both are served by
+    /// `watch_generic_impl`'s Added/Modified fast path, which now delegates to the single,
+    /// independently-tested `prepare_live_event` instead of the fast path and the
+    /// CR/selector-filtered path each hand-rolling their own parse+default+serialize.
+    /// This pins the cross-path invariant the split enables: a future edit to one path's
+    /// selector/defaulting/stamping logic without the matching edit to the other would make
+    /// two watchers on the same resource observably disagree about the same live write —
+    /// exactly the drift risk of maintaining the logic twice, which is what leaving
+    /// `prepare_live_event` uncalled in production (its pre-fix state) risked. Kubernetes
+    /// clients rely on every watcher of a resource agreeing on its watch events.
+    #[tokio::test]
+    async fn watch_generic_two_concurrent_watchers_receive_byte_identical_live_added_event() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        // Unlike read_watch_body_with_timeout (used elsewhere in this file), this returns the
+        // raw NDJSON line, not a decoded Value — decoding would hide a real field-ordering or
+        // whitespace divergence between the two watchers behind serde_json's own normalization.
+        async fn first_raw_line(resp: axum::response::Response) -> String {
+            use tokio::time::{timeout, Duration};
+            let bytes = timeout(
+                Duration::from_secs(3),
+                axum::body::to_bytes(resp.into_body(), usize::MAX),
+            )
+            .await
+            .expect("stream must close within the 3s test timeout")
+            .expect("body read must succeed");
+            std::str::from_utf8(&bytes)
+                .expect("NDJSON body must be valid UTF-8")
+                .lines()
+                .next()
+                .unwrap_or_else(|| {
+                    panic!("watch stream must emit at least one line, got {bytes:?}")
+                })
+                .to_string()
+        }
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let watch_cfg = |username: &str| WatchConfig {
+            prefix: "/registry/configmaps/default/".into(),
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            from_revision: 0,
+            initial_items: None,
+            label_selector: None,
+            field_selector: None,
+            allow_watch_bookmarks: false,
+            username: username.into(),
+            as_partial_object_metadata: false,
+            group: "".into(),
+            plural: "configmaps".into(),
+            timeout_seconds: Some(1),
+        };
+
+        // Subscribe BOTH watchers before writing, so the write below is a live broadcast
+        // event for both (store::watch subscribes before returning — see its own "Subscribe
+        // FIRST to avoid missing events between replay and live" comment), not a ring-buffer
+        // replay of a pre-existing write.
+        let resp_a = watch_generic(state.clone(), watch_cfg("watcher-a"))
+            .await
+            .unwrap_or_else(|_| panic!("watcher A must subscribe successfully"));
+        let resp_b = watch_generic(state.clone(), watch_cfg("watcher-b"))
+            .await
+            .unwrap_or_else(|_| panic!("watcher B must subscribe successfully"));
+
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-shared", "namespace": "default" },
+            "data": { "k": "v" }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-shared",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let (line_a, line_b) = tokio::join!(first_raw_line(resp_a), first_raw_line(resp_b));
+
+        assert!(
+            line_a.contains("\"type\":\"ADDED\""),
+            "watcher A must see the live write as ADDED; got {line_a:?}"
+        );
+        assert_eq!(
+            line_a, line_b,
+            "two watchers on the same resource observing the same live write must receive \
+             byte-identical NDJSON — both now go through prepare_live_event's single \
+             parse+default+serialize instead of two independently-maintained inline \
+             implementations that could silently drift"
+        );
+    }
+
     /// `key in (v1,v2)`: objects with key=v1 or key=v2 must match; others must not.
     ///
     /// Without this fix the `in` operator falls through to bare-key Exists, matching
@@ -3986,6 +4335,304 @@ mod tests {
                 "watch-this-configmap in (multiple-watchers-A)"
             ),
             "a configmap without the watcher label must not match"
+        );
+    }
+
+    // -- watch metrics: apiserver_longrunning_requests / apiserver_watch_events_total /
+    //    apiserver_request_total / u7s_watch_closed_total{client_limit_exceeded} --
+
+    /// derive_watch_version must extract just the version, not the group, for both core
+    /// (no group prefix) and grouped apiVersions — a wrong version label would silently merge
+    /// unrelated resource types' watch metrics under the wrong series.
+    #[test]
+    fn derive_watch_version_strips_group_prefix() {
+        assert_eq!(
+            derive_watch_version("v1"),
+            "v1",
+            "a core apiVersion (no '/') must be used as-is"
+        );
+        assert_eq!(
+            derive_watch_version("apps/v1"),
+            "v1",
+            "a grouped apiVersion must report only the version segment, matching upstream's \
+             apiserver_longrunning_requests `version` label semantics"
+        );
+    }
+
+    /// derive_watch_scope must classify by whether the request named a specific namespace, not
+    /// by whether the resource type is namespaced — mirroring upstream's RequestInfo-derived
+    /// `scope` label. A namespaced resource watched across all namespaces is still "cluster"
+    /// scope; only a namespace-suffixed prefix is "namespace" scope.
+    #[test]
+    fn derive_watch_scope_distinguishes_all_namespaces_from_one_namespace() {
+        assert_eq!(
+            derive_watch_scope("/registry/pods/", "pods"),
+            "cluster",
+            "watching a namespaced resource across all namespaces must report scope=cluster, \
+             matching upstream semantics where scope reflects the request URL, not the resource \
+             type's namespacing"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/pods/default/", "pods"),
+            "namespace",
+            "watching pods in one namespace must report scope=namespace"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/apps/deployments/", "deployments"),
+            "cluster",
+            "a grouped resource watched across all namespaces must also report scope=cluster"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/apps/deployments/default/", "deployments"),
+            "namespace",
+            "a grouped resource watched in one namespace must report scope=namespace"
+        );
+        assert_eq!(
+            derive_watch_scope("/registry/nodes/", "nodes"),
+            "cluster",
+            "a genuinely cluster-scoped resource (no namespace concept at all) must also \
+             report scope=cluster"
+        );
+    }
+
+    /// Opening a watch must increment apiserver_longrunning_requests{verb="watch",...} for the
+    /// real duration the stream is open, and dropping the stream (client disconnect, in this
+    /// test) must decrement it back down — the whole point of the gauge is to answer "how many
+    /// watches are open right now", which is wrong if it only ever grows or never grows at all.
+    #[tokio::test]
+    async fn watch_open_and_drop_brackets_longrunning_gauge() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Unique label values so concurrently-running tests in this same binary cannot
+        // perturb this test's before/after comparison for this exact label combination.
+        let group = "u7s-test-metrics-group";
+        let plural = "u7s-test-metrics-longrunning-resources";
+        let label_values = [
+            "watch",
+            group,
+            "v1",
+            plural,
+            "",
+            "cluster",
+            crate::metrics::COMPONENT,
+        ];
+        let before = crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&label_values)
+            .get();
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: format!("/registry/{group}/{plural}/"),
+                api_version: "v1".into(),
+                kind: "Widget".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "longrunning-gauge-test-user".into(),
+                as_partial_object_metadata: false,
+                group: group.into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        use futures_util::StreamExt;
+        let mut body = resp.into_body().into_data_stream();
+        // Drive the stream generator's first poll (up to its first suspension point), which
+        // runs the guard construction synchronously before any await completes.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), body.next()).await;
+
+        let during = crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            during,
+            before + 1,
+            "opening a watch must increment apiserver_longrunning_requests{{verb=\"watch\"}}"
+        );
+
+        drop(body);
+
+        let after = crate::metrics::LONGRUNNING_REQUESTS
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            after, before,
+            "dropping the watch stream must decrement apiserver_longrunning_requests back down; \
+             a gauge that never decrements would falsely report every watch ever opened as \
+             still active"
+        );
+    }
+
+    /// The (MAX_WATCHES_PER_CLIENT + 1)th watch from the same user must count as a 429 request
+    /// and a client_limit_exceeded closure — operators need to see rejected watch attempts in
+    /// apiserver_request_total and u7s_watch_closed_total just as much as successful ones,
+    /// otherwise a client stuck retrying against the per-user limit is invisible in metrics.
+    #[tokio::test]
+    async fn watch_limit_429_increments_request_total_and_closed_total() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let username = "watch-429-metrics-test-user";
+        let group = "u7s-test-metrics-429-group";
+        let plural = "u7s-test-metrics-429-resources";
+
+        let sem = state.watch_limit.semaphore_for(username);
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem.clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        let request_total_before = crate::metrics::REQUEST_TOTAL
+            .with_label_values(&["watch", group, "v1", plural, "cluster", "429"])
+            .get();
+        let closed_total_before = u7s_store::metrics::WATCH_CLOSED_TOTAL
+            .with_label_values(&["client_limit_exceeded"])
+            .get();
+
+        let result = watch_generic(
+            state.clone(),
+            WatchConfig {
+                prefix: format!("/registry/{group}/{plural}/"),
+                api_version: "v1".into(),
+                kind: "Widget".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: username.into(),
+                as_partial_object_metadata: false,
+                group: group.into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await;
+        assert!(result.is_err(), "the 429th watch attempt must be rejected");
+
+        let request_total_after = crate::metrics::REQUEST_TOTAL
+            .with_label_values(&["watch", group, "v1", plural, "cluster", "429"])
+            .get();
+        assert_eq!(
+            request_total_after,
+            request_total_before + 1,
+            "a 429 watch rejection must be counted in apiserver_request_total{{code=\"429\"}}"
+        );
+
+        let closed_total_after = u7s_store::metrics::WATCH_CLOSED_TOTAL
+            .with_label_values(&["client_limit_exceeded"])
+            .get();
+        assert_eq!(
+            closed_total_after,
+            closed_total_before + 1,
+            "a 429 watch rejection must be counted in \
+             u7s_watch_closed_total{{reason=\"client_limit_exceeded\"}}"
+        );
+    }
+
+    /// Every ADDED item and the terminating BOOKMARK sent during sendInitialEvents must be
+    /// counted in apiserver_watch_events_total — this is the "an event was actually written to
+    /// the client's HTTP body" signal, and sendInitialEvents is the simplest, fully
+    /// deterministic path to exercise it (no timing dependency on live broadcast delivery).
+    #[tokio::test]
+    async fn send_initial_events_increments_watch_events_total_per_item_and_bookmark() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "u7s-test-metrics-events-group";
+        let plural = "u7s-test-metrics-events-resources";
+        let label_values = [group, "v1", plural];
+        let before = crate::metrics::WATCH_EVENTS_TOTAL
+            .with_label_values(&label_values)
+            .get();
+
+        let items = vec![
+            serde_json::json!({"metadata": {"name": "a", "namespace": "default"}}),
+            serde_json::json!({"metadata": {"name": "b", "namespace": "default"}}),
+        ];
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: format!("/registry/{group}/{plural}/"),
+                api_version: "v1".into(),
+                kind: "Widget".into(),
+                from_revision: 0,
+                initial_items: Some((items, 5)),
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "watch-events-metrics-test-user".into(),
+                as_partial_object_metadata: false,
+                group: group.into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        use futures_util::StreamExt;
+        let mut body = resp.into_body().into_data_stream();
+        // Drain exactly the 2 ADDED items + 1 initial-events-end BOOKMARK; sendInitialEvents
+        // emits these synchronously before ever touching the live broadcast stream.
+        for _ in 0..3 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), body.next())
+                .await
+                .expect("must not time out draining sendInitialEvents output")
+                .expect("stream must not end before sendInitialEvents output is drained")
+                .expect("chunk must not be an error");
+            assert!(!chunk.is_empty());
+        }
+
+        let after = crate::metrics::WATCH_EVENTS_TOTAL
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            after,
+            before + 3,
+            "2 ADDED items + 1 initial-events-end BOOKMARK must each increment \
+             apiserver_watch_events_total exactly once"
         );
     }
 }

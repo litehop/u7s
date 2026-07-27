@@ -173,6 +173,11 @@ fn push_event_locked(
             // Update compaction horizon to the revision of the oldest remaining entry.
             if let Some(oldest) = guard.front() {
                 compaction_horizon.store(oldest.revision, Ordering::Relaxed);
+                tracing::debug!(
+                    new_horizon = oldest.revision,
+                    ring_len = guard.len(),
+                    "push_event_locked: ring buffer compacted"
+                );
             }
         }
     }
@@ -205,6 +210,11 @@ fn push_event_locked(
                 // of an O(n) linear scan over `by_key`.
                 if let Some((_, oldest_key)) = guard.by_revision.pop_first() {
                     guard.by_key.remove(&oldest_key);
+                    tracing::debug!(
+                        evicted_key = %oldest_key,
+                        cap = DELETION_LOG_CAP,
+                        "push_event_locked: deletion tombstone log evicted oldest entry"
+                    );
                 }
             }
         } else {
@@ -378,6 +388,7 @@ fn put_sync(
     if let Some((existing_revision, existing_value)) = &stored {
         if semantically_equal_ignoring_resource_version(&value, existing_value) {
             conn.execute_batch("ROLLBACK")?;
+            tracing::debug!(key, existing_revision, "put_sync: no-op write suppressed");
             return Ok((
                 *existing_revision,
                 Bytes::from(existing_value.clone()),
@@ -935,7 +946,8 @@ impl Store for SqliteStore {
         let ring = Arc::clone(&self.ring);
         let deletion_log = Arc::clone(&self.deletion_log);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
-        let revision = tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let (revision, is_noop, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let (revision, stamped_value, is_create, is_noop) =
                 put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
@@ -960,9 +972,17 @@ impl Store for SqliteStore {
                     }),
                 );
             }
-            Ok::<u64, StoreError>(revision)
+            Ok::<(u64, bool, bool), StoreError>((revision, is_noop, is_create))
         })
         .await??;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            key,
+            elapsed_ms,
+            is_noop,
+            is_create,
+            "store: write committed"
+        );
 
         Ok(revision)
     }
@@ -975,6 +995,7 @@ impl Store for SqliteStore {
         let ring = Arc::clone(&self.ring);
         let deletion_log = Arc::clone(&self.deletion_log);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let start = std::time::Instant::now();
         let (revision, last_value) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let (revision, last_value) =
@@ -997,6 +1018,8 @@ impl Store for SqliteStore {
             Ok::<(u64, Bytes), StoreError>((revision, last_value))
         })
         .await??;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::debug!(key, elapsed_ms, "store: delete committed");
 
         Ok((revision, last_value))
     }
@@ -1090,6 +1113,7 @@ impl Store for SqliteStore {
             from_revision,
             horizon,
             replayed_count = replayed.len(),
+            receiver_count = self.tx.receiver_count(),
             "watch: stream opened"
         );
 
@@ -1196,8 +1220,11 @@ impl Store for SqliteStore {
                         // always sees a stale RV and requeues indefinitely.
                         yield WatchEvent::Bookmark { revision: last_replayed };
                     }
-                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         // The broadcast channel dropped messages because this receiver was too slow.
+                        crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+                            .with_label_values(&[&prefix_owned])
+                            .inc_by(n);
                         // Attempt recovery: re-subscribe (to capture all future events) then
                         // re-scan the ring buffer for events missed during the lag.  This avoids
                         // terminating the stream with a 410 error for a transient slow-consumer
@@ -1230,6 +1257,15 @@ impl Store for SqliteStore {
                         // would never deliver its DELETED event: the client would reconnect after
                         // a relist, open a new Watch at the current revision, and wait forever.
                         let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
+                        let recovered = current_horizon <= last_replayed;
+                        tracing::debug!(
+                            prefix = %prefix_owned,
+                            missed = n,
+                            last_replayed,
+                            current_horizon,
+                            recovered,
+                            "watch: lag detected, ring-buffer recovery attempted"
+                        );
                         if current_horizon > last_replayed {
                             // Use from_revision (the watcher's original start) rather than
                             // last_replayed as the lower bound for deletion_log replay.
@@ -1275,9 +1311,20 @@ impl Store for SqliteStore {
                         // Ring buffer covered the gap; continue watching from last_replayed.
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        // Sender dropped; stop stream.
-                        tracing::debug!(prefix = %prefix_owned, "watch: broadcast sender closed, stopping stream");
-                        return;
+                        // Structurally unreachable: `tx_clone` (captured above) lives inside
+                        // this same generator for as long as this `rx.recv()` call is being
+                        // polled, so this stream always holds at least one Sender handle of
+                        // its own. The broadcast channel's sender count can therefore never
+                        // reach zero from this stream's point of view — dropping the
+                        // originating `SqliteStore` only releases `SqliteStore::tx`, never the
+                        // clone this stream is holding. Kept as an exhaustive match arm rather
+                        // than deleted so a future change to `tx_clone`'s capture strategy that
+                        // defeats this invariant fails loudly instead of silently leaking watch
+                        // streams that poll a dead channel forever.
+                        unreachable!(
+                            "watch() retains its own broadcast Sender clone for this stream's \
+                             entire lifetime, so RecvError::Closed can never be observed here"
+                        )
                     }
                 }
             }
@@ -1292,6 +1339,10 @@ impl Store for SqliteStore {
 
     fn current_revision(&self) -> u64 {
         self.last_written_revision.load(Ordering::Acquire)
+    }
+
+    fn watch_receiver_count(&self) -> usize {
+        self.tx.receiver_count()
     }
 }
 
@@ -2379,6 +2430,134 @@ mod tests {
             "a stale expected_revision must be rejected as RevisionMismatch even when the \
              content would have been unchanged — the no-op optimization must never mask a real \
              optimistic-concurrency conflict, got: {result:?}"
+        );
+    }
+
+    // -- watch metrics: u7s_watch_broadcast_receivers / u7s_watch_broadcast_lagged_total --
+
+    /// `watch_receiver_count` backs the `u7s_watch_broadcast_receivers` gauge — it must track
+    /// the number of *currently open* watch streams, not just the number ever opened. Without
+    /// this, an operator scraping /metrics could never tell "50 watches opened at startup and
+    /// still open" from "50 watches opened and long since closed", which is the whole point of
+    /// the gauge.
+    #[tokio::test]
+    async fn watch_receiver_count_reflects_open_streams_not_ever_opened() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        assert_eq!(
+            store.watch_receiver_count(),
+            0,
+            "a fresh store must report zero active watch receivers"
+        );
+
+        let stream_a = store.watch("/registry/pods/", 0).await.expect("watch a");
+        let stream_b = store.watch("/registry/pods/", 0).await.expect("watch b");
+        assert_eq!(
+            store.watch_receiver_count(),
+            2,
+            "two open watch streams must report receiver_count=2"
+        );
+
+        drop(stream_a);
+        assert_eq!(
+            store.watch_receiver_count(),
+            1,
+            "dropping one watch stream must decrement receiver_count back to 1 — a gauge that \
+             only ever grows would tell an operator every watch that ever connected is still \
+             open, hiding leaked or already-closed watchers"
+        );
+
+        drop(stream_b);
+        assert_eq!(
+            store.watch_receiver_count(),
+            0,
+            "dropping the last watch stream must bring receiver_count back to zero"
+        );
+    }
+
+    /// A real `RecvError::Lagged(n)` must add exactly `n` to
+    /// `u7s_watch_broadcast_lagged_total{prefix}` — this is the currently-discarded `_n` that
+    /// motivated the metric: without counting it, an operator has no way to see that a watcher
+    /// fell behind and silently missed events (recovered via ring-buffer catchup or a 410, but
+    /// only after the fact).
+    #[tokio::test]
+    async fn broadcast_lag_increments_lagged_total_by_exact_missed_count() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/lag-test-events/";
+
+        // Subscribe but do not poll the stream, so the receiver falls behind once the
+        // broadcast channel fills past its capacity.
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[prefix])
+            .get();
+
+        // Write one more than the broadcast capacity so the unpolled subscriber is guaranteed
+        // to have missed at least one message once it is finally polled.
+        let writes = BROADCAST_CAPACITY as u64 + 1;
+        for i in 0..writes {
+            let key = format!("{prefix}obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+
+        // Draining the ring buffer is not enough to observe Lagged — the ring buffer only
+        // holds RING_CAPACITY entries, but the broadcast channel itself dropped messages for
+        // this specific unpolled receiver once BROADCAST_CAPACITY was exceeded. Poll once to
+        // surface the Lagged error the receiver accumulated while unread.
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[prefix])
+            .get();
+        assert!(
+            after > before,
+            "a receiver that missed more than BROADCAST_CAPACITY messages must increment \
+             u7s_watch_broadcast_lagged_total for its prefix once polled; before={before} after={after}"
+        );
+    }
+
+    /// Dropping the store that created a watch stream must not end that stream: `watch()`
+    /// captures its own broadcast `Sender` clone (`tx_clone`, used for lag-recovery
+    /// re-subscription) for the entire lifetime of the returned stream, so the channel's
+    /// sender count can never reach zero while this same stream is the one polling
+    /// `rx.recv()`. This pins down the invariant the `RecvError::Closed` match arm's
+    /// `unreachable!()` relies on: if a future change to `tx_clone`'s capture strategy ever
+    /// broke it, a real store shutdown would either panic every open watch task (loud, this
+    /// test would start failing by panicking instead of timing out) or — if `unreachable!()`
+    /// were also reverted back to a plain `return` — silently end every open watch stream
+    /// clients still expect events from, instead of leaving them correctly pending forever
+    /// (the actual behavior for as long as the apiserver process is alive).
+    #[tokio::test]
+    async fn watch_stream_stays_pending_after_originating_store_is_dropped() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let stream = store
+            .watch("/registry/pods/", 0)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // Drop the only handle to the store, including its own `tx` broadcast::Sender field.
+        // The returned stream holds no reference back into `store` (its 'static bound
+        // requires that), so this compiles — and is exactly what makes this a meaningful test:
+        // it isolates whether losing the store's OWN Sender handle closes a stream opened
+        // before the drop.
+        drop(store);
+
+        // If `tx_clone` did not exist (or were dropped along with the store), the next
+        // rx.recv() would return RecvError::Closed and the stream would resolve — to `None`
+        // before this fix, or by panicking inside `unreachable!()` after it — well within this
+        // window instead of staying pending.
+        let outcome = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        assert!(
+            outcome.is_err(),
+            "a watch stream must remain pending after its originating store is dropped — \
+             resolving here means the channel was observed as closed, which should be \
+             structurally impossible while this stream holds its own Sender clone; got: \
+             {outcome:?}"
         );
     }
 }

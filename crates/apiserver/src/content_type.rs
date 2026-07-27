@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, Request, Response, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use tower::Layer;
 use tower_service::Service;
 
@@ -77,150 +77,159 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let wants_proto = prefer_proto(req.headers());
         let method = req.method().clone();
+        // `uri` intentionally includes the query string: none of this apiserver's routes
+        // accept bearer tokens or secrets as query parameters (auth is Authorization-header
+        // or client-cert only; the only query params in use are things like timeout,
+        // fieldSelector, labelSelector, watch, limit, continue), so there is no credential
+        // leakage risk in logging it verbatim.
         let uri = req.uri().to_string();
-        let _accept = req
+        let user_agent = req
             .headers()
-            .get(header::ACCEPT)
+            .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let request_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let is_openapi = uri.starts_with("/openapi/");
+        let is_get = method == axum::http::Method::GET;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let resp = inner.call(req).await?;
+
+            // Only attempt proto re-encoding for GET requests outside /openapi/ when the
+            // client asked for protobuf. OpenAPI has its own content negotiation, and
+            // non-GET/non-proto-accept responses must pass through unchanged (see the
+            // module doc comment for why client-go's proto decoder can't be trusted here).
+            let mut resp = if wants_proto && !is_openapi && is_get {
+                reencode_proto_response(&uri, resp).await
+            } else {
+                resp
+            };
+
+            // Single access-log point for every request, regardless of which branch
+            // above was taken — keeps the field set/level consistent and avoids the
+            // previous bug where a mid-flight 500 (failed body collection) was logged
+            // with the pre-failure status code instead of the one actually returned.
             let status = resp.status().as_u16();
-
-            // Only re-encode when client asked for protobuf.
-            if !wants_proto {
-                tracing::info!(method = %method, uri = %uri, status, "request");
-                return Ok(resp);
+            let request_id_str = request_id.to_string();
+            if let Ok(value) = HeaderValue::from_str(&request_id_str) {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("x-request-id"), value);
             }
-
-            // OpenAPI endpoints use their own content-type negotiation and must
-            // always return application/json.  Passing them through the proto
-            // re-encode path can set the wrong Content-Type and cause kubectl to
-            // report "unable to respond with a content type that the client supports".
-            if uri.starts_with("/openapi/") {
-                tracing::info!(method = %method, uri = %uri, status, "request openapi passthrough");
-                return Ok(resp);
-            }
-
-            // Only re-encode GET responses.
-            //
-            // For write operations (POST/PUT/PATCH), client-go's protobuf decoder
-            // does not reliably honour the contentType=application/json field inside
-            // the Unknown envelope: it may attempt to decode the raw JSON bytes as a
-            // typed proto message, producing "proto: illegal wireType 6" (ASCII 'n'
-            // from "name" field is interpreted as a proto tag with wire type 6).
-            //
-            // The Accept header includes "application/json" as a fallback, so the
-            // server is permitted to respond with JSON for these methods. Kubelet
-            // smoke tests pass with this change because they use GET for status
-            // reads and kubelet's PUT path also handles JSON responses correctly.
-            if method != axum::http::Method::GET {
-                tracing::info!(method = %method, uri = %uri, status, "request");
-                return Ok(resp);
-            }
-
-            tracing::info!(method = %method, uri = %uri, status, "request proto");
-
-            // Only re-encode successful (2xx) responses.
-            if !resp.status().is_success() {
-                return Ok(resp);
-            }
-
-            // Only re-encode when the response is application/json.
-            let is_json = resp
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.starts_with("application/json"))
-                .unwrap_or(false);
-
-            if !is_json {
-                return Ok(resp);
-            }
-
-            // Watch streams use chunked transfer encoding (streaming NDJSON).
-            // Buffering a watch stream would deadlock the response — the stream
-            // never ends while the connection is open.  Pass watch responses
-            // through unchanged; the client's Accept includes "application/json"
-            // as a fallback so returning JSON is always legal.
-            let is_chunked = resp
-                .headers()
-                .get(header::TRANSFER_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(|te| te.eq_ignore_ascii_case("chunked"))
-                .unwrap_or(false);
-            if is_chunked {
-                tracing::debug!(uri = %uri, "skip proto re-encode: chunked watch stream");
-                return Ok(resp);
-            }
-
-            // Collect the body bytes. Limit to 32 MiB — any larger response is
-            // pathological for our API surface.
-            let (parts, body) = resp.into_parts();
-            let body_bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
-                Ok(b) => b,
-                Err(_) => {
-                    // Can't collect body — pass through a 500.
-                    return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
-                        .unwrap());
-                }
-            };
-
-            // Parse as JSON.  If not valid JSON, pass through unchanged.
-            let json_val: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    let resp = Response::from_parts(parts, Body::from(body_bytes));
-                    return Ok(resp);
-                }
-            };
-
-            // Discovery meta-types are NOT re-encoded as proto.
-            //
-            // client-go 1.36+ sends Accept: application/vnd.kubernetes.protobuf for
-            // discovery requests (GET /api, /api/v1, /apis, /apis/{group}/{version})
-            // but its discovery decoder path decodes these types from JSON, not from
-            // our Unknown-envelope-with-JSON-inside proto format. Re-encoding them as
-            // proto causes "proto: illegal wireType 6" in kubectl because the Go proto
-            // decoder encounters unexpected bytes when trying to decode the discovery
-            // response as a typed proto message.
-            //
-            // Node/NodeList responses are also NOT re-encoded as proto.
-            //
-            // When the kubelet reads its own node (GET /api/v1/nodes/{name}?timeout=10s),
-            // client-go's typed proto decoder does not reliably honour the
-            // contentType=application/json field inside the Unknown envelope. It tries to
-            // decode Unknown.raw as a typed proto Node message, encounters JSON bytes that
-            // produce "proto: illegal wireType 7" (e.g. the `/` in a CIDR or `o` in
-            // "conditions" aligns to a varint byte whose low 3 bits are 0b111). Returning
-            // JSON is legal because Accept includes "application/json" as a fallback.
-            let kind = json_val["kind"].as_str().unwrap_or("");
-
-            // client-go's typed proto decoders do not reliably honour the
-            // contentType=application/json field inside the Unknown envelope — they
-            // attempt to decode Unknown.raw as a native typed proto message and
-            // produce "proto: illegal wireType N" when JSON bytes happen to align
-            // to invalid wire types.  Returning JSON is always valid: Accept
-            // includes "application/json" as a fallback, and client-go falls back
-            // to JSON decoding transparently.
-            //
-            // We previously re-encoded only non-discovery types as proto (to avoid
-            // a different wireType 6 error in kubectl for discovery responses), but
-            // that created a growing exclusion list (Node, NodeList, Pod, PodList,
-            // …).  The correct fix is to skip re-encoding for all types.
-            tracing::debug!(
+            tracing::info!(
+                method = %method,
                 uri = %uri,
-                kind = %kind,
-                "skip proto re-encode: returning JSON (always valid per Accept header)"
+                status,
+                user_agent = %user_agent,
+                latency_ms = start.elapsed().as_millis() as u64,
+                request_id = %request_id_str,
+                "request"
             );
-            Ok(Response::from_parts(parts, Body::from(body_bytes)))
+            Ok(resp)
         })
     }
+}
+
+// Only re-encode successful, non-chunked, application/json GET responses (outside
+// /openapi/) when the client's Accept header prefers protobuf — see the module doc
+// comment for why every branch here ultimately falls back to returning JSON unchanged.
+async fn reencode_proto_response(uri: &str, resp: Response<Body>) -> Response<Body> {
+    // Only re-encode successful (2xx) responses.
+    if !resp.status().is_success() {
+        return resp;
+    }
+
+    // Only re-encode when the response is application/json.
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/json"))
+        .unwrap_or(false);
+
+    if !is_json {
+        return resp;
+    }
+
+    // Watch streams use chunked transfer encoding (streaming NDJSON).
+    // Buffering a watch stream would deadlock the response — the stream
+    // never ends while the connection is open.  Pass watch responses
+    // through unchanged; the client's Accept includes "application/json"
+    // as a fallback so returning JSON is always legal.
+    let is_chunked = resp
+        .headers()
+        .get(header::TRANSFER_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|te| te.eq_ignore_ascii_case("chunked"))
+        .unwrap_or(false);
+    if is_chunked {
+        tracing::debug!(uri = %uri, "skip proto re-encode: chunked watch stream");
+        return resp;
+    }
+
+    // Collect the body bytes. Limit to 32 MiB — any larger response is
+    // pathological for our API surface.
+    let (parts, body) = resp.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            // Can't collect body — pass through a 500.
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+
+    // Parse as JSON.  If not valid JSON, pass through unchanged.
+    let json_val: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return Response::from_parts(parts, Body::from(body_bytes));
+        }
+    };
+
+    // Discovery meta-types are NOT re-encoded as proto.
+    //
+    // client-go 1.36+ sends Accept: application/vnd.kubernetes.protobuf for
+    // discovery requests (GET /api, /api/v1, /apis, /apis/{group}/{version})
+    // but its discovery decoder path decodes these types from JSON, not from
+    // our Unknown-envelope-with-JSON-inside proto format. Re-encoding them as
+    // proto causes "proto: illegal wireType 6" in kubectl because the Go proto
+    // decoder encounters unexpected bytes when trying to decode the discovery
+    // response as a typed proto message.
+    //
+    // Node/NodeList responses are also NOT re-encoded as proto.
+    //
+    // When the kubelet reads its own node (GET /api/v1/nodes/{name}?timeout=10s),
+    // client-go's typed proto decoder does not reliably honour the
+    // contentType=application/json field inside the Unknown envelope. It tries to
+    // decode Unknown.raw as a typed proto Node message, encounters JSON bytes that
+    // produce "proto: illegal wireType 7" (e.g. the `/` in a CIDR or `o` in
+    // "conditions" aligns to a varint byte whose low 3 bits are 0b111). Returning
+    // JSON is legal because Accept includes "application/json" as a fallback.
+    let kind = json_val["kind"].as_str().unwrap_or("");
+
+    // client-go's typed proto decoders do not reliably honour the
+    // contentType=application/json field inside the Unknown envelope — they
+    // attempt to decode Unknown.raw as a native typed proto message and
+    // produce "proto: illegal wireType N" when JSON bytes happen to align
+    // to invalid wire types.  Returning JSON is always valid: Accept
+    // includes "application/json" as a fallback, and client-go falls back
+    // to JSON decoding transparently.
+    //
+    // We previously re-encoded only non-discovery types as proto (to avoid
+    // a different wireType 6 error in kubectl for discovery responses), but
+    // that created a growing exclusion list (Node, NodeList, Pod, PodList,
+    // …).  The correct fix is to skip re-encoding for all types.
+    tracing::debug!(
+        uri = %uri,
+        kind = %kind,
+        "skip proto re-encode: returning JSON (always valid per Accept header)"
+    );
+    Response::from_parts(parts, Body::from(body_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -970,5 +979,201 @@ mod tests {
                 "{uri} body must be unchanged — ContentTypeLayer must not modify openapi responses"
             );
         }
+    }
+
+    // In-memory sink for tracing-subscriber's fmt layer, so access-log tests can assert on
+    // the rendered field set without adding a tracing-test dependency.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_log(buf: &SharedBuf) -> String {
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// The access log must carry `user_agent`, `latency_ms` and `request_id` on the plain
+    /// GET/JSON path, and the same `request_id` must be echoed back as `x-request-id` — an
+    /// operator correlating a slow/erroring client report against server logs needs both the
+    /// client identity (user_agent) and a way to line up a specific client-visible response
+    /// with the exact log line that produced it (request_id).
+    #[tokio::test]
+    async fn access_log_carries_user_agent_latency_and_correlatable_request_id() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: SAMPLE_JSON,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/my-namespace")
+            .header("accept", "application/json")
+            .header("user-agent", "kubectl/v1.34.0 (darwin/arm64)")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+
+        let request_id_header = resp
+            .headers()
+            .get("x-request-id")
+            .expect(
+                "response must carry x-request-id so a client can correlate its own \
+                     request against the server's access log",
+            )
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let log = captured_log(&buf);
+        assert!(
+            log.contains("kubectl/v1.34.0"),
+            "access log must record the client's user_agent so operators can tell which \
+             client made a request; log was: {log}"
+        );
+        assert!(
+            log.contains("latency_ms"),
+            "access log must record request latency — this was explicitly required so \
+             operators can spot slow requests; log was: {log}"
+        );
+        assert!(
+            log.contains(&request_id_header),
+            "the request_id logged server-side must match the x-request-id echoed to the \
+             client, otherwise a client-reported request_id can't be found in the logs; \
+             log was: {log}"
+        );
+    }
+
+    /// The access log must never contain the Authorization header value — logging a bearer
+    /// token would leak credentials into log storage/shippers that operators and support staff
+    /// can read, effectively handing out impersonation access to anyone with log access.
+    #[tokio::test]
+    async fn access_log_never_leaks_authorization_header_value() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: SAMPLE_JSON,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/my-namespace")
+            .header("accept", "application/json")
+            .header("authorization", "Bearer super-secret-token-value")
+            .body(Body::empty())
+            .unwrap();
+
+        layer_svc.call(req).await.unwrap();
+
+        let log = captured_log(&buf);
+        assert!(
+            !log.contains("super-secret-token-value"),
+            "access log must never contain the bearer token value — this would leak \
+             credentials to anyone with log access; log was: {log}"
+        );
+        assert!(
+            !log.to_lowercase().contains("bearer"),
+            "access log must not echo the Authorization scheme/value at all; log was: {log}"
+        );
+    }
+
+    /// Every branch of the middleware (openapi passthrough, non-GET, proto-eligible GET) must
+    /// log the same field set — a request that happens to take a different internal code path
+    /// must not silently disappear from correlation-by-user_agent/request_id tooling.
+    #[tokio::test]
+    async fn access_log_field_set_is_consistent_across_all_branches() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // openapi passthrough branch
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: "{}",
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/openapi/v2")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .header("user-agent", "openapi-client/1.0")
+            .body(Body::empty())
+            .unwrap();
+        layer_svc.call(req).await.unwrap();
+
+        // non-GET branch
+        let svc = FixedService {
+            status: StatusCode::CREATED,
+            content_type: "application/json",
+            body: "{}",
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .header("user-agent", "post-client/1.0")
+            .body(Body::empty())
+            .unwrap();
+        layer_svc.call(req).await.unwrap();
+
+        let log = captured_log(&buf);
+        for needle in ["openapi-client/1.0", "post-client/1.0"] {
+            assert!(
+                log.contains(needle),
+                "user_agent must be logged for every branch (openapi passthrough and non-GET), \
+                 not just the default GET/JSON path — otherwise the access log is inconsistent \
+                 depending on which internal branch a request takes; log was: {log}"
+            );
+        }
+        let request_id_occurrences = log.matches("request_id").count();
+        assert_eq!(
+            request_id_occurrences, 2,
+            "expected exactly one access-log line per request (2 requests made), each \
+             carrying request_id — extra or missing lines mean the consolidation to a single \
+             log point regressed; log was: {log}"
+        );
     }
 }
