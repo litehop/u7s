@@ -430,12 +430,20 @@ fn subject_matches(binding: &RbacBinding, username: &str, groups: &[String]) -> 
         "Group" => groups.iter().any(|g| g == &s.name),
         "ServiceAccount" => {
             // Kubernetes encodes ServiceAccount usernames as
-            // "system:serviceaccount:<namespace>:<name>".
-            // Match against both the encoded form (for RBAC) and the raw name
-            // (for bindings created without a namespace field).
+            // "system:serviceaccount:<namespace>:<name>" — that prefix is the only
+            // unforgeable marker of ServiceAccount identity, and exists precisely so
+            // the ServiceAccount and User identity spaces can never collide. Only the
+            // fully-encoded form may match.
+            //
+            // A raw `username == s.name` fallback (even gated on s.namespace.is_none())
+            // must NOT be added back: ServiceAccount names are validated as DNS-1123
+            // labels (lowercase alphanumeric + hyphens, no colons), so s.name can never
+            // equal a colon-containing username — a plain User whose username happens
+            // to equal a bound ServiceAccount's bare name (e.g. a User named "argocd"
+            // colliding with ServiceAccount default/argocd) must never match here.
             let ns = s.namespace.as_deref().unwrap_or("");
             let encoded = format!("system:serviceaccount:{ns}:{}", s.name);
-            username == encoded || username == s.name
+            username == encoded
         }
         _ => false,
     })
@@ -1602,6 +1610,98 @@ mod tests {
             !idx.is_allowed(&r),
             "system:serviceaccount:default:other-sa must be denied — \
              only my-sa is bound, not other-sa"
+        );
+    }
+
+    #[test]
+    fn serviceaccount_subject_does_not_match_user_with_same_bare_name() {
+        // A ClusterRoleBinding subject of kind: ServiceAccount, name: "argocd" must NOT
+        // grant access to an authenticated User named "argocd" — real Kubernetes'
+        // "system:serviceaccount:<ns>:<name>" prefix exists precisely so the User and
+        // ServiceAccount identity spaces can never collide. Helm-chart-installed addons
+        // commonly bind ClusterRoles to low-entropy ServiceAccount names like "argocd",
+        // "prometheus", or "cert-manager"; if a plain User could authenticate with that
+        // same bare name and inherit the binding, any operator who ever created a
+        // --token-auth-file entry or signed an x509 cert with a matching CN would
+        // silently gain that ServiceAccount's full permission set.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let (bind_key, bind_val) =
+            make_cluster_binding_sa("argocd-binding", "pod-reader", "default", "argocd");
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // A plain User named "argocd" (NOT the encoded ServiceAccount identity) must be denied.
+        let user_req = req("argocd", &groups, "get", "pods", "", Some("default"), None);
+        assert!(
+            !idx.is_allowed(&user_req),
+            "a User named 'argocd' must be denied — the binding's subject is a \
+             ServiceAccount, not a User, and matching on the bare name reunites two \
+             identity spaces that system:serviceaccount: is meant to keep separate"
+        );
+
+        // The real ServiceAccount, presenting its fully-encoded identity, must still be
+        // allowed — the fix must not regress legitimate ServiceAccount authentication.
+        let sa_req = req(
+            "system:serviceaccount:default:argocd",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("default"),
+            None,
+        );
+        assert!(
+            idx.is_allowed(&sa_req),
+            "system:serviceaccount:default:argocd must still be allowed — the fix for the \
+             User/ServiceAccount identity collision must not break real ServiceAccount auth"
+        );
+    }
+
+    #[test]
+    fn user_holds_all_rules_does_not_credit_user_via_colliding_serviceaccount_binding() {
+        // Privilege-escalation prevention (user_holds_all_rules) calls back into
+        // RbacIndex::is_allowed, so it inherits the same User/ServiceAccount identity-
+        // collision bug: a User whose name matches a bound ServiceAccount's bare name
+        // must not be treated as already holding that ServiceAccount's rules. Without
+        // this, a User named "argocd" could self-bind to the ClusterRole granted to
+        // ServiceAccount default/argocd by passing the (bogus) "already holds these
+        // rules" escalation check, then use the new binding as User "argocd" directly.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let (bind_key, bind_val) =
+            make_cluster_binding_sa("argocd-binding", "pod-reader", "default", "argocd");
+        idx.apply_object(&bind_key, &bind_val);
+
+        let pod_reader_rules = idx.cluster_role_rules("pod-reader");
+        let groups: Vec<String> = vec![];
+
+        assert!(
+            !user_holds_all_rules("argocd", &groups, &pod_reader_rules, &idx),
+            "User 'argocd' must NOT be credited with pod-reader's rules just because a \
+             ServiceAccount subject named 'argocd' is bound — crediting it would let this \
+             User self-bind to pod-reader as an escalation shortcut"
         );
     }
 
