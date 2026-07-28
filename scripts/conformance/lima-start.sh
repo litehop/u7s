@@ -366,6 +366,9 @@ if [ -f "$CA_CERT" ]; then
   # Write --client-ca-file and --tls-cert-file into the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]
+# klog has no --utc flag, so kubelet's embedded klog lines render whatever local
+# time the process inherits; force UTC so kubelet.log matches apiserver.log.
+Environment=TZ=UTC
 ExecStart=
 ExecStart=/usr/bin/kubelet \\\\
   --config=/etc/kubelet-config.yaml \\\\
