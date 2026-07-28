@@ -756,18 +756,6 @@ async fn watch_generic_impl<S: Store>(
         .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "200"])
         .inc();
 
-    // Keep the store alive for the entire watch stream lifetime.
-    //
-    // The broadcast sender (`tx`) lives inside the store. If the store's `Arc` reference count
-    // drops to zero while the stream body is being consumed, `tx` is dropped and the broadcast
-    // receivers immediately get `RecvError::Closed`, causing the watch stream to close instead
-    // of staying open for future events. This most visibly affects the namespace watch
-    // (GET /api/v1/namespaces?watch=true): when the ring buffer is empty for the namespace prefix
-    // and the caller holds no other store reference (common in tests and possible under request
-    // routing where the handler-local `state` is the only live clone), the stream closes before
-    // the client receives any data.
-    let _store_keepalive = std::sync::Arc::clone(&state.store);
-
     // Cloned so live/DELETED CR watch events can be converted via the CRD's conversion
     // webhook mid-stream (see convert_watched_cr_object). The webhook call needs the full
     // AppState (webhook client, cluster CA, konnectivity proxy config), not just the store,
@@ -781,9 +769,6 @@ async fn watch_generic_impl<S: Store>(
         use std::pin::pin;
         use tokio::time::{Duration, interval, sleep};
 
-        // Hold the store Arc for the duration of the stream so the broadcast sender
-        // is never dropped while we are waiting for live events.
-        let _store_keepalive = _store_keepalive;
         let state_for_conversion = state_for_conversion;
         // Brackets apiserver_longrunning_requests{verb="watch",...} for the stream's real
         // lifetime — see LongRunningWatchGuard's doc for why it must be constructed here,
@@ -1216,7 +1201,7 @@ async fn watch_generic_impl<S: Store>(
                         // of any write the controller made to *any* resource type. A
                         // StatefulSet watch only sees StatefulSet events, so last_rv stays
                         // stale relative to pod writes — causing endless requeue loops.
-                        let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
+                        let bookmark_rv = state_for_conversion.store.current_revision().max(last_rv);
                         record_watch_event();
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
@@ -1228,7 +1213,7 @@ async fn watch_generic_impl<S: Store>(
                         .with_label_values(&["timeout"])
                         .inc();
                     if allow_watch_bookmarks {
-                        let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
+                        let bookmark_rv = state_for_conversion.store.current_revision().max(last_rv);
                         record_watch_event();
                         yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
@@ -3838,6 +3823,87 @@ mod tests {
             "BOOKMARK revision {event} must be >= pod write revision {pod_rv} — \
              without this, KCM ConsistencyStore.EnsureReady requeues the StatefulSet \
              controller forever after every pod creation"
+        );
+    }
+
+    /// The stream-timeout BOOKMARK (the `max_duration` branch of `watch_generic_impl`,
+    /// fired when the client's `timeoutSeconds` elapses) must carry the store's actual
+    /// current revision — the same `bookmark_rv` computation the periodic-tick branch
+    /// above relies on for KCM's ConsistencyStore.EnsureReady.
+    ///
+    /// This fails on revert to a stale or detached revision source (e.g. a `bookmark_rv`
+    /// that silently reads a snapshot taken before the write instead of the live store):
+    /// the asserted resourceVersion would then diverge from the store's real current
+    /// revision without any other symptom until a StatefulSet watch stalls permanently.
+    #[tokio::test]
+    async fn watch_generic_timeout_bookmark_carries_store_current_revision() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let rv = store
+            .put(
+                "/registry/configmaps/default/cm-1",
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "v1", "kind": "ConfigMap",
+                        "metadata": {"name": "cm-1", "namespace": "default"}
+                    }))
+                    .unwrap(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("configmap write must succeed");
+        let expected_rv = store.current_revision();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: rv,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: true,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "configmaps".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        // No further writes: the watch sees no live events, so the only BOOKMARK on the
+        // stream is the one the max_duration branch emits once timeout_seconds elapses.
+        let lines = read_watch_body_with_timeout(resp).await;
+        let bookmarks: Vec<_> = lines.iter().filter(|v| v["type"] == "BOOKMARK").collect();
+        assert_eq!(
+            bookmarks.len(),
+            1,
+            "expected exactly one BOOKMARK from the stream-timeout branch; got {:?}",
+            lines
+        );
+        assert_eq!(
+            bookmarks[0]["object"]["metadata"]["resourceVersion"],
+            expected_rv.to_string(),
+            "timeout BOOKMARK resourceVersion must equal the store's current_revision \
+             ({expected_rv}) — this is the value KCM's ConsistencyStore.EnsureReady compares \
+             against every other resource's write RV; got {:?}",
+            lines
         );
     }
 
