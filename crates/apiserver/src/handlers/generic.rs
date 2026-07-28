@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct CollectionQuery {
+    #[serde(default, deserialize_with = "crate::util::deserialize_watch_bool")]
     pub watch: Option<bool>,
     #[serde(rename = "resourceVersion")]
     pub resource_version: Option<u64>,
@@ -1688,7 +1689,7 @@ mod tests {
         );
     }
 
-    // -- mayor-ofi: json-patch 'add' must create intermediate objects --
+    // -- json-patch 'add' must create intermediate objects --
 
     /// RFC 6902 §4.1: 'add' must create missing intermediate objects.
     #[test]
@@ -3109,7 +3110,7 @@ mod escalation_tests {
     }
 }
 
-// -- CollectionQuery serde deserialization (mayor-utbu regression) --
+// -- CollectionQuery serde deserialization regression --
 //
 // Kubernetes client-go sends camelCase query parameters: labelSelector, resourceVersion.
 // Without the correct #[serde(rename)] attributes, these are silently ignored, causing
@@ -3127,7 +3128,7 @@ mod collection_query_rename_tests {
     /// when clients send `?labelSelector=X` (Kubernetes standard camelCase param).
     /// This causes LIST to return all objects regardless of label, breaking sonobuoy's
     /// post-delete wait loop: it lists all CRBs (including protected system: ones),
-    /// tries to delete them, gets 403, and loops forever (mayor-utbu).
+    /// tries to delete them, gets 403, and loops forever.
     #[test]
     fn label_selector_camel_case_field_is_deserialized() {
         // serde #[rename] applies to all formats; JSON is the simplest to test without
@@ -3140,7 +3141,7 @@ mod collection_query_rename_tests {
             Some("component=sonobuoy"),
             "labelSelector must populate label_selector; \
              without #[serde(rename = \"labelSelector\")] the HTTP query param is silently \
-             ignored and all objects are returned regardless of label (mayor-utbu)"
+             ignored and all objects are returned regardless of label"
         );
     }
 
@@ -3185,6 +3186,41 @@ mod collection_query_rename_tests {
             "snake_case 'resource_version' must NOT populate resource_version after rename"
         );
     }
+
+    /// kubectl and client-go historically send `?watch=1` (not just `?watch=true`) — a
+    /// documented Kubernetes API accept form. Before the fix, `watch: Option<bool>` only
+    /// parsed Rust's `bool::from_str` ("true"/"false"), so a real `?watch=1` request to any
+    /// of the many endpoints sharing this `CollectionQuery` (list_resource, list_namespaces,
+    /// CRD/CR list-or-watch, CSR list-or-watch, ...) failed axum's Query extraction and
+    /// never reached the handler (Query rejection maps to HTTP 400). This test fails on
+    /// revert: `try_from_uri` would return `Err`, not `watch: Some(true)`.
+    #[test]
+    fn watch_equals_1_is_accepted_as_true_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/configmaps?watch=1".parse().unwrap();
+        let axum::extract::Query(q) = axum::extract::Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=1 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(true),
+            "?watch=1 must resolve to watch:Some(true), the same as ?watch=true, so the \
+             handler routes to the streaming watch path instead of a plain list"
+        );
+    }
+
+    /// Mirror of the `watch=1` test above for the `watch=0` alias of `watch=false`. Before
+    /// the fix this also 400'd instead of falling through to the normal list response.
+    #[test]
+    fn watch_equals_0_is_accepted_as_false_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/configmaps?watch=0".parse().unwrap();
+        let axum::extract::Query(q) = axum::extract::Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=0 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(false),
+            "?watch=0 must resolve to watch:Some(false) so the request stays on the \
+             normal list path, not the watch stream"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3220,7 +3256,7 @@ mod apply_delete_policy_tests {
     ///
     /// The upstream KCM namespace controller only begins its drain cycle when it observes
     /// status.phase == "Terminating" on the watch event. Without this field the KCM never
-    /// removes the kubernetes finalizer and the namespace hangs forever (mayor-qyfg).
+    /// removes the kubernetes finalizer and the namespace hangs forever.
     #[test]
     fn namespace_with_finalizers_gets_terminating_phase() {
         let mut obj = make_obj("Namespace", &["kubernetes"]);
@@ -3231,7 +3267,7 @@ mod apply_delete_policy_tests {
             body["status"]["phase"].as_str(),
             Some("Terminating"),
             "status.phase must be \"Terminating\" so KCM starts the drain cycle; \
-             without it the namespace hangs forever (mayor-qyfg)"
+             without it the namespace hangs forever"
         );
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),
@@ -3251,7 +3287,7 @@ mod apply_delete_policy_tests {
         assert!(
             body["status"]["phase"].is_null(),
             "status.phase must NOT be set on non-Namespace objects; \
-             only Namespaces need this field to trigger KCM drain (mayor-qyfg)"
+             only Namespaces need this field to trigger KCM drain"
         );
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),

@@ -934,7 +934,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // SubjectAccessReview privilege gate tests (mayor-mzcw)
+    // SubjectAccessReview privilege gate tests
     // ---------------------------------------------------------------------------
 
     /// Extract the privilege-check logic from subject_access_review into a

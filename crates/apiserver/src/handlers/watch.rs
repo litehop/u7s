@@ -1665,7 +1665,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-e8fx: when a client opens a watch with a resourceVersion
+    /// Regression test: when a client opens a watch with a resourceVersion
     /// below the compaction horizon, watch_generic must return HTTP 410 BEFORE committing
     /// headers.
     #[tokio::test]
@@ -1900,7 +1900,7 @@ mod tests {
         );
     }
 
-    // -- fetch_initial_events and watch_generic store error paths (mayor-8j1l) --
+    // -- fetch_initial_events and watch_generic store error paths --
 
     /// fetch_initial_events maps StoreError → StatusError(500) via Status::internal.
     /// This test verifies the error conversion so that if the map_err is accidentally
@@ -1998,7 +1998,7 @@ mod tests {
         );
     }
 
-    // -- watch_generic label/field selector filtering (mayor-gkif) --
+    // -- watch_generic label/field selector filtering --
 
     /// Helper: read from a watch_generic Response body with a timeout, returning parsed NDJSON lines.
     ///
@@ -2278,7 +2278,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-dymy (bug 2): when a MODIFIED event changes the object's
+    /// Regression test (bug 2): when a MODIFIED event changes the object's
     /// labels so it no longer matches the watch selector, the server must emit a synthetic
     /// DELETED event, not drop the event silently.
     ///
@@ -2380,7 +2380,7 @@ mod tests {
             deleted_count, 1,
             "MODIFIED event that removes matching label must emit a synthetic DELETED; \
              without it informers never learn the object left scope and keep stale cache \
-             entries (mayor-dymy regression): got {:?}",
+             entries (regression): got {:?}",
             lines
         );
 
@@ -3151,11 +3151,11 @@ mod tests {
         );
     }
 
-    // -- sendInitialEvents regression: initial-events-end BOOKMARK via watch_generic (mayor-w9tz) --
+    // -- sendInitialEvents regression: initial-events-end BOOKMARK via watch_generic --
 
     /// Regression: when fetch_initial_events returns Some(items, rv) and is passed to
     /// watch_generic, the stream must emit the initial-events-end BOOKMARK before any
-    /// live events. This verifies the fix for mayor-w9tz: CR watch paths (cr.rs, crd.rs)
+    /// live events. This verifies the fix: CR watch paths (cr.rs, crd.rs)
     /// previously passed None for initial_items, causing GC to block forever waiting for
     /// the BOOKMARK and never completing cache sync.
     #[tokio::test]
@@ -3244,7 +3244,7 @@ mod tests {
         assert!(
             bookmark.is_some(),
             "watch_generic must emit initial-events-end BOOKMARK when initial_items is Some; \
-             without it GC (metadatainformer) blocks cache sync forever (mayor-w9tz). \
+             without it GC (metadatainformer) blocks cache sync forever. \
              Got lines: {:?}",
             lines
         );
@@ -3401,7 +3401,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-guqc: timeout_seconds controls the server-side watch stream
+    /// Regression test: timeout_seconds controls the server-side watch stream
     /// lifetime. When `timeout_seconds: Some(1)`, the stream must close within ~2 seconds.
     ///
     /// Without the fix, timeout_seconds was ignored and the server defaulted to 5 minutes (300s).
@@ -3466,13 +3466,13 @@ mod tests {
             "watch stream with timeout_seconds=1 must close within 3s; \
              if it does not, timeout_seconds is being ignored and the server uses a longer \
              default — Kubernetes informers that set timeoutSeconds will get streams that \
-             close at the wrong time (mayor-guqc)"
+             close at the wrong time"
         );
     }
 
-    // -- sendInitialEvents + fieldSelector regression (mayor-ezur) --
+    // -- sendInitialEvents + fieldSelector regression --
 
-    /// Regression for mayor-ezur: a watch with sendInitialEvents=true AND a matching
+    /// Regression: a watch with sendInitialEvents=true AND a matching
     /// fieldSelector must deliver an ADDED event for the matching object followed by a
     /// BOOKMARK with k8s.io/initial-events-end=true.
     ///
@@ -3560,7 +3560,7 @@ mod tests {
         );
         assert_eq!(
             added[0]["object"]["metadata"]["name"], "default",
-            "ADDED event must carry the matching object (mayor-ezur)"
+            "ADDED event must carry the matching object"
         );
 
         // Must have a BOOKMARK with k8s.io/initial-events-end=true.
@@ -3571,12 +3571,12 @@ mod tests {
         assert!(
             bookmark.is_some(),
             "sendInitialEvents watch must emit initial-events-end BOOKMARK; \
-             without it the watch hangs forever (mayor-ezur). Got lines: {:?}",
+             without it the watch hangs forever. Got lines: {:?}",
             lines
         );
     }
 
-    /// Regression for mayor-ezur: a watch with sendInitialEvents=true AND a non-matching
+    /// Regression: a watch with sendInitialEvents=true AND a non-matching
     /// fieldSelector must emit NO ADDED events (the object is filtered out) but still emit
     /// the BOOKMARK with k8s.io/initial-events-end=true.
     ///
@@ -3659,7 +3659,7 @@ mod tests {
         assert_eq!(
             added_count, 0,
             "sendInitialEvents + non-matching fieldSelector must emit no ADDED events; \
-             field selector filtering of initial snapshot is broken (mayor-ezur). Got: {:?}",
+             field selector filtering of initial snapshot is broken. Got: {:?}",
             lines
         );
 
@@ -3671,13 +3671,13 @@ mod tests {
         assert!(
             bookmark.is_some(),
             "sendInitialEvents watch must emit initial-events-end BOOKMARK even when no objects \
-             match the fieldSelector; without it the watch hangs forever (mayor-ezur). \
+             match the fieldSelector; without it the watch hangs forever. \
              Got lines: {:?}",
             lines
         );
     }
 
-    /// Regression test for mayor-bg80: a watch opened with from_revision=N (the revision at
+    /// Regression test: a watch opened with from_revision=N (the revision at
     /// which an object was created) must NOT deliver a spurious ADDED event for that object.
     ///
     /// The Kubernetes conformance test "should observe add, update, and delete watch notifications
@@ -3755,7 +3755,7 @@ mod tests {
             "watch at from_revision=N must not emit ADDED for objects created at revision ≤N; \
              a spurious ADDED breaks the conformance test \
              'should observe add, update, and delete watch notifications on configmaps' \
-             (mayor-bg80). Got lines: {:?}",
+             Got lines: {:?}",
             lines
         );
     }

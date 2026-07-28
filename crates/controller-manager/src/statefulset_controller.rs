@@ -21,7 +21,7 @@ pub struct PodObject {
 }
 
 // ---------------------------------------------------------------------------
-// mayor-z981: fast status.replicas=0 when scaling to zero
+// Fast status.replicas=0 when scaling to zero
 // ---------------------------------------------------------------------------
 
 /// Returns true when `status.replicas` should be immediately set to 0.
@@ -57,7 +57,7 @@ pub fn statefulset_status_path(namespace: &str, name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// mayor-tkwj: ControllerRevision creation on template update
+// ControllerRevision creation on template update
 // ---------------------------------------------------------------------------
 
 /// Minimal view of a ControllerRevision object.
@@ -169,7 +169,7 @@ mod tests {
         }
     }
 
-    // --- mayor-z981 ---
+    // --- Scale-to-zero status.replicas tests ---
 
     /// AfterEach polls status.replicas==0 after scale-to-zero. If we only set
     /// status.replicas=0 after pods are fully removed from etcd, AfterEach
@@ -248,7 +248,7 @@ mod tests {
         );
     }
 
-    // --- mayor-tkwj ---
+    // --- ControllerRevision creation on template update tests ---
 
     fn revision_with_hash(hash: &str) -> ControllerRevision {
         let mut labels = std::collections::HashMap::new();

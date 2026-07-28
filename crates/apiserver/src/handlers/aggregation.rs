@@ -5,8 +5,8 @@
 ///   1. A dynamic proxy handler for `/apis/{group}/{version}/*` that forwards to the
 ///      backend, presenting a dedicated proxy-client certificate the backend trusts via
 ///      `requestheader-client-ca-file` (populated from the extension-apiserver-authentication
-///      configmap). u7s does not populate that configmap with real CA data (see mayor-n3yk —
-///      the lookup is only made to *tolerate* 404 instead of crashing), so an aggregated
+///      configmap). u7s does not populate that configmap with real CA data (the lookup is
+///      only made to *tolerate* 404 instead of crashing), so an aggregated
 ///      backend such as sample-apiserver falls back to its other configured authenticator:
 ///      delegated TokenReview against this apiserver. This proxy therefore forwards the
 ///      caller's own Authorization header unchanged instead of minting an impersonation

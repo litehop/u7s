@@ -1508,7 +1508,7 @@ pub enum PickNodeError {
 /// A node at or above its `status.allocatable.pods` limit, or that cannot fit
 /// `pod.requests` alongside what's already tallied, is skipped. Returns
 /// `Err(PickNodeError::NoCapacity)` when no suitable node exists so the
-/// caller can skip binding and leave the pod Pending (mayor-bbxr: without
+/// caller can skip binding and leave the pod Pending (without
 /// this check, pods are bound to full nodes and the kubelet fails them
 /// OutOfpods/OutOfcpu/OutOfephemeral-storage). Returns
 /// `Err(PickNodeError::ApiError(_))` when the GET or its response body is
@@ -1589,7 +1589,7 @@ pub struct PreemptionPlan {
 ///
 /// Intended to run only after `pick_node` has already failed for the same pod —
 /// this is the fallback that stops a higher-priority pod from staying Pending
-/// forever just because lower-priority pods claimed every slot first (mayor-rsei).
+/// forever just because lower-priority pods claimed every slot first.
 ///
 /// Per-node pod identity/priority/requests come from `tally` (see
 /// `NodeTally`), not a live GET — see `pick_node`'s doc comment for why.
@@ -2353,7 +2353,7 @@ mod tests {
     // pods_needing_resync tests — the periodic resync's core decision: which
     // pods from a fresh /api/v1/pods list get a fresh scheduling attempt this
     // tick. A pod that exhausts preemption retries and goes FailedScheduling
-    // never produces another watch event by itself (mayor-d2242) — resync is
+    // never produces another watch event by itself — resync is
     // the only thing left that can ever pick it back up, so this decision
     // dropping such a pod, or ignoring in_flight, reintroduces the exact
     // stranding this fixes.
@@ -2362,8 +2362,8 @@ mod tests {
     fn pods_needing_resync_includes_a_still_unscheduled_pod() {
         // Mirrors a pod that lost a scheduling race (e.g. exhausted
         // preemption retries) and is still sitting Pending with no
-        // nodeName — the exact shape of the pod stranded by mayor-d2242. If
-        // this stopped returning such a pod, the periodic resync would never
+        // nodeName — the exact shape of a pod stranded with no other watch event
+        // coming. If this stopped returning such a pod, the periodic resync would never
         // re-attempt it and the stranding bug would be back.
         let items = vec![json!({
             "metadata": { "name": "stranded-pod", "namespace": "kube-system" },
@@ -2592,7 +2592,7 @@ mod tests {
         assert_eq!(pending.pod_name, "pending-pod");
     }
 
-    // schedulingGates tests (mayor-vkobg): a ReplicaSet's pods can carry
+    // schedulingGates tests: a ReplicaSet's pods can carry
     // spec.schedulingGates so they stay Pending — not even considered "ready to
     // schedule" — until an external controller clears the gates. Without this
     // check the scheduler binds gated pods immediately, which is why the
@@ -2638,7 +2638,7 @@ mod tests {
         );
     }
 
-    // scheduling_gate_status_patch / scheduling_gate_status_reset tests (mayor-pwf4g):
+    // scheduling_gate_status_patch / scheduling_gate_status_reset tests:
     // needs_scheduling correctly keeps gated pods out of the scheduling cycle, but
     // that alone leaves status.conditions untouched — WaitForPodsSchedulingGated
     // (upstream test/e2e/framework/pod/wait.go) polls status.conditions for
@@ -3206,7 +3206,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Additional coverage (mayor-in2l): branches not exercised by earlier tests.
+    // Additional coverage: branches not exercised by earlier tests.
     // ---------------------------------------------------------------------------
 
     // needs_scheduling with a BOOKMARKED event type — exercises the non-ADDED/MODIFIED
@@ -3296,7 +3296,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // nodeSelector filtering (mayor-ewnt): the scheduler must respect spec.nodeSelector.
+    // nodeSelector filtering: the scheduler must respect spec.nodeSelector.
     // Before this fix, pick_node blindly returned the first node regardless of labels,
     // causing pods with non-matching selectors to be bound to the wrong node and the
     // conformance test "validates that NodeSelector is respected if not matching" to fail.
@@ -3339,7 +3339,7 @@ mod tests {
 
     /// node_selector_matches returns false when the node is missing a required label.
     ///
-    /// This is the regression test for mayor-ewnt: before the fix, pick_node ignored
+    /// This is the regression test: before the fix, pick_node ignored
     /// nodeSelector, so a pod requesting `scheduledOnNode=lima-node-2` would be bound
     /// to `lima-node` (the only node). The test "NodeSelector is respected if not matching"
     /// would then fail waiting for the pod to remain Pending.
@@ -3413,7 +3413,7 @@ mod tests {
 
     /// select_node_for_pod returns Err when no node satisfies the nodeSelector.
     ///
-    /// This is the regression test for mayor-ewnt: before the fix, a pod with a
+    /// This is the regression test: before the fix, a pod with a
     /// non-matching nodeSelector would be bound to the first node anyway (via
     /// select_first_node). With the fix, select_node_for_pod returns Err so the
     /// caller skips binding and the pod stays Pending — which is the correct behavior
@@ -3441,7 +3441,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // taints/tolerations (mayor-2ksh8): the scheduler must not bind a pod to a
+    // taints/tolerations: the scheduler must not bind a pod to a
     // NoSchedule/NoExecute-tainted node unless the pod tolerates that taint.
     // Before this fix, crates/scheduler/ had zero taint/toleration handling —
     // pods without a matching toleration were bound to tainted nodes anyway,
@@ -3642,7 +3642,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // nodeAffinity (mayor-oei5x): RequiredDuringSchedulingIgnoredDuringExecution
+    // nodeAffinity: RequiredDuringSchedulingIgnoredDuringExecution
     // must be enforced like nodeSelector. Before this fix, crates/scheduler/ had
     // zero handling of spec.affinity.nodeAffinity anywhere — a pod whose required
     // nodeAffinity term no node satisfied was bound anyway, failing "validates
@@ -3917,7 +3917,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // NodeResourcesFit / pod-capacity gate (mayor-bbxr)
+    // NodeResourcesFit / pod-capacity gate
     //
     // Without this check the scheduler binds pods to nodes already at their pod
     // cap; the kubelet then fails them OutOfpods (phase=Failed) instead of leaving
@@ -3975,7 +3975,7 @@ mod tests {
 
     /// A node at pod capacity must NOT be chosen — otherwise the kubelet fails
     /// the pod with OutOfpods (phase=Failed) and controllers may recreate without
-    /// bound (mayor-bbxr).  Reverting `select_node_with_capacity` to ignore counts
+    /// bound.  Reverting `select_node_with_capacity` to ignore counts
     /// would make this test pass when it should fail: the function would return
     /// Ok("worker-0") instead of Err, so a pod would be bound to a full node.
     #[test]
@@ -3991,7 +3991,7 @@ mod tests {
         assert!(
             result.is_err(),
             "a node at pod capacity must return Err so the pod stays Pending, \
-             not be selected and cause the kubelet to fail it OutOfpods (mayor-bbxr) — \
+             not be selected and cause the kubelet to fail it OutOfpods — \
              got: {:?}",
             result.ok()
         );
@@ -4042,7 +4042,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             "worker-free",
-            "must skip the full node and pick the one with free capacity (mayor-bbxr)"
+            "must skip the full node and pick the one with free capacity"
         );
     }
 
@@ -4066,7 +4066,7 @@ mod tests {
         assert!(
             result.is_err(),
             "all nodes full must return Err so the pod stays Pending, not be bound \
-             to a full node causing OutOfpods (mayor-bbxr)"
+             to a full node causing OutOfpods"
         );
     }
 
@@ -4139,7 +4139,7 @@ mod tests {
         assert_eq!(
             usage["worker-0"].pod_count, 3,
             "Running + Pending + unknown-phase count as consuming a slot; \
-             Succeeded and Failed do not (NodeResourcesFit predicate, mayor-bbxr)"
+             Succeeded and Failed do not (NodeResourcesFit predicate)"
         );
     }
 
@@ -4432,7 +4432,7 @@ mod tests {
         assert_eq!(parse_quantity_milli("not-a-quantity"), 0);
     }
 
-    // resource_fits / NodeResourcesFit resource-dimension tests (mayor-7duz2):
+    // resource_fits / NodeResourcesFit resource-dimension tests:
     // the scheduler previously only checked pod COUNT against
     // status.allocatable.pods; a node saturated on cpu/memory/ephemeral-storage
     // but with a free pod slot would still accept a pod the kubelet then rejects
@@ -4575,8 +4575,8 @@ mod tests {
         );
     }
 
-    // needs_scheduling / select_node_with_capacity resource-request wiring
-    // (mayor-7duz2): the pending pod's OWN requests must be extracted from the
+    // needs_scheduling / select_node_with_capacity resource-request wiring:
+    // the pending pod's OWN requests must be extracted from the
     // watch event and factored into the fit check, not just the already-bound
     // pods' requests.
 
@@ -4767,7 +4767,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Preemption (mayor-rsei): needs_scheduling priority extraction,
+    // Preemption: needs_scheduling priority extraction,
     // NodeTally.pods_on, and select_preemption_victims.
     //
     // Without priority-aware preemption, a higher-priority pod stays Pending
@@ -4777,7 +4777,7 @@ mod tests {
 
     /// needs_scheduling extracts spec.priority from the watch event.
     ///
-    /// If priority is silently dropped here (as it once was — mayor-osuq), every
+    /// If priority is silently dropped here (as it once was), every
     /// pod looks identical to preemption and a high-priority pod can never
     /// legitimately evict a low-priority one.
     #[test]
@@ -5287,7 +5287,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Scheduling Events (mayor-lafgk): scheduling_event_name/scheduling_event_payload
+    // Scheduling Events: scheduling_event_name/scheduling_event_payload
     // /events_path. Before this fix the scheduler never created an Event object on
     // bind success or failure, so `kubectl describe pod` showed nothing and the
     // SchedulerPredicates e2e suite's observeEventAfterAction watch timed out

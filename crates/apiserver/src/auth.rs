@@ -1367,7 +1367,7 @@ mod tests {
         assert_eq!(p.name.as_deref(), Some("mypod"));
     }
 
-    // Regression tests for parse_path misclassifying namespace paths (mayor-8kmu).
+    // Regression tests for parse_path misclassifying namespace paths.
     // /api/v1/namespaces and /api/v1/namespaces/{name} are cluster-scoped
     // operations on the "namespaces" resource, not namespaced operations.
     // Without the rest.len() >= 3 guard, resource="" and RBAC wildcard rules
@@ -2514,7 +2514,7 @@ mod tests {
 
     // --- Impersonation via Impersonate-User / Impersonate-Group headers ---
     //
-    // The conformance test (mayor-pya9) creates SA `e2e`, submits SAR for list
+    // The conformance test creates SA `e2e`, submits SAR for list
     // configmaps → returns false (correct), then impersonates the SA and actually
     // lists configmaps.  Before this fix the server ignored impersonation headers
     // and processed the request as the authenticated caller (cluster-admin), so
@@ -2822,7 +2822,7 @@ mod tests {
         );
     }
 
-    // --- field_selector_name() (mayor-fnym9) ---
+    // --- field_selector_name() ---
     //
     // Every client-go informer that watches a single named object (e.g. the ConfigMap
     // informer aggregated apiservers use to read
@@ -2886,8 +2886,8 @@ mod tests {
         assert!(field_selector_name(Some("watch=true")).is_none());
     }
 
-    /// End-to-end regression for the sample-apiserver aggregator conformance failure
-    /// (mayor-fnym9): a Role restricted via resourceNames to one ConfigMap must grant a
+    /// End-to-end regression for the sample-apiserver aggregator conformance failure:
+    /// a Role restricted via resourceNames to one ConfigMap must grant a
     /// LIST-with-fieldSelector request for that exact name, the same way real Kubernetes
     /// does. Before this fix, `is_allowed` always saw `name: None` for such requests (the
     /// URL path carries no name on a collection endpoint), so the resourceNames check in

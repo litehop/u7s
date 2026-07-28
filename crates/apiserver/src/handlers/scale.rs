@@ -826,7 +826,7 @@ mod handler_tests {
     /// GET scale on a StatefulSet whose spec.replicas=0 but status.replicas=3 (pods still running)
     /// must return status.replicas=3, not 0.
     ///
-    /// This is the regression test for mayor-bg94: after scale-to-0, AfterEach polls the scale
+    /// This is the regression test: after scale-to-0, AfterEach polls the scale
     /// subresource waiting for status.replicas==0. If status.replicas is always set to spec.replicas,
     /// it incorrectly shows 0 immediately even while pods are still running, making the AfterEach
     /// think cleanup is done prematurely while other tests see stale pods.
@@ -879,7 +879,7 @@ mod handler_tests {
             "status.replicas must reflect actual pod count (3) even after scale-to-0 — \
              if it returned 0 immediately, AfterEach would think cleanup is done while \
              3 pods are still running, causing subsequent tests to see unexpected pods \
-             (mayor-bg94 regression: scale subresource status.replicas must lag spec.replicas)"
+             (regression: scale subresource status.replicas must lag spec.replicas)"
         );
     }
 
@@ -1019,7 +1019,7 @@ mod handler_tests {
             json["status"]["replicas"], 1,
             "status.replicas must reflect the actual pod count at the time of the write, \
              not the newly-desired spec.replicas — the two may differ while pods are being \
-             created or terminated (mayor-bg94)"
+             created or terminated"
         );
 
         // Confirm the workload in the store was actually updated.
@@ -1266,7 +1266,7 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Generation increment on scale change (mayor-pv04 / mayor-js6s)
+    // Generation increment on scale change
     // -----------------------------------------------------------------------
 
     /// PUT scale that changes spec.replicas must increment metadata.generation.
@@ -1330,7 +1330,7 @@ mod handler_tests {
             "generation must be incremented when spec.replicas changes — \
              the KCM statefulset controller uses generation/observedGeneration \
              to detect spec drift; without increment, status.replicas may not \
-             be updated after scale-to-0 (mayor-pv04)"
+             be updated after scale-to-0"
         );
     }
 
@@ -1447,13 +1447,13 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Regression tests for mayor-q0y9: proto body support and no-status
+    // Regression tests: proto body support and no-status
     // StatefulSet handling
     // -----------------------------------------------------------------------
 
     /// PUT scale on a StatefulSet with no status field returns valid JSON.
     ///
-    /// This is the direct regression test for mayor-q0y9. A freshly-created
+    /// This is the direct regression test. A freshly-created
     /// StatefulSet may have no `status` key at all (the KCM hasn't reconciled
     /// yet). Before the fix, `extract_status_replicas` could panic or produce
     /// an unexpected value; with the fix it falls back to `spec.replicas`.
@@ -1813,7 +1813,7 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Regression test for mayor-trb0: unified handler must keep RC on core key
+    // Regression test: unified handler must keep RC on core key
     //
     // After the refactor the RC handlers delegate to scale_put_impl/scale_get_impl
     // with group="".  This test confirms the RC path still resolves the correct
@@ -1890,7 +1890,7 @@ mod handler_tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests for mayor-8phw: scale_put_impl must CAS on the incoming
+    // Regression tests: scale_put_impl must CAS on the incoming
     // Scale's metadata.resourceVersion, not the stored object's RV.
     // ---------------------------------------------------------------------------
 

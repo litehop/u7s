@@ -229,11 +229,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // read from cache instead of falling back to the store.
     state.init_apiservice_cache().await;
 
-    // 10c. Keep the kubernetes EndpointSlice in sync with the kubernetes Endpoints.
+    // 10c. Keep the kubernetes Endpoints in sync with the kubernetes EndpointSlice.
     // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
     // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
-    // the loopback address in the Endpoints. This reconciler overwrites those changes
-    // so EndpointSlice.addresses always equals Endpoints.subsets[*].addresses[*].ip.
+    // the loopback address in the Endpoints. This reconciler updates the Endpoints to
+    // match, so Endpoints.subsets[*].addresses[*].ip always equals EndpointSlice.addresses.
     let (_reconciler_shutdown_tx, mut reconciler_shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let reconcile_store = Arc::clone(&store);
@@ -468,7 +468,7 @@ fn build_router(state: AppState) -> Router {
         // admission) as their GET/WebSocket siblings before returning 501 — see
         // pod_exec_post/pod_attach_post: a denied GET/WebSocket dial is retried by
         // client-go as POST/SPDY, and that retry must surface the same denial Status
-        // instead of a generic 405 (mayor-u6eb, mayor-c7r3).
+        // instead of a generic 405.
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/exec",
             get(handlers::proxy::pod_exec).post(handlers::proxy::pod_exec_post),
@@ -4100,7 +4100,7 @@ mod tests {
              kubelet webhook authenticator calls back to the apiserver"
         );
 
-        // Regression test for mayor-7vbe: kubelet must be allowed to POST
+        // Regression test: kubelet must be allowed to POST
         // /api/v1/namespaces/{ns}/serviceaccounts/{name}/token (TokenRequest subresource).
         // Without this rule the projected SA token volume never gets populated —
         // the kubelet's POST returns 403 and containers never receive an SA token,
@@ -4119,7 +4119,7 @@ mod tests {
         assert!(
             state.rbac_index.is_allowed(&sa_token_create),
             "system:nodes must be allowed to create serviceaccounts/token — \
-             kubelet needs this to project SA tokens into pod volumes (mayor-7vbe)"
+             kubelet needs this to project SA tokens into pod volumes"
         );
 
         // A user NOT in system:nodes must be denied — the binding is group-specific.
@@ -4215,7 +4215,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-fvkg: the KCM resourcequota controller must be able
+    /// Regression test: the KCM resourcequota controller must be able
     /// to PATCH resourcequotas/status after pod creation. With --use-service-account-credentials=false
     /// the KCM uses the system:kube-controller-manager identity for all controllers. If
     /// resourcequotas/status is absent from that ClusterRole, the quota controller gets 403
@@ -4251,8 +4251,7 @@ mod tests {
         assert!(
             state.rbac_index.is_allowed(&patch_status),
             "system:kube-controller-manager must be allowed to PATCH resourcequotas/status — \
-             without this the KCM quota controller gets 403 and quota.status.used is never updated \
-             (mayor-fvkg)"
+             without this the KCM quota controller gets 403 and quota.status.used is never updated"
         );
 
         // Also verify GET on resourcequotas/status (quota controller reads current status).
@@ -6194,7 +6193,7 @@ mod tests {
     /// DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings must return 200,
     /// not 405 Method Not Allowed.
     ///
-    /// Regression test for mayor-6l6m: sonobuoy delete --all sends a collection DELETE to
+    /// Regression test: sonobuoy delete --all sends a collection DELETE to
     /// remove all ClusterRoleBindings it created.  Before the fix the collection route only
     /// registered GET+POST, so axum returned 405.  The test verifies:
     ///   1. The route exists and accepts DELETE (not 405).
@@ -6353,8 +6352,8 @@ mod tests {
     /// to remove all pods it created. The pods collection route previously only registered
     /// GET+POST, so axum returned 405. The fix adds DELETE via core_delete_collection_namespaced_resource.
     /// The test verifies: 1) the route accepts DELETE (not 405), 2) a matching pod is
-    /// soft-deleted (delete_collection_pods mirrors delete_pod's soft-delete-first semantics —
-    /// mayor-859w — so a running pod is never yanked out from under the kubelet without a
+    /// soft-deleted (delete_collection_pods mirrors delete_pod's soft-delete-first semantics
+    /// so a running pod is never yanked out from under the kubelet without a
     /// graceful-termination signal), 3) labelSelector actually selects it.
     #[tokio::test]
     async fn delete_collection_namespaced_pods_returns_200_not_405() {
@@ -6446,7 +6445,7 @@ mod tests {
 
     /// DELETE /api/v1/persistentvolumes (collection) must return 200, not 405.
     ///
-    /// Regression test for mayor-yssp: the CSI PV lifecycle conformance test creates and
+    /// Regression test: the CSI PV lifecycle conformance test creates and
     /// deletes individual PVs, then calls DeleteCollection to bulk-clean. The cluster-scoped
     /// core/v1 collection route (`/api/v1/{resource}`) registered only GET+POST, unlike its
     /// namespaced sibling which already has DELETE wired — so PersistentVolumes (and every
@@ -6936,7 +6935,7 @@ mod tests {
     /// Before this fix, `build_router` wired only `.get().post().put().delete()` on
     /// all 7 proxy route blocks, so PATCH and OPTIONS returned 405 Method Not Allowed.
     /// Each failing verb then polled for up to a full minute before giving up — turning
-    /// a routing gap into hours of conformance wall-clock burn (mayor-gjy0).
+    /// a routing gap into hours of conformance wall-clock burn.
     ///
     /// None of the targets below exist, so a request that actually reaches the proxy
     /// handler must 404 ("pod/node/service not found in store"). A 404 proves the verb
@@ -7012,7 +7011,7 @@ mod tests {
 
     /// POST /api/v1/namespaces/default/secrets with a JSON body must return 201 Created.
     ///
-    /// Regression test for mayor-l6u0: Secret creates returned HTTP 400
+    /// Regression test: Secret creates returned HTTP 400
     /// "invalid JSON: expected value at line 1 column 1".  The conformance suite
     /// (webhook.go:1075 BeforeEach, secrets.go) creates Secrets via client-go which
     /// sends proto-encoded bodies.  This test verifies the JSON path also works — a
@@ -7079,7 +7078,7 @@ mod tests {
 
     /// POST /apis/batch/v1/namespaces/default/jobs with a JSON body must return 201 Created.
     ///
-    /// Regression test for mayor-np42: batch/v1 Job creates returned HTTP 400
+    /// Regression test: batch/v1 Job creates returned HTTP 400
     /// "invalid JSON: expected value at line 1 column 1".  The conformance suite
     /// (job.go:502, job.go:621) creates Jobs via client-go which sends proto-encoded bodies.
     /// This test verifies the JSON path works — a broken JSON path means the server cannot
@@ -7145,7 +7144,7 @@ mod tests {
 
     /// POST /api/v1/namespaces/default/secrets with a proto-encoded body must return 201.
     ///
-    /// Regression test for mayor-l6u0: the conformance client sends Secrets with
+    /// Regression test: the conformance client sends Secrets with
     /// Content-Type: application/vnd.kubernetes.protobuf.  If decode_secret_proto returns
     /// None for any reason, extract_body falls back to returning the raw proto bytes, and
     /// Object::from_bytes fails with "invalid JSON: expected value at line 1 column 1".
@@ -7244,7 +7243,7 @@ mod tests {
 
     /// POST /apis/batch/v1/namespaces/default/cronjobs with a proto-encoded body must return 201.
     ///
-    /// Regression test for mayor-np42: the conformance client (cronjob.go:106) creates CronJobs
+    /// Regression test: the conformance client (cronjob.go:106) creates CronJobs
     /// with Content-Type: application/vnd.kubernetes.protobuf.  If decode_cronjob_proto returns
     /// None, extract_body returns raw proto bytes and Object::from_bytes fails with
     /// "invalid JSON: expected value at line 1 column 1".

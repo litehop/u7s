@@ -308,7 +308,7 @@ fn handle_pod_event(
         // the two lets us emit the matching Event below — without it,
         // `kubectl describe pod` and the SchedulerPredicates e2e suite's
         // observeEventAfterAction watch never see a Scheduled/FailedScheduling
-        // event and the watch times out (mayor-lafgk).
+        // event and the watch times out.
         let first_pick = pick_node(&connector_clone, &server_clone, &pending, &tally_clone).await;
         if let Err(e) = &first_pick {
             if should_retry_without_preempting(e) {
@@ -343,7 +343,7 @@ fn handle_pod_event(
                 Err(_no_capacity) => {
                     // No node has a free slot — try preemption before giving
                     // up: evict lower-priority pods to make room rather than
-                    // leaving a higher-priority pod Pending forever (mayor-rsei).
+                    // leaving a higher-priority pod Pending forever.
                     match preempt_and_pick_node(
                         &connector_clone,
                         &server_clone,

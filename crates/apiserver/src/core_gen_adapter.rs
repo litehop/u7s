@@ -1916,13 +1916,13 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             obj["spec"] = serde_json::json!({ "finalizers": fins });
         }
     }
-    // (mayor-oww6 — this IS the mayor-ftkl PANIC-1 fix, see below) This decoder never
+    // (this IS the PANIC-1 fix, see below) This decoder never
     // read `ns.status` at all, so any protobuf-encoded Namespace write (Content-Type:
     // application/vnd.kubernetes.protobuf) silently lost status.phase and
     // status.conditions together — put_namespace_status wholesale-replaces stored status
     // with whatever this decoder returns, which was nothing.
     //
-    // A previous version of this comment claimed this was unrelated to the mayor-ftkl
+    // A previous version of this comment claimed this was unrelated to the
     // "should apply changes to a namespace status" conformance panic (namespace.go:365,
     // `index out of range [-1]`), reasoning that "that test's client uses plain JSON"
     // because this stack's kube-controller-manager is started with
@@ -1933,7 +1933,7 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     // --kube-api-content-type flag, unset by our sonobuoy invocation), so
     // `f.ClientSet.CoreV1().Namespaces().UpdateStatus(...)` — the exact call the failing
     // test makes after appending a condition — sends protobuf and hits this decoder.
-    // Verified live (mayor-ftkl worker, 2026-07-07): the real upstream conformance spec,
+    // Verified live in a worker session (2026-07-07): the real upstream conformance spec,
     // run via `sonobuoy --e2e-focus="should apply changes to a namespace status"` against
     // a build with this fix, passed twice in a row (~0.02s, no panic); reverting this `if
     // let Some(status) = ns.status` block reproduces the empty status.conditions the
@@ -3144,8 +3144,8 @@ mod tests {
     /// (e.g. node.kubernetes.io/not-ready:NoExecute) are treated by the scheduler
     /// as if they have no tolerations. This causes them to be evicted from tainted
     /// nodes immediately rather than after the tolerationSeconds window, breaking
-    /// taint-based eviction conformance tests. This test subsumes mayor-40cj (tolerations
-    /// dropped by hand pod_spec_to_json) and mayor-osuq (priorityClassName dropped).
+    /// taint-based eviction conformance tests. This test subsumes two prior regressions:
+    /// tolerations dropped by hand pod_spec_to_json, and priorityClassName dropped.
     #[test]
     fn generated_pod_spec_preserves_tolerations_by_construction() {
         let pod = core_v1::Pod {
@@ -3182,7 +3182,7 @@ mod tests {
         let tols = result["spec"]["tolerations"].as_array().expect(
             "spec.tolerations must be present — without it, the scheduler ignores taint \
                  tolerations and immediately evicts pods from tainted nodes, breaking \
-                 taint-based eviction conformance (mayor-40cj)",
+                 taint-based eviction conformance",
         );
         assert_eq!(tols.len(), 1, "one toleration must survive decode");
         assert_eq!(
@@ -3205,7 +3205,7 @@ mod tests {
         assert_eq!(
             result["spec"]["priorityClassName"], "system-cluster-critical",
             "priorityClassName must survive decode — without it the scheduler cannot \
-             enforce preemption priority ordering (mayor-osuq)"
+             enforce preemption priority ordering"
         );
         assert_eq!(
             result["spec"]["priority"], 2000000000,
@@ -3385,13 +3385,13 @@ mod tests {
     }
 
     /// Namespace status.phase and status.conditions must survive proto decode
-    /// (mayor-oww6 — this is also the mayor-ftkl PANIC-1 fix).
+    /// (this is also the PANIC-1 fix).
     ///
     /// Before this fix, decode_namespace_proto_gen never read `ns.status` at all, so any
     /// protobuf-encoded Namespace write (Content-Type: application/vnd.kubernetes.protobuf)
     /// silently lost its entire status — put_namespace_status wholesale-replaces stored
     /// status with whatever this decoder returns, which was nothing. This is exactly the
-    /// mayor-ftkl "should apply changes to a namespace status" conformance panic
+    /// the "should apply changes to a namespace status" conformance panic
     /// (namespace.go:365, `index out of range [-1]`): the e2e test's typed clientset
     /// defaults to protobuf content-type (upstream test/e2e/framework/test_context.go's
     /// --kube-api-content-type, unset by our sonobuoy invocation) for

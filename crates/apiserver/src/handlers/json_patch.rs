@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Webhook configuration field validation — regression for mayor-i5x4
+    // Webhook configuration field validation — regression
     // ---------------------------------------------------------------------------
 
     /// ValidatingWebhookConfiguration and MutatingWebhookConfiguration top-level field
@@ -1243,7 +1243,7 @@ mod tests {
     /// apply_field_validation with Strict mode must accept a ValidatingWebhookConfiguration
     /// or MutatingWebhookConfiguration body whose only resource-specific field is `webhooks`.
     ///
-    /// This is the end-to-end regression for mayor-i5x4: `kubectl apply` sends
+    /// This is the end-to-end regression: `kubectl apply` sends
     /// `?fieldValidation=Strict` by default, so a false "unknown field" positive here means
     /// every webhook config POST is rejected with 422, and the 8 [sig-api-machinery]
     /// AdmissionWebhook conformance tests fail during setup because they can't register
@@ -1297,7 +1297,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // PodTemplate / Endpoints / Event (both schemas) / CSIStorageCapacity field
-    // validation — regression for mayor-tw11
+    // validation — regression
     // ---------------------------------------------------------------------------
 
     /// PodTemplate's top-level `template` field must not be reported as unknown.
@@ -1456,7 +1456,7 @@ mod tests {
     /// types above, whose only resource-specific fields are their real (non-spec)
     /// top-level fields.
     ///
-    /// This is the end-to-end regression for mayor-tw11: `kubectl apply` sends
+    /// This is the end-to-end regression: `kubectl apply` sends
     /// `?fieldValidation=Strict` by default, so a false "unknown field" positive here
     /// means every create of these types is rejected with 422 — breaking PodTemplate/
     /// Endpoints/Event/CSIStorageCapacity creation cluster-wide (kubelet event
@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // EndpointSlice field validation — regression for mayor-9b6g
+    // EndpointSlice field validation — regression
     // ---------------------------------------------------------------------------
 
     /// EndpointSlice top-level fields (addressType, endpoints, ports) must not be
@@ -1640,7 +1640,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Nested spec field validation — regression for mayor-ftkl (PANIC 2)
+    // Nested spec field validation — regression (PANIC 2)
     // ---------------------------------------------------------------------------
 
     /// detect_unknown_fields must recurse into `spec` for resource types with a known

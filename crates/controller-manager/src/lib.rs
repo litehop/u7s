@@ -120,7 +120,7 @@ pub fn secrets_path(namespace: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ClusterRole aggregation controller — pure logic (mayor-5u0r)
+// ClusterRole aggregation controller — pure logic
 // ---------------------------------------------------------------------------
 
 /// Minimal typed view of a ClusterRole's metadata in a watch event.
@@ -468,7 +468,7 @@ mod tests {
         );
     }
 
-    // --- ClusterRole aggregation controller (mayor-5u0r) ---
+    // --- ClusterRole aggregation controller ---
 
     fn make_rule(verbs: &[&str], resources: &[&str]) -> PolicyRule {
         PolicyRule {

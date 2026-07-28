@@ -24,6 +24,7 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct CollectionQuery {
+    #[serde(default, deserialize_with = "crate::util::deserialize_watch_bool")]
     pub watch: Option<bool>,
     #[serde(rename = "resourceVersion")]
     pub resource_version: Option<u64>,
@@ -47,7 +48,7 @@ pub struct CollectionQuery {
 /// Extract a store-level FieldSelector from a raw field selector string.
 /// Picks the first equality (`=`) term that is not a negation (`!=`).
 /// Returns None if no equality term is present or the string is empty.
-pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
+pub(crate) fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
     sel.split(',').find_map(|term| {
         let term = term.trim();
         if !term.contains("!=") {
@@ -81,7 +82,7 @@ pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
 ///
 /// An empty or absent selector matches everything (pass-through).
 /// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
-pub fn filter_pods_by_field_selector(
+pub(crate) fn filter_pods_by_field_selector(
     pods: Vec<serde_json::Value>,
     selector: &str,
 ) -> Vec<serde_json::Value> {
@@ -177,7 +178,7 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
 /// All supplied terms are AND-evaluated: an event must match every term.
 /// An unknown field is ignored (pass-through). An event missing a constrained
 /// field does not match.
-pub fn filter_events_by_field_selector(
+pub(crate) fn filter_events_by_field_selector(
     events: Vec<serde_json::Value>,
     selector: &str,
 ) -> Vec<serde_json::Value> {
@@ -255,7 +256,7 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
     }
 }
 
-pub async fn list_pods<S: Store>(
+pub(crate) async fn list_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
@@ -476,7 +477,7 @@ pub(crate) async fn create_pod<S: Store>(
     // Must happen here (not in the pure apply_pod_create_defaults) because it
     // requires a store lookup. Without this, spec.priority is always absent
     // (defaults to 0 for the scheduler), so the scheduler's preemption logic
-    // (crates/scheduler) can never tell pods apart by priority (mayor-2u9x).
+    // (crates/scheduler) can never tell pods apart by priority.
     if let Some(pc_name) = obj.body["spec"]["priorityClassName"]
         .as_str()
         .filter(|n| !n.is_empty())
@@ -532,7 +533,7 @@ pub(crate) async fn create_pod<S: Store>(
     // apply_pod_create_defaults (above, before the webhook chain) only ever saw the
     // client-supplied containers; a webhook can add new ones the first pass never
     // touched. Real kube-apiserver re-runs defaulting after each mutating-webhook
-    // round; this single re-apply is the MVP form of that (mayor-nu77). Idempotent —
+    // round; this single re-apply is the MVP form of that. Idempotent —
     // apply_pod_spec_defaults only fills absent/empty fields, so containers already
     // defaulted above are unchanged. Must run before validation so validating
     // webhooks see the fully-defaulted object, matching upstream ordering.
@@ -573,7 +574,7 @@ pub(crate) async fn create_pod<S: Store>(
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
-pub async fn get_pod<S: Store>(
+pub(crate) async fn get_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -619,7 +620,7 @@ pub async fn get_pod<S: Store>(
         .into_response())
 }
 
-pub async fn replace_pod<S: Store>(
+pub(crate) async fn replace_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
@@ -764,7 +765,7 @@ fn deletion_timestamp_after_grace(grace_period_seconds: i64) -> String {
 ///
 /// sonobuoy cleanup sends this to remove all pods it created in a namespace.
 /// Applies the labelSelector if present; deletes all matching pods.
-pub async fn delete_collection_pods<S: Store>(
+pub(crate) async fn delete_collection_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<super::generic::CollectionQuery>,
@@ -847,7 +848,7 @@ pub async fn delete_collection_pods<S: Store>(
     })))
 }
 
-pub async fn delete_pod<S: Store>(
+pub(crate) async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
@@ -1104,7 +1105,7 @@ use crate::util::utc_now_rfc3339;
 /// "Should recreate evicted statefulset" hangs: the test calls the Eviction API,
 /// receives a 404 (no route), the pod is never terminated, and the StatefulSet
 /// controller never triggers recreation.
-pub async fn evict_pod<S: Store>(
+pub(crate) async fn evict_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     body: Bytes,
@@ -1547,6 +1548,41 @@ mod watch_tests {
             "resourceVersion (the wire format every real client sends) must populate \
              resource_version; a missing #[serde(rename)] leaves it None and silently \
              resets every watch to a full history replay"
+        );
+    }
+
+    /// kubectl and client-go historically send `?watch=1` (not just `?watch=true`) — a
+    /// documented Kubernetes API accept form. Before the fix, `watch: Option<bool>` only
+    /// parsed Rust's `bool::from_str` ("true"/"false"), so `?watch=1` failed query-string
+    /// deserialization and the request never reached the handler at all (axum's Query
+    /// extractor rejection maps to HTTP 400). This test fails on revert: `try_from_uri`
+    /// would return `Err`, not a parsed `watch: Some(true)`.
+    #[test]
+    fn collection_query_accepts_watch_equals_1_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/namespaces/default/pods?watch=1".parse().unwrap();
+        let Query(q) = Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=1 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(true),
+            "?watch=1 must resolve to watch:Some(true), the same as ?watch=true, so the \
+             handler routes to the streaming watch path instead of a plain list"
+        );
+    }
+
+    /// Mirror of the `watch=1` test above for the `watch=0` alias of `watch=false`.
+    /// `?watch=0` must resolve to `Some(false)` so the handler stays on the normal list
+    /// path — before the fix this also 400'd instead of falling through to list mode.
+    #[test]
+    fn collection_query_accepts_watch_equals_0_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/namespaces/default/pods?watch=0".parse().unwrap();
+        let Query(q) = Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=0 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(false),
+            "?watch=0 must resolve to watch:Some(false) so the request stays on the \
+             normal list path, not the watch stream"
         );
     }
 }
@@ -2137,7 +2173,7 @@ mod label_selector_tests {
         );
     }
 
-    /// Regression test for mayor-zcnd: sendInitialEvents pod watch with a labelSelector must
+    /// Regression test: sendInitialEvents pod watch with a labelSelector must
     /// exclude pods that do not match the selector from the initial ADDED events.
     ///
     /// The StatefulSet controller opens a pod watch with sendInitialEvents=true and
@@ -2182,7 +2218,7 @@ mod label_selector_tests {
             1,
             "sendInitialEvents with labelSelector=app=ss must return only ss-0, not unrelated pods; \
              without the fix all pods are returned and the StatefulSet controller's pod informer \
-             cache is polluted with pods from other StatefulSets (mayor-zcnd)"
+             cache is polluted with pods from other StatefulSets"
         );
         assert_eq!(
             pods[0]["metadata"]["name"], "ss-0",
@@ -2190,7 +2226,7 @@ mod label_selector_tests {
         );
     }
 
-    /// Regression test for mayor-zcnd (live watch path): pod watch with labelSelector must
+    /// Regression test (live watch path): pod watch with labelSelector must
     /// deliver MODIFIED events for matching pods and suppress events for non-matching pods.
     ///
     /// Before the fix, label_selector was hardcoded to None in the pod watch path, so
@@ -2240,7 +2276,7 @@ mod label_selector_tests {
 // Status subresource — GET/PUT/PATCH /api/v1/namespaces/:ns/pods/:name/status
 // ---------------------------------------------------------------------------
 
-pub async fn get_pod_status<S: Store>(
+pub(crate) async fn get_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -2262,7 +2298,7 @@ pub async fn get_pod_status<S: Store>(
         .into_response())
 }
 
-pub async fn replace_pod_status<S: Store>(
+pub(crate) async fn replace_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -2331,7 +2367,7 @@ fn accepts_patch_content_type(ct: &str) -> bool {
 /// that `$patch:delete` directives remove matching items rather than being stored
 /// literally.  Storing them literally causes the kubelet to detect phantom array
 /// changes on every reconcile and continuously recreate the pod sandbox.
-pub fn apply_status_patch(
+pub(crate) fn apply_status_patch(
     stored: &serde_json::Value,
     patch: &serde_json::Value,
 ) -> serde_json::Value {
@@ -2486,7 +2522,7 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
     }
 }
 
-pub async fn patch_pod_status<S: Store>(
+pub(crate) async fn patch_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -2593,7 +2629,7 @@ fn resize_section_removes_resource(section: Option<&serde_json::Value>, resource
     }
 }
 
-pub fn validate_resize_patch(
+pub(crate) fn validate_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> Result<(), String> {
@@ -2883,7 +2919,7 @@ fn merge_resize_section(
 /// multi-container resizes where different containers (or different dimensions of the
 /// same container) change independently. Only spec.containers[].resources is updated;
 /// all other fields are preserved. This is the pure logic extracted for testability.
-pub fn apply_resize_patch(
+pub(crate) fn apply_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> serde_json::Value {
@@ -2923,7 +2959,7 @@ pub fn apply_resize_patch(
     result
 }
 
-pub async fn patch_pod_resize<S: Store>(
+pub(crate) async fn patch_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -2978,7 +3014,7 @@ pub async fn patch_pod_resize<S: Store>(
 /// current resize state. The in-place-resize conformance test polls this endpoint
 /// after each PATCH /resize to confirm the resize was applied; without this
 /// handler the route returns 405 and the conformance poll loop never terminates.
-pub async fn get_pod_resize<S: Store>(
+pub(crate) async fn get_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -3012,7 +3048,7 @@ pub async fn get_pod_resize<S: Store>(
 ///
 /// Extracted as a pure function for testability — the async handler cannot be
 /// tested without a live store.
-pub fn apply_ephemeral_containers_patch(
+pub(crate) fn apply_ephemeral_containers_patch(
     stored: &serde_json::Value,
     patch: &serde_json::Value,
 ) -> serde_json::Value {
@@ -3044,7 +3080,7 @@ pub fn apply_ephemeral_containers_patch(
     result
 }
 
-pub async fn get_ephemeral_containers<S: Store>(
+pub(crate) async fn get_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -3066,7 +3102,7 @@ pub async fn get_ephemeral_containers<S: Store>(
         .into_response())
 }
 
-pub async fn patch_ephemeral_containers<S: Store>(
+pub(crate) async fn patch_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -3108,7 +3144,7 @@ pub async fn patch_ephemeral_containers<S: Store>(
     Ok(Json(current_obj.body))
 }
 
-pub async fn put_ephemeral_containers<S: Store>(
+pub(crate) async fn put_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -3361,7 +3397,7 @@ mod status_tests {
     /// The kubelet increments restartCount after each container restart triggered by a
     /// failing liveness probe. If apply_status_patch silently drops or zeros restartCount,
     /// the e2e test "should have monotonically increasing restart count" always sees 0
-    /// and fails. This is failure mode B for mayor-4ath.
+    /// and fails. This is failure mode B.
     #[test]
     fn patch_pod_status_restart_count_persists() {
         let stored = serde_json::json!({
@@ -3397,7 +3433,7 @@ mod status_tests {
             result["status"]["containerStatuses"][0]["restartCount"], 3,
             "restartCount must be preserved after status PATCH — kubelet increments this \
              after each liveness probe restart; if it's zeroed, the e2e monotonic-restart-count \
-             test always sees 0 restarts (mayor-4ath failure mode B)"
+             test always sees 0 restarts (failure mode B)"
         );
         assert_eq!(
             result["spec"]["containers"][0]["livenessProbe"]["exec"]["command"][0], "/bin/false",
@@ -3861,7 +3897,7 @@ mod status_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Patch type detection tests — regression for mayor-erz
+// Patch type detection tests — regression
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -3877,7 +3913,7 @@ mod patch_type_tests {
     }
 
     /// json-patch+json must be accepted — not return 415.
-    /// This is the regression test for mayor-erz: before the fix, patch_pod
+    /// This is the regression test: before the fix, patch_pod
     /// rejected application/json-patch+json with HTTP 415 Unsupported Media Type.
     #[test]
     fn json_patch_content_type_is_accepted() {
@@ -3886,7 +3922,7 @@ mod patch_type_tests {
         assert!(
             result.is_ok(),
             "application/json-patch+json must be accepted by patch_pod; \
-             before mayor-erz fix it returned 415 Unsupported Media Type"
+             before the fix it returned 415 Unsupported Media Type"
         );
         assert!(matches!(result.ok(), Some(PatchType::Json)));
     }
@@ -4049,7 +4085,7 @@ fn validate_pod_sysctls(pod: &serde_json::Value) -> Result<(), String> {
 /// This must NOT touch pod.status — callers on the update path rely on it being
 /// status-free so that a running pod's phase and conditions are never stomped back
 /// to "Pending" / "Unschedulable" by a no-op replace or patch.
-pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
+pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     // Deserialize spec into typed form once; all typed-field accesses are compile-checked.
     let mut spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
 
@@ -4198,7 +4234,7 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
                 // after the mutating webhook chain (see create_pod), so webhook-injected
                 // containers get the same default a real client would have supplied.
                 // Breaks conformance "[sig-api-machinery] AdmissionWebhook ... should mutate
-                // pod and apply defaults after mutation" otherwise (mayor-nu77).
+                // pod and apply defaults after mutation" otherwise.
                 if container["terminationMessagePolicy"].is_null()
                     || container["terminationMessagePolicy"] == ""
                 {
@@ -4261,7 +4297,7 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
 ///
 /// Extracted for testability — the full create_pod handler is async and needs
 /// a live store, so the defaulting logic lives here as a pure function.
-pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+pub(crate) fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     apply_pod_spec_defaults(pod);
 
     // Initialize status.conditions with PodScheduled=False when absent.
@@ -4308,7 +4344,7 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
 /// matches what the kube-apiserver RuntimeClass admission plugin does).
 /// The RuntimeClass JSON must be the full stored object; if it has no
 /// `overhead.podFixed` this is a no-op.
-pub fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
+pub(crate) fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
     let pod_fixed = &rc["overhead"]["podFixed"];
     if pod_fixed.is_null() || pod_fixed.as_object().is_none_or(|m| m.is_empty()) {
         return;
@@ -4332,7 +4368,7 @@ pub const SYSTEM_NODE_CRITICAL_VALUE: i32 = 2_000_001_000;
 /// The scheduler's preemption logic (crates/scheduler) keys entirely off
 /// `spec.priority` — without this resolution every pod looks like priority 0
 /// and preemption can never distinguish a high-priority pod from a low-priority
-/// one (mayor-2u9x).
+/// one.
 ///
 /// `stored_class` is the PriorityClass object already fetched from the store by
 /// name (`None` if no such object exists). It is ignored for the two built-in
@@ -4349,9 +4385,8 @@ pub const SYSTEM_NODE_CRITICAL_VALUE: i32 = 2_000_001_000;
 /// persisted with an unresolved priority the scheduler cannot act on.
 ///
 /// NOTE: does not implement `globalDefault` (the PriorityClass applied when a
-/// pod sets no `priorityClassName` at all) — tracked as a known gap, see
-/// mayor-2u9x follow-up discussion.
-pub fn resolve_pod_priority_class(
+/// pod sets no `priorityClassName` at all) — tracked as a known gap.
+pub(crate) fn resolve_pod_priority_class(
     pod: &mut serde_json::Value,
     stored_class: Option<&serde_json::Value>,
 ) -> Result<(), String> {
@@ -4403,7 +4438,7 @@ pub fn resolve_pod_priority_class(
 /// Without this, conformance tests like node/pods.go:200 ("Pods should be
 /// submitted and removed") fail because they create a pod with requests==limits
 /// and assert status.qosClass == "Guaranteed".
-pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
+pub(crate) fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
     let containers: Vec<&serde_json::Value> = {
         let mut v: Vec<&serde_json::Value> = Vec::new();
         if let Some(arr) = pod["spec"]["containers"].as_array() {
@@ -4464,7 +4499,7 @@ pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
 /// Controllers that gate on observedGeneration == generation must see generation=1
 /// on every new pod; a caller-supplied value of 100 would force a controller to
 /// wait for 99 phantom generations that will never arrive.
-pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
+pub(crate) fn initialize_pod_generation(pod: &mut serde_json::Value) {
     pod["metadata"]["generation"] = serde_json::json!(1i64);
 }
 
@@ -4499,7 +4534,7 @@ pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
 /// Both sides are spec-defaulted the same way `increment_pod_generation_if_spec_changed`
 /// does, so a client PUT that omits already-defaulted fields (dnsPolicy,
 /// serviceAccountName, ...) isn't mistaken for an illegal spec change.
-pub fn validate_pod_spec_immutable(
+pub(crate) fn validate_pod_spec_immutable(
     spec_before: &serde_json::Value,
     spec_after: &serde_json::Value,
 ) -> Result<(), String> {
@@ -4741,7 +4776,7 @@ mod pod_resources_immutability_tests {
 /// container env fieldRef.apiVersion, port protocol, terminationMessagePolicy)
 /// does not produce a spurious generation bump — upstream k8s only bumps on a
 /// real spec change.
-pub fn increment_pod_generation_if_spec_changed(
+pub(crate) fn increment_pod_generation_if_spec_changed(
     pod: &mut serde_json::Value,
     spec_before: &serde_json::Value,
 ) {
@@ -4785,7 +4820,7 @@ pub fn increment_pod_generation_if_spec_changed(
 ///
 /// This function writes the resolved boolean into `pod["spec"]["automountServiceAccountToken"]`
 /// so that `inject_sa_token_volume` can make a deterministic decision.
-pub async fn apply_automount_sa_token_default<S: Store>(
+pub(crate) async fn apply_automount_sa_token_default<S: Store>(
     state: &AppState<S>,
     pod: &mut serde_json::Value,
     namespace: &str,
@@ -4828,7 +4863,7 @@ pub async fn apply_automount_sa_token_default<S: Store>(
 ///
 /// The volume name suffix is derived deterministically from the pod name so
 /// the function is pure (no I/O, no randomness) and therefore unit-testable.
-pub fn inject_sa_token_volume(pod: &mut serde_json::Value, pod_name: &str) {
+pub(crate) fn inject_sa_token_volume(pod: &mut serde_json::Value, pod_name: &str) {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -5584,7 +5619,7 @@ mod create_defaults_tests {
     /// If apply_pod_create_defaults (or any other CREATE-path code) strips or transforms
     /// livenessProbe, the kubelet never sees the probe config and cannot run it — causing
     /// the container to never restart even when the probe command fails. This is failure
-    /// mode A for mayor-4ath: the probe config is dropped before the kubelet can act on it.
+    /// mode A: the probe config is dropped before the kubelet can act on it.
     #[test]
     fn liveness_probe_is_preserved_through_create_defaults() {
         let mut pod = serde_json::json!({
@@ -5612,7 +5647,7 @@ mod create_defaults_tests {
             probe.is_object(),
             "livenessProbe must remain an object after apply_pod_create_defaults — \
              kubelet reads it to schedule probe runs; if missing, probes never fire \
-             and restartCount stays at 0 (mayor-4ath failure mode A)"
+             and restartCount stays at 0 (failure mode A)"
         );
         assert_eq!(
             probe["exec"]["command"][0], "/bin/sh",
@@ -5990,7 +6025,7 @@ mod create_defaults_tests {
     /// post-mutation — otherwise the injected container is stored with no
     /// terminationMessagePolicy at all, which fails conformance
     /// "[sig-api-machinery] AdmissionWebhook ... should mutate pod and apply defaults
-    /// after mutation" (mayor-nu77). This also proves the re-apply is idempotent: the
+    /// after mutation". This also proves the re-apply is idempotent: the
     /// container defaulted on the first pass must be unchanged by the second pass.
     #[test]
     fn post_mutation_defaults_apply_to_webhook_injected_container() {
@@ -6042,7 +6077,7 @@ mod create_defaults_tests {
 /// `now` must be an RFC3339 timestamp string (used as `lastTransitionTime`).
 ///
 /// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
-pub fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
+pub(crate) fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
     if !pod["status"].is_object() {
         pod["status"] = serde_json::json!({});
     }
@@ -6565,7 +6600,7 @@ mod generation_tests {
 ///
 /// Returns `Err` with a 400 if `target.name` is absent or empty.
 /// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
-pub fn extract_binding_node_name(
+pub(crate) fn extract_binding_node_name(
     binding: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
     let parsed: Binding = serde_json::from_value(binding.clone())
@@ -6576,7 +6611,7 @@ pub fn extract_binding_node_name(
     Ok(parsed.target.name)
 }
 
-pub async fn bind_pod<S: Store>(
+pub(crate) async fn bind_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -7394,7 +7429,7 @@ mod priority_class_tests {
     /// The scheduler's preemption logic (crates/scheduler) keys entirely off
     /// spec.priority — without this resolution every pod looks like priority 0
     /// and a pod that explicitly asked for a high PriorityClass could never
-    /// preempt a lower-priority one (mayor-2u9x).
+    /// preempt a lower-priority one.
     #[test]
     fn resolves_priority_from_stored_priority_class_value() {
         let mut pod = serde_json::json!({
@@ -7510,7 +7545,7 @@ mod priority_class_tests {
     /// when priorityClassName also resolves to a different value.
     ///
     /// u7s currently lets a client set spec.priority directly and it survives the
-    /// wire round-trip (mayor-osuq); silently overwriting that value here would
+    /// wire round-trip; silently overwriting that value here would
     /// break whichever caller relies on their explicit priority sticking.
     #[test]
     fn does_not_overwrite_an_explicit_client_set_priority() {
@@ -8366,7 +8401,7 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
-    // dnsPolicy round-trip regression test (mayor-grmb)
+    // dnsPolicy round-trip regression test
     // -----------------------------------------------------------------------
 
     /// A pod created with spec.dnsPolicy: ClusterFirstWithHostNet must have that
@@ -8434,7 +8469,7 @@ mod handler_tests {
             v["spec"]["dnsPolicy"],
             serde_json::json!("ClusterFirstWithHostNet"),
             "spec.dnsPolicy must survive the create→get round-trip unchanged — \
-             before mayor-grmb fix this was lost, causing kubelet to log \
+             before the fix this was lost, causing kubelet to log \
              'invalid DNSPolicy=' for every pod"
         );
 
@@ -8630,14 +8665,14 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
-    // priorityClassName -> priority resolution (mayor-2u9x)
+    // priorityClassName -> priority resolution
     // -----------------------------------------------------------------------
 
     /// Creating a pod with spec.priorityClassName referencing a stored PriorityClass
     /// must result in the stored (and returned) pod having spec.priority set to
     /// that class's value.
     ///
-    /// The scheduler's preemption logic (crates/scheduler, mayor-rsei) reads
+    /// The scheduler's preemption logic (crates/scheduler) reads
     /// spec.priority off the pod watch stream. Before this fix the apiserver never
     /// resolved priorityClassName at all, so every pod looked like priority 0 and
     /// preemption could never fire. This test fails if the store lookup + resolve
@@ -8809,7 +8844,7 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
-    // automountServiceAccountToken defaulting (mayor-vfe2)
+    // automountServiceAccountToken defaulting
     // -----------------------------------------------------------------------
 
     /// A pod created without spec.automountServiceAccountToken must have it
@@ -9094,7 +9129,7 @@ mod handler_tests {
     /// receives a DELETED tombstone with minimal metadata (no spec), and the container never
     /// receives SIGTERM — it keeps running indefinitely.
     ///
-    /// This is the regression test for the StatefulSet AfterEach hang (mayor-859w):
+    /// This is the regression test for the StatefulSet AfterEach hang:
     /// scale-to-0 stalled for up to 91 minutes because the StatefulSet pod was hard-deleted without
     /// going through the soft-delete+SIGTERM flow. This test fails on revert: if pods are
     /// hard-deleted immediately, the pod will be gone from the store and the deletionTimestamp
@@ -9141,7 +9176,7 @@ mod handler_tests {
             v["metadata"]["deletionTimestamp"].is_string(),
             "deletionTimestamp must be stamped on first DELETE even without finalizers — \
              kubelet uses this signal to send SIGTERM to the container; without it the \
-             container keeps running and the StatefulSet scale-to-0 hangs (mayor-859w)"
+             container keeps running and the StatefulSet scale-to-0 hangs"
         );
     }
 
@@ -10165,7 +10200,7 @@ mod handler_tests {
 
     /// PATCH /status must persist the new phase to the store and the response body.
     ///
-    /// Regression test for mayor-fbp7: the handler accepted the PATCH without error
+    /// Regression test: the handler accepted the PATCH without error
     /// but reported 0 changed fields — meaning the stored object was not mutated.
     ///
     /// This test fails if patch_pod_status is a no-op: if it returns 200 but leaves
@@ -10231,7 +10266,7 @@ mod handler_tests {
         assert_eq!(
             v["status"]["phase"], "Running",
             "phase must be updated to Running in the store — \
-             if this fails the PATCH is a no-op (mayor-fbp7 regression): \
+             if this fails the PATCH is a no-op (regression): \
              kubelet cannot advance pod lifecycle and pods stay Pending forever"
         );
         assert_eq!(
@@ -10338,7 +10373,7 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
-    /// Regression test for mayor-h9fz: PATCH /status on a pod whose namespace is deleted
+    /// Regression test: PATCH /status on a pod whose namespace is deleted
     /// must return "Pod not found" 404 (loop-terminating), NOT "Namespace not found" 404
     /// (retryable). KCM's pod-GC controller marks orphaned/terminating pods Failed via a
     /// status PATCH; if the namespace is already hard-deleted, the previous code returned
@@ -10406,7 +10441,7 @@ mod handler_tests {
         );
     }
 
-    /// Regression test for mayor-h9fz: PUT /status on a pod whose namespace is deleted
+    /// Regression test: PUT /status on a pod whose namespace is deleted
     /// must return "Pod not found" 404, not "Namespace not found" 404.
     /// Same invariant as the PATCH case above — KCM also uses PUT /status in some paths.
     #[tokio::test]
@@ -12167,7 +12202,7 @@ mod handler_tests {
         assert_eq!(
             v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
             "container resources must be updated to 200m after /resize PATCH — \
-             if this fails the in-place resize feature is not working (mayor-sor9)"
+             if this fails the in-place resize feature is not working"
         );
         assert_eq!(
             v["status"]["resize"], "Proposed",
@@ -12678,7 +12713,7 @@ mod handler_tests {
         }
     }
 
-    /// mayor-y832 investigated sonobuoy's `sonobuoy status` freezing mid-run: the
+    /// Prior investigation into sonobuoy's `sonobuoy status` freezing mid-run found:
     /// aggregator PATCHes its own pod's annotation to publish progress while the
     /// kubelet concurrently PATCHes the same pod's /status. The leading hypothesis
     /// was a lost-update clobber between the two writers. Live evidence from a full
@@ -12948,7 +12983,7 @@ mod resize_tests {
         assert_eq!(
             result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
             "container resources must be updated to 200m — \
-             if this fails the in-place resize feature is broken (mayor-sor9)"
+             if this fails the in-place resize feature is broken"
         );
         assert_eq!(
             result["status"]["resize"], "Proposed",
@@ -14187,7 +14222,7 @@ mod ephemeral_containers_route_tests {
 
 // ---------------------------------------------------------------------------
 // Admission regression tests — prove create_pod / replace_pod invoke the
-// admission webhook pipeline (mayor-8sn9).
+// admission webhook pipeline.
 //
 // Without the fix both handlers skipped admission entirely; admission-based
 // controls (OPA Gatekeeper, Kyverno) on pods were non-functional.
@@ -14403,7 +14438,7 @@ mod admission_tests {
     /// apply_pod_create_defaults ran once, before run_mutating_webhooks, so the
     /// webhook-added container was never seen by the defaulting pass. This breaks
     /// conformance "[sig-api-machinery] AdmissionWebhook ... should mutate pod and
-    /// apply defaults after mutation" (mayor-nu77). If create_pod stops re-applying
+    /// apply defaults after mutation". If create_pod stops re-applying
     /// defaults after the mutating webhook chain, this test fails because the injected
     /// container comes back with terminationMessagePolicy absent.
     #[tokio::test]

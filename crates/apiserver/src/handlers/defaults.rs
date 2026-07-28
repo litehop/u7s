@@ -189,7 +189,7 @@ fn default_pvc(obj: &mut serde_json::Value) {
 /// creates RCs without an explicit selector, relying on this defaulting. Without it our apiserver
 /// stores an empty selector; the KCM RC controller with an empty selector cannot match the pods it
 /// creates (empty set matches nothing) → always sees active=0/desired=N → creates pods without
-/// bound (verified: nil-selector RC created 179 pods in 8 s; mayor-n9t6).
+/// bound (verified: nil-selector RC created 179 pods in 8 s).
 ///
 /// IMPORTANT: RC uses a flat equality-based label selector (`map<string,string>`), NOT the
 /// set-based `{matchLabels: {...}}` format used by ReplicaSet/StatefulSet/Deployment.
@@ -1669,7 +1669,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// A nil RC selector must default to the template labels; otherwise the RC controller
-    /// cannot match its own pods and creates them without bound (conformance RC runaway, mayor-n9t6).
+    /// cannot match its own pods and creates them without bound (conformance RC runaway).
     ///
     /// The conformance helper `newRC` (test/e2e/apps/rc.go) creates an RC with spec.selector=nil,
     /// relying on this defaulting. Without it the apiserver stores an empty selector; KCM sees
@@ -1697,7 +1697,7 @@ mod tests {
             serde_json::json!({ "name": "my-hostname-basic" }),
             "spec.selector must be a flat map defaulted from template labels — \
              an empty RC selector causes KCM to see active=0 forever and create \
-             pods without bound (conformance RC runaway, mayor-n9t6)"
+             pods without bound (conformance RC runaway)"
         );
         // Must NOT be wrapped in matchLabels (RC uses equality-based selector).
         assert!(
@@ -1902,7 +1902,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Event core/v1 <-> events.k8s.io/v1 field-shape translation (mayor-1wey)
+    // Event core/v1 <-> events.k8s.io/v1 field-shape translation
     // ---------------------------------------------------------------------------
 
     /// An Event created via events.k8s.io/v1 (which sets `regarding`/`note`, never the
@@ -2022,7 +2022,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: spec.type defaulting (mayor-51ji)
+    // Regression tests: spec.type defaulting
     // ---------------------------------------------------------------------------
 
     /// A Service with no spec.type must have spec.type defaulted to "ClusterIP".
@@ -2077,7 +2077,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: NodePort allocation (mayor-51ji)
+    // Regression tests: NodePort allocation
     // ---------------------------------------------------------------------------
 
     /// A NodePort Service with no nodePort on its ports must have one assigned.
@@ -2188,7 +2188,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: ExternalName ClusterIP (mayor-bdum)
+    // Regression tests: ExternalName ClusterIP
     // ---------------------------------------------------------------------------
 
     /// An ExternalName service must NOT get ipFamilies, ipFamilyPolicy, or clusterIPs.
@@ -2231,7 +2231,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: PVC status.phase defaulting (mayor-hyyu)
+    // Regression tests: PVC status.phase defaulting
     // ---------------------------------------------------------------------------
 
     /// A PVC created without status.phase must have it initialized to "Pending".
@@ -2289,7 +2289,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: NodePort clearing on ExternalName transition (mayor-c6ek)
+    // Regression tests: NodePort clearing on ExternalName transition
     // ---------------------------------------------------------------------------
 
     /// A service patched from NodePort to ExternalName must have nodePort zeroed on all ports.
@@ -2389,7 +2389,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: workload metadata.generation initialisation (mayor-u0vp)
+    // Regression tests: workload metadata.generation initialisation
     // ---------------------------------------------------------------------------
 
     /// A newly created Deployment must have metadata.generation=1 set by apply_defaults.
@@ -2705,7 +2705,6 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Regression tests: null creationTimestamp stripped from pod template metadata
-    // (mayor-48ks)
     // ---------------------------------------------------------------------------
 
     /// Deployment pod template metadata must not contain "creationTimestamp: null" after
@@ -3253,7 +3252,6 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Regression tests: RoleBinding/ClusterRoleBinding roleRef.apiGroup defaulting
-    // (mayor-fnym9)
     // ---------------------------------------------------------------------------
 
     /// A RoleBinding created with `roleRef.apiGroup: ""` (as the upstream aggregator
@@ -3337,7 +3335,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: Job/CronJob defaulting and pod template labels (mayor-md7t)
+    // Regression tests: Job/CronJob defaulting and pod template labels
     // ---------------------------------------------------------------------------
 
     /// A Job with no spec.template.metadata.labels must have them defaulted to {}.
