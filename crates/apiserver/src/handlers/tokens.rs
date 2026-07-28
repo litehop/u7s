@@ -919,7 +919,7 @@ mod handler_tests {
     /// A protobuf-encoded TokenRequest body (as sent by kubectl 1.31+) must be decoded
     /// and produce a JWT whose `aud` claim matches the audience in the proto body.
     ///
-    /// This is the primary regression test for mayor-hy77: kubectl 1.31+ always sends
+    /// This is the primary regression test: kubectl 1.31+ always sends
     /// Content-Type: application/vnd.kubernetes.protobuf for subresource POSTs, and the
     /// handler was previously failing with "invalid JSON: expected value at line 1 column 1".
     ///
@@ -988,7 +988,7 @@ mod handler_tests {
         );
     }
 
-    /// Regression test for mayor-0awf: when a TokenRequest body includes spec.boundObjectRef,
+    /// Regression test: when a TokenRequest body includes spec.boundObjectRef,
     /// the response must echo it back in spec.boundObjectRef.
     ///
     /// kubelet's DeleteServiceAccountToken (token_manager.go:139) accesses
@@ -1034,7 +1034,7 @@ mod handler_tests {
         let bor = &resp_body["spec"]["boundObjectRef"];
         assert!(
             bor.is_object(),
-            "spec.boundObjectRef must be present in response to prevent kubelet nil-pointer panic (mayor-0awf)"
+            "spec.boundObjectRef must be present in response to prevent kubelet nil-pointer panic"
         );
         assert_eq!(
             bor["kind"], "Pod",
@@ -1268,7 +1268,7 @@ mod handler_tests {
         );
     }
 
-    /// Regression test for mayor-o30k: response must include spec.expirationSeconds so kubelet's
+    /// Regression test: response must include spec.expirationSeconds so kubelet's
     /// token_manager can schedule token refresh without falling back.
     ///
     /// Kubelet reads spec.expirationSeconds from the TokenRequest response to know when to
@@ -1320,7 +1320,7 @@ mod handler_tests {
         // Without it, kubelet logs "Expiration seconds was nil for token request".
         let resp_exp_secs = resp_body["spec"]["expirationSeconds"]
             .as_u64()
-            .expect("spec.expirationSeconds must be present in response (mayor-o30k regression)");
+            .expect("spec.expirationSeconds must be present in response (regression)");
         assert_eq!(
             resp_exp_secs, 600,
             "spec.expirationSeconds in response must match the requested value"

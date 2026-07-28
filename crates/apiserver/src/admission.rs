@@ -241,7 +241,7 @@ pub(crate) fn label_selector_matches(
 /// fires only if every condition's expression evaluates to `true` (logical AND); if any
 /// evaluates to `false`, the webhook must be skipped entirely, as if it had not matched.
 /// Without this check a webhook mutates/validates objects it was explicitly configured to
-/// exclude (verified live: mayor-prtw).
+/// exclude (verified live).
 ///
 /// A condition that fails to evaluate (parse error, or references a variable this evaluator
 /// subset doesn't support, e.g. `authorizer`) is treated as satisfied rather than as a skip —
@@ -3390,7 +3390,7 @@ mod tests {
 
     /// Deleting a ValidatingWebhookConfiguration must bypass the admission pipeline too.
     ///
-    /// mayor-w354 wired DELETE handlers into run_validating_webhooks for the first time —
+    /// DELETE handlers were wired into run_validating_webhooks for the first time —
     /// before that fix, DELETE never reached this function at all, so the bypass below was
     /// never exercised on the DELETE path. Once DELETE started flowing through admission,
     /// an operation-DELETE self-referential webhook config would deadlock cluster bootstrap
@@ -4413,7 +4413,7 @@ mod tests {
     /// Returning only a generic "Timeout: …" message without the URL fails check 2.
     /// Returning a 500 fails the expectation of a gateway-timeout-class error.
     ///
-    /// Separately (mayor-gelc), the `should be able to deny pod and configmap creation`
+    /// Separately, the `should be able to deny pod and configmap creation`
     /// conformance test's hanging-webhook assertion does a *strict* single-substring grep
     /// — `strings.Contains(err.Error(), "deadline")`, with no "OR timeout" fallback — so
     /// the message must literally contain "deadline" even though it already said "timeout".
@@ -4518,7 +4518,7 @@ mod tests {
              reverting the URL inclusion breaks this check. Got: {}",
             err.1.message
         );
-        // mayor-gelc: `should be able to deny pod and configmap creation` greps strictly for
+        // `should be able to deny pod and configmap creation` greps strictly for
         // "deadline" (not "timeout") on the hanging-webhook error. Wording it as only
         // "...requested timeout Ns: <url>" is a behaviorally-correct rejection that still
         // fails that conformance string-grep.
@@ -4533,7 +4533,7 @@ mod tests {
 
     /// Mirrors `validating_webhook_timeout_error_contains_url_with_timeout_param` for the
     /// mutating webhook path (a separate call site in `invoke_mutating_webhook`, using the
-    /// same message format independently — see mayor-gelc). Without this test, fixing the
+    /// same message format independently). Without this test, fixing the
     /// validating-path wording while leaving the mutating-path wording stale would go
     /// unnoticed even though both are exercised by conformance (mutating webhooks run first).
     #[tokio::test]
@@ -4832,7 +4832,7 @@ mod tests {
 
     // -- webhook_match_conditions_pass unit tests --
     //
-    // Regression coverage for mayor-prtw: matchConditions were validated syntactically at
+    // Regression coverage: matchConditions were validated syntactically at
     // config-write time but never evaluated at invocation, so a webhook configured to skip
     // e.g. "skip-me" objects fired identically for every object. These tests exercise the
     // pure skip-decision helper directly (see also the run_mutating_webhooks /
@@ -4844,7 +4844,7 @@ mod tests {
 
     /// A matchCondition that evaluates to false must skip the webhook.
     ///
-    /// This is the exact scenario verified live in mayor-prtw: a webhook with
+    /// This is the exact scenario verified live: a webhook with
     /// `object.metadata.name != "skip-me"` must NOT fire for an object named "skip-me" — if it
     /// does, the webhook mutates/validates an object it was explicitly configured to exclude.
     #[test]
@@ -5174,7 +5174,7 @@ mod tests {
         );
     }
 
-    // -- apply_webhook_patch error branches (mayor-l3rh) --
+    // -- apply_webhook_patch error branches --
 
     /// apply_webhook_patch must return Err when the patch string is not valid base64.
     /// Webhooks that accidentally base64-encode garbage must be rejected immediately
@@ -5218,7 +5218,7 @@ mod tests {
         );
     }
 
-    // -- reinvocation pass tests (mayor-6jk5) --
+    // -- reinvocation pass tests --
 
     /// Start an axum router on a random local TCP port and return the base URL and handle.
     async fn start_mock_webhook_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -5796,7 +5796,7 @@ mod tests {
         }
     }
 
-    // -- Regression tests for mayor-jexr, mayor-h9ea, mayor-72qh --
+    // -- Regression tests for build_review's request.kind population --
 
     /// build_review must populate request.kind.kind from the object's "kind" field.
     ///
@@ -6243,7 +6243,7 @@ mod tests {
         );
     }
 
-    /// End-to-end (mayor-prtw): a mutating webhook with a matchCondition excluding
+    /// End-to-end: a mutating webhook with a matchCondition excluding
     /// name="skip-me" must be skipped, not invoked, for an object actually named "skip-me".
     ///
     /// This is the exact live-verified bug: matchConditions were checked syntactically at
@@ -6565,7 +6565,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // CEL-based MutatingAdmissionPolicy tests (mayor-iia9)
+    // CEL-based MutatingAdmissionPolicy tests
     // ---------------------------------------------------------------------------
 
     /// A stored MutatingAdmissionPolicy with a CEL ApplyConfiguration mutation
@@ -6990,7 +6990,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // CEL arithmetic overflow tests (mayor-wucf)
+    // CEL arithmetic overflow tests
     //
     // A VAP/MAP author can submit CEL expressions with overflowing integer arithmetic.
     // In Rust, integer overflow panics in debug mode and under overflow-checks=true
@@ -7189,7 +7189,7 @@ mod tests {
         );
     }
 
-    /// mayor-gelc regression: the conformance test asserts
+    /// Regression: the conformance test asserts
     /// `gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("compilation failed")))`
     /// on the rejection produced for this exact expression (see
     /// k8s.io/kubernetes test/e2e/apimachinery/webhook.go, `should reject {validating,mutating}
@@ -7212,7 +7212,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests for mayor-sz59: ValidatingAdmissionPolicy enforcement
+    // Regression tests: ValidatingAdmissionPolicy enforcement
     //
     // These tests verify that VAP + Binding pairs are enforced at admission time.
     // Without this fix, a conformance test creating a Deployment with even replicas
@@ -8787,7 +8787,7 @@ mod tests {
     /// A VAP expression using `namespaceObject.metadata.name` must resolve the actual
     /// Namespace object of the admitted resource and allow a request when it matches.
     ///
-    /// This is the regression test for mayor-kxht / the upstream conformance test
+    /// This is the regression test for the upstream conformance test
     /// `[sig-api-machinery] ValidatingAdmissionPolicy should validate against a Deployment`,
     /// which binds a policy to namespace `f.UniqueName` and validates
     /// `namespaceObject.metadata.name == f.UniqueName`. Before this fix, `namespaceObject`
@@ -9551,7 +9551,7 @@ mod tests {
         );
     }
 
-    // -- build_review oldObject tests (mayor-8qqp) --
+    // -- build_review oldObject tests --
 
     /// A validating webhook must receive a non-null request.oldObject on UPDATE.
     ///

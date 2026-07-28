@@ -2399,7 +2399,7 @@ mod tests {
 
 // ---------------------------------------------------------------------------
 // Admission regression tests — prove create_crd / replace_crd invoke the
-// admission webhook pipeline (mayor-8sn9).
+// admission webhook pipeline.
 //
 // Without the fix, these handlers bypassed admission entirely.
 // ---------------------------------------------------------------------------

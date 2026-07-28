@@ -4701,8 +4701,8 @@ mod tests {
 
     /// delete_collection_cr_namespaced must respect metadata.finalizers exactly like a single
     /// delete_cr_namespaced call: a CR with finalizers must be soft-deleted (deletionTimestamp
-    /// stamped, kept alive), never hard-deleted outright. mayor-njkk1 tracks the analogous gap
-    /// for BUILT-IN resources' DeleteCollection; this locks in that the new CR DeleteCollection
+    /// stamped, kept alive), never hard-deleted outright. The analogous gap for BUILT-IN
+    /// resources' DeleteCollection is tracked separately; this locks in that the new CR DeleteCollection
     /// path doesn't regress the guarantee single-object CR delete and the built-in
     /// DeleteCollection loop already provide.
     ///
@@ -7485,7 +7485,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression: RevisionMismatch must return 409, not 500 (mayor-5yfc)
+    // Regression: RevisionMismatch must return 409, not 500
     // ---------------------------------------------------------------------------
 
     // store_err_cr must map StoreError::RevisionMismatch to 409 Conflict.
@@ -7555,7 +7555,7 @@ mod tests {
         );
     }
 
-    // replace_cr_namespaced with a stale resourceVersion must return 409 Conflict (mayor-gg9u).
+    // replace_cr_namespaced with a stale resourceVersion must return 409 Conflict.
     // Optimistic concurrency control (OCC) protects against lost updates: if a client sends
     // a PUT with a resourceVersion that no longer matches the stored revision, the server
     // must reject the write with 409 rather than silently overwriting concurrent changes.
@@ -7627,7 +7627,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression: empty-group list response must not produce "/v1alpha1" apiVersion (mayor-q04t)
+    // Regression: empty-group list response must not produce "/v1alpha1" apiVersion
     // ---------------------------------------------------------------------------
 
     // build_list_response must produce apiVersion="v1alpha1" (not "/v1alpha1") when group="".
@@ -7910,7 +7910,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // call_conversion_webhook error paths (mayor-q402)
+    // call_conversion_webhook error paths
     // ---------------------------------------------------------------------------
 
     /// Start an axum router on a random local TCP port and return the base URL.
@@ -8080,7 +8080,7 @@ mod tests {
     /// across CR versions sends every non-matching item to the webhook in ONE call; if the
     /// webhook picks a non-JSON encoding for that response, u7s can't parse it and the whole
     /// LIST 500s with "conversion webhook response JSON parse error" — even though every
-    /// object was perfectly convertible. This is a live regression (mayor-11rsj): a v1 LIST
+    /// object was perfectly convertible. This is a live regression: a v1 LIST
     /// of CRs stored as v2 failed exactly this way. The mock below reproduces the real
     /// webhook's negotiation fork (JSON only on an explicit `application/json` Accept) so
     /// reverting the Accept header on the request re-triggers it here.
@@ -8214,7 +8214,7 @@ mod tests {
     /// `clientConfig.caBundle` — if the conversion client only trusted the cluster CA (the
     /// bug), the TLS handshake against every such webhook fails and CRD conversion is
     /// 100% non-functional for any real backend, exactly as seen in the
-    /// CustomResourceConversionWebhook conformance failures (mayor-hjcgj).
+    /// CustomResourceConversionWebhook conformance failures.
     #[tokio::test]
     async fn call_conversion_webhook_trusts_webhook_ca_bundle_over_cluster_ca() {
         use rcgen::generate_simple_self_signed;
@@ -8379,7 +8379,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // PartialObjectMetadata media type negotiation (mayor-ve5z)
+    // PartialObjectMetadata media type negotiation
     // ---------------------------------------------------------------------------
 
     /// wants_partial_object_metadata must detect the kcm metadatainformer Accept header.
@@ -8565,8 +8565,8 @@ mod tests {
         );
 
         // Use timeout_seconds=1 so the stream closes after 1s, allowing to_bytes to return
-        // with the ring-buffer events. The stream stays open (correct behavior per mayor-8tiu
-        // fix: _store_keepalive keeps the store alive), so we need a bounded timeout.
+        // with the ring-buffer events. The stream stays open (correct behavior: the store
+        // is kept alive for the stream's lifetime), so we need a bounded timeout.
         let query_with_timeout = super::super::generic::CollectionQuery {
             watch: Some(true),
             resource_version: Some(0),
@@ -8797,7 +8797,7 @@ mod tests {
     // ---------------------------------------------------------------------------
     // call_conversion_webhook clientConfig resolution — service-based and error paths
     //
-    // These exercise the shared admission::prepare_webhook_call path (mayor-hjcgj):
+    // These exercise the shared admission::prepare_webhook_call path:
     // conversion webhooks now resolve clientConfig exactly like admission webhooks —
     // no more bespoke store lookup for the `service` case.
     // ---------------------------------------------------------------------------
@@ -9141,7 +9141,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Tombstone + watch guard tests (P1: mayor-jiap)
+    // Tombstone + watch guard tests (P1)
     //
     // These tests encode the contract that prevents the conformance-killing hot-loop:
     //
@@ -9157,7 +9157,7 @@ mod tests {
     // empty watch stream (200 + BOOKMARK) so the informer parks at a valid RV instead.
     // ---------------------------------------------------------------------------
 
-    // REGRESSION TEST (P1 mayor-jiap): a watch+sendInitialEvents=true on a tombstoned
+    // REGRESSION TEST (P1): a watch+sendInitialEvents=true on a tombstoned
     // CRD group must return HTTP 200 (chunked watch stream with BOOKMARK), NOT 410.
     // If reverted, this test returns Err(410) → confirm the hot-loop regression is back.
     #[tokio::test]
@@ -9242,7 +9242,7 @@ mod tests {
         );
     }
 
-    // REGRESSION TEST (P1 mayor-jiap): same guard for the namespaced watch path.
+    // REGRESSION TEST (P1): same guard for the namespaced watch path.
     // Namespaced informers (e.g., argo CD watching per-namespace apps) hit list_cr_namespaced
     // — if this path still 410s on sendInitialEvents, they also hot-loop.
     #[tokio::test]
@@ -9788,7 +9788,7 @@ mod tests {
     /// A validating webhook with failurePolicy=Fail and an unreachable URL must
     /// deny CR deletion with an error, not silently allow it.
     ///
-    /// Regression test for mayor-w354: every DELETE handler in the apiserver skipped
+    /// Regression test: every DELETE handler in the apiserver skipped
     /// admission entirely, so a Fail-policy validating webhook registered on DELETE
     /// never received a request and the object was always removed regardless of the
     /// webhook's verdict. This is exactly the delete half of the conformance test
@@ -11297,7 +11297,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests for mayor-8phw: put_cr_status must CAS on the INCOMING
+    // Regression tests: put_cr_status must CAS on the INCOMING
     // body's metadata.resourceVersion, not the stored object's RV.
     // ---------------------------------------------------------------------------
 
@@ -11457,7 +11457,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression test for mayor-4xgf: non-storage-version CR writes must deliver
+    // Regression test: non-storage-version CR writes must deliver
     // watch events on the storage-version prefix (FieldValidation conformance tests).
     //
     // Root cause: create_cr/delete_cr used the REQUEST version in the store key, but
@@ -12245,7 +12245,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression test for mayor-4xgf (SSA upsert): apply-patch+yaml on a missing
+    // Regression test (SSA upsert): apply-patch+yaml on a missing
     // cluster-scoped CR must CREATE it (201), not return 404.
     //
     // Root cause: patch_cr returned 404 for objects not yet in the store even when
@@ -12358,7 +12358,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // CR fieldValidation regression tests (mayor-ago8)
+    // CR fieldValidation regression tests
     //
     // Root cause: resource.rs routes any CR request to cr.rs BEFORE its own
     // apply_field_validation runs, and cr.rs never checked ?fieldValidation= at all — so
@@ -12745,7 +12745,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // CR structural-schema pruning (mayor-w1p59)
+    // CR structural-schema pruning
     //
     // Root cause: cr.rs never pruned CR data against the CRD's structural schema at all —
     // `apply_cr_field_validation` only DETECTED unknown fields for ?fieldValidation=

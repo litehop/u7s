@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: webhook client CA pinning (mayor-h0n2)
+    // Regression tests: webhook client CA pinning
     //
     // These tests verify that build_webhook_client correctly constructs a pinned
     // reqwest::Client. The security property under test: a user with webhook RBAC
@@ -1511,7 +1511,7 @@ mod tests {
 
     /// build_webhook_client returns Err when given invalid CA DER bytes.
     ///
-    /// Security regression test (mayor-ca6p): before the fix, a corrupt or replaced
+    /// Security regression test: before the fix, a corrupt or replaced
     /// ca.crt caused Certificate::from_der to fail silently, and the webhook client
     /// fell back to the system/Mozilla CA trust store. That allowed an attacker with
     /// webhook RBAC to register a webhook pointing to any system-trusted HTTPS server

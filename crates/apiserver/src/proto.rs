@@ -650,8 +650,8 @@ pub fn decode_proto_by_kind_and_version(
 //     Info field 2 = description (string)  [version is field 6]
 // Definitions (field 14 in gnostic proto) is omitted — an empty/absent
 // definitions map is valid; kubectl skips schema validation for types it
-// has no definition for. Encoding CRD definitions in proto is deferred to
-// mayor-52wo (embedding upstream OpenAPI v2 schema).
+// has no definition for. Encoding CRD definitions in proto is deferred
+// (would require embedding upstream OpenAPI v2 schema).
 
 fn gnostic_varint(mut v: u64) -> Vec<u8> {
     let mut out = Vec::new();
@@ -2731,7 +2731,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-cux: encode_proto_response must produce a valid Kubernetes
+    /// Regression test: encode_proto_response must produce a valid Kubernetes
     /// protobuf envelope for a realistic Namespace JSON with name, uid, resourceVersion,
     /// creationTimestamp, and labels — the exact fields present in a real `kubectl create
     /// namespace smoke-test` response.
@@ -2833,7 +2833,7 @@ mod tests {
         assert!(recovered["metadata"]["creationTimestamp"].is_null());
     }
 
-    /// Regression test for mayor-ajtd: encode_proto_response must produce a valid Kubernetes
+    /// Regression test: encode_proto_response must produce a valid Kubernetes
     /// protobuf envelope for a realistic Node JSON with status conditions and addresses —
     /// the exact response shape the kubelet receives when reading its own node status.
     ///
@@ -3073,16 +3073,16 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-z7v0 and mayor-ttx3: MicroTime with seconds = -1 must
+    /// Regression test: MicroTime with seconds = -1 must
     /// decode to the real pre-1970 date (1969-12-31T23:59:59Z), not year 584554049254
     /// ("584554049254-11-09T...") and not be dropped entirely.
     ///
-    /// Original root cause (mayor-z7v0): `t.seconds as u64` for negative i64 wraps to a huge
+    /// Original root cause: `t.seconds as u64` for negative i64 wraps to a huge
     /// u64 value (e.g. -1_i64 as u64 = u64::MAX ≈ 1.845×10^19), which `secs_to_rfc3339` then
     /// rendered as year ~584554049254. The interim fix dropped any non-positive seconds
     /// instead — but negative Unix seconds are a legitimate pre-1970 date (Lease conformance
     /// uses Go's zero-value time.Time{}, which is year 0001), so dropping them made every
-    /// pre-1970 Lease acquire/renew time look never-acquired. mayor-ttx3 fixed the root cause:
+    /// pre-1970 Lease acquire/renew time look never-acquired. The follow-up fix addressed the root cause:
     /// `secs_to_rfc3339`/`secs_nanos_to_rfc3339_micro` now take `i64` and use
     /// `div_euclid`/`rem_euclid` so negative seconds decode to the correct calendar date.
     ///
@@ -3538,7 +3538,7 @@ mod tests {
     /// decode_core_proto_by_kind must dispatch ClusterRole proto to the correct decoder and
     /// extract metadata, rules (with apiGroups, resources, verbs).
     ///
-    /// This is the PRIMARY regression guard for mayor-hww0: kubectl create clusterrole sends
+    /// This is the PRIMARY regression guard: kubectl create clusterrole sends
     /// a proto-encoded ClusterRole in Unknown.raw with empty contentType. Previously,
     /// decode_core_proto_by_kind returned None for "ClusterRole", so extract_body fell through
     /// to JSON parsing and failed with "invalid JSON: expected value at line 1 column 1".
@@ -3900,7 +3900,7 @@ mod tests {
     /// `kubectl create token sonobuoy-serviceaccount -n sonobuoy --audience=https://kubernetes.default.svc.cluster.local`
     /// invocation (72 bytes, after stripping the outer k8s envelope).
     ///
-    /// This is the primary regression guard for mayor-hy77: kubectl 1.31+ sends a native
+    /// This is the primary regression guard: kubectl 1.31+ sends a native
     /// protobuf TokenRequest body that the handler was previously trying to parse as JSON,
     /// producing "invalid JSON: expected value at line 1 column 1".
     #[test]
@@ -3934,7 +3934,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-2qq8: decode_token_request must correctly decode a
+    /// Regression test: decode_token_request must correctly decode a
     /// TokenRequest with both expirationSeconds and a non-default audience, as sent by
     /// kubectl 1.31+ with explicit flags.
     ///
@@ -3979,7 +3979,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-c9o3: expirationSeconds is at field 4 in the canonical
+    /// Regression test: expirationSeconds is at field 4 in the canonical
     /// k8s TokenRequestSpec proto, not field 2. If our prost tag is wrong (e.g. tag=2),
     /// decoding real k8s client bytes will always yield expiration_seconds=0 (default),
     /// so every token request uses the server default TTL regardless of what was asked.
@@ -4040,7 +4040,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// decode_core_proto_by_kind must dispatch CronJob proto and extract metadata and
-    /// spec.schedule. This is the primary regression guard for mayor-50f3: the e2e CronJob
+    /// spec.schedule. This is the primary regression guard: the e2e CronJob
     /// conformance test sends CronJob objects with Content-Type: application/vnd.kubernetes.protobuf.
     /// Without this decoder, decode_core_proto_by_kind returns None for "CronJob", extract_body
     /// returns raw proto bytes, Object::from_bytes fails with "expected value at line 1 column 1",
@@ -4103,7 +4103,7 @@ mod tests {
     }
 
     /// decode_cronjob_proto must handle a kubectl wire-format body where JobSpec.template is
-    /// at proto field 6 (LEN wire type). Before mayor-w00n, JobSpec had `template` at tag=5 and
+    /// at proto field 6 (LEN wire type). Before the fix, JobSpec had `template` at tag=5 and
     /// `backoffLimit` at tag=6. kubectl encodes `template` as field 6 (LEN), so prost saw
     /// field 6 as wire type 2 when the struct expected wire type 0 (int32 backoffLimit),
     /// causing CronJob::decode to return Err, decode_cronjob_proto to return None,
@@ -4166,7 +4166,7 @@ mod tests {
 
         let result = crate::batch_gen_adapter::decode_cronjob_proto_gen(&buf).expect(
             "decode_cronjob_proto must return Some when JobSpec.template is at field 6 \
-                     (LEN wire type) — before mayor-w00n fix, JobSpec had template at tag=5 \
+                     (LEN wire type) — before the fix, JobSpec had template at tag=5 \
                      causing a wire-type mismatch when kubectl sends template at field 6, \
                      making CronJob::decode return Err and the apiserver return HTTP 400",
         );
@@ -6299,7 +6299,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests — field tag correctness (mayor-52cj)
+    // Regression tests — field tag correctness
     // These tests encode a value at the CORRECT wire tag and verify it appears in
     // the decoded JSON. If a tag is wrong, prost silently ignores the field and the
     // asserted JSON key will be absent, causing the test to fail.

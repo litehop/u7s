@@ -802,7 +802,7 @@ async fn cascade_delete_namespace_resources<S: Store>(
 /// orphaned forever: it has no namespace left to ever re-drain it, and — if it was still
 /// Pending/unscheduled — it silently blocks anything that requires every pod cluster-wide
 /// to be scheduled, e.g. the SchedulerPredicates/SchedulerPreemption conformance suite's
-/// "wait for stable cluster" precondition (bd mayor-35zvy).
+/// "wait for stable cluster" precondition.
 ///
 /// Returns `true` if the namespace must stay Terminating (a finalizer'd object needs its
 /// controller to act, or resources kept reappearing after the retry budget ran out) and
@@ -998,7 +998,7 @@ pub(crate) async fn delete_namespace<S: Store>(
         // Persist status.phase=Terminating to the store. create_namespaced_resource's
         // Terminating gate reads this stored value, so a racing controller create is
         // rejected the instant this write lands — before the real namespace controller
-        // (or anything else) does any further work (bd mayor-74j3.6).
+        // (or anything else) does any further work.
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -3546,7 +3546,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Regression: PUT /status with Content-Type: application/vnd.kubernetes.protobuf
-    // must persist status.conditions (mayor-ftkl PANIC-1)
+    // must persist status.conditions (PANIC-1)
     // -----------------------------------------------------------------------
 
     /// Build a protobuf varint (LEB128) encoding of v.
@@ -3628,7 +3628,7 @@ mod tests {
     // JSON, so it never exercised proto decoding and could not have caught this. But the
     // real "should apply changes to a namespace status" e2e test's typed clientset
     // defaults to protobuf (see build_namespace_status_put_proto_envelope's doc comment),
-    // so that is the content type the conformance run actually hits. Before mayor-oww6's
+    // so that is the content type the conformance run actually hits. Before the
     // fix to decode_namespace_proto_gen, this decoder never read `ns.status` at all, so a
     // protobuf-encoded PUT /status silently stored an empty status; the e2e client then
     // read back an empty Conditions slice and panicked with "index out of range [-1]"
@@ -3878,7 +3878,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-8tiu: `GET /api/v1/namespaces?watch=true` with no
+    /// Regression test: `GET /api/v1/namespaces?watch=true` with no
     /// sendInitialEvents and an empty namespace store must stay open for the requested
     /// timeoutSeconds, not close immediately with 0 bytes.
     ///
@@ -3953,7 +3953,7 @@ mod tests {
             "namespace watch with timeoutSeconds=1 must stay open for at least 900ms; \
              if it closes immediately ({}ms), the broadcast tx was dropped when the handler's \
              AppState was destroyed — the _store_keepalive fix in watch_generic is needed to \
-             keep the store alive for the stream's lifetime (mayor-8tiu)",
+             keep the store alive for the stream's lifetime",
             elapsed.as_millis()
         );
     }
@@ -4288,7 +4288,7 @@ mod tests {
     /// is nothing left to ever re-drain it — if it was never scheduled, it silently blocks
     /// anything that requires every pod cluster-wide to have a node (the mechanism behind
     /// the SchedulerPredicates/SchedulerPreemption conformance suite's "wait for stable
-    /// cluster" timeout on leftover pods from unrelated namespaces; bd mayor-35zvy).
+    /// cluster" timeout on leftover pods from unrelated namespaces).
     ///
     /// delete_namespace no longer calls this cascade for "kubernetes"-finalized namespaces
     /// (the real KCM namespace-controller owns that drain now), but it still calls it — and
@@ -4487,7 +4487,7 @@ mod status_tests {
 
 // ---------------------------------------------------------------------------
 // Admission regression tests — prove create_namespace invokes the
-// admission webhook pipeline (mayor-8sn9).
+// admission webhook pipeline.
 //
 // Without the fix, create_namespace bypassed admission entirely; admission-based
 // controls on namespaces were non-functional.
@@ -4794,7 +4794,7 @@ mod admission_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Regression tests for mayor-8phw: put_namespace_status must CAS on the
+// Regression tests: put_namespace_status must CAS on the
 // INCOMING body's resourceVersion, not the stored object's RV.
 // ---------------------------------------------------------------------------
 

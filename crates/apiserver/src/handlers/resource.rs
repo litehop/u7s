@@ -6554,7 +6554,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-3cgu): collection DELETE on RBAC resources must NOT remove
+    /// Regression test: collection DELETE on RBAC resources must NOT remove
     /// bootstrap objects (system:masters, cluster-admin, system:node, etc.).
     ///
     /// sonobuoy delete --all issues DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings
@@ -8564,7 +8564,7 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
-    // -- resource.rs CRUD handler error mappings (mayor-96nx) --
+    // -- resource.rs CRUD handler error mappings --
 
     /// patch_resource with an unsupported content-type (e.g. application/json) must
     /// return 415 Unsupported Media Type. Clients that accidentally use the wrong
@@ -8733,7 +8733,7 @@ mod tests {
         assert_eq!(containers.len(), 2, "SMP must merge containers by name");
     }
 
-    // -- PartialObjectMetadata (POM) watch support for built-in resources (mayor-by0r) --
+    // -- PartialObjectMetadata (POM) watch support for built-in resources --
     //
     // The kube-controller-manager's garbage collector uses metadatainformer, which opens
     // watches on ALL resource types with Accept: ...as=PartialObjectMetadata... .
@@ -9729,7 +9729,7 @@ mod tests {
         assert!(
             wants_partial_object_metadata(gc_accept),
             "GC's Accept header must be detected as POM; if not, GC informers get wrong \
-             apiVersion/kind and can never sync (mayor-by0r)"
+             apiVersion/kind and can never sync"
         );
 
         // Non-POM accept must return false.
@@ -10022,7 +10022,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // ClusterIP auto-allocation regression tests (mayor-pzkt)
+    // ClusterIP auto-allocation regression tests
     //
     // These tests verify that POST /api/v1/namespaces/{ns}/services with an
     // allocator configured returns a Service with .spec.clusterIP populated.
@@ -10256,7 +10256,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // fieldValidation query param regression (mayor-hww0)
+    // fieldValidation query param regression
     // ---------------------------------------------------------------------------
 
     /// create_resource with a valid ClusterRole body must return 201.
@@ -10749,7 +10749,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-2cwk): patching a ConfigMap must emit a MODIFIED watch event
+    /// Regression test: patching a ConfigMap must emit a MODIFIED watch event
     /// with the updated data (missing the deleted key).
     ///
     /// Symptom: after patching a ConfigMap to remove a key, the kubelet's projected volume
@@ -10850,7 +10850,7 @@ mod tests {
         //    timeout_seconds=1 closes the stream after 1s so to_bytes can return with data.
         //    (Previously this relied on watch_state being the only store Arc so the broadcast
         //    channel would close when watch_generic dropped it — that shortcut was fixed by
-        //    the mayor-8tiu _store_keepalive fix which keeps the store alive for the stream.)
+        //    the store-keepalive fix which keeps the store alive for the stream.)
         let resp = super::watch_generic(
             watch_state,
             super::WatchConfig {
@@ -10967,7 +10967,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-bdsj): GET on a stored namespaced object must return
+    /// Regression test: GET on a stored namespaced object must return
     /// metadata.resourceVersion that is non-empty and non-zero.
     ///
     /// Why this matters: KCM's root CA publisher controller reads kube-root-ca.crt
@@ -11033,13 +11033,13 @@ mod tests {
             !rv.is_empty(),
             "GET response must include metadata.resourceVersion — an absent field causes KCM's \
              root CA publisher to treat resourceVersion as 0 and loop forever on PUT \
-             precondition failures (mayor-bdsj)"
+             precondition failures"
         );
         assert_ne!(
             rv, "0",
             "GET response must not return metadata.resourceVersion=\"0\" — store must stamp the \
              actual revision (>= 1); returning 0 makes KCM's PUT fail with revision mismatch \
-             (mayor-bdsj: root CA publisher loops on 'expected N, current 0')"
+             (root CA publisher loops on 'expected N, current 0')"
         );
         let rv_int: u64 = rv.parse().unwrap_or_else(|_| {
             panic!("metadata.resourceVersion must be a decimal integer string; got: {rv:?}")
@@ -11047,7 +11047,7 @@ mod tests {
         assert!(
             rv_int > 0,
             "metadata.resourceVersion must be > 0 after first write; got: {rv_int} \
-             (mayor-bdsj: store counter starts at 1)"
+             (store counter starts at 1)"
         );
     }
 
@@ -11129,7 +11129,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: selector defaulting for Deployment/RS/StatefulSet (mayor-2fja)
+    // Regression tests: selector defaulting for Deployment/RS/StatefulSet
     // ---------------------------------------------------------------------------
 
     /// POST a Deployment without spec.selector returns 201 and spec.selector is
@@ -11362,7 +11362,7 @@ mod tests {
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "Deployment with no selector and no template labels must return 422 — \
              the real kube-apiserver returns 422 Invalid for this case; returning 400 or 500 \
-             breaks the AdmissionWebhook conformance test's BeforeEach (mayor-p807)"
+             breaks the AdmissionWebhook conformance test's BeforeEach"
         );
     }
 
@@ -11565,7 +11565,7 @@ mod tests {
         );
     }
 
-    // -- expired continue token returns 410 Gone (mayor-snp5) --
+    // -- expired continue token returns 410 Gone --
 
     /// Build a continue token payload signed with the given 32-byte key and the given
     /// issued-at timestamp.  Mirrors the format of `encode_continue` in generic.rs so
@@ -11755,7 +11755,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-9ejz): expired continue token must include `metadata.continue`
+    /// Regression test: expired continue token must include `metadata.continue`
     /// in the 410 response so clients can restart pagination from the beginning.
     ///
     /// Kubernetes conformance test chunking.go:202 (step 3 → 4):
@@ -12003,7 +12003,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-quqc): PATCHing Event series.lastObservedTime must persist and
+    /// Regression test: PATCHing Event series.lastObservedTime must persist and
     /// be normalized to microsecond precision on GET.
     ///
     /// The Kubernetes Event controller uses merge-patch to update series.count and
@@ -12131,7 +12131,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests: fieldValidation=Strict/Warn/Ignore (mayor-7exg)
+    // Regression tests: fieldValidation=Strict/Warn/Ignore
     // ---------------------------------------------------------------------------
 
     /// POST with an unknown top-level field and ?fieldValidation=Strict must return
@@ -12413,7 +12413,7 @@ mod tests {
         );
     }
 
-    // -- Regression: ResourceSlice create response must include kind and apiVersion (mayor-lf0w) --
+    // -- Regression: ResourceSlice create response must include kind and apiVersion --
 
     /// The Kubernetes API contract requires every response object to include TypeMeta
     /// (kind + apiVersion). client-go (and the DRA conformance test) call create and then
@@ -12482,7 +12482,7 @@ mod tests {
         assert_eq!(
             v["kind"], "ResourceSlice",
             "response must have kind=ResourceSlice — client-go asserts this and returns \
-             'Object Kind is missing' when absent (DRA conformance test mayor-lf0w)"
+             'Object Kind is missing' when absent (DRA conformance test)"
         );
         assert_eq!(
             v["apiVersion"], "resource.k8s.io/v1",
@@ -12554,7 +12554,7 @@ mod tests {
         );
     }
 
-    // -- Regression: KCM deployment controller revision annotation (mayor-ufa4) --
+    // -- Regression: KCM deployment controller revision annotation --
 
     /// KCM annotates the Deployment with `deployment.kubernetes.io/revision=1` after
     /// creating the initial ReplicaSet. It uses a strategic-merge-patch body that contains
@@ -12711,7 +12711,7 @@ mod tests {
         );
     }
 
-    // -- Regression: KCM 1.36 RS create propagates revision to Deployment (mayor-tt5j) --
+    // -- Regression: KCM 1.36 RS create propagates revision to Deployment --
 
     /// KCM 1.36 sets `deployment.kubernetes.io/revision=1` on the ReplicaSet body before
     /// POSTing it (in-memory, as part of the creation body), but does NOT subsequently
@@ -12960,7 +12960,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Status preservation on PUT (mayor-pv04)
+    // Status preservation on PUT
     // -----------------------------------------------------------------------
 
     /// PUT (full replace) on a StatefulSet must preserve the current stored status.
@@ -12972,7 +12972,7 @@ mod tests {
     /// Without this fix, after `kubectl apply`, status.replicas resets to 0 or
     /// disappears. The KCM statefulset controller then must re-update status from
     /// scratch, but if there are concurrent OCC conflicts it may never converge
-    /// — causing AfterEach to poll status.replicas==0 for 10 minutes (mayor-pv04).
+    /// — causing AfterEach to poll status.replicas==0 for 10 minutes.
     ///
     /// This test fails if the status restoration is removed from
     /// replace_namespaced_resource.
@@ -13068,7 +13068,7 @@ mod tests {
         assert_eq!(
             v["status"]["replicas"], 3,
             "status.replicas must be preserved after full PUT — the KCM writes \
-             status via /status; a spec-only PUT must not wipe it out (mayor-pv04)"
+             status via /status; a spec-only PUT must not wipe it out"
         );
         assert_eq!(
             v["status"]["readyReplicas"], 3,
@@ -13721,7 +13721,7 @@ mod tests {
         );
     }
 
-    // -- Regression: EndpointSlice mirroring blocked by last-change-trigger-time (mayor-tjtl) --
+    // -- Regression: EndpointSlice mirroring blocked by last-change-trigger-time --
 
     /// PUT on an Endpoints object must clear `endpoints.kubernetes.io/last-change-trigger-time`.
     ///
@@ -14840,7 +14840,7 @@ mod tests {
         );
     }
 
-    // -- ownerReferences preserved through create ObjectMeta round-trip (mayor-2f5a) --
+    // -- ownerReferences preserved through create ObjectMeta round-trip --
 
     /// create_namespaced_resource must persist ownerReferences from the incoming body.
     ///
@@ -14944,7 +14944,7 @@ mod tests {
         let _ = result;
     }
 
-    // -- CronJob cascade (mayor-2f5a) --
+    // -- CronJob cascade --
 
     /// Deleting a CronJob must cascade-delete owned Jobs AND their pods, or the GC conformance
     /// spec "should delete jobs and pods created by cronjob" will time out polling for 0 jobs
@@ -15383,7 +15383,6 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Lease acquireTime/renewTime must be persisted and returned on GET
-    // (mayor-tiqt)
     // ---------------------------------------------------------------------------
 
     /// A Lease created with spec.acquireTime and spec.renewTime must return
@@ -15545,7 +15544,6 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Service ExternalName→ClusterIP type transition must allocate a clusterIP
-    // (mayor-qofd)
     // ---------------------------------------------------------------------------
 
     /// Changing a Service from ExternalName to ClusterIP via PUT must result in a
@@ -16397,7 +16395,7 @@ mod tests {
     /// A validating webhook with failurePolicy=Fail and an unreachable URL must deny a
     /// namespaced deletecollection, not just single-object DELETE.
     ///
-    /// Regression test for mayor-07he: mayor-w354 (PR #700) wired admission into the
+    /// Regression test: PR #700 wired admission into the
     /// single-delete handlers but explicitly deferred deletecollection, so
     /// `kubectl delete configmaps --all` bypassed a Fail-policy validating webhook that
     /// would have blocked each object individually — a webhook must be able to deny a

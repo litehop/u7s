@@ -534,7 +534,7 @@ pub async fn pod_attach<S: Store>(
 /// extractor rejects any non-GET method before the handler body runs — so the
 /// fallback request never reached `resolve_attach_target`/admission a second time,
 /// and the client's terminal error was axum's generic "Request method must be
-/// `GET`" instead of the webhook's denial message (mayor-u6eb).
+/// `GET`" instead of the webhook's denial message.
 ///
 /// Run the same pre-upgrade checks here so the fallback surfaces the same Status
 /// (denial, not-found, not-scheduled, ...) that the GET attempt already computed.
@@ -975,7 +975,7 @@ pub async fn pod_exec<S: Store>(
 /// extractor rejects any non-GET method before the handler body runs — so the
 /// fallback request never reached `resolve_exec_target`/admission a second time,
 /// and the client's terminal error was axum's generic "Request method must be
-/// `GET`" instead of the webhook's denial message (mayor-c7r3).
+/// `GET`" instead of the webhook's denial message.
 ///
 /// Run the same pre-upgrade checks here so the fallback surfaces the same Status
 /// (denial, not-found, not-scheduled, ...) that the GET attempt already computed.
@@ -4977,7 +4977,7 @@ mod tests {
     // would cause GET to appear instead.
     //
     // IMPLEMENTATION NOTE: because the tunnel function requires mTLS (build_kubelet_tls_config),
-    // the network-level test is the live VM repro (see bead mayor-n124). The unit test
+    // the network-level test is the live VM repro. The unit test
     // below validates the CONNECT request string construction independently.
     // -----------------------------------------------------------------------
 

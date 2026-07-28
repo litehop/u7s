@@ -1399,7 +1399,7 @@ mod tests {
         );
     }
 
-    // --- Regression tests for nested list SMP merge (mayor-4c81) ---
+    // --- Regression tests for nested list SMP merge ---
     // These tests must FAIL if the path-threading fix is reverted (i.e. if
     // strategic_merge_array is called with "" instead of the array's path).
 
@@ -2548,7 +2548,7 @@ mod tests {
     /// spec/status wrapper (webhooks is a bare top-level field, same shape as
     /// ServiceAccount.secrets above).
     ///
-    /// This is the exact repro from a real user-facing bug (mayor-t4opz): `kubectl create` a
+    /// This is the exact repro from a real user-facing bug: `kubectl create` a
     /// ValidatingWebhookConfiguration, then `kubectl apply` the same object again with only
     /// rules[].resources changed. Without this entry, "webhooks" falls through to Unknown
     /// (whole-array replace using whatever the second apply's computed patch happens to

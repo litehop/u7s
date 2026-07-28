@@ -1689,7 +1689,7 @@ mod tests {
         );
     }
 
-    // -- mayor-ofi: json-patch 'add' must create intermediate objects --
+    // -- json-patch 'add' must create intermediate objects --
 
     /// RFC 6902 §4.1: 'add' must create missing intermediate objects.
     #[test]
@@ -3110,7 +3110,7 @@ mod escalation_tests {
     }
 }
 
-// -- CollectionQuery serde deserialization (mayor-utbu regression) --
+// -- CollectionQuery serde deserialization regression --
 //
 // Kubernetes client-go sends camelCase query parameters: labelSelector, resourceVersion.
 // Without the correct #[serde(rename)] attributes, these are silently ignored, causing
@@ -3128,7 +3128,7 @@ mod collection_query_rename_tests {
     /// when clients send `?labelSelector=X` (Kubernetes standard camelCase param).
     /// This causes LIST to return all objects regardless of label, breaking sonobuoy's
     /// post-delete wait loop: it lists all CRBs (including protected system: ones),
-    /// tries to delete them, gets 403, and loops forever (mayor-utbu).
+    /// tries to delete them, gets 403, and loops forever.
     #[test]
     fn label_selector_camel_case_field_is_deserialized() {
         // serde #[rename] applies to all formats; JSON is the simplest to test without
@@ -3141,7 +3141,7 @@ mod collection_query_rename_tests {
             Some("component=sonobuoy"),
             "labelSelector must populate label_selector; \
              without #[serde(rename = \"labelSelector\")] the HTTP query param is silently \
-             ignored and all objects are returned regardless of label (mayor-utbu)"
+             ignored and all objects are returned regardless of label"
         );
     }
 
@@ -3256,7 +3256,7 @@ mod apply_delete_policy_tests {
     ///
     /// The upstream KCM namespace controller only begins its drain cycle when it observes
     /// status.phase == "Terminating" on the watch event. Without this field the KCM never
-    /// removes the kubernetes finalizer and the namespace hangs forever (mayor-qyfg).
+    /// removes the kubernetes finalizer and the namespace hangs forever.
     #[test]
     fn namespace_with_finalizers_gets_terminating_phase() {
         let mut obj = make_obj("Namespace", &["kubernetes"]);
@@ -3267,7 +3267,7 @@ mod apply_delete_policy_tests {
             body["status"]["phase"].as_str(),
             Some("Terminating"),
             "status.phase must be \"Terminating\" so KCM starts the drain cycle; \
-             without it the namespace hangs forever (mayor-qyfg)"
+             without it the namespace hangs forever"
         );
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),
@@ -3287,7 +3287,7 @@ mod apply_delete_policy_tests {
         assert!(
             body["status"]["phase"].is_null(),
             "status.phase must NOT be set on non-Namespace objects; \
-             only Namespaces need this field to trigger KCM drain (mayor-qyfg)"
+             only Namespaces need this field to trigger KCM drain"
         );
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),

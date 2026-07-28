@@ -1398,7 +1398,7 @@ mod tests {
         );
     }
 
-    // --- ServiceAccount subject matching (mayor-41y9) ---
+    // --- ServiceAccount subject matching ---
 
     fn make_cluster_binding_sa(
         name: &str,
@@ -1418,7 +1418,7 @@ mod tests {
         (key, val)
     }
 
-    // --- enumerate_rules namespace binding path + RoleBinding→ClusterRole (mayor-qftq) ---
+    // --- enumerate_rules namespace binding path + RoleBinding→ClusterRole ---
 
     #[test]
     fn enumerate_rules_rolebinding_appears_in_bound_namespace_only() {
@@ -1744,7 +1744,7 @@ mod tests {
         );
     }
 
-    // --- nonResourceURLs matching (mayor-9sil) ---
+    // --- nonResourceURLs matching ---
 
     fn non_resource_req<'a>(
         username: &'a str,
@@ -1932,7 +1932,7 @@ mod tests {
         );
     }
 
-    // --- Regression: RoleBinding namespace from key path (mayor-k8z4) ---
+    // --- Regression: RoleBinding namespace from key path ---
 
     #[test]
     fn rwlock_poison_recovery_uses_into_inner() {
@@ -1992,7 +1992,7 @@ mod tests {
         // If apply_object fails to extract the namespace from the key, binding.namespace
         // stays None, and is_allowed never matches it against any request namespace,
         // causing a SubjectAccessReview for a bound ServiceAccount to return allowed=false.
-        // This is the exact failure mode from the conformance test (mayor-k8z4).
+        // This is the exact failure mode from the conformance test.
         let idx = RbacIndex::new();
 
         // Role in "test-ns" (namespace comes from key path — the helper puts it in the key).

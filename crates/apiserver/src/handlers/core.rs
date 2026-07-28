@@ -500,7 +500,7 @@ mod tests {
     use std::sync::Arc;
     use u7s_store::{SqliteStore, Store};
 
-    /// Regression test for mayor-8qcs: the cluster-wide pod watch with sendInitialEvents=true
+    /// Regression test: the cluster-wide pod watch with sendInitialEvents=true
     /// and fieldSelector=spec.nodeName=<node> must only return pods assigned to that node in the
     /// initial ADDED events snapshot.
     ///
@@ -574,7 +574,7 @@ mod tests {
             1,
             "initial sendInitialEvents snapshot for fieldSelector=spec.nodeName=lima-node \
              must contain only pods on lima-node; without field-selector filtering, kubelet \
-             receives ADDED events for pods on other nodes (mayor-8qcs regression). \
+             receives ADDED events for pods on other nodes (regression). \
              Got: {:?}",
             pods
         );
@@ -588,7 +588,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-zcnd: the cluster-wide pod watch with sendInitialEvents=true
+    /// Regression test: the cluster-wide pod watch with sendInitialEvents=true
     /// and a labelSelector must only return matching pods in the initial ADDED events snapshot.
     ///
     /// Before this fix, core_list_resource applied field_selector but NOT label_selector to
@@ -660,7 +660,7 @@ mod tests {
             .filter_map(|o| serde_json::from_slice(&o.value).ok())
             .collect();
 
-        // This is the exact retain logic added by the mayor-zcnd fix.
+        // This is the exact retain logic added by the label-selector fix.
         pods.retain(|pod| {
             crate::handlers::watch::object_matches_label_selector(pod, label_selector_str)
         });
@@ -671,7 +671,7 @@ mod tests {
             "cluster-wide pod watch sendInitialEvents with labelSelector=app=ss,controller-uid=abc123 \
              must return only ss-0 across all namespaces; without label_selector filtering the \
              StatefulSet controller informer cache is polluted with pods from other StatefulSets \
-             (mayor-zcnd regression). Got: {:?}",
+             (regression). Got: {:?}",
             pods
         );
         assert_eq!(

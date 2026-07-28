@@ -1638,7 +1638,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-fvkg: PATCH resourcequotas/status updates status.used
+    /// Regression test: PATCH resourcequotas/status updates status.used
     /// but must not touch spec.hard.
     ///
     /// The KCM's resourcequota controller patches this endpoint to record how many objects
@@ -1715,7 +1715,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-2z1k: PATCH/PUT poddisruptionbudgets/status must persist
+    /// Regression test: PATCH/PUT poddisruptionbudgets/status must persist
     /// status.disruptedPods so the DisruptionController conformance test passes.
     ///
     /// The spec '[sig-apps] DisruptionController should update/patch PodDisruptionBudget status'
@@ -2151,7 +2151,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-k7t4: PATCH /status on a ValidatingAdmissionPolicy must return
+    /// Regression test: PATCH /status on a ValidatingAdmissionPolicy must return
     /// exactly what the client sent in the patch, not a hardcoded Ready condition injected by
     /// write_vap_status.
     ///
@@ -2800,7 +2800,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // PVC status.conditions must be persisted via /status subresource (mayor-r83x)
+    // PVC status.conditions must be persisted via /status subresource
     // ---------------------------------------------------------------------------
 
     /// PATCH /pvc/status with conditions must persist the conditions so they are
@@ -3011,7 +3011,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression tests for mayor-8phw: subresource PUT CAS must use the INCOMING
+    // Regression tests: subresource PUT CAS must use the INCOMING
     // body's resourceVersion, not the stored object's.  Without this fix, a writer
     // holding a stale RV can overwrite a newer write (concurrent clobber) instead
     // of receiving 409 Conflict and retrying from a fresh GET.
