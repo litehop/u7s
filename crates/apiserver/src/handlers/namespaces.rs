@@ -55,7 +55,7 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
     }
 }
 
-pub async fn list_namespaces<S: Store>(
+pub(crate) async fn list_namespaces<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<super::generic::CollectionQuery>,
     Extension(user): Extension<UserInfo>,
@@ -115,7 +115,7 @@ pub async fn list_namespaces<S: Store>(
     Ok(Json(body).into_response())
 }
 
-pub async fn create_namespace<S: Store>(
+pub(crate) async fn create_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -319,7 +319,7 @@ pub async fn create_namespace<S: Store>(
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
-pub async fn get_namespace<S: Store>(
+pub(crate) async fn get_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -339,7 +339,7 @@ pub async fn get_namespace<S: Store>(
         .into_response())
 }
 
-pub async fn replace_namespace<S: Store>(
+pub(crate) async fn replace_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
@@ -504,7 +504,7 @@ pub(crate) async fn patch_namespace<S: Store>(
 /// full PUT, this endpoint only updates spec.finalizers (stored as
 /// metadata.finalizers). If deletionTimestamp is set and finalizers are now
 /// empty, the namespace is hard-deleted.
-pub async fn finalize_namespace<S: Store>(
+pub(crate) async fn finalize_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
@@ -591,7 +591,7 @@ pub async fn finalize_namespace<S: Store>(
 /// GET /api/v1/namespaces/{name}/status
 ///
 /// Returns the full namespace object. Status is embedded, not a separate subresource store.
-pub async fn get_namespace_status<S: Store>(
+pub(crate) async fn get_namespace_status<S: Store>(
     state: State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -602,7 +602,7 @@ pub async fn get_namespace_status<S: Store>(
 ///
 /// Replaces only the status field of a namespace. The KCM namespace controller calls this
 /// to set status.conditions (e.g. NamespaceDeletionContentFailure) during namespace deletion.
-pub async fn put_namespace_status<S: Store>(
+pub(crate) async fn put_namespace_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
@@ -653,7 +653,7 @@ pub async fn put_namespace_status<S: Store>(
 ///
 /// Patches only the status field of a namespace. Supports merge-patch, strategic-merge-patch,
 /// and json-patch. The KCM namespace controller uses strategic-merge-patch to update conditions.
-pub async fn patch_namespace_status<S: Store>(
+pub(crate) async fn patch_namespace_status<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
@@ -941,7 +941,7 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
     }
 }
 
-pub async fn delete_namespace<S: Store>(
+pub(crate) async fn delete_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     Extension(user): Extension<UserInfo>,

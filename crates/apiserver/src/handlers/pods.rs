@@ -48,7 +48,7 @@ pub struct CollectionQuery {
 /// Extract a store-level FieldSelector from a raw field selector string.
 /// Picks the first equality (`=`) term that is not a negation (`!=`).
 /// Returns None if no equality term is present or the string is empty.
-pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
+pub(crate) fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
     sel.split(',').find_map(|term| {
         let term = term.trim();
         if !term.contains("!=") {
@@ -82,7 +82,7 @@ pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
 ///
 /// An empty or absent selector matches everything (pass-through).
 /// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
-pub fn filter_pods_by_field_selector(
+pub(crate) fn filter_pods_by_field_selector(
     pods: Vec<serde_json::Value>,
     selector: &str,
 ) -> Vec<serde_json::Value> {
@@ -178,7 +178,7 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
 /// All supplied terms are AND-evaluated: an event must match every term.
 /// An unknown field is ignored (pass-through). An event missing a constrained
 /// field does not match.
-pub fn filter_events_by_field_selector(
+pub(crate) fn filter_events_by_field_selector(
     events: Vec<serde_json::Value>,
     selector: &str,
 ) -> Vec<serde_json::Value> {
@@ -256,7 +256,7 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
     }
 }
 
-pub async fn list_pods<S: Store>(
+pub(crate) async fn list_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
@@ -574,7 +574,7 @@ pub(crate) async fn create_pod<S: Store>(
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
-pub async fn get_pod<S: Store>(
+pub(crate) async fn get_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -620,7 +620,7 @@ pub async fn get_pod<S: Store>(
         .into_response())
 }
 
-pub async fn replace_pod<S: Store>(
+pub(crate) async fn replace_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
@@ -765,7 +765,7 @@ fn deletion_timestamp_after_grace(grace_period_seconds: i64) -> String {
 ///
 /// sonobuoy cleanup sends this to remove all pods it created in a namespace.
 /// Applies the labelSelector if present; deletes all matching pods.
-pub async fn delete_collection_pods<S: Store>(
+pub(crate) async fn delete_collection_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<super::generic::CollectionQuery>,
@@ -848,7 +848,7 @@ pub async fn delete_collection_pods<S: Store>(
     })))
 }
 
-pub async fn delete_pod<S: Store>(
+pub(crate) async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
@@ -1105,7 +1105,7 @@ use crate::util::utc_now_rfc3339;
 /// "Should recreate evicted statefulset" hangs: the test calls the Eviction API,
 /// receives a 404 (no route), the pod is never terminated, and the StatefulSet
 /// controller never triggers recreation.
-pub async fn evict_pod<S: Store>(
+pub(crate) async fn evict_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     body: Bytes,
@@ -2276,7 +2276,7 @@ mod label_selector_tests {
 // Status subresource — GET/PUT/PATCH /api/v1/namespaces/:ns/pods/:name/status
 // ---------------------------------------------------------------------------
 
-pub async fn get_pod_status<S: Store>(
+pub(crate) async fn get_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -2298,7 +2298,7 @@ pub async fn get_pod_status<S: Store>(
         .into_response())
 }
 
-pub async fn replace_pod_status<S: Store>(
+pub(crate) async fn replace_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -2367,7 +2367,7 @@ fn accepts_patch_content_type(ct: &str) -> bool {
 /// that `$patch:delete` directives remove matching items rather than being stored
 /// literally.  Storing them literally causes the kubelet to detect phantom array
 /// changes on every reconcile and continuously recreate the pod sandbox.
-pub fn apply_status_patch(
+pub(crate) fn apply_status_patch(
     stored: &serde_json::Value,
     patch: &serde_json::Value,
 ) -> serde_json::Value {
@@ -2522,7 +2522,7 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
     }
 }
 
-pub async fn patch_pod_status<S: Store>(
+pub(crate) async fn patch_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -2629,7 +2629,7 @@ fn resize_section_removes_resource(section: Option<&serde_json::Value>, resource
     }
 }
 
-pub fn validate_resize_patch(
+pub(crate) fn validate_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> Result<(), String> {
@@ -2919,7 +2919,7 @@ fn merge_resize_section(
 /// multi-container resizes where different containers (or different dimensions of the
 /// same container) change independently. Only spec.containers[].resources is updated;
 /// all other fields are preserved. This is the pure logic extracted for testability.
-pub fn apply_resize_patch(
+pub(crate) fn apply_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> serde_json::Value {
@@ -2959,7 +2959,7 @@ pub fn apply_resize_patch(
     result
 }
 
-pub async fn patch_pod_resize<S: Store>(
+pub(crate) async fn patch_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -3014,7 +3014,7 @@ pub async fn patch_pod_resize<S: Store>(
 /// current resize state. The in-place-resize conformance test polls this endpoint
 /// after each PATCH /resize to confirm the resize was applied; without this
 /// handler the route returns 405 and the conformance poll loop never terminates.
-pub async fn get_pod_resize<S: Store>(
+pub(crate) async fn get_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -3048,7 +3048,7 @@ pub async fn get_pod_resize<S: Store>(
 ///
 /// Extracted as a pure function for testability — the async handler cannot be
 /// tested without a live store.
-pub fn apply_ephemeral_containers_patch(
+pub(crate) fn apply_ephemeral_containers_patch(
     stored: &serde_json::Value,
     patch: &serde_json::Value,
 ) -> serde_json::Value {
@@ -3080,7 +3080,7 @@ pub fn apply_ephemeral_containers_patch(
     result
 }
 
-pub async fn get_ephemeral_containers<S: Store>(
+pub(crate) async fn get_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -3102,7 +3102,7 @@ pub async fn get_ephemeral_containers<S: Store>(
         .into_response())
 }
 
-pub async fn patch_ephemeral_containers<S: Store>(
+pub(crate) async fn patch_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -3144,7 +3144,7 @@ pub async fn patch_ephemeral_containers<S: Store>(
     Ok(Json(current_obj.body))
 }
 
-pub async fn put_ephemeral_containers<S: Store>(
+pub(crate) async fn put_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
@@ -4085,7 +4085,7 @@ fn validate_pod_sysctls(pod: &serde_json::Value) -> Result<(), String> {
 /// This must NOT touch pod.status — callers on the update path rely on it being
 /// status-free so that a running pod's phase and conditions are never stomped back
 /// to "Pending" / "Unschedulable" by a no-op replace or patch.
-pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
+pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     // Deserialize spec into typed form once; all typed-field accesses are compile-checked.
     let mut spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
 
@@ -4297,7 +4297,7 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
 ///
 /// Extracted for testability — the full create_pod handler is async and needs
 /// a live store, so the defaulting logic lives here as a pure function.
-pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+pub(crate) fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     apply_pod_spec_defaults(pod);
 
     // Initialize status.conditions with PodScheduled=False when absent.
@@ -4344,7 +4344,7 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
 /// matches what the kube-apiserver RuntimeClass admission plugin does).
 /// The RuntimeClass JSON must be the full stored object; if it has no
 /// `overhead.podFixed` this is a no-op.
-pub fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
+pub(crate) fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
     let pod_fixed = &rc["overhead"]["podFixed"];
     if pod_fixed.is_null() || pod_fixed.as_object().is_none_or(|m| m.is_empty()) {
         return;
@@ -4387,7 +4387,7 @@ pub const SYSTEM_NODE_CRITICAL_VALUE: i32 = 2_000_001_000;
 /// NOTE: does not implement `globalDefault` (the PriorityClass applied when a
 /// pod sets no `priorityClassName` at all) — tracked as a known gap, see
 /// mayor-2u9x follow-up discussion.
-pub fn resolve_pod_priority_class(
+pub(crate) fn resolve_pod_priority_class(
     pod: &mut serde_json::Value,
     stored_class: Option<&serde_json::Value>,
 ) -> Result<(), String> {
@@ -4439,7 +4439,7 @@ pub fn resolve_pod_priority_class(
 /// Without this, conformance tests like node/pods.go:200 ("Pods should be
 /// submitted and removed") fail because they create a pod with requests==limits
 /// and assert status.qosClass == "Guaranteed".
-pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
+pub(crate) fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
     let containers: Vec<&serde_json::Value> = {
         let mut v: Vec<&serde_json::Value> = Vec::new();
         if let Some(arr) = pod["spec"]["containers"].as_array() {
@@ -4500,7 +4500,7 @@ pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
 /// Controllers that gate on observedGeneration == generation must see generation=1
 /// on every new pod; a caller-supplied value of 100 would force a controller to
 /// wait for 99 phantom generations that will never arrive.
-pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
+pub(crate) fn initialize_pod_generation(pod: &mut serde_json::Value) {
     pod["metadata"]["generation"] = serde_json::json!(1i64);
 }
 
@@ -4535,7 +4535,7 @@ pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
 /// Both sides are spec-defaulted the same way `increment_pod_generation_if_spec_changed`
 /// does, so a client PUT that omits already-defaulted fields (dnsPolicy,
 /// serviceAccountName, ...) isn't mistaken for an illegal spec change.
-pub fn validate_pod_spec_immutable(
+pub(crate) fn validate_pod_spec_immutable(
     spec_before: &serde_json::Value,
     spec_after: &serde_json::Value,
 ) -> Result<(), String> {
@@ -4777,7 +4777,7 @@ mod pod_resources_immutability_tests {
 /// container env fieldRef.apiVersion, port protocol, terminationMessagePolicy)
 /// does not produce a spurious generation bump — upstream k8s only bumps on a
 /// real spec change.
-pub fn increment_pod_generation_if_spec_changed(
+pub(crate) fn increment_pod_generation_if_spec_changed(
     pod: &mut serde_json::Value,
     spec_before: &serde_json::Value,
 ) {
@@ -4821,7 +4821,7 @@ pub fn increment_pod_generation_if_spec_changed(
 ///
 /// This function writes the resolved boolean into `pod["spec"]["automountServiceAccountToken"]`
 /// so that `inject_sa_token_volume` can make a deterministic decision.
-pub async fn apply_automount_sa_token_default<S: Store>(
+pub(crate) async fn apply_automount_sa_token_default<S: Store>(
     state: &AppState<S>,
     pod: &mut serde_json::Value,
     namespace: &str,
@@ -4864,7 +4864,7 @@ pub async fn apply_automount_sa_token_default<S: Store>(
 ///
 /// The volume name suffix is derived deterministically from the pod name so
 /// the function is pure (no I/O, no randomness) and therefore unit-testable.
-pub fn inject_sa_token_volume(pod: &mut serde_json::Value, pod_name: &str) {
+pub(crate) fn inject_sa_token_volume(pod: &mut serde_json::Value, pod_name: &str) {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -6078,7 +6078,7 @@ mod create_defaults_tests {
 /// `now` must be an RFC3339 timestamp string (used as `lastTransitionTime`).
 ///
 /// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
-pub fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
+pub(crate) fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
     if !pod["status"].is_object() {
         pod["status"] = serde_json::json!({});
     }
@@ -6601,7 +6601,7 @@ mod generation_tests {
 ///
 /// Returns `Err` with a 400 if `target.name` is absent or empty.
 /// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
-pub fn extract_binding_node_name(
+pub(crate) fn extract_binding_node_name(
     binding: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
     let parsed: Binding = serde_json::from_value(binding.clone())
@@ -6612,7 +6612,7 @@ pub fn extract_binding_node_name(
     Ok(parsed.target.name)
 }
 
-pub async fn bind_pod<S: Store>(
+pub(crate) async fn bind_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,

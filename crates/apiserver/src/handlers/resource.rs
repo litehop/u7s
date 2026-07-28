@@ -43,7 +43,7 @@ fn wants_partial_object_metadata(accept: &str) -> bool {
     accept.contains("as=PartialObjectMetadata")
 }
 
-pub async fn list_resource<S: Store>(
+pub(crate) async fn list_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
@@ -214,7 +214,7 @@ pub async fn list_resource<S: Store>(
     Ok(Json(body).into_response())
 }
 
-pub async fn get_resource<S: Store>(
+pub(crate) async fn get_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
@@ -634,7 +634,7 @@ pub(crate) async fn replace_resource<S: Store>(
     Ok(Json(obj.body).into_response())
 }
 
-pub async fn delete_resource<S: Store>(
+pub(crate) async fn delete_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Extension(user): Extension<UserInfo>,
@@ -1289,7 +1289,7 @@ pub(crate) async fn patch_resource<S: Store>(
 // Namespaced handlers  (group/version/namespaces/:ns/resource)
 // ---------------------------------------------------------------------------
 
-pub async fn list_namespaced_resource<S: Store>(
+pub(crate) async fn list_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
@@ -1453,7 +1453,7 @@ pub async fn list_namespaced_resource<S: Store>(
     Ok(Json(body).into_response())
 }
 
-pub async fn get_namespaced_resource<S: Store>(
+pub(crate) async fn get_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
@@ -2114,7 +2114,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     Ok(Json(obj.body).into_response())
 }
 
-pub async fn delete_namespaced_resource<S: Store>(
+pub(crate) async fn delete_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Extension(user): Extension<UserInfo>,
@@ -2508,7 +2508,7 @@ pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
 /// Kubernetes supports collection delete (kubectl delete clusterrolebinding --all,
 /// sonobuoy delete --all).  Without this handler axum returns 405 because no
 /// DELETE is registered on the collection route.
-pub async fn delete_collection_resource<S: Store>(
+pub(crate) async fn delete_collection_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
@@ -2665,7 +2665,7 @@ pub async fn delete_collection_resource<S: Store>(
 /// DELETE /apis/{group}/{version}/namespaces/{ns}/{resource}
 ///
 /// Deletes all namespaced objects of the given resource type within the namespace.
-pub async fn delete_collection_namespaced_resource<S: Store>(
+pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
