@@ -229,11 +229,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // read from cache instead of falling back to the store.
     state.init_apiservice_cache().await;
 
-    // 10c. Keep the kubernetes EndpointSlice in sync with the kubernetes Endpoints.
+    // 10c. Keep the kubernetes Endpoints in sync with the kubernetes EndpointSlice.
     // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
     // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
-    // the loopback address in the Endpoints. This reconciler overwrites those changes
-    // so EndpointSlice.addresses always equals Endpoints.subsets[*].addresses[*].ip.
+    // the loopback address in the Endpoints. This reconciler updates the Endpoints to
+    // match, so Endpoints.subsets[*].addresses[*].ip always equals EndpointSlice.addresses.
     let (_reconciler_shutdown_tx, mut reconciler_shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let reconcile_store = Arc::clone(&store);
