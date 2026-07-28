@@ -304,6 +304,54 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::Stat
         .map_err(|e| Status::internal(e.to_string()))
 }
 
+/// Remove `cr_schema_cache` entries left behind by a CRD generation that a write
+/// (replace/patch) or a delete just superseded. `old_group`/`old_version_names`/
+/// `old_resource_version` describe the CRD *before* that write, i.e. exactly the values
+/// the now-stale entries were cached under. This is memory hygiene only, not a
+/// correctness requirement: the CRD's next resourceVersion is always different (the
+/// store's revision counter is global and never reused), so a stale entry could never
+/// be looked up again even if this were never called.
+fn evict_cr_schema_cache<S: Store>(
+    state: &AppState<S>,
+    old_group: &str,
+    old_version_names: &[String],
+    old_resource_version: &str,
+) {
+    if old_resource_version.is_empty() {
+        return;
+    }
+    for version in old_version_names {
+        state.cr_schema_cache.invalidate(&(
+            old_group.to_string(),
+            version.clone(),
+            old_resource_version.to_string(),
+        ));
+    }
+}
+
+/// Extract `(spec.group, [versions[].name], metadata.resourceVersion)` from a raw CRD
+/// `Value` — used to find the `cr_schema_cache` keys a CRD generation was cached under,
+/// without needing a full `CustomResourceDefinition` parse.
+fn crd_schema_cache_identity(crd: &serde_json::Value) -> (String, Vec<String>, String) {
+    let group = crd["spec"]["group"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let versions = crd["spec"]["versions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let resource_version = crd["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    (group, versions, resource_version)
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -540,10 +588,11 @@ pub async fn replace_crd<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, KIND))?;
 
+    let existing: serde_json::Value =
+        serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
+
     // Preserve server-assigned fields from stored copy if not present in incoming.
     if crd.metadata.uid.is_empty() || crd.metadata.creation_timestamp.is_empty() {
-        let existing: serde_json::Value =
-            serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
         if crd.metadata.uid.is_empty() {
             if let Some(uid) = existing["metadata"]["uid"].as_str() {
                 crd.metadata.uid = uid.to_string();
@@ -600,6 +649,9 @@ pub async fn replace_crd<S: Store>(
     let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
     let _ = state.store.delete(&tombstone_key, None).await;
 
+    let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&existing);
+    evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
+
     crd.metadata.resource_version = rv.to_string();
     Ok(Json(crd))
 }
@@ -622,10 +674,7 @@ pub async fn delete_crd<S: Store>(
     // Parse once: used both for the tombstone's group below and as the admission review object.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    let group: String = existing["spec"]["group"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let (group, versions, resource_version) = crd_schema_cache_identity(&existing);
 
     // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
     let admission_ctx = AdmissionContext {
@@ -649,6 +698,8 @@ pub async fn delete_crd<S: Store>(
         .delete(&key, None)
         .await
         .map_err(|e| store_err_crd(e, &name))?;
+
+    evict_cr_schema_cache(&state, &group, &versions, &resource_version);
 
     // Write a tombstone so CR handlers can return 410 Gone (not 404) for this
     // group after deletion. Informers treat 410 as "stop watching" and 404 as
@@ -748,6 +799,9 @@ pub async fn patch_crd<S: Store>(
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    // Captured before the patch mutates `current` in place, so this reflects the CRD
+    // generation the pre-patch cr_schema_cache entries were cached under.
+    let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&current);
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
@@ -808,6 +862,8 @@ pub async fn patch_crd<S: Store>(
         .put(&key, to_bytes(&crd)?, None)
         .await
         .map_err(|e| store_err_crd(e, &name))?;
+
+    evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
 
     crd.metadata.resource_version = rv.to_string();
     Ok(Json(crd))
