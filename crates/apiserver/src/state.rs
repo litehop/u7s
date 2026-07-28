@@ -151,11 +151,11 @@ pub struct AdmissionConfigCache {
     /// ValidatingWebhookConfiguration `webhooks[]` entries, flattened across all configs.
     pub(crate) validating_webhooks: RwLock<Option<Arc<Vec<WebhookEntry>>>>,
     /// MutatingAdmissionPolicy objects.
-    pub mutating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    pub(crate) mutating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
     /// ValidatingAdmissionPolicy objects.
-    pub validating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    pub(crate) validating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
     /// ValidatingAdmissionPolicyBinding objects.
-    pub validating_policy_bindings: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    pub(crate) validating_policy_bindings: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
 }
 
 impl AdmissionConfigCache {
