@@ -480,6 +480,12 @@ fn validate_cr_schema(
     let Some(schema) = &ctx.schema else {
         return Ok(());
     };
+    // Defense in depth: CRD admission (crd.rs::validate_crd_schema) already rejects
+    // oversized patterns and patternProperties, but a CRD that bypassed that check
+    // (installed before it existed, restored from backup, or written directly to the
+    // store) must not still be able to trigger boon's O(n^2) ECMA-compat rewrite on
+    // every CR write against it.
+    crate::handlers::crd::walk_schema_dos_bounds(schema, "openAPIV3Schema")?;
     let mut schemas = boon::Schemas::new();
     let mut compiler = boon::Compiler::new();
     compiler
@@ -6019,6 +6025,36 @@ mod tests {
         assert!(
             check_schema(&value, schema).is_err(),
             "additional property must be rejected"
+        );
+    }
+
+    /// Defense in depth: a CRD schema with an oversized `pattern` that somehow bypassed
+    /// crd.rs::validate_crd_schema (installed before that check existed, restored from
+    /// backup, or written directly to the store) must still be rejected here, before
+    /// boon::Compiler::compile ever sees it — otherwise every CR write against that CRD
+    /// retriggers boon's O(n^2) ECMA-compat rewrite, pinning a CPU core per request.
+    #[test]
+    fn validate_cr_schema_defense_in_depth_rejects_oversized_pattern_that_bypassed_crd_admission() {
+        let oversized = "a".repeat(crate::handlers::crd::MAX_CRD_PATTERN_BYTES + 1);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "field": { "type": "string", "pattern": oversized } }
+        });
+        let err = match check_schema(&serde_json::json!({ "field": "x" }), schema) {
+            Ok(()) => panic!(
+                "an oversized pattern must be rejected before boon::Compiler::compile runs, \
+                 even when it reached validate_cr_schema without going through CRD admission"
+            ),
+            Err(e) => e,
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422);
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("exceeds maximum length"),
+            "error must identify the oversized-pattern ReDoS defense, not a generic failure: {json}"
         );
     }
 
@@ -13265,5 +13301,73 @@ mod tests {
             "GET must apply the current schema's default even though the CR predates it — \
              without read-time defaulting, informers waiting on this field would hang forever"
         );
+    }
+
+    // Slow benchmark, not a regression gate — the real regression gates are the 3
+    // admission-cap tests (crd.rs and cr.rs). This is opt-in via `cargo test -- --ignored`
+    // and empirically confirms the audit's claim that boon's ECMA-compat rewrite (which
+    // runs before Regex::new, so regex::RegexBuilder::size_limit can't help) is O(n^2):
+    // each geometric doubling should roughly quadruple compile time, not double it. Each
+    // size is individually wall-clock-capped at 60s so this never turns into a multi-minute
+    // CI hang — a size that blows the cap is itself evidence of superlinear scaling.
+    #[test]
+    #[ignore]
+    fn poc_timing_boon_ecma_compat_shim_is_quadratic() {
+        use std::time::{Duration, Instant};
+
+        const CAP: Duration = Duration::from_secs(60);
+
+        // Baseline: a 1-byte pattern isolates boon::Compiler's fixed per-call setup cost
+        // (meta-schema/vocabulary loading) from the marginal, pattern-length-driven cost
+        // the geometric sweep below measures.
+        {
+            let start = Instant::now();
+            let mut schemas = boon::Schemas::new();
+            let mut compiler = boon::Compiler::new();
+            compiler
+                .add_resource(
+                    "baseline.json",
+                    serde_json::json!({ "type": "string", "pattern": "a" }),
+                )
+                .unwrap();
+            let _ = compiler.compile("baseline.json", &mut schemas);
+            eprintln!(
+                "PoC: 1 B baseline pattern compiled in {:?}",
+                start.elapsed()
+            );
+        }
+
+        let mut prev: Option<(usize, Duration)> = None;
+
+        for &size in &[1024usize, 4096, 16384, 65536, 262144, 1_048_576] {
+            let pattern = "\\d".repeat(size / 2);
+            let start = Instant::now();
+            let mut schemas = boon::Schemas::new();
+            let mut compiler = boon::Compiler::new();
+            compiler
+                .add_resource(
+                    "poc.json",
+                    serde_json::json!({ "type": "string", "pattern": pattern }),
+                )
+                .unwrap();
+            let _ = compiler.compile("poc.json", &mut schemas);
+            let elapsed = start.elapsed();
+            eprintln!("PoC: {size} B \\d-repeated pattern compiled in {elapsed:?}");
+
+            if elapsed > CAP {
+                eprintln!("PoC: {size} B exceeded the {CAP:?} cap — stopping (superlinear scaling confirmed)");
+                break;
+            }
+            if let Some((prev_size, prev_elapsed)) = prev {
+                let size_ratio = size as f64 / prev_size as f64;
+                let time_ratio = elapsed.as_secs_f64() / prev_elapsed.as_secs_f64().max(1e-9);
+                eprintln!(
+                    "PoC: {prev_size} B -> {size} B: size x{size_ratio:.1}, time x{time_ratio:.1} \
+                     (linear would be x{size_ratio:.1}, quadratic would be x{:.1})",
+                    size_ratio * size_ratio
+                );
+            }
+            prev = Some((size, elapsed));
+        }
     }
 }
