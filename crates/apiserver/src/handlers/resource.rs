@@ -1647,7 +1647,14 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     }
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let put_start = std::time::Instant::now();
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    tracing::debug!(
+        key = %key,
+        elapsed_ms = put_start.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        "create_namespaced_resource: store.put call completed"
+    );
     let new_rv = match result {
         Ok(rv) => rv,
         Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
@@ -2099,11 +2106,18 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         return Ok(Json(obj.body).into_response());
     }
 
-    let new_rv = state
+    let put_start = std::time::Instant::now();
+    let put_result = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .await;
+    tracing::debug!(
+        key = %key,
+        elapsed_ms = put_start.elapsed().as_millis() as u64,
+        ok = put_result.is_ok(),
+        "replace_namespaced_resource: store.put call completed"
+    );
+    let new_rv = put_result.map_err(|e| store_err(e, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
     if group == RBAC_GROUP {
