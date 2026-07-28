@@ -563,7 +563,7 @@ pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
 /// the message stops changing. Mirrors `scheduling_gate_status_patch`'s
 /// identical guard for the identical reason.
 pub fn failed_scheduling_status_patch(event: &Value, message: &str) -> Option<Value> {
-    if let Ok(watch_event) = serde_json::from_value::<WatchEvent<PodObject>>(event.clone()) {
+    if let Ok(watch_event) = WatchEvent::<PodObject>::deserialize(event) {
         let already_marked = watch_event.object.status.conditions.iter().any(|c| {
             c.condition_type.as_deref() == Some(POD_SCHEDULED)
                 && c.status.as_deref() == Some("False")
