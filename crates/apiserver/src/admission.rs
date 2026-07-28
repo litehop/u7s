@@ -3034,174 +3034,165 @@ pub async fn run_validating_webhooks<S: Store>(
 
     // Share object/old_object across all N webhook calls below via Arc instead of
     // deep-cloning the JSON tree into every AdmissionRequest — only uid varies per call.
-    // Skipped entirely when there are no webhooks configured (the conformance default).
-    let has_webhooks = !all_webhooks.is_empty();
-    let object_arc = has_webhooks.then(|| Arc::new(object.clone()));
-    let old_object_arc = if has_webhooks {
-        old_object.map(|v| Arc::new(v.clone()))
-    } else {
-        None
-    };
+    // Both are scoped to this block, so their existence is tied to the loop actually
+    // running by the compiler, not by a separately-computed bool kept in sync by hand.
+    if !all_webhooks.is_empty() {
+        let object_arc = Arc::new(object.clone());
+        let old_object_arc = old_object.map(|v| Arc::new(v.clone()));
 
-    for webhook in all_webhooks.iter() {
-        // Check rule match.
-        if !webhook.rules.is_empty() {
-            let has_match = webhook.rules.iter().any(|rule| {
-                matches_rule_typed(
-                    rule,
-                    ctx.group,
-                    ctx.version,
-                    ctx.resource,
-                    ctx.namespace,
-                    ctx.operation,
-                )
-            });
-            if !has_match {
-                continue;
+        for webhook in all_webhooks.iter() {
+            // Check rule match.
+            if !webhook.rules.is_empty() {
+                let has_match = webhook.rules.iter().any(|rule| {
+                    matches_rule_typed(
+                        rule,
+                        ctx.group,
+                        ctx.version,
+                        ctx.resource,
+                        ctx.namespace,
+                        ctx.operation,
+                    )
+                });
+                if !has_match {
+                    continue;
+                }
             }
-        }
 
-        // namespaceSelector: skip if the request namespace's labels don't match.
-        if webhook.namespace_selector.is_some() {
-            if let Some(ns) = ctx.namespace {
-                let ns_labels = fetch_namespace_labels(state, ns).await;
-                if !label_selector_matches(webhook.namespace_selector.as_ref(), &ns_labels) {
-                    tracing::debug!(
+            // namespaceSelector: skip if the request namespace's labels don't match.
+            if webhook.namespace_selector.is_some() {
+                if let Some(ns) = ctx.namespace {
+                    let ns_labels = fetch_namespace_labels(state, ns).await;
+                    if !label_selector_matches(webhook.namespace_selector.as_ref(), &ns_labels) {
+                        tracing::debug!(
                         "admission: validating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
                         webhook.name, ns
                     );
-                    continue;
+                        continue;
+                    }
                 }
             }
-        }
 
-        // objectSelector: skip if the object's labels don't match.
-        if webhook.object_selector.is_some() {
-            let obj_labels: BTreeMap<String, String> = object["metadata"]["labels"]
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !label_selector_matches(webhook.object_selector.as_ref(), &obj_labels) {
-                tracing::debug!(
+            // objectSelector: skip if the object's labels don't match.
+            if webhook.object_selector.is_some() {
+                let obj_labels: BTreeMap<String, String> = object["metadata"]["labels"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !label_selector_matches(webhook.object_selector.as_ref(), &obj_labels) {
+                    tracing::debug!(
                     "admission: validating webhook \"{}\" skipped: object does not match objectSelector",
                     webhook.name
                 );
-                continue;
+                    continue;
+                }
             }
-        }
 
-        // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
-        // expression evaluates to false — see webhook_match_conditions_pass.
-        if !webhook.match_conditions.is_empty() {
-            let request_val = webhook_match_condition_request(ctx);
-            if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
-                tracing::debug!(
+            // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
+            // expression evaluates to false — see webhook_match_conditions_pass.
+            if !webhook.match_conditions.is_empty() {
+                let request_val = webhook_match_condition_request(ctx);
+                if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+                    tracing::debug!(
                     "admission: validating webhook \"{}\" skipped: matchCondition evaluated false",
                     webhook.name
                 );
-                continue;
+                    continue;
+                }
             }
-        }
 
-        let target = match webhook_url(state, &webhook.client_config, &webhook.name).await {
-            Ok(t) => t,
-            Err(e) => {
-                if webhook.failure_policy == "Ignore" {
-                    tracing::warn!(
+            let target = match webhook_url(state, &webhook.client_config, &webhook.name).await {
+                Ok(t) => t,
+                Err(e) => {
+                    if webhook.failure_policy == "Ignore" {
+                        tracing::warn!(
                         "admission: validating webhook \"{}\" skipped (service not found, failurePolicy=Ignore): {e}",
                         webhook.name
                     );
-                    continue;
-                } else {
-                    return Err(Status::internal(format!(
-                        "admission webhook \"{}\": {e}",
-                        webhook.name
-                    )));
+                        continue;
+                    } else {
+                        return Err(Status::internal(format!(
+                            "admission webhook \"{}\": {e}",
+                            webhook.name
+                        )));
+                    }
                 }
-            }
-        };
-        let base_url = match &target {
-            WebhookTarget::DirectUrl(u) => u.as_str(),
-            WebhookTarget::ServiceResolved { url } => url.as_str(),
-        };
-        let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
-        // Append timeout=Ns so the URL in error messages matches what the conformance
-        // test checks for (strings.Contains(err, "/path?timeout=1s")).
-        let call_url = webhook_url_with_timeout(base_url, secs);
+            };
+            let base_url = match &target {
+                WebhookTarget::DirectUrl(u) => u.as_str(),
+                WebhookTarget::ServiceResolved { url } => url.as_str(),
+            };
+            let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+            // Append timeout=Ns so the URL in error messages matches what the conformance
+            // test checks for (strings.Contains(err, "/path?timeout=1s")).
+            let call_url = webhook_url_with_timeout(base_url, secs);
 
-        let uid = uuid::Uuid::new_v4().to_string();
-        let review = build_review(
-            &uid,
-            ctx,
-            object_arc
-                .as_ref()
-                .expect("all_webhooks is non-empty inside this loop, so object_arc was built"),
-            old_object_arc.as_ref(),
-        );
+            let uid = uuid::Uuid::new_v4().to_string();
+            let review = build_review(&uid, ctx, &object_arc, old_object_arc.as_ref());
 
-        // DirectUrl webhooks go to an external endpoint: do not route through the
-        // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
-        // present the apiserver mTLS identity (which would leak it to an external host).
-        let (effective_proxy, effective_identity) = match &target {
-            WebhookTarget::DirectUrl(_) => (None, None),
-            WebhookTarget::ServiceResolved { .. } => (
-                state.konnectivity_proxy_addr.as_deref(),
-                state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
-            ),
-        };
+            // DirectUrl webhooks go to an external endpoint: do not route through the
+            // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
+            // present the apiserver mTLS identity (which would leak it to an external host).
+            let (effective_proxy, effective_identity) = match &target {
+                WebhookTarget::DirectUrl(_) => (None, None),
+                WebhookTarget::ServiceResolved { .. } => (
+                    state.konnectivity_proxy_addr.as_deref(),
+                    state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
+                ),
+            };
 
-        let wh_client = build_webhook_call_client(
-            webhook.client_config.ca_bundle.as_deref(),
-            effective_proxy,
-            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-            effective_identity,
-            &state.webhook_client,
-            webhook.timeout_seconds,
-        );
-        let (response, timed_out) = call_webhook(&wh_client, &call_url, &review).await;
+            let wh_client = build_webhook_call_client(
+                webhook.client_config.ca_bundle.as_deref(),
+                effective_proxy,
+                state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+                effective_identity,
+                &state.webhook_client,
+                webhook.timeout_seconds,
+            );
+            let (response, timed_out) = call_webhook(&wh_client, &call_url, &review).await;
 
-        match response {
-            Some(resp) => {
-                if !resp.allowed {
-                    let message = resp
-                        .status
-                        .as_ref()
-                        .and_then(|s| {
-                            s.message
-                                .as_deref()
-                                .filter(|m| !m.is_empty())
-                                .or(s.reason.as_deref().filter(|r| !r.is_empty()))
-                        })
-                        .unwrap_or("admission webhook denied the request")
-                        .to_string();
-                    return Err(Status::forbidden(format!(
-                        "admission webhook \"{}\" denied the request: {message}",
-                        webhook.name
-                    )));
+            match response {
+                Some(resp) => {
+                    if !resp.allowed {
+                        let message = resp
+                            .status
+                            .as_ref()
+                            .and_then(|s| {
+                                s.message
+                                    .as_deref()
+                                    .filter(|m| !m.is_empty())
+                                    .or(s.reason.as_deref().filter(|r| !r.is_empty()))
+                            })
+                            .unwrap_or("admission webhook denied the request")
+                            .to_string();
+                        return Err(Status::forbidden(format!(
+                            "admission webhook \"{}\" denied the request: {message}",
+                            webhook.name
+                        )));
+                    }
                 }
-            }
-            None => {
-                if webhook.failure_policy == "Ignore" {
-                    tracing::warn!(
+                None => {
+                    if webhook.failure_policy == "Ignore" {
+                        tracing::warn!(
                         "admission: validating webhook \"{}\" failed, ignoring (failurePolicy=Ignore)",
                         webhook.name
                     );
-                } else if timed_out {
-                    // Include the full URL (with ?timeout=Ns) so the client error message
-                    // matches what the conformance test checks: the URL path + "timeout".
-                    return Err(Status::gateway_timeout(format!(
-                        "request did not complete within requested timeout {secs}s \
+                    } else if timed_out {
+                        // Include the full URL (with ?timeout=Ns) so the client error message
+                        // matches what the conformance test checks: the URL path + "timeout".
+                        return Err(Status::gateway_timeout(format!(
+                            "request did not complete within requested timeout {secs}s \
                          (context deadline exceeded): {call_url}"
-                    )));
-                } else {
-                    return Err(Status::internal(format!(
-                        "admission webhook \"{}\" failed to respond (failurePolicy=Fail)",
-                        webhook.name
-                    )));
+                        )));
+                    } else {
+                        return Err(Status::internal(format!(
+                            "admission webhook \"{}\" failed to respond (failurePolicy=Fail)",
+                            webhook.name
+                        )));
+                    }
                 }
             }
         }
@@ -3971,6 +3962,72 @@ mod tests {
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
         assert!(result.is_ok(), "no webhooks must return Ok");
+    }
+
+    /// A non-empty webhook list where every entry is filtered out by rule mismatch must
+    /// still complete without panicking.
+    ///
+    /// The object/old_object Arcs used for webhook calls are built once per request and
+    /// shared across the loop; that construction and the loop's non-emptiness must stay
+    /// coupled to the same `all_webhooks` fact, or a future refactor that decouples them
+    /// (e.g. a separately-computed "any webhooks configured" flag next to a filtered loop)
+    /// would panic on every validating-webhook-configured request whose rules don't happen
+    /// to match — not just malformed input. This request never matches the configured
+    /// webhook's rule (pods vs. the rule's deployments), so the loop runs one iteration
+    /// that hits `continue` before ever building an AdmissionReview, without dispatching
+    /// to the (deliberately unreachable, failurePolicy=Fail) URL.
+    #[tokio::test]
+    async fn run_validating_webhooks_all_entries_skipped_by_rule_mismatch_does_not_panic() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "non-matching-vwc"},
+            "webhooks": [{
+                "name": "non-matching.validating.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [make_rule("apps", "v1", "deployments", "CREATE")],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/non-matching-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Pod", "metadata": {"name": "my-pod"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "my-pod",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "a webhook config that exists but whose rule never matches this request must \
+             not panic or error; if the object_arc/loop coupling ever broke and the mismatched \
+             webhook were dispatched anyway, the unreachable URL + failurePolicy=Fail would \
+             surface as Err, so this also confirms the rule mismatch really skipped dispatch"
+        );
     }
 
     // -- Mock webhook server helpers --
