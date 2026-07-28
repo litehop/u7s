@@ -176,6 +176,92 @@ fn validate_crd_group(group: &str) -> Result<(), crate::status::StatusError> {
     Ok(())
 }
 
+/// Maximum length, in bytes, for a `pattern` string or a `patternProperties` key in a
+/// CRD's `openAPIV3Schema`. boon (the JSON-schema engine u7s compiles CRD schemas with)
+/// runs an ECMA-to-Rust-regex compatibility rewrite (boon-0.6.1 src/ecma.rs::convert)
+/// before `Regex::new` ever sees the pattern, and that rewrite is O(pattern_length^2) —
+/// so `regex::RegexBuilder::size_limit` cannot protect against it, since the shim's cost
+/// is paid before compilation. Real-world CRD patterns top out at 113 bytes (median 91);
+/// this cap gives ~9x headroom while keeping worst-case compile cost bounded.
+pub(crate) const MAX_CRD_PATTERN_BYTES: usize = 1024;
+
+/// Walk a single JSON-Schema node (and everything nested under it — `properties`,
+/// `items`, `additionalProperties`, `allOf`/`anyOf`/`oneOf`, etc.) rejecting the two
+/// `openAPIV3Schema` shapes that can blow up boon's ECMA-compat regex rewrite:
+/// `patternProperties` (forbidden outright, matching upstream K8s's structural-schema
+/// rule, apiextensions-apiserver release-1.36 validation.go:1493-1494) and any `pattern`
+/// longer than `MAX_CRD_PATTERN_BYTES`.
+pub(crate) fn walk_schema_dos_bounds(
+    node: &serde_json::Value,
+    field_path: &str,
+) -> Result<(), crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(pp) = map.get("patternProperties").and_then(|v| v.as_object()) {
+                // Defense-in-depth: bound key length unconditionally, not only when
+                // patternProperties happens to be non-empty below — a future change that
+                // relaxes the outright rejection must not silently reopen the boon
+                // O(n^2) ReDoS via unbounded patternProperties keys.
+                for key in pp.keys() {
+                    if key.len() > MAX_CRD_PATTERN_BYTES {
+                        return Err(Status::unprocessable_entity(format!(
+                            "{field_path}.patternProperties key exceeds maximum length of \
+                             {MAX_CRD_PATTERN_BYTES} bytes (was {} bytes) — see ReDoS defense",
+                            key.len()
+                        )));
+                    }
+                }
+                if !pp.is_empty() {
+                    return Err(Status::unprocessable_entity(format!(
+                        "{field_path}.patternProperties: patternProperties is not supported"
+                    )));
+                }
+            }
+            if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
+                if pattern.len() > MAX_CRD_PATTERN_BYTES {
+                    return Err(Status::unprocessable_entity(format!(
+                        "{field_path}.pattern exceeds maximum length of {MAX_CRD_PATTERN_BYTES} \
+                         bytes (was {} bytes) — see ReDoS defense",
+                        pattern.len()
+                    )));
+                }
+            }
+            for (key, value) in map {
+                walk_schema_dos_bounds(value, &format!("{field_path}.{key}"))?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                walk_schema_dos_bounds(item, &format!("{field_path}[{i}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Validate a CRD's `openAPIV3Schema` (across all versions) against the boon-ReDoS
+/// class of bugs before persisting the CRD.
+fn validate_crd_schema(
+    spec: &CustomResourceDefinitionSpec,
+) -> Result<(), crate::status::StatusError> {
+    for version in &spec.versions {
+        let Some(schema) = version
+            .schema
+            .as_ref()
+            .and_then(|s| s.get("openAPIV3Schema"))
+        else {
+            continue;
+        };
+        walk_schema_dos_bounds(
+            schema,
+            &format!("spec.versions[{}].schema.openAPIV3Schema", version.name),
+        )?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -334,6 +420,7 @@ pub async fn create_crd<S: Store>(
     }
 
     validate_crd_group(&crd.spec.group)?;
+    validate_crd_schema(&crd.spec)?;
 
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if name != expected_name {
@@ -440,6 +527,8 @@ pub async fn replace_crd<S: Store>(
             crd.metadata.name
         )));
     }
+
+    validate_crd_schema(&crd.spec)?;
 
     let key = store_key(&name);
 
@@ -688,6 +777,8 @@ pub async fn patch_crd<S: Store>(
     // Preserve server-assigned type meta.
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
+
+    validate_crd_schema(&crd.spec)?;
 
     // Admission webhook pipeline (mutating then validating).
     {
@@ -2236,6 +2327,205 @@ mod tests {
         assert!(validate_crd_group("example.com").is_ok());
         assert!(validate_crd_group("argoproj.io").is_ok());
         assert!(validate_crd_group("gateway.networking.x-k8s.io").is_ok());
+    }
+
+    // -- validate_crd_schema: patternProperties rejected outright, matching upstream --
+
+    fn crd_bytes_with_schema(name: &str, schema: serde_json::Value) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": { "openAPIV3Schema": schema }
+                    }]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    /// Upstream K8s (apiextensions-apiserver validation.go:1493-1494) unconditionally
+    /// rejects `patternProperties` at the schema root as a structural-schema violation.
+    /// A u7s CRD accepting it would let an unprivileged CR author install a resource
+    /// upstream would have refused, breaking portability of CRDs across clusters.
+    #[tokio::test]
+    async fn create_crd_rejects_root_pattern_properties_to_match_upstream() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "patternProperties": { "^x-": { "type": "string" } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "root-level patternProperties must be rejected with 422"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("patternProperties is not supported"),
+            "error must echo upstream's exact wording so K8s clients parse it identically: {json}"
+        );
+    }
+
+    /// patternProperties nested inside a `properties` map entry (not just the schema
+    /// root) must also be rejected — a CRD author could otherwise bury the forbidden
+    /// keyword one level deep to evade a root-only check.
+    #[tokio::test]
+    async fn create_crd_rejects_pattern_properties_nested_in_properties_map() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "patternProperties": { "^x-": { "type": "string" } }
+                }
+            }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "patternProperties nested under properties.spec must be rejected"
+        );
+        assert!(json["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("patternProperties is not supported"));
+    }
+
+    /// patternProperties nested inside an array item schema must also be rejected —
+    /// the walk must recurse into `items`, not just `properties`.
+    #[tokio::test]
+    async fn create_crd_rejects_pattern_properties_nested_in_array_item_schema() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "patternProperties": { "^x-": { "type": "string" } }
+                    }
+                }
+            }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "patternProperties nested under an array item schema must be rejected"
+        );
+        assert!(json["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("patternProperties is not supported"));
+    }
+
+    /// Positive control: a schema with no patternProperties anywhere must be accepted —
+    /// otherwise the walk is over-eager and blocks legitimate CRDs that only use `pattern`.
+    #[tokio::test]
+    async fn create_crd_accepts_schema_without_pattern_properties() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "cpu": { "type": "string", "pattern": "^[0-9]+m?$" }
+                    }
+                }
+            }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        assert!(
+            create_crd(State(state), test_user(), HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "a schema using only `pattern` (no patternProperties) must be accepted"
+        );
+    }
+
+    // -- validate_crd_schema: pattern length cap (boon O(n^2) ReDoS defense) --
+
+    /// A `pattern` over MAX_CRD_PATTERN_BYTES must be rejected at CRD admission time —
+    /// otherwise any principal with mere create/update RBAC on the resulting Custom
+    /// Resource kind can retrigger boon's O(n^2) ECMA-compat rewrite on every CR write,
+    /// pinning a CPU core for the duration of the compile.
+    #[tokio::test]
+    async fn crd_admission_rejects_oversized_pattern_to_prevent_boon_o_n_squared_dos() {
+        let state = make_state();
+        let oversized = "a".repeat(MAX_CRD_PATTERN_BYTES + 1);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": { "field": { "type": "string", "pattern": oversized } }
+                }
+            }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "a pattern exceeding the {MAX_CRD_PATTERN_BYTES}-byte cap must be rejected"
+        );
+        let message = json["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("exceeds maximum length") && message.contains("1025 bytes"),
+            "error must report the actual oversized length so the CRD author can fix it: {message}"
+        );
+    }
+
+    /// A `pattern` exactly at the MAX_CRD_PATTERN_BYTES boundary must be accepted —
+    /// an off-by-one here would reject legitimate schemas that happen to sit right at
+    /// the cap (e.g. hand-written alternation patterns).
+    #[tokio::test]
+    async fn crd_admission_accepts_at_cap_pattern() {
+        let state = make_state();
+        let at_cap = "a".repeat(MAX_CRD_PATTERN_BYTES);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": { "field": { "type": "string", "pattern": at_cap } }
+                }
+            }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        assert!(
+            create_crd(State(state), test_user(), HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "a pattern exactly at the {MAX_CRD_PATTERN_BYTES}-byte cap must be accepted \
+             (off-by-one guard)"
+        );
     }
 
     /// Regression: when kcm's metadatainformer opens a watch on CRDs with an Accept header
