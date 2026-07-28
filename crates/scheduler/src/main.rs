@@ -199,6 +199,13 @@ async fn evict_victims(
 /// its own retry-triggering event never arrives.
 const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Path for the scheduler's cluster-wide pod watch. `allowWatchBookmarks=true`
+/// requests the apiserver's 60s bookmark heartbeat so `watch_stream`'s 5-min
+/// per-frame idle timeout (`WATCH_IDLE_TIMEOUT` in `kubeconfig::lib`) never
+/// trips on a healthy cluster that is simply quiet — without it, an idle
+/// cluster forces a harmless but unnecessary reconnect every 5 minutes.
+const POD_WATCH_PATH: &str = "/api/v1/pods?watch=true&allowWatchBookmarks=true";
+
 /// Handle one pod watch event — a real one from the live watch, or a
 /// synthetic `{"type": "MODIFIED", "object": ...}` manufactured by the
 /// periodic resync loop from a fresh `/api/v1/pods` list (see
@@ -545,8 +552,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Watch loop — reconnect on error with a short backoff.
     loop {
-        info!("starting pod watch on /api/v1/pods?watch=true");
-        let path = "/api/v1/pods?watch=true";
+        info!("starting pod watch on {POD_WATCH_PATH}");
+        let path = POD_WATCH_PATH;
         tally.lock().expect("tally lock poisoned").clear();
 
         // Collect events; for each ADDED/MODIFIED pod with empty nodeName, schedule it.
@@ -565,5 +572,23 @@ async fn main() -> anyhow::Result<()> {
             error!("watch error: {e} — reconnecting in 5s");
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pod_watch_path_requests_allow_watch_bookmarks() {
+        // Without allowWatchBookmarks=true, the apiserver never sends the 60s
+        // bookmark heartbeat, so an idle-but-healthy cluster would trip
+        // watch_stream's 5-min idle timeout and force a spurious reconnect
+        // every 5 minutes. Losing this param would reintroduce that churn.
+        assert!(
+            POD_WATCH_PATH.contains("allowWatchBookmarks=true"),
+            "pod watch path must request allowWatchBookmarks=true to avoid \
+             spurious idle-timeout reconnects on a quiet cluster; got: {POD_WATCH_PATH}"
+        );
     }
 }
