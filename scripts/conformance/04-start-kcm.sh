@@ -55,6 +55,9 @@ limactl shell "$VM_NAME" bash -s <<EOF
 set -euo pipefail
 
 WORKDIR="$WORKDIR"
+# klog has no --utc flag, so kube-controller-manager renders whatever local time
+# it inherits; force UTC here so kcm.log matches apiserver.log/scheduler.log.
+export TZ=UTC
 # Verbosity flag: when run-all.sh is invoked with --verbose it passes --kcm-v <N>,
 # which becomes "--v=<N>" here to surface controller-decision logs (see run-all.sh
 # for the level chosen and why).

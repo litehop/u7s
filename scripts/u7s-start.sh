@@ -158,7 +158,9 @@ EXTEOF
 
   pkill -f "konnectivity-server.*${WORKDIR}" || true
 
-  "$SERVER_BIN" \
+  # klog has no --utc flag, so konnectivity-server renders whatever local time
+  # it inherits; force UTC so konnectivity-server.log matches apiserver.log.
+  TZ=UTC "$SERVER_BIN" \
     --logtostderr=true \
     --log-file-max-size=0 \
     --cluster-cert="$WORKDIR/konnectivity-server.crt" \
@@ -284,7 +286,7 @@ EXTEOF
       -out "$WORKDIR/konnectivity-server.crt"
     rm -f "$WORKDIR/konnectivity-server.csr"
   fi
-  "$SERVER_BIN" \
+  TZ=UTC "$SERVER_BIN" \
     --logtostderr=true --log-file-max-size=0 \
     --cluster-cert="$WORKDIR/konnectivity-server.crt" \
     --cluster-key="$WORKDIR/konnectivity-server.key" \
