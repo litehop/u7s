@@ -1129,6 +1129,25 @@ mod tests {
         );
     }
 
+    /// The access log above logs `user_agent` verbatim via `%user_agent` Display formatting,
+    /// with no escaping performed by this crate. That is only safe because a header value
+    /// containing CR/LF can never reach `req.headers()` in the first place: hyper/axum build
+    /// every incoming header value through `http::HeaderValue`'s own byte validation, which
+    /// this test exercises directly. If that upstream contract ever weakened (e.g. a
+    /// validation-bypassing construction path were introduced), a client could send
+    /// `User-Agent: real-agent\r\nfake-log-line: injected` and split/forge lines in the
+    /// structured access log or inject ANSI/terminal escapes into an operator's terminal.
+    #[test]
+    fn header_value_rejects_embedded_crlf_so_user_agent_cannot_forge_access_log_lines() {
+        assert!(
+            HeaderValue::from_str("Mozilla/5.0 \r\nfake-log-line: injected").is_err(),
+            "http::HeaderValue::from_str must reject header values containing CR/LF — this is \
+             the sole reason logging user_agent verbatim in the access log is safe from \
+             newline-log-injection and ANSI-terminal-escape-injection; if the http crate ever \
+             accepted CR/LF here, this control would silently fail"
+        );
+    }
+
     /// Every branch of the middleware (openapi passthrough, non-GET, proto-eligible GET) must
     /// log the same field set — a request that happens to take a different internal code path
     /// must not silently disappear from correlation-by-user_agent/request_id tooling.
