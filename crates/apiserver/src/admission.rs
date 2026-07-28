@@ -816,9 +816,12 @@ fn split_subresource(resource: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// `pub` (not `pub(crate)`), and re-exported from the crate root, so
-/// `benches/admission_review.rs` can call it directly — a criterion bench is a
-/// separate crate that only ever sees this crate's public API.
+/// Must stay `pub` (not `pub(crate)`): the crate-root `pub use` re-export at
+/// `lib.rs:49` (needed so `benches/admission_review.rs`, a separate crate, can
+/// call it) requires the re-exported item itself to already be externally
+/// reachable. `mod admission` being private is irrelevant here — `pub use`
+/// cannot upgrade a `pub(crate)` item to external visibility; rustc rejects
+/// that re-export outright (E0364/E0365).
 pub fn build_review(
     uid: &str,
     ctx: &AdmissionContext<'_>,
