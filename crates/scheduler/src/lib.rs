@@ -563,7 +563,7 @@ pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
 /// the message stops changing. Mirrors `scheduling_gate_status_patch`'s
 /// identical guard for the identical reason.
 pub fn failed_scheduling_status_patch(event: &Value, message: &str) -> Option<Value> {
-    if let Ok(watch_event) = serde_json::from_value::<WatchEvent<PodObject>>(event.clone()) {
+    if let Ok(watch_event) = WatchEvent::<PodObject>::deserialize(event) {
         let already_marked = watch_event.object.status.conditions.iter().any(|c| {
             c.condition_type.as_deref() == Some(POD_SCHEDULED)
                 && c.status.as_deref() == Some("False")
@@ -1947,6 +1947,10 @@ struct SchedulingEvent<'a> {
     event_type: &'a str,
     count: u32,
     source: EventSource<'a>,
+    #[serde(rename = "firstTimestamp")]
+    first_timestamp: &'a str,
+    #[serde(rename = "lastTimestamp")]
+    last_timestamp: &'a str,
 }
 
 /// Build a unique Event object name for `pod_name`.
@@ -1963,12 +1967,56 @@ pub fn scheduling_event_name(pod_name: &str, nanos: u128) -> String {
     format!("{pod_name}.{nanos:x}")
 }
 
+/// Convert nanoseconds since the Unix epoch to an RFC3339 UTC timestamp
+/// (`YYYY-MM-DDThh:mm:ssZ`) — the shape real kube-scheduler stamps on an
+/// Event's `firstTimestamp`/`lastTimestamp` (`metav1.Time`, second precision).
+///
+/// `nanos` is passed in (same reason as `scheduling_event_name`) so the
+/// conversion can be unit-tested without a clock dependency. Uses only
+/// `std::time` — no chrono dependency: this crate has no dependency on the
+/// apiserver crate (whose `util::secs_to_rfc3339` does the same conversion),
+/// so the calendar math (Howard Hinnant's public-domain `civil_from_days`) is
+/// duplicated here rather than shared.
+pub fn scheduling_event_timestamp(nanos: u128) -> String {
+    let secs = (nanos / 1_000_000_000) as i64;
+    let secs_of_day = secs.rem_euclid(86400);
+    let s = secs_of_day % 60;
+    let m = (secs_of_day / 60) % 60;
+    let h = (secs_of_day / 3600) % 24;
+    let days = secs.div_euclid(86400);
+
+    let z = days + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 /// Build the JSON payload for a Kubernetes Event recording a scheduling outcome
 /// (bind success or failure) for a pod.
 ///
 /// Pure function so the payload shape can be verified in tests without a network.
 /// Uses typed structs so field renames are compile errors, not silent bugs —
 /// mirrors `binding_payload`.
+///
+/// `timestamp` sets both `firstTimestamp` and `lastTimestamp` to the moment the
+/// event was created — real kube-scheduler always stamps both on a newly
+/// created Event (they only diverge on a later same-reason update, which this
+/// scheduler doesn't do: every scheduling attempt creates a fresh Event).
+/// Without it, `kubectl describe pod`'s AGE column and any conformance check
+/// on Event freshness (e.g. `WaitForEvent`'s age-based staleness filter) see a
+/// null timestamp instead of a real one.
 pub fn scheduling_event_payload(
     namespace: &str,
     pod_name: &str,
@@ -1976,6 +2024,7 @@ pub fn scheduling_event_payload(
     reason: &str,
     message: &str,
     event_type: &str,
+    timestamp: &str,
 ) -> Value {
     let event = SchedulingEvent {
         api_version: "v1",
@@ -1997,6 +2046,8 @@ pub fn scheduling_event_payload(
         source: EventSource {
             component: "u7s-scheduler",
         },
+        first_timestamp: timestamp,
+        last_timestamp: timestamp,
     };
     serde_json::to_value(event).expect("SchedulingEvent is always serializable")
 }
@@ -2031,6 +2082,7 @@ pub async fn emit_scheduling_event(
         .unwrap_or_default()
         .as_nanos();
     let event_name = scheduling_event_name(pod_name, nanos);
+    let timestamp = scheduling_event_timestamp(nanos);
     let payload = scheduling_event_payload(
         namespace,
         pod_name,
@@ -2038,6 +2090,7 @@ pub async fn emit_scheduling_event(
         reason,
         message,
         event_type,
+        &timestamp,
     );
     let path = events_path(namespace);
     let start = std::time::Instant::now();
@@ -5332,6 +5385,7 @@ mod tests {
             "FailedScheduling",
             "0/1 nodes are available: node(s) didn't match Pod's node affinity/selector.",
             "Warning",
+            "2026-01-01T00:00:00Z",
         );
         assert_eq!(payload["kind"], "Event");
         assert_eq!(payload["apiVersion"], "v1");
@@ -5354,6 +5408,7 @@ mod tests {
             "Scheduled",
             "Successfully assigned staging/web-pod to worker-2",
             "Normal",
+            "2026-01-01T00:00:00Z",
         );
         assert_eq!(payload["involvedObject"]["kind"], "Pod");
         assert_eq!(payload["involvedObject"]["name"], "web-pod");
@@ -5372,10 +5427,52 @@ mod tests {
             "Scheduled",
             "Successfully assigned default/my-pod to node-1",
             "Normal",
+            "2026-01-01T00:00:00Z",
         );
         assert_eq!(
             payload["message"], "Successfully assigned default/my-pod to node-1",
             "message must be preserved verbatim for the success-event Contains() check"
+        );
+    }
+
+    /// scheduling_event_payload must set firstTimestamp/lastTimestamp to the given
+    /// timestamp, not leave them null. Real kube-scheduler always sets both on a
+    /// newly created Event; a null firstTimestamp/lastTimestamp makes `kubectl get
+    /// events`'s AGE column show `<unknown>` and breaks any client that sorts or
+    /// filters Events by age (e.g. the Event garbage collector, or a conformance
+    /// wait that only accepts events newer than a cutoff).
+    #[test]
+    fn scheduling_event_payload_sets_first_and_last_timestamp() {
+        let payload = scheduling_event_payload(
+            "default",
+            "my-pod",
+            "my-pod.123",
+            "Scheduled",
+            "Successfully assigned default/my-pod to node-1",
+            "Normal",
+            "2026-07-28T14:45:00Z",
+        );
+        assert_eq!(
+            payload["firstTimestamp"], "2026-07-28T14:45:00Z",
+            "firstTimestamp must carry the real creation time, not be left null"
+        );
+        assert_eq!(
+            payload["lastTimestamp"], "2026-07-28T14:45:00Z",
+            "lastTimestamp must carry the real creation time, not be left null"
+        );
+    }
+
+    /// scheduling_event_timestamp must produce a timestamp client-go and kubectl
+    /// can actually parse and read back the same instant from — a wrong calendar
+    /// conversion would silently corrupt every Event's displayed age without
+    /// ever failing an HTTP call or a schema check.
+    #[test]
+    fn scheduling_event_timestamp_matches_known_epoch_offset() {
+        let nanos = 1_704_067_200u128 * 1_000_000_000;
+        assert_eq!(
+            scheduling_event_timestamp(nanos),
+            "2024-01-01T00:00:00Z",
+            "a known Unix timestamp must convert to its correct RFC3339 calendar date"
         );
     }
 
