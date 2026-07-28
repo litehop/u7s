@@ -125,7 +125,7 @@ pub fn parse_endpoints_event(event: &Value) -> EndpointsAction {
         object: EndpointsObject,
     }
 
-    let we: WatchEvent = match serde_json::from_value(event.clone()) {
+    let we: WatchEvent = match WatchEvent::deserialize(event) {
         Ok(e) => e,
         Err(_) => return EndpointsAction::None,
     };
