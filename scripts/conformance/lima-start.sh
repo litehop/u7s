@@ -23,9 +23,9 @@
 #
 # Troubleshooting:
 #   kubelet not registering:
-#     limactl shell lima-node sudo journalctl -u kubelet --no-pager -n 50
+#     limactl shell lima-node sudo journalctl -u kubelet --no-pager --utc -n 50
 #   CRI-O issues:
-#     limactl shell lima-node sudo journalctl -u crio --no-pager -n 30
+#     limactl shell lima-node sudo journalctl -u crio --no-pager --utc -n 30
 #     (pass --verbose to raise both kubelet --v and CRI-O's log_level to debug)
 #   Container sandbox failures ("unknown version specified"):
 #     Two possible causes:
@@ -681,7 +681,7 @@ done
 if [ "$FOUND" -eq 0 ]; then
   echo "ERROR: ${VM_NAME} did not appear within 60s." >&2
   echo "--- kubelet log (last 30 lines) ---" >&2
-  limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager -n 30 >&2
+  limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager --utc -n 30 >&2
   exit 1
 fi
 

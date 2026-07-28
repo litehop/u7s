@@ -202,7 +202,7 @@ kubectl --kubeconfig temp/u7s/kubeconfig get nodes
 
 If the node does not register:
 ```bash
-limactl shell <VM> sudo journalctl -u kubelet --no-pager -n 30
+limactl shell <VM> sudo journalctl -u kubelet --no-pager --utc -n 30
 ```
 
 ---
@@ -376,14 +376,24 @@ form rather than hunting for a kubectl binary inside the VM (there isn't one).
 | apiserver           | `temp/u7s/apiserver.log`                           |
 | konnectivity-server | `temp/u7s/konnectivity-server.log`                 |
 | KCM                 | `limactl shell <VM> tail -f /tmp/kcm.log`                     |
-| kubelet             | `limactl shell <VM> sudo journalctl -u kubelet -n 50`         |
+| kubelet             | `limactl shell <VM> sudo journalctl -u kubelet --utc -n 50`   |
 | konnectivity-agent  | `kubectl --kubeconfig temp/u7s/kubeconfig logs -n kube-system konnectivity-agent` |
+
+apiserver.log and scheduler.log are always UTC (Rust `tracing` default). `<TIMESTAMP>`
+in run-dir names (below) is also UTC. The VM's system timezone is whatever the host's
+is (e.g. JST) — `journalctl` without `--utc` renders its own prefix in that local time,
+so always pass `--utc` when reading the journal by hand or the wrapper prefix will be
+hours off from apiserver.log. Note this only fixes the journal wrapper's own prefix:
+klog itself has no UTC option, so the *embedded* `I0725 HH:MM:SS...` line inside
+kubelet.log, and all of kcm.log / konnectivity-server.log (also klog), still render in
+whatever timezone their own process considers local — don't assume they're UTC just
+because the surrounding journal prefix now is.
 
 After a sonobuoy run completes, `06-run-sonobuoy.sh` automatically collects all logs into
 `temp/e2e/<TIMESTAMP>-<FOCUS>/host-logs/`: `apiserver.log`, `scheduler.log`,
 `konnectivity-server.log`, `kcm.log` (from in-VM `/tmp/kcm.log`), and `kubelet.log`
-(from `journalctl -u kubelet --no-pager` — captures the full boot history, including any
-crash-loops). To collect manually (e.g. after a `--stack-only` run):
+(from `journalctl -u kubelet --no-pager --utc` — captures the full boot history,
+including any crash-loops). To collect manually (e.g. after a `--stack-only` run):
 ```bash
-limactl shell <VM> sudo journalctl -u kubelet --no-pager > kubelet.log
+limactl shell <VM> sudo journalctl -u kubelet --no-pager --utc > kubelet.log
 ```

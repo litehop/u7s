@@ -198,7 +198,7 @@ fi
 
 limactl shell "$VM_NAME" sudo cp "$HOST_PATH" /tmp/sonobuoy-results.tar.gz
 
-TIMESTAMP=$(date +%m%d-%H%M)
+TIMESTAMP=$(date -u +%m%d-%H%M)
 FOCUS_SLUG=$(echo "${FOCUS:-conformance}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')
 OUTFILE="$WORKDIR/../e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
 mkdir -p "$WORKDIR/../e2e"
@@ -222,9 +222,9 @@ NODES=("$VM_NAME")
 for NODE in "${NODES[@]}"; do
   SUFFIX=""
   [ "$NODE" != "$VM_NAME" ] && SUFFIX="-${NODE}"
-  limactl shell "$NODE" sudo journalctl -u kubelet --no-pager \
+  limactl shell "$NODE" sudo journalctl -u kubelet --no-pager --utc \
     > "$HOST_LOGS_DIR/kubelet${SUFFIX}.log" 2>/dev/null || true
-  limactl shell "$NODE" sudo journalctl -u crio --no-pager \
+  limactl shell "$NODE" sudo journalctl -u crio --no-pager --utc \
     > "$HOST_LOGS_DIR/crio${SUFFIX}.log" 2>/dev/null || true
 done
 limactl shell "$VM_NAME" sudo cat /tmp/kcm.log \
