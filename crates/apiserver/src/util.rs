@@ -121,6 +121,45 @@ pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::st
     }
 }
 
+/// Deserializes a `watch` query parameter, accepting `1`/`0` as aliases for `true`/`false`.
+///
+/// kubectl and client-go historically send `?watch=1` in some code paths, and it's a
+/// documented Kubernetes API accept form alongside `watch=true`. A plain `Option<bool>`
+/// field only parses `"true"`/`"false"` (Rust's `bool::from_str`), so `?watch=1` fails
+/// query-string deserialization and the request gets rejected with HTTP 400 before the
+/// handler ever runs — even though `watch=true` for the exact same intent works fine.
+///
+/// Must be paired with `#[serde(default)]` on the field: serde's derive macro only
+/// auto-defaults a missing `Option<T>` key to `None` when there's no `deserialize_with`;
+/// adding `deserialize_with` alone would turn an absent `?watch` param into a hard error.
+pub(crate) fn deserialize_watch_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct WatchBoolVisitor;
+
+    impl serde::de::Visitor<'_> for WatchBoolVisitor {
+        type Value = Option<bool>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("`true`, `false`, `1`, or `0`")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match v {
+                "true" | "1" => Ok(Some(true)),
+                "false" | "0" => Ok(Some(false)),
+                other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+            }
+        }
+    }
+
+    deserializer.deserialize_str(WatchBoolVisitor)
+}
+
 /// Returns the current UTC time formatted as RFC3339 (`YYYY-MM-DDThh:mm:ssZ`).
 /// Uses only `std::time` — no chrono dependency.
 pub fn utc_now_rfc3339() -> String {

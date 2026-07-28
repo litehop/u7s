@@ -24,6 +24,7 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct CollectionQuery {
+    #[serde(default, deserialize_with = "crate::util::deserialize_watch_bool")]
     pub watch: Option<bool>,
     #[serde(rename = "resourceVersion")]
     pub resource_version: Option<u64>,
@@ -1547,6 +1548,41 @@ mod watch_tests {
             "resourceVersion (the wire format every real client sends) must populate \
              resource_version; a missing #[serde(rename)] leaves it None and silently \
              resets every watch to a full history replay"
+        );
+    }
+
+    /// kubectl and client-go historically send `?watch=1` (not just `?watch=true`) — a
+    /// documented Kubernetes API accept form. Before the fix, `watch: Option<bool>` only
+    /// parsed Rust's `bool::from_str` ("true"/"false"), so `?watch=1` failed query-string
+    /// deserialization and the request never reached the handler at all (axum's Query
+    /// extractor rejection maps to HTTP 400). This test fails on revert: `try_from_uri`
+    /// would return `Err`, not a parsed `watch: Some(true)`.
+    #[test]
+    fn collection_query_accepts_watch_equals_1_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/namespaces/default/pods?watch=1".parse().unwrap();
+        let Query(q) = Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=1 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(true),
+            "?watch=1 must resolve to watch:Some(true), the same as ?watch=true, so the \
+             handler routes to the streaming watch path instead of a plain list"
+        );
+    }
+
+    /// Mirror of the `watch=1` test above for the `watch=0` alias of `watch=false`.
+    /// `?watch=0` must resolve to `Some(false)` so the handler stays on the normal list
+    /// path — before the fix this also 400'd instead of falling through to list mode.
+    #[test]
+    fn collection_query_accepts_watch_equals_0_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/namespaces/default/pods?watch=0".parse().unwrap();
+        let Query(q) = Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=0 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(false),
+            "?watch=0 must resolve to watch:Some(false) so the request stays on the \
+             normal list path, not the watch stream"
         );
     }
 }

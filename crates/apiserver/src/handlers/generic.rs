@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct CollectionQuery {
+    #[serde(default, deserialize_with = "crate::util::deserialize_watch_bool")]
     pub watch: Option<bool>,
     #[serde(rename = "resourceVersion")]
     pub resource_version: Option<u64>,
@@ -3183,6 +3184,41 @@ mod collection_query_rename_tests {
         assert!(
             q.resource_version.is_none(),
             "snake_case 'resource_version' must NOT populate resource_version after rename"
+        );
+    }
+
+    /// kubectl and client-go historically send `?watch=1` (not just `?watch=true`) — a
+    /// documented Kubernetes API accept form. Before the fix, `watch: Option<bool>` only
+    /// parsed Rust's `bool::from_str` ("true"/"false"), so a real `?watch=1` request to any
+    /// of the many endpoints sharing this `CollectionQuery` (list_resource, list_namespaces,
+    /// CRD/CR list-or-watch, CSR list-or-watch, ...) failed axum's Query extraction and
+    /// never reached the handler (Query rejection maps to HTTP 400). This test fails on
+    /// revert: `try_from_uri` would return `Err`, not `watch: Some(true)`.
+    #[test]
+    fn watch_equals_1_is_accepted_as_true_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/configmaps?watch=1".parse().unwrap();
+        let axum::extract::Query(q) = axum::extract::Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=1 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(true),
+            "?watch=1 must resolve to watch:Some(true), the same as ?watch=true, so the \
+             handler routes to the streaming watch path instead of a plain list"
+        );
+    }
+
+    /// Mirror of the `watch=1` test above for the `watch=0` alias of `watch=false`. Before
+    /// the fix this also 400'd instead of falling through to the normal list response.
+    #[test]
+    fn watch_equals_0_is_accepted_as_false_for_kubectl_client_go_compat() {
+        let uri: axum::http::Uri = "/api/v1/configmaps?watch=0".parse().unwrap();
+        let axum::extract::Query(q) = axum::extract::Query::<CollectionQuery>::try_from_uri(&uri)
+            .expect("?watch=0 must deserialize, not 400 — client-go/kubectl compat form");
+        assert_eq!(
+            q.watch,
+            Some(false),
+            "?watch=0 must resolve to watch:Some(false) so the request stays on the \
+             normal list path, not the watch stream"
         );
     }
 }
