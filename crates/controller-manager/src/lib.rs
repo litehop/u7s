@@ -85,8 +85,8 @@ struct SaObject {
 ///
 /// Namespace defaults to "default" when missing, matching Kubernetes behaviour.
 pub fn parse_sa_added_event(event: &Value) -> Option<(String, String)> {
-    let watch_event: WatchEvent<SaObject> =
-        serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
+    let watch_event: WatchEvent<SaObject> = WatchEvent::<SaObject>::deserialize(event)
+        .unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
             object: SaObject::default(),
         });
@@ -185,8 +185,8 @@ pub struct ClusterRoleSnapshot {
 ///
 /// Returns `None` if the event is malformed or the ClusterRole has no name.
 pub fn parse_cluster_role_event(event: &Value) -> Option<(String, ClusterRoleSnapshot)> {
-    let watch_event: WatchEvent<ClusterRoleObject> = serde_json::from_value(event.clone())
-        .unwrap_or_else(|_| WatchEvent {
+    let watch_event: WatchEvent<ClusterRoleObject> =
+        WatchEvent::<ClusterRoleObject>::deserialize(event).unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
             object: ClusterRoleObject::default(),
         });

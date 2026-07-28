@@ -88,7 +88,7 @@ pub const NON_CORE_DRAIN_RESOURCES: &[(&str, &str, &str)] = &[
 
 /// Parse a namespace watch event into an action.
 pub fn parse_ns_event(event: &Value) -> NsAction {
-    let watch_event: NsWatchEvent = match serde_json::from_value(event.clone()) {
+    let watch_event: NsWatchEvent = match NsWatchEvent::deserialize(event) {
         Ok(e) => e,
         Err(_) => return NsAction::None,
     };
