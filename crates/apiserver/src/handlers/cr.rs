@@ -162,6 +162,9 @@ pub struct CrContext {
     /// different set, so this is scoped to the specific version a request named — never
     /// the CRD as a whole.
     pub selectable_fields: Vec<String>,
+    /// (CRD group, matched version name, CRD's own resourceVersion) — the
+    /// `cr_schema_cache` key for `schema`. See `state::CrSchemaCache` for why.
+    pub schema_cache_key: crate::state::CrSchemaCacheKey,
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
@@ -241,6 +244,11 @@ pub async fn find_crd<S: Store>(
             .filter(|c| c["strategy"].as_str() == Some("Webhook"))
             .and_then(|c| c["webhook"]["clientConfig"].as_object())
             .map(|cfg| serde_json::Value::Object(cfg.clone()));
+        let schema_cache_key = (
+            crd.spec.group.clone(),
+            matched_version.name.clone(),
+            crd.metadata.resource_version.clone(),
+        );
         return Ok(CrContext {
             kind: crd.spec.names.kind.clone(),
             namespaced,
@@ -248,6 +256,7 @@ pub async fn find_crd<S: Store>(
             schema,
             conversion_webhook_client_config,
             selectable_fields,
+            schema_cache_key,
         });
     }
 
@@ -476,6 +485,7 @@ fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::st
 fn validate_cr_schema(
     obj: &serde_json::Value,
     ctx: &CrContext,
+    cache: &crate::state::CrSchemaCache,
 ) -> Result<(), crate::status::StatusError> {
     let Some(schema) = &ctx.schema else {
         return Ok(());
@@ -484,17 +494,27 @@ fn validate_cr_schema(
     // oversized patterns and patternProperties, but a CRD that bypassed that check
     // (installed before it existed, restored from backup, or written directly to the
     // store) must not still be able to trigger boon's O(n^2) ECMA-compat rewrite on
-    // every CR write against it.
+    // every CR write against it. This runs on every call, cache hit or miss.
     crate::handlers::crd::walk_schema_dos_bounds(schema, "openAPIV3Schema")?;
-    let mut schemas = boon::Schemas::new();
-    let mut compiler = boon::Compiler::new();
-    compiler
-        .add_resource("schema.json", schema.clone())
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let idx = compiler
-        .compile("schema.json", &mut schemas)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    schemas.validate(obj, idx).map_err(|e| {
+
+    let compiled = match cache.get(&ctx.schema_cache_key) {
+        Some(compiled) => compiled,
+        None => {
+            let mut schemas = boon::Schemas::new();
+            let mut compiler = boon::Compiler::new();
+            compiler
+                .add_resource("schema.json", schema.clone())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let index = compiler
+                .compile("schema.json", &mut schemas)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let compiled = std::sync::Arc::new(crate::state::CompiledCrSchema { schemas, index });
+            cache.insert(ctx.schema_cache_key.clone(), compiled.clone());
+            compiled
+        }
+    };
+
+    compiled.schemas.validate(obj, compiled.index).map_err(|e| {
         Status::unprocessable_entity(format!(
             "CR schema validation failed: {}",
             enum_violation_message(&e, obj)
@@ -1303,7 +1323,7 @@ pub async fn create_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
 
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
@@ -1401,7 +1421,7 @@ pub async fn replace_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -2117,7 +2137,7 @@ pub async fn create_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
 
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -2214,7 +2234,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -2524,7 +2544,7 @@ pub async fn patch_cr<S: Store>(
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
-        validate_cr_schema(&obj, &ctx)?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
         let admission_ctx = AdmissionContext {
             group: &group,
             version: &version,
@@ -2614,7 +2634,7 @@ pub async fn patch_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
 
     // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
     // controller completes an Orphan-marked delete_cr: it strips ownerReferences from every
@@ -2729,7 +2749,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
-        validate_cr_schema(&obj, &ctx)?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
         let admission_ctx = AdmissionContext {
             group: &group,
             version: &version,
@@ -2819,7 +2839,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
 
     // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
     // controller completes an Orphan-marked delete_cr_namespaced: it strips ownerReferences
@@ -5949,8 +5969,13 @@ mod tests {
             schema: Some(schema),
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
+            schema_cache_key: ("test".into(), "v1".into(), "0".into()),
         };
-        validate_cr_schema(obj, &ctx)
+        // Fresh cache per call: these tests exercise schema-correctness, not caching, and
+        // every call here uses the same fixed schema_cache_key — sharing one cache across
+        // calls with different schemas would return the wrong compiled schema.
+        let cache = crate::state::CrSchemaCache::new();
+        validate_cr_schema(obj, &ctx, &cache)
     }
 
     // type:object with valid object passes.
@@ -6055,6 +6080,171 @@ mod tests {
                 .unwrap_or("")
                 .contains("exceeds maximum length"),
             "error must identify the oversized-pattern ReDoS defense, not a generic failure: {json}"
+        );
+    }
+
+    // A single high-privilege CRD install must not turn into a repeatable amplification
+    // vector: without a cache, every CR create/update/patch against that CRD pays boon's
+    // parse-and-regex-compile cost again (measured ~657ms for the max-allowed 1024-byte
+    // pattern) even though the schema never changed. This asserts the second write against
+    // the same CRD generation reuses the compiled schema instead of recompiling — a compile
+    // counter, not timing, because a real compile is slow enough to make timing-based
+    // assertions flaky under CI load.
+    #[test]
+    fn cr_schema_cache_avoids_boon_recompile_on_repeated_writes_against_same_crd_version() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": { "type": "object" } }
+        });
+        let ctx = CrContext {
+            kind: "Test".into(),
+            namespaced: false,
+            has_status_subresource: false,
+            schema: Some(schema),
+            conversion_webhook_client_config: None,
+            selectable_fields: vec![],
+            schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
+        };
+        // Local to this test (not a shared/global counter) so parallel test execution in
+        // the same process cannot pollute the count.
+        let cache = crate::state::CrSchemaCache::new();
+        let value = serde_json::json!({ "spec": {} });
+
+        assert!(
+            validate_cr_schema(&value, &ctx, &cache).is_ok(),
+            "first write must validate"
+        );
+        assert!(
+            validate_cr_schema(&value, &ctx, &cache).is_ok(),
+            "second write must validate"
+        );
+
+        assert_eq!(
+            cache.compile_count(),
+            1,
+            "a second CR write against the same CRD generation (same group/version/resourceVersion) \
+             must reuse the cached compiled schema, not pay boon::Compiler::compile's cost again"
+        );
+    }
+
+    // If the cache ever failed to distinguish CRD generations (e.g. keyed on group+version
+    // only, ignoring resourceVersion), a CR write following a legitimate CRD schema update
+    // would silently validate against the OLD schema forever — a correctness bug, not just a
+    // missed optimization. Two different resourceVersions (as a real CRD update produces) must
+    // each force their own compile.
+    #[test]
+    fn cr_schema_cache_rebuilds_on_crd_schema_update() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": { "type": "object" } }
+        });
+        let make_ctx = |rv: &str| CrContext {
+            kind: "Test".into(),
+            namespaced: false,
+            has_status_subresource: false,
+            schema: Some(schema.clone()),
+            conversion_webhook_client_config: None,
+            selectable_fields: vec![],
+            schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
+        };
+        let cache = crate::state::CrSchemaCache::new();
+        let value = serde_json::json!({ "spec": {} });
+
+        assert!(validate_cr_schema(&value, &make_ctx("1"), &cache).is_ok());
+        assert!(validate_cr_schema(&value, &make_ctx("2"), &cache).is_ok());
+
+        assert_eq!(
+            cache.compile_count(),
+            2,
+            "a CRD update (new resourceVersion) must force a fresh compile — reusing the old \
+             compiled schema after the CRD's schema changed would silently validate CRs against \
+             stale rules"
+        );
+    }
+
+    // Without eviction, a CRD's compiled schema stays in the cache map forever even after the
+    // CRD is deleted and can never be looked up again (a fresh resourceVersion after a later
+    // recreate would never collide with the deleted one) — an unbounded memory leak for any
+    // workload that repeatedly creates and deletes CRDs (e.g. CI test churn, operators that
+    // recreate CRDs on upgrade). This asserts delete_crd's eviction actually removes the entry.
+    #[tokio::test]
+    async fn cr_schema_cache_evicts_on_crd_delete() {
+        let state = make_state();
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": { "spec": { "type": "object" } }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD with schema"
+        );
+
+        let ctx = find_crd(&state, "example.io", "v1", "widgets")
+            .await
+            .expect("CRD must be found right after installing it");
+        let key = ctx.schema_cache_key.clone();
+
+        // Populate the cache via the real validation path (same code every CR write uses).
+        validate_cr_schema(
+            &serde_json::json!({ "spec": {} }),
+            &ctx,
+            &state.cr_schema_cache,
+        )
+        .expect("CR body must validate against the installed schema");
+        assert!(
+            state.cr_schema_cache.contains(&key),
+            "sanity check: the cache must be populated before delete for this test to mean anything"
+        );
+
+        assert!(
+            crd::delete_crd(
+                State(state.clone()),
+                Path("widgets.example.io".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
+            "delete CRD"
+        );
+
+        assert!(
+            !state.cr_schema_cache.contains(&key),
+            "deleting a CRD must evict its compiled schema from the cache — otherwise the map \
+             grows by one entry per CRD generation forever, even for CRDs that can never be \
+             looked up again"
         );
     }
 

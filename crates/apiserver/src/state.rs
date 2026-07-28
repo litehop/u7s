@@ -197,6 +197,72 @@ impl ApiServiceCache {
     }
 }
 
+/// A compiled CRD `openAPIV3Schema`: the `boon::Schemas` set plus the root schema's
+/// index within it (both are required to call `Schemas::validate`).
+pub struct CompiledCrSchema {
+    pub schemas: boon::Schemas,
+    pub index: boon::SchemaIndex,
+}
+
+/// (CRD `spec.group`, served version name, CRD's own `metadata.resourceVersion`) —
+/// identifies exactly one compiled `openAPIV3Schema`.
+pub type CrSchemaCacheKey = (String, String, String);
+
+/// Cache of compiled CRD schemas, so `boon::Compiler::compile` runs once per CRD
+/// generation instead of once per CR write.
+///
+/// The resourceVersion is part of the key (not just group+version) because it comes
+/// from the store's global, never-reused revision counter and changes on every write
+/// to the CRD — so a cache hit can only ever be the schema compiled from that exact
+/// CRD generation, and a schema-changing CRD update is always a guaranteed miss with
+/// no extra bookkeeping. `handlers/crd.rs` calls `invalidate` after a CRD write and
+/// eviction on delete purely to reclaim the now-unreachable previous-generation entry
+/// rather than leaving it in the map forever; correctness does not depend on it.
+pub struct CrSchemaCache {
+    inner: RwLock<HashMap<CrSchemaCacheKey, Arc<CompiledCrSchema>>>,
+    /// Counts `insert` calls, i.e. cache-miss compiles. Per-instance (not a global static)
+    /// so tests that each build their own `CrSchemaCache` get an isolated count even when
+    /// `cargo test` runs them concurrently in the same process.
+    #[cfg(test)]
+    compile_count: std::sync::atomic::AtomicUsize,
+}
+
+impl CrSchemaCache {
+    pub fn new() -> Self {
+        CrSchemaCache {
+            inner: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            compile_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn get(&self, key: &CrSchemaCacheKey) -> Option<Arc<CompiledCrSchema>> {
+        self.inner.read().unwrap().get(key).cloned()
+    }
+
+    pub fn insert(&self, key: CrSchemaCacheKey, value: Arc<CompiledCrSchema>) {
+        #[cfg(test)]
+        self.compile_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.write().unwrap().insert(key, value);
+    }
+
+    pub fn invalidate(&self, key: &CrSchemaCacheKey) {
+        self.inner.write().unwrap().remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: &CrSchemaCacheKey) -> bool {
+        self.inner.read().unwrap().contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compile_count(&self) -> usize {
+        self.compile_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub struct AppState<S = SqliteStore> {
     pub store: Arc<S>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
@@ -263,6 +329,9 @@ pub struct AppState<S = SqliteStore> {
     /// Per-namespace lock serializing ResourceQuota check-then-write critical sections.
     /// See `QuotaAdmissionLocks` for why this is required.
     pub quota_admission_locks: QuotaAdmissionLocks,
+    /// Cache of compiled CRD `openAPIV3Schema`s, keyed by CRD generation.
+    /// See `CrSchemaCache` for the invalidation strategy.
+    pub cr_schema_cache: Arc<CrSchemaCache>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -326,6 +395,7 @@ impl<S> Clone for AppState<S> {
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
             quota_admission_locks: self.quota_admission_locks.clone(),
+            cr_schema_cache: self.cr_schema_cache.clone(),
         }
     }
 }
@@ -517,6 +587,7 @@ impl<S: Store> AppState<S> {
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),
             quota_admission_locks: QuotaAdmissionLocks::new(),
+            cr_schema_cache: Arc::new(CrSchemaCache::new()),
         }
     }
 
