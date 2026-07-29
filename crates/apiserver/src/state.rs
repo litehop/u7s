@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -304,6 +304,23 @@ impl CrConversionCache {
 
     pub fn invalidate(&self, key: &CrConversionCacheKey) {
         self.inner.write().unwrap().remove(key);
+    }
+
+    /// Remove every entry keyed on `rv` (any target apiVersion) — called after a CR
+    /// bearing that resourceVersion is hard-deleted, since the never-reused rv means none
+    /// of its entries can ever be looked up again. Memory hygiene only.
+    pub fn invalidate_by_rv(&self, rv: &str) {
+        self.inner.write().unwrap().retain(|key, _| key.0 != rv);
+    }
+
+    /// Remove every entry whose target apiVersion is in `target_api_versions` — called
+    /// after a CRD is deleted, since none of its served versions can ever be requested
+    /// again. Memory hygiene only, same rationale as `invalidate_by_rv`.
+    pub fn invalidate_by_target_api_versions(&self, target_api_versions: &HashSet<String>) {
+        self.inner
+            .write()
+            .unwrap()
+            .retain(|key, _| !target_api_versions.contains(&key.1));
     }
 
     #[cfg(test)]

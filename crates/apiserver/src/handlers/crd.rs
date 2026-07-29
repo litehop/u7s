@@ -6,6 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::handlers::json_patch::{
@@ -700,6 +701,19 @@ pub async fn delete_crd<S: Store>(
         .map_err(|e| store_err_crd(e, &name))?;
 
     evict_cr_schema_cache(&state, &group, &versions, &resource_version);
+
+    // A deleted CRD's versions can never be requested (or converted to) again, so every
+    // cr_conversion_cache entry targeting one of them is now permanently unreachable —
+    // unlike evict_cr_schema_cache above, this sweeps ALL rvs cached under these target
+    // versions, not just one CRD generation's, since conversion-cache entries are keyed
+    // per source-object write, not per CRD generation.
+    if !versions.is_empty() {
+        let target_api_versions: HashSet<String> =
+            versions.iter().map(|v| format!("{group}/{v}")).collect();
+        state
+            .cr_conversion_cache
+            .invalidate_by_target_api_versions(&target_api_versions);
+    }
 
     // Write a tombstone so CR handlers can return 410 Gone (not 404) for this
     // group after deletion. Informers treat 410 as "stop watching" and 404 as
