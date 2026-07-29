@@ -717,6 +717,16 @@ When a worker returns from a VM/sonobuoy-touching bead:
   the worker back.
 - **Generic prompts produce generic work.** Always include file:line
   citations + concrete fix sketches.
+- **Timing PoCs asked to reproduce a "slow / minutes of CPU" claim without a wall-clock
+  cap.** When a security or perf brief asks a worker to empirically confirm a pathological
+  runtime cost (e.g. "compile boon on a 1MB pattern to confirm the audit's O(n²) claim"),
+  the brief MUST specify a hard wall-clock cap (60-180s typical) AND direct the worker to
+  demonstrate the scaling via GEOMETRICALLY-increasing sizes under the cap, not by running
+  the worst case to completion. Two data points at N and 4N with a ~16x time ratio proves
+  quadratic scaling as rigorously as one data point at 1024N taking minutes — and doesn't
+  burn 10+ minutes of wall-clock. Also: any such PoC should be `#[test] #[ignore]` so it
+  doesn't fire in normal `cargo test`, which the project convention says completes in a few
+  minutes end-to-end. See `bd memories timing-pocs-must-be-bounded`.
 - **Findings docs leak into PRs.** `ai/findings/` is gitignored; never
   commit one.
 - **Mayor force-merges through a failing check with `--admin`.** NEVER use
