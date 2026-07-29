@@ -375,6 +375,20 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
     Ok(())
 }
 
+/// Evict `state.cr_conversion_cache` entries left behind by a CR that was just
+/// hard-deleted. `deleted_resource_version` is the deleted object's own stored
+/// `metadata.resourceVersion` — every entry keyed on it (any target apiVersion) can
+/// never be looked up again, since a deleted object's rv is never reused. Memory hygiene
+/// only: correctness never depended on this (see `CrConversionCache`'s doc comment).
+fn evict_cr_conversion_cache<S: Store>(
+    state: &AppState<S>,
+    deleted_resource_version: Option<&str>,
+) {
+    if let Some(rv) = deleted_resource_version {
+        state.cr_conversion_cache.invalidate_by_rv(rv);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Store key helpers
 // ---------------------------------------------------------------------------
@@ -1659,6 +1673,8 @@ pub async fn delete_cr<S: Store>(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
+    evict_cr_conversion_cache(&state, obj.resource_version());
+
     // Background cascade-delete dependents after the owner is hard-deleted. Orphan-marked
     // owners never reach here — they returned above via the soft-delete branch and defer to
     // KCM's GC controller + patch_cr's finalizer-drain-complete check (complete_cr_finalizer_drain).
@@ -2377,6 +2393,8 @@ pub async fn delete_cr_namespaced<S: Store>(
         .delete(&key, None)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+
+    evict_cr_conversion_cache(&state, obj.resource_version());
 
     // Background cascade-delete dependents after the owner is hard-deleted. Orphan-marked
     // owners never reach here — they returned above via the soft-delete branch and defer to
@@ -8874,6 +8892,284 @@ mod tests {
             "the stamped resourceVersion must equal the store's own revision counter for \
              this key — the invariant CrConversionCache's cache-key safety depends on (see \
              bd memory store-revision-counter-monotonic-never-reused)"
+        );
+    }
+
+    /// Deleting a CR must evict every `cr_conversion_cache` entry keyed on its own rv —
+    /// without this, a long-running cluster with heavy CR churn accumulates one
+    /// unreachable cache entry per (write, watched target version) forever, since a
+    /// deleted object's rv can never be looked up again (see
+    /// `store-revision-counter-monotonic-never-reused`). Fails on revert: without the
+    /// eviction call, the entries inserted below survive the delete untouched.
+    #[tokio::test]
+    async fn cr_conversion_cache_evicts_on_cr_delete_removes_matching_rv_entries() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("evict-on-delete-widget"),
+        )
+        .await
+        .expect("create must succeed")
+        .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rv = created["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("create response must include resourceVersion")
+            .to_string();
+
+        // Two entries under the deleted object's own rv, at different target versions —
+        // exactly what two watchers of different served versions would have cached for
+        // this write.
+        state.cr_conversion_cache.insert(
+            (rv.clone(), "example.io/v2".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+        );
+        state.cr_conversion_cache.insert(
+            (rv.clone(), "example.io/v3".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "example.io/v3"})),
+        );
+        // An entry under a DIFFERENT rv (a different write) must survive this delete —
+        // eviction must be scoped to the deleted object's own rv, not a blanket clear.
+        state.cr_conversion_cache.insert(
+            ("999".to_string(), "example.io/v2".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+        );
+
+        delete_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "evict-on-delete-widget".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&(rv.clone(), "example.io/v2".to_string())),
+            "deleting the CR must evict every cache entry keyed on its own rv — otherwise \
+             this entry can never be reclaimed even though it can never be served again"
+        );
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&(rv, "example.io/v3".to_string())),
+            "eviction on delete must cover every target-version entry cached under the \
+             deleted object's rv, not just the first one found"
+        );
+        assert!(
+            state
+                .cr_conversion_cache
+                .contains(&("999".to_string(), "example.io/v2".to_string())),
+            "an entry cached under a DIFFERENT write's rv must survive this delete — \
+             eviction must be scoped to the deleted object's own rv only, never a blanket \
+             clear of the whole cache"
+        );
+    }
+
+    /// Deleting a CRD must evict every `cr_conversion_cache` entry whose target apiVersion
+    /// is one of that CRD's own versions — once a CRD is gone, none of its versions can
+    /// ever be requested (or converted to) again, so those entries are permanently
+    /// unreachable. Fails on revert: without the eviction call, entries A/v1 and A/v2
+    /// below survive CRD A's deletion untouched.
+    #[tokio::test]
+    async fn cr_conversion_cache_evicts_on_crd_delete_removes_all_entries_for_that_crds_versions() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+
+        let crd_a = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gizmos.multiver.example.com" },
+                "spec": {
+                    "group": "multiver.example.com",
+                    "names": {
+                        "plural": "gizmos",
+                        "singular": "gizmo",
+                        "kind": "Gizmo",
+                        "listKind": "GizmoList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true },
+                        { "name": "v2", "served": true, "storage": false }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_a,
+        )
+        .await
+        .expect("install CRD A");
+
+        let crd_b = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.other.example.com" },
+                "spec": {
+                    "group": "other.example.com",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_b,
+        )
+        .await
+        .expect("install CRD B");
+
+        state.cr_conversion_cache.insert(
+            ("10".to_string(), "multiver.example.com/v1".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "multiver.example.com/v1"})),
+        );
+        state.cr_conversion_cache.insert(
+            ("10".to_string(), "multiver.example.com/v2".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "multiver.example.com/v2"})),
+        );
+        state.cr_conversion_cache.insert(
+            ("20".to_string(), "other.example.com/v1".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "other.example.com/v1"})),
+        );
+
+        crd::delete_crd(
+            State(state.clone()),
+            Path("gizmos.multiver.example.com".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("delete CRD A must succeed");
+
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&("10".to_string(), "multiver.example.com/v1".to_string())),
+            "deleting CRD A must evict cache entries targeting its v1 — that version can \
+             never be requested again once the CRD is gone"
+        );
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&("10".to_string(), "multiver.example.com/v2".to_string())),
+            "deleting CRD A must evict cache entries for EVERY one of its versions, not \
+             just the first"
+        );
+        assert!(
+            state
+                .cr_conversion_cache
+                .contains(&("20".to_string(), "other.example.com/v1".to_string())),
+            "CRD B's entry must survive CRD A's deletion — eviction must be scoped to the \
+             deleted CRD's own versions, never a blanket clear of the whole cache"
+        );
+    }
+
+    /// Positive control for eviction: after an entry is evicted, converting the same
+    /// (rv, target version) again must still work and produce the identical result as
+    /// before — just via a fresh webhook call instead of a cache hit. This guards against
+    /// an eviction bug that corrupts the cache-miss path itself (as opposed to evicting
+    /// the wrong keys, which the other two eviction tests already cover).
+    #[tokio::test]
+    async fn cr_conversion_cache_no_regression_on_conversion_correctness_after_eviction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(counting_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+
+        let source = || {
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "w", "resourceVersion": "5" }
+            })
+        };
+
+        let mut items_before = vec![source()];
+        convert_cr_list_items(
+            &state,
+            Some(&client_config),
+            &mut items_before,
+            "example.io/v2",
+        )
+        .await
+        .expect("first conversion must succeed");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "first call must miss and webhook-convert"
+        );
+
+        state.cr_conversion_cache.invalidate_by_rv("5");
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&("5".to_string(), "example.io/v2".to_string())),
+            "eviction must have actually removed the entry for this positive control to \
+             mean anything"
+        );
+
+        let mut items_after = vec![source()];
+        convert_cr_list_items(
+            &state,
+            Some(&client_config),
+            &mut items_after,
+            "example.io/v2",
+        )
+        .await
+        .expect("conversion after eviction must still succeed");
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "with the entry evicted, the second call must be a fresh cache miss that \
+             re-invokes the webhook rather than silently returning stale/absent data"
+        );
+        assert_eq!(
+            items_before[0], items_after[0],
+            "eviction must never change the CONTENT a client observes — the same source \
+             object converted to the same target version must produce an identical body \
+             whether served from cache or freshly computed after an eviction"
         );
     }
 
