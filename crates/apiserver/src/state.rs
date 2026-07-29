@@ -263,6 +263,60 @@ impl CrSchemaCache {
     }
 }
 
+/// (CR object's own stored `metadata.resourceVersion`, target `apiVersion`) — identifies
+/// exactly one webhook-converted CR body.
+pub type CrConversionCacheKey = (String, String);
+
+/// Cache of CR conversion webhook results, so a cross-version conversion runs once per
+/// (write, target version) instead of once per LIST request or watcher that happens to
+/// observe that write.
+///
+/// The object's own resourceVersion is part of the key because the store stamps it from
+/// its global, never-reused revision counter on every write (`sqlite.rs`'s
+/// `stamp_resource_version`; see bd memory `store-revision-counter-monotonic-never-reused`)
+/// — so a cache hit can only ever be the conversion computed for that exact write, and a
+/// later write to the same object is always a guaranteed miss with no extra bookkeeping.
+/// `target_api_version` is a mandatory, explicit part of the key (never inferred) because
+/// the same source object+rv can be served at several different target versions to
+/// different watchers concurrently. There is no invalidation-on-write here (unlike
+/// `CrSchemaCache`, which invalidates because a CRD's schema can change under a fixed
+/// group+version): the never-reused rv means a stale entry can never be served for a
+/// different write, so `invalidate` exists purely so a future eviction pass (memory
+/// hygiene, not correctness) has something to call.
+pub struct CrConversionCache {
+    inner: RwLock<HashMap<CrConversionCacheKey, Arc<serde_json::Value>>>,
+}
+
+impl CrConversionCache {
+    pub fn new() -> Self {
+        CrConversionCache {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: &CrConversionCacheKey) -> Option<Arc<serde_json::Value>> {
+        self.inner.read().unwrap().get(key).cloned()
+    }
+
+    pub fn insert(&self, key: CrConversionCacheKey, value: Arc<serde_json::Value>) {
+        self.inner.write().unwrap().insert(key, value);
+    }
+
+    pub fn invalidate(&self, key: &CrConversionCacheKey) {
+        self.inner.write().unwrap().remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: &CrConversionCacheKey) -> bool {
+        self.inner.read().unwrap().contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.inner.read().unwrap().len()
+    }
+}
+
 pub struct AppState<S = SqliteStore> {
     pub store: Arc<S>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
@@ -332,6 +386,10 @@ pub struct AppState<S = SqliteStore> {
     /// Cache of compiled CRD `openAPIV3Schema`s, keyed by CRD generation.
     /// See `CrSchemaCache` for the invalidation strategy.
     pub cr_schema_cache: Arc<CrSchemaCache>,
+    /// Cache of CR conversion webhook results, keyed by (source object's own
+    /// resourceVersion, target apiVersion). See `CrConversionCache` for the cache-key
+    /// rationale and invalidation strategy.
+    pub cr_conversion_cache: Arc<CrConversionCache>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -396,6 +454,7 @@ impl<S> Clone for AppState<S> {
             apiservice_cache: self.apiservice_cache.clone(),
             quota_admission_locks: self.quota_admission_locks.clone(),
             cr_schema_cache: self.cr_schema_cache.clone(),
+            cr_conversion_cache: self.cr_conversion_cache.clone(),
         }
     }
 }
@@ -588,6 +647,7 @@ impl<S: Store> AppState<S> {
             apiservice_cache: Arc::new(ApiServiceCache::new()),
             quota_admission_locks: QuotaAdmissionLocks::new(),
             cr_schema_cache: Arc::new(CrSchemaCache::new()),
+            cr_conversion_cache: Arc::new(CrConversionCache::new()),
         }
     }
 
