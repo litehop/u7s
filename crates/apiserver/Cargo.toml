@@ -80,3 +80,7 @@ harness = false
 [[bench]]
 name    = "cr_conversion_fanout"
 harness = false
+
+[[bench]]
+name    = "request_total_record"
+harness = false

@@ -74,6 +74,23 @@ pub static REQUEST_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
+/// Compile-time-args-checked wrapper for REQUEST_TOTAL increments.
+/// The 6-parameter signature prevents label-order drift and count-mismatch
+/// panics if a future edit changes REQUEST_TOTAL's registered labels — the
+/// helper must be updated in lockstep, forcing every call site to update too.
+pub fn record_request_total(
+    verb: &str,
+    group: &str,
+    version: &str,
+    resource: &str,
+    scope: &str,
+    code: &str,
+) {
+    REQUEST_TOTAL
+        .with_label_values(&[verb, group, version, resource, scope, code])
+        .inc();
+}
+
 /// Snapshot of `Store::watch_receiver_count` — the number of watch streams currently open
 /// across every resource type. Set at scrape time in `handlers::metrics::metrics` rather than
 /// bookkept incrementally: `tokio::sync::broadcast::Sender::receiver_count` already tracks
@@ -109,3 +126,44 @@ pub static STALE_SA_TOKENS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
         .expect("u7s_stale_sa_tokens_total is registered exactly once per process");
     counter
 });
+
+#[cfg(test)]
+mod tests {
+    use prometheus::core::Collector;
+    use prometheus::{IntCounterVec, Opts};
+
+    /// record_request_total's compile-time-checked signature only protects against label-order
+    /// drift; it says nothing about whether the underlying IntCounterVec actually keeps series
+    /// accounting proportional to the number of distinct label combos rather than, say,
+    /// silently collapsing or exploding them. A THROWAWAY vector (never registered against any
+    /// registry) is used here so this test can run any number of times without permanently
+    /// growing the process-global `apiserver_request_total` series count across the test suite.
+    #[test]
+    fn record_request_total_cardinality_ceiling_is_bounded_and_proportional_to_label_combos() {
+        let local_vec = IntCounterVec::new(
+            Opts::new("test_request_total_local", "Test-only, do not use"),
+            &["verb", "group", "version", "resource", "scope", "code"],
+        )
+        .expect("static metric definition is valid");
+
+        for i in 0..500 {
+            local_vec
+                .with_label_values(&[
+                    "get",
+                    "core",
+                    "v1",
+                    &format!("resource-{i}"),
+                    "namespace",
+                    "200",
+                ])
+                .inc();
+        }
+
+        let series_count = local_vec.collect()[0].get_metric().len();
+        assert_eq!(
+            series_count, 500,
+            "IntCounterVec should hold exactly N=500 series for N=500 unique label combos — \
+             if this fails, the crate's series-count semantics have changed"
+        );
+    }
+}
