@@ -324,6 +324,11 @@ fn object_needs_conversion(
 ///
 /// Takes the conversion config directly (rather than `&CrContext`) so callers that only carry
 /// that config — like the watch path's `CrFieldSelectorContext` — don't need a full CrContext.
+///
+/// Items needing conversion are first checked against `state.cr_conversion_cache` keyed on
+/// (the item's own stored `metadata.resourceVersion`, `desired_api_version`) — see
+/// `CrConversionCache` for why that key is safe to reuse across LIST requests and watchers.
+/// Only cache misses are sent to the webhook; every miss result is inserted before returning.
 pub(crate) async fn convert_cr_list_items<S: Store>(
     state: &AppState<S>,
     conversion_webhook_client_config: Option<&serde_json::Value>,
@@ -335,17 +340,36 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
     };
     let mut convert_indices = Vec::new();
     let mut to_convert = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        if object_needs_conversion(item, desired_api_version, Some(cfg)) {
-            convert_indices.push(i);
-            to_convert.push(item.clone());
+    let mut miss_keys: Vec<Option<crate::state::CrConversionCacheKey>> = Vec::new();
+    for (i, item) in items.iter_mut().enumerate() {
+        if !object_needs_conversion(item, desired_api_version, Some(cfg)) {
+            continue;
         }
+        // A missing/unparseable resourceVersion (should not happen — the store stamps it
+        // on every write, see CrConversionCache's doc comment) just skips the cache rather
+        // than risking a key collision: `key` stays None and this item always falls through
+        // to the webhook below, exactly today's behavior.
+        let key = item["metadata"]["resourceVersion"]
+            .as_str()
+            .map(|rv| (rv.to_string(), desired_api_version.to_string()));
+        if let Some(cached) = key.as_ref().and_then(|k| state.cr_conversion_cache.get(k)) {
+            *item = (*cached).clone();
+            continue;
+        }
+        convert_indices.push(i);
+        to_convert.push(item.clone());
+        miss_keys.push(key);
     }
     if to_convert.is_empty() {
         return Ok(());
     }
     let converted = call_conversion_webhook(state, cfg, to_convert, desired_api_version).await?;
-    for (i, converted_item) in convert_indices.into_iter().zip(converted) {
+    for ((i, converted_item), key) in convert_indices.into_iter().zip(converted).zip(miss_keys) {
+        if let Some(k) = key {
+            state
+                .cr_conversion_cache
+                .insert(k, std::sync::Arc::new(converted_item.clone()));
+        }
         items[i] = converted_item;
     }
     Ok(())
@@ -8559,6 +8583,297 @@ mod tests {
              ships its own serving cert) fails its TLS handshake and webhook-strategy CRD \
              conversion is 100% non-functional: {:?}",
             result.err()
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CrConversionCache
+    // ---------------------------------------------------------------------------
+
+    /// A conversion webhook that unconditionally sets every object's apiVersion to
+    /// whatever `desiredAPIVersion` the caller asked for, counting invocations — so
+    /// CrConversionCache tests can assert on the number of real HTTP round trips, not
+    /// just on the cache's own internal bookkeeping.
+    fn counting_conversion_router(call_count: Arc<std::sync::atomic::AtomicUsize>) -> axum::Router {
+        use axum::routing::post;
+        use std::sync::atomic::Ordering;
+
+        axum::Router::new().route(
+            "/convert",
+            post(move |axum::Json(review): axum::Json<serde_json::Value>| {
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    let desired = review["request"]["desiredAPIVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let objects = review["request"]["objects"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let converted: Vec<serde_json::Value> = objects
+                        .into_iter()
+                        .map(|mut o| {
+                            o["apiVersion"] = serde_json::Value::String(desired.clone());
+                            o
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": {"status": "Success"},
+                            "convertedObjects": converted
+                        }
+                    }))
+                }
+            }),
+        )
+    }
+
+    /// Two independent conversion requests (e.g. two watchers, or a watcher plus a LIST)
+    /// observing the SAME write (identical source resourceVersion) and asking for the SAME
+    /// target version must share one webhook round trip, not pay for it twice — the entire
+    /// point of CrConversionCache under N-way watch fan-out. Fails on revert: without the
+    /// cache, convert_cr_list_items calls the webhook on every invocation regardless of
+    /// whether an identical conversion was already computed, so N watchers of one write
+    /// cost N webhook round trips instead of one.
+    #[tokio::test]
+    async fn cr_conversion_cache_shares_single_webhook_call_across_watchers_same_target_version_same_rv(
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(counting_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+
+        let source = || {
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "w", "resourceVersion": "5" }
+            })
+        };
+
+        let mut items_a = vec![source()];
+        convert_cr_list_items(&state, Some(&client_config), &mut items_a, "example.io/v2")
+            .await
+            .expect("first conversion must succeed");
+
+        let mut items_b = vec![source()];
+        convert_cr_list_items(&state, Some(&client_config), &mut items_b, "example.io/v2")
+            .await
+            .expect("second conversion must succeed");
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a second caller converting the identical (resourceVersion, target apiVersion) \
+             must hit the cache instead of re-invoking the webhook — this is the entire win \
+             CrConversionCache exists to capture"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.entry_count(),
+            1,
+            "one (rv, target version) pair must produce exactly one cache entry"
+        );
+        assert!(
+            state
+                .cr_conversion_cache
+                .contains(&("5".to_string(), "example.io/v2".to_string())),
+            "the cache entry must be addressable by the exact (source rv, target version) \
+             key convert_cr_list_items derives from the object's own stored fields"
+        );
+        assert_eq!(
+            items_a[0]["apiVersion"], items_b[0]["apiVersion"],
+            "both callers must observe the identical converted body, not just an identical \
+             call count"
+        );
+    }
+
+    /// The SAME source object+resourceVersion watched at two DIFFERENT target versions must
+    /// convert independently — collapsing them into one cache entry would serve one
+    /// client's v2 body to a client that asked for v3. Fails on revert to a key that omits
+    /// (or mis-derives) target_api_version: the second call would wrongly hit the first
+    /// call's cache entry, returning the wrong version's body without ever calling the
+    /// webhook for v3.
+    #[tokio::test]
+    async fn cr_conversion_cache_uses_independent_entries_for_different_target_versions_same_source_object(
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(counting_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+
+        let source = || {
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "w", "resourceVersion": "5" }
+            })
+        };
+
+        let mut items_v2 = vec![source()];
+        convert_cr_list_items(&state, Some(&client_config), &mut items_v2, "example.io/v2")
+            .await
+            .expect("conversion to v2 must succeed");
+
+        let mut items_v3 = vec![source()];
+        convert_cr_list_items(&state, Some(&client_config), &mut items_v3, "example.io/v3")
+            .await
+            .expect("conversion to v3 must succeed");
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "two different target versions of the same source object must each call the \
+             webhook — a shared cache entry would silently serve one version's body to \
+             watchers of the other"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.entry_count(),
+            2,
+            "each (rv, target version) pair must own a distinct cache entry"
+        );
+        assert_eq!(items_v2[0]["apiVersion"], "example.io/v2");
+        assert_eq!(items_v3[0]["apiVersion"], "example.io/v3");
+    }
+
+    /// A later write to the same object (a new resourceVersion) must never reuse the
+    /// previous write's cached conversion — otherwise a watcher observing the update would
+    /// be served stale pre-write content under the guise of a fresh conversion. Fails on
+    /// revert to a key that omits resourceVersion (or ignores it): the second call would
+    /// wrongly hit the first write's entry and never re-invoke the webhook for the new
+    /// content.
+    #[tokio::test]
+    async fn cr_conversion_cache_invalidates_on_write_new_rv_triggers_fresh_conversion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(counting_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+
+        let mut items_rv5 = vec![serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "w", "resourceVersion": "5" },
+            "spec": { "color": "blue" }
+        })];
+        convert_cr_list_items(
+            &state,
+            Some(&client_config),
+            &mut items_rv5,
+            "example.io/v2",
+        )
+        .await
+        .expect("conversion of rv 5 must succeed");
+
+        // Simulate a subsequent write: the store stamps a new resourceVersion on every
+        // write (see CrConversionCache's doc comment), so a real second write produces a
+        // body whose own metadata.resourceVersion has advanced past "5".
+        let mut items_rv6 = vec![serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "w", "resourceVersion": "6" },
+            "spec": { "color": "red" }
+        })];
+        convert_cr_list_items(
+            &state,
+            Some(&client_config),
+            &mut items_rv6,
+            "example.io/v2",
+        )
+        .await
+        .expect("conversion of rv 6 must succeed");
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "a write producing a new resourceVersion must trigger a fresh webhook call, \
+             not reuse the previous write's cached conversion"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.entry_count(),
+            2,
+            "the old and new resourceVersion must each own an independent cache entry — \
+             no cross-entry contamination"
+        );
+        assert_eq!(
+            items_rv5[0]["spec"]["color"], "blue",
+            "the rv-5 entry must still reflect rv 5's own content"
+        );
+        assert_eq!(
+            items_rv6[0]["spec"]["color"], "red",
+            "the rv-6 entry must reflect rv 6's own content, not rv 5's cached body"
+        );
+    }
+
+    /// Belt-and-suspenders precondition check backing CrConversionCache's cache-key
+    /// rationale: after a real CR write, the object's OWN stored metadata.resourceVersion
+    /// (what convert_cr_list_items keys the cache on) must equal the store's revision
+    /// counter for the write that produced it. If this ever drifted — e.g. a future
+    /// storage refactor stopped stamping it on write — the cache would key on a value that
+    /// no longer identifies "this exact write", and a hit could silently serve a
+    /// conversion computed for different content. See `crates/store/src/sqlite.rs`'s
+    /// `stamp_resource_version`, called from `put_sync` on every write independent of
+    /// anything the CR handler itself puts in the body.
+    #[tokio::test]
+    async fn cr_conversion_cache_precondition_stored_metadata_rv_matches_store_counter() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("precondition-widget"),
+        )
+        .await
+        .expect("create must succeed")
+        .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let response_rv = response_val["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("create response must include resourceVersion");
+
+        let key = "/registry/cr/example.io/widgets/precondition-widget";
+        let stored = state
+            .store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("object must exist in the store after create");
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let stamped_rv = stored_obj["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("stored bytes must carry a stamped metadata.resourceVersion");
+
+        assert_eq!(
+            stamped_rv, response_rv,
+            "the raw bytes actually persisted by the write must carry the SAME \
+             metadata.resourceVersion the write's own HTTP response reported — a later \
+             LIST/watch reads this exact field back off stored bytes, so a mismatch here \
+             would mean CrConversionCache keys on a value the write itself never produced"
+        );
+        assert_eq!(
+            stamped_rv,
+            stored.revision.to_string(),
+            "the stamped resourceVersion must equal the store's own revision counter for \
+             this key — the invariant CrConversionCache's cache-key safety depends on (see \
+             bd memory store-revision-counter-monotonic-never-reused)"
         );
     }
 

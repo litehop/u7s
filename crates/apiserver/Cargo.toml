@@ -72,3 +72,7 @@ harness = false
 [[bench]]
 name    = "admission_review"
 harness = false
+
+[[bench]]
+name    = "cr_conversion_fanout"
+harness = false
