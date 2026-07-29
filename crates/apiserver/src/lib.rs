@@ -51,6 +51,7 @@ pub use args::Args;
 use auth::{AuthLayer, PeerCertificate};
 use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
+pub use metrics::record_request_total;
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 
