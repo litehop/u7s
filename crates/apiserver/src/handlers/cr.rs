@@ -311,6 +311,39 @@ fn object_needs_conversion(
         && obj["apiVersion"].as_str() != Some(desired_api_version)
 }
 
+/// Derive the `state.cr_conversion_cache` key for `item` at `desired_api_version` — the
+/// item's own stored `metadata.resourceVersion` paired with the target version. A
+/// missing/unparseable resourceVersion (should not happen — the store stamps it on every
+/// write, see `CrConversionCache`'s doc comment) yields `None`, which callers treat as
+/// "always miss, never claim/cache" rather than risking a key collision.
+fn conversion_cache_key(
+    item: &serde_json::Value,
+    desired_api_version: &str,
+) -> Option<crate::state::CrConversionCacheKey> {
+    item["metadata"]["resourceVersion"]
+        .as_str()
+        .map(|rv| (rv.to_string(), desired_api_version.to_string()))
+}
+
+/// Releases every not-yet-resolved key in `keys` (via `CrConversionCache::resolve(_, None)`)
+/// when dropped. Guards the span from a successful `claim` to the matching `resolve` so a
+/// leader that never reaches its own `resolve` call — an early `?` return from the webhook
+/// call, or a panic inside it — cannot leave concurrent followers registered on that key's
+/// `Notify` waiting forever. Callers `clear()` the keys they resolved normally so the drop
+/// only cleans up the ones actually left outstanding.
+struct LeaderClaimGuard<'a> {
+    cache: &'a crate::state::CrConversionCache,
+    keys: Vec<crate::state::CrConversionCacheKey>,
+}
+
+impl Drop for LeaderClaimGuard<'_> {
+    fn drop(&mut self) {
+        for key in self.keys.drain(..) {
+            self.cache.resolve(&key, None);
+        }
+    }
+}
+
 /// Convert only the items whose own stored apiVersion differs from `desired_api_version`,
 /// leaving already-matching items untouched. Used for LIST pages and, via a one-element
 /// slice, for a single CR watch event (see `watch::convert_watched_cr_object`) — both need
@@ -328,7 +361,13 @@ fn object_needs_conversion(
 /// Items needing conversion are first checked against `state.cr_conversion_cache` keyed on
 /// (the item's own stored `metadata.resourceVersion`, `desired_api_version`) — see
 /// `CrConversionCache` for why that key is safe to reuse across LIST requests and watchers.
-/// Only cache misses are sent to the webhook; every miss result is inserted before returning.
+/// Cache misses go through `CrConversionCache::claim`: within this call, every miss that
+/// isn't claimed elsewhere is batched into one webhook call (unchanged from before); a miss
+/// whose key another *concurrent* call already claimed instead waits on that call's result
+/// instead of independently invoking the webhook — this is what stops N watchers/LIST
+/// requests racing one write's first conversion from becoming N webhook calls. If the other
+/// call's leader fails, a waiter wakes to a fresh cache miss and re-claims the key itself on
+/// the next round.
 pub(crate) async fn convert_cr_list_items<S: Store>(
     state: &AppState<S>,
     conversion_webhook_client_config: Option<&serde_json::Value>,
@@ -338,40 +377,78 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
     let Some(cfg) = conversion_webhook_client_config else {
         return Ok(());
     };
-    let mut convert_indices = Vec::new();
-    let mut to_convert = Vec::new();
-    let mut miss_keys: Vec<Option<crate::state::CrConversionCacheKey>> = Vec::new();
+
+    let mut pending: Vec<usize> = Vec::new();
     for (i, item) in items.iter_mut().enumerate() {
         if !object_needs_conversion(item, desired_api_version, Some(cfg)) {
             continue;
         }
-        // A missing/unparseable resourceVersion (should not happen — the store stamps it
-        // on every write, see CrConversionCache's doc comment) just skips the cache rather
-        // than risking a key collision: `key` stays None and this item always falls through
-        // to the webhook below, exactly today's behavior.
-        let key = item["metadata"]["resourceVersion"]
-            .as_str()
-            .map(|rv| (rv.to_string(), desired_api_version.to_string()));
+        let key = conversion_cache_key(item, desired_api_version);
         if let Some(cached) = key.as_ref().and_then(|k| state.cr_conversion_cache.get(k)) {
             *item = (*cached).clone();
             continue;
         }
-        convert_indices.push(i);
-        to_convert.push(item.clone());
-        miss_keys.push(key);
+        pending.push(i);
     }
-    if to_convert.is_empty() {
-        return Ok(());
-    }
-    let converted = call_conversion_webhook(state, cfg, to_convert, desired_api_version).await?;
-    for ((i, converted_item), key) in convert_indices.into_iter().zip(converted).zip(miss_keys) {
-        if let Some(k) = key {
-            state
-                .cr_conversion_cache
-                .insert(k, std::sync::Arc::new(converted_item.clone()));
+
+    while !pending.is_empty() {
+        let mut leader_indices = Vec::new();
+        let mut leader_keys: Vec<Option<crate::state::CrConversionCacheKey>> = Vec::new();
+        let mut waiters: Vec<(
+            usize,
+            crate::state::CrConversionCacheKey,
+            tokio::sync::futures::OwnedNotified,
+        )> = Vec::new();
+
+        for i in pending.drain(..) {
+            match conversion_cache_key(&items[i], desired_api_version) {
+                None => {
+                    leader_indices.push(i);
+                    leader_keys.push(None);
+                }
+                Some(key) => match state.cr_conversion_cache.claim(&key) {
+                    crate::state::ConversionClaim::Leader => {
+                        leader_indices.push(i);
+                        leader_keys.push(Some(key));
+                    }
+                    crate::state::ConversionClaim::Follow(notified) => {
+                        waiters.push((i, key, notified));
+                    }
+                },
+            }
         }
-        items[i] = converted_item;
+
+        if !leader_indices.is_empty() {
+            let to_convert: Vec<serde_json::Value> =
+                leader_indices.iter().map(|&i| items[i].clone()).collect();
+            let mut guard = LeaderClaimGuard {
+                cache: &state.cr_conversion_cache,
+                keys: leader_keys.iter().flatten().cloned().collect(),
+            };
+            let converted =
+                call_conversion_webhook(state, cfg, to_convert, desired_api_version).await?;
+            for ((i, converted_item), key) in
+                leader_indices.into_iter().zip(converted).zip(leader_keys)
+            {
+                if let Some(k) = key {
+                    state
+                        .cr_conversion_cache
+                        .resolve(&k, Some(std::sync::Arc::new(converted_item.clone())));
+                }
+                items[i] = converted_item;
+            }
+            guard.keys.clear();
+        }
+
+        for (i, key, notified) in waiters {
+            notified.await;
+            match state.cr_conversion_cache.get(&key) {
+                Some(cached) => items[i] = (*cached).clone(),
+                None => pending.push(i),
+            }
+        }
     }
+
     Ok(())
 }
 
@@ -9170,6 +9247,279 @@ mod tests {
             "eviction must never change the CONTENT a client observes — the same source \
              object converted to the same target version must produce an identical body \
              whether served from cache or freshly computed after an eviction"
+        );
+    }
+
+    /// Like `counting_conversion_router`, but sleeps `delay_ms` before responding — models
+    /// a real conversion webhook's non-zero round-trip cost, needed so concurrent callers
+    /// actually overlap the leader's in-flight window instead of racing so fast that one
+    /// finishes (and populates the cache) before the next one even starts.
+    fn delayed_counting_conversion_router(
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+        delay_ms: u64,
+    ) -> axum::Router {
+        use axum::routing::post;
+        use std::sync::atomic::Ordering;
+
+        axum::Router::new().route(
+            "/convert",
+            post(move |axum::Json(review): axum::Json<serde_json::Value>| {
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    let desired = review["request"]["desiredAPIVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let objects = review["request"]["objects"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let converted: Vec<serde_json::Value> = objects
+                        .into_iter()
+                        .map(|mut o| {
+                            o["apiVersion"] = serde_json::Value::String(desired.clone());
+                            o
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": {"status": "Success"},
+                            "convertedObjects": converted
+                        }
+                    }))
+                }
+            }),
+        )
+    }
+
+    /// N concurrent callers racing the identical cold (rv, target version) key must produce
+    /// exactly ONE webhook call, not N. This is the thundering-herd pathology
+    /// mayor-k7b4w's bench measured empirically (100% herd: N callers -> N calls, at every
+    /// N and delay tested, zero exceptions) — a plain `RwLock<HashMap>` cache like
+    /// `CrConversionCache`'s eliminates redundant calls for STAGGERED callers (see the test
+    /// above) but does nothing for callers that all miss before any of them has inserted.
+    /// A real conversion webhook is not free like the mock's `tokio::time::sleep` here — it
+    /// is a real HTTP round trip against a service u7s doesn't control, so N-for-1 redundant
+    /// calls is real load amplification, not just wasted CPU. Fails on revert: disabling the
+    /// single-flight claim (verified manually by making `CrConversionCache::claim` always
+    /// return `Leader`, so no caller ever waits on another's in-flight computation) reproduces
+    /// the bench's 100-calls-for-100-racers result here too.
+    #[tokio::test]
+    async fn cr_conversion_cache_single_flight_coalesces_concurrent_gets_on_cold_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        const N: usize = 100;
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) = start_mock_conversion_server(delayed_counting_conversion_router(
+            Arc::clone(&call_count),
+            20,
+        ))
+        .await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let barrier = Arc::new(Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let state = state.clone();
+            let client_config = client_config.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut items = vec![serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": { "name": "w", "resourceVersion": "5" }
+                })];
+                convert_cr_list_items(&state, Some(&client_config), &mut items, "example.io/v2")
+                    .await
+                    .expect("conversion must succeed");
+                items[0]["apiVersion"]
+                    .as_str()
+                    .expect("converted body must have a string apiVersion")
+                    .to_string()
+            }));
+        }
+
+        let mut results = Vec::with_capacity(N);
+        for h in handles {
+            results.push(h.await.expect("racer task must not panic"));
+        }
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "{N} concurrent callers racing the identical cold (rv, target version) key must \
+             coalesce into ONE webhook call via single-flight, not {N} — without this, every \
+             watcher/LIST request observing one write's first conversion pays its own real \
+             round trip against the (possibly rate-limited, non-free) conversion webhook"
+        );
+        assert!(
+            results.iter().all(|v| v == "example.io/v2"),
+            "every one of the {N} racers must still observe the correctly converted body, \
+             not just a reduced call count — coalescing must never trade correctness for \
+             fewer webhook calls"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.in_flight_count(),
+            0,
+            "once every racer has resolved, the single-flight registry must have no leaked \
+             entry for this key — an orphaned entry would permanently stall any future \
+             caller for this (rv, target version) pair"
+        );
+    }
+
+    /// A leader whose webhook call fails must still release every waiter blocked on it —
+    /// otherwise a single conversion failure would hang every concurrent watcher/LIST
+    /// request observing the same write forever, turning a normal webhook error into a
+    /// full request-handling deadlock. Bounded via `tokio::time::timeout`: an unbounded
+    /// hang here is exactly the bug (a leader that errors without calling
+    /// `notify_waiters` first) this test exists to catch, and the timeout makes such a
+    /// regression a fast, obvious test failure rather than a wedged CI job.
+    #[tokio::test]
+    async fn cr_conversion_cache_leader_error_releases_waiters_without_hanging() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::sync::Barrier;
+
+        const N: usize = 10;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                axum::Json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "result": {
+                            "status": "Failure",
+                            "message": "conversion always fails in this test"
+                        }
+                    }
+                }))
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let barrier = Arc::new(Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let state = state.clone();
+            let client_config = client_config.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut items = vec![serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": { "name": "w", "resourceVersion": "5" }
+                })];
+                convert_cr_list_items(&state, Some(&client_config), &mut items, "example.io/v2")
+                    .await
+            }));
+        }
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut results = Vec::with_capacity(N);
+            for h in handles {
+                results.push(h.await.expect("racer task must not panic"));
+            }
+            results
+        })
+        .await;
+
+        let results = outcome.expect(
+            "N callers racing a key whose leader always errors must all resolve (either by \
+             seeing the error directly, or by waking from a failed leader's release and \
+             re-claiming/re-erroring themselves) within a bounded time — a leader that errors \
+             without notifying its waiters would leave every follower's `notified().await` \
+             parked forever",
+        );
+
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every caller must observe the webhook's failure — silently treating a \
+             resolved-but-still-empty cache slot as success would serve stale/unconverted \
+             objects to a client instead of surfacing the conversion error"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.in_flight_count(),
+            0,
+            "every leader across every retry round must release its slot on failure — a \
+             leaked in_flight entry here would permanently orphan any future caller for \
+             this key even after the webhook recovers"
+        );
+    }
+
+    /// Positive control: a cache HIT must still be served purely from the plain
+    /// `RwLock<HashMap>` fast path — the single-flight `claim`/`resolve` machinery added to
+    /// coalesce cold-key misses must never be touched on a warm key. A regression that ran
+    /// every lookup through `claim` (even redundantly, immediately followed by finding the
+    /// fast-path hit) would add lock traffic and latency to the dominant, already-optimized
+    /// hit path for no benefit — see `cr_conversion_fanout.rs`'s `cr_conversion_fanout_with_cache`
+    /// bench group, whose numbers this change must not move since its code path is byte-for-byte
+    /// unchanged by this fix.
+    #[tokio::test]
+    async fn cr_conversion_cache_no_regression_on_cache_hit_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let (base_url, _handle) =
+            start_mock_conversion_server(counting_conversion_router(Arc::clone(&call_count))).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+
+        let key = ("5".to_string(), "example.io/v2".to_string());
+        let pre_converted = serde_json::json!({
+            "apiVersion": "example.io/v2",
+            "kind": "Widget",
+            "metadata": { "name": "w", "resourceVersion": "5" }
+        });
+        state
+            .cr_conversion_cache
+            .insert(key.clone(), std::sync::Arc::new(pre_converted.clone()));
+
+        let mut items = vec![serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "w", "resourceVersion": "5" }
+        })];
+        convert_cr_list_items(&state, Some(&client_config), &mut items, "example.io/v2")
+            .await
+            .expect("a pre-warmed cache entry must serve the request without error");
+
+        assert_eq!(
+            items[0], pre_converted,
+            "a cache hit must return the exact cached body"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "a cache hit must never invoke the webhook — it should never even reach the \
+             claim/resolve single-flight path"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.in_flight_count(),
+            0,
+            "a cache hit must never touch the single-flight registry — claim/resolve exist \
+             only for the miss path, and any in-flight bookkeeping on a hit would be pure \
+             unneeded overhead on the dominant request path"
+        );
+        assert_eq!(
+            state.cr_conversion_cache.entry_count(),
+            1,
+            "a cache hit must not write a duplicate/redundant entry back into the cache"
         );
     }
 

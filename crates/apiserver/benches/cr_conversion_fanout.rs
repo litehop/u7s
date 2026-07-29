@@ -246,10 +246,160 @@ fn bench_thundering_herd(c: &mut Criterion) {
     group.finish();
 }
 
+/// Mirrors `u7s_apiserver::state::CrConversionCache`'s single-flight primitive
+/// (`claim`/`resolve`, backed by `Mutex<HashMap<Key, Arc<Notify>>>`) for the same reason
+/// `ConversionCache` above mirrors its plain cache shape: the real type is crate-private.
+/// See `CrConversionCache`'s doc comment in `state.rs` for why the `notified_owned()` call
+/// in `claim` must happen while still holding the `in_flight` lock.
+enum ConversionClaim {
+    Leader,
+    Follow(tokio::sync::futures::OwnedNotified),
+}
+
+struct SingleFlightConversionCache {
+    inner: RwLock<HashMap<ConversionCacheKey, Arc<Value>>>,
+    in_flight: std::sync::Mutex<HashMap<ConversionCacheKey, Arc<tokio::sync::Notify>>>,
+}
+
+impl SingleFlightConversionCache {
+    fn new() -> Self {
+        SingleFlightConversionCache {
+            inner: RwLock::new(HashMap::new()),
+            in_flight: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &ConversionCacheKey) -> Option<Arc<Value>> {
+        self.inner.read().unwrap().get(key).cloned()
+    }
+
+    fn claim(&self, key: &ConversionCacheKey) -> ConversionClaim {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        match in_flight.get(key) {
+            Some(notify) => ConversionClaim::Follow(notify.clone().notified_owned()),
+            None => {
+                in_flight.insert(key.clone(), Arc::new(tokio::sync::Notify::new()));
+                ConversionClaim::Leader
+            }
+        }
+    }
+
+    fn resolve(&self, key: &ConversionCacheKey, value: Option<Arc<Value>>) {
+        if let Some(v) = value {
+            self.inner.write().unwrap().insert(key.clone(), v);
+        }
+        if let Some(notify) = self.in_flight.lock().unwrap().remove(key) {
+            notify.notify_waiters();
+        }
+    }
+}
+
+/// This bead's fix applied to the exact thundering-herd shape `bench_thundering_herd`
+/// measures: every racer still checks the cache and, on a miss, either becomes the one
+/// leader that pays the webhook round trip or waits on that leader's result — no other
+/// racer independently calls the webhook. Same two metrics as `bench_thundering_herd`
+/// (wall-clock + `webhook_calls`) so the two groups read side by side at identical (N,
+/// delay) points: at N=100/20ms, `webhook_calls` reads ~1.00 here versus ~100.00 in
+/// `bench_thundering_herd` — the empirical delta this sub-bead exists to produce.
+fn bench_thundering_herd_with_single_flight(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("cr_conversion_fanout_thundering_herd_with_single_flight");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_millis(1500));
+    group.warm_up_time(Duration::from_millis(300));
+    for delay_ms in [5u64, 20u64] {
+        for watchers in [1usize, 5, 10, 20, 50, 100] {
+            let label = format!("{delay_ms}ms_delay/{watchers}_watchers");
+            let rt = &rt;
+            group.bench_with_input(
+                BenchmarkId::from_parameter(label.clone()),
+                &(delay_ms, watchers),
+                move |b, &(delay_ms, watchers)| {
+                    let total_calls = AtomicUsize::new(0);
+                    let total_iters = AtomicUsize::new(0);
+                    b.iter_custom(|iters| {
+                        rt.block_on(async {
+                            let mut elapsed = Duration::ZERO;
+                            for _ in 0..iters {
+                                let cache = Arc::new(SingleFlightConversionCache::new());
+                                let barrier = Arc::new(Barrier::new(watchers));
+                                let call_count = Arc::new(AtomicUsize::new(0));
+                                let key: ConversionCacheKey =
+                                    ("5".to_string(), "example.io/v2".to_string());
+                                let source = Arc::new(source_object("5"));
+
+                                let mut handles = Vec::with_capacity(watchers);
+                                for _ in 0..watchers {
+                                    let cache = cache.clone();
+                                    let barrier = barrier.clone();
+                                    let call_count = call_count.clone();
+                                    let key = key.clone();
+                                    let source = source.clone();
+                                    handles.push(tokio::spawn(async move {
+                                        barrier.wait().await;
+                                        loop {
+                                            if let Some(cached) = cache.get(&key) {
+                                                black_box((*cached).clone());
+                                                return;
+                                            }
+                                            match cache.claim(&key) {
+                                                ConversionClaim::Leader => {
+                                                    call_count.fetch_add(1, Ordering::SeqCst);
+                                                    let converted = simulated_webhook_call(
+                                                        black_box(&source),
+                                                        "example.io/v2",
+                                                        delay_ms,
+                                                    )
+                                                    .await;
+                                                    cache.resolve(
+                                                        &key,
+                                                        Some(Arc::new(converted.clone())),
+                                                    );
+                                                    black_box(converted);
+                                                    return;
+                                                }
+                                                ConversionClaim::Follow(notified) => {
+                                                    notified.await;
+                                                    // Leader resolved (or failed and
+                                                    // released) — loop back to re-check
+                                                    // the cache / re-claim.
+                                                }
+                                            }
+                                        }
+                                    }));
+                                }
+
+                                let start = Instant::now();
+                                for handle in handles {
+                                    handle.await.unwrap();
+                                }
+                                elapsed += start.elapsed();
+                                total_calls
+                                    .fetch_add(call_count.load(Ordering::SeqCst), Ordering::SeqCst);
+                                total_iters.fetch_add(1, Ordering::SeqCst);
+                            }
+                            elapsed
+                        })
+                    });
+                    let iters = total_iters.load(Ordering::SeqCst);
+                    if iters > 0 {
+                        let avg_calls = total_calls.load(Ordering::SeqCst) as f64 / iters as f64;
+                        eprintln!(
+                            "{label}: avg webhook_calls = {avg_calls:.2} (of {watchers} watchers) over {iters} sample iterations [with single-flight]"
+                        );
+                    }
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_without_cache,
     bench_with_cache,
-    bench_thundering_herd
+    bench_thundering_herd,
+    bench_thundering_herd_with_single_flight
 );
 criterion_main!(benches);

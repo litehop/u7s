@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use u7s_store::{ListOptions, SqliteStore, Store};
 
 use crate::admission::WebhookEntry;
@@ -285,12 +285,30 @@ pub type CrConversionCacheKey = (String, String);
 /// hygiene, not correctness) has something to call.
 pub struct CrConversionCache {
     inner: RwLock<HashMap<CrConversionCacheKey, Arc<serde_json::Value>>>,
+    /// Single-flight registry: while a key has an entry here, some caller has already
+    /// claimed it via `claim` and is computing its conversion. Concurrent callers that
+    /// hit the same cold key join that one computation (`claim` returns `Follow`) instead
+    /// of each independently invoking the conversion webhook — without this, N concurrent
+    /// watchers/LIST requests racing one write's first conversion produce N webhook calls
+    /// instead of 1 (a real cost against an external service, unlike an in-process cache
+    /// hit) even though the plain `inner` cache above eliminates the redundant work for
+    /// staggered (non-concurrent) callers just fine.
+    in_flight: Mutex<HashMap<CrConversionCacheKey, Arc<Notify>>>,
+}
+
+/// Outcome of `CrConversionCache::claim`: exactly one concurrent caller per cold key
+/// becomes `Leader` (responsible for computing and publishing the result); every other
+/// caller gets `Follow` and waits on the leader's `resolve` call instead of recomputing.
+pub enum ConversionClaim {
+    Leader,
+    Follow(tokio::sync::futures::OwnedNotified),
 }
 
 impl CrConversionCache {
     pub fn new() -> Self {
         CrConversionCache {
             inner: RwLock::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -304,6 +322,37 @@ impl CrConversionCache {
 
     pub fn invalidate(&self, key: &CrConversionCacheKey) {
         self.inner.write().unwrap().remove(key);
+    }
+
+    /// Attempt to become the single leader responsible for computing `key`. The
+    /// `notified_owned()` call for a `Follow` result happens while still holding the
+    /// `in_flight` lock so it is strictly ordered (via that lock) against `resolve`'s own
+    /// lock-guarded removal — without that ordering a follower could create its wait
+    /// future after the leader already called `notify_waiters`, and hang forever waiting
+    /// for a wakeup that already happened.
+    pub fn claim(&self, key: &CrConversionCacheKey) -> ConversionClaim {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        match in_flight.get(key) {
+            Some(notify) => ConversionClaim::Follow(notify.clone().notified_owned()),
+            None => {
+                in_flight.insert(key.clone(), Arc::new(Notify::new()));
+                ConversionClaim::Leader
+            }
+        }
+    }
+
+    /// Release a key claimed via `claim`'s `Leader` result. `Some(value)` publishes the
+    /// computed result to the cache before releasing the slot, so every waiter that wakes
+    /// after this sees a hit; `None` (the leader's compute failed) releases the slot
+    /// without caching anything, so every waiter wakes to a cache miss and must retry
+    /// (re-`claim`) rather than block forever on a value that will never arrive.
+    pub fn resolve(&self, key: &CrConversionCacheKey, value: Option<Arc<serde_json::Value>>) {
+        if let Some(v) = value {
+            self.inner.write().unwrap().insert(key.clone(), v);
+        }
+        if let Some(notify) = self.in_flight.lock().unwrap().remove(key) {
+            notify.notify_waiters();
+        }
     }
 
     /// Remove every entry keyed on `rv` (any target apiVersion) — called after a CR
@@ -331,6 +380,11 @@ impl CrConversionCache {
     #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize {
         self.inner.read().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.in_flight.lock().unwrap().len()
     }
 }
 
