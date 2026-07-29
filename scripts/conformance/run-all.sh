@@ -63,6 +63,14 @@
 #             apiserver as --node-kubelet-port at step 2 (before the node joins) so
 #             kubectl logs/exec/attach/port-forward against a pod on the 2nd node
 #             reach ITS kubelet forward instead of the primary's.
+#   --profile  Rebuild u7s-apiserver with --features dhat after the normal build so
+#             the conformance workload runs under dhat's allocation profiler. The
+#             profile (dhat-heap.json) is written into --workdir, but only once the
+#             apiserver actually exits — dhat flushes it from a Drop impl that never
+#             runs while the server keeps serving, and run-all.sh intentionally leaves
+#             the stack running at the end (for sonobuoy log retrieval / --stack-only
+#             debugging). Ignored (with a warning) if --binary is also given, since
+#             that binary's feature set is the caller's responsibility.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -78,6 +86,7 @@ KUBELET_PORT=""
 KONNECTIVITY_SERVER_PORT=""
 EXTRA_NODE=""
 EXTRA_KUBELET_PORT=""
+PROFILE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -94,12 +103,18 @@ while [[ $# -gt 0 ]]; do
     --stack-only) STACK_ONLY=1; shift ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
+    --profile) PROFILE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 if [ "$STACK_ONLY" -eq 1 ] && [ -n "$FOCUS" ]; then
   echo "--focus ignored with --stack-only" >&2
+fi
+
+if [ "$PROFILE" -eq 1 ] && [ -n "$BINARY" ]; then
+  echo "--profile ignored with --binary (pre-built binary's features are not rebuilt)" >&2
+  PROFILE=0
 fi
 
 # Both flags are required together: a 2nd node needs its own kubelet port, and a
@@ -170,6 +185,18 @@ else
   bash "$DIR/01-build.sh"
 fi
 
+DHAT_HEAP_FILE=""
+if [ "$PROFILE" -eq 1 ]; then
+  banner "Profile: rebuilding u7s-apiserver with --features dhat"
+  # 01-build.sh builds u7s-apiserver and u7s-scheduler together with no
+  # features enabled; this targeted rebuild overwrites just the apiserver
+  # binary in place (same output path, only the feature set changes) so the
+  # scheduler binary from the step above is left untouched.
+  cargo build --release -p u7s-apiserver --features dhat --manifest-path "$REPO/Cargo.toml"
+  DHAT_HEAP_FILE="$WORKDIR/dhat-heap.json"
+  export U7S_DHAT_HEAP_FILE="$DHAT_HEAP_FILE"
+fi
+
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.
 banner "Step 2/6: Start apiserver"
 # shellcheck source=02-start-apiserver.sh
@@ -215,6 +242,14 @@ else
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
   bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG}
+fi
+
+if [ -n "$DHAT_HEAP_FILE" ]; then
+  echo ""
+  echo "Allocation profile: apiserver is running under dhat. dhat only flushes"
+  echo "$DHAT_HEAP_FILE on a graceful exit, so it does not exist yet — stop the"
+  echo "apiserver with SIGTERM when you're done exercising it, e.g.:"
+  echo "  kill -TERM \$(lsof -ti tcp:${PORT:-6443} -sTCP:LISTEN)"
 fi
 
 banner "Done"
