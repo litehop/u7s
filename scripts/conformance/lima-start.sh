@@ -65,6 +65,12 @@ done
 # --v=2 is today's unchanged default so a non-verbose run's log volume never grows.
 KUBELET_V=2
 [ "$VERBOSE" -eq 1 ] && KUBELET_V=5
+# kube-proxy --v=5 additionally logs every EndpointSlice update it processes and every
+# IPVS sync completion (this deployment runs kube-proxy in IPVS mode — see config.conf
+# below) — the measurement needed to tell whether kube-proxy saw an EndpointSlice event
+# late or reprogrammed slowly. --v=2 is the unchanged default.
+KUBE_PROXY_V=2
+[ "$VERBOSE" -eq 1 ] && KUBE_PROXY_V=5
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
@@ -625,7 +631,8 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/kube-proxy \\
   --config=/etc/kube-proxy/config.conf \\
-  --hostname-override=${VM_NAME}
+  --hostname-override=${VM_NAME} \\
+  --v=${KUBE_PROXY_V}
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
