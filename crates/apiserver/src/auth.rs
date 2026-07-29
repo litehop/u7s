@@ -20,6 +20,7 @@ use tower_service::Service;
 use u7s_store::{SqliteStore, Store};
 
 use crate::keys::object_key;
+use crate::metrics::record_request_total;
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::status::Status;
 use crate::util::{rfc3339_to_unix_secs, validate_cli_path};
@@ -717,6 +718,10 @@ fn field_selector_name(query: Option<&str>) -> Option<String> {
 /// Parsed path components needed for AuthzRequest construction.
 struct ParsedPath {
     api_group: String,
+    /// The API version segment ("v1" for `/api/v1/...`, the version in
+    /// `/apis/<group>/<version>/...`) — used only for the `version` metrics label, since
+    /// RBAC authorization itself is version-agnostic.
+    version: String,
     resource: String,
     subresource: String,
     namespace: Option<String>,
@@ -737,17 +742,19 @@ struct ParsedPath {
 fn parse_path(path: &str) -> ParsedPath {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-    let (api_group, rest) = match segs.first().copied() {
+    let (api_group, version, rest) = match segs.first().copied() {
         Some("api") => {
             // /api/<version>/...
+            let version = segs.get(1).copied().unwrap_or("").to_owned();
             let rest = if segs.len() > 2 { &segs[2..] } else { &[] };
-            (String::new(), rest)
+            (String::new(), version, rest)
         }
         Some("apis") => {
             // /apis/<group>/<version>/...
             let group = segs.get(1).copied().unwrap_or("").to_owned();
+            let version = segs.get(2).copied().unwrap_or("").to_owned();
             let rest = if segs.len() > 3 { &segs[3..] } else { &[] };
-            (group, rest)
+            (group, version, rest)
         }
         _ => return unknown_path(),
     };
@@ -779,6 +786,7 @@ fn parse_path(path: &str) -> ParsedPath {
 
     ParsedPath {
         api_group,
+        version,
         resource,
         subresource,
         namespace,
@@ -789,6 +797,7 @@ fn parse_path(path: &str) -> ParsedPath {
 fn unknown_path() -> ParsedPath {
     ParsedPath {
         api_group: String::new(),
+        version: String::new(),
         resource: String::new(),
         subresource: String::new(),
         namespace: None,
@@ -946,7 +955,13 @@ where
             .await
             {
                 AuthnResult::Identified(u) => u,
-                AuthnResult::BadToken => return Ok(unauthorized_response()),
+                AuthnResult::BadToken => {
+                    // Fires before parse_path runs, so group/version/resource/scope are
+                    // unknown — recorded empty rather than guessed, matching a non-resource
+                    // request's shape rather than a specific one.
+                    record_request_total(method_to_verb(req.method()), "", "", "", "", "401");
+                    return Ok(unauthorized_response());
+                }
             };
 
             // 1a. Impersonation — Kubernetes-style Impersonate-User / Impersonate-Group headers.
@@ -1078,6 +1093,12 @@ where
             };
             let authz_name = parsed.name.as_deref().or(fs_name.as_deref());
 
+            let scope = if parsed.namespace.is_some() {
+                "namespace"
+            } else {
+                "cluster"
+            };
+
             let allowed = rbac_index.is_allowed(&AuthzRequest {
                 username: &user.username,
                 groups: &user.groups,
@@ -1091,12 +1112,40 @@ where
             });
 
             if !allowed {
+                record_request_total(
+                    verb,
+                    &parsed.api_group,
+                    &parsed.version,
+                    &parsed.resource,
+                    scope,
+                    "403",
+                );
                 return Ok(forbidden_response(&user.username, verb, &parsed.resource));
             }
 
             // 3. Attach UserInfo to request extensions and pass through.
             req.extensions_mut().insert(user);
-            inner.call(req).await
+            let resp = inner.call(req).await;
+            // Recorded here, not content_type.rs: path/verb/scope are already parsed above
+            // and the final status is available now — a pure .inc(), never a header/body
+            // mutation, so this cannot repeat the chunked-response header-mutation incident.
+            // Watch is excluded: its handler already counts this at 200/410/429, so recording
+            // it again here would double-count every watch request.
+            if verb != "watch" {
+                let code = match &resp {
+                    Ok(r) => r.status().as_u16().to_string(),
+                    Err(_) => "500".to_owned(),
+                };
+                record_request_total(
+                    verb,
+                    &parsed.api_group,
+                    &parsed.version,
+                    &parsed.resource,
+                    scope,
+                    &code,
+                );
+            }
+            resp
         })
     }
 }
@@ -3039,6 +3088,346 @@ mod tests {
             "a fieldSelector naming a DIFFERENT resource must still be denied by a \
              resourceNames-restricted Role — the fix must not turn resourceNames into a \
              no-op for LIST/WATCH requests"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // apiserver_request_total wiring
+    // ---------------------------------------------------------------------------
+
+    /// Grants `username` every verb on every resource/group, so tests exercising the
+    /// request-total wiring don't also need to exercise RBAC's own matching logic.
+    fn allow_all_rbac(username: &str) -> Arc<RbacIndex> {
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/request-total-test-allow-all",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/request-total-test-allow-all-binding",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": username }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "request-total-test-allow-all"
+                }
+            }),
+        );
+        idx
+    }
+
+    /// An operator reading `apiserver_request_total` relies on the `verb` label to tell a
+    /// read (`get`) from a write (`patch`) from a bulk destructive operation
+    /// (`deletecollection`) — if AuthLayer's new recording call site ever mislabels one of
+    /// these (e.g. records every DELETE as `"delete"` regardless of whether a name was
+    /// given), the metric would hide exactly the traffic shape an operator most needs to see
+    /// during an incident. This exercises the full AuthLayer, not just `method_to_verb`
+    /// directly, because the wiring calls `record_request_total` with the verb the RBAC
+    /// check itself resolved — a metric that disagreed with what RBAC actually enforced
+    /// would be actively misleading, not just imprecise.
+    #[tokio::test]
+    async fn auth_layer_records_request_total_with_correct_verb_mapping_across_get_patch_deletecollection(
+    ) {
+        use axum::{
+            body::Body,
+            http::Request,
+            routing::{delete, get},
+            Router,
+        };
+        use tower::ServiceExt;
+
+        use crate::metrics::REQUEST_TOTAL;
+
+        let idx = allow_all_rbac("verb-mapping-tester");
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "verb-mapping-token".to_owned(),
+            UserInfo {
+                username: "verb-mapping-tester".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+
+        const RESOURCE: &str = "authtotalverbmappingitems";
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/default/authtotalverbmappingitems/{name}",
+                get(ok).patch(ok),
+            )
+            .route(
+                "/api/v1/namespaces/default/authtotalverbmappingitems",
+                delete(ok),
+            )
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+            ));
+
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "GET",
+                "/api/v1/namespaces/default/authtotalverbmappingitems/widget1",
+                "get",
+            ),
+            (
+                "PATCH",
+                "/api/v1/namespaces/default/authtotalverbmappingitems/widget1",
+                "patch",
+            ),
+            (
+                "DELETE",
+                "/api/v1/namespaces/default/authtotalverbmappingitems",
+                "deletecollection",
+            ),
+        ];
+
+        for (method, uri, verb) in cases {
+            let before = REQUEST_TOTAL
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "200"])
+                .get();
+
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", "Bearer verb-mapping-token")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "request must succeed for the verb-mapping assertion below to be meaningful"
+            );
+
+            let after = REQUEST_TOTAL
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "200"])
+                .get();
+            assert_eq!(
+                after,
+                before + 1,
+                "a {method} request must be recorded under verb={verb:?} in \
+                 apiserver_request_total — an operator filtering by verb would otherwise \
+                 miscount this traffic"
+            );
+        }
+    }
+
+    /// This is the operator's stated production-incident concern made concrete: the
+    /// content_type.rs postmortem (see `ai/extended-context/`) was a per-response header
+    /// mutation that wasn't exempted for chunked/streaming watch responses and broke live
+    /// watch streams for three days. This design only ever calls `.inc()` — there is no
+    /// `resp.headers_mut()` anywhere in the wiring — but "obviously safe" middleware
+    /// touching every request needs its own proof, not just an argument from design intent.
+    /// This also proves the watch-verb exclusion (added so AuthLayer doesn't double-count
+    /// on top of the watch handler's own instrumentation) doesn't silently drop the count to
+    /// zero: the mock inner service records its own single increment exactly like the real
+    /// watch handler does, and this asserts AuthLayer adds no second one.
+    #[tokio::test]
+    async fn auth_layer_records_request_total_but_does_not_mutate_response_headers_on_chunked_watch(
+    ) {
+        use axum::http::Method;
+
+        use crate::metrics::REQUEST_TOTAL;
+
+        const RESOURCE: &str = "authtotalchunkedwatchitems";
+
+        #[derive(Clone)]
+        struct ChunkedWatchService;
+        impl Service<Request<Body>> for ChunkedWatchService {
+            type Response = Response<Body>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                Box::pin(async move {
+                    // Mirrors handlers/watch.rs's own REQUEST_TOTAL increment on a
+                    // successful watch open — this test proves AuthLayer does not add a
+                    // second increment on top of it.
+                    record_request_total("watch", "", "v1", RESOURCE, "namespace", "200");
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("transfer-encoding", "chunked")
+                        .body(Body::from(
+                            r#"{"type":"ADDED","object":{"kind":"Pod","apiVersion":"v1","metadata":{"name":"p"}}}"#,
+                        ))
+                        .unwrap())
+                })
+            }
+        }
+
+        let idx = allow_all_rbac("watch-mutation-tester");
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "watch-mutation-token".to_owned(),
+            UserInfo {
+                username: "watch-mutation-tester".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+
+        let mut svc = AuthLayer::new(idx, token_map, None, Arc::new(make_test_store()))
+            .layer(ChunkedWatchService);
+
+        let before = REQUEST_TOTAL
+            .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200"])
+            .get();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/namespaces/default/{RESOURCE}?watch=true"))
+            .header("authorization", "Bearer watch-mutation-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+
+        assert!(
+            resp.headers().get("x-request-id").is_none(),
+            "AuthLayer must never inject headers into a chunked watch response — the body \
+             is a live stream already in flight by the time this middleware sees it, the \
+             exact precondition that broke watch streams in the content_type.rs incident"
+        );
+        assert_eq!(
+            resp.headers().get("transfer-encoding").unwrap(),
+            "chunked",
+            "transfer-encoding must pass through unchanged — recording the counter must \
+             never touch response headers or rebuild the body"
+        );
+
+        let after = REQUEST_TOTAL
+            .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200"])
+            .get();
+        assert_eq!(
+            after,
+            before + 1,
+            "the watch handler's own single increment must be the only one recorded — if \
+             AuthLayer's watch-verb exclusion regresses, this count would double, silently \
+             misreporting actual watch traffic to anyone reading apiserver_request_total"
+        );
+    }
+
+    /// After AuthLayer denies a request outright — bad credential or RBAC denial — the
+    /// operator must still see it in apiserver_request_total: a credential-stuffing attempt
+    /// or an under-privileged caller retrying a forbidden call would otherwise be invisible
+    /// in the one metric meant to show total request volume broken out by outcome code.
+    #[tokio::test]
+    async fn auth_layer_records_request_total_on_401_and_403_early_returns() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        use crate::metrics::REQUEST_TOTAL;
+
+        const RESOURCE: &str = "authtotal401403items";
+
+        // --- 401: bad bearer token, fires before parse_path runs ---
+        let empty_rbac = Arc::new(RbacIndex::new());
+        let empty_token_map: HashMap<String, UserInfo> = HashMap::new();
+        let app_401 = Router::new()
+            .route(
+                &format!("/api/v1/namespaces/default/{RESOURCE}"),
+                get(|| async { "ok" }),
+            )
+            .layer(AuthLayer::new(
+                Arc::clone(&empty_rbac),
+                empty_token_map,
+                None,
+                Arc::new(make_test_store()),
+            ));
+
+        let before_401 = REQUEST_TOTAL
+            .with_label_values(&["get", "", "", "", "", "401"])
+            .get();
+
+        let req_401 = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/namespaces/default/{RESOURCE}"))
+            .header("authorization", "Bearer not-a-real-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp_401 = app_401.oneshot(req_401).await.unwrap();
+        assert_eq!(
+            resp_401.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "precondition: an unrecognized token must be rejected before the 401 recording \
+             assertion below is meaningful"
+        );
+
+        let after_401 = REQUEST_TOTAL
+            .with_label_values(&["get", "", "", "", "", "401"])
+            .get();
+        assert_eq!(
+            after_401,
+            before_401 + 1,
+            "a bad-token rejection must be counted with code=401 and empty \
+             group/version/resource (unknown pre-parse) — otherwise repeated bad-credential \
+             attempts leave no trace in apiserver_request_total"
+        );
+
+        // --- 403: authenticated but RBAC denies, fires after parse_path/verb resolution ---
+        let mut unprivileged_token_map = HashMap::new();
+        unprivileged_token_map.insert(
+            "unprivileged-token".to_owned(),
+            UserInfo {
+                username: "unprivileged-user".to_owned(),
+                uid: "2".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+        let app_403 = Router::new()
+            .route(
+                &format!("/api/v1/namespaces/default/{RESOURCE}"),
+                get(|| async { "ok" }),
+            )
+            .layer(AuthLayer::new(
+                empty_rbac,
+                unprivileged_token_map,
+                None,
+                Arc::new(make_test_store()),
+            ));
+
+        let before_403 = REQUEST_TOTAL
+            .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "403"])
+            .get();
+
+        let req_403 = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/namespaces/default/{RESOURCE}"))
+            .header("authorization", "Bearer unprivileged-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp_403 = app_403.oneshot(req_403).await.unwrap();
+        assert_eq!(
+            resp_403.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "precondition: a caller with no RBAC grants must be denied before the 403 \
+             recording assertion below is meaningful"
+        );
+
+        let after_403 = REQUEST_TOTAL
+            .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "403"])
+            .get();
+        assert_eq!(
+            after_403,
+            before_403 + 1,
+            "an RBAC denial must be counted with the already-resolved group/version/resource/ \
+             scope and code=403 — otherwise a caller retrying a forbidden call repeatedly is \
+             invisible in apiserver_request_total"
         );
     }
 }
