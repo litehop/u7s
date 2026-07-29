@@ -206,11 +206,13 @@ limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"
 echo "Results: $OUTFILE"
 
 # Collect host-side and VM-side logs into <run>/host-logs/ for post-run diagnosis.
-# Kubelet and CRI-O both run as systemd units on the Lima VM — their logs are in the
-# journal, not a file. Without this, a kubelet crash-loop (as in run 0705-1409) or a
-# PLEG-relist-miss needing CRI-O's own timeline is undiagnosable post-hoc. Collected
-# for every node in the run (not just the primary) — KCM/scheduler run once for the
-# whole cluster so they stay unlisted here.
+# Kubelet, CRI-O, and kube-proxy all run as systemd units on the Lima VM — their logs
+# are in the journal, not a file. Without this, a kubelet crash-loop (as in run
+# 0705-1409) or a PLEG-relist-miss needing CRI-O's own timeline is undiagnosable
+# post-hoc; kube-proxy's own timeline is the only way to tell whether it saw an
+# EndpointSlice event late or reprogrammed slowly (vs. u7s never delivering the event).
+# Collected for every node in the run (not just the primary) — KCM/scheduler run once
+# for the whole cluster so they stay unlisted here.
 RUN_DIR="${OUTFILE%.tar.gz}"
 HOST_LOGS_DIR="$RUN_DIR/host-logs"
 mkdir -p "$HOST_LOGS_DIR"
@@ -226,6 +228,10 @@ for NODE in "${NODES[@]}"; do
     > "$HOST_LOGS_DIR/kubelet${SUFFIX}.log" 2>/dev/null || true
   limactl shell "$NODE" sudo journalctl -u crio --no-pager --utc \
     > "$HOST_LOGS_DIR/crio${SUFFIX}.log" 2>/dev/null || true
+  # Always node-qualified (unlike kubelet/crio's unsuffixed primary) so a single-node
+  # run's file name is unambiguous when compared side-by-side with a multi-node run's.
+  limactl shell "$NODE" sudo journalctl -u kube-proxy --no-pager --utc \
+    > "$HOST_LOGS_DIR/kube-proxy-${NODE}.log" 2>/dev/null || true
 done
 limactl shell "$VM_NAME" sudo cat /tmp/kcm.log \
   > "$HOST_LOGS_DIR/kcm.log" 2>/dev/null || true
