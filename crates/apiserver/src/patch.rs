@@ -153,14 +153,10 @@ fn strategic_merge_patch_at(
                 }
             }
         } else if value.is_object() {
-            if should_replace_object(&child_path) {
-                target_obj.insert(key.clone(), value.clone());
-            } else {
-                let entry = target_obj
-                    .entry(key)
-                    .or_insert(serde_json::Value::Object(Default::default()));
-                strategic_merge_patch_at(entry, value, &child_path, schema)?;
-            }
+            let entry = target_obj
+                .entry(key)
+                .or_insert(serde_json::Value::Object(Default::default()));
+            strategic_merge_patch_at(entry, value, &child_path, schema)?;
         } else {
             target_obj.insert(key.clone(), value.clone());
         }
@@ -490,15 +486,6 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
         // devicePath, dropping every other device mapping.
         path if path.ends_with(".volumeDevices") => MergeKeyKind::Key("devicePath".to_string()),
 
-        // allocatedResourcesStatus is nested inside a containerStatuses element (same shape
-        // as volumeMounts/env above, but for ContainerStatus rather than Container). Upstream
-        // declares patchMergeKey=name/patchStrategy=merge; without this entry a kubelet status
-        // patch reporting a new allocated-resource health entry silently replaces the whole
-        // array instead of merging by name.
-        path if path.ends_with(".allocatedResourcesStatus") => {
-            MergeKeyKind::Key("name".to_string())
-        }
-
         // Service spec.ports uses "port" (integer) as the merge key, not "containerPort".
         // This exact match must come before the suffix match below.
         "spec.ports" => MergeKeyKind::Key("port".to_string()),
@@ -556,15 +543,10 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
             MergeKeyKind::Key("uid".to_string())
         }
 
-        path if path == "containerStatuses"
-            || path.ends_with(".containerStatuses")
-            || path == "initContainerStatuses"
-            || path.ends_with(".initContainerStatuses")
-            || path == "ephemeralContainerStatuses"
-            || path.ends_with(".ephemeralContainerStatuses") =>
-        {
-            MergeKeyKind::Key("name".to_string())
-        }
+        // containerStatuses / initContainerStatuses / ephemeralContainerStatuses
+        // intentionally fall through to Unknown (whole-array-replace): the real Go
+        // struct tags at k8s.io/api/core/v1/types.go:5403,5415,5433 carry no
+        // patchStrategy=merge tag, so upstream strategicpatch replaces the whole array.
 
         // ServiceAccount.secrets is a top-level field directly on the object (ServiceAccount
         // has no spec/status wrapper), so PATCHing a ServiceAccount always produces the bare
@@ -662,23 +644,6 @@ fn find_schema_node<'a>(
         node = node.get("properties")?.get(segment)?;
     }
     Some(node)
-}
-
-/// Returns true for object-valued fields that must be replaced wholesale rather than
-/// deep-merged. ContainerStatus.state is a discriminated union (exactly one of waiting,
-/// running, or terminated is set); merging the patch into the existing object would leave
-/// stale sibling keys (e.g. both "running" and "waiting" present simultaneously), which
-/// breaks sonobuoy's aggregator readiness check and any other consumer that inspects state.
-fn should_replace_object(path: &str) -> bool {
-    // state under any containerStatuses element, e.g.:
-    //   "containerStatuses.state", "initContainerStatuses.state", "ephemeralContainerStatuses.state"
-    // The path uses "." as separator and each segment after the array merge is relative
-    // to the element, so the path looks like "<prefix>.state" where prefix ends with
-    // one of the status array names.
-    path.ends_with(".state")
-        && (path.contains("containerStatuses")
-            || path.contains("initContainerStatuses")
-            || path.contains("ephemeralContainerStatuses"))
 }
 
 fn has_delete_directive(arr: &serde_json::Value) -> bool {
@@ -2224,54 +2189,47 @@ mod tests {
         );
     }
 
-    /// ContainerStatus.allocatedResourcesStatus must be registered with merge key "name"
-    /// (matching upstream's `patchStrategy:"merge" patchMergeKey:"name"` tag).
-    ///
-    /// Without this entry, `merge_key_for_path` falls through to Unknown, and a kubelet
-    /// status patch reporting a newly-allocated resource's health silently REPLACES the
-    /// whole array instead of merging by name — discarding the health status of every
-    /// other already-allocated resource the moment a second one is allocated.
+    /// containerStatuses has no upstream patchMergeKey (Go struct tags at
+    /// k8s.io/api/core/v1/types.go:5403,5415,5433 carry only `+listType=atomic`, no
+    /// `patchStrategy=merge`), so a real kube-apiserver whole-array-replaces it on a
+    /// strategic-merge-patch. A partial patch naming only one of several containers
+    /// (e.g. `kubectl patch --subresource=status`, which unlike kubelet doesn't always
+    /// resend every container's status) must therefore DROP the unlisted container's
+    /// entry entirely — silently preserving it instead would misrepresent u7s's status
+    /// endpoint as merge-by-name when real clients rely on replace semantics.
     #[test]
-    fn test_smp_allocated_resources_status_merge_preserves_existing() {
+    fn containerstatuses_partial_status_patch_drops_unlisted_containers_matching_upstream_strategicpatch(
+    ) {
         let mut target = json!({
             "status": {
-                "containerStatuses": [{
-                    "name": "app",
-                    "allocatedResourcesStatus": [
-                        {"name": "gpu", "resources": [{"resourceID": "gpu-0", "health": "Healthy"}]}
-                    ]
-                }]
+                "containerStatuses": [
+                    {"name": "main", "ready": false},
+                    {"name": "sidecar", "ready": true}
+                ]
             }
         });
         let patch = json!({
             "status": {
-                "containerStatuses": [{
-                    "name": "app",
-                    "allocatedResourcesStatus": [
-                        {"name": "nic", "resources": [{"resourceID": "nic-0", "health": "Healthy"}]}
-                    ]
-                }]
+                "containerStatuses": [
+                    {"name": "main", "ready": true}
+                ]
             }
         });
 
         strategic_merge_patch(&mut target, &patch).unwrap();
 
-        let statuses = target["status"]["containerStatuses"][0]["allocatedResourcesStatus"]
-            .as_array()
-            .unwrap();
+        let statuses = target["status"]["containerStatuses"].as_array().unwrap();
         assert_eq!(
             statuses.len(),
-            2,
-            "reporting a newly-allocated resource must not silently drop the health status \
-             of an already-allocated one; got: {statuses:?}"
+            1,
+            "real kube-apiserver drops unlisted container entries on strategic-merge-patch \
+             to containerStatuses because Go struct tags at \
+             k8s.io/api/core/v1/types.go:5403 carry no patchStrategy=merge; u7s must match \
+             — got: {statuses:?}"
         );
-        let names: Vec<&str> = statuses
-            .iter()
-            .map(|s| s["name"].as_str().unwrap())
-            .collect();
-        assert!(
-            names.contains(&"gpu") && names.contains(&"nic"),
-            "both the original and newly-patched resource name must survive; got: {names:?}"
+        assert_eq!(
+            statuses[0]["name"], "main",
+            "the listed container's patched status must be applied"
         );
     }
 
@@ -2854,6 +2812,16 @@ mod tests {
         //    past `versions` to reach `schema.openAPIV3Schema.properties.*.x-kubernetes-
         //    validations` in the first place. Lowest priority of the original 9 given how rarely
         //    a CRD's OpenAPI schema is strategic-merge-patched at all.
+        //  - ContainerStatus.allocatedResourcesStatus genuinely declares patchMergeKey=name/
+        //    patchStrategy=merge (verified against the real Go struct tag at
+        //    k8s.io/api/core/v1/types.go:3400, not just the .proto comment) — but it's the same
+        //    unreachable-nested-field shape as xKubernetesValidations above: it's only ever
+        //    consulted by recursing into an already-merged containerStatuses ELEMENT, and
+        //    containerStatuses itself carries no patchMergeKey (see merge_key_for_path's
+        //    containerStatuses arm), so upstream's own mergeSliceHandler takes the
+        //    whole-array-replace branch for containerStatuses and never calls mergeMap on an
+        //    individual ContainerStatus — meaning this field's real merge-key annotation is
+        //    dead in upstream too, not just here.
         //
         // Two of the 7 fixed above (*WebhookConfiguration.webhooks) have a real JSON key that
         // differs in case from the literal .proto token, so this test's per-field candidate
@@ -2868,6 +2836,7 @@ mod tests {
         let known_missing_tracked_separately: &[(&str, &str)] = &[
             ("ValidatingAdmissionPolicySpec", "variables"),
             ("JSONSchemaProps", "xKubernetesValidations"),
+            ("ContainerStatus", "allocatedResourcesStatus"),
         ];
 
         let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto-include");
