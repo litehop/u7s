@@ -55,6 +55,7 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
         .await
         .map_err(|e| Status::internal(format!("conversion webhook: {e}")))?;
 
+    let requested_len = objects.len();
     let uid = uuid::Uuid::new_v4().to_string();
     let review = serde_json::json!({
         "apiVersion": "apiextensions.k8s.io/v1",
@@ -130,10 +131,19 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
         .cloned()
         .unwrap_or_default();
 
-    if converted.is_empty() {
-        return Err(Status::internal(
-            "conversion webhook returned no converted objects".into(),
-        ));
+    // Upstream's conversion webhook contract requires exactly one converted object per
+    // requested object, in the same order. A short response used to slip through here as
+    // "success" (only `is_empty()` was checked); the caller's `leader_indices.zip(converted)`
+    // then silently truncated to the shorter side, leaving the un-zipped tail of leader keys
+    // stuck in `CrConversionCache::in_flight` forever (the `LeaderClaimGuard::clear()` call
+    // that would normally release them only runs after that same zip loop finishes). Returning
+    // Err here instead makes the caller's `?` drop the still-armed guard, whose Drop impl
+    // releases every claimed key — see `LeaderClaimGuard`.
+    if converted.len() != requested_len {
+        return Err(Status::internal(format!(
+            "conversion webhook returned {} converted objects, expected {requested_len}",
+            converted.len()
+        )));
     }
 
     Ok(converted)
@@ -9459,6 +9469,106 @@ mod tests {
             "every leader across every retry round must release its slot on failure — a \
              leaked in_flight entry here would permanently orphan any future caller for \
              this key even after the webhook recovers"
+        );
+    }
+
+    /// A conversion webhook that returns FEWER `convertedObjects` than requested (but still
+    /// non-empty) must be rejected outright, not accepted as a partial success. Two items
+    /// needing conversion collapse into one webhook call whose response the leader-resolve
+    /// loop pairs up via `leader_indices.zip(converted).zip(leader_keys)` — `zip` silently
+    /// truncates to the shortest iterator, so a 1-of-2 response used to leave the second
+    /// leader key never reaching `resolve`/`guard.keys.clear()`. Fails on revert to
+    /// `converted.is_empty()`: this response is non-empty, so the old check let it through,
+    /// `convert_cr_list_items` returned `Ok(())`, and the second key (rv 11) was orphaned in
+    /// `in_flight` — any future watcher/LIST racing that same (resourceVersion, target
+    /// apiVersion) key would then `claim` a `Follow` and block on a `Notify` nobody will ever
+    /// fire, hanging that request forever.
+    #[tokio::test]
+    async fn call_conversion_webhook_short_response_errors_and_releases_in_flight_keys() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(
+                |axum::Json(review): axum::Json<serde_json::Value>| async move {
+                    let desired = review["request"]["desiredAPIVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let objects = review["request"]["objects"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    // Malformed webhook: only converts the first of the N requested objects.
+                    let short: Vec<serde_json::Value> = objects
+                        .into_iter()
+                        .take(1)
+                        .map(|mut o| {
+                            o["apiVersion"] = serde_json::Value::String(desired.clone());
+                            o
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": {"status": "Success"},
+                            "convertedObjects": short
+                        }
+                    }))
+                },
+            ),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+
+        // Two items, distinct resourceVersions, so both are cold (Leader) claims on the
+        // same webhook call — the scenario the zip-truncation bug needs to fire.
+        let mut items = vec![
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "a", "resourceVersion": "10" }
+            }),
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "b", "resourceVersion": "11" }
+            }),
+        ];
+
+        let result =
+            convert_cr_list_items(&state, Some(&client_config), &mut items, "example.io/v2").await;
+
+        let err = result.expect_err(
+            "a webhook returning 1 converted object for 2 requested must be rejected — \
+             silently accepting it truncates the leader-resolve loop and serves item 'b' \
+             back unconverted to whatever LIST/watch triggered this call",
+        );
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a shape-mismatched webhook response must surface as a 500, the same failure \
+             mode as every other conversion webhook error"
+        );
+        assert!(
+            err.1.message.contains("returned 1") && err.1.message.contains("expected 2"),
+            "the error must name the exact shape mismatch (1 returned vs 2 expected) so an \
+             operator debugging a broken conversion webhook sees the discrepancy instead of \
+             a generic failure: got {:?}",
+            err.1.message
+        );
+        assert_eq!(
+            state.cr_conversion_cache.in_flight_count(),
+            0,
+            "both (resourceVersion, target apiVersion) keys claimed as leader for this call \
+             must be released on the error path — an entry left behind here means any future \
+             concurrent caller for that same key (a second watcher, a retried LIST) blocks \
+             forever on a Notify that nobody will ever fire"
         );
     }
 
