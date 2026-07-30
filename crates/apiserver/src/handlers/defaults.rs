@@ -38,6 +38,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumes") = (group, plural) {
         default_pv(obj);
     }
+    if let ("", "namespaces") = (group, plural) {
+        default_namespace(obj);
+    }
     if let ("coordination.k8s.io", "leases") = (group, plural) {
         default_lease(obj);
     }
@@ -215,6 +218,27 @@ fn default_pv(obj: &mut serde_json::Value) {
     }
     if obj["spec"]["volumeMode"].is_null() {
         obj["spec"]["volumeMode"] = serde_json::Value::String("Filesystem".to_string());
+    }
+}
+
+/// Set status.phase to "Active" for a newly created Namespace, matching upstream
+/// `NamespaceStrategy.PrepareForCreate` (pkg/registry/core/namespace/strategy.go), which
+/// the real kube-apiserver runs for both plain `POST` create AND `PATCH`-based
+/// server-side-apply create — u7s previously only ran the equivalent of this in the
+/// plain-create handler, so an SSA-created (`kubectl apply`) namespace was persisted
+/// with `status: {}`. KCM's ServiceAccount controller skips reconciling the `default`
+/// ServiceAccount for any namespace whose `status.phase != Active`, so a pod created in
+/// such a namespace with the pod-spec default `automountServiceAccountToken: true`
+/// sticks in ContainerCreating forever.
+///
+/// Idempotent: an existing status.phase (e.g. "Terminating", stamped by delete) is
+/// never overwritten.
+fn default_namespace(obj: &mut serde_json::Value) {
+    if obj["status"]["phase"].is_null() {
+        if !obj["status"].is_object() {
+            obj["status"] = serde_json::json!({});
+        }
+        obj["status"]["phase"] = serde_json::Value::String("Active".to_string());
     }
 }
 

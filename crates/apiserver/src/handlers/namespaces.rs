@@ -179,20 +179,16 @@ pub(crate) async fn create_namespace<S: Store>(
 
     validate_namespace_name(&name)?;
 
-    // Ensure kind/apiVersion and status are set
+    // Ensure kind/apiVersion are set
     if obj.body.get("kind").is_none() {
         obj.body["kind"] = serde_json::Value::String("Namespace".into());
     }
     if obj.body.get("apiVersion").is_none() {
         obj.body["apiVersion"] = serde_json::Value::String("v1".into());
     }
-    if obj.body["status"].is_null() || obj.body.get("status").is_none() {
-        obj.body["status"] = serde_json::to_value(NamespaceStatus {
-            phase: Some(NamespacePhase::Active),
-            rest: serde_json::Value::Object(Default::default()),
-        })
-        .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
-    }
+    // status.phase=Active is set by apply_defaults, the same defaulter the SSA
+    // create-on-missing path (do_patch) uses — see its "namespaces" branch.
+    crate::handlers::defaults::apply_defaults("", "namespaces", &mut obj.body);
 
     // Stamp the "kubernetes" finalizer into spec.finalizers at creation time.
     //
@@ -3936,6 +3932,118 @@ mod tests {
         assert_eq!(
             mf[0]["operation"], "Apply",
             "managedFields[0].operation must be 'Apply' for SSA requests"
+        );
+    }
+
+    /// A Namespace created via SSA PATCH on a name that does not yet exist (the
+    /// `kubectl apply` create-on-missing path, `do_patch`'s `is_ssa && stored_opt.is_none()`
+    /// branch) must get `status.phase: Active`, exactly like plain `kubectl create`.
+    ///
+    /// Before the fix, `apply_defaults` had no Namespace case, so this path stored
+    /// `status: {}`. KCM's ServiceAccount controller skips reconciling the default SA
+    /// for any namespace whose status.phase != Active — so an apply-created namespace
+    /// silently never gets its `default` ServiceAccount, and any pod created in it with
+    /// the pod-spec default `automountServiceAccountToken: true` sticks in
+    /// ContainerCreating forever with a misleading kubelet TokenRequest error.
+    #[tokio::test]
+    async fn apply_created_namespace_gets_status_phase_active() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "apply-created-ns" }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&manifest).unwrap());
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_namespace(
+            State(state.clone()),
+            Path("apply-created-ns".to_string()),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kubectl-apply".to_string()),
+                _field_validation: None,
+                dry_run: None,
+            }),
+            test_user(),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA create-on-missing must succeed, got {:?}", e.0))
+        .into_response();
+
+        let body_bytes = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Active",
+            "apply-created Namespace must get status.phase=Active in the response; \
+             if this regresses, KCM's ServiceAccount controller silently skips \
+             reconciling the default SA for apply-created namespaces, and any pod in \
+             that namespace with default automountServiceAccountToken: true sticks in \
+             ContainerCreating forever with a misleading kubelet TokenRequest error"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "apply-created-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must exist in store");
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["status"]["phase"], "Active",
+            "the STORED apply-created Namespace must have status.phase=Active, not just \
+             the response body — KCM's ServiceAccount controller reads the stored object"
+        );
+    }
+
+    /// Plain `kubectl create namespace` (POST) must still get status.phase=Active after
+    /// routing through the shared `apply_defaults` defaulter.
+    ///
+    /// Regression guard for the refactor that made `create_namespace` call
+    /// `apply_defaults` instead of setting status inline: this must not silently drop
+    /// the default kube-controller-manager's ServiceAccount controller (and every other
+    /// consumer of namespace status) depends on for every plain-created namespace.
+    #[tokio::test]
+    async fn plain_created_namespace_still_gets_status_phase_active() {
+        let state = make_state();
+
+        create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("plain-created-ns"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "plain-created-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must exist in store");
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            body["status"]["phase"], "Active",
+            "plain-created Namespace must still get status.phase=Active after routing \
+             through apply_defaults; a regression here breaks the working plain-create \
+             path that KCM's ServiceAccount controller and every namespace-scoped \
+             conformance test depend on"
         );
     }
 
