@@ -504,6 +504,80 @@ fn delete_sync(
     Ok((new_revision, last_value))
 }
 
+/// Atomically check `ns_key`'s `status.phase` and, only if it is not `"Terminating"`,
+/// create-only-insert `value` at `key`. Both the namespace read and the insert run inside one
+/// `BEGIN IMMEDIATE … COMMIT` transaction, guarded by `write_conn`'s mutex like every other
+/// write path here — so a concurrent `put_sync` flipping `ns_key`'s phase (e.g.
+/// `delete_namespace`'s Terminating write) can never land between this function's read of
+/// `ns_key` and its insert at `key`: the two operations either fully precede or fully follow
+/// each other, never interleave.
+fn create_if_namespace_active_sync(
+    conn: &Connection,
+    ns_key: Option<&str>,
+    key: &str,
+    value: Bytes,
+    last_written: &AtomicU64,
+) -> std::result::Result<(u64, Bytes), CreateNamespacedError> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    if let Some(ns_key) = ns_key {
+        let ns_value: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM objects WHERE key = ?1",
+                params![ns_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(ns_bytes) = ns_value {
+            if let Ok(ns_json) = serde_json::from_slice::<serde_json::Value>(&ns_bytes) {
+                if ns_json["status"]["phase"].as_str() == Some("Terminating") {
+                    conn.execute_batch("ROLLBACK")?;
+                    return Err(CreateNamespacedError::NamespaceTerminating);
+                }
+            }
+        }
+    }
+
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM objects WHERE key = ?1", params![key], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    if exists {
+        conn.execute_batch("ROLLBACK")?;
+        return Err(CreateNamespacedError::Store(StoreError::AlreadyExists {
+            key: key.to_string(),
+        }));
+    }
+
+    conn.execute(
+        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
+        [],
+    )?;
+    let new_revision: u64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+
+    let (stamped_value, ns, obj_name) = stamp_resource_version(&value, new_revision)?;
+    conn.execute(
+        "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            key,
+            stamped_value.as_ref(),
+            new_revision as i64,
+            ns,
+            obj_name
+        ],
+    )?;
+
+    conn.execute_batch("COMMIT")?;
+    last_written.fetch_max(new_revision, Ordering::Release);
+    Ok((new_revision, stamped_value))
+}
+
 /// Delete all objects in a namespace atomically.
 ///
 /// Returns (key, body, revision) for each deleted object. Each object gets its own distinct
@@ -983,6 +1057,57 @@ impl Store for SqliteStore {
             is_create,
             "store: write committed"
         );
+
+        Ok(revision)
+    }
+
+    async fn create_if_namespace_active(
+        &self,
+        ns_key: Option<&str>,
+        key: &str,
+        value: Bytes,
+    ) -> std::result::Result<u64, CreateNamespacedError> {
+        let conn = self.write_conn.clone();
+        let ns_key_owned = ns_key.map(|s| s.to_string());
+        let key_str = key.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
+        let tx = self.tx.clone();
+        let ring = Arc::clone(&self.ring);
+        let deletion_log = Arc::clone(&self.deletion_log);
+        let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let start = std::time::Instant::now();
+        let revision = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let (revision, stamped_value) = create_if_namespace_active_sync(
+                &conn,
+                ns_key_owned.as_deref(),
+                &key_str,
+                value,
+                &last_written,
+            )?;
+            // Broadcast while still holding write_conn's guard — see push_event_locked's doc
+            // comment for why this ordering matters under concurrent writers. A namespaced
+            // create is always a fresh key (create-only, gated on AlreadyExists above), so
+            // is_create is unconditionally true here — unlike put's no-op suppression, there is
+            // no case where this write should be silently absorbed.
+            push_event_locked(
+                &tx,
+                &ring,
+                &deletion_log,
+                &compaction_horizon,
+                Arc::new(InternalEvent {
+                    key: key_str,
+                    revision,
+                    value: Some(stamped_value),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+            );
+            Ok::<u64, CreateNamespacedError>(revision)
+        })
+        .await??;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::debug!(key, elapsed_ms, "store: namespaced create committed");
 
         Ok(revision)
     }
@@ -2559,5 +2684,150 @@ mod tests {
              structurally impossible while this stream holds its own Sender clone; got: \
              {outcome:?}"
         );
+    }
+
+    /// `create_if_namespace_active` must reject a create whose namespace is ALREADY
+    /// Terminating at commit time — the base case the transactional guard exists for. Without
+    /// it, a controller can keep injecting objects into a namespace mid-deletion, which is
+    /// exactly the orphaned-content bug mayor-74j3.6/74j3.7 fix.
+    #[tokio::test]
+    async fn create_if_namespace_active_rejects_terminating_namespace() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns_key = "/registry/namespaces/dying-ns";
+        store
+            .put(
+                ns_key,
+                Bytes::from(r#"{"status":{"phase":"Terminating"}}"#),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let result = store
+            .create_if_namespace_active(
+                Some(ns_key),
+                "/registry/core/configmaps/dying-ns/cm",
+                Bytes::from(r#"{"metadata":{"name":"cm","namespace":"dying-ns"}}"#),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CreateNamespacedError::NamespaceTerminating)),
+            "a create whose namespace is Terminating at commit time must be rejected with \
+             NamespaceTerminating, not silently written — got {result:?}"
+        );
+        assert!(
+            store
+                .get("/registry/core/configmaps/dying-ns/cm")
+                .await
+                .unwrap()
+                .is_none(),
+            "the object must never be visible in the store when its namespace check failed"
+        );
+    }
+
+    /// A namespace that does not exist at `ns_key` must be treated as active, not rejected —
+    /// this method only closes the create-vs-delete race for namespaces that exist; it is not
+    /// a namespace-existence check (that stays the caller's job, e.g. pods.rs's
+    /// parse_namespace), matching the pre-existing behavior of the inline checks this method
+    /// replaces (which also silently allowed the create when the namespace lookup found
+    /// nothing).
+    #[tokio::test]
+    async fn create_if_namespace_active_allows_create_when_namespace_absent() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let result = store
+            .create_if_namespace_active(
+                Some("/registry/namespaces/never-created"),
+                "/registry/core/configmaps/never-created/cm",
+                Bytes::from(r#"{"metadata":{"name":"cm","namespace":"never-created"}}"#),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a missing namespace must not be treated as Terminating — got {result:?}"
+        );
+    }
+
+    /// The namespace check and the object insert must be a single atomic unit: a concurrent
+    /// write that flips the namespace to Terminating strictly AFTER this call's transaction
+    /// has already committed the create must not retroactively fail it, and (the property that
+    /// actually matters for correctness) the create must never observe a torn state where its
+    /// own insert exists but the namespace phase it should have been gated on was never
+    /// consulted at all.
+    ///
+    /// This exercises the same BEGIN IMMEDIATE / COMMIT boundary as `put_sync` and
+    /// `delete_namespace_sync` — if the namespace-phase read and the object insert were ever
+    /// split into two separate transactions (the bug this whole method exists to close), a
+    /// `put` to `ns_key` issued by another task between them would sometimes win the race and
+    /// sometimes lose it depending on scheduling, making this test flaky. Because `write_conn`
+    /// serializes every write behind one mutex and `create_if_namespace_active_sync` never
+    /// releases it between the read and the insert, running this many times must be
+    /// deterministic every time.
+    #[tokio::test]
+    async fn create_if_namespace_active_check_and_insert_are_not_interleaved_by_concurrent_writes()
+    {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns_key = "/registry/namespaces/busy-ns";
+        store
+            .put(
+                ns_key,
+                Bytes::from(r#"{"status":{"phase":"Active"}}"#),
+                None,
+            )
+            .await
+            .expect("seed active namespace");
+
+        for i in 0..50 {
+            let obj_key = format!("/registry/core/configmaps/busy-ns/cm-{i}");
+            let create_store = Arc::clone(&store);
+            let create_key = obj_key.clone();
+            let create = tokio::spawn(async move {
+                create_store
+                    .create_if_namespace_active(
+                        Some("/registry/namespaces/busy-ns"),
+                        &create_key,
+                        Bytes::from(r#"{"metadata":{"name":"cm","namespace":"busy-ns"}}"#),
+                    )
+                    .await
+            });
+            let flip_store = Arc::clone(&store);
+            let flip = tokio::spawn(async move {
+                flip_store
+                    .put(
+                        "/registry/namespaces/busy-ns",
+                        Bytes::from(r#"{"status":{"phase":"Terminating"}}"#),
+                        None,
+                    )
+                    .await
+            });
+
+            let (create_result, flip_result) = tokio::join!(create, flip);
+            let create_result = create_result.expect("create task must not panic");
+            flip_result
+                .expect("flip task must not panic")
+                .expect("flip put must succeed");
+
+            // Whichever order the two writes actually landed in, the object's presence in the
+            // store must agree with whether the create call reported success — there must be
+            // no window where the create returned Ok but the object is absent (or vice versa),
+            // which is what "check and insert happen in one transaction" guarantees.
+            let stored = store.get(&obj_key).await.expect("get must not error");
+            assert_eq!(
+                create_result.is_ok(),
+                stored.is_some(),
+                "iteration {i}: create_if_namespace_active's return value and the object's \
+                 actual presence in the store disagree — the namespace check and the insert \
+                 must be one atomic unit, never a torn write"
+            );
+
+            // Reset the namespace to Active for the next iteration.
+            store
+                .put(
+                    "/registry/namespaces/busy-ns",
+                    Bytes::from(r#"{"status":{"phase":"Active"}}"#),
+                    None,
+                )
+                .await
+                .expect("reset namespace to active");
+        }
     }
 }

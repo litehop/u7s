@@ -804,28 +804,56 @@ async fn cascade_delete_namespace_resources<S: Store>(
 /// to be scheduled, e.g. the SchedulerPredicates/SchedulerPreemption conformance suite's
 /// "wait for stable cluster" precondition.
 ///
-/// Returns `true` if the namespace must stay Terminating (a finalizer'd object needs its
-/// controller to act, or resources kept reappearing after the retry budget ran out) and
-/// `false` once a pass finds nothing left to soft-delete and a fresh list confirms empty.
+/// Outcome of `cascade_delete_namespace_resources_until_stable`.
+///
+/// `FinalizerPending` and `RetryExhausted` used to be conflated into a single `true` return —
+/// but they call for different caller behavior: a real finalizer will eventually clear (the
+/// owning controller acts on it, then `maybe_finalize_terminating_namespace` re-fires), while
+/// retry-exhaustion means content kept reappearing for reasons a finalizer removal will never
+/// trigger. `create_if_namespace_active` closes the create-vs-delete race that used to make
+/// `RetryExhausted` reachable in practice, but keeping it distinct means a future create path
+/// that forgets to route through that atomic guard fails loud (a namespace visibly warns and
+/// still finishes deleting) instead of silently wedging in Terminating forever.
+#[derive(Debug, PartialEq, Eq)]
+enum CascadeResult {
+    /// A pass found nothing left, and a fresh list confirmed the namespace is empty.
+    CleanEmpty,
+    /// A real `metadata.finalizers` entry is blocking a contained object; its owning
+    /// controller must observe `deletionTimestamp` and clear the finalizer before it (and
+    /// eventually the namespace) can hard-delete.
+    FinalizerPending,
+    /// Every retry pass found the namespace non-empty, but never because of a genuine
+    /// finalizer. `remaining` is the object count from the final list, for the caller's log.
+    RetryExhausted { remaining: usize },
+}
+
 async fn cascade_delete_namespace_resources_until_stable<S: Store>(
     state: &AppState<S>,
     namespace: &str,
-) -> bool {
+) -> CascadeResult {
     const MAX_ATTEMPTS: u32 = 5;
     for _ in 0..MAX_ATTEMPTS {
         if cascade_delete_namespace_resources(state, namespace).await {
             // A finalizer'd object was soft-deleted — its controller owns finishing this,
             // not us. No amount of retrying here will make it disappear faster.
-            return true;
+            return CascadeResult::FinalizerPending;
         }
         match state.store.list_namespace_objects(namespace).await {
-            Ok(remaining) if remaining.is_empty() => return false,
+            Ok(remaining) if remaining.is_empty() => return CascadeResult::CleanEmpty,
             Ok(_) => continue, // an object appeared after this pass's cascade — retry
-            Err(_) => return false,
+            Err(_) => return CascadeResult::CleanEmpty,
         }
     }
-    // Objects kept reappearing across every retry — don't hard-delete out from under them.
-    true
+    // Objects kept reappearing across every retry, never because of a real finalizer. Count
+    // what's left purely for the caller's warn log — this extra list only runs on this
+    // (expected-unreachable now that creates are gated atomically) exhaustion path.
+    let remaining = state
+        .store
+        .list_namespace_objects(namespace)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    CascadeResult::RetryExhausted { remaining }
 }
 
 /// Check if a Terminating namespace can now be hard-deleted.
@@ -1027,10 +1055,43 @@ pub(crate) async fn delete_namespace<S: Store>(
     // No spec.finalizers — hard-delete immediately (namespace was not given a lifecycle
     // controller, e.g. seeded directly in tests). Cascade-delete all resources first so
     // that re-creating the namespace does not inherit stale objects (false 409).
-    // Objects with metadata.finalizers are still soft-deleted for correctness but the
-    // namespace itself is immediately gone (no Terminating state mechanism without
-    // deletionTimestamp on the namespace).
-    cascade_delete_namespace_resources_until_stable(&state, &name).await;
+    match cascade_delete_namespace_resources_until_stable(&state, &name).await {
+        CascadeResult::CleanEmpty => {}
+        CascadeResult::FinalizerPending => {
+            // A contained object has a real metadata.finalizers entry and was only
+            // soft-deleted. Hard-deleting the namespace out from under it now would orphan
+            // it forever (no namespace left to ever re-drain it) — give the namespace a
+            // genuine Terminating lifecycle instead, matching the "kubernetes"-finalized
+            // path above, so maybe_finalize_terminating_namespace re-fires once the
+            // object's controller clears the finalizer.
+            obj.body["metadata"]["deletionTimestamp"] =
+                serde_json::Value::String(utc_now_rfc3339());
+            obj.body["status"] = serde_json::to_value(NamespaceStatus {
+                phase: Some(NamespacePhase::Terminating),
+                rest: serde_json::Value::Object(Default::default()),
+            })
+            .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
+            let expected_rv = parse_resource_version(obj.resource_version())?;
+            let new_rv = state
+                .store
+                .put(&key, obj.to_bytes(), expected_rv)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+            obj.set_resource_version(new_rv);
+            return Ok(Json(obj.body).into_response());
+        }
+        CascadeResult::RetryExhausted { remaining } => {
+            // Content kept reappearing across every retry, never because of a real
+            // finalizer. create_if_namespace_active's atomic guard should make this
+            // unreachable now — this only fires if some create path forgot to route
+            // through it. Log and proceed rather than parking the namespace in
+            // Terminating forever with nothing left to ever re-drive it.
+            tracing::warn!(
+                "namespace {name}: cascade retry budget exhausted with {remaining} object(s) \
+                 still present; hard-deleting anyway"
+            );
+        }
+    }
     state
         .store
         .delete(&key, None)
@@ -4331,6 +4392,210 @@ mod tests {
             "a pod created during the cascade race must still be reaped by a retry pass — \
              otherwise it is orphaned forever with no namespace left to ever re-drain it"
         );
+    }
+
+    /// A store wrapper whose `list_namespace_objects` injects a brand-new, finalizer-less
+    /// racer pod into `target_ns` after EVERY call (not just the first, unlike
+    /// `RaceInjectStore` above) — simulating content that keeps getting recreated by a still
+    /// live controller no amount of retrying will ever outpace. Used to force
+    /// `cascade_delete_namespace_resources_until_stable` to genuinely exhaust its retry
+    /// budget rather than converge on empty.
+    struct PerpetualRacerStore {
+        inner: Arc<SqliteStore>,
+        target_ns: String,
+        counter: std::sync::atomic::AtomicU64,
+    }
+
+    impl u7s_store::Store for PerpetualRacerStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            let is_target = namespace == self.target_ns;
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let target_ns = self.target_ns.clone();
+            async move {
+                let result = inner.list_namespace_objects(&ns).await;
+                if is_target {
+                    let racer_key =
+                        crate::keys::object_key("pods", &target_ns, &format!("racer-{n}"));
+                    let racer = serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": { "name": format!("racer-{n}"), "namespace": target_ns },
+                        "spec": { "containers": [] }
+                    });
+                    inner
+                        .put(&racer_key, Bytes::from(racer.to_string()), None)
+                        .await
+                        .expect("racer pod write must succeed");
+                }
+                result
+            }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// A real `metadata.finalizers` entry must report `FinalizerPending`, not
+    /// `RetryExhausted` — `delete_namespace` uses this to decide whether to wait for the
+    /// owning controller (which will eventually clear the finalizer) instead of logging a
+    /// warning and hard-deleting the namespace out from under content that is still
+    /// legitimately draining.
+    ///
+    /// Fails on revert: reverting `cascade_delete_namespace_resources_until_stable` to its old
+    /// `bool` return collapses this distinction — both cases become the same `true`, so a
+    /// caller (or a future refactor) can no longer tell "wait, a controller is handling this"
+    /// apart from "give up and log a warning".
+    #[tokio::test]
+    async fn cascade_returns_finalizer_pending_for_real_finalizer() {
+        let state = make_state();
+
+        let pod_key = crate::keys::object_key("pods", "fin-only-ns", "protected-pod");
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "protected-pod",
+                "namespace": "fin-only-ns",
+                "finalizers": ["test.io/delete-me"]
+            },
+            "spec": { "containers": [] }
+        });
+        state
+            .store
+            .put(&pod_key, Bytes::from(pod.to_string()), None)
+            .await
+            .expect("pod-with-finalizer write must succeed");
+
+        let result = cascade_delete_namespace_resources_until_stable(&state, "fin-only-ns").await;
+        assert_eq!(
+            result,
+            CascadeResult::FinalizerPending,
+            "a real metadata.finalizers entry must report FinalizerPending so the caller waits \
+             for its owning controller, not RetryExhausted (which tells the caller to give up \
+             and hard-delete instead) — got {result:?}"
+        );
+    }
+
+    /// Content that keeps reappearing on every single retry pass — never because of a real
+    /// finalizer — must report `RetryExhausted` with the leftover count, not `FinalizerPending`.
+    /// `delete_namespace` logs a warning and proceeds to hard-delete for this case; treating it
+    /// as `FinalizerPending` instead would make the namespace wait forever for a finalizer
+    /// removal that will never come, wedging it in Terminating exactly like the bug
+    /// mayor-74j3.6 fixed.
+    ///
+    /// Fails on revert: reverting to the old `bool` return makes this indistinguishable from
+    /// `cascade_returns_finalizer_pending_for_real_finalizer` above — both were the same `true`.
+    #[tokio::test]
+    async fn cascade_returns_retry_exhausted_for_livelocked_content() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let racer_store = Arc::new(PerpetualRacerStore {
+            inner: Arc::clone(&inner),
+            target_ns: "livelock-ns".to_string(),
+            counter: std::sync::atomic::AtomicU64::new(0),
+        });
+        let state = crate::state::AppState::new(
+            Arc::clone(&racer_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = cascade_delete_namespace_resources_until_stable(&state, "livelock-ns").await;
+        match result {
+            CascadeResult::RetryExhausted { remaining } => {
+                assert!(
+                    remaining > 0,
+                    "RetryExhausted must report a non-zero remaining count — content really is \
+                     still present, it just never carried a finalizer"
+                );
+            }
+            other => panic!(
+                "content that keeps reappearing on every pass without ever carrying a real \
+                 finalizer must report RetryExhausted, not {other:?} — otherwise the namespace \
+                 waits forever for a finalizer removal that will never happen"
+            ),
+        }
     }
 }
 

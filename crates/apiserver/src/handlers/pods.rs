@@ -6,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::Deserialize;
-use u7s_store::{ListOptions, Store, StoreError};
+use u7s_store::{CreateNamespacedError, ListOptions, Store, StoreError};
 
 use crate::{
     admission::{
@@ -434,24 +434,6 @@ pub(crate) async fn create_pod<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
 
-    // Reject pod creation in a Terminating namespace — matches kube-apiserver behaviour and
-    // the same gate create_namespaced_resource already enforces for every other resource
-    // type. Without this, a ReplicationController/ReplicaSet controller can keep recreating
-    // pods in a namespace mid-deletion, forcing the real KCM namespace-controller's own
-    // DeleteCollection retries to repeatedly race new pods instead of converging quickly.
-    {
-        let ns_key = cluster_object_key("namespaces", ns.as_str());
-        if let Ok(Some(stored)) = state.store.get(&ns_key).await {
-            if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                    return Err(Status::forbidden(format!(
-                        "unable to create new content in namespace {ns} because it is being terminated"
-                    )));
-                }
-            }
-        }
-    }
-
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -591,11 +573,27 @@ pub(crate) async fn create_pod<S: Store>(
     }
 
     let key = object_key("pods", ns.as_str(), &name);
-    let new_rv = state
+    let ns_key = cluster_object_key("namespaces", ns.as_str());
+    // Reject pod creation in a Terminating namespace — matches kube-apiserver behaviour and
+    // the same gate create_namespaced_resource enforces for every other resource type,
+    // atomically with the insert so a concurrent delete_namespace phase-flip can never land
+    // between the check and this write. Without this, a ReplicationController/ReplicaSet
+    // controller can keep recreating pods in a namespace mid-deletion, forcing the real KCM
+    // namespace-controller's own DeleteCollection retries to repeatedly race new pods instead
+    // of converging quickly.
+    let new_rv = match state
         .store
-        .put(&key, obj.to_bytes(), Some(0))
+        .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
         .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    {
+        Ok(rv) => rv,
+        Err(CreateNamespacedError::NamespaceTerminating) => {
+            return Err(Status::forbidden(format!(
+                "unable to create new content in namespace {ns} because it is being terminated"
+            )));
+        }
+        Err(CreateNamespacedError::Store(e)) => return Err(store_err_to_status(e, &name)),
+    };
 
     obj.set_resource_version(new_rv);
 
