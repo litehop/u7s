@@ -448,20 +448,18 @@ pub async fn list_crds<S: Store>(
     Ok(Json(body).into_response())
 }
 
-pub async fn create_crd<S: Store>(
-    State(state): State<AppState<S>>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
-    let mut crd = parse_crd(&body)?;
-
-    let name = crd.metadata.name.clone();
+/// Run the defaulting/validation/admission/status-stamping pipeline a brand-new CRD must go
+/// through before it is persisted. Shared by `create_crd` (POST) and `patch_crd`'s SSA
+/// create-on-missing branch, so `kubectl apply --server-side` against a CRD name that doesn't
+/// exist yet gets the same name-format check, group/schema validation, admission webhooks, and
+/// Established/NamesAccepted status stamping as `kubectl create` — instead of drifting out of
+/// sync with `create_crd` over time.
+async fn build_new_crd<S: Store>(
+    state: &AppState<S>,
+    user: &UserInfo,
+    name: &str,
+    mut crd: CustomResourceDefinition,
+) -> Result<CustomResourceDefinition, crate::status::StatusError> {
     if name.is_empty() {
         return Err(Status::unprocessable_entity(
             "metadata.name is required".into(),
@@ -486,7 +484,7 @@ pub async fn create_crd<S: Store>(
             group: "apiextensions.k8s.io",
             version: "v1",
             resource: "customresourcedefinitions",
-            name: &name,
+            name,
             namespace: None,
             operation: "CREATE",
             user_info: Some(serde_json::json!({
@@ -497,8 +495,8 @@ pub async fn create_crd<S: Store>(
             dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
-        let mutated = run_mutating_webhooks(&state, obj_val, None, &admission_ctx).await?;
-        run_validating_webhooks(&state, &mutated, None, &admission_ctx).await?;
+        let mutated = run_mutating_webhooks(state, obj_val, None, &admission_ctx).await?;
+        run_validating_webhooks(state, &mutated, None, &admission_ctx).await?;
         crd = serde_json::from_value(mutated)
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
@@ -521,6 +519,24 @@ pub async fn create_crd<S: Store>(
             }
         ]
     }));
+
+    Ok(crd)
+}
+
+pub async fn create_crd<S: Store>(
+    State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let crd = parse_crd(&body)?;
+    let name = crd.metadata.name.clone();
+    let mut crd = build_new_crd(&state, &user, &name, crd).await?;
 
     let key = store_key(&name);
     let rv = state
@@ -804,12 +820,42 @@ pub async fn patch_crd<S: Store>(
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = store_key(&name);
-    let stored = state
+    let stored_opt = state
         .store
         .get(&key)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, KIND))?;
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // SSA create-on-missing: `kubectl apply --server-side -f my-crd.yaml` against a CRD name
+    // that doesn't exist yet sends exactly this PATCH (Content-Type: application/apply-patch+yaml)
+    // and relies on the apiserver to create it — this is core SSA semantics, not an edge case
+    // (see do_patch's identical `is_ssa && stored_opt.is_none()` branch for the generic resource
+    // path). A non-SSA patch type (merge/strategic-merge/JSON Patch) on a missing CRD still 404s,
+    // matching upstream: those patch types have no create-on-missing semantics.
+    if is_ssa && stored_opt.is_none() {
+        let mut body_json = ssa_body_to_json(&body)?;
+        // The URL name is authoritative for what gets created, regardless of what (if anything)
+        // the apply body's metadata.name says — mirrors do_patch's obj_meta.name override.
+        body_json["metadata"]["name"] = serde_json::Value::String(name.clone());
+        let crd: CustomResourceDefinition = serde_json::from_value(body_json).map_err(|e| {
+            Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}"))
+        })?;
+        let mut crd = build_new_crd(&state, &user, &name, crd).await?;
+
+        let rv = state
+            .store
+            .put(&key, to_bytes(&crd)?, Some(0))
+            .await
+            .map_err(|e| store_err_crd(e, &name))?;
+
+        let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
+        let _ = state.store.delete(&tombstone_key, None).await;
+
+        crd.metadata.resource_version = rv.to_string();
+        return Ok((StatusCode::CREATED, Json(crd)).into_response());
+    }
+
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, KIND))?;
 
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -880,7 +926,7 @@ pub async fn patch_crd<S: Store>(
     evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
 
     crd.metadata.resource_version = rv.to_string();
-    Ok(Json(crd))
+    Ok(Json(crd).into_response())
 }
 
 /// GET /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}/status
@@ -1890,6 +1936,184 @@ mod tests {
         assert_eq!(
             json["code"], 404,
             "PATCH on missing CRD must return 404 NotFound"
+        );
+    }
+
+    /// SSA apply-patch on a CRD name that does not exist yet must create it — with the same
+    /// Established/NamesAccepted status stamping `create_crd` gives a plain POST — instead of
+    /// 404ing. Real Server-Side Apply creates the target object on first apply; before this
+    /// fix, `kubectl apply --server-side -f my-crd.yaml` against a fresh CRD 404'd outright,
+    /// breaking any GitOps flow that applies (rather than creates) CRDs.
+    #[tokio::test]
+    async fn ssa_apply_patch_creates_missing_crd_with_full_status_stamping() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "widgets.example.io";
+
+        let manifest = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": name },
+            "spec": {
+                "group": "example.io",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget",
+                    "listKind": "WidgetList"
+                },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&manifest).unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "SSA apply-patch on a missing CRD must create it, not 404 — this breaks any \
+                 GitOps flow using `kubectl apply --server-side` on a fresh CRD: {e:?}"
+            )
+        })
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            StatusCode::CREATED,
+            "creating a CRD via SSA apply must return 201, matching create_crd's POST response"
+        );
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["metadata"]["name"], name);
+
+        let condition_types: Vec<&str> = v["status"]["conditions"]
+            .as_array()
+            .expect("SSA-created CRD must have status.conditions stamped, matching create_crd")
+            .iter()
+            .map(|c| c["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            condition_types,
+            vec!["Established", "NamesAccepted"],
+            "SSA create-on-missing must stamp the same conditions as plain `kubectl create` — \
+             without this, controllers gating on CRD readiness never see it as usable"
+        );
+
+        // Persisted, not just echoed back — get_crd must independently observe the new CRD.
+        let stored = get_crd(State(state), Path(name.to_string())).await.expect(
+            "the SSA-created CRD must be durably persisted, not merely returned in the response",
+        );
+        assert_eq!(stored.status(), StatusCode::OK);
+    }
+
+    /// SSA apply-patch on a CRD that already exists must update it in place, not create a
+    /// second copy — this guards the upsert branch's `stored_opt.is_none()` gate. If that
+    /// check ever regressed to fire unconditionally, a second `kubectl apply --server-side`
+    /// on an existing CRD would reset server-assigned fields (uid) instead of patching the
+    /// live object, silently breaking identity-sensitive consumers (owner references, caches
+    /// keyed by uid).
+    #[tokio::test]
+    async fn ssa_apply_patch_on_existing_crd_still_updates_not_creates() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "widgets.example.io";
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.io", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let existing = get_crd(State(state.clone()), Path(name.to_string()))
+            .await
+            .expect("get after create must succeed");
+        let existing_body = axum::body::to_bytes(existing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let existing_json: serde_json::Value = serde_json::from_slice(&existing_body).unwrap();
+        let original_uid = existing_json["metadata"]["uid"]
+            .as_str()
+            .expect("create_crd must stamp a uid")
+            .to_string();
+
+        let manifest = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": name },
+            "spec": {
+                "group": "example.io",
+                "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1", "served": true, "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": { "spec": { "type": "object" } }
+                        }
+                    }
+                }]
+            }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&manifest).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect("SSA apply on an existing CRD must succeed")
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            StatusCode::OK,
+            "SSA apply on an EXISTING CRD must return 200 (update), not 201 (create) — a 201 \
+             here would mean the create-on-missing branch fired despite the CRD already existing"
+        );
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], original_uid,
+            "updating via SSA apply must preserve the original uid — a fresh uid means the \
+             object was recreated rather than patched in place"
+        );
+        assert_eq!(
+            v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["type"],
+            "object",
+            "the patch's schema change must be applied to the existing object"
         );
     }
 
