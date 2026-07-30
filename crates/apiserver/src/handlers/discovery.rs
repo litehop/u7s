@@ -1867,6 +1867,36 @@ fn curated_kind_description(kind: &str) -> Option<&'static str> {
             Some("Namespace provides a scope for Names. Use of multiple namespaces is optional.")
         }
         "Deployment" => Some("Deployment enables declarative updates for Pods and ReplicaSets."),
+        "ReplicaSet" => Some(
+            "ReplicaSet ensures that a specified number of pod replicas are running at any \
+             given time.",
+        ),
+        "StatefulSet" => Some("StatefulSet represents a set of pods with consistent identities."),
+        "DaemonSet" => Some("DaemonSet represents the configuration of a daemon set."),
+        "Job" => Some("Job represents the configuration of a single job."),
+        "CronJob" => Some("CronJob represents the configuration of a single cron job."),
+        "PersistentVolume" => Some(
+            "PersistentVolume (PV) is a storage resource provisioned by an administrator. It \
+             is analogous to a node.",
+        ),
+        "PersistentVolumeClaim" => {
+            Some("PersistentVolumeClaim is a user's request for and claim to a persistent volume")
+        }
+        "ServiceAccount" => Some(
+            "ServiceAccount binds together:\n\
+             * a name, understood by users, and perhaps by peripheral systems, for an identity\n\
+             * a principal that can be authenticated and authorized\n\
+             * a set of secrets",
+        ),
+        "Ingress" => Some(
+            "Ingress is a collection of rules that allow inbound connections to reach the \
+             endpoints defined by a backend. An Ingress can be configured to give services \
+             externally-reachable urls, load balance traffic, terminate SSL, offer name based \
+             virtual hosting etc.",
+        ),
+        "NetworkPolicy" => {
+            Some("NetworkPolicy describes what network traffic is allowed for a set of Pods")
+        }
         _ => None,
     }
 }
@@ -2034,6 +2064,209 @@ fn curated_top_level_properties(kind: &str) -> Option<Vec<(&'static str, serde_j
                 }),
             ),
         ]),
+        "ReplicaSet" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Spec defines the specification of the desired behavior of \
+                        the ReplicaSet. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Status is the most recently observed status of the \
+                        ReplicaSet. This data may be out of date by some window of time. \
+                        Populated by the system. Read-only. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "StatefulSet" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Spec defines the desired identities of pods in this set."
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Status is the current status of Pods in this StatefulSet. \
+                        This data may be out of date by some window of time."
+                }),
+            ),
+        ]),
+        "DaemonSet" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "The desired behavior of this daemon set. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "The current status of this daemon set. This data may be \
+                        out of date by some window of time. Populated by the system. Read-only. \
+                        More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "Job" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Specification of the desired behavior of a job. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Current status of a job. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "CronJob" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Specification of the desired behavior of a cron job, \
+                        including the schedule. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "Current status of a cron job. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "PersistentVolume" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "spec defines a specification of a persistent volume owned \
+                        by the cluster. Provisioned by an administrator. More info: \
+                        https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistent-volumes"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "status represents the current information/status for the \
+                        persistent volume. Populated by the system. Read-only. More info: \
+                        https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistent-volumes"
+                }),
+            ),
+        ]),
+        "PersistentVolumeClaim" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "spec defines the desired characteristics of a volume \
+                        requested by a pod author. More info: \
+                        https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "status represents the current information/status of a \
+                        persistent volume claim. Read-only. More info: \
+                        https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims"
+                }),
+            ),
+        ]),
+        "ServiceAccount" => Some(vec![
+            (
+                "secrets",
+                serde_json::json!({
+                    "type": "array",
+                    "items": { "type": "object" },
+                    "description": "Secrets is a list of the secrets in the same namespace \
+                        that pods running using this ServiceAccount are allowed to use. Pods \
+                        are only limited to this list if this service account has a \
+                        \"kubernetes.io/enforce-mountable-secrets\" annotation set to \"true\". \
+                        The \"kubernetes.io/enforce-mountable-secrets\" annotation is deprecated \
+                        since v1.32. Prefer separate namespaces to isolate access to mounted \
+                        secrets. This field should not be used to find auto-generated service \
+                        account token secrets for use outside of pods. Instead, tokens can be \
+                        requested directly using the TokenRequest API, or service account token \
+                        secrets can be manually created. More info: \
+                        https://kubernetes.io/docs/concepts/configuration/secret"
+                }),
+            ),
+            (
+                "imagePullSecrets",
+                serde_json::json!({
+                    "type": "array",
+                    "items": { "type": "object" },
+                    "description": "ImagePullSecrets is a list of references to secrets in the \
+                        same namespace to use for pulling any images in pods that reference \
+                        this ServiceAccount. ImagePullSecrets are distinct from Secrets because \
+                        Secrets can be mounted in the pod, but ImagePullSecrets are only \
+                        accessed by the kubelet. More info: \
+                        https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod"
+                }),
+            ),
+            (
+                "automountServiceAccountToken",
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "AutomountServiceAccountToken indicates whether pods \
+                        running as this service account should have an API token automatically \
+                        mounted. Can be overridden at the pod level."
+                }),
+            ),
+        ]),
+        "Ingress" => Some(vec![
+            (
+                "spec",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "spec is the desired state of the Ingress. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+            (
+                "status",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "status is the current state of the Ingress. More info: \
+                        https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status"
+                }),
+            ),
+        ]),
+        "NetworkPolicy" => Some(vec![(
+            "spec",
+            serde_json::json!({
+                "type": "object",
+                "description": "spec represents the specification of the desired behavior \
+                    for this NetworkPolicy."
+            }),
+        )]),
         _ => None,
     }
 }
@@ -4515,32 +4748,173 @@ mod tests {
         );
     }
 
-    // A built-in Kind in a group with NO curated top-level fields at all (batch/v1 isn't in
-    // the curated table) must still resolve to a valid document — `kubectl explain jobs`
-    // should get a correct-but-minimal schema (apiVersion/kind/metadata), never the 404 an
-    // unrecognized group gets, since batch/v1 IS a real built-in group.
+    // GET /openapi/v3/apis/apps/v1 must show real spec/status descriptions for the other
+    // apps/v1 workload Kinds too, not just Deployment — `kubectl explain replicasets`,
+    // `daemonsets` and `statefulsets` were left at apiVersion/kind/metadata-only before this
+    // curated data was added.
+    #[tokio::test]
+    async fn openapi_v3_group_apps_v1_replicaset_daemonset_statefulset_have_real_spec_status() {
+        let state = make_state();
+        let resp =
+            openapi_v3_group(State(state), Path(("apps".to_string(), "v1".to_string()))).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for kind in ["ReplicaSet", "DaemonSet", "StatefulSet"] {
+            let schema = &val["components"]["schemas"][kind];
+            assert!(
+                !schema["properties"]["spec"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{kind} schema must have a real \"spec\" description — `kubectl explain \
+                 {kind}` users need real field docs, not a bare type; got: {schema:?}"
+            );
+            assert!(
+                !schema["properties"]["status"].is_null(),
+                "{kind} schema must have a \"status\" property; got: {schema:?}"
+            );
+        }
+    }
+
+    // GET /openapi/v3/apis/batch/v1 must show real spec/status for Job and CronJob —
+    // `kubectl explain jobs`/`cronjobs` were left at apiVersion/kind/metadata-only before
+    // this curated data was added.
+    #[tokio::test]
+    async fn openapi_v3_group_batch_v1_job_and_cronjob_have_real_spec_status() {
+        let state = make_state();
+        let resp =
+            openapi_v3_group(State(state), Path(("batch".to_string(), "v1".to_string()))).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for kind in ["Job", "CronJob"] {
+            let schema = &val["components"]["schemas"][kind];
+            assert!(
+                !schema["properties"]["spec"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{kind} schema must have a real \"spec\" description; got: {schema:?}"
+            );
+            assert!(
+                !schema["properties"]["status"].is_null(),
+                "{kind} schema must have a \"status\" property; got: {schema:?}"
+            );
+        }
+    }
+
+    // GET /openapi/v3/api/v1 must show real spec/status for PersistentVolume and
+    // PersistentVolumeClaim, but NEVER invent a "spec"/"status" pair for ServiceAccount —
+    // ServiceAccount's real top-level fields (secrets, imagePullSecrets,
+    // automountServiceAccountToken) don't follow the spec/status convention, and a wrong
+    // field name is worse than an incomplete schema for a `kubectl explain
+    // serviceaccounts` user.
+    #[tokio::test]
+    async fn openapi_v3_core_pv_pvc_have_real_spec_status_serviceaccount_does_not() {
+        let resp = openapi_v3_core().await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        for kind in ["PersistentVolume", "PersistentVolumeClaim"] {
+            let schema = &val["components"]["schemas"][kind];
+            assert!(
+                !schema["properties"]["spec"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{kind} schema must have a real \"spec\" description; got: {schema:?}"
+            );
+            assert!(
+                !schema["properties"]["status"].is_null(),
+                "{kind} schema must have a \"status\" property; got: {schema:?}"
+            );
+        }
+
+        let sa_props = &val["components"]["schemas"]["ServiceAccount"]["properties"];
+        assert!(
+            !sa_props["secrets"].is_null(),
+            "ServiceAccount schema must have its real \"secrets\" field; got: {sa_props:?}"
+        );
+        assert!(
+            sa_props["spec"].is_null() && sa_props["status"].is_null(),
+            "ServiceAccount has no \"spec\"/\"status\" fields in real Kubernetes — inventing \
+             them would be actively wrong, not just incomplete; got: {sa_props:?}"
+        );
+    }
+
+    // GET /openapi/v3/apis/networking.k8s.io/v1 must show a real "spec" for Ingress AND
+    // NetworkPolicy, but NEVER invent a "status" for NetworkPolicy — upstream tombstones
+    // NetworkPolicy's status field (protobuf tag 3 reserved, field commented out) precisely
+    // so it stays absent; guessing one back in would misrepresent the real API to a
+    // `kubectl explain networkpolicies` user.
+    #[tokio::test]
+    async fn openapi_v3_group_networking_v1_ingress_has_status_networkpolicy_does_not() {
+        let state = make_state();
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("networking.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let ingress = &val["components"]["schemas"]["Ingress"]["properties"];
+        assert!(
+            !ingress["spec"].is_null() && !ingress["status"].is_null(),
+            "Ingress schema must have real \"spec\" and \"status\" fields; got: {ingress:?}"
+        );
+
+        let netpol = &val["components"]["schemas"]["NetworkPolicy"]["properties"];
+        assert!(
+            !netpol["spec"].is_null(),
+            "NetworkPolicy schema must have a real \"spec\" field; got: {netpol:?}"
+        );
+        assert!(
+            netpol["status"].is_null(),
+            "NetworkPolicy has no \"status\" field in real Kubernetes (protobuf tag 3 is \
+             reserved but the field itself was never added) — inventing one would be \
+             actively wrong; got: {netpol:?}"
+        );
+    }
+
+    // A built-in Kind in a group with NO curated top-level fields at all (storage.k8s.io/v1
+    // isn't in the curated table) must still resolve to a valid document — `kubectl explain
+    // storageclasses` should get a correct-but-minimal schema (apiVersion/kind/metadata),
+    // never the 404 an unrecognized group gets, since storage.k8s.io IS a real built-in group.
     #[tokio::test]
     async fn openapi_v3_group_uncurated_static_group_still_returns_200_not_404() {
         let state = make_state();
 
-        let resp =
-            openapi_v3_group(State(state), Path(("batch".to_string(), "v1".to_string()))).await;
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("storage.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "batch/v1 is a real built-in group (STATIC_GROUPS) — it must never 404 just \
-             because it has no curated top-level fields yet"
+            "storage.k8s.io/v1 is a real built-in group (STATIC_GROUPS) — it must never 404 \
+             just because it has no curated top-level fields yet"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let job = &val["components"]["schemas"]["Job"];
+        let storage_class = &val["components"]["schemas"]["StorageClass"];
         assert_eq!(
-            job["properties"]["apiVersion"]["type"], "string",
+            storage_class["properties"]["apiVersion"]["type"], "string",
             "even an uncurated Kind must get the real apiVersion/kind/metadata fields; \
-             got: {job:?}"
+             got: {storage_class:?}"
         );
     }
 
