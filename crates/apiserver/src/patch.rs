@@ -552,6 +552,15 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
             MergeKeyKind::Key("name".to_string())
         }
 
+        // ResourceClaimStatus.reservedFor — the list of consumers (usually Pods) currently
+        // allowed to use a DRA ResourceClaim. Upstream declares patchMergeKey=uid/
+        // patchStrategy=merge. Without this entry, a strategic-merge-patch adding one more
+        // consumer to an already-reserved claim would replace the whole array instead of
+        // merging by uid, silently evicting every other pod's reservation on that claim.
+        path if path == "reservedFor" || path.ends_with(".reservedFor") => {
+            MergeKeyKind::Key("uid".to_string())
+        }
+
         // NodeStatus.addresses — upstream declares patchMergeKey=type/patchStrategy=merge, but
         // unlike podIPs' "ip", "type" is not safely unique here (upstream's own comment on this
         // field warns the merge key "is not sufficiently unique, which can cause data
