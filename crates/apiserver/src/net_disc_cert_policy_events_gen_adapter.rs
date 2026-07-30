@@ -1680,4 +1680,146 @@ mod tests {
         ]);
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // Each test below builds a message with every optional field unset (`Default::default()`),
+    // decodes it through the real entry point, and asserts no key survives as an explicit JSON
+    // `null` (other than ObjectMeta's `creationTimestamp`) and that optional top-level blocks
+    // (spec/status) are genuinely absent rather than present-with-nulls.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_ingress_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = networking_v1::Ingress::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_ingress_proto_gen(&buf).expect("all-default Ingress must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — an ingress controller that checks \
+             `status.loadBalancer != null` to decide whether an address has been assigned would \
+             otherwise treat a brand-new Ingress as already provisioned"
+        );
+    }
+
+    #[test]
+    fn decode_ingressclass_proto_gen_omits_unset_spec_instead_of_emitting_null() {
+        let obj = networking_v1::IngressClass::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_ingressclass_proto_gen(&buf).expect("all-default IngressClass must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset IngressClassSpec must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_ipaddress_proto_gen_omits_unset_spec_instead_of_emitting_null() {
+        let obj = networking_v1::IpAddress::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_ipaddress_proto_gen(&buf).expect("all-default IPAddress must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset IPAddress spec.parentRef must leave `spec` entirely absent, not null — \
+             an IPAddress with no parentRef isn't a valid allocation, so a caller must be able \
+             to tell \"never set\" apart from \"explicitly cleared\""
+        );
+    }
+
+    #[test]
+    fn decode_servicecidr_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = networking_v1::ServiceCidr::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_servicecidr_proto_gen(&buf).expect("all-default ServiceCIDR must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_endpointslice_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = discovery_v1::EndpointSlice::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_endpointslice_proto_gen(&buf).expect("all-default EndpointSlice must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert_eq!(
+            decoded["endpoints"].as_array().map(|a| a.len()),
+            Some(0),
+            "endpoints must decode to an empty array (matching upstream, which has no \
+             omitempty), not null"
+        );
+    }
+
+    #[test]
+    fn decode_csr_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = certs_v1::CertificateSigningRequest::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_csr_proto_gen(&buf).expect("all-default CertificateSigningRequest must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — an approval webhook that checks \
+             `status != null` to mean \"has an approval decision\" would otherwise treat a \
+             brand-new CSR as already decided"
+        );
+    }
+
+    #[test]
+    fn decode_poddisruptionbudget_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = policy_v1::PodDisruptionBudget::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_poddisruptionbudget_proto_gen(&buf)
+            .expect("all-default PodDisruptionBudget must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — the eviction API reads status to \
+             decide whether a voluntary disruption is currently allowed; a present-but-empty \
+             status (disruptionsAllowed defaulting to 0) would incorrectly block every eviction \
+             instead of signaling \"never reconciled\""
+        );
+    }
+
+    #[test]
+    fn decode_events_v1_event_proto_gen_omits_unset_optional_fields_instead_of_emitting_null() {
+        let ev = events_v1::Event::default();
+        let mut buf = Vec::new();
+        ev.encode(&mut buf).unwrap();
+        let decoded =
+            decode_events_v1_event_proto_gen(&buf).expect("all-default Event must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("eventTime").is_none()
+                && decoded.get("series").is_none()
+                && decoded.get("regarding").is_none(),
+            "unset eventTime/series/regarding must be absent, not null — event-aggregation \
+             tooling that groups by `series != null` to detect a repeated event would otherwise \
+             misclassify every single-occurrence event as part of a series"
+        );
+    }
 }

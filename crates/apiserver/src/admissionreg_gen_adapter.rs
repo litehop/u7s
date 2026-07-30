@@ -1331,4 +1331,109 @@ mod tests {
         expected.extend(["spec", "policyName", "paramRef", "matchResources"]);
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // Each test below builds a message with every optional field unset (`Default::default()`),
+    // decodes it through the real entry point, and asserts no key survives as an explicit JSON
+    // `null` (other than ObjectMeta's `creationTimestamp`, which upstream always nulls when
+    // zero) and that the "does this policy have a spec/status" style optional blocks are
+    // genuinely absent rather than present-with-nulls.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_validatingwebhookconfiguration_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = ar_v1::ValidatingWebhookConfiguration::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_validatingwebhookconfiguration_proto_gen(&buf)
+            .expect("all-default ValidatingWebhookConfiguration must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert_eq!(
+            decoded["webhooks"].as_array().map(|a| a.len()),
+            Some(0),
+            "webhooks must decode to an empty array (matching upstream, which has no \
+             omitempty), not null — an admission controller that checks `webhooks == null` to \
+             mean \"unconfigured\" must still see a well-formed empty list"
+        );
+    }
+
+    #[test]
+    fn decode_mutatingwebhookconfiguration_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = ar_v1::MutatingWebhookConfiguration::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_mutatingwebhookconfiguration_proto_gen(&buf)
+            .expect("all-default MutatingWebhookConfiguration must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+    }
+
+    #[test]
+    fn decode_validatingadmissionpolicy_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null(
+    ) {
+        let obj = ar_v1::ValidatingAdmissionPolicy::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_validatingadmissionpolicy_proto_gen(&buf)
+            .expect("all-default ValidatingAdmissionPolicy must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — a controller that treats \
+             `status != null` as \"has been reconciled at least once\" would otherwise treat a \
+             brand-new policy as already reconciled"
+        );
+    }
+
+    #[test]
+    fn decode_validatingadmissionpolicybinding_proto_gen_omits_unset_spec_fields_instead_of_emitting_null(
+    ) {
+        let obj = ar_v1::ValidatingAdmissionPolicyBinding::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_validatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("all-default ValidatingAdmissionPolicyBinding must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset ValidatingAdmissionPolicyBindingSpec must be absent, not null — matches \
+             the other admission-policy decoders in this file and lets a caller distinguish \
+             \"binding has no spec yet\" from \"binding explicitly cleared its spec\""
+        );
+    }
+
+    #[test]
+    fn decode_mutatingadmissionpolicy_proto_gen_omits_unset_spec_instead_of_emitting_null() {
+        let obj = ar_v1::MutatingAdmissionPolicy::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_mutatingadmissionpolicy_proto_gen(&buf)
+            .expect("all-default MutatingAdmissionPolicy must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset MutatingAdmissionPolicySpec must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_mutatingadmissionpolicybinding_proto_gen_omits_unset_spec_instead_of_emitting_null() {
+        let obj = ar_v1::MutatingAdmissionPolicyBinding::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_mutatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("all-default MutatingAdmissionPolicyBinding must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset MutatingAdmissionPolicyBindingSpec must be absent, not null"
+        );
+    }
 }

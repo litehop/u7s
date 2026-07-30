@@ -1962,4 +1962,174 @@ mod tests {
         ]);
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // Each test below builds a message with every optional field unset (`Default::default()`),
+    // decodes it through the real entry point, and asserts no key survives as an explicit JSON
+    // `null` (other than ObjectMeta's `creationTimestamp`) and that optional top-level blocks
+    // (spec/status) are genuinely absent rather than present-with-nulls.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_csinode_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = storage_v1::CsiNode::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_csinode_proto_gen(&buf).expect("all-default CSINode must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert_eq!(
+            decoded["spec"]["drivers"].as_array().map(|a| a.len()),
+            Some(0),
+            "spec.drivers must decode to an empty array (matching upstream, which has no \
+             omitempty), not null"
+        );
+    }
+
+    #[test]
+    fn decode_csidriver_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = storage_v1::CsiDriver::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_csidriver_proto_gen(&buf).expect("all-default CSIDriver must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+    }
+
+    #[test]
+    fn decode_csistoragecapacity_proto_gen_omits_unset_fields_instead_of_emitting_null() {
+        let obj = storage_v1::CsiStorageCapacity::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_csistoragecapacity_proto_gen(&buf)
+            .expect("all-default CSIStorageCapacity must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("capacity").is_none() && decoded.get("maximumVolumeSize").is_none(),
+            "unset capacity/maximumVolumeSize must be absent, not null — the scheduler's \
+             storage-capacity-tracking feature treats an absent capacity as \"unknown, don't \
+             schedule\" but a present-null value could be misread as \"zero capacity\", both of \
+             which must NOT be confused with each other"
+        );
+    }
+
+    #[test]
+    fn decode_volumeattachment_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = storage_v1::VolumeAttachment::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_volumeattachment_proto_gen(&buf)
+            .expect("all-default VolumeAttachment must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — the attach/detach controller checks \
+             `status.attached != null` to know whether the CSI driver has reported back yet; a \
+             stray null would be indistinguishable from a real (missing) status"
+        );
+    }
+
+    #[test]
+    fn decode_storageclass_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = storage_v1::StorageClass::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_storageclass_proto_gen(&buf).expect("all-default StorageClass must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("provisioner").is_none() && decoded.get("allowVolumeExpansion").is_none(),
+            "unset provisioner/allowVolumeExpansion must be absent, not null — a spurious \
+             `allowVolumeExpansion: false` would be indistinguishable from an admin's explicit \
+             opt-out of volume expansion"
+        );
+    }
+
+    #[test]
+    fn decode_volumeattributesclass_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = storage_v1::VolumeAttributesClass::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_volumeattributesclass_proto_gen(&buf)
+            .expect("all-default VolumeAttributesClass must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("driverName").is_none(),
+            "an unset driverName must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_runtimeclass_proto_gen_omits_unset_overhead_and_scheduling_instead_of_emitting_null()
+    {
+        let obj = node_v1::RuntimeClass::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_runtimeclass_proto_gen(&buf).expect("all-default RuntimeClass must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("overhead").is_none() && decoded.get("scheduling").is_none(),
+            "unset overhead/scheduling must be absent, not null — the scheduler treats a \
+             missing overhead as \"no extra resource reservation\", which is a different \
+             decision than an explicit-but-empty one"
+        );
+    }
+
+    #[test]
+    fn decode_priorityclass_proto_gen_omits_no_nulls_on_all_default_input() {
+        let obj = scheduling_v1::PriorityClass::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_priorityclass_proto_gen(&buf).expect("all-default PriorityClass must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("globalDefault").is_none(),
+            "an unset globalDefault must be absent, not null — a spurious `globalDefault: \
+             false` is indistinguishable from an admin's explicit opt-out, but the real bug \
+             this guards is a stray `null` which no client's boolean parser can even interpret"
+        );
+    }
+
+    #[test]
+    fn decode_flowschema_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = flowcontrol_v1::FlowSchema::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_flowschema_proto_gen(&buf).expect("all-default FlowSchema must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — the API priority-and-fairness \
+             controller checks `status.conditions != null` to know whether this FlowSchema has \
+             ever been evaluated for conflicts"
+        );
+    }
+
+    #[test]
+    fn decode_prioritylevelconfiguration_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null(
+    ) {
+        let obj = flowcontrol_v1::PriorityLevelConfiguration::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_prioritylevelconfiguration_proto_gen(&buf)
+            .expect("all-default PriorityLevelConfiguration must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null"
+        );
+    }
 }

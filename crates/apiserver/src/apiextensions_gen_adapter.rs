@@ -1259,4 +1259,54 @@ mod tests {
         ];
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_crd_proto_gen_omits_unset_status_instead_of_emitting_null() {
+        let crd = apiext_v1::CustomResourceDefinition::default();
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).unwrap();
+        let decoded =
+            decode_crd_proto_gen(&buf).expect("all-default CustomResourceDefinition must decode");
+
+        // This adapter deliberately special-cases creationTimestamp to `""` instead of the
+        // `null` every other adapter emits (see decode_crd_proto_gen's fixup) — no allow-list
+        // entry needed here, so any null this test does find is a genuine bug.
+        assert_no_stray_nulls(&decoded, &[]);
+        assert_eq!(
+            decoded["metadata"]["creationTimestamp"], "",
+            "CRD creationTimestamp must be an empty string, never null, when unset — this \
+             adapter's own established convention, verified so a future refactor toward the \
+             other adapters' null convention doesn't slip in unnoticed"
+        );
+        assert!(
+            decoded.get("status").is_none(),
+            "an unset CustomResourceDefinitionStatus must be absent, not null — a controller \
+             that treats `status != null` as \"has been reconciled at least once\" would \
+             otherwise treat a brand-new CRD as already established"
+        );
+    }
+
+    #[test]
+    fn decode_delete_options_proto_gen_omits_all_unset_fields_instead_of_emitting_null() {
+        let opts = meta_v1::DeleteOptions::default();
+        let mut buf = Vec::new();
+        opts.encode(&mut buf).unwrap();
+        let decoded =
+            decode_delete_options_proto_gen(&buf).expect("all-default DeleteOptions must decode");
+
+        assert_no_stray_nulls(&decoded, &[]);
+        let keys: Vec<&String> = decoded.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "an all-default DeleteOptions must only carry apiVersion/kind ({keys:?}) — a \
+             spurious `orphanDependents: false` or `gracePeriodSeconds: 0` key would be \
+             indistinguishable from a client's explicit request to disable orphaning or force \
+             immediate deletion"
+        );
+    }
 }

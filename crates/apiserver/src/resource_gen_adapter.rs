@@ -1287,4 +1287,91 @@ mod tests {
              requests against a shared device would go unbounded"
         );
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // The round-trip tests above check `result["metadata"]["namespace"].is_null()`, which is
+    // also true when the key is simply absent — it cannot tell "correctly omitted" apart from
+    // "present as null" (the exact bug class this bead is about). The tests below use
+    // `assert_no_stray_nulls`/`.get()` on the actual JSON object map instead, so they would fail
+    // if a future change started emitting `null` for an unset optional field.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_deviceclass_proto_gen_omits_unset_spec_instead_of_emitting_null() {
+        let dc = resource_v1::DeviceClass::default();
+        let mut buf = Vec::new();
+        dc.encode(&mut buf).unwrap();
+        let decoded =
+            decode_deviceclass_proto_gen(&buf).expect("all-default DeviceClass must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset DeviceClassSpec must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_resourceclaim_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let rc = resource_v1::ResourceClaim::default();
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).unwrap();
+        let decoded =
+            decode_resourceclaim_proto_gen(&buf).expect("all-default ResourceClaim must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — the scheduler checks \
+             `status.allocation != null` to know whether devices have already been bound to \
+             this claim; a stray null would be indistinguishable from a real (but empty) \
+             allocation result"
+        );
+    }
+
+    #[test]
+    fn decode_resourceclaimtemplate_proto_gen_omits_unset_nested_fields_instead_of_emitting_null() {
+        // Unlike the other three Kinds in this file, ResourceClaimTemplate.spec is realistically
+        // always Some() (it's the only reason the template exists) — so the meaningful
+        // all-default case is a *present* spec whose nested metadata/devices are themselves
+        // unset, not an absent top-level spec.
+        let rct = resource_v1::ResourceClaimTemplate {
+            spec: Some(resource_v1::ResourceClaimTemplateSpec::default()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        rct.encode(&mut buf).unwrap();
+        let decoded = decode_resourceclaimtemplate_proto_gen(&buf)
+            .expect("ResourceClaimTemplate with an all-default spec must decode");
+
+        // creationTimestamp appears twice here: once on the object's own metadata, once on the
+        // nested template metadata this file's decode_resourceclaimtemplate_proto_gen
+        // synthesizes for an unset spec.metadata — both are the same deliberate convention.
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded["spec"]["spec"]
+                .as_object()
+                .is_some_and(|m| !m.contains_key("devices")),
+            "an unset embedded ResourceClaimSpec.devices must be absent, not null — every \
+             ResourceClaim the control plane generates from this template copies spec.spec \
+             verbatim, so a stray null here would propagate to every generated claim"
+        );
+    }
+
+    #[test]
+    fn decode_resourceslice_proto_gen_omits_unset_spec_instead_of_emitting_null() {
+        let rs = resource_v1::ResourceSlice::default();
+        let mut buf = Vec::new();
+        rs.encode(&mut buf).unwrap();
+        let decoded =
+            decode_resourceslice_proto_gen(&buf).expect("all-default ResourceSlice must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset ResourceSliceSpec must be absent, not null"
+        );
+    }
 }

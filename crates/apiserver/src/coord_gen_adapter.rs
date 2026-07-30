@@ -348,4 +348,29 @@ mod tests {
         ];
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: decode_lease_proto_gen_a with an all-default Lease ----
+    //
+    // A Lease with every optional field unset must decode to a `spec`-less object, and
+    // metadata must carry no explicit nulls besides `creationTimestamp` (which upstream
+    // `metav1.Time` always marshals as `null` when zero). A stray `"holderIdentity": null` or a
+    // `"spec": null` would make a leader-election client think a lease was actively released by
+    // some holder instead of never having been acquired at all — those are different states.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_lease_proto_gen_a_omits_unset_fields_instead_of_emitting_null() {
+        let lease = coord_v1::Lease::default();
+        let mut buf = Vec::new();
+        lease.encode(&mut buf).unwrap();
+        let decoded = decode_lease_proto_gen_a(&buf).expect("all-default Lease must still decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset LeaseSpec must omit `spec` entirely, not emit `spec: null` or `spec: {{}}` \
+             — a present-but-empty spec could be misread as \"lease held with no identity\""
+        );
+    }
 }

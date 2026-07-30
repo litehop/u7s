@@ -371,6 +371,64 @@ pub(crate) mod sentinel_test_util {
              `expected` list)"
         );
     }
+
+    /// Recursively collects the dotted key path of every object key whose value is a bare JSON
+    /// `null`, skipping any key named in `allowed`. Kubernetes clients (and CRD schema
+    /// validators) treat `"field": null` as semantically distinct from the key being absent —
+    /// `null` means "explicitly cleared", absence means "not set". A `gen_*_to_json` function
+    /// that unconditionally inserts a key instead of gating on `Option::is_some()` before
+    /// insertion produces exactly this bug: the field never round-trips as "unset" again once a
+    /// controller re-reads it.
+    pub(crate) fn collect_null_paths(
+        value: &serde_json::Value,
+        prefix: &str,
+        allowed: &[&str],
+        out: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    if v.is_null() {
+                        if !allowed.contains(&k.as_str()) {
+                            out.push(path);
+                        }
+                    } else {
+                        collect_null_paths(v, &path, allowed, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_null_paths(item, prefix, allowed, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Asserts a decoded object contains no stray explicit-`null` fields other than the
+    /// caller's known/deliberate exceptions (e.g. ObjectMeta's `creationTimestamp`, which upstream
+    /// `metav1.Time` always marshals as `null` rather than omitting when zero). Pair with a
+    /// message built from `Default::default()` protobuf (every optional field unset) — any null
+    /// found this way means a `gen_*_to_json` function inserts a key unconditionally instead of
+    /// gating on the source `Option` being `Some`.
+    pub(crate) fn assert_no_stray_nulls(decoded: &serde_json::Value, allowed_null_fields: &[&str]) {
+        let mut offenders = Vec::new();
+        collect_null_paths(decoded, "", allowed_null_fields, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "field(s) {offenders:?} serialize as explicit JSON null instead of being omitted \
+             when unset — kube clients treat `field: null` as \"explicitly cleared\", not \"never \
+             set\", so this corrupts round-tripped objects for any controller that distinguishes \
+             the two; fix the gen_*_to_json function to skip inserting the key when the source \
+             Option is None"
+        );
+    }
 }
 
 #[cfg(test)]
