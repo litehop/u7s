@@ -313,3 +313,24 @@ conformance run has dozens of simultaneous long-lived watches sharing the same
 future attempt should add TLS and concurrent watch load to the same repro harness (both
 are additive to what's already built in `temp/mo96q-repro/`) before concluding the
 mechanism is unreachable by direct experiment.
+
+## Addendum 2026-07-30: TLS and concurrent-load preconditions also ruled out
+
+`mayor-e25ge` extended the mo96q repro (`temp/e25ge-repro/`, gitignored) with the two
+untested preconditions the previous addendum flagged: TLS layering (tokio-rustls 0.26.4
++ a real self-signed cert via rcgen 0.14.8, mirroring
+`crates/apiserver/src/lib.rs::serve_tls`'s exact
+`TcpListener`→`TlsAcceptor`→`hyper_util::TokioIo`→`hyper::service_fn` wiring) and
+concurrent watch load (N=1/25/50 simultaneous real `client-go@v0.36.2` `RetryWatcher`
+clients sharing one server process). Ran the full cross product (TLS-only,
+concurrent-only, TLS+concurrent) × (broken/fixed mode) for 15-20s each, up to N=50:
+**zero cancellations, restarts, or anomalous log signals in every cell**, cross-validated
+via both klog output and a direct resourceVersion-reset detector. Neither hypothesis
+reproduces, alone or combined. All three levels this investigation has now checked
+(type-level source read, single-connection real client, TLS+concurrent-load real client
+at conformance-scale N) show no coupling.
+
+**Verdict: mechanism investigation closed as unproven-but-fixed.** The fix (PR #907)
+remains validated by commit-level bisection and four independent stable live runs;
+further first-principles pursuit of *why* is not a good use of effort against an
+already-resolved, stable issue.
