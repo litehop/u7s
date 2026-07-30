@@ -1801,6 +1801,89 @@ async fn propagate_rs_revision_to_deployment<S: Store>(
     }
 }
 
+/// Emits the `u7s::apiserver::spec_replace` debug signal for a workload-tier PUT
+/// (Deployment/ReplicaSet/StatefulSet/DaemonSet/Job/CronJob/PodDisruptionBudget — see
+/// `is_workload_resource`). `spec_changed` alone lets an operator filter re-applies (a
+/// client PUTting back exactly what it read) from real edits; `spec_diff_summary` is only
+/// attached when something actually changed, since it costs a `spec` walk to build.
+fn log_spec_replace(
+    ns: &str,
+    name: &str,
+    kind: &str,
+    spec_before: &serde_json::Value,
+    spec_after: &serde_json::Value,
+) {
+    let spec_changed = spec_after != spec_before;
+    if spec_changed {
+        tracing::debug!(
+            target: "u7s::apiserver::spec_replace",
+            namespace = %ns,
+            name = %name,
+            resource = %kind,
+            spec_changed,
+            spec_diff_summary = %spec_diff_summary(spec_before, spec_after),
+            "namespaced resource replace"
+        );
+    } else {
+        tracing::debug!(
+            target: "u7s::apiserver::spec_replace",
+            namespace = %ns,
+            name = %name,
+            resource = %kind,
+            spec_changed,
+            "namespaced resource replace"
+        );
+    }
+}
+
+/// Short human-readable summary of what changed between two workload specs. Covers the two
+/// fields operators most commonly care about when triaging a replace (scale and image
+/// rollout); other spec fields are named but not value-diffed, since dumping e.g. a full
+/// `selector` or `template.spec.volumes` change into a log line defeats the point of a
+/// short summary.
+fn spec_diff_summary(before: &serde_json::Value, after: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+
+    if before["replicas"] != after["replicas"] {
+        parts.push(format!(
+            "replicas: {} -> {}",
+            before["replicas"], after["replicas"]
+        ));
+    }
+
+    let before_image = before
+        .pointer("/template/spec/containers/0/image")
+        .and_then(|v| v.as_str());
+    let after_image = after
+        .pointer("/template/spec/containers/0/image")
+        .and_then(|v| v.as_str());
+    if before_image != after_image {
+        parts.push(format!(
+            "image: {} -> {}",
+            before_image.unwrap_or("<none>"),
+            after_image.unwrap_or("<none>")
+        ));
+    }
+
+    // The pod template can change in ways other than containers[0].image (env, resources,
+    // extra containers, volumes, labels) — too large to diff inline, so just flag it.
+    if before["template"] != after["template"] && before_image == after_image {
+        parts.push("template changed (non-image field)".to_string());
+    }
+
+    for field in ["selector", "minAvailable", "maxUnavailable"] {
+        if before[field] != after[field] {
+            parts.push(format!("{field} changed"));
+        }
+    }
+
+    if parts.is_empty() {
+        "spec changed (no diffable field matched)".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 pub(crate) async fn replace_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
@@ -2045,6 +2128,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     if let Some(ref spec_before) = spec_before_replace {
+        log_spec_replace(&ns, &name, &meta.kind, spec_before, &obj.body["spec"]);
         super::defaults::increment_workload_generation_if_spec_changed(&mut obj.body, spec_before);
     }
     if let Some(ref eps_before) = eps_before_replace {
@@ -13200,6 +13284,181 @@ mod tests {
             "generation must increment from the true stored value (3 -> 4) when the spec \
              changes via a PUT that omits metadata.generation — resetting to 1-based counting \
              (e.g. landing at 2) desyncs status.observedGeneration from the real change history"
+        );
+    }
+
+    /// In-memory sink for tracing-subscriber's fmt layer, so debug-visibility tests can
+    /// assert on rendered field content without adding a tracing-test dependency.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_log(buf: &SharedBuf) -> String {
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A spec-changing PUT must be flagged `spec_changed=true` with a diff summary naming the
+    /// actual change (scale, image), while a PUT that re-applies the exact same spec must be
+    /// flagged `spec_changed=false` with no summary — otherwise an operator watching
+    /// `u7s::apiserver::spec_replace=debug` can't tell a real rollout apart from a controller
+    /// re-syncing an unchanged object, which is the single most common source of replace noise.
+    #[tokio::test]
+    async fn replace_emits_spec_diff_summary_only_when_spec_actually_changed() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default", "generation": 1},
+            "spec": {
+                "replicas": 3,
+                "selector": {"matchLabels": {"app": "web"}},
+                "template": {
+                    "metadata": {"labels": {"app": "web"}},
+                    "spec": {"containers": [{"name": "web", "image": "nginx:1.20"}]}
+                }
+            }
+        });
+        let key = "/registry/apps/deployments/default/web";
+        let rv1 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // First PUT: a real edit — scale 3 -> 5 and image bump.
+        let changed_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": rv1.to_string()},
+            "spec": {
+                "replicas": 5,
+                "selector": {"matchLabels": {"app": "web"}},
+                "template": {
+                    "metadata": {"labels": {"app": "web"}},
+                    "spec": {"containers": [{"name": "web", "image": "nginx:1.21"}]}
+                }
+            }
+        });
+        let _ = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "deployments".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PUT Deployment must succeed, got: {e:?}"))
+        .into_response();
+
+        let log_after_edit = captured_log(&buf);
+        assert!(
+            log_after_edit.contains("spec_changed=true"),
+            "a real spec edit must be flagged spec_changed=true; log was: {log_after_edit}"
+        );
+        assert!(
+            log_after_edit.contains("replicas: 3") && log_after_edit.contains("-> 5"),
+            "the diff summary must name the actual scale change; log was: {log_after_edit}"
+        );
+        assert!(
+            log_after_edit.contains("nginx:1.20") && log_after_edit.contains("nginx:1.21"),
+            "the diff summary must name the actual image rollout, the most common reason an \
+             operator investigates a replace event; log was: {log_after_edit}"
+        );
+
+        // Second PUT: a re-apply of the exact same spec just written — must NOT be reported
+        // as a spec change, or every controller re-sync would look like a real edit.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let reapply_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "resourceVersion": stored_v["metadata"]["resourceVersion"]
+            },
+            "spec": stored_v["spec"].clone()
+        });
+        let _ = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "deployments".to_string(),
+                "web".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&reapply_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("re-apply PUT must succeed, got: {e:?}"))
+        .into_response();
+
+        let log_after_reapply = captured_log(&buf);
+        let reapply_lines: Vec<&str> = log_after_reapply
+            .lines()
+            .filter(|l| l.contains("namespaced resource replace"))
+            .collect();
+        let last_line = reapply_lines
+            .last()
+            .expect("re-apply must still emit a spec_replace debug event");
+        assert!(
+            last_line.contains("spec_changed=false"),
+            "re-applying the exact same spec must be flagged spec_changed=false, or an \
+             operator can't distinguish it from a real edit; line was: {last_line}"
+        );
+        assert!(
+            !last_line.contains("spec_diff_summary"),
+            "no diff summary should be attached when nothing changed; line was: {last_line}"
         );
     }
 
