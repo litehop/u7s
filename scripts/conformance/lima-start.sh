@@ -681,7 +681,7 @@ fi
 echo "Waiting for ${VM_NAME} to register (up to 60s)..."
 FOUND=0
 for i in $(seq 1 60); do
-  if kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes 2>/dev/null | grep -q "${VM_NAME}"; then
+  if kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o name 2>/dev/null | grep -Fxq "node/${VM_NAME}"; then
     FOUND=1
     break
   fi
