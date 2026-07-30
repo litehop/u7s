@@ -62,6 +62,20 @@ fn ndjson_initial_events_bookmark(api_version: &str, kind: &str, revision: u64) 
     Bytes::from(buf)
 }
 
+/// Stamp `obj["apiVersion"]`/`obj["kind"]` with the canonical values for the watched resource,
+/// skipping the write (and its `String` allocation) when the stored object already carries
+/// them. Built-in resources and CRs served at their stored version always already match, so
+/// this avoids allocating two Strings on essentially every watch event; only a CR watched at a
+/// version other than the one it's stored in needs the write.
+fn stamp_type_meta_if_changed(obj: &mut serde_json::Value, api_version: &str, kind: &str) {
+    if obj.get("apiVersion").and_then(|v| v.as_str()) != Some(api_version) {
+        obj["apiVersion"] = serde_json::Value::String(api_version.to_owned());
+    }
+    if obj.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+        obj["kind"] = serde_json::Value::String(kind.to_owned());
+    }
+}
+
 /// Apply defaults and produce the final NDJSON bytes for an object already confirmed to match
 /// this watcher's label/field selector (and, for CRs, already converted to the requested
 /// served version). This is the tail shared by `prepare_live_event` (which parses raw bytes
@@ -83,8 +97,7 @@ fn finish_live_event(
     let emit = if as_partial_object_metadata {
         to_partial_object_metadata(&parsed)
     } else {
-        parsed["apiVersion"] = serde_json::Value::String(api_version.to_owned());
-        parsed["kind"] = serde_json::Value::String(kind.to_owned());
+        stamp_type_meta_if_changed(&mut parsed, api_version, kind);
         parsed
     };
     ndjson_event_value(event_type, &emit)
@@ -159,8 +172,7 @@ fn finish_deleted_event(
     kind: &str,
 ) -> Bytes {
     obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
-    obj["apiVersion"] = serde_json::Value::String(api_version.to_owned());
-    obj["kind"] = serde_json::Value::String(kind.to_owned());
+    stamp_type_meta_if_changed(&mut obj, api_version, kind);
     ndjson_event_value("DELETED", &obj)
 }
 
@@ -850,8 +862,7 @@ async fn watch_generic_impl<S: Store>(
                     to_partial_object_metadata(&item)
                 } else {
                     let mut v = item;
-                    v["apiVersion"] = serde_json::Value::String(api_version.clone());
-                    v["kind"] = serde_json::Value::String(kind.clone());
+                    stamp_type_meta_if_changed(&mut v, &api_version, &kind);
                     v
                 };
                 record_watch_event();
@@ -4059,6 +4070,67 @@ mod tests {
             "watch stream with timeout_seconds=None must NOT close within 2s; \
              if the server default is <= 2s, watch streams expire faster than client-go can \
              reconnect, causing context-canceled cascades in long conformance runs"
+        );
+    }
+
+    // -- stamp_type_meta_if_changed: skip the per-event allocation when TypeMeta already matches --
+
+    /// Built-in resources (the overwhelming majority of watch traffic — Pods, ConfigMaps,
+    /// Secrets, etc.) are always stored with the apiVersion/kind that matches the watch they're
+    /// served on, so stamping them again on every event is pure waste: two heap allocations
+    /// per watcher per event that never change the bytes on the wire. This test proves the
+    /// stamp is skipped (not just "produces the same value") by checking that the `apiVersion`
+    /// string's heap pointer is unchanged after the call — a fresh `String::to_owned()` would
+    /// always allocate a new buffer at a different address, even when the contents are equal.
+    ///
+    /// If this regresses to an unconditional stamp, every watch event allocates two Strings
+    /// that never change; ambient waste under high watch load (many watchers × long-lived
+    /// streams), not correctness-breaking but the exact ongoing cost this fix removes.
+    #[test]
+    fn stamp_type_meta_if_changed_skips_allocation_when_already_canonical() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "already-canonical"}
+        });
+        let before_ptr = obj["apiVersion"].as_str().unwrap().as_ptr();
+        let before_kind_ptr = obj["kind"].as_str().unwrap().as_ptr();
+
+        stamp_type_meta_if_changed(&mut obj, "v1", "Pod");
+
+        assert_eq!(
+            obj["apiVersion"].as_str().unwrap().as_ptr(),
+            before_ptr,
+            "apiVersion already equals the canonical value; stamping it again would allocate \
+             a new String on every single watch event for no observable benefit"
+        );
+        assert_eq!(
+            obj["kind"].as_str().unwrap().as_ptr(),
+            before_kind_ptr,
+            "kind already equals the canonical value; stamping it again would allocate a new \
+             String on every single watch event for no observable benefit"
+        );
+    }
+
+    /// A CR watched at a served version different from the version it's stored under (or any
+    /// object whose stored TypeMeta is stale) must still be corrected. The allocation-skipping
+    /// fast path above must not silently drop this correction — clients rely on apiVersion/kind
+    /// matching the watch they opened, not the object's on-disk version.
+    #[test]
+    fn stamp_type_meta_if_changed_still_corrects_mismatched_values() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "example.com/v1alpha1",
+            "kind": "Widget",
+            "metadata": {"name": "stale-typemeta"}
+        });
+
+        stamp_type_meta_if_changed(&mut obj, "example.com/v1", "Widget");
+
+        assert_eq!(
+            obj["apiVersion"], "example.com/v1",
+            "a CR served at a version other than its stored version must have apiVersion \
+             corrected to the requested served version; skipping the write here would leak \
+             the storage version onto the wire and break clients watching the served version"
         );
     }
 
