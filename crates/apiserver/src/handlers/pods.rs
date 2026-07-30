@@ -9633,6 +9633,105 @@ mod handler_tests {
         }
     }
 
+    /// A single graceful DELETE (no explicit `gracePeriodSeconds`, mirroring exactly what
+    /// u7s-scheduler's preemption eviction sends) must leave the pod visible to a subsequent
+    /// GET — 200 with `.metadata.deletionTimestamp` set — not 404.
+    ///
+    /// This is the exact contract upstream's `test/e2e/scheduling/preemption.go` (release-1.36,
+    /// line ~402) depends on: it polls a preempted victim once a second expecting
+    /// `DeletionTimestamp != nil` while the pod is still Gettable. u7s-scheduler's preemption
+    /// path used to force a second, immediate hard-delete right after the first, so by the very
+    /// next 1s poll the victim had already vanished — the test failed with `Pod ... not found`
+    /// well before it ever got to inspect DeletionTimestamp.
+    ///
+    /// Fails on revert: if `delete_pod` (or `get_pod`) regresses to hard-delete on the very
+    /// first call, the GET below returns 404 instead of 200.
+    #[tokio::test]
+    async fn single_delete_leaves_pod_gettable_with_deletion_timestamp() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/preempted-victim";
+        let grace = 80i64;
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "preempted-victim", "namespace": "default", "resourceVersion": "1" },
+            "spec": { "terminationGracePeriodSeconds": grace },
+            "status": { "phase": "Running" }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}",
+                delete(delete_pod).get(get_pod),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Exactly what u7s-scheduler's delete_pod sends: no body, no query params — the
+        // apiserver must fall back to spec.terminationGracePeriodSeconds.
+        let delete_req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/preempted-victim")
+            .body(Body::empty())
+            .unwrap();
+        let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
+        assert_eq!(
+            delete_resp.status(),
+            StatusCode::OK,
+            "graceful DELETE of a preemption victim must return 200"
+        );
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/preempted-victim")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(
+            get_resp.status(),
+            StatusCode::OK,
+            "a preemption victim must stay GETtable right after a single soft-delete — a 404 \
+             here is exactly the upstream e2e failure this bug caused (`Pod ... not found`, \
+             preemption.go:402), because the pod vanished before the 1s poll interval could \
+             ever observe DeletionTimestamp"
+        );
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ts = v["metadata"]["deletionTimestamp"]
+            .as_str()
+            .expect("deletionTimestamp must be set and visible via GET after a single DELETE");
+        let candidates: Vec<String> = (before..=after)
+            .map(|s| crate::util::secs_to_rfc3339(s + grace))
+            .collect();
+        assert!(
+            candidates.contains(&ts.to_string()),
+            "deletionTimestamp {ts} must reflect spec.terminationGracePeriodSeconds ({grace}s), \
+             proving the pod is mid-grace-period, not already torn down"
+        );
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "the pod GET must still return its real status, not a bare tombstone — a client \
+             polling for DeletionTimestamp needs the rest of the object intact too"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // evict_pod
     // -----------------------------------------------------------------------
