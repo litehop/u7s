@@ -2133,6 +2133,22 @@ pub fn disruption_target_patch(pending_pod_name: &str) -> Value {
     })
 }
 
+/// Build the status-subresource PATCH that stamps `status.nominatedNodeName`
+/// on the pending pod once `find_preemption_plan`/`verify_and_reserve_preemption`
+/// have committed a plan for it, mirroring upstream kube-scheduler's
+/// nominate-then-evict-async ordering: the nomination must be visible to a
+/// client polling the pod BEFORE any victim is evicted, not only after the
+/// pod is finally bound. Without this, `SchedulerAsyncPreemption`'s e2e test
+/// (`test/e2e/scheduling/preemption.go`) hangs forever on its very first wait
+/// step (`highPod.Status.NominatedNodeName != ""`), at any contention level.
+pub fn nominated_node_name_patch(node_name: &str) -> Value {
+    serde_json::json!({
+        "status": {
+            "nominatedNodeName": node_name
+        }
+    })
+}
+
 /// Evict a pod (preemption's victim-removal step) via DELETE .../pods/:name.
 ///
 /// The apiserver's pod DELETE always soft-deletes on the first call (stamps
@@ -5337,6 +5353,39 @@ mod tests {
             message.contains("high-priority-pod"),
             "the message must reference the preemptor pod by name; got {message:?}"
         );
+    }
+
+    // nominated_node_name_patch tests: before this fix u7s's scheduler never
+    // wrote status.nominatedNodeName at all, so any client (kubectl, or the
+    // SchedulerAsyncPreemption e2e test) polling for it after a preemption
+    // plan is committed saw it stay empty forever, even though the pod later
+    // bound and ran correctly — the nomination and the eventual bind are
+    // separate, and only the latter existed.
+
+    /// Must produce exactly `{"status":{"nominatedNodeName":"<node>"}}` — the
+    /// apiserver's status-patch merge (`apply_status_patch`) treats
+    /// `nominatedNodeName` as a plain scalar merge-patch field, so any other
+    /// shape (nesting, wrapping, wrong key name/casing) would silently fail
+    /// to set the field a client is polling for.
+    #[test]
+    fn nominated_node_name_patch_yields_status_patch_with_target_node() {
+        let patch = nominated_node_name_patch("node-a");
+        assert_eq!(
+            patch,
+            json!({"status": {"nominatedNodeName": "node-a"}}),
+            "patch body must be exactly {{status: {{nominatedNodeName}}}} — a client \
+             polling status.nominatedNodeName only ever reads this exact shape"
+        );
+    }
+
+    /// The chosen node's name must round-trip verbatim into the patch — a
+    /// preemptor nominated for the wrong node would send eviction-watching
+    /// tooling (and any downstream scheduler decision reading nominations)
+    /// to look at the wrong place entirely.
+    #[test]
+    fn nominated_node_name_patch_names_the_planned_node() {
+        let patch = nominated_node_name_patch("worker-7");
+        assert_eq!(patch["status"]["nominatedNodeName"], "worker-7");
     }
 
     // ---------------------------------------------------------------------------
