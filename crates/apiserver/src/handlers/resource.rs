@@ -1024,15 +1024,22 @@ pub(crate) async fn do_patch<S: Store>(
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
-        // reject any patch attempt.  Real kube-apiserver returns 422 "Invalid".
-        if group.is_empty()
+        // snapshot data/binaryData/stringData before the patch is applied so the rejection
+        // below (after the patch) can be scoped to changes that actually touch them or
+        // clear the flag — matching replace_namespaced_resource's scoping (~line 1978),
+        // instead of blanket-rejecting metadata-only patches (e.g. `kubectl label`).
+        let immutable_snapshot = if group.is_empty()
             && (plural == "secrets" || plural == "configmaps")
             && current.body["immutable"] == serde_json::Value::Bool(true)
         {
-            return Err(Status::unprocessable_entity(format!(
-                "{plural}/{name} is immutable and cannot be updated"
-            )));
-        }
+            Some((
+                current.body["data"].clone(),
+                current.body["binaryData"].clone(),
+                current.body["stringData"].clone(),
+            ))
+        } else {
+            None
+        };
 
         // Capture PriorityClass.value before patch: it drives scheduling/preemption
         // ordering cluster-wide and is immutable after create. Real kube-apiserver
@@ -1100,6 +1107,22 @@ pub(crate) async fn do_patch<S: Store>(
             if &current.body["value"] != old_value {
                 return Err(Status::unprocessable_entity(format!(
                     "{plural}/{name} .value is immutable and cannot be updated"
+                )));
+            }
+        }
+
+        if let Some((ref data_before, ref binary_data_before, ref string_data_before)) =
+            immutable_snapshot
+        {
+            let new_immutable = &current.body["immutable"];
+            let immutable_cleared =
+                new_immutable == &serde_json::Value::Bool(false) || new_immutable.is_null();
+            let data_changed = &current.body["data"] != data_before;
+            let binary_data_changed = &current.body["binaryData"] != binary_data_before;
+            let string_data_changed = &current.body["stringData"] != string_data_before;
+            if immutable_cleared || data_changed || binary_data_changed || string_data_changed {
+                return Err(Status::unprocessable_entity(format!(
+                    "{plural}/{name} is immutable and cannot be updated"
                 )));
             }
         }
@@ -14780,6 +14803,403 @@ mod tests {
             Ok(_) => panic!(
                 "PATCH on immutable secret must return 422 — immutability check is missing \
                  from do_patch"
+            ),
+        }
+    }
+
+    /// PATCH that only touches labels on an immutable Secret must succeed.
+    ///
+    /// Real kube-apiserver only rejects PATCHes that change data/binaryData/stringData or
+    /// clear the immutable flag — `immutable: true` does not freeze the whole object. Without
+    /// this scoping, `kubectl label`/`kubectl annotate` on an immutable secret returns a
+    /// confusing 422 for an operation the API contract explicitly allows, forcing the operator
+    /// to delete and recreate the secret just to add a label.
+    ///
+    /// This test fails if do_patch's immutability check reverts to rejecting every patch
+    /// against an immutable object regardless of what the patch touches.
+    #[tokio::test]
+    async fn patch_labels_on_immutable_secret_succeeds() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let secret_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "labelled-immutable", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "dmFsdWUx" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "labelled-immutable".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial secret create must succeed")
+            .into_response();
+
+        let patch = serde_json::json!({ "metadata": { "labels": { "team": "platform" } } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "labelled-immutable".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let body = result
+            .expect(
+                "PATCH that only adds a label to an immutable secret must succeed — \
+                 `kubectl label`/`kubectl annotate` on an immutable secret is a legitimate \
+                 operator workflow that upstream kube-apiserver allows",
+            )
+            .into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            updated["metadata"]["labels"]["team"], "platform",
+            "the label patch must actually apply, not just avoid the 422"
+        );
+        assert_eq!(
+            updated["data"]["key1"], "dmFsdWUx",
+            "data must remain untouched by a metadata-only patch"
+        );
+    }
+
+    /// PATCH that clears `immutable: true` back to false (or removes it) must return 422.
+    ///
+    /// Immutability is monotonic in upstream Kubernetes: once set, it cannot be unset via any
+    /// update path. Without this check, an operator (or a compromised client) could flip
+    /// `immutable` off and then rotate the secret's data, defeating the entire purpose of the
+    /// flag — preventing silent secret rotation that mounted Pods won't pick up without a
+    /// restart.
+    ///
+    /// This test fails if do_patch stops checking for a cleared immutable flag after scoping
+    /// the check to data/binaryData/stringData changes.
+    #[tokio::test]
+    async fn patch_clearing_immutable_flag_on_secret_returns_422() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let secret_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "unfreeze-immutable", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "dmFsdWUx" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "unfreeze-immutable".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial secret create must succeed")
+            .into_response();
+
+        let patch = serde_json::json!({ "immutable": false });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "unfreeze-immutable".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH clearing immutable:true must return 422 — immutability is monotonic \
+                 once set; allowing it to be cleared defeats its purpose of preventing silent \
+                 secret rotation"
+            ),
+            Ok(_) => panic!(
+                "PATCH must not be able to clear immutable:true — this would let a client \
+                 unfreeze a secret and then rotate its data through a second PATCH"
+            ),
+        }
+    }
+
+    /// PATCH that only touches labels on an immutable ConfigMap must succeed, mirroring the
+    /// Secret case above — `immutable` scoping must be identical for both resource types since
+    /// do_patch's check gates on `plural == "secrets" || plural == "configmaps"` together.
+    ///
+    /// This test fails if the ConfigMap branch of the scoped immutability check regresses
+    /// independently of the Secret branch (e.g. a fix that special-cases secrets only).
+    #[tokio::test]
+    async fn patch_labels_on_immutable_configmap_succeeds() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "labelled-immutable-cm", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "value1" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "labelled-immutable-cm".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial configmap create must succeed")
+            .into_response();
+
+        let patch = serde_json::json!({ "metadata": { "labels": { "team": "platform" } } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "labelled-immutable-cm".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let body = result
+            .expect(
+                "PATCH that only adds a label to an immutable configmap must succeed — \
+                 `kubectl label` on an immutable configmap is allowed by upstream \
+                 kube-apiserver",
+            )
+            .into_response();
+        let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            updated["metadata"]["labels"]["team"], "platform",
+            "the label patch must actually apply, not just avoid the 422"
+        );
+        assert_eq!(
+            updated["data"]["key1"], "value1",
+            "data must remain untouched by a metadata-only patch"
+        );
+    }
+
+    /// PATCH that changes `.data` on an immutable ConfigMap must return 422, mirroring the
+    /// Secret data-change test above.
+    ///
+    /// This test fails if the ConfigMap branch of the scoped immutability check stops
+    /// rejecting data changes (e.g. a scoping bug that only inspects `data` for Secrets).
+    #[tokio::test]
+    async fn patch_data_on_immutable_configmap_returns_422() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "data-immutable-cm", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "value1" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "data-immutable-cm".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial configmap create must succeed")
+            .into_response();
+
+        let patch = serde_json::json!({ "data": { "key1": "newvalue" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "data-immutable-cm".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH on immutable configmap with changed data must return 422 — allowing it \
+                 through would let a workload's mounted config drift out from under it with no \
+                 restart, which `immutable: true` exists to prevent"
+            ),
+            Ok(_) => panic!(
+                "PATCH on immutable configmap must return 422 when data changes — \
+                 immutability check is missing the ConfigMap data path"
+            ),
+        }
+    }
+
+    /// PATCH that clears `immutable: true` on a ConfigMap must return 422, mirroring the
+    /// Secret immutable-clear test above.
+    ///
+    /// This test fails if the ConfigMap branch stops enforcing that immutability is
+    /// monotonic once set.
+    #[tokio::test]
+    async fn patch_clearing_immutable_flag_on_configmap_returns_422() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "unfreeze-immutable-cm", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "value1" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "unfreeze-immutable-cm".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial configmap create must succeed")
+            .into_response();
+
+        let patch = serde_json::json!({ "immutable": false });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "unfreeze-immutable-cm".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH clearing immutable:true on a configmap must return 422 — immutability \
+                 is monotonic once set, same as for Secrets"
+            ),
+            Ok(_) => panic!(
+                "PATCH must not be able to clear immutable:true on a configmap — this would \
+                 let a client unfreeze it and then rotate its data through a second PATCH"
             ),
         }
     }
