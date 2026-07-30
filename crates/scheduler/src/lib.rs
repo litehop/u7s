@@ -1889,15 +1889,13 @@ pub fn delete_pod_path(namespace: &str, pod_name: &str) -> String {
 /// eviction, or another actor — which is the outcome preemption wants, so it
 /// must be treated as success rather than aborting the eviction loop.
 ///
-/// A 409 means the eviction's own soft-delete PUT lost an optimistic-concurrency
+/// A 409 means the eviction's soft-delete PUT lost an optimistic-concurrency
 /// race against a concurrent write to the same victim (e.g. the kubelet's
 /// routine status sync while the pod is being torn down, or another scheduling
-/// attempt evicting the same victim). `delete_pod` issues this DELETE twice
-/// (soft-delete then force-delete) specifically to drive the pod to gone, so a
-/// 409 here just means the current attempt lost that race, not that eviction
-/// failed — the pod is already moving toward deletion. Treating it as fatal
-/// would abort the whole preemption cycle via `?` and leave the preemptor
-/// pod stuck Pending.
+/// attempt evicting the same victim). Either way the pod is already moving
+/// toward deletion, so a 409 here is not a real eviction failure. Treating it
+/// as fatal would abort the whole preemption cycle via `?` and leave the
+/// preemptor pod stuck Pending.
 pub fn check_delete_response(status: u16) -> anyhow::Result<()> {
     if (200..300).contains(&status) || status == 404 || status == 409 {
         return Ok(());
@@ -2149,19 +2147,30 @@ pub fn nominated_node_name_patch(node_name: &str) -> Value {
     })
 }
 
-/// Evict a pod (preemption's victim-removal step) via DELETE .../pods/:name.
+/// Evict a pod (preemption's victim-removal step) via a single graceful
+/// DELETE to .../pods/:name.
 ///
 /// The apiserver's pod DELETE always soft-deletes on the first call (stamps
-/// `deletionTimestamp` so a real kubelet can gracefully terminate the
-/// container) and only hard-deletes once the pod is already Terminating with
-/// no finalizers. kube-scheduler's real preemption waits out that grace
-/// period via its scheduling queue; this MVP explicitly skips that
-/// multi-round wait (no such queue exists here) and instead issues the
-/// DELETE twice to force immediate removal — equivalent to `kubectl delete
-/// --grace-period=0 --force`, and the same force-hard-delete pattern already
-/// used by this codebase's Job/CronJob GC (see `delete_pods_owned_by` in the
-/// apiserver). Without this, the freed slot would not be visible yet when the
-/// caller immediately tries to bind the preemptor into it.
+/// `deletionTimestamp`, honoring `spec.terminationGracePeriodSeconds`, so the
+/// real kubelet running the victim's container can send SIGTERM, run any
+/// preStop hook, and gracefully terminate) and only hard-deletes once the pod
+/// is already Terminating with no finalizers. That second, hard-delete call
+/// is issued by the kubelet itself once it has actually stopped the
+/// container — not by this scheduler.
+///
+/// An earlier version of this function issued the DELETE twice back-to-back
+/// to force the victim straight to hard-deleted, on the theory that the
+/// freed slot needed to already be gone from the apiserver's store before
+/// the caller's immediate bind attempt for the preemptor could see it. That
+/// reasoning no longer holds: the scheduler's own capacity accounting lives
+/// entirely in the in-memory `NodeTally`, and `evict_victims` (main.rs)
+/// removes the victim from `tally` as soon as this call returns success —
+/// independent of whether the pod has actually disappeared from the
+/// apiserver's store. Force-double-DELETE bought nothing but a victim that
+/// goes from Running to 404 in about a second, which is too fast for
+/// upstream's e2e preemption test (`test/e2e/scheduling/preemption.go`,
+/// 1s poll interval) to ever observe the intermediate
+/// "DeletionTimestamp set, still Gettable" state it asserts on.
 pub async fn delete_pod(
     connector: &TlsConnector,
     server: &str,
@@ -2169,14 +2178,12 @@ pub async fn delete_pod(
     pod_name: &str,
 ) -> anyhow::Result<()> {
     let path = delete_pod_path(namespace, pod_name);
-    for _ in 0..2 {
-        let start = std::time::Instant::now();
-        let (status, body) = http_delete(connector, server, &path).await?;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
-        check_delete_response(status.as_u16())
-            .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
-    }
+    let start = std::time::Instant::now();
+    let (status, body) = http_delete(connector, server, &path).await?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
+    check_delete_response(status.as_u16())
+        .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     info!("evicted pod {namespace}/{pod_name} (preemption)");
     Ok(())
 }
@@ -5290,20 +5297,20 @@ mod tests {
         assert!(check_delete_response(202).is_ok());
     }
 
-    /// `delete_pod` issues DELETE twice (soft-delete then force-delete) to drive a
-    /// victim to gone; the second call races the first's resourceVersion bump
-    /// against any concurrent write to the same pod (e.g. the kubelet's routine
-    /// status sync while it terminates) and can lose with a 409. That is a benign
-    /// "already changing" signal, not a real failure — treating it as a hard
-    /// error aborts the entire preemption `?`-chain in main.rs's eviction loop,
-    /// leaving the higher-priority preemptor pod stuck Pending until a passive
-    /// watch reconnect minutes later, well past conformance test timeouts.
+    /// `delete_pod`'s single soft-delete can race a concurrent write to the same
+    /// victim (e.g. the kubelet's routine status sync while it terminates, or
+    /// another in-flight preemption evicting the same pod) and lose with a 409.
+    /// That is a benign "already changing" signal, not a real failure —
+    /// treating it as a hard error aborts the entire preemption `?`-chain in
+    /// main.rs's eviction loop, leaving the higher-priority preemptor pod stuck
+    /// Pending until a passive watch reconnect minutes later, well past
+    /// conformance test timeouts.
     #[test]
     fn check_delete_response_ok_on_409_conflict() {
         assert!(
             check_delete_response(409).is_ok(),
-            "409 from delete_pod's own double-DELETE race must be tolerated, or a single \
-             benign conflict aborts the whole preemption cycle and strands the preemptor"
+            "409 from a benign concurrent-write race on the victim must be tolerated, or a \
+             single benign conflict aborts the whole preemption cycle and strands the preemptor"
         );
     }
 
@@ -5314,6 +5321,117 @@ mod tests {
     fn check_delete_response_err_on_failure() {
         assert!(check_delete_response(500).is_err());
         assert!(check_delete_response(403).is_err());
+    }
+
+    /// `delete_pod` must send the eviction DELETE exactly once, not twice.
+    ///
+    /// An earlier version force-issued the DELETE twice back-to-back
+    /// (soft-delete, then an immediate second call the apiserver treats as
+    /// "already Terminating, no finalizers" and hard-deletes) to drive a
+    /// preemption victim straight to gone. That made the victim disappear
+    /// from the apiserver in about a second — too fast for upstream's e2e
+    /// preemption test (`test/e2e/scheduling/preemption.go`, 1s poll
+    /// interval) to ever observe the "DeletionTimestamp set, still Gettable"
+    /// state it polls for, so the test failed with `Pod ... not found`.
+    ///
+    /// Drives `delete_pod` against a real in-process TLS mock server so the
+    /// number of requests actually sent over the wire — not a mocked return
+    /// value — is what's under test. Fails on revert: reinstating the
+    /// `for _ in 0..2` loop makes the mock server observe two connections
+    /// instead of one.
+    #[tokio::test]
+    async fn delete_pod_sends_exactly_one_delete_request() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        // A single self-signed cert for 127.0.0.1, trusted directly by the
+        // client as its own root — no separate CA needed for this test.
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // Counts distinct TLS connections handled — HyperApiClient opens a
+        // fresh connection per request, so this is exactly the DELETE count.
+        let requests_seen = Arc::new(AtomicUsize::new(0));
+        let requests_seen_srv = requests_seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let requests_seen = requests_seen_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 4096];
+                    let mut total = 0usize;
+                    loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    // Incrementing before writing the response guarantees the
+                    // caller's `delete_pod().await` cannot return until this
+                    // is visible: it only completes once it has read the
+                    // response we write right after.
+                    requests_seen.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"kind":"Status","status":"Success"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let server = format!("https://127.0.0.1:{port}");
+        delete_pod(&connector, &server, "default", "victim")
+            .await
+            .expect("delete_pod must succeed against a mock server that returns 200");
+
+        assert_eq!(
+            requests_seen.load(Ordering::SeqCst),
+            1,
+            "delete_pod must issue exactly one DELETE — a second, immediate force-delete makes \
+             the preemption victim disappear from the apiserver before upstream's 1s-interval \
+             e2e poll can ever observe it Terminating with a DeletionTimestamp"
+        );
     }
 
     // disruption_target_patch tests: upstream kube-scheduler stamps a
