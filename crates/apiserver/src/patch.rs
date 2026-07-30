@@ -131,6 +131,12 @@ fn strategic_merge_patch_at(
                         .or_insert(serde_json::Value::Array(vec![]));
                     strategic_merge_array(entry, value, &merge_key, &child_path, schema)?;
                 }
+                MergeKeyKind::Set => {
+                    let entry = target_obj
+                        .entry(key)
+                        .or_insert(serde_json::Value::Array(vec![]));
+                    strategic_merge_set_array(entry, value);
+                }
                 MergeKeyKind::Replace | MergeKeyKind::Unknown => {
                     // $patch:delete can only be honored by matching a merge key; an array
                     // with no registered merge key has no way to identify which element to
@@ -299,6 +305,28 @@ fn strategic_merge_array(
     Ok(())
 }
 
+/// Merge a `x-kubernetes-list-type: set` patch array into `target`: elements have no merge
+/// key, so a patch element is only a no-op if it already matches an existing element by
+/// whole-value equality (`serde_json::Value`'s `PartialEq` covers both scalar and object
+/// elements); anything else is appended. Unlike the Key/Replace/Unknown paths above, a
+/// pre-existing element the patch doesn't mention is never dropped — atomic-replacing the
+/// whole array on every patch would silently discard fields the patch never touched, which
+/// is not what upstream's "set" list-type declaration promises.
+fn strategic_merge_set_array(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let Some(patch_arr) = patch.as_array() else {
+        return;
+    };
+    if !target.is_array() {
+        *target = serde_json::Value::Array(vec![]);
+    }
+    let target_arr = target.as_array_mut().unwrap();
+    for elem in patch_arr {
+        if !target_arr.contains(elem) {
+            target_arr.push(elem.clone());
+        }
+    }
+}
+
 /// Reorder a just-merged strategic-merge-patch array to match upstream ordering semantics
 /// (`mergeSortedSlice` in k8s.io/apimachinery/pkg/util/strategicpatch/patch.go).
 ///
@@ -390,6 +418,10 @@ enum MergeKeyKind {
     /// Array uses this field as the merge key. Owned (not `&'static str`) because a
     /// CRD-derived key is borrowed from the CRD's own schema `Value`, not from a literal.
     Key(String),
+    /// `x-kubernetes-list-type: set` — merge by whole-element value equality, not a key:
+    /// patch elements already present verbatim are deduped, new ones are appended, and
+    /// pre-existing elements the patch doesn't mention are never dropped.
+    Set,
     /// Array has no merge key — always replace.
     Replace,
     /// Not a known strategic-merge path — last-write-wins.
@@ -596,17 +628,18 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
 
 /// Resolves a CR list field's merge key purely from what the CRD author declared in their own
 /// OpenAPI schema — the documented, GA-since-1.16 `x-kubernetes-list-type: map` +
-/// `x-kubernetes-list-map-keys` structural-schema extension. Only that exact declaration yields
-/// a merge key; `x-kubernetes-list-type: set` (dedupe-by-value, not a keyed merge — tracked
-/// separately) and `"atomic"`, a missing annotation, or a malformed schema node all fall to
-/// `Unknown`, matching upstream's atomic-replace default for every case that isn't a declared
-/// map.
+/// `x-kubernetes-list-map-keys` structural-schema extension, plus `x-kubernetes-list-type: set`
+/// (dedupe-by-value, no key). `"atomic"`, a missing annotation, a `"map"` declaration missing
+/// its `list-map-keys`, or a malformed schema node all fall to `Unknown`, matching upstream's
+/// atomic-replace default for every case that isn't a declared map or set.
 fn crd_merge_key_for_path(schema: &serde_json::Value, path: &str) -> MergeKeyKind {
     let Some(node) = find_schema_node(schema, path) else {
         return MergeKeyKind::Unknown;
     };
-    if node.get("x-kubernetes-list-type").and_then(|v| v.as_str()) != Some("map") {
-        return MergeKeyKind::Unknown;
+    match node.get("x-kubernetes-list-type").and_then(|v| v.as_str()) {
+        Some("set") => return MergeKeyKind::Set,
+        Some("map") => {}
+        _ => return MergeKeyKind::Unknown,
     }
     match node
         .get("x-kubernetes-list-map-keys")
@@ -3065,15 +3098,14 @@ mod tests {
         );
     }
 
-    /// x-kubernetes-list-type: set means dedupe-by-value, never merge-by-key — this is the
-    /// boundary case the CRD schema plumbing must get right rather than gloss over. A CRD
-    /// author who annotated a field "set" (even one whose elements happen to carry a "name"
-    /// field, and even if list-map-keys were also present, which real CRDs wouldn't pair with
-    /// "set" but a malformed one might) must still see atomic-replace, not have this code
-    /// mistake "set" for "map" and silently start merging by key — that would leave stale
-    /// elements the client meant to remove sitting in the array forever, e.g. a patch intended
-    /// to drop a stale set entry would instead be interpreted as "add a keyed entry", failing
-    /// to remove anything.
+    /// x-kubernetes-list-type: set means dedupe-by-whole-value, never merge-by-key — this is
+    /// the boundary case the CRD schema plumbing must get right rather than gloss over. Even
+    /// when list-map-keys is also present (real CRDs wouldn't pair that with "set", but a
+    /// malformed one might) and an element's "name" collides with an existing element's
+    /// "name", this code must not mistake "set" for "map" and deep-merge by that key — a
+    /// deep-merge would silently overwrite the pre-existing element's other fields in place,
+    /// whereas value-equality dedupe correctly treats two elements with different total
+    /// content as two distinct set members, preserving the original untouched.
     #[test]
     fn test_smp_for_cr_list_type_set_is_not_treated_as_merge_key() {
         let schema = json!({
@@ -3088,7 +3120,7 @@ mod tests {
                             "x-kubernetes-list-map-keys": ["name"],
                             "items": {
                                 "type": "object",
-                                "properties": {"name": {"type": "string"}}
+                                "properties": {"name": {"type": "string"}, "value": {"type": "string"}}
                             }
                         }
                     }
@@ -3099,16 +3131,78 @@ mod tests {
         let mut target = json!({
             "spec": {
                 "tags": [
-                    {"name": "stale-tag-the-client-wants-removed"},
-                    {"name": "kept-tag"}
+                    {"name": "shared", "value": "old"},
+                    {"name": "solo", "value": "untouched"}
                 ]
             }
         });
         let patch = json!({
             "spec": {
                 "tags": [
-                    {"name": "kept-tag"}
+                    {"name": "shared", "value": "new"}
                 ]
+            }
+        });
+
+        strategic_merge_patch_for_cr(&mut target, &patch, Some(&schema)).unwrap();
+
+        let tags = target["spec"]["tags"].as_array().unwrap();
+        assert!(
+            tags.contains(&json!({"name": "shared", "value": "old"})),
+            "if \"set\" were mistaken for \"map\" merge-by-name, the patch element sharing \
+             \"name\": \"shared\" would deep-merge into the original and overwrite its \
+             \"value\": \"old\" in place — value-equality dedupe must instead treat the two as \
+             distinct whole values, leaving the original untouched; got: {tags:?}"
+        );
+        assert!(
+            tags.contains(&json!({"name": "shared", "value": "new"})),
+            "the patch element, being a genuinely new whole value (not equal to any existing \
+             element), must be appended rather than dropped; got: {tags:?}"
+        );
+        assert!(
+            tags.contains(&json!({"name": "solo", "value": "untouched"})),
+            "an element the patch never mentions must survive — this is what distinguishes \
+             \"set\" from atomic-replace; got: {tags:?}"
+        );
+        assert_eq!(
+            tags.len(),
+            3,
+            "no element should be spuriously deduped or dropped; got: {tags:?}"
+        );
+    }
+
+    /// A CRD author who declares x-kubernetes-list-type: set on a scalar list field must get
+    /// upstream's dedupe-by-value merge, not atomic-replace. Before MergeKeyKind::Set existed,
+    /// "set" fell through to Unknown (atomic-replace), so a patch adding just one new element
+    /// would silently wipe out every pre-existing element the patch didn't mention — the exact
+    /// opposite of what a client following documented "set" semantics expects, and a violation
+    /// of kubectl-apply's parity guarantee for CRDs.
+    #[test]
+    fn test_smp_for_cr_list_type_set_dedupes_and_preserves_untouched_elements() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "x-kubernetes-list-type": "set",
+                            "items": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut target = json!({
+            "spec": {
+                "tags": ["a", "b", "c"]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "tags": ["b", "d"]
             }
         });
 
@@ -3117,12 +3211,11 @@ mod tests {
         let tags = target["spec"]["tags"].as_array().unwrap();
         assert_eq!(
             tags,
-            &vec![json!({"name": "kept-tag"})],
-            "x-kubernetes-list-type: set must fall to atomic-replace (Unknown), never be \
-             mistaken for \"map\" even when a (non-standard) list-map-keys is also present — \
-             if \"stale-tag-the-client-wants-removed\" survived, it would mean \"set\" was \
-             silently treated as a merge key, defeating the client's whole-array-replace intent \
-             for this field; got: {tags:?}"
+            &vec![json!("a"), json!("b"), json!("c"), json!("d")],
+            "atomic-replace on x-kubernetes-list-type: set silently discards fields the patch \
+             didn't touch, violating upstream kubectl-apply parity — \"a\" and \"c\" must \
+             survive since the patch never mentioned removing them, \"b\" must not be \
+             duplicated since it was already present, and \"d\" must be appended; got: {tags:?}"
         );
     }
 }
