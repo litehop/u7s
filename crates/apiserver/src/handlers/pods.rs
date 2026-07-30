@@ -68,6 +68,21 @@ pub(crate) fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSele
     })
 }
 
+/// Comma-joined `spec.containers[].image` for a pod, used by the list_pods debug signal so an
+/// operator can see which image(s) a pod is running without pulling the full spec.
+fn pod_container_images(pod: &serde_json::Value) -> String {
+    pod["spec"]["containers"]
+        .as_array()
+        .map(|containers| {
+            containers
+                .iter()
+                .filter_map(|c| c["image"].as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 /// Parse a `fieldSelector` query string and test a pod JSON value against it.
 ///
 /// Supported selectors (comma-separated), matching upstream's SelectableFields
@@ -378,6 +393,21 @@ pub(crate) async fn list_pods<S: Store>(
         items
     };
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
+
+    // Per-pod lifecycle visibility: enable with `u7s::apiserver::pod_lifecycle=debug`. Emitted
+    // per item (not one aggregate log line) so an operator can grep/filter by pod name without
+    // capturing full PodList response bodies for every request.
+    for pod in &items {
+        tracing::debug!(
+            target: "u7s::apiserver::pod_lifecycle",
+            namespace = %pod["metadata"]["namespace"].as_str().unwrap_or(""),
+            name = %pod["metadata"]["name"].as_str().unwrap_or(""),
+            phase = %pod["status"]["phase"].as_str().unwrap_or(""),
+            deletion_timestamp = ?pod["metadata"]["deletionTimestamp"].as_str(),
+            image = %pod_container_images(pod),
+            "pod list entry"
+        );
+    }
 
     // Return Table format when as=Table;v=v1 is requested (v1beta1 was rejected above).
     if super::table::wants_table(accept) {
@@ -10690,6 +10720,126 @@ mod handler_tests {
         let items = v["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "only worker-1 pods should be returned");
         assert_eq!(items[0]["spec"]["nodeName"], "worker-1");
+    }
+
+    /// In-memory sink for tracing-subscriber's fmt layer, so debug-visibility tests can
+    /// assert on rendered field content without adding a tracing-test dependency.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_log(buf: &SharedBuf) -> String {
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// list_pods must emit one DEBUG event per pod, carrying that pod's own phase and
+    /// deletionTimestamp — not the first pod's, or a single aggregate line — so an operator
+    /// enabling `u7s::apiserver::pod_lifecycle=debug` can trace an individual pod's lifecycle
+    /// (e.g. spot a pod stuck Terminating) without capturing full PodList response bodies.
+    #[tokio::test]
+    async fn list_pods_emits_one_debug_event_per_pod_with_lifecycle_fields() {
+        use axum::http::method::Method;
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "pod-a", serde_json::json!({})).await;
+        seed_pod(
+            &store,
+            "default",
+            "pod-b",
+            serde_json::json!({
+                "metadata": {
+                    "name": "pod-b",
+                    "namespace": "default",
+                    "resourceVersion": "1",
+                    "deletionTimestamp": "2026-07-30T00:00:00Z"
+                },
+                "spec": {"containers": [{"name": "app", "image": "httpd"}]},
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/default/pods")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let log = captured_log(&buf);
+        let entry_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("pod list entry"))
+            .collect();
+        assert_eq!(
+            entry_lines.len(),
+            2,
+            "expected one debug event per pod in the response — a single aggregate line \
+             would force an operator to re-parse the whole PodList to find one pod; log was: {log}"
+        );
+
+        let pod_a_line = entry_lines
+            .iter()
+            .find(|l| l.contains("pod-a"))
+            .expect("pod-a must have its own debug event");
+        assert!(
+            pod_a_line.contains("Pending"),
+            "pod-a's own phase (Pending) must be recorded on its line, not pod-b's; line was: {pod_a_line}"
+        );
+        assert!(
+            !pod_a_line.contains("2026-07-30T00:00:00Z"),
+            "pod-a (not terminating) must not carry pod-b's deletionTimestamp; line was: {pod_a_line}"
+        );
+        assert!(
+            pod_a_line.contains("nginx"),
+            "pod-a's container image must be recorded; line was: {pod_a_line}"
+        );
+
+        let pod_b_line = entry_lines
+            .iter()
+            .find(|l| l.contains("pod-b"))
+            .expect("pod-b must have its own debug event");
+        assert!(
+            pod_b_line.contains("Running"),
+            "pod-b's own phase (Running) must be recorded, distinct from pod-a's Pending; line was: {pod_b_line}"
+        );
+        assert!(
+            pod_b_line.contains("2026-07-30T00:00:00Z"),
+            "a terminating pod's deletionTimestamp must be visible so an operator can spot a \
+             pod stuck Terminating without pulling the full response body; line was: {pod_b_line}"
+        );
     }
 
     /// GET /pods on a nonexistent namespace must return 404.
