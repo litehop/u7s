@@ -26,10 +26,10 @@ use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
     failed_scheduling_status_patch, find_preemption_plan, http_get, needs_scheduling,
-    patch_pod_status, pick_node, pods_needing_resync, scheduling_gate_status_patch,
-    scheduling_gate_status_reset, should_retry_after_preemption_plan_error,
-    should_retry_without_preempting, should_schedule, stream_watch_events, NodeTally, PendingPod,
-    PodList,
+    nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
+    scheduling_gate_status_patch, scheduling_gate_status_reset,
+    should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
+    stream_watch_events, NodeTally, PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -125,6 +125,27 @@ async fn preempt_and_pick_node(
             plan.victims.len(),
             plan.node_name
         );
+        // Nominate BEFORE evicting anyone, matching upstream kube-scheduler's
+        // nominate-then-evict-async ordering: a client polling this pod's
+        // status.nominatedNodeName (e.g. SchedulerAsyncPreemption's e2e test)
+        // must see it non-empty while eviction is still in flight, not only
+        // once binding finally completes. Best-effort: a failed PATCH here
+        // must not block the eviction itself, since freeing the slot for the
+        // higher-priority pod matters more than the nomination annotation.
+        if let Err(e) = patch_pod_status(
+            connector,
+            server,
+            namespace,
+            pod_name,
+            &nominated_node_name_patch(&plan.node_name),
+        )
+        .await
+        {
+            error!(
+                "failed to set nominatedNodeName={} on preempting pod {namespace}/{pod_name}: {e}",
+                plan.node_name
+            );
+        }
         match evict_victims(connector, server, &plan.victims, tally, pod_name).await {
             Ok(()) => return Ok(plan.node_name),
             Err(e) => {
