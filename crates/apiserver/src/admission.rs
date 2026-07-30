@@ -8,6 +8,7 @@
 /// - Reject on failurePolicy: Fail if webhook is unreachable or returns denied
 /// - Re-run mutating webhooks marked reinvocationPolicy: IfNeeded if any patch was applied
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -2760,16 +2761,20 @@ async fn run_validating_admission_policies<S: Store>(
         None => serde_json::Value::Null,
     };
 
+    // Index policies by name once so the binding loop below is O(N+M) instead of
+    // re-scanning the full policy list (O(N*M)) for every binding.
+    let policies_by_name: HashMap<&str, &serde_json::Value> = policies
+        .iter()
+        .filter_map(|p| p["metadata"]["name"].as_str().map(|name| (name, p)))
+        .collect();
+
     for binding in bindings.iter() {
         let policy_name = binding["spec"]["policyName"].as_str().unwrap_or("");
         if policy_name.is_empty() {
             continue;
         }
-        let policy = match policies
-            .iter()
-            .find(|p| p["metadata"]["name"].as_str() == Some(policy_name))
-        {
-            Some(p) => p,
+        let policy = match policies_by_name.get(policy_name) {
+            Some(p) => *p,
             None => {
                 tracing::warn!(
                     "admission: VAP binding references unknown policy \"{policy_name}\", skipping"
@@ -7487,6 +7492,160 @@ mod tests {
             result.is_ok(),
             "Deployment with odd replicas (3) > 1 must be allowed by the odd-replicas VAP; \
              incorrectly denying valid requests breaks workload deployment"
+        );
+    }
+
+    /// Each binding must resolve its policy strictly by `spec.policyName`, never by the
+    /// position/order the store happens to return policies or bindings in.
+    ///
+    /// This test wires two policies and two bindings so that the store's key-lexicographic
+    /// list order pairs binding[0] with policy[1] and binding[1] with policy[0] under any
+    /// positional/index-based lookup — the opposite of the correct name-based pairing.
+    /// binding-x-lenient names "policy-b-lenient" (no validations, always allows) while
+    /// binding-y-strict names "policy-a-strict" (denies even replicas). If the binding→policy
+    /// lookup ever regresses from name-keyed to position-keyed (e.g. a broken rewrite of the
+    /// O(N*M) scan into an indexed map), binding-x-lenient — evaluated first in list order —
+    /// would silently run policy-a-strict's validations instead of its own declared policy's,
+    /// deny the request, and still report its own policyName in the message, masking exactly
+    /// which policy fired. Reverting the HashMap-indexed lookup to `.find()` also resolves by
+    /// name and keeps this test passing, since both implementations key off policyName.
+    #[tokio::test]
+    async fn vap_binding_resolves_policy_by_name_not_list_position() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "vap-lookup-ns", "labels": {"vap-test": "true"}}
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-lookup-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Lexicographically: "policy-a-strict" sorts before "policy-b-lenient".
+        let policy_a_strict = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "policy-a-strict"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "variables": [
+                    {"name": "replicas", "expression": "object.spec.replicas"},
+                    {"name": "oddReplicas", "expression": "variables.replicas % 2 == 1"}
+                ],
+                "validations": [
+                    {"expression": "variables.oddReplicas"}
+                ]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/policy-a-strict",
+            bytes::Bytes::from(serde_json::to_vec(&policy_a_strict).unwrap()), None).await.unwrap();
+
+        let policy_b_lenient = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "policy-b-lenient"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "validations": []
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/policy-b-lenient",
+            bytes::Bytes::from(serde_json::to_vec(&policy_b_lenient).unwrap()), None).await.unwrap();
+
+        // Lexicographically: "binding-x-lenient" sorts before "binding-y-strict", so
+        // binding-x-lenient (naming the lenient policy) is evaluated first, while the
+        // policy list places policy-a-strict (the strict one) first — the pairings a
+        // positional bug would use are the exact opposite of the declared policyNames.
+        let binding_x_lenient = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "binding-x-lenient"},
+            "spec": {
+                "policyName": "policy-b-lenient",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {"matchLabels": {"vap-test": "true"}}
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/binding-x-lenient",
+            bytes::Bytes::from(serde_json::to_vec(&binding_x_lenient).unwrap()), None).await.unwrap();
+
+        let binding_y_strict = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "binding-y-strict"},
+            "spec": {
+                "policyName": "policy-a-strict",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {"matchLabels": {"vap-test": "true"}}
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/binding-y-strict",
+            bytes::Bytes::from(serde_json::to_vec(&binding_y_strict).unwrap()), None).await.unwrap();
+
+        // Even replicas: only policy-a-strict (via binding-y-strict) must deny.
+        let deploy_even = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "lookup-deploy", "namespace": "vap-lookup-ns"},
+            "spec": {"replicas": 2}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "lookup-deploy",
+            namespace: Some("vap-lookup-ns"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &deploy_even, None, &ctx).await;
+        let err = result.expect_err(
+            "policy-a-strict must deny even replicas via binding-y-strict regardless of \
+             binding/policy list order",
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("policy-a-strict"),
+            "denial must be attributed to policy-a-strict (the policy binding-y-strict \
+             actually names); if the lookup regresses to positional pairing, binding-x-lenient \
+             would fire first using policy-a-strict's validations while reporting its own \
+             \"policy-b-lenient\" name instead, silently misattributing the denial: {msg}"
         );
     }
 
