@@ -147,12 +147,26 @@ async fn preempt_and_pick_node(
             );
         }
         match evict_victims(connector, server, &plan.victims, tally, pod_name).await {
-            Ok(()) => return Ok(plan.node_name),
-            Err(e) => {
+            Ok(()) => {
+                // Every victim in `plan.victims` is now actually gone, so
+                // this is a no-op for the tally's pod map — it only clears
+                // the claim bookkeeping `verify_and_reserve_preemption` set
+                // up (see `NodeTally::release_victims`).
                 tally
                     .lock()
                     .expect("tally lock poisoned")
-                    .remove(&pending.namespace, &pending.pod_name);
+                    .release_victims(&plan.victims);
+                return Ok(plan.node_name);
+            }
+            Err(e) => {
+                // Unlike the success path, some of `plan.victims` may still
+                // be real, un-evicted pods here — releasing their claim is
+                // what matters: without it, they would stay excluded from
+                // every future preemption plan's candidate pool forever,
+                // even though nothing is actually still trying to evict them.
+                let mut guard = tally.lock().expect("tally lock poisoned");
+                guard.remove(&pending.namespace, &pending.pod_name);
+                guard.release_victims(&plan.victims);
                 last_err = Some(PreemptionFailure::Fail(e));
             }
         }

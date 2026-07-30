@@ -926,6 +926,9 @@ struct TalliedPod {
 #[derive(Debug, Default)]
 pub struct NodeTally {
     pods: std::collections::HashMap<String, TalliedPod>,
+    /// "namespace/name" keys of pods already named as victims by a reserved-
+    /// but-not-yet-evicted preemption plan — see `claim_victims`.
+    reserved_victims: std::collections::HashSet<String>,
 }
 
 impl NodeTally {
@@ -975,8 +978,24 @@ impl NodeTally {
                     },
                 );
             }
-            _ => {
+            Some(_) => {
+                // Bound but now terminal (Succeeded/Failed) — free its slot.
                 self.pods.remove(&key);
+            }
+            None => {
+                // Still unbound: do NOT remove any existing entry. Live-
+                // reproduced: main.rs's best-effort `nominatedNodeName`
+                // status PATCH on a pod this scheduler just `assume`d (but
+                // has not yet bound — bind is what actually sets
+                // `spec.nodeName`) echoes back through this SAME watch
+                // stream with `spec.nodeName` still empty. Removing here
+                // erased that concurrently-committed reservation well before
+                // the real bind landed, letting a THIRD pod's capacity check
+                // see phantom free room and get force-bound onto a node that
+                // was, in physical reality, already full — the kubelet then
+                // rejected it OutOfResource. A pod that was never bound was
+                // never in `pods` to begin with, so this is a genuine no-op
+                // for the ordinary (not-yet-scheduled) case.
             }
         }
     }
@@ -1017,6 +1036,38 @@ impl NodeTally {
     /// could never otherwise correct.
     pub fn clear(&mut self) {
         self.pods.clear();
+        self.reserved_victims.clear();
+    }
+
+    /// Mark every pod in `victims` ("namespace/name" keys) as claimed by an
+    /// in-flight (reserved-but-not-yet-evicted) preemption plan.
+    ///
+    /// Called by `verify_and_reserve_preemption` under the same lock
+    /// acquisition as its `assume` call, so the claim becomes visible to
+    /// every other decision at the exact instant the plan is committed.
+    /// `pods_on` then hides these keys from every OTHER concurrent plan's
+    /// candidate search until `release_victims` undoes this — without it,
+    /// two concurrent equal-priority preemptors independently re-derive the
+    /// same "cheapest victim" every time, since neither plan's search has
+    /// any way to know the other has already committed to evicting it (live
+    /// reproduced: 3 concurrent equal-priority preemptors all targeted the
+    /// same single victim, leaving 2 of them force-bound onto a node that
+    /// never actually had room, which the kubelet then rejected).
+    pub fn claim_victims(&mut self, victims: &[String]) {
+        self.reserved_victims.extend(victims.iter().cloned());
+    }
+
+    /// Undo `claim_victims` once a plan's eviction sequence finishes,
+    /// whether every victim was actually evicted (the ordinary case; a
+    /// no-op for those keys, since `remove` already dropped them from
+    /// `pods` by then) or the plan was abandoned partway through eviction —
+    /// the case that matters: an un-evicted victim must become visible to
+    /// `pods_on` again, or it would stay excluded from every future
+    /// preemption plan forever even though it is still really there.
+    pub fn release_victims(&mut self, victims: &[String]) {
+        for v in victims {
+            self.reserved_victims.remove(v);
+        }
     }
 
     /// Non-terminal pod count and summed resource requests per node — the
@@ -1034,10 +1085,20 @@ impl NodeTally {
 
     /// Every tallied pod currently on `node_name`, for preemption victim
     /// selection — in place of a live GET.
+    ///
+    /// Excludes any pod already claimed by another in-flight preemption plan
+    /// (see `claim_victims`). Such a pod is still physically on the node, so
+    /// `usage_by_node` — the path ordinary direct scheduling reads — must
+    /// keep counting it; but for preemption planning it is already spoken
+    /// for, since the plan that claimed it has already folded the capacity
+    /// its eviction will free into its own `assume` reservation. Continuing
+    /// to offer it here as a candidate/occupant to every OTHER concurrent
+    /// plan is exactly what let equal-priority preemptors independently
+    /// converge on the same victim.
     pub fn pods_on(&self, node_name: &str) -> Vec<NodePod> {
         self.pods
             .iter()
-            .filter(|(_, p)| p.node_name == node_name)
+            .filter(|(key, p)| p.node_name == node_name && !self.reserved_victims.contains(*key))
             .map(|(key, p)| NodePod {
                 key: key.clone(),
                 priority: p.priority,
@@ -1757,9 +1818,11 @@ fn verify_and_reserve_preemption(
             acc + p.requests.clone()
         });
     for victim in &plan.victims {
-        // A victim already absent from the fresh read (e.g. some other actor
-        // deleted it independently) contributes nothing to subtract — its
-        // capacity is already free, which only helps this check succeed.
+        // A victim already absent from the fresh read — because some other
+        // actor deleted it independently, or because a fresher concurrent
+        // plan already claimed it (see `NodeTally::pods_on`) — contributes
+        // nothing to subtract — its capacity is already accounted for as
+        // free, which only helps this check succeed.
         if let Some(p) = current_pods.iter().find(|p| &p.key == victim) {
             remaining_pod_count -= 1;
             subtract_requests(&mut remaining_requests, &p.requests);
@@ -1784,6 +1847,10 @@ fn verify_and_reserve_preemption(
         pod.priority,
         pod.requests.clone(),
     );
+    // Claim the victims under this SAME lock acquisition, not a later one —
+    // otherwise a fresher concurrent plan's search could still see them as
+    // available in the gap between this commit and a separate claim call.
+    tally_guard.claim_victims(&plan.victims);
     Ok(())
 }
 
@@ -4421,6 +4488,259 @@ mod tests {
         );
     }
 
+    /// Live-reproduced against a 3-filler/3-preemptor extended-resource
+    /// scenario once mayor-efhom's nominatedNodeName PATCH lengthened the
+    /// window before eviction: unlike
+    /// `verify_and_reserve_preemption_never_double_books_shared_victims`
+    /// (which hands every contender the SAME pre-computed victim list), each
+    /// of these threads independently SEARCHES for its own victim via
+    /// `select_preemption_victims`, exactly like `find_preemption_plan`
+    /// does, retrying up to `ATTEMPTS` times exactly like
+    /// `preempt_and_pick_node` — a single search-then-verify attempt can
+    /// still lose a race (the search itself takes no lock), so a retry is
+    /// always expected; what must never happen, with or without a retry, is
+    /// two DIFFERENT winning plans landing on the same victim. Before
+    /// `NodeTally::pods_on` excluded already-claimed victims, equal-priority
+    /// tie-breaking made every concurrent search converge on the same
+    /// cheapest filler even across retries, so N concurrent preemptors only
+    /// ever freed ONE filler's worth of capacity between them.
+    #[test]
+    fn concurrent_equal_priority_preemption_selects_disjoint_victims() {
+        const N: usize = 3;
+        const ATTEMPTS: u32 = 5;
+        let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            for i in 0..N {
+                guard.assume(
+                    "default",
+                    &format!("filler-{i}"),
+                    "worker-0",
+                    100,
+                    requests(1000, 0, 0),
+                );
+            }
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let tally = std::sync::Arc::clone(&tally);
+                let barrier = std::sync::Arc::clone(&barrier);
+                // Exactly saturated by the N 1000m-cpu fillers — evicting
+                // any one of them frees just enough room for one 1000m
+                // preemptor, never two, so at most N total can ever fit.
+                let mut node = make_node_with_capacity("worker-0", &[], "110");
+                node.status.allocatable.cpu = N.to_string();
+                let mut pod = empty_pending_pod();
+                pod.pod_name = format!("preemptor-{i}");
+                pod.priority = 1000;
+                pod.requests = requests(1000, 0, 0);
+                std::thread::spawn(move || {
+                    // Line every contender up so as many as possible search
+                    // for a victim at the same instant.
+                    barrier.wait();
+                    for _ in 0..ATTEMPTS {
+                        let node_pods = tally
+                            .lock()
+                            .expect("tally lock poisoned")
+                            .pods_on("worker-0");
+                        let victims = select_preemption_victims(
+                            pod.priority,
+                            &pod.requests,
+                            &node_pods,
+                            110,
+                            &node.status.allocatable,
+                        );
+                        if victims.is_empty() {
+                            continue;
+                        }
+                        let plan = PreemptionPlan {
+                            node_name: "worker-0".to_owned(),
+                            victims,
+                        };
+                        if verify_and_reserve_preemption(&pod, &node, &plan, &tally).is_ok() {
+                            return Some(plan.victims);
+                        }
+                    }
+                    None
+                })
+            })
+            .collect();
+
+        let results: Vec<Option<Vec<String>>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok_count = results.iter().filter(|r| r.is_some()).count();
+        let raw_victims: Vec<String> = results.iter().flatten().flatten().cloned().collect();
+        let mut deduped_victims = raw_victims.clone();
+        deduped_victims.sort();
+        deduped_victims.dedup();
+        assert_eq!(
+            ok_count, N,
+            "all {N} equal-priority preemptors must win a distinct victim in \
+             this exactly-balanced scenario — got {ok_count}"
+        );
+        // The bug's real signature (matches the live log evidence exactly:
+        // "preempting 1 pod(s)... preempting 2 pod(s)... preempting 3
+        // pod(s)"): each concurrent plan's victim list is a superset of the
+        // previous, so summing every plan's victim COUNT (not just
+        // deduplicating the union) is what actually distinguishes N disjoint
+        // singleton victims (sum == N) from N nested/overlapping plans that
+        // still happen to cover every filler between them (sum > N, e.g. 6
+        // for N=3's 1+2+3 pattern) — a union-only check would miss the
+        // latter case entirely.
+        assert_eq!(
+            raw_victims.len(),
+            N,
+            "if this regresses, concurrent plans re-target victims another \
+             plan already claimed instead of picking disjoint ones — total \
+             victim mentions across all {N} winning plans should be exactly \
+             {N} (one each), got {} across {:?}",
+            raw_victims.len(),
+            results
+        );
+        assert_eq!(
+            deduped_victims.len(),
+            N,
+            "if this regresses, {N} concurrent preemptors all target the same \
+             victim, freeing 1 unit of resource instead of {N}, forcing \
+             kubelet OutOfResource on the {} preemptors that don't fit; \
+             distinct victims actually evicted: {deduped_victims:?}",
+            N - 1
+        );
+    }
+
+    /// The other half of the fix `concurrent_equal_priority_preemption_selects_disjoint_victims`
+    /// exercises under real thread races: a victim already claimed by a
+    /// reserved-but-not-yet-evicted plan must not be offered to a second,
+    /// later plan even outside of a race — deterministic, so a regression
+    /// here always fails, not just probabilistically under thread timing.
+    #[test]
+    fn victim_claimed_by_pending_plan_is_not_selectable_by_a_later_plan() {
+        let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.assume("default", "filler-a", "worker-0", 100, requests(1000, 0, 0));
+            guard.assume("default", "filler-b", "worker-0", 100, requests(1000, 0, 0));
+        }
+        // Saturated by the two fillers — the first plan needs to evict
+        // exactly one of them to fit.
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "2".to_owned();
+
+        let mut pod1 = empty_pending_pod();
+        pod1.pod_name = "preemptor-1".to_owned();
+        pod1.priority = 1000;
+        pod1.requests = requests(1000, 0, 0);
+        let plan1 = PreemptionPlan {
+            node_name: "worker-0".to_owned(),
+            // Named explicitly (not searched) so this test does not depend
+            // on NodeTally's HashMap iteration order to pick filler-a.
+            victims: vec!["default/filler-a".to_owned()],
+        };
+        verify_and_reserve_preemption(&pod1, &node, &plan1, &tally)
+            .expect("evicting filler-a frees exactly enough room for preemptor-1");
+
+        // A second, later plan for a different pending pod searches while
+        // filler-a is still reserved (not yet actually evicted).
+        let node_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .pods_on("worker-0");
+        let victims2 = select_preemption_victims(
+            1000,
+            &requests(1000, 0, 0),
+            &node_pods,
+            110,
+            &node.status.allocatable,
+        );
+
+        assert_eq!(
+            victims2,
+            vec!["default/filler-b".to_owned()],
+            "filler-a is already claimed by preemptor-1's reserved-but-not-\
+             yet-evicted plan, so the second plan must fall through to the \
+             only other eligible candidate (filler-b), never re-select \
+             filler-a — got {victims2:?}"
+        );
+    }
+
+    /// `sequential_preemption_still_reuses_freed_victim_slots`: once a
+    /// claimed victim is actually evicted and its claim released, a pod
+    /// later recreated under that EXACT SAME "namespace/name" key (e.g. a
+    /// controller re-creating a fixed-name pod, which several conformance
+    /// fixtures do) must be selectable again — the only way a leaked claim
+    /// entry (never released after a completed eviction) would ever become
+    /// observable, since `pods_on` already excludes anything no longer in
+    /// the tally regardless of claim state.
+    #[test]
+    fn sequential_preemption_still_reuses_freed_victim_slots() {
+        let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "filler-a",
+            "worker-0",
+            100,
+            requests(1000, 0, 0),
+        );
+
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "1".to_owned();
+        let mut pod1 = empty_pending_pod();
+        pod1.pod_name = "preemptor-1".to_owned();
+        pod1.priority = 1000;
+        pod1.requests = requests(1000, 0, 0);
+        let plan1 = PreemptionPlan {
+            node_name: "worker-0".to_owned(),
+            victims: vec!["default/filler-a".to_owned()],
+        };
+        verify_and_reserve_preemption(&pod1, &node, &plan1, &tally)
+            .expect("evicting filler-a frees exactly enough room for preemptor-1");
+
+        // Mirrors main.rs's evict_victims + preempt_and_pick_node: the
+        // victim is actually deleted (removed from the tally), then its
+        // claim is released once the eviction sequence finishes.
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.remove("default", "filler-a");
+            guard.release_victims(&plan1.victims);
+        }
+
+        // A controller recreates a pod under the exact same key.
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "filler-a",
+            "worker-0",
+            100,
+            requests(1000, 0, 0),
+        );
+
+        // Now saturated by preemptor-1 + the recreated filler-a; a second
+        // preemptor needs to evict the recreated filler-a to fit.
+        node.status.allocatable.cpu = "2".to_owned();
+        let node_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .pods_on("worker-0");
+        let victims2 = select_preemption_victims(
+            1000,
+            &requests(1000, 0, 0),
+            &node_pods,
+            110,
+            &node.status.allocatable,
+        );
+
+        assert_eq!(
+            victims2,
+            vec!["default/filler-a".to_owned()],
+            "a leaked claim on 'default/filler-a' (never released after its \
+             first eviction completed) would make this key permanently \
+             invisible to pods_on, hiding the recreated pod's real resource \
+             usage and making the node look like it already has spare \
+             capacity it does not have — got {victims2:?}"
+        );
+    }
+
     /// `remove` must actually free the capacity it removes — used both to
     /// roll back a failed bind's `assume` and to account for a preemption
     /// eviction. If a removal were silently dropped, the tally would
@@ -4467,6 +4787,51 @@ mod tests {
             "a DELETED event must remove the pod's tallied usage — otherwise a \
              real pod deletion would leave a phantom reservation that blocks \
              scheduling onto a node that actually has room"
+        );
+    }
+
+    /// Live-reproduced once `main.rs`'s best-effort `nominatedNodeName`
+    /// status PATCH landed in the critical path before eviction/bind: that
+    /// PATCH changes only `status`, but its watch-echo still carries
+    /// `spec.nodeName` empty (the bind that actually sets it hasn't happened
+    /// yet) — and `apply_event` used to treat ANY empty-`spec.nodeName`
+    /// ADDED/MODIFIED event as "this pod occupies no slot, drop it", which
+    /// erased the `assume` reservation `verify_and_reserve_preemption` had
+    /// already committed for this exact pod moments earlier. A concurrently
+    /// scheduled THIRD pod's capacity check then saw phantom free room (the
+    /// tally had "forgotten" this pod), got force-bound, and the kubelet
+    /// rejected it OutOfResource even though nothing was actually wrong with
+    /// preemption's victim selection.
+    #[test]
+    fn apply_event_does_not_erase_an_assumed_reservation_for_a_still_unbound_watch_echo() {
+        let mut tally = NodeTally::default();
+        tally.assume(
+            "default",
+            "preemptor",
+            "worker-0",
+            1000,
+            requests(1000, 0, 0),
+        );
+
+        // Mirrors the nominatedNodeName status PATCH's watch-echo: same pod,
+        // `spec.nodeName` still empty, `status` is the only thing that changed.
+        tally.apply_event(&json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "preemptor", "namespace": "default" },
+                "spec": { "containers": [] },
+                "status": { "phase": "Pending" }
+            }
+        }));
+
+        assert_eq!(
+            tally.usage_by_node().get("worker-0").map(|u| u.pod_count),
+            Some(1),
+            "a stale/echoed watch event that predates this scheduler's own \
+             assume() for this pod must never erase that fresher reservation \
+             — otherwise a concurrently-scheduled pod's capacity check sees \
+             phantom free room and gets force-bound onto a node that is, in \
+             physical reality, already full"
         );
     }
 
