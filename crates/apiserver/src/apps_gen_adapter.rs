@@ -1649,4 +1649,93 @@ mod tests {
         expected.extend(["revision", "data"]);
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // Each test below builds a message with every optional field unset (`Default::default()`),
+    // decodes it through the real entry point, and asserts no key survives as an explicit JSON
+    // `null` (other than ObjectMeta's `creationTimestamp`) and that spec/status are genuinely
+    // absent rather than present-with-nulls.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_statefulset_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = apps_v1::StatefulSet::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_statefulset_proto_gen(&buf).expect("all-default StatefulSet must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — the StatefulSet controller checks \
+             `status.currentRevision != null` to decide whether it has ever created a replica; \
+             a stray null there is indistinguishable from a real (but empty) revision"
+        );
+    }
+
+    #[test]
+    fn decode_deployment_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = apps_v1::Deployment::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_deployment_proto_gen(&buf).expect("all-default Deployment must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — `kubectl rollout status` reads \
+             status.conditions to report progress; a stray null there could crash a client that \
+             expects either a real array or a missing key, but not `null`"
+        );
+    }
+
+    #[test]
+    fn decode_daemonset_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = apps_v1::DaemonSet::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_daemonset_proto_gen(&buf).expect("all-default DaemonSet must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_replicaset_proto_gen_omits_unset_spec_and_status_instead_of_emitting_null() {
+        let obj = apps_v1::ReplicaSet::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded =
+            decode_replicaset_proto_gen(&buf).expect("all-default ReplicaSet must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null"
+        );
+    }
+
+    #[test]
+    fn decode_controllerrevision_proto_gen_omits_unset_data_instead_of_emitting_null() {
+        let obj = apps_v1::ControllerRevision::default();
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let decoded = decode_controllerrevision_proto_gen(&buf)
+            .expect("all-default ControllerRevision must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("data").is_none(),
+            "an unset data payload must be absent, not null — the StatefulSet/DaemonSet \
+             controllers diff ControllerRevision.data to detect a rollback target; a stray null \
+             would be indistinguishable from a revision that legitimately captured an empty patch"
+        );
+    }
 }

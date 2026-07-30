@@ -1116,4 +1116,131 @@ mod tests {
         let expected = ["token", "audiences"];
         assert_fields_present(&paths, &expected);
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // Each test below builds a message with every optional field unset (`Default::default()`),
+    // decodes it through the real entry point, and asserts no key survives as an explicit JSON
+    // `null` (other than ObjectMeta's `creationTimestamp`, which upstream always nulls when
+    // zero). `indexing["missing_key"]` returns a static `Value::Null` for both an absent key and
+    // a genuinely-null one, which is exactly how earlier tests in this file (see
+    // `resourceAttributes.namespace` above) could pass even if a gen_*_to_json function started
+    // inserting `null` unconditionally — these tests inspect the actual JSON object map instead.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_clusterrole_proto_gen_omits_unset_aggregation_rule_instead_of_emitting_null() {
+        let cr = rbac_v1::ClusterRole::default();
+        let mut buf = Vec::new();
+        cr.encode(&mut buf).unwrap();
+        let decoded =
+            decode_clusterrole_proto_gen(&buf).expect("all-default ClusterRole must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("aggregationRule").is_none(),
+            "an unset aggregationRule must be absent, not `null` — a client that checks \
+             `if aggregationRule != null` to decide whether the aggregation controller manages \
+             this role would misclassify a plain role as aggregated"
+        );
+    }
+
+    #[test]
+    fn decode_clusterrolebinding_proto_gen_omits_unset_role_ref_fields_instead_of_emitting_null() {
+        let crb = rbac_v1::ClusterRoleBinding::default();
+        let mut buf = Vec::new();
+        crb.encode(&mut buf).unwrap();
+        let decoded = decode_clusterrolebinding_proto_gen(&buf)
+            .expect("all-default ClusterRoleBinding must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded["roleRef"].as_object().is_some_and(|m| m.is_empty()),
+            "an unset RoleRef must decode to an empty object, not one with null apiGroup/kind/name \
+             keys — a client that iterates roleRef's keys to detect \"which fields were set\" \
+             would otherwise see three phantom fields"
+        );
+    }
+
+    #[test]
+    fn decode_role_proto_gen_omits_no_nulls_on_all_default_input() {
+        let role = rbac_v1::Role::default();
+        let mut buf = Vec::new();
+        role.encode(&mut buf).unwrap();
+        let decoded = decode_role_proto_gen(&buf).expect("all-default Role must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert_eq!(
+            decoded["rules"].as_array().map(|a| a.len()),
+            Some(0),
+            "rules must decode to an empty array (matching upstream Role.rules, which has no \
+             omitempty), not a null or missing key"
+        );
+    }
+
+    #[test]
+    fn decode_rolebinding_proto_gen_omits_unset_role_ref_fields_instead_of_emitting_null() {
+        let rb = rbac_v1::RoleBinding::default();
+        let mut buf = Vec::new();
+        rb.encode(&mut buf).unwrap();
+        let decoded =
+            decode_rolebinding_proto_gen(&buf).expect("all-default RoleBinding must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded["roleRef"].as_object().is_some_and(|m| m.is_empty()),
+            "an unset RoleRef must decode to an empty object, not null-valued keys"
+        );
+    }
+
+    #[test]
+    fn decode_subject_access_review_proto_gen_omits_unset_spec_fields_instead_of_emitting_null() {
+        let sar = authz_v1::SubjectAccessReview::default();
+        let mut buf = Vec::new();
+        sar.encode(&mut buf).unwrap();
+        let decoded = decode_subject_access_review_proto_gen(&buf)
+            .expect("all-default SubjectAccessReview must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded["spec"].as_object().is_some_and(|m| {
+                !m.contains_key("resourceAttributes") && !m.contains_key("nonResourceAttributes")
+            }),
+            "unset resourceAttributes/nonResourceAttributes must be absent, not null — a webhook \
+             authorizer that branches on `spec.resourceAttributes != null` would otherwise treat \
+             every review as a resource-scoped check even when none was requested"
+        );
+    }
+
+    #[test]
+    fn decode_local_subject_access_review_proto_gen_omits_no_nulls_on_all_default_input() {
+        let lsar = authz_v1::LocalSubjectAccessReview::default();
+        let mut buf = Vec::new();
+        lsar.encode(&mut buf).unwrap();
+        let decoded = decode_local_subject_access_review_proto_gen(&buf)
+            .expect("all-default LocalSubjectAccessReview must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+    }
+
+    #[test]
+    fn decode_token_review_proto_gen_omits_unset_audiences_instead_of_emitting_null() {
+        let tr = authn_v1::TokenReview::default();
+        let mut buf = Vec::new();
+        tr.encode(&mut buf).unwrap();
+        let decoded =
+            decode_token_review_proto_gen(&buf).expect("all-default TokenReview must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            !decoded["spec"]
+                .as_object()
+                .is_some_and(|m| m.contains_key("audiences")),
+            "unset audiences must be absent, not null — an audience-aware authenticator that \
+             checks `spec.audiences == null` to mean \"any audience\" happens to be safe here, \
+             but the array must still be omitted rather than emitted as an empty/null value so \
+             every authenticator agrees on the encoding"
+        );
+    }
 }

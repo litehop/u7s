@@ -628,4 +628,47 @@ mod tests {
              explain why scaling did or did not happen"
         );
     }
+
+    // ---- Field-omission: all-default proto must decode with no stray nulls ----
+    //
+    // `decode_hpa_v1_proto_gen_omits_unset_target_cpu_utilization` above checks
+    // `result[...].is_null()`, which is also true when the key is simply absent — it can't
+    // distinguish "omitted" (correct) from "present as null" (the bug this bead is about). The
+    // tests below inspect the actual JSON object map via `assert_no_stray_nulls`/`.get()`
+    // instead, so they would actually fail if a future change started emitting `null` for an
+    // optional field instead of omitting the key.
+
+    use crate::util::sentinel_test_util::assert_no_stray_nulls;
+
+    #[test]
+    fn decode_hpa_v1_proto_gen_omits_unset_optional_fields_instead_of_emitting_null() {
+        let hpa = autoscaling_v1::HorizontalPodAutoscaler::default();
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).unwrap();
+        let decoded = decode_hpa_v1_proto_gen(&buf)
+            .expect("all-default autoscaling/v1 HorizontalPodAutoscaler must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null — spec/status are always Some() for a \
+             real HPA, but the decoder must not turn an all-default sub-message into a block of \
+             null-valued keys the HPA controller could misread as explicit zero targets"
+        );
+    }
+
+    #[test]
+    fn decode_hpa_v2_proto_gen_omits_unset_optional_fields_instead_of_emitting_null() {
+        let hpa = autoscaling_v2::HorizontalPodAutoscaler::default();
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).unwrap();
+        let decoded = decode_hpa_v2_proto_gen(&buf)
+            .expect("all-default autoscaling/v2 HorizontalPodAutoscaler must decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none() && decoded.get("status").is_none(),
+            "unset spec/status must be absent, not null"
+        );
+    }
 }
