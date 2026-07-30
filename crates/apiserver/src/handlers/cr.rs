@@ -2217,20 +2217,6 @@ pub async fn create_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour:
-    // 403 Forbidden: unable to create new content in namespace <ns> because it is being terminated
-    {
-        let ns_key = cluster_object_key("namespaces", &ns);
-        if let Ok(Some(stored)) = state.store.get(&ns_key).await {
-            if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                    return Err(Status::forbidden(format!(
-                        "unable to create new content in namespace {ns} because it is being terminated"
-                    )));
-                }
-            }
-        }
-    }
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -2288,12 +2274,26 @@ pub async fn create_cr_namespaced<S: Store>(
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
+    let ns_key = cluster_object_key("namespaces", &ns);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
-    let rv = state
+    // Namespace-Terminating check and the create are one atomic store transaction — matches
+    // kube-apiserver behaviour: 403 Forbidden "unable to create new content in namespace <ns>
+    // because it is being terminated".
+    let rv = match state
         .store
-        .put(&key, Bytes::from(bytes), Some(0))
+        .create_if_namespace_active(Some(&ns_key), &key, Bytes::from(bytes))
         .await
-        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+    {
+        Ok(rv) => rv,
+        Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
+            return Err(Status::forbidden(format!(
+                "unable to create new content in namespace {ns} because it is being terminated"
+            )));
+        }
+        Err(u7s_store::CreateNamespacedError::Store(e)) => {
+            return Err(store_err_cr(e, &name, &ctx.kind))
+        }
+    };
 
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
@@ -2845,22 +2845,6 @@ pub async fn patch_cr_namespaced<S: Store>(
     // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
-        // Reject object creation in a Terminating namespace — matches
-        // create_cr_namespaced/create_namespaced_resource/create_pod. Without this,
-        // `kubectl apply --server-side` can create a new CR in a namespace mid-deletion by
-        // going through PATCH+apply instead of POST+create.
-        {
-            let ns_key = cluster_object_key("namespaces", &ns);
-            if let Ok(Some(stored)) = state.store.get(&ns_key).await {
-                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                        return Err(Status::forbidden(format!(
-                            "unable to create new content in namespace {ns} because it is being terminated"
-                        )));
-                    }
-                }
-            }
-        }
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         let warn_header = apply_cr_field_validation(
             &mut obj,
@@ -2897,11 +2881,26 @@ pub async fn patch_cr_namespaced<S: Store>(
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
         let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
-        let rv = state
+        let ns_key = cluster_object_key("namespaces", &ns);
+        // Reject object creation in a Terminating namespace, atomically with the create —
+        // matches create_cr_namespaced/create_namespaced_resource/create_pod. Without this,
+        // `kubectl apply --server-side` can create a new CR in a namespace mid-deletion by
+        // going through PATCH+apply instead of POST+create.
+        let rv = match state
             .store
-            .put(&key, Bytes::from(bytes), Some(0))
+            .create_if_namespace_active(Some(&ns_key), &key, Bytes::from(bytes))
             .await
-            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        {
+            Ok(rv) => rv,
+            Err(u7s_store::CreateNamespacedError::NamespaceTerminating) => {
+                return Err(Status::forbidden(format!(
+                    "unable to create new content in namespace {ns} because it is being terminated"
+                )));
+            }
+            Err(u7s_store::CreateNamespacedError::Store(e)) => {
+                return Err(store_err_cr(e, &name, &ctx.kind))
+            }
+        };
         let mut meta: crate::types::ObjectMeta =
             serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
         meta.resource_version = Some(rv.to_string());

@@ -191,6 +191,30 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Error from `Store::create_if_namespace_active`.
+#[derive(Debug, Error)]
+pub enum CreateNamespacedError {
+    /// The namespace at the checked key has `status.phase == "Terminating"`. The insert was
+    /// never attempted — real kube-apiserver rejects the create outright rather than letting
+    /// it land in a namespace that is mid-deletion.
+    #[error("namespace is being terminated")]
+    NamespaceTerminating,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl From<rusqlite::Error> for CreateNamespacedError {
+    fn from(e: rusqlite::Error) -> Self {
+        CreateNamespacedError::Store(StoreError::from(e))
+    }
+}
+
+impl From<tokio::task::JoinError> for CreateNamespacedError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        CreateNamespacedError::Store(StoreError::from(e))
+    }
+}
+
 /// Internal event broadcast after every write.
 #[derive(Debug)]
 pub struct InternalEvent {
@@ -264,6 +288,52 @@ pub trait Store: Send + Sync + 'static {
         value: Bytes,
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
+
+    /// Create-only write, gated on a namespace's `status.phase` not being `"Terminating"`.
+    ///
+    /// `ns_key`, when `Some`, is the full store key of the parent namespace object (e.g.
+    /// `/registry/namespaces/foo`) — the phase read and the create at `key` happen inside one
+    /// transaction, so no concurrent write to `ns_key` (e.g. a namespace delete flipping its
+    /// phase to `Terminating`) can land in the gap between the check and the insert. Pass
+    /// `None` for cluster-scoped creates, which skip the namespace check entirely and behave
+    /// exactly like `put(key, value, Some(0))`.
+    ///
+    /// A namespace that does not exist at `ns_key` is treated as active (not Terminating):
+    /// namespace-existence enforcement, where a caller wants it, is the caller's own job (see
+    /// e.g. pods.rs's `parse_namespace`), not this method's — it exists solely to close the
+    /// create-vs-delete phase-flip race, not to add a new validation rule.
+    ///
+    /// The default implementation (`get` the namespace, then `put`) is NOT atomic — it exists
+    /// so callers that don't need real atomicity (test doubles wrapping another `Store`) don't
+    /// have to implement this method. `SqliteStore` overrides it with a single
+    /// `BEGIN IMMEDIATE … COMMIT` transaction; that override is the one path production code
+    /// actually depends on for correctness.
+    fn create_if_namespace_active(
+        &self,
+        ns_key: Option<&str>,
+        key: &str,
+        value: Bytes,
+    ) -> impl std::future::Future<Output = std::result::Result<u64, CreateNamespacedError>> + Send
+    {
+        async move {
+            if let Some(ns_key) = ns_key {
+                if let Some(stored) = self
+                    .get(ns_key)
+                    .await
+                    .map_err(CreateNamespacedError::Store)?
+                {
+                    if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                        if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                            return Err(CreateNamespacedError::NamespaceTerminating);
+                        }
+                    }
+                }
+            }
+            self.put(key, value, Some(0))
+                .await
+                .map_err(CreateNamespacedError::Store)
+        }
+    }
 
     /// Delete an object. Same optimistic concurrency semantics as put.
     /// Returns the new global revision and the last-known object bytes on success.

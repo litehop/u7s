@@ -5,7 +5,7 @@ use axum::{
     Extension, Json,
 };
 use bytes::Bytes;
-use u7s_store::{ListOptions, Store, StoreError};
+use u7s_store::{CreateNamespacedError, ListOptions, Store, StoreError};
 
 use crate::admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext};
 use crate::{limit_range, quota};
@@ -910,22 +910,6 @@ pub(crate) async fn do_patch<S: Store>(
 
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
-        // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour
-        // and mirrors the same check in create_namespaced_resource/create_cr_namespaced/
-        // create_pod. Without this, `kubectl apply --server-side` can create new content in a
-        // namespace mid-deletion by going through PATCH+apply instead of POST+create.
-        if let Some(namespace) = ns {
-            let ns_key = cluster_object_key("namespaces", namespace);
-            if let Ok(Some(stored)) = state.store.get(&ns_key).await {
-                if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                    if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                        return Err(Status::forbidden(format!(
-                            "unable to create new content in namespace {namespace} because it is being terminated"
-                        )));
-                    }
-                }
-            }
-        }
         // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side), which
         // Object::from_bytes (JSON-only) rejects outright — ssa_body_to_json handles both.
         let mut obj = Object {
@@ -954,9 +938,24 @@ pub(crate) async fn do_patch<S: Store>(
             }
             return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
         }
-        let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
+        // Namespace-Terminating check (when namespaced) and the create are one atomic store
+        // transaction — mirrors create_namespaced_resource/create_cr_namespaced/create_pod.
+        // Without this, `kubectl apply --server-side` could create new content in a namespace
+        // mid-deletion by going through PATCH+apply instead of POST+create.
+        let ns_key = ns.map(|namespace| cluster_object_key("namespaces", namespace));
+        let new_rv = match state
+            .store
+            .create_if_namespace_active(ns_key.as_deref(), key, obj.to_bytes())
+            .await
+        {
             Ok(rv) => rv,
-            Err(StoreError::AlreadyExists { .. }) => {
+            Err(CreateNamespacedError::NamespaceTerminating) => {
+                let namespace = ns.unwrap_or_default();
+                return Err(Status::forbidden(format!(
+                    "unable to create new content in namespace {namespace} because it is being terminated"
+                )));
+            }
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
                 // Race: another writer created it; fall through to normal merge below.
                 let stored = state
                     .store
@@ -990,7 +989,7 @@ pub(crate) async fn do_patch<S: Store>(
                 current.set_resource_version(rv);
                 return Ok(Json(current.body).into_response());
             }
-            Err(e) => return Err(store_err(e, name, &meta.kind)),
+            Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, name, &meta.kind)),
         };
         obj.set_resource_version(new_rv);
         if let Some(fm) = field_manager {
@@ -1531,20 +1530,6 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour:
-    // 403 Forbidden: unable to create new content in namespace <ns> because it is being terminated
-    {
-        let ns_key = cluster_object_key("namespaces", &ns);
-        if let Ok(Some(stored)) = state.store.get(&ns_key).await {
-            if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
-                if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
-                    return Err(Status::forbidden(format!(
-                        "unable to create new content in namespace {ns} because it is being terminated"
-                    )));
-                }
-            }
-        }
-    }
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1670,8 +1655,17 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     }
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let ns_key = cluster_object_key("namespaces", &ns);
     let put_start = std::time::Instant::now();
-    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    // Namespace-Terminating check and the create are one atomic store transaction — matches
+    // kube-apiserver behaviour: 403 Forbidden "unable to create new content in namespace <ns>
+    // because it is being terminated" — closing the check-then-act window a separate earlier
+    // check + this write used to leave open (a create could observe Active, then a concurrent
+    // delete_namespace flips the phase, and this write would blindly succeed regardless).
+    let result = state
+        .store
+        .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
+        .await;
     tracing::debug!(
         key = %key,
         elapsed_ms = put_start.elapsed().as_millis() as u64,
@@ -1680,7 +1674,14 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     );
     let new_rv = match result {
         Ok(rv) => rv,
-        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
+        Err(CreateNamespacedError::NamespaceTerminating) => {
+            return Err(Status::forbidden(format!(
+                "unable to create new content in namespace {ns} because it is being terminated"
+            )));
+        }
+        Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
+            if meta.create_or_update =>
+        {
             // createOrUpdate: replace existing object unconditionally.
             state
                 .store
@@ -1688,7 +1689,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                 .await
                 .map_err(|e| store_err(e, &name, &meta.kind))?
         }
-        Err(StoreError::AlreadyExists { .. }) => {
+        Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
             let stored = state
                 .store
                 .get(&key)
@@ -1699,7 +1700,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                 .map_err(|e| Status::internal(e.to_string()))?;
             return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
         }
-        Err(e) => return Err(store_err(e, &name, &meta.kind)),
+        Err(CreateNamespacedError::Store(e)) => return Err(store_err(e, &name, &meta.kind)),
     };
 
     obj.set_resource_version(new_rv);
@@ -13078,6 +13079,257 @@ mod tests {
                 .contains("being terminated"),
             "error message must say namespace is being terminated"
         );
+    }
+
+    /// A store wrapper that flips its target namespace to `Terminating` the first time
+    /// `list()` is asked for that namespace's ResourceQuotas — the exact point
+    /// `create_namespaced_resource`'s admission pipeline reaches (via
+    /// `quota::check_resource_quota`) strictly AFTER an old-style early Terminating check
+    /// would have already run and passed, but strictly BEFORE the object is actually
+    /// persisted. This reproduces "a namespace delete's phase-flip commits in the gap
+    /// between a concurrent create's admission work and its store write" deterministically,
+    /// without relying on OS thread-scheduling luck.
+    struct PhaseFlipDuringQuotaCheckStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        target_ns: String,
+        flipped: std::sync::atomic::AtomicBool,
+    }
+
+    impl u7s_store::Store for PhaseFlipDuringQuotaCheckStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix_owned = prefix.to_string();
+            let quota_prefix = format!("/registry/resourcequotas/{}/", self.target_ns);
+            let should_flip = prefix == quota_prefix
+                && !self.flipped.swap(true, std::sync::atomic::Ordering::SeqCst);
+            let ns_key = format!("/registry/namespaces/{}", self.target_ns);
+            async move {
+                if should_flip {
+                    if let Ok(Some(stored)) = inner.get(&ns_key).await {
+                        let mut ns_obj: serde_json::Value =
+                            serde_json::from_slice(&stored.value).unwrap();
+                        ns_obj["status"]["phase"] = serde_json::json!("Terminating");
+                        inner
+                            .put(
+                                &ns_key,
+                                Bytes::from(ns_obj.to_string()),
+                                Some(stored.revision),
+                            )
+                            .await
+                            .expect("phase-flip put must succeed");
+                    }
+                }
+                inner.list(&prefix_owned, opts).await
+            }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn create_if_namespace_active(
+            &self,
+            ns_key: Option<&str>,
+            key: &str,
+            value: Bytes,
+        ) -> impl std::future::Future<
+            Output = std::result::Result<u64, u7s_store::CreateNamespacedError>,
+        > + Send {
+            let inner = self.inner.clone();
+            let ns_key = ns_key.map(|s| s.to_string());
+            let key = key.to_string();
+            async move {
+                inner
+                    .create_if_namespace_active(ns_key.as_deref(), &key, value)
+                    .await
+            }
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+
+        fn watch_receiver_count(&self) -> usize {
+            self.inner.watch_receiver_count()
+        }
+    }
+
+    /// The namespace-Terminating create-guard must be checked atomically with the insert, not
+    /// once early in the handler and then trusted for the rest of the request. A separate
+    /// early check (the old shape) can observe Active, then run the whole admission pipeline
+    /// (webhooks, LimitRange, quota) — during which a concurrent `delete_namespace` can flip
+    /// the namespace to Terminating — and finally persist the object anyway, having never
+    /// re-checked. That's exactly the mechanism mayor-74j3.6 fixed for the cascade's own LIST
+    /// snapshot; this closes the same class of bug for every namespaced create path.
+    ///
+    /// Runs 50 times (fresh state each iteration) because the fix must hold unconditionally,
+    /// not just on lucky scheduling — every iteration must reject with 403 and must never
+    /// persist the object.
+    ///
+    /// Fails on revert: restoring the early separate `state.store.get(&ns_key)` check +
+    /// standalone `state.store.put(..., Some(0))` (the shape this diff removes) makes the
+    /// early check observe the namespace before this test's injected flip fires, so the
+    /// object gets created anyway and this test's `Err` match arm panics.
+    #[tokio::test]
+    async fn create_during_delete_namespace_phase_flip_returns_403_atomically() {
+        use axum::extract::State;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        for i in 0..50 {
+            let ns = format!("race-ns-{i}");
+            let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+            let ns_key = format!("/registry/namespaces/{ns}");
+            inner
+                .put(
+                    &ns_key,
+                    Bytes::from(
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": { "name": ns },
+                            "status": { "phase": "Active" }
+                        })
+                        .to_string(),
+                    ),
+                    None,
+                )
+                .await
+                .expect("seed active namespace");
+
+            let wrapped = Arc::new(PhaseFlipDuringQuotaCheckStore {
+                inner: Arc::clone(&inner),
+                target_ns: ns.clone(),
+                flipped: std::sync::atomic::AtomicBool::new(false),
+            });
+            let state = crate::state::AppState::new(
+                Arc::clone(&wrapped),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+
+            let cm = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": "test-cm", "namespace": ns }
+            });
+
+            let result = create_namespaced_resource(
+                State(state),
+                axum::extract::Path((
+                    "".to_string(),
+                    "v1".to_string(),
+                    ns.clone(),
+                    "configmaps".to_string(),
+                )),
+                axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                Bytes::from(serde_json::to_vec(&cm).unwrap()),
+            )
+            .await;
+
+            match result {
+                Err(e) => {
+                    let json = serde_json::to_value(&e.1).unwrap();
+                    assert_eq!(
+                        json["code"], 403,
+                        "iteration {i}: a create whose namespace flipped to Terminating during \
+                         its own admission pipeline must be rejected with 403, not any other \
+                         status"
+                    );
+                    assert!(
+                        json["message"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("being terminated"),
+                        "iteration {i}: rejection message must say the namespace is being \
+                         terminated"
+                    );
+                }
+                Ok(_) => panic!(
+                    "iteration {i}: create must be rejected once its own atomic check observes \
+                     Terminating — succeeding here means a create can slip through the exact \
+                     window mayor-74j3.6/74j3.7 close, wedging namespace deletion"
+                ),
+            }
+
+            let cm_key = format!("/registry/configmaps/{ns}/test-cm");
+            assert!(
+                inner.get(&cm_key).await.unwrap().is_none(),
+                "iteration {i}: the object must never be persisted when its namespace check \
+                 observed Terminating"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
