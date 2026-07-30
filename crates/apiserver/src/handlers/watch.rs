@@ -972,12 +972,14 @@ async fn watch_generic_impl<S: Store>(
                                     .await
                                     {
                                         Ok(converted) => {
-                                            tracing::debug!(
-                                                prefix = %prefix,
-                                                key = %obj.key,
-                                                elapsed_ms = conversion_start.elapsed().as_millis() as u64,
-                                                "watch: CR conversion webhook call completed"
-                                            );
+                                            if cr_fields.is_some() {
+                                                tracing::debug!(
+                                                    prefix = %prefix,
+                                                    key = %obj.key,
+                                                    elapsed_ms = conversion_start.elapsed().as_millis() as u64,
+                                                    "watch: CR conversion webhook call completed"
+                                                );
+                                            }
                                             converted
                                         }
                                         Err(e) => {
@@ -1112,12 +1114,14 @@ async fn watch_generic_impl<S: Store>(
                                             .await
                                             {
                                                 Ok(converted) => {
-                                                    tracing::debug!(
-                                                        prefix = %prefix,
-                                                        key = %key,
-                                                        elapsed_ms = conversion_start.elapsed().as_millis() as u64,
-                                                        "watch: CR conversion webhook call completed"
-                                                    );
+                                                    if cr_fields.is_some() {
+                                                        tracing::debug!(
+                                                            prefix = %prefix,
+                                                            key = %key,
+                                                            elapsed_ms = conversion_start.elapsed().as_millis() as u64,
+                                                            "watch: CR conversion webhook call completed"
+                                                        );
+                                                    }
                                                     let matches = object_matches_label_selector(&converted, &label_selector)
                                                         && field_selector_matches(&converted);
                                                     // The object is gone either way; forget it so a
