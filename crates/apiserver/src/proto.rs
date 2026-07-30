@@ -628,6 +628,19 @@ pub fn decode_proto_by_kind_and_version(
         }
         "ControllerRevision" => crate::apps_gen_adapter::decode_controllerrevision_proto_gen(raw),
         "DeleteOptions" => crate::apiextensions_gen_adapter::decode_delete_options_proto_gen(raw),
+        "HorizontalPodAutoscaler" => {
+            if api_version == "autoscaling/v2" {
+                crate::autoscaling_gen_adapter::decode_hpa_v2_proto_gen(raw)
+            } else {
+                crate::autoscaling_gen_adapter::decode_hpa_v1_proto_gen(raw)
+            }
+        }
+        "DeviceClass" => crate::resource_gen_adapter::decode_deviceclass_proto_gen(raw),
+        "ResourceClaim" => crate::resource_gen_adapter::decode_resourceclaim_proto_gen(raw),
+        "ResourceClaimTemplate" => {
+            crate::resource_gen_adapter::decode_resourceclaimtemplate_proto_gen(raw)
+        }
+        "ResourceSlice" => crate::resource_gen_adapter::decode_resourceslice_proto_gen(raw),
         _ => None,
     }
 }

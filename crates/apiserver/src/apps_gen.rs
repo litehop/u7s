@@ -57,6 +57,19 @@ pub mod k8s {
                     include!(concat!(env!("OUT_DIR"), "/k8s.io.api.batch.v1.rs"));
                 }
             }
+            pub mod autoscaling {
+                pub mod v1 {
+                    include!(concat!(env!("OUT_DIR"), "/k8s.io.api.autoscaling.v1.rs"));
+                }
+                pub mod v2 {
+                    include!(concat!(env!("OUT_DIR"), "/k8s.io.api.autoscaling.v2.rs"));
+                }
+            }
+            pub mod resource {
+                pub mod v1 {
+                    include!(concat!(env!("OUT_DIR"), "/k8s.io.api.resource.v1.rs"));
+                }
+            }
         }
     }
 }

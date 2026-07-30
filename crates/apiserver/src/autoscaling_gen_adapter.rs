@@ -1,0 +1,631 @@
+use prost::Message;
+
+use crate::apps_gen::k8s::io::api::autoscaling::v1 as autoscaling_v1;
+use crate::apps_gen::k8s::io::api::autoscaling::v2 as autoscaling_v2;
+use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+
+fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
+    crate::core_gen_adapter::gen_object_meta_to_json(meta)
+}
+
+fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
+    crate::core_gen_adapter::gen_label_selector_to_json(sel)
+}
+
+fn gen_quantity_to_json(
+    q: Option<crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity>,
+) -> Option<serde_json::Value> {
+    q.and_then(|q| q.string)
+        .filter(|s| !s.is_empty())
+        .map(serde_json::Value::String)
+}
+
+fn gen_condition_common(
+    r#type: Option<String>,
+    status: Option<String>,
+    last_transition_time: Option<meta_v1::Time>,
+    reason: Option<String>,
+    message: Option<String>,
+) -> serde_json::Value {
+    let mut m = serde_json::json!({
+        "type": r#type.unwrap_or_default(),
+        "status": status.unwrap_or_default(),
+    });
+    if let Some(t) = last_transition_time {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            m["lastTransitionTime"] = crate::util::secs_to_rfc3339(secs).into();
+        }
+    }
+    if let Some(v) = reason.filter(|s| !s.is_empty()) {
+        m["reason"] = v.into();
+    }
+    if let Some(v) = message.filter(|s| !s.is_empty()) {
+        m["message"] = v.into();
+    }
+    m
+}
+
+// ---- autoscaling/v1 ---------------------------------------------------------
+
+fn gen_v1_cross_version_object_reference_to_json(
+    r: autoscaling_v1::CrossVersionObjectReference,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+        m.insert("kind".to_string(), v.into());
+    }
+    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), v.into());
+    }
+    if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
+        m.insert("apiVersion".to_string(), v.into());
+    }
+    serde_json::Value::Object(m)
+}
+
+pub fn decode_hpa_v1_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = autoscaling_v1::HorizontalPodAutoscaler::decode(data).ok()?;
+    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "autoscaling/v1",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::Map::new();
+        if let Some(r) = spec.scale_target_ref {
+            spec_json.insert(
+                "scaleTargetRef".to_string(),
+                gen_v1_cross_version_object_reference_to_json(r),
+            );
+        }
+        if let Some(v) = spec.min_replicas {
+            spec_json.insert("minReplicas".to_string(), v.into());
+        }
+        spec_json.insert(
+            "maxReplicas".to_string(),
+            spec.max_replicas.unwrap_or(0).into(),
+        );
+        if let Some(v) = spec.target_cpu_utilization_percentage {
+            spec_json.insert("targetCPUUtilizationPercentage".to_string(), v.into());
+        }
+        out["spec"] = serde_json::Value::Object(spec_json);
+    }
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::Map::new();
+        if let Some(v) = status.observed_generation {
+            status_json.insert("observedGeneration".to_string(), v.into());
+        }
+        if let Some(t) = status.last_scale_time {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json.insert(
+                    "lastScaleTime".to_string(),
+                    crate::util::secs_to_rfc3339(secs).into(),
+                );
+            }
+        }
+        status_json.insert(
+            "currentReplicas".to_string(),
+            status.current_replicas.unwrap_or(0).into(),
+        );
+        status_json.insert(
+            "desiredReplicas".to_string(),
+            status.desired_replicas.unwrap_or(0).into(),
+        );
+        if let Some(v) = status.current_cpu_utilization_percentage {
+            status_json.insert("currentCPUUtilizationPercentage".to_string(), v.into());
+        }
+        out["status"] = serde_json::Value::Object(status_json);
+    }
+    Some(out)
+}
+
+// ---- autoscaling/v2 ---------------------------------------------------------
+
+fn gen_v2_cross_version_object_reference_to_json(
+    r: autoscaling_v2::CrossVersionObjectReference,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+        m.insert("kind".to_string(), v.into());
+    }
+    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), v.into());
+    }
+    if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
+        m.insert("apiVersion".to_string(), v.into());
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_metric_identifier_to_json(id: autoscaling_v2::MetricIdentifier) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = id.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), v.into());
+    }
+    if let Some(sel) = id.selector {
+        m.insert("selector".to_string(), gen_label_selector_to_json(sel));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_metric_target_to_json(t: autoscaling_v2::MetricTarget) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = t.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), v.into());
+    }
+    if let Some(v) = gen_quantity_to_json(t.value) {
+        m.insert("value".to_string(), v);
+    }
+    if let Some(v) = gen_quantity_to_json(t.average_value) {
+        m.insert("averageValue".to_string(), v);
+    }
+    if let Some(v) = t.average_utilization {
+        m.insert("averageUtilization".to_string(), v.into());
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_metric_value_status_to_json(v: autoscaling_v2::MetricValueStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(x) = gen_quantity_to_json(v.value) {
+        m.insert("value".to_string(), x);
+    }
+    if let Some(x) = gen_quantity_to_json(v.average_value) {
+        m.insert("averageValue".to_string(), x);
+    }
+    if let Some(x) = v.average_utilization {
+        m.insert("averageUtilization".to_string(), x.into());
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_metric_spec_to_json(spec: autoscaling_v2::MetricSpec) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = spec.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), v.into());
+    }
+    if let Some(o) = spec.object {
+        let mut om = serde_json::Map::new();
+        if let Some(d) = o.described_object {
+            om.insert(
+                "describedObject".to_string(),
+                gen_v2_cross_version_object_reference_to_json(d),
+            );
+        }
+        if let Some(t) = o.target {
+            om.insert("target".to_string(), gen_metric_target_to_json(t));
+        }
+        if let Some(id) = o.metric {
+            om.insert("metric".to_string(), gen_metric_identifier_to_json(id));
+        }
+        m.insert("object".to_string(), serde_json::Value::Object(om));
+    }
+    if let Some(p) = spec.pods {
+        let mut pm = serde_json::Map::new();
+        if let Some(id) = p.metric {
+            pm.insert("metric".to_string(), gen_metric_identifier_to_json(id));
+        }
+        if let Some(t) = p.target {
+            pm.insert("target".to_string(), gen_metric_target_to_json(t));
+        }
+        m.insert("pods".to_string(), serde_json::Value::Object(pm));
+    }
+    if let Some(r) = spec.resource {
+        let mut rm = serde_json::Map::new();
+        if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+            rm.insert("name".to_string(), v.into());
+        }
+        if let Some(t) = r.target {
+            rm.insert("target".to_string(), gen_metric_target_to_json(t));
+        }
+        m.insert("resource".to_string(), serde_json::Value::Object(rm));
+    }
+    if let Some(c) = spec.container_resource {
+        let mut cm = serde_json::Map::new();
+        if let Some(v) = c.name.filter(|s| !s.is_empty()) {
+            cm.insert("name".to_string(), v.into());
+        }
+        if let Some(t) = c.target {
+            cm.insert("target".to_string(), gen_metric_target_to_json(t));
+        }
+        if let Some(v) = c.container.filter(|s| !s.is_empty()) {
+            cm.insert("container".to_string(), v.into());
+        }
+        m.insert(
+            "containerResource".to_string(),
+            serde_json::Value::Object(cm),
+        );
+    }
+    if let Some(e) = spec.external {
+        let mut em = serde_json::Map::new();
+        if let Some(id) = e.metric {
+            em.insert("metric".to_string(), gen_metric_identifier_to_json(id));
+        }
+        if let Some(t) = e.target {
+            em.insert("target".to_string(), gen_metric_target_to_json(t));
+        }
+        m.insert("external".to_string(), serde_json::Value::Object(em));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_metric_status_to_json(status: autoscaling_v2::MetricStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = status.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), v.into());
+    }
+    if let Some(o) = status.object {
+        let mut om = serde_json::Map::new();
+        if let Some(id) = o.metric {
+            om.insert("metric".to_string(), gen_metric_identifier_to_json(id));
+        }
+        if let Some(c) = o.current {
+            om.insert("current".to_string(), gen_metric_value_status_to_json(c));
+        }
+        if let Some(d) = o.described_object {
+            om.insert(
+                "describedObject".to_string(),
+                gen_v2_cross_version_object_reference_to_json(d),
+            );
+        }
+        m.insert("object".to_string(), serde_json::Value::Object(om));
+    }
+    if let Some(p) = status.pods {
+        let mut pm = serde_json::Map::new();
+        if let Some(id) = p.metric {
+            pm.insert("metric".to_string(), gen_metric_identifier_to_json(id));
+        }
+        if let Some(c) = p.current {
+            pm.insert("current".to_string(), gen_metric_value_status_to_json(c));
+        }
+        m.insert("pods".to_string(), serde_json::Value::Object(pm));
+    }
+    if let Some(r) = status.resource {
+        let mut rm = serde_json::Map::new();
+        if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+            rm.insert("name".to_string(), v.into());
+        }
+        if let Some(c) = r.current {
+            rm.insert("current".to_string(), gen_metric_value_status_to_json(c));
+        }
+        m.insert("resource".to_string(), serde_json::Value::Object(rm));
+    }
+    if let Some(c) = status.container_resource {
+        let mut cm = serde_json::Map::new();
+        if let Some(v) = c.name.filter(|s| !s.is_empty()) {
+            cm.insert("name".to_string(), v.into());
+        }
+        if let Some(cur) = c.current {
+            cm.insert("current".to_string(), gen_metric_value_status_to_json(cur));
+        }
+        if let Some(v) = c.container.filter(|s| !s.is_empty()) {
+            cm.insert("container".to_string(), v.into());
+        }
+        m.insert(
+            "containerResource".to_string(),
+            serde_json::Value::Object(cm),
+        );
+    }
+    if let Some(e) = status.external {
+        let mut em = serde_json::Map::new();
+        if let Some(id) = e.metric {
+            em.insert("metric".to_string(), gen_metric_identifier_to_json(id));
+        }
+        if let Some(c) = e.current {
+            em.insert("current".to_string(), gen_metric_value_status_to_json(c));
+        }
+        m.insert("external".to_string(), serde_json::Value::Object(em));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_hpa_scaling_policy_to_json(p: autoscaling_v2::HpaScalingPolicy) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = p.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), v.into());
+    }
+    if let Some(v) = p.value {
+        m.insert("value".to_string(), v.into());
+    }
+    if let Some(v) = p.period_seconds {
+        m.insert("periodSeconds".to_string(), v.into());
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_hpa_scaling_rules_to_json(r: autoscaling_v2::HpaScalingRules) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = r.stabilization_window_seconds {
+        m.insert("stabilizationWindowSeconds".to_string(), v.into());
+    }
+    if let Some(v) = r.select_policy.filter(|s| !s.is_empty()) {
+        m.insert("selectPolicy".to_string(), v.into());
+    }
+    if !r.policies.is_empty() {
+        m.insert(
+            "policies".to_string(),
+            r.policies
+                .into_iter()
+                .map(gen_hpa_scaling_policy_to_json)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    if let Some(v) = gen_quantity_to_json(r.tolerance) {
+        m.insert("tolerance".to_string(), v);
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_hpa_behavior_to_json(
+    b: autoscaling_v2::HorizontalPodAutoscalerBehavior,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(su) = b.scale_up {
+        m.insert("scaleUp".to_string(), gen_hpa_scaling_rules_to_json(su));
+    }
+    if let Some(sd) = b.scale_down {
+        m.insert("scaleDown".to_string(), gen_hpa_scaling_rules_to_json(sd));
+    }
+    serde_json::Value::Object(m)
+}
+
+pub fn decode_hpa_v2_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = autoscaling_v2::HorizontalPodAutoscaler::decode(data).ok()?;
+    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::Map::new();
+        if let Some(r) = spec.scale_target_ref {
+            spec_json.insert(
+                "scaleTargetRef".to_string(),
+                gen_v2_cross_version_object_reference_to_json(r),
+            );
+        }
+        if let Some(v) = spec.min_replicas {
+            spec_json.insert("minReplicas".to_string(), v.into());
+        }
+        spec_json.insert(
+            "maxReplicas".to_string(),
+            spec.max_replicas.unwrap_or(0).into(),
+        );
+        if !spec.metrics.is_empty() {
+            spec_json.insert(
+                "metrics".to_string(),
+                spec.metrics
+                    .into_iter()
+                    .map(gen_metric_spec_to_json)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        if let Some(b) = spec.behavior {
+            spec_json.insert("behavior".to_string(), gen_hpa_behavior_to_json(b));
+        }
+        out["spec"] = serde_json::Value::Object(spec_json);
+    }
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::Map::new();
+        if let Some(v) = status.observed_generation {
+            status_json.insert("observedGeneration".to_string(), v.into());
+        }
+        if let Some(t) = status.last_scale_time {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json.insert(
+                    "lastScaleTime".to_string(),
+                    crate::util::secs_to_rfc3339(secs).into(),
+                );
+            }
+        }
+        if let Some(v) = status.current_replicas {
+            status_json.insert("currentReplicas".to_string(), v.into());
+        }
+        status_json.insert(
+            "desiredReplicas".to_string(),
+            status.desired_replicas.unwrap_or(0).into(),
+        );
+        if !status.current_metrics.is_empty() {
+            status_json.insert(
+                "currentMetrics".to_string(),
+                status
+                    .current_metrics
+                    .into_iter()
+                    .map(gen_metric_status_to_json)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        if !status.conditions.is_empty() {
+            status_json.insert(
+                "conditions".to_string(),
+                status
+                    .conditions
+                    .into_iter()
+                    .map(|c| {
+                        gen_condition_common(
+                            c.r#type,
+                            c.status,
+                            c.last_transition_time,
+                            c.reason,
+                            c.message,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        out["status"] = serde_json::Value::Object(status_json);
+    }
+    Some(out)
+}
+
+// ---- Tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// autoscaling/v1 HPA has no `metrics` list — only a single targetCPUUtilizationPercentage.
+    /// Before this decoder existed, an autoscaling/v1 HPA created via a typed client
+    /// (protobuf by default) had no decode path at all, so scaleTargetRef/minReplicas/
+    /// targetCPUUtilizationPercentage were silently dropped rather than merely defaulted.
+    #[test]
+    fn decode_hpa_v1_proto_gen_round_trips_spec_and_status() {
+        let hpa = autoscaling_v1::HorizontalPodAutoscaler {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("web".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(autoscaling_v1::HorizontalPodAutoscalerSpec {
+                scale_target_ref: Some(autoscaling_v1::CrossVersionObjectReference {
+                    kind: Some("Deployment".to_string()),
+                    name: Some("web".to_string()),
+                    api_version: Some("apps/v1".to_string()),
+                }),
+                min_replicas: Some(2),
+                max_replicas: Some(10),
+                target_cpu_utilization_percentage: Some(80),
+            }),
+            status: Some(autoscaling_v1::HorizontalPodAutoscalerStatus {
+                current_replicas: Some(3),
+                desired_replicas: Some(4),
+                current_cpu_utilization_percentage: Some(55),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).unwrap();
+
+        let result = decode_hpa_v1_proto_gen(&buf).expect(
+            "autoscaling/v1 HPA must decode — without a \
+                registered decoder here, a protobuf-encoded HPA create/update from a typed \
+                client is silently dropped rather than stored",
+        );
+
+        assert_eq!(
+            result["spec"]["scaleTargetRef"]["name"], "web",
+            "scaleTargetRef must survive decode — without it the autoscaler has nothing to scale"
+        );
+        assert_eq!(
+            result["spec"]["targetCPUUtilizationPercentage"], 80,
+            "targetCPUUtilizationPercentage must survive decode — it is the only scaling \
+             signal v1 HPA supports"
+        );
+        assert_eq!(
+            result["status"]["desiredReplicas"], 4,
+            "status.desiredReplicas must survive decode — the HPA controller and kubectl \
+             both read this to report/act on scaling decisions"
+        );
+        assert_eq!(
+            result["status"]["currentCPUUtilizationPercentage"], 55,
+            "status.currentCPUUtilizationPercentage must survive decode"
+        );
+    }
+
+    /// A None targetCPUUtilizationPercentage (unset) must be omitted, not emitted as 0 —
+    /// 0 is a valid (if useless) explicit target and upstream distinguishes "unset, use
+    /// default policy" from "explicitly targeting 0%".
+    #[test]
+    fn decode_hpa_v1_proto_gen_omits_unset_target_cpu_utilization() {
+        let hpa = autoscaling_v1::HorizontalPodAutoscaler {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-target".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(autoscaling_v1::HorizontalPodAutoscalerSpec {
+                max_replicas: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).unwrap();
+
+        let result = decode_hpa_v1_proto_gen(&buf).expect("HPA must decode");
+        assert!(
+            result["spec"]["targetCPUUtilizationPercentage"].is_null(),
+            "unset targetCPUUtilizationPercentage must be omitted, not defaulted to 0 — a \
+             caller reading back 0 would think the user asked for an unreachable 0% target"
+        );
+    }
+
+    /// autoscaling/v2 HPA's `metrics`/`behavior`/`conditions` fields have no v1 equivalent;
+    /// before this decoder existed there was no way to tell v1 and v2 wire formats apart in
+    /// decode_proto_by_kind_and_version, so a v2-specific field like `metrics` (which drives
+    /// the entire scaling decision under v2) had nowhere to be decoded into.
+    #[test]
+    fn decode_hpa_v2_proto_gen_round_trips_metrics_behavior_and_conditions() {
+        let hpa = autoscaling_v2::HorizontalPodAutoscaler {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("web".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(autoscaling_v2::HorizontalPodAutoscalerSpec {
+                scale_target_ref: Some(autoscaling_v2::CrossVersionObjectReference {
+                    kind: Some("Deployment".to_string()),
+                    name: Some("web".to_string()),
+                    ..Default::default()
+                }),
+                max_replicas: Some(10),
+                metrics: vec![autoscaling_v2::MetricSpec {
+                    r#type: Some("Resource".to_string()),
+                    resource: Some(autoscaling_v2::ResourceMetricSource {
+                        name: Some("cpu".to_string()),
+                        target: Some(autoscaling_v2::MetricTarget {
+                            r#type: Some("Utilization".to_string()),
+                            average_utilization: Some(75),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }],
+                behavior: Some(autoscaling_v2::HorizontalPodAutoscalerBehavior {
+                    scale_down: Some(autoscaling_v2::HpaScalingRules {
+                        stabilization_window_seconds: Some(300),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: Some(autoscaling_v2::HorizontalPodAutoscalerStatus {
+                desired_replicas: Some(6),
+                conditions: vec![autoscaling_v2::HorizontalPodAutoscalerCondition {
+                    r#type: Some("AbleToScale".to_string()),
+                    status: Some("True".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).unwrap();
+
+        let result = decode_hpa_v2_proto_gen(&buf)
+            .expect("autoscaling/v2 HPA must decode via its own generated struct");
+
+        assert_eq!(
+            result["spec"]["metrics"][0]["resource"]["target"]["averageUtilization"], 75,
+            "metrics[].resource.target.averageUtilization must survive decode — this is the \
+             actual scaling target under autoscaling/v2, dropping it removes the HPA's only \
+             signal for CPU-based scaling"
+        );
+        assert_eq!(
+            result["spec"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"], 300,
+            "behavior.scaleDown.stabilizationWindowSeconds must survive decode — without it \
+             HPA flapping protection configured by the user is silently discarded"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "AbleToScale",
+            "status.conditions must survive decode — kubectl describe hpa reads these to \
+             explain why scaling did or did not happen"
+        );
+    }
+}

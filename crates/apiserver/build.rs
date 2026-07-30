@@ -105,6 +105,18 @@ fn main() {
                     .join("k8s.io/kube-aggregator/pkg/apis/apiregistration/v1/generated.proto")
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join("k8s.io/api/autoscaling/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/autoscaling/v2/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/resource/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )
