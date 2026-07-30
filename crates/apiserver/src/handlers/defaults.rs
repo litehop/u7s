@@ -35,6 +35,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumeclaims") = (group, plural) {
         default_pvc(obj);
     }
+    if let ("", "persistentvolumes") = (group, plural) {
+        default_pv(obj);
+    }
     if let ("coordination.k8s.io", "leases") = (group, plural) {
         default_lease(obj);
     }
@@ -166,19 +169,52 @@ pub fn increment_endpointslice_generation_if_changed(
     }
 }
 
-/// Set status.phase to "Pending" for a newly created PersistentVolumeClaim.
+/// Set status.phase to "Pending" and spec.volumeMode to "Filesystem" for a newly
+/// created PersistentVolumeClaim.
 ///
 /// The real kube-apiserver initializes PVC status.phase to "Pending" at create time.
 /// Without this, controllers and conformance tests that check `phase == "Pending"` before
 /// the volume is bound will fail — they expect the field to be present immediately.
 ///
-/// Idempotent: if status.phase is already set it is not overwritten.
+/// spec.volumeMode matches upstream `SetDefaults_PersistentVolumeClaimSpec`
+/// (pkg/apis/core/v1/defaults.go), which defaults it to "Filesystem" when the client
+/// omits it — nearly every hand-written PVC manifest does. Without this default,
+/// kubelet's desired_state_of_world_populator fails with "cannot get volumeMode for
+/// volume" and the pod mounting the PVC stays Pending forever.
+///
+/// Idempotent: if a field is already set it is not overwritten.
 fn default_pvc(obj: &mut serde_json::Value) {
     if obj["status"]["phase"].is_null() {
         if !obj["status"].is_object() {
             obj["status"] = serde_json::json!({});
         }
         obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
+    }
+    if obj["spec"]["volumeMode"].is_null() {
+        obj["spec"]["volumeMode"] = serde_json::Value::String("Filesystem".to_string());
+    }
+}
+
+/// Set status.phase to "Pending" and spec.volumeMode to "Filesystem" for a newly
+/// created PersistentVolume, matching upstream `SetDefaults_PersistentVolume`
+/// (pkg/apis/core/v1/defaults.go).
+///
+/// Without the volumeMode default, kubelet's desired_state_of_world_populator fails
+/// with "cannot get volumeMode for volume: <name>" and the pod mounting a PVC bound
+/// to this PV stays Pending forever — the mechanism behind e2e's
+/// WaitForPodNotPending timing out for hand-written PV manifests (e.g.
+/// e2epv.CreatePVPVC, which omits volumeMode like almost every manifest does).
+///
+/// Idempotent: if a field is already set it is not overwritten.
+fn default_pv(obj: &mut serde_json::Value) {
+    if obj["status"]["phase"].is_null() {
+        if !obj["status"].is_object() {
+            obj["status"] = serde_json::json!({});
+        }
+        obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
+    }
+    if obj["spec"]["volumeMode"].is_null() {
+        obj["spec"]["volumeMode"] = serde_json::Value::String("Filesystem".to_string());
     }
 }
 
@@ -2285,6 +2321,129 @@ mod tests {
             obj["status"]["phase"], "Bound",
             "existing status.phase must not be overwritten — resetting Bound to Pending \
              would break controllers that track binding state"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: PV/PVC spec.volumeMode defaulting
+    // ---------------------------------------------------------------------------
+
+    /// A PVC created without spec.volumeMode must have it defaulted to "Filesystem".
+    ///
+    /// kubelet cannot mount a PV/PVC without volumeMode set — this default protects
+    /// nearly every hand-written manifest from FailedMount. Without it, kubelet's
+    /// desired_state_of_world_populator rejects the volume with "cannot get
+    /// volumeMode for volume", and the pod mounting it stays Pending forever.
+    #[test]
+    fn pvc_volume_mode_defaults_to_filesystem() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "my-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+
+        apply_defaults("", "persistentvolumeclaims", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["volumeMode"], "Filesystem",
+            "spec.volumeMode must default to Filesystem — kubelet cannot mount a PVC \
+             without volumeMode set, and the pod mounting it stays Pending forever"
+        );
+    }
+
+    /// A PVC whose spec.volumeMode is already set must not have it overwritten.
+    ///
+    /// A raw-block PVC (volumeMode: Block) silently defaulted to Filesystem would
+    /// fail to mount as a block device.
+    #[test]
+    fn pvc_existing_volume_mode_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "my-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeMode": "Block"
+            }
+        });
+
+        apply_defaults("", "persistentvolumeclaims", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["volumeMode"], "Block",
+            "existing spec.volumeMode must not be overwritten — a raw-block PVC \
+             defaulted to Filesystem would fail to mount as a block device"
+        );
+    }
+
+    /// A PV created without spec.volumeMode must have it defaulted to "Filesystem",
+    /// and status.phase defaulted to "Pending" (matching upstream
+    /// SetDefaults_PersistentVolume).
+    ///
+    /// kubelet cannot mount a PV/PVC without volumeMode set — this default protects
+    /// nearly every hand-written manifest from FailedMount. Before this fix,
+    /// apply_defaults had zero dispatch arm for persistentvolumes, so this field was
+    /// never defaulted; kubelet's desired_state_of_world_populator failed with
+    /// "cannot get volumeMode for volume", leaving the mounting pod Pending forever.
+    #[test]
+    fn pv_volume_mode_defaults_to_filesystem() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "my-pv" },
+            "spec": {
+                "capacity": { "storage": "1Gi" },
+                "accessModes": ["ReadWriteOnce"],
+                "local": { "path": "/mnt/data" }
+            }
+        });
+
+        apply_defaults("", "persistentvolumes", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["volumeMode"], "Filesystem",
+            "spec.volumeMode must default to Filesystem — kubelet cannot mount a PV \
+             without volumeMode set, and the pod mounting it stays Pending forever"
+        );
+        assert_eq!(
+            obj["status"]["phase"], "Pending",
+            "status.phase must default to Pending on create, matching upstream \
+             SetDefaults_PersistentVolume"
+        );
+    }
+
+    /// A PV whose spec.volumeMode and status.phase are already set must not have
+    /// them overwritten.
+    #[test]
+    fn pv_existing_volume_mode_and_phase_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "my-pv" },
+            "spec": {
+                "capacity": { "storage": "1Gi" },
+                "accessModes": ["ReadWriteOnce"],
+                "local": { "path": "/mnt/data" },
+                "volumeMode": "Block"
+            },
+            "status": { "phase": "Bound" }
+        });
+
+        apply_defaults("", "persistentvolumes", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["volumeMode"], "Block",
+            "existing spec.volumeMode must not be overwritten"
+        );
+        assert_eq!(
+            obj["status"]["phase"], "Bound",
+            "existing status.phase must not be overwritten — resetting Bound to \
+             Pending would break controllers that track binding state"
         );
     }
 
