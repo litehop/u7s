@@ -52,6 +52,21 @@ impl ServiceIpAllocator {
             hint: AtomicU32::new(2), // start at offset 2 (.2), skip .0 and .1
         })
     }
+
+    /// Return the IPv4 address at host offset `n` within the range (offset 1 is the
+    /// first usable host, matching kubeadm's convention of reserving `.1` for the
+    /// kubernetes Service and `.10` for kube-dns). Errs if the range is too small to
+    /// contain that many hosts, so a misconfigured `--service-cluster-ip-range` fails
+    /// loudly at startup instead of silently seeding a wrong bootstrap ClusterIP.
+    pub fn nth_host(&self, n: u32) -> Result<Ipv4Addr, String> {
+        if n == 0 || n >= self.size {
+            return Err(format!(
+                "offset {n} does not fit in range starting at {} (size {})",
+                self.base, self.size
+            ));
+        }
+        Ok(Ipv4Addr::from(u32::from(self.base) + n))
+    }
 }
 
 /// Maximum number of concurrent watch streams allowed per authenticated user.
@@ -1895,6 +1910,54 @@ mod tests {
         assert!(
             ServiceIpAllocator::from_cidr("999.0.0.0/24").is_err(),
             "from_cidr must reject invalid IP address"
+        );
+    }
+
+    /// `nth_host` must derive the kubernetes and kube-dns bootstrap ClusterIPs from
+    /// whatever `--service-cluster-ip-range` is configured, not just the default
+    /// 10.96.0.0/12 — an operator running a non-default range (e.g. 172.20.0.0/16)
+    /// still needs both bootstrap Services to land inside their configured range.
+    #[test]
+    fn nth_host_derives_bootstrap_ips_for_default_and_custom_ranges() {
+        let default_alloc = ServiceIpAllocator::from_cidr("10.96.0.0/12").unwrap();
+        assert_eq!(
+            default_alloc.nth_host(1).unwrap(),
+            "10.96.0.1".parse::<Ipv4Addr>().unwrap(),
+            "first host of the default range must remain 10.96.0.1 — every conformance \
+             fixture and kubeconfig in this repo assumes the kubernetes Service is there"
+        );
+        assert_eq!(
+            default_alloc.nth_host(10).unwrap(),
+            "10.96.0.10".parse::<Ipv4Addr>().unwrap(),
+            "tenth host of the default range must remain 10.96.0.10 — kubelet hardcodes \
+             this as the in-pod nameserver"
+        );
+
+        let custom_alloc = ServiceIpAllocator::from_cidr("172.20.0.0/16").unwrap();
+        assert_eq!(
+            custom_alloc.nth_host(1).unwrap(),
+            "172.20.0.1".parse::<Ipv4Addr>().unwrap(),
+            "first host of a non-default range must derive from that range, not fall \
+             back to the 10.96.x.x hardcode"
+        );
+        assert_eq!(
+            custom_alloc.nth_host(10).unwrap(),
+            "172.20.0.10".parse::<Ipv4Addr>().unwrap(),
+            "tenth host of a non-default range must derive from that range, not fall \
+             back to the 10.96.x.x hardcode"
+        );
+    }
+
+    /// A range too small to hold 10 hosts must be rejected, not silently truncated —
+    /// a wrong kube-dns ClusterIP would black-hole in-cluster DNS instead of failing
+    /// loudly at startup.
+    #[test]
+    fn nth_host_rejects_offset_that_does_not_fit_in_range() {
+        let tiny = ServiceIpAllocator::from_cidr("10.0.0.0/30").unwrap();
+        assert!(
+            tiny.nth_host(10).is_err(),
+            "a /30 has only 4 addresses; offset 10 must not silently wrap or overflow \
+             into a bogus address outside the range"
         );
     }
 
