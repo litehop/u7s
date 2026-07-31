@@ -104,6 +104,30 @@ pre-built binary; for normal worktree iteration, omit it.
 
 ---
 
+## Full non-certified suite — `--all-e2e`
+
+`--focus`/bare-run/`--stack-only` above all operate within `--mode=certified-conformance`
+(the `[Conformance]`-tagged subset). `--all-e2e` widens the run to the full e2e ginkgo
+set instead (`--e2e-focus=".*"` with `--e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]"`),
+surfacing plain `ginkgo.It` specs (e.g. SSA field-manager tests) that certified-conformance
+never exercises. This is a periodic discovery / perf-baseline run, NOT a per-PR gate —
+**wall-clock is ~6-12h, vs certified's ~2h.** Only run it when explicitly asked to.
+
+Mutually exclusive with `--focus` (the two are conceptually opposite — narrow vs. widen —
+so combining them errors out rather than silently picking one). Composes with
+`--stack-only` the same way `--focus` does: `--stack-only` wins and `--all-e2e` is ignored
+(warning printed to stderr).
+
+**Expect a large number of new failures on the FIRST such run** — mostly legitimate
+discovery of code paths certified-conformance never touched, with some lima-precondition
+noise mixed in. Triage of those failures is a separate initiative from running the flag.
+
+```bash
+scripts/conformance/run-all.sh --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT> --all-e2e
+```
+
+---
+
 ## Stack-only mode — live stack without sonobuoy
 
 Use `--stack-only` to bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler)
@@ -141,7 +165,8 @@ kubectl --kubeconfig temp/u7s/kubeconfig get pods -A
 ```
 
 If `--focus` and `--stack-only` are both passed, `--focus` is ignored (warning printed to
-stderr) and the stack is brought up without sonobuoy.
+stderr) and the stack is brought up without sonobuoy. `--all-e2e` and `--stack-only`
+compose the same way (`--all-e2e` ignored, warning printed to stderr).
 
 ---
 

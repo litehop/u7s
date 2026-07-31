@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run sonobuoy conformance tests inside the lima VM.
 #
-# Reads --focus from SONOBUOY_FOCUS env var or CLI argument.
+# Reads --focus from SONOBUOY_FOCUS env var or CLI argument. --all-e2e widens
+# the run to the full e2e ginkgo set instead of --mode=certified-conformance
+# (see run-all.sh for the mutual-exclusivity/precedence rules with --focus).
 #
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
@@ -9,6 +11,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
+ALL_E2E=0
 WORKDIR="$PWD/temp/u7s"
 UNPACK=1
 PORT="${U7S_PORT:-6443}"
@@ -17,6 +20,7 @@ EXTRA_NODE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
+    --all-e2e) ALL_E2E=1; shift ;;
     --no-unpack) UNPACK=0; shift ;;
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -145,6 +149,17 @@ SONOBUOY_EXIT=0
 if [ -n "$FOCUS" ]; then
   # shellcheck disable=SC2086
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
+elif [ "$ALL_E2E" -eq 1 ]; then
+  # Full ginkgo set (~7500 specs) instead of just the [Conformance]-tagged
+  # subset — surfaces plain ginkgo.It cases (e.g. SSA field-manager tests)
+  # certified-conformance never runs. Skips are upstream's own release-qual
+  # exclusions: [Disruptive] needs multi-node infra our lima setup lacks,
+  # [Flaky] is upstream-known-flaky (not signal), [Slow] (>5min specs) would
+  # otherwise balloon wall-clock unpredictably.
+  # shellcheck disable=SC2086
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS \
+    --e2e-focus=".*" \
+    --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]" || SONOBUOY_EXIT=$?
 else
   # shellcheck disable=SC2086
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=certified-conformance || SONOBUOY_EXIT=$?

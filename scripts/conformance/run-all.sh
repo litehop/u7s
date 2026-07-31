@@ -10,9 +10,9 @@
 #   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
-#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--stack-only] [--vm <name>]
-#                                  [--binary <path>] [--port <N>] [--workdir <path>]
-#                                  [--konnectivity-server-port <N>]
+#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--all-e2e] [--stack-only]
+#                                  [--vm <name>] [--binary <path>] [--port <N>]
+#                                  [--workdir <path>] [--konnectivity-server-port <N>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
@@ -21,7 +21,19 @@
 #                never silently reused on a network config it predates), and
 #                wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
 #   --focus      Passed through to sonobuoy to narrow test selection.
-#                Also settable via SONOBUOY_FOCUS env var.
+#                Also settable via SONOBUOY_FOCUS env var. Mutually exclusive
+#                with --all-e2e (error if both given).
+#   --all-e2e    Widen sonobuoy beyond the default --mode=certified-conformance
+#                (the [Conformance]-tagged subset) to the full e2e ginkgo set via
+#                --e2e-focus=".*" --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]".
+#                Surfaces plain ginkgo.It specs (e.g. SSA field-manager tests)
+#                that certified-conformance never runs. Wall-clock: ~6-12h vs
+#                certified's ~2h — a deliberate discovery/perf-baseline run, not
+#                a default. Mutually exclusive with --focus (error if both
+#                given — they're conceptually opposite: --focus narrows,
+#                --all-e2e widens). If --stack-only is also given, --stack-only
+#                wins and --all-e2e is ignored (warning printed to stderr), same
+#                as --focus's existing interaction with --stack-only.
 #   --stack-only Bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler) and
 #                then stop — skip step 6 (sonobuoy). The stack is left running so you
 #                can use kubectl or inspect the DB directly. Useful for manual debugging
@@ -77,6 +89,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
 WORKDIR="$PWD/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
+ALL_E2E=0
 RESET=0
 VERBOSE=0
 STACK_ONLY=0
@@ -92,6 +105,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
+    --all-e2e) ALL_E2E=1; shift ;;
     --verbose) export RUST_LOG=debug; VERBOSE=1; shift ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
     --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
@@ -108,8 +122,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# --focus narrows test selection, --all-e2e widens it — conceptually opposite,
+# so silently picking one would be a footgun. Error unconditionally (even
+# under --stack-only, where neither would actually reach sonobuoy) rather than
+# let the combination pass silently.
+if [ "$ALL_E2E" -eq 1 ] && [ -n "$FOCUS" ]; then
+  echo "error: --all-e2e and --focus are mutually exclusive (--focus narrows, --all-e2e widens)" >&2
+  exit 1
+fi
+
 if [ "$STACK_ONLY" -eq 1 ] && [ -n "$FOCUS" ]; then
   echo "--focus ignored with --stack-only" >&2
+fi
+
+if [ "$STACK_ONLY" -eq 1 ] && [ "$ALL_E2E" -eq 1 ]; then
+  echo "--all-e2e ignored with --stack-only" >&2
 fi
 
 if [ "$PROFILE" -eq 1 ] && [ -n "$BINARY" ]; then
@@ -150,6 +177,7 @@ _KCM_V_ARG=""
 _VERBOSE_ARG=""
 _EXTRA_NODE_ARG=""
 _NODE_KUBELET_PORT_ARG=""
+_ALL_E2E_ARG=""
 # When --verbose is set, raise kube-controller-manager verbosity to --v=5 so both the
 # disruption controller's pod-list / expectedCount decisions (V(4)) and the DaemonSet
 # controller's replacement-reasoning lines ("candidate to replace" / "allowing
@@ -170,6 +198,7 @@ _WORKDIR_ARG="--workdir $WORKDIR"
 # so it tells the apiserver about that node's forward up front rather than needing any
 # restart/reload once the node actually joins. See --node-kubelet-port in u7s-apiserver.
 [ -n "$EXTRA_NODE" ] && _NODE_KUBELET_PORT_ARG="--node-kubelet-port ${EXTRA_NODE}=${EXTRA_KUBELET_PORT}"
+[ "$ALL_E2E" -eq 1 ] && _ALL_E2E_ARG="--all-e2e"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -241,7 +270,7 @@ else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
-  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG}
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG}
 fi
 
 if [ -n "$DHAT_HEAP_FILE" ]; then
