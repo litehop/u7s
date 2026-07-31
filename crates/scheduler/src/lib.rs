@@ -289,7 +289,7 @@ struct PodObject {
 /// selection. A struct (not a growing tuple) so each new predicate this
 /// scheduler learns to enforce is a named field, not another `_` in a
 /// destructure at every call site.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PendingPod {
     pub namespace: String,
     pub pod_name: String,
@@ -902,6 +902,80 @@ struct TalliedPod {
     requests: ResourceRequests,
 }
 
+/// A preemption plan whose victims have all had their graceful DELETE issued
+/// (see `delete_pod`'s doc comment) but not yet confirmed PHYSICALLY gone by
+/// a real watch event from the kubelet actually running them.
+#[derive(Debug)]
+struct WaitingPlan {
+    pod: PendingPod,
+    node_name: String,
+    /// Victim keys ("namespace/name") not yet confirmed gone. Shrinks as
+    /// `PreemptionWaiters::resolve` observes each one's real removal; once
+    /// empty, the plan is ready for `main.rs`'s deferred bind.
+    remaining_victims: std::collections::HashSet<String>,
+}
+
+/// Preemption plans deferred by `main.rs`'s `preempt_and_pick_node` between
+/// "victims evicted" (a soft, graceful DELETE acknowledged by the apiserver)
+/// and "victims actually gone" (a real DELETED/terminal-phase watch event
+/// from the kubelet that was running them) — see `NodeTally::apply_event`'s
+/// DELETED-branch hook, which drains a plan here the instant its last
+/// awaited victim is confirmed.
+///
+/// CACHE ONLY, NEVER A DECISION RECORD: the durable correctness backstop for
+/// every pod tracked here is `pods_needing_resync`'s unconditional retry of
+/// any pod still `spec.nodeName`-empty (see its doc comment) — that resync
+/// loop must keep retrying a pod with `nominatedNodeName` set exactly as it
+/// would any other stranded pod. Losing this map entirely (process restart,
+/// or the `clear()` a watch reconnect triggers) costs at most
+/// `RESYNC_INTERVAL` of extra latency for the waiting pod, never a
+/// stuck-forever pod — nothing here is any pod's ONLY path to getting bound.
+/// Conversely, a plan resolving here is only ever a cue to RE-TRY the bind,
+/// never a license to skip re-verifying fit first (see
+/// `preemption_reservation_still_fits`): the reservation this plan made when
+/// it committed can go stale while this plan sits here waiting (e.g. a watch
+/// reconnect wipes `NodeTally.pods` — including this plan's own `assume`d
+/// reservation — well before the victim's real DELETE lands).
+#[derive(Debug, Default)]
+struct PreemptionWaiters {
+    plans: Vec<WaitingPlan>,
+}
+
+impl PreemptionWaiters {
+    fn register(&mut self, pod: PendingPod, node_name: String, victims: &[String]) {
+        self.plans.push(WaitingPlan {
+            pod,
+            node_name,
+            remaining_victims: victims.iter().cloned().collect(),
+        });
+    }
+
+    /// `victim_key` was just observed as truly, physically gone. Returns
+    /// every plan for which this was the LAST still-awaited victim, each as
+    /// `(pod, node_name)` — ready for the caller to attempt the deferred
+    /// bind for (after re-verifying fit; see this struct's doc comment).
+    fn resolve(&mut self, victim_key: &str) -> Vec<(PendingPod, String)> {
+        for plan in &mut self.plans {
+            plan.remaining_victims.remove(victim_key);
+        }
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.plans.len() {
+            if self.plans[i].remaining_victims.is_empty() {
+                let plan = self.plans.remove(i);
+                ready.push((plan.pod, plan.node_name));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    }
+
+    fn clear(&mut self) {
+        self.plans.clear();
+    }
+}
+
 /// An in-memory, watch-maintained running tally of every bound, non-terminal
 /// pod's resource requests, keyed by "namespace/name".
 ///
@@ -929,6 +1003,9 @@ pub struct NodeTally {
     /// "namespace/name" keys of pods already named as victims by a reserved-
     /// but-not-yet-evicted preemption plan — see `claim_victims`.
     reserved_victims: std::collections::HashSet<String>,
+    /// Preemption plans deferred until their victims are confirmed
+    /// physically gone — see `PreemptionWaiters`.
+    waiters: PreemptionWaiters,
 }
 
 impl NodeTally {
@@ -941,13 +1018,20 @@ impl NodeTally {
     /// ADDED/MODIFIED event overwrites (never adds to) the entry, so
     /// replaying the same event twice — e.g. after a watch reconnect —
     /// is idempotent.
-    pub fn apply_event(&mut self, event: &Value) {
+    ///
+    /// Returns every deferred preemption plan (see `PreemptionWaiters`,
+    /// `register_preemption_waiter`) for which this event was the LAST
+    /// still-awaited victim's real removal — `(pending pod, node name)`
+    /// pairs the caller (`main.rs`'s `handle_pod_event`) should now attempt
+    /// the deferred bind for. Empty for the overwhelming majority of events,
+    /// which never touch a tracked victim at all.
+    pub fn apply_event(&mut self, event: &Value) -> Vec<(PendingPod, String)> {
         let Ok(watch_event) = WatchEvent::<PreemptionPodListItem>::deserialize(event) else {
-            return;
+            return Vec::new();
         };
         let name = watch_event.object.metadata.name.unwrap_or_default();
         if name.is_empty() {
-            return;
+            return Vec::new();
         }
         let namespace = watch_event
             .object
@@ -958,7 +1042,7 @@ impl NodeTally {
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.pods.remove(&key);
-            return;
+            return self.waiters.resolve(&key);
         }
         let terminal = matches!(
             watch_event.object.status.phase.as_str(),
@@ -977,10 +1061,17 @@ impl NodeTally {
                         requests,
                     },
                 );
+                Vec::new()
             }
             Some(_) => {
                 // Bound but now terminal (Succeeded/Failed) — free its slot.
+                // A terminal phase is as strong a "physically gone" signal as
+                // a real DELETE: the kubelet only reports it once the
+                // container(s) it was running have actually stopped, so a
+                // preemption victim that completes this way (rather than
+                // being hard-deleted first) must resolve waiters too.
                 self.pods.remove(&key);
+                self.waiters.resolve(&key)
             }
             None => {
                 // Still unbound: do NOT remove any existing entry. Live-
@@ -996,6 +1087,7 @@ impl NodeTally {
                 // rejected it OutOfResource. A pod that was never bound was
                 // never in `pods` to begin with, so this is a genuine no-op
                 // for the ordinary (not-yet-scheduled) case.
+                Vec::new()
             }
         }
     }
@@ -1034,9 +1126,32 @@ impl NodeTally {
     /// without clearing first, a pod deleted while disconnected (and since
     /// aged out of the ring buffer) would leave a phantom entry this tally
     /// could never otherwise correct.
+    ///
+    /// Also drops every deferred preemption plan (`waiters`): a reconnect
+    /// wipes `pods`, which is where each plan's own `assume`d reservation
+    /// lived, so a plan surviving this call would be waiting to bind a
+    /// reservation that no longer exists. This is safe to drop unconditionally
+    /// — see `PreemptionWaiters`'s doc comment for why losing it costs only
+    /// latency (the periodic resync re-plans the still-Pending pod from
+    /// scratch), never correctness.
     pub fn clear(&mut self) {
         self.pods.clear();
         self.reserved_victims.clear();
+        self.waiters.clear();
+    }
+
+    /// Defer `pod`'s bind to `node_name` until every one of `victims` has a
+    /// real (not just this scheduler's own soft-delete bookkeeping) removal
+    /// observed via `apply_event` — see `PreemptionWaiters`. Called by
+    /// `main.rs`'s `preempt_and_pick_node` immediately after `evict_victims`
+    /// issues each victim's graceful DELETE, in place of binding right away.
+    pub fn register_preemption_waiter(
+        &mut self,
+        pod: PendingPod,
+        node_name: String,
+        victims: &[String],
+    ) {
+        self.waiters.register(pod, node_name, victims);
     }
 
     /// Mark every pod in `victims` ("namespace/name" keys) as claimed by an
@@ -1591,6 +1706,30 @@ pub async fn pick_node(
     select_and_reserve_node(list, pod, tally)
 }
 
+/// Fetch a single node by name, for `main.rs`'s `attempt_deferred_bind` to
+/// re-verify fit against right before a deferred preemption bind. Fetches
+/// the full list (like `pick_node`/`find_preemption_plan` do) rather than
+/// assuming a single-resource GET path exists, so this makes no new
+/// assumption about the API surface beyond what the rest of the scheduler
+/// already relies on. `Ok(None)` means the node no longer exists (e.g.
+/// removed from the cluster while a bind was deferred) — the caller must
+/// treat that as "cannot bind here any more", not as an error.
+pub async fn fetch_node(
+    connector: &TlsConnector,
+    server: &str,
+    node_name: &str,
+) -> anyhow::Result<Option<NodeItem>> {
+    let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
+    if !status.is_success() {
+        bail!("GET /api/v1/nodes returned {status}: {body}");
+    }
+    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    Ok(list
+        .items
+        .into_iter()
+        .find(|n| n.metadata.name == node_name))
+}
+
 /// The synchronous fit-check-and-reserve step behind `pick_node`, split out
 /// so its atomicity (one `tally` lock acquisition covers both the check and
 /// the reservation) can be exercised under real concurrent access in a unit
@@ -1852,6 +1991,50 @@ fn verify_and_reserve_preemption(
     // available in the gap between this commit and a separate claim call.
     tally_guard.claim_victims(&plan.victims);
     Ok(())
+}
+
+/// Re-check, under the CURRENT tally, that `pod`'s already-`assume`d
+/// preemption reservation on `node` still holds — `main.rs`'s
+/// `attempt_deferred_bind` must call this before every deferred bind, never
+/// bind purely because `PreemptionWaiters` says a plan's victims are gone.
+///
+/// The fast-path counterpart to `verify_and_reserve_preemption`'s re-check,
+/// called just before a DEFERRED bind instead of just before the ORIGINAL
+/// reservation commits. Unlike that function, no victims need subtracting
+/// here: by the time a deferred bind is attempted, every one of the plan's
+/// victims has already been removed from `tally` (both by `evict_victims`'s
+/// eager `tally.remove` and by the real watch event that triggered this
+/// recheck), so none of them appear in `pods_on` any more. `pod`'s own
+/// reservation IS excluded from "what else occupies this node" — it's the
+/// thing being verified, not a competing occupant.
+///
+/// This is what a stale reservation looks like in practice: a watch
+/// reconnect (`NodeTally::clear`) wipes `pod`'s `assume`d slot entirely,
+/// after which some other, unrelated scheduling decision can legitimately
+/// claim the same node capacity while this plan sits in `PreemptionWaiters`
+/// waiting for its victims. Returning `false` here is what makes that safe —
+/// the caller falls back to leaving `pod` Pending for the same 30s resync
+/// backstop that already covers a pod stranded any other way (see
+/// `PreemptionWaiters`'s doc comment), instead of double-booking the node.
+pub fn preemption_reservation_still_fits(
+    pod: &PendingPod,
+    node: &NodeItem,
+    tally: &std::sync::Mutex<NodeTally>,
+) -> bool {
+    let capacity = pod_count_capacity(node);
+    let self_key = format!("{}/{}", pod.namespace, pod.pod_name);
+    let current_pods = tally
+        .lock()
+        .expect("tally lock poisoned")
+        .pods_on(&node.metadata.name);
+    let mut remaining_pod_count = 0u32;
+    let mut remaining_requests = ResourceRequests::default();
+    for p in current_pods.iter().filter(|p| p.key != self_key) {
+        remaining_pod_count += 1;
+        remaining_requests = remaining_requests + p.requests.clone();
+    }
+    (capacity == 0 || remaining_pod_count < capacity)
+        && resource_fits(&node.status.allocatable, &remaining_requests, &pod.requests)
 }
 
 /// The target of a Binding — identifies the node to bind to.
@@ -2558,6 +2741,38 @@ mod tests {
             pods_needing_resync(&items, &in_flight).is_empty(),
             "a pod already in in_flight must be skipped by resync, not double-scheduled"
         );
+    }
+
+    /// Guardrail (restart-safety audit): a pod nominated by a deferred
+    /// preemption plan (`PreemptionWaiters` in-memory only — see its doc
+    /// comment) must be retried by resync exactly like any other
+    /// `spec.nodeName`-empty pod, `nominatedNodeName` notwithstanding. The
+    /// in-memory waiters map vanishes on process restart or a watch
+    /// reconnect; the ONLY thing that makes losing it a latency regression
+    /// instead of a stuck-forever pod is this resync path never special-
+    /// casing (excluding) a pod just because it looks "already handled" by
+    /// its `nominatedNodeName`. If a future change adds such a filter, this
+    /// test catches it: the pod would silently stop being retried the moment
+    /// the waiters map that was supposed to bind it disappears.
+    #[test]
+    fn pods_needing_resync_includes_a_pod_with_nominated_node_name_set() {
+        let items = vec![json!({
+            "metadata": { "name": "preemptor-pod", "namespace": "default" },
+            "spec": { "nodeName": "" },
+            "status": { "nominatedNodeName": "worker-0" }
+        })];
+        let in_flight = std::collections::HashSet::new();
+        let events = pods_needing_resync(&items, &in_flight);
+        assert_eq!(
+            events.len(),
+            1,
+            "a pod with nominatedNodeName set but spec.nodeName still empty \
+             must still be retried by resync — excluding it reintroduces the \
+             stuck-forever failure mode the restart-safety audit flagged, \
+             since the in-memory map that would otherwise finish binding it \
+             does not survive a restart or a watch reconnect"
+        );
+        assert_eq!(events[0]["object"]["metadata"]["name"], "preemptor-pod");
     }
 
     // drain_watch_buffer is re-exported from kubeconfig where it is called by
@@ -4832,6 +5047,174 @@ mod tests {
              — otherwise a concurrently-scheduled pod's capacity check sees \
              phantom free room and gets force-bound onto a node that is, in \
              physical reality, already full"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // PreemptionWaiters / deferred preemption bind (Option A)
+    //
+    // Regression coverage for the exact race live-reproduced against
+    // `validates basic preemption works`: `preempt_and_pick_node` used to treat
+    // `evict_victims`'s successful graceful DELETE as "the node is free" and
+    // bind the preemptor synchronously — ~1.4ms after the DELETE call
+    // returned, while the real out-of-process kubelet running the victim
+    // didn't finish tearing it down for another ~1.2s, so its own admission
+    // check rejected the bind OutOfResource (a terminal, unrecoverable Failed
+    // phase for a bare Pod). These tests exercise the fix at the same level
+    // `main.rs`'s `preempt_and_pick_node`/`attempt_deferred_bind` call
+    // through — `NodeTally::register_preemption_waiter` and
+    // `NodeTally::apply_event`'s DELETED-branch hook — since neither of those
+    // main.rs functions is unit-testable without a live API server.
+    // ---------------------------------------------------------------------------
+
+    /// The core regression: registering a plan (mirroring what
+    /// `preempt_and_pick_node` now does instead of binding immediately) must
+    /// NOT resolve on an unrelated pod's DELETE, and must resolve on the
+    /// plan's own victim's DELETE — the real signal the kubelet emits only
+    /// once it has actually stopped the container. If this regressed back to
+    /// resolving eagerly (e.g. `preempt_and_pick_node` binding right after
+    /// `evict_victims` returns `Ok(())`, without ever consulting this map),
+    /// the scheduler would once again decide to bind before the real kubelet
+    /// has freed the resource — exactly the failure this fix closes.
+    #[test]
+    fn preemption_waiter_only_resolves_once_its_own_victim_is_confirmed_gone() {
+        let mut tally = NodeTally::default();
+        let mut preemptor = empty_pending_pod();
+        preemptor.pod_name = "preemptor-pod".to_owned();
+        // Mirrors preempt_and_pick_node: the preemptor was already `assume`d
+        // by `verify_and_reserve_preemption` before eviction ran.
+        tally.assume(
+            "default",
+            "preemptor-pod",
+            "worker-0",
+            1000,
+            ResourceRequests::default(),
+        );
+        tally.register_preemption_waiter(
+            preemptor,
+            "worker-0".to_owned(),
+            &["default/victim".to_owned()],
+        );
+
+        let unrelated = tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": { "metadata": { "name": "someone-else", "namespace": "default" } }
+        }));
+        assert!(
+            unrelated.is_empty(),
+            "an unrelated pod's DELETE must never resolve a different pod's \
+             preemption waiter — got {unrelated:?}"
+        );
+
+        let ready = tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": { "metadata": { "name": "victim", "namespace": "default" } }
+        }));
+        assert_eq!(
+            ready.len(),
+            1,
+            "the victim's own real DELETED event must resolve exactly this \
+             one waiting plan, making it ready for the deferred bind"
+        );
+        assert_eq!(ready[0].0.pod_name, "preemptor-pod");
+        assert_eq!(ready[0].1, "worker-0");
+    }
+
+    /// A plan with more than one victim (the shape krae9's concurrent 3v3
+    /// scenario can produce) must wait for ALL of them, not just the first —
+    /// the other victim's container may still be running and occupying the
+    /// node's capacity the preemptor actually needs. Binding after only a
+    /// partial confirmation would reproduce the same OutOfResource race one
+    /// victim at a time instead of all at once.
+    #[test]
+    fn preemption_waiter_with_multiple_victims_waits_for_all_of_them() {
+        let mut tally = NodeTally::default();
+        let mut preemptor = empty_pending_pod();
+        preemptor.pod_name = "preemptor-pod".to_owned();
+        tally.register_preemption_waiter(
+            preemptor,
+            "worker-0".to_owned(),
+            &["default/victim-a".to_owned(), "default/victim-b".to_owned()],
+        );
+
+        let after_first = tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": { "metadata": { "name": "victim-a", "namespace": "default" } }
+        }));
+        assert!(
+            after_first.is_empty(),
+            "a two-victim plan must not resolve after only one victim is \
+             confirmed gone — the other victim may still be occupying the \
+             capacity the preemptor needs"
+        );
+
+        let after_second = tally.apply_event(&json!({
+            "type": "DELETED",
+            "object": { "metadata": { "name": "victim-b", "namespace": "default" } }
+        }));
+        assert_eq!(
+            after_second.len(),
+            1,
+            "the plan must resolve once the LAST awaited victim is confirmed gone"
+        );
+    }
+
+    /// kn79c guardrail: `attempt_deferred_bind` (main.rs) must never bind a
+    /// deferred preemption purely because `PreemptionWaiters` says the plan's
+    /// victims are gone — it must re-verify fit under the CURRENT tally
+    /// first, exactly as this test does directly against
+    /// `preemption_reservation_still_fits`. Simulates the drift scenario the
+    /// restart-safety audit flagged: between a plan's commit and its
+    /// victims' real DELETE landing, some OTHER pod independently claims the
+    /// same node's remaining capacity (e.g. a watch reconnect wiped this
+    /// preemptor's own `assume` reservation, and a concurrent, unrelated
+    /// scheduling decision filled the gap it left) — `attempt_deferred_bind`
+    /// has no FailedScheduling branch on a `false` result here at all, so a
+    /// regression that made this always return `true` would let the fast
+    /// path bind onto a node that's actually full, reproducing the same
+    /// OutOfResource failure Option A exists to fix, instead of falling back
+    /// to the 30s resync backstop.
+    #[test]
+    fn preemption_reservation_still_fits_refuses_when_capacity_drifted_after_reservation() {
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "2".to_owned(); // 2000m total
+
+        let mut pod = empty_pending_pod();
+        pod.pod_name = "preemptor".to_owned();
+        pod.requests.cpu_milli = 2000;
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "preemptor",
+            "worker-0",
+            1000,
+            pod.requests.clone(),
+        );
+
+        // Baseline: with nothing else on the node, the reservation still
+        // fits — this must be true, or every ordinary (non-drifted) deferred
+        // bind would wrongly fall back to the slow 30s resync path too.
+        assert!(
+            preemption_reservation_still_fits(&pod, &node, &tally),
+            "an undrifted reservation must still fit"
+        );
+
+        // Some other pod independently claims the node's remaining capacity
+        // in the interim.
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "unrelated-pod",
+            "worker-0",
+            0,
+            requests(1000, 0, 0),
+        );
+
+        assert!(
+            !preemption_reservation_still_fits(&pod, &node, &tally),
+            "capacity claimed by another pod after the plan committed must \
+             make the reservation no longer fit — binding anyway here is \
+             exactly the 'the map says so' shortcut the fast path must never \
+             take"
         );
     }
 

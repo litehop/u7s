@@ -25,9 +25,9 @@ use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
-    failed_scheduling_status_patch, find_preemption_plan, http_get, needs_scheduling,
+    failed_scheduling_status_patch, fetch_node, find_preemption_plan, http_get, needs_scheduling,
     nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
-    scheduling_gate_status_patch, scheduling_gate_status_reset,
+    preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stream_watch_events, NodeTally, PendingPod, PodList,
 };
@@ -83,10 +83,23 @@ enum PreemptionFailure {
     Fail(anyhow::Error),
 }
 
-/// Plan and execute preemption for `pending`, retrying up to
+/// Plan preemption for `pending` and evict its victims, retrying up to
 /// `MAX_PREEMPTION_ATTEMPTS` times if `find_preemption_plan`'s atomic
-/// reservation loses to a fresher read, and returning the node name once one
-/// succeeds.
+/// reservation loses to a fresher read.
+///
+/// Does NOT bind `pending` on success — only registers it as waiting for its
+/// victims' real removal (see `NodeTally::register_preemption_waiter`). A
+/// victim's graceful DELETE (see `delete_pod`'s doc comment) only stamps
+/// `deletionTimestamp`; the real, out-of-process kubelet running it keeps the
+/// container up, and the node's actual capacity occupied, until it finishes
+/// tearing it down — live-reproduced at ~1.2s after the DELETE call returns.
+/// Binding here, synchronously, is exactly what a live kubelet's own
+/// admission check then rejects with `OutOfResource`, which sets a bare
+/// Pod's `phase` to the terminal `Failed` — unrecoverable, since nothing
+/// retries a pod once it leaves a non-terminal phase. `main.rs`'s
+/// `handle_pod_event` instead attempts the deferred bind once
+/// `NodeTally::apply_event`'s DELETED-branch hook confirms every victim is
+/// actually gone (see `attempt_deferred_bind`).
 ///
 /// `find_preemption_plan` reserves `pending` on the chosen node before this
 /// function evicts anyone (see its doc comment for why: reserving only
@@ -106,7 +119,7 @@ async fn preempt_and_pick_node(
     tally: &Mutex<NodeTally>,
     namespace: &str,
     pod_name: &str,
-) -> Result<String, PreemptionFailure> {
+) -> Result<(), PreemptionFailure> {
     let mut last_err: Option<PreemptionFailure> = None;
     for _ in 0..MAX_PREEMPTION_ATTEMPTS {
         let plan = match find_preemption_plan(connector, server, pending, tally).await {
@@ -148,15 +161,21 @@ async fn preempt_and_pick_node(
         }
         match evict_victims(connector, server, &plan.victims, tally, pod_name).await {
             Ok(()) => {
-                // Every victim in `plan.victims` is now actually gone, so
-                // this is a no-op for the tally's pod map — it only clears
-                // the claim bookkeeping `verify_and_reserve_preemption` set
-                // up (see `NodeTally::release_victims`).
-                tally
-                    .lock()
-                    .expect("tally lock poisoned")
-                    .release_victims(&plan.victims);
-                return Ok(plan.node_name);
+                // Every victim in `plan.victims` has had its graceful DELETE
+                // acknowledged — NOT confirmed physically gone (see this
+                // function's doc comment). Release the claim bookkeeping
+                // `verify_and_reserve_preemption` set up (`pods_on` already
+                // hides them via `tally.remove`, done inside `evict_victims`)
+                // and defer the actual bind until `apply_event` observes each
+                // victim's real removal.
+                let mut guard = tally.lock().expect("tally lock poisoned");
+                guard.release_victims(&plan.victims);
+                guard.register_preemption_waiter(
+                    pending.clone(),
+                    plan.node_name.clone(),
+                    &plan.victims,
+                );
+                return Ok(());
             }
             Err(e) => {
                 // Unlike the success path, some of `plan.victims` may still
@@ -222,6 +241,98 @@ async fn evict_victims(
     Ok(())
 }
 
+/// Attempt the bind `preempt_and_pick_node` deferred, once
+/// `NodeTally::apply_event`'s DELETED-branch hook confirms every victim in
+/// `pending`'s plan is actually gone (see `handle_pod_event`'s
+/// `ready_deferred_binds` loop, the only caller).
+///
+/// Re-verifies `pending`'s reservation on `node_name` against the CURRENT
+/// tally first (`preemption_reservation_still_fits`) — the plan may have
+/// committed seconds ago, and a watch reconnect (`NodeTally::clear`) can
+/// erase that reservation in the meantime, so this must never bind purely
+/// because `PreemptionWaiters` says the plan's victims are gone (see that
+/// function's doc comment for the concrete drift scenario this guards
+/// against).
+///
+/// On a fit-check or bind failure, does NOT mark `pending` FailedScheduling
+/// or emit any event — unlike a direct scheduling failure, this is not
+/// `pending`'s last chance: it stays Pending, still `spec.nodeName`-empty, so
+/// `pods_needing_resync` (see its doc comment) re-plans it from scratch
+/// within `RESYNC_INTERVAL`, exactly as it would for any other stranded pod.
+async fn attempt_deferred_bind(
+    connector: &TlsConnector,
+    server: &str,
+    tally: &Mutex<NodeTally>,
+    pending: PendingPod,
+    node_name: String,
+) {
+    let key = format!("{}/{}", pending.namespace, pending.pod_name);
+    let node = match fetch_node(connector, server, &node_name).await {
+        Ok(Some(node)) => node,
+        Ok(None) => {
+            info!(
+                "deferred bind for {key}: node {node_name} no longer exists — \
+                 leaving pod Pending for the periodic resync to re-plan"
+            );
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .remove(&pending.namespace, &pending.pod_name);
+            return;
+        }
+        Err(e) => {
+            error!(
+                "deferred bind for {key}: failed to re-fetch node {node_name}: {e} — \
+                 leaving pod Pending for the periodic resync to re-plan"
+            );
+            return;
+        }
+    };
+    if !preemption_reservation_still_fits(&pending, &node, tally) {
+        info!(
+            "deferred bind for {key}: reservation on {node_name} no longer fits \
+             (capacity drifted while waiting for the victim's real removal) — \
+             leaving pod Pending for the periodic resync to re-plan"
+        );
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .remove(&pending.namespace, &pending.pod_name);
+        return;
+    }
+    info!(
+        "deferred bind for {key}: every victim confirmed gone and fit re-verified — \
+         attempting bind to {node_name}"
+    );
+    match bind_reserved_node(connector, server, tally, &pending, &node_name).await {
+        Ok(()) => {
+            let message = format!(
+                "Successfully assigned {}/{} to {node_name}",
+                pending.namespace, pending.pod_name
+            );
+            if let Err(e) = emit_scheduling_event(
+                connector,
+                server,
+                &pending.namespace,
+                &pending.pod_name,
+                "Scheduled",
+                &message,
+                "Normal",
+            )
+            .await
+            {
+                error!("failed to emit Scheduled event for {key}: {e}");
+            }
+        }
+        Err(e) => {
+            error!(
+                "deferred bind failed for {key}: {e} — leaving pod Pending for \
+                 the periodic resync to re-plan"
+            );
+        }
+    }
+}
+
 /// How often the periodic resync (spawned in `main`) re-lists `/api/v1/pods`
 /// and re-attempts scheduling for anything still unscheduled, independent of
 /// whatever the watch stream has delivered. Matches upstream kube-scheduler's
@@ -261,10 +372,30 @@ fn handle_pod_event(
     // resource usage. Must run unconditionally, before the
     // needs_scheduling early-return below, so a later event in this
     // same stream never reads a tally missing an earlier one.
-    tally
+    //
+    // `ready_deferred_binds` are preemption plans (see
+    // `preempt_and_pick_node`/`NodeTally::register_preemption_waiter`) whose
+    // LAST awaited victim this exact event just confirmed physically gone —
+    // attempt each one's bind now instead of waiting for the next resync.
+    let ready_deferred_binds = tally
         .lock()
         .expect("tally lock poisoned")
         .apply_event(&event);
+    for (pending, node_name) in ready_deferred_binds {
+        let connector_clone = connector.clone();
+        let server_clone = server.to_string();
+        let tally_clone = tally.clone();
+        tokio::spawn(async move {
+            attempt_deferred_bind(
+                &connector_clone,
+                &server_clone,
+                &tally_clone,
+                pending,
+                node_name,
+            )
+            .await;
+        });
+    }
 
     // A gated pod never enters the scheduling cycle below (needs_scheduling
     // returns None for it) — without this, its PodScheduled condition never
@@ -396,7 +527,18 @@ fn handle_pod_event(
                     )
                     .await
                     {
-                        Ok(node) => node,
+                        Ok(()) => {
+                            // Victims evicted; the bind itself is deferred
+                            // until `apply_event`'s DELETED-branch hook
+                            // confirms they're actually gone (see
+                            // `preempt_and_pick_node`'s doc comment and
+                            // `attempt_deferred_bind`). Nothing to report
+                            // yet — no Scheduled/FailedScheduling event, `key`
+                            // stays out of `in_flight` below exactly as it
+                            // would on any other "wait for the next tick"
+                            // outcome.
+                            return None;
+                        }
                         Err(PreemptionFailure::Skip(e)) => {
                             error!(
                                 "find_preemption_plan could not reach the API server while scheduling {key}: {e} — retrying on next watch tick"
