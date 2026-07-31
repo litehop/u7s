@@ -2335,6 +2335,15 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         add_orphan_finalizer(&mut obj);
     }
 
+    // Foreground: signal via the `foregroundDeletion` finalizer (added BEFORE the soft/
+    // hard-delete decision below) instead of hard-deleting the owner immediately and
+    // racing our own best-effort delete_pods_owned_by cascade further down. See
+    // add_foreground_deletion_finalizer for why.
+    let foreground_requested = delete_opts.propagation_policy.as_deref() == Some("Foreground");
+    if foreground_requested && !owner_uid.is_empty() {
+        add_foreground_deletion_finalizer(&mut obj);
+    }
+
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // Evict from RBAC index immediately on soft-delete — same rationale as
         // delete_resource: permissions must not outlast the deletion request.
@@ -2390,14 +2399,19 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
     }
 
     // Cascade-delete pods owned by a deleted ReplicationController — only when the caller
-    // explicitly requests Background or Foreground propagation.
+    // explicitly requests Background propagation.
     //
     // Nil-policy RC deletes are handled above (effective_orphan is true for RCs when no
-    // explicit cascade is requested), so this branch only runs for explicit Background/Foreground.
+    // explicit cascade is requested). Foreground is also handled above (foregroundDeletion
+    // finalizer added, soft-delete taken, function already returned before reaching here) —
+    // `!foreground_requested` is kept as an explicit guard rather than relying solely on
+    // that early return, so this branch cannot silently start double-cascading pods that
+    // real KCM's garbage collector is now the sole authority for under Foreground.
     if group.is_empty()
         && plural == "replicationcontrollers"
         && !owner_uid.is_empty()
         && delete_opts.is_explicit_cascade()
+        && !foreground_requested
     {
         delete_pods_owned_by(&state, &ns, &owner_uid, "ReplicationController").await;
     }
@@ -3020,6 +3034,46 @@ pub(crate) fn add_orphan_finalizer(obj: &mut Object) {
         }
         None => {
             obj.body["metadata"]["finalizers"] = serde_json::json!([ORPHAN_FINALIZER]);
+        }
+    }
+}
+
+/// Mark `obj` for Foreground propagation by adding the `foregroundDeletion` finalizer
+/// (`metav1.FinalizerDeleteDependents`), instead of hard-deleting the owner synchronously.
+/// Idempotent — a no-op if the finalizer is already present; appends rather than replaces,
+/// so a pre-existing, unrelated finalizer survives untouched.
+///
+/// Mirrors `add_orphan_finalizer`'s rationale: routing through `apply_delete_policy`'s
+/// soft-delete branch (deletionTimestamp set, object stays visible) is exactly the signal
+/// real, unmodified KCM needs to run its garbage-collector's finalizer-drain protocol on —
+/// mark every blocking dependent for deletion, wait for them to be actually gone, then
+/// remove this finalizer so `finalizer_drain_complete` lets the owner's hard-delete
+/// complete for real.
+///
+/// The previous implementation hard-deleted the owner immediately and, for
+/// ReplicationControllers, ran a single best-effort `delete_pods_owned_by` list()-then-
+/// delete snapshot afterward as a bonus. That snapshot permanently missed any pod the RC's
+/// own controller created concurrently with the delete (observed live: an RC's last two
+/// replicas, created in the same instant the RC was deleted, ended up with no
+/// `deletionTimestamp` and no live owner). GC conformance spec "should keep the rc around
+/// until all its pods are deleted if the deleteOptions says so" polls for up to 30s+ for
+/// the RC to disappear only once zero pods remain — a window only KCM's real,
+/// continuously-reconciling GC controller can guarantee, not a one-shot snapshot.
+pub(crate) fn add_foreground_deletion_finalizer(obj: &mut Object) {
+    const FOREGROUND_DELETION_FINALIZER: &str = "foregroundDeletion";
+    match obj.body["metadata"]["finalizers"].as_array_mut() {
+        Some(finalizers) => {
+            if !finalizers
+                .iter()
+                .any(|f| f.as_str() == Some(FOREGROUND_DELETION_FINALIZER))
+            {
+                finalizers.push(serde_json::Value::String(
+                    FOREGROUND_DELETION_FINALIZER.to_string(),
+                ));
+            }
+        }
+        None => {
+            obj.body["metadata"]["finalizers"] = serde_json::json!([FOREGROUND_DELETION_FINALIZER]);
         }
     }
 }
@@ -5561,21 +5615,24 @@ mod tests {
         );
     }
 
-    /// A foreground GC cascade must not destroy a pod that still has another live owner.
+    /// A background GC cascade must not destroy a pod that still has another live owner.
     ///
     /// The k8s GC conformance spec "should not delete dependents that have both valid
     /// owner and owner that's waiting for dependents to be deleted" (garbage_collector.go)
-    /// creates two ReplicationControllers, patches half of the first RC's pods to add the
-    /// second RC as a co-owner, deletes the first RC with Foreground propagation, and
-    /// asserts the co-owned pods survive with exactly one ownerReference (the second RC's)
-    /// left. delete_pods_owned_by previously matched pods by the deleted owner's uid+kind
-    /// and unconditionally hard-deleted them without checking for another live owner —
-    /// every foreground/background cascade from any RC/DaemonSet/StatefulSet/ReplicaSet/
-    /// Job silently destroyed dependents that were still legitimately owned by something
-    /// else. That is systemic data loss, not just a test failure: any workload adopted by
-    /// a second controller would vanish the moment either owner was deleted.
+    /// runs this exact scenario with Foreground propagation — which now routes through the
+    /// `foregroundDeletion` finalizer and defers entirely to real, unmodified KCM's GC
+    /// controller (see add_foreground_deletion_finalizer), so that spec is exercised live,
+    /// not by this unit test. What this test still guards is the shared
+    /// `strip_or_delete_dependent` co-owner check itself, exercised here via Background
+    /// (the one explicit-cascade policy that still runs `delete_pods_owned_by`
+    /// synchronously): it previously matched pods by the deleted owner's uid+kind and
+    /// unconditionally hard-deleted them without checking for another live owner — every
+    /// cascade from any RC/DaemonSet/StatefulSet/ReplicaSet/Job silently destroyed
+    /// dependents that were still legitimately owned by something else. That is systemic
+    /// data loss, not just a test failure: any workload adopted by a second controller
+    /// would vanish the moment either owner was deleted.
     #[tokio::test]
-    async fn foreground_cascade_preserves_pod_with_another_live_owner() {
+    async fn background_cascade_preserves_pod_with_another_live_owner() {
         use std::sync::Arc;
         use u7s_store::SqliteStore;
 
@@ -5681,12 +5738,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete owner-A with Foreground propagation, mirroring the conformance spec.
-        let fg_body = bytes::Bytes::from(
+        // Delete owner-A with Background propagation — exercises the same
+        // strip_or_delete_dependent co-owner check the Foreground conformance spec relies
+        // on, via the code path that still runs delete_pods_owned_by synchronously.
+        let bg_body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "DeleteOptions",
-                "propagationPolicy": "Foreground"
+                "propagationPolicy": "Background"
             }))
             .unwrap(),
         );
@@ -5701,7 +5760,7 @@ mod tests {
             )),
             test_user(),
             axum::http::HeaderMap::new(),
-            fg_body,
+            bg_body,
         )
         .await
         .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
@@ -5718,13 +5777,13 @@ mod tests {
         );
 
         // The co-owned pod must survive: destroying it here would be exactly the bug — a
-        // foreground cascade must never delete a dependent through one owner while it is
-        // still legitimately referenced by another live owner.
+        // cascade must never delete a dependent through one owner while it is still
+        // legitimately referenced by another live owner.
         let surviving = store.get(pod_both_key).await.unwrap().expect(
-            "pod co-owned by owner-A and owner-B must survive owner-A's foreground \
-                 cascade delete — deleting it would silently destroy a pod that is still \
-                 live and owned via owner-B, which is systemic data loss for any workload \
-                 adopted by a second controller",
+            "pod co-owned by owner-A and owner-B must survive owner-A's cascade delete — \
+                 deleting it would silently destroy a pod that is still live and owned via \
+                 owner-B, which is systemic data loss for any workload adopted by a second \
+                 controller",
         );
         let surviving: serde_json::Value = serde_json::from_slice(&surviving.value).unwrap();
         assert!(
@@ -5754,6 +5813,180 @@ mod tests {
             store.get(pod_solo_key).await.unwrap().is_none(),
             "pod owned solely by the deleted RC must still be cascade-deleted — the fix \
              for co-owned dependents must not weaken the ordinary single-owner cascade"
+        );
+    }
+
+    /// Foreground delete of an RC must soft-delete the RC (deletionTimestamp +
+    /// the `foregroundDeletion` finalizer) and must NOT synchronously cascade-delete its
+    /// pods via `delete_pods_owned_by`.
+    ///
+    /// GC conformance spec "should keep the rc around until all its pods are deleted if the
+    /// deleteOptions says so" (garbage_collector.go:711) polls for up to 30s+ for the RC to
+    /// disappear, and only after that asserts zero pods remain. The old implementation
+    /// hard-deleted the RC immediately and ran a single best-effort list()-then-delete
+    /// cascade right after — any pod the RC's own controller created concurrently with the
+    /// delete (observed live: the RC's last two replicas, created in the same second the
+    /// delete was issued) was invisible to that one-shot snapshot and permanently orphaned
+    /// from u7s's point of view, so the test's `GET(rc)=404` fired before those pods were
+    /// gone. Soft-deleting with `foregroundDeletion` instead lets real, unmodified KCM run
+    /// its own continuously-reconciling GC controller, which does not miss late-created
+    /// dependents.
+    #[tokio::test]
+    async fn foreground_delete_rc_soft_deletes_and_skips_synchronous_pod_cascade() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let rc_uid = "eeee2222-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the ReplicationController with no pre-existing finalizers — exactly what
+        // the conformance spec's RC looks like.
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "foreground-rc", "namespace": ns, "uid": rc_uid },
+            "spec": { "replicas": 1, "selector": { "app": "foreground-rc" } }
+        });
+        let rc_key = "/registry/replicationcontrollers/default/foreground-rc";
+        store
+            .put(
+                rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this RC — stands in for a pod the RC controller created
+        // concurrently with the delete, which the old synchronous cascade could miss.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "foreground-rc-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "foreground-rc",
+                    "uid": rc_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/foreground-rc-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let fg_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Foreground"
+            }))
+            .unwrap(),
+        );
+        delete_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "foreground-rc".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            fg_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("foreground delete must succeed: {e:?}"));
+
+        // RC must be SOFT-deleted: still present, with deletionTimestamp and the
+        // `foregroundDeletion` finalizer — NOT hard-deleted synchronously in this request.
+        let rc_stored = store.get(rc_key).await.unwrap().expect(
+            "RC must remain in the store (soft-deleted) immediately after a Foreground \
+             delete — hard-deleting it here, before KCM confirms every dependent is gone, \
+             is the exact race that let late-created pods slip past our own cascade",
+        );
+        let rc_val: serde_json::Value = serde_json::from_slice(&rc_stored.value).unwrap();
+        assert!(
+            rc_val["metadata"]["deletionTimestamp"].is_string(),
+            "Foreground delete must stamp deletionTimestamp on the RC — this is the signal \
+             every well-behaved client (including the conformance test's poll loop) uses to \
+             tell whether the RC is still blocking on its dependents"
+        );
+        assert_eq!(
+            rc_val["metadata"]["finalizers"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec!["foregroundDeletion"]),
+            "Foreground delete must add the `foregroundDeletion` finalizer \
+             (metav1.FinalizerDeleteDependents) so real KCM's GC controller knows to run \
+             the blocking-dependents drain before the finalizer is removed and the RC \
+             actually disappears"
+        );
+
+        // Pod must SURVIVE this request — u7s's own delete_pods_owned_by cascade must not
+        // run for Foreground. If it fires here, we're back to the one-shot snapshot that
+        // misses concurrently-created pods; the whole point of this fix is that only real
+        // KCM's continuously-reconciling GC controller is trusted to decide when every
+        // dependent is actually gone.
+        assert!(
+            store.get(pod_key).await.unwrap().is_some(),
+            "Foreground delete of RC must NOT synchronously cascade-delete pods — that \
+             cascade is now exclusively real KCM's job, triggered by the foregroundDeletion \
+             finalizer above"
+        );
+
+        // GET immediately after DELETE must observe the same soft-deleted state a real
+        // client polling for the RC to disappear would see.
+        let get_response = get_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "foreground-rc".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("GET after foreground delete must still succeed: {e:?}"));
+        let body = axum::body::to_bytes(get_response.into_body(), 65536)
+            .await
+            .unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !got["metadata"]["deletionTimestamp"].is_null(),
+            "a GET immediately after a Foreground DELETE must show deletionTimestamp set — \
+             a client that sees this knows the RC is still draining, not gone"
+        );
+        assert_eq!(
+            got["metadata"]["finalizers"]
+                .as_array()
+                .map(|f| f.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec!["foregroundDeletion"]),
+            "a GET immediately after a Foreground DELETE must show the foregroundDeletion \
+             finalizer still present — its removal is what signals real KCM has finished \
+             draining every blocking dependent"
         );
     }
 
