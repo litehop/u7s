@@ -94,7 +94,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     seed_namespaces(&store).await?;
     seed_rbac(&store).await?;
     seed_flowcontrol(&store).await?;
-    seed_services(&store, &apiserver_ip, apiserver_port).await?;
+    seed_services(
+        &store,
+        &apiserver_ip,
+        apiserver_port,
+        &args.service_cluster_ip_range,
+    )
+    .await?;
     seed_serviceaccounts(&store).await?;
     seed_coredns(&store).await?;
     seed_servicecidrs(&store, &args.service_cluster_ip_range).await?;
@@ -2148,13 +2154,48 @@ fn parse_advertise_address(addr: &str) -> (String, u16) {
     }
 }
 
+/// Derive the ClusterIPs for the two well-known bootstrap Services from the configured
+/// `--service-cluster-ip-range`: `default/kubernetes` gets the first host (kubeadm's
+/// `.1` convention), `kube-system/kube-dns` gets the tenth host (kubeadm's `.10`
+/// convention). Both must land inside the configured range — a Service outside its
+/// ServiceCIDR fails the startup coherence check, and kube-proxy/kubelet would program
+/// rules for an IP the range doesn't actually own.
+///
+/// An empty range only disables *user* Service clusterIP auto-allocation (see
+/// `--service-cluster-ip-range`'s doc comment in args.rs); the two bootstrap Services
+/// still need concrete IPs, so fall back to the historical default range in that case.
+fn bootstrap_service_ips(
+    service_cluster_ip_range: &str,
+) -> anyhow::Result<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    let range = if service_cluster_ip_range.is_empty() {
+        "10.96.0.0/12"
+    } else {
+        service_cluster_ip_range
+    };
+    let allocator = state::ServiceIpAllocator::from_cidr(range)
+        .map_err(|e| anyhow::anyhow!("invalid --service-cluster-ip-range '{range}': {e}"))?;
+    let kubernetes_ip = allocator.nth_host(1).map_err(|e| {
+        anyhow::anyhow!(
+            "--service-cluster-ip-range '{range}' too small for kubernetes Service: {e}"
+        )
+    })?;
+    let kube_dns_ip = allocator.nth_host(10).map_err(|e| {
+        anyhow::anyhow!("--service-cluster-ip-range '{range}' too small for kube-dns Service: {e}")
+    })?;
+    Ok((kubernetes_ip, kube_dns_ip))
+}
+
 async fn seed_services(
     store: &SqliteStore,
     apiserver_ip: &str,
     apiserver_port: u16,
+    service_cluster_ip_range: &str,
 ) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
+
+    let (kubernetes_cluster_ip, kube_dns_cluster_ip) =
+        bootstrap_service_ips(service_cluster_ip_range)?;
 
     // default/kubernetes — reaches the API server from inside pods via
     // in-cluster DNS (kubernetes.default.svc.cluster.local:443 → 10.96.0.1).
@@ -2170,7 +2211,7 @@ async fn seed_services(
             "labels": { "component": "apiserver", "provider": "kubernetes" }
         },
         "spec": {
-            "clusterIP": "10.96.0.1",
+            "clusterIP": kubernetes_cluster_ip.to_string(),
             "ports": [{ "name": "https", "port": 443, "targetPort": 6443, "protocol": "TCP" }],
             "sessionAffinity": "None",
             "type": "ClusterIP"
@@ -2199,7 +2240,7 @@ async fn seed_services(
             "labels": { "k8s-app": "kube-dns", "kubernetes.io/cluster-service": "true", "kubernetes.io/name": "CoreDNS" }
         },
         "spec": {
-            "clusterIP": "10.96.0.10",
+            "clusterIP": kube_dns_cluster_ip.to_string(),
             "selector": { "k8s-app": "kube-dns" },
             "ports": [
                 { "name": "dns", "port": 53, "targetPort": 53, "protocol": "UDP" },
@@ -4276,6 +4317,47 @@ mod tests {
         );
     }
 
+    /// bootstrap_service_ips must derive both bootstrap ClusterIPs from whatever range
+    /// is configured, falling back to the historical default only when the range is
+    /// empty (disabled auto-allocation still needs concrete bootstrap IPs), and must
+    /// reject a range too small to hold the tenth host reserved for kube-dns.
+    #[test]
+    fn bootstrap_service_ips_derives_or_falls_back_correctly() {
+        let (k8s_ip, dns_ip) =
+            bootstrap_service_ips("10.96.0.0/12").expect("default range must resolve");
+        assert_eq!(k8s_ip.to_string(), "10.96.0.1");
+        assert_eq!(dns_ip.to_string(), "10.96.0.10");
+
+        let (k8s_ip, dns_ip) =
+            bootstrap_service_ips("172.20.0.0/16").expect("custom range must resolve");
+        assert_eq!(
+            k8s_ip.to_string(),
+            "172.20.0.1",
+            "kubernetes ClusterIP must derive from the custom range"
+        );
+        assert_eq!(
+            dns_ip.to_string(),
+            "172.20.0.10",
+            "kube-dns ClusterIP must derive from the custom range"
+        );
+
+        let (k8s_ip, dns_ip) = bootstrap_service_ips("")
+            .expect("empty range (auto-allocation disabled) must still yield bootstrap IPs");
+        assert_eq!(
+            k8s_ip.to_string(),
+            "10.96.0.1",
+            "empty --service-cluster-ip-range only disables allocation for user Services; \
+             the bootstrap Services still need a concrete ClusterIP"
+        );
+        assert_eq!(dns_ip.to_string(), "10.96.0.10");
+
+        assert!(
+            bootstrap_service_ips("10.0.0.0/30").is_err(),
+            "a /30 has no tenth host for kube-dns — this must fail loudly at startup \
+             instead of seeding a wrong or out-of-range ClusterIP"
+        );
+    }
+
     #[tokio::test]
     async fn seed_services_creates_kubernetes_and_kube_dns() {
         // Both Services are required for in-cluster communication:
@@ -4286,7 +4368,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443)
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("seed must not fail");
 
@@ -4351,6 +4433,59 @@ mod tests {
         }
     }
 
+    /// seed_services must derive the bootstrap ClusterIPs from a non-default
+    /// --service-cluster-ip-range, not hardcode 10.96.0.1/10.96.0.10.
+    ///
+    /// An operator running u7s with e.g. --service-cluster-ip-range 172.20.0.0/16 would
+    /// otherwise get bootstrap Services outside their configured ServiceCIDR — failing
+    /// the startup coherence check, and leaving kube-proxy/kubelet programmed against an
+    /// IP the range doesn't actually own.
+    #[tokio::test]
+    async fn seed_services_derives_cluster_ips_from_custom_range() {
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store, "127.0.0.1", 6443, "172.20.0.0/16")
+            .await
+            .expect("seed must not fail");
+
+        let k8s_key = keys::object_key("services", "default", "kubernetes");
+        let k8s: serde_json::Value = serde_json::from_slice(
+            &store
+                .get(&k8s_key)
+                .await
+                .expect("get must not fail")
+                .unwrap()
+                .value,
+        )
+        .expect("valid json");
+        assert_eq!(
+            k8s["spec"]["clusterIP"].as_str(),
+            Some("172.20.0.1"),
+            "kubernetes Service ClusterIP must be the first host of the configured range, \
+             not the 10.96.0.1 hardcode — otherwise it falls outside the seeded ServiceCIDR"
+        );
+
+        let dns_key = keys::object_key("services", "kube-system", "kube-dns");
+        let dns: serde_json::Value = serde_json::from_slice(
+            &store
+                .get(&dns_key)
+                .await
+                .expect("get must not fail")
+                .unwrap()
+                .value,
+        )
+        .expect("valid json");
+        assert_eq!(
+            dns["spec"]["clusterIP"].as_str(),
+            Some("172.20.0.10"),
+            "kube-dns Service ClusterIP must be the tenth host of the configured range, \
+             not the 10.96.0.10 hardcode — otherwise kubelet's resolv.conf nameserver \
+             points at an IP no Service actually owns"
+        );
+    }
+
     #[tokio::test]
     async fn seed_services_is_idempotent() {
         // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
@@ -4359,10 +4494,10 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443)
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("first seed must not fail");
-        seed_services(&store, "127.0.0.1", 6443)
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("second seed must not fail");
 
@@ -4393,7 +4528,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443)
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("seed must not fail");
 
@@ -4451,7 +4586,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "192.168.5.2", 6443)
+        seed_services(&store, "192.168.5.2", 6443, "10.96.0.0/12")
             .await
             .expect("seed must not fail");
 
@@ -4545,7 +4680,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443)
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("seed must not fail");
 
@@ -4651,7 +4786,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443)
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("seed must not fail");
 
