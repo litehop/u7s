@@ -22,6 +22,95 @@ use crate::status::{Status, StatusError};
 /// Prevents a compromised or misbehaving webhook from exhausting apiserver memory.
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// Backoff schedule (ms) for retrying a webhook POST after a connection-refused or
+/// connection-reset error. Total budget is capped at 300ms: kube-proxy normally finishes
+/// programming a freshly created Service's ClusterIP -> PodIP NAT rule well within that
+/// window, and the apiserver still owes its own request-timeout budget to the caller.
+const WEBHOOK_CONNECT_RETRY_BACKOFFS_MS: &[u64] = &[100, 200];
+
+/// True when `err`'s source chain bottoms out in an OS-level connection-refused or
+/// connection-reset `io::Error` — the signature of kube-proxy not having (yet, or any
+/// longer) an IPVS/iptables NAT rule programmed for a Service's ClusterIP. A brand-new
+/// Service can see a handful of these in the first tens of milliseconds after creation,
+/// before kube-proxy's next sync converges; the same race hits any real cluster whose
+/// kube-proxy restarts (node reboot, DaemonSet recreation, upgrade), not just conformance.
+///
+/// Deliberately narrower than `reqwest::Error::is_connect()`: that flag also covers TLS
+/// handshake failures, because hyper's `Connect` step wraps the whole TCP-dial-then-TLS-
+/// handshake sequence. Retrying a broken TLS handshake would mask a genuinely
+/// misconfigured webhook behind added latency instead of surfacing it immediately.
+///
+/// Service-based webhook targets are routed through the konnectivity HTTP CONNECT proxy
+/// (`prepare_webhook_call`'s `effective_proxy`). When the proxy's own dial to the target
+/// fails (exactly the same NAT-not-programmed-yet race, now observed from the proxy's
+/// side), hyper-util's `Tunnel` connector reports it as a non-2xx response to our CONNECT
+/// request — a `TunnelError::TunnelUnsuccessful`/`TunnelUnexpectedEof` with no wrapped
+/// `io::Error` to inspect. That type lives in a private hyper-util module, so external
+/// crates cannot name it to `downcast_ref`; matching its fixed `Display` text (confirmed
+/// against hyper-util 0.1.20) is the only signal available. If hyper-util changes this
+/// wording, the retry silently stops firing for the proxied path — it does not panic or
+/// misclassify anything else, so this is a safe (if fragile) degradation.
+fn is_connect_refused_or_reset(err: &reqwest::Error) -> bool {
+    use std::error::Error as _;
+    let mut source = err.source();
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+            ) {
+                return true;
+            }
+        }
+        let msg = e.to_string();
+        if msg == "tunnel error: unsuccessful" || msg == "tunnel error: unexpected end of file" {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// Send a webhook POST, retrying with the `WEBHOOK_CONNECT_RETRY_BACKOFFS_MS` backoff
+/// schedule when the connection was refused or reset — see `is_connect_refused_or_reset`.
+///
+/// `build_request` must build a fresh, independent `RequestBuilder` on every call:
+/// `RequestBuilder` is consumed by `send()`, so the same one cannot be reused across
+/// attempts. Any other outcome — a TLS failure, a timeout, or a response that was
+/// successfully received (even with a non-2xx status) — returns immediately on the first
+/// attempt: those are genuine webhook failures the caller must see, not a transient
+/// network race to paper over. Shared by both admission webhook calls (`call_webhook`
+/// below) and CRD conversion webhook calls (`handlers::cr::call_conversion_webhook`).
+pub(crate) async fn send_webhook_request_with_retry<F>(
+    build_request: F,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        match build_request().send().await {
+            Ok(resp) => return Ok(resp),
+            Err(err) => {
+                if attempt >= WEBHOOK_CONNECT_RETRY_BACKOFFS_MS.len()
+                    || !is_connect_refused_or_reset(&err)
+                {
+                    return Err(err);
+                }
+                let backoff_ms = WEBHOOK_CONNECT_RETRY_BACKOFFS_MS[attempt];
+                tracing::debug!(
+                    attempt,
+                    backoff_ms,
+                    "webhook: retrying after connect-refused/reset \
+                     (kube-proxy Service NAT rule likely not yet programmed)"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AdmissionReview types (matches Kubernetes API schema)
 // ---------------------------------------------------------------------------
@@ -1025,12 +1114,13 @@ async fn call_webhook(
         return (None, false);
     };
     let start = std::time::Instant::now();
-    let send_result = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-        .await;
+    let send_result = send_webhook_request_with_retry(|| {
+        client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body.clone())
+    })
+    .await;
     let (response, timed_out) = match send_result {
         Ok(mut resp) => {
             // Bounded read: treat oversized responses as a network failure so the
@@ -4688,6 +4778,290 @@ mod tests {
              `should be able to deny pod and configmap creation` conformance test greps \
              strictly for that substring on the hanging-webhook rejection. Got: {}",
             err.1.message
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // send_webhook_request_with_retry / is_connect_refused_or_reset
+    //
+    // A freshly created webhook Service can be connection-refused for a handful of
+    // milliseconds after creation, before kube-proxy finishes programming the
+    // ClusterIP -> PodIP IPVS/iptables NAT rule. These tests pin down which failures
+    // the retry must absorb (connect-refused) and which it must never mask behind
+    // added latency (TLS failures, timeouts, and any response the webhook actually sent,
+    // including a 5xx).
+    // ---------------------------------------------------------------------------
+
+    /// A bare connection-refused error (nothing listening on the port) is exactly the
+    /// kube-proxy IPVS-programming race signature and must be classified as retryable —
+    /// otherwise the fix in `send_webhook_request_with_retry` never engages and the
+    /// original conformance failure (3rd conversion call within ~30ms of Service
+    /// creation getting "connection refused") reappears.
+    #[tokio::test]
+    async fn is_connect_refused_or_reset_true_for_connection_refused() {
+        let client = reqwest::Client::new();
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1; the OS must refuse the connection");
+
+        assert!(
+            is_connect_refused_or_reset(&err),
+            "a bare connection-refused error must be classified as retryable, got: {err}"
+        );
+    }
+
+    /// Service-based webhook targets are routed through the konnectivity HTTP CONNECT
+    /// proxy, not dialed directly — so in production this race surfaces as a failed
+    /// CONNECT (the proxy's own dial to the ClusterIP was refused), not a bare
+    /// connection-refused on the apiserver's own socket. A live conformance run
+    /// confirmed the real failure is a non-2xx CONNECT response (`TunnelUnsuccessful`),
+    /// which carries no wrapped `io::Error` — without this case, the retry silently never
+    /// engages for any Service-resolved webhook call, which is the majority of real
+    /// conversion/admission webhooks.
+    #[tokio::test]
+    async fn is_connect_refused_or_reset_true_for_proxy_tunnel_failure_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Mirrors konnectivity-server refusing our CONNECT because its own dial to
+            // the ClusterIP failed (kube-proxy hasn't programmed the NAT rule yet).
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).expect("build proxy"))
+            .build()
+            .expect("build proxied client");
+
+        let err = client
+            .get("https://webhook.example.svc/convert")
+            .send()
+            .await
+            .expect_err("a non-2xx CONNECT response must surface as an error");
+
+        assert!(
+            is_connect_refused_or_reset(&err),
+            "a proxy CONNECT failure (the proxy's own dial to the target was refused) \
+             must be classified as retryable — otherwise Service-resolved webhook calls, \
+             which always go through konnectivity, never benefit from the retry at all: \
+             {err}"
+        );
+    }
+
+    /// A TLS handshake failure (server certificate not signed by the CA the client
+    /// pinned to) must NOT be classified as retryable. If it were, a genuinely
+    /// misconfigured webhook would be retried for up to 300ms on every single call
+    /// instead of failing fast and surfacing the real TLS problem.
+    #[tokio::test]
+    async fn is_connect_refused_or_reset_false_for_tls_handshake_failure() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        rustls_post_quantum::provider().install_default().ok();
+
+        let server_cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("generate self-signed server cert");
+        let server_cert_der = server_cert.cert.der().to_vec();
+        let server_key_der = server_cert.signing_key.serialize_der();
+
+        // A CA the client pins to that does NOT match the server's actual cert — the
+        // handshake must fail on certificate verification, not on connection setup.
+        let wrong_ca = generate_simple_self_signed(vec!["wrong-ca.local".to_string()])
+            .expect("generate stand-in wrong CA cert");
+        let wrong_ca_der = wrong_ca.cert.der().to_vec();
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(server_cert_der)],
+                PrivateKeyDer::try_from(server_key_der).expect("valid PKCS8 key"),
+            )
+            .expect("build server TLS config");
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                // Client rejects our cert during the handshake; nothing more to do.
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+
+        let b64_der =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wrong_ca_der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64_der.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        let wrong_ca_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
+
+        let fallback = reqwest::Client::new();
+        let client =
+            build_webhook_call_client(Some(&wrong_ca_b64), None, None, None, &fallback, None);
+
+        let err = client
+            .get(format!("https://{addr}/"))
+            .send()
+            .await
+            .expect_err("handshake against an untrusted CA must fail");
+
+        assert!(
+            !is_connect_refused_or_reset(&err),
+            "a TLS handshake failure must not be classified as connect-refused/reset — \
+             retrying it would mask a genuinely misconfigured webhook behind added \
+             latency instead of surfacing the real problem: {err}"
+        );
+    }
+
+    /// The retry loop must actually retry a connect-refused failure, and must stop
+    /// within the documented ~300ms budget rather than retrying forever — an unbounded
+    /// retry would eat into the apiserver's own upstream request-timeout budget and
+    /// turn a fast failure into a slow one for a webhook that is genuinely down.
+    #[tokio::test]
+    async fn send_webhook_request_with_retry_retries_connect_refused_within_budget() {
+        let client = reqwest::Client::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+        let start = std::time::Instant::now();
+
+        let result = send_webhook_request_with_retry(|| {
+            attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.get("http://127.0.0.1:1/")
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a permanently-refused connection must eventually surface as an error, \
+             not retry forever"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1 + WEBHOOK_CONNECT_RETRY_BACKOFFS_MS.len(),
+            "connect-refused must be retried exactly WEBHOOK_CONNECT_RETRY_BACKOFFS_MS.len() \
+             times after the first attempt — fewer retries would fail to absorb the \
+             kube-proxy IPVS-programming race this fix targets; more would exceed the \
+             documented retry budget"
+        );
+        let budget_ms: u64 = WEBHOOK_CONNECT_RETRY_BACKOFFS_MS.iter().sum();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(budget_ms),
+            "the backoffs must actually be waited out before giving up, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the retry budget must stay bounded to a few hundred ms so it doesn't eat \
+             into the apiserver's own upstream request-timeout budget, got {elapsed:?}"
+        );
+    }
+
+    /// A webhook that responds — even with a 5xx status — is not a network error:
+    /// reqwest returns `Ok`, and the caller (not this retry loop) is responsible for
+    /// inspecting the AdmissionReview/ConversionReview body. Retrying an application-level
+    /// failure would only add up to 300ms of latency without ever changing the outcome
+    /// for a webhook that is genuinely broken.
+    #[tokio::test]
+    async fn send_webhook_request_with_retry_does_not_retry_application_error_response() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let router = Router::new().route(
+            "/webhook",
+            post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("webhook stub server must not fail");
+        });
+
+        let client = reqwest::Client::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+
+        let result = send_webhook_request_with_retry(|| {
+            attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.post(format!("http://{addr}/webhook"))
+        })
+        .await;
+
+        let resp = result.expect("an HTTP 500 response is a successful send(), not an Err");
+        assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a webhook that returns 500 on every call must not be retried"
+        );
+    }
+
+    /// A webhook that connects fine but never responds within its configured timeout
+    /// must fail fast, not be retried — connect already succeeded, so this is not the
+    /// kube-proxy NAT-rule race the retry targets, and retrying a real timeout would
+    /// waste up to 300ms without ever succeeding sooner.
+    #[tokio::test]
+    async fn send_webhook_request_with_retry_does_not_retry_on_timeout() {
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let router = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                "too slow"
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("slow webhook stub server must not fail");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .expect("build client with short timeout");
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+
+        let result = send_webhook_request_with_retry(|| {
+            attempts_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.get(format!("http://{addr}/slow"))
+        })
+        .await;
+
+        let err = result.expect_err("a webhook that never responds within its timeout must error");
+        assert!(
+            err.is_timeout(),
+            "the failure must be classified as a timeout, not folded into the \
+             connect-refused retry path: {err}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a slow-but-reachable webhook must not be retried"
         );
     }
 

@@ -9,7 +9,8 @@ use u7s_store::{ListOptions, Store};
 
 use crate::{
     admission::{
-        prepare_webhook_call, run_mutating_webhooks, run_validating_webhooks, AdmissionContext,
+        prepare_webhook_call, run_mutating_webhooks, run_validating_webhooks,
+        send_webhook_request_with_retry, AdmissionContext,
     },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
@@ -68,21 +69,27 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     });
 
     let body = serde_json::to_vec(&review).map_err(|e| Status::internal(e.to_string()))?;
-    let resp = wh_client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        // Real conversion webhooks (including the k8s conformance suite's sample webhook)
-        // content-negotiate their response body from the Accept header, falling back to an
-        // arbitrary (even non-JSON, e.g. YAML) encoding when it doesn't name a type explicitly.
-        // Without this, reqwest's default `Accept: */*` leaves that choice up to the webhook,
-        // and a response we can't parse as JSON below is indistinguishable from a broken one.
-        // This mirrors upstream apiserver's own webhook client (client-go's RESTClient with
-        // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
-        .header("Accept", "application/json, */*")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
+    // send_webhook_request_with_retry absorbs a connect-refused/reset error with a short
+    // bounded retry — a freshly created webhook Service's ClusterIP can see a few of these
+    // in the first tens of milliseconds, before kube-proxy finishes programming its
+    // IPVS/iptables NAT rule (see the function doc in admission.rs for the mechanism).
+    let resp = send_webhook_request_with_retry(|| {
+        wh_client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            // Real conversion webhooks (including the k8s conformance suite's sample
+            // webhook) content-negotiate their response body from the Accept header,
+            // falling back to an arbitrary (even non-JSON, e.g. YAML) encoding when it
+            // doesn't name a type explicitly. Without this, reqwest's default
+            // `Accept: */*` leaves that choice up to the webhook, and a response we can't
+            // parse as JSON below is indistinguishable from a broken one. This mirrors
+            // upstream apiserver's own webhook client (client-go's RESTClient with
+            // ContentConfig.ContentType=json always sends `Accept: application/json, */*`).
+            .header("Accept", "application/json, */*")
+            .body(body.clone())
+    })
+    .await
+    .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
 
     // Bounded read: treat oversized responses as a webhook failure so the apiserver
     // returns 500 rather than exhausting memory. The 1 MiB cap matches the admission
@@ -8389,6 +8396,67 @@ mod tests {
         assert!(
             result.is_err(),
             "call_conversion_webhook must return Err when HTTP call fails (bad URL)"
+        );
+    }
+
+    /// Reproduces the conformance-test race this fix targets: a webhook Service's
+    /// ClusterIP refuses connections for the first tens of milliseconds after creation,
+    /// before kube-proxy finishes programming the ClusterIP -> PodIP NAT rule, then
+    /// starts accepting once the rule lands. Without the bounded retry in
+    /// `send_webhook_request_with_retry`, the call against a not-yet-routable target
+    /// fails outright; with it, the call recovers within the retry budget.
+    #[tokio::test]
+    async fn call_conversion_webhook_recovers_from_transient_connect_refused() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        // Reserve a port, then release it immediately — nothing is listening yet, so
+        // the first attempt(s) against it see connection-refused, mirroring a freshly
+        // created Service whose ClusterIP NAT rule kube-proxy hasn't programmed yet.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let router = Router::new().route(
+                "/convert",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "ConversionReview",
+                        "response": {
+                            "uid": "test-uid",
+                            "result": {"status": "Success"},
+                            "convertedObjects": [{"apiVersion": "example.io/v2", "kind": "Widget"}]
+                        }
+                    }))
+                }),
+            );
+            let listener = TcpListener::bind(addr)
+                .await
+                .expect("rebind the released port for the delayed webhook server");
+            axum::serve(listener, router)
+                .await
+                .expect("delayed webhook server must not fail");
+        });
+
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("http://{addr}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+
+        assert!(
+            result.is_ok(),
+            "call_conversion_webhook must retry through a transient connection-refused \
+             window and succeed once the target becomes reachable within the retry \
+             budget — without the retry, a webhook Service that refuses connections for \
+             even a few tens of milliseconds after creation (the kube-proxy \
+             IPVS-programming race) fails the call outright: {:?}",
+            result.err()
         );
     }
 
