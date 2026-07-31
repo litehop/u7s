@@ -7,7 +7,7 @@ use rustls::{
 use std::sync::Arc;
 
 use crate::util::validate_cli_path;
-use crate::Args;
+use crate::{bootstrap_service_ips, Args};
 
 // ---------------------------------------------------------------------------
 // Private key write helper — always 0o600
@@ -249,15 +249,24 @@ fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
 }
 
 /// Build the full SAN list for the server certificate.
-/// Always includes localhost, 127.0.0.1, host.lima.internal, and 10.96.0.1
-/// (the kubernetes ClusterIP used by in-cluster clients).
+/// Always includes localhost, 127.0.0.1, host.lima.internal, and the kubernetes
+/// Service's ClusterIP derived from `--service-cluster-ip-range` (first host —
+/// same offset `bootstrap_service_ips` uses to seed the `default/kubernetes`
+/// Service, e.g. 10.96.0.1 for the default 10.96.0.0/12 range). In-cluster
+/// clients validate the apiserver's cert against `KUBERNETES_SERVICE_HOST`,
+/// which the kubelet populates from that Service's actual ClusterIP, so the
+/// SAN must always match it exactly or TLS validation fails in-cluster.
 /// If advertise_host is Some, appends it as an IP SAN or DNS SAN.
-fn build_server_sans(advertise_host_str: Option<&str>) -> anyhow::Result<Vec<SanType>> {
+fn build_server_sans(
+    advertise_host_str: Option<&str>,
+    service_cluster_ip_range: &str,
+) -> anyhow::Result<Vec<SanType>> {
+    let (kubernetes_ip, _kube_dns_ip) = bootstrap_service_ips(service_cluster_ip_range)?;
     let mut sans: Vec<SanType> = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::DnsName("host.lima.internal".try_into()?),
-        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 96, 0, 1))),
+        SanType::IpAddress(std::net::IpAddr::V4(kubernetes_ip)),
         SanType::DnsName("kubernetes".try_into()?),
         SanType::DnsName("kubernetes.default".try_into()?),
         SanType::DnsName("kubernetes.default.svc".try_into()?),
@@ -292,7 +301,10 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let mut server_params = CertificateParams::default();
     // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
     // plus the advertise-address host if provided.
-    let sans = build_server_sans(advertise_host(args.advertise_address.as_deref()).as_deref())?;
+    let sans = build_server_sans(
+        advertise_host(args.advertise_address.as_deref()).as_deref(),
+        &args.service_cluster_ip_range,
+    )?;
     server_params.subject_alt_names = sans;
     server_params
         .distinguished_name
@@ -570,7 +582,7 @@ mod tests {
     /// server certificate and will refuse to connect.
     #[test]
     fn build_server_sans_always_includes_lima_host() {
-        let sans = build_server_sans(None).expect("build_server_sans failed");
+        let sans = build_server_sans(None, "10.96.0.0/12").expect("build_server_sans failed");
         let has_lima = sans
             .iter()
             .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal"));
@@ -580,19 +592,47 @@ mod tests {
         );
     }
 
-    /// build_server_sans must always include 10.96.0.1 (kubernetes ClusterIP).
-    /// In-cluster clients (sonobuoy, pods) use KUBERNETES_SERVICE_HOST=10.96.0.1
-    /// and verify the TLS cert against it. Without this SAN the TLS handshake fails
-    /// even after the DNAT rule routes the traffic to the host apiserver.
+    /// build_server_sans must include the kubernetes ClusterIP (10.96.0.1 for the
+    /// default 10.96.0.0/12 range). In-cluster clients (sonobuoy, pods) use
+    /// KUBERNETES_SERVICE_HOST=10.96.0.1 and verify the TLS cert against it. Without
+    /// this SAN the TLS handshake fails even after the DNAT rule routes the traffic
+    /// to the host apiserver.
     #[test]
     fn build_server_sans_always_includes_cluster_ip() {
-        let sans = build_server_sans(None).expect("build_server_sans failed");
+        let sans = build_server_sans(None, "10.96.0.0/12").expect("build_server_sans failed");
         let has_cluster_ip = sans
             .iter()
             .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "10.96.0.1"));
         assert!(
             has_cluster_ip,
-            "10.96.0.1 (kubernetes ClusterIP) must be in server SANs for in-cluster clients"
+            "10.96.0.1 (kubernetes ClusterIP) must be in server SANs for in-cluster clients \
+             on the default service-cluster-ip-range"
+        );
+    }
+
+    /// build_server_sans must derive the kubernetes ClusterIP SAN from a non-default
+    /// `--service-cluster-ip-range` instead of hardcoding 10.96.0.1. If an operator
+    /// runs with e.g. 172.20.0.0/16, the `default/kubernetes` Service gets 172.20.0.1
+    /// (bootstrap_service_ips), the kubelet populates in-cluster pods'
+    /// KUBERNETES_SERVICE_HOST with that same IP, and the apiserver cert must carry
+    /// it as a SAN or in-cluster TLS validation fails even though the Service and
+    /// Downward API are both correct.
+    #[test]
+    fn build_server_sans_derives_cluster_ip_from_custom_range() {
+        let sans = build_server_sans(None, "172.20.0.0/16").expect("build_server_sans failed");
+        assert!(
+            sans.iter()
+                .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "172.20.0.1")),
+            "172.20.0.1 (kubernetes ClusterIP for the configured 172.20.0.0/16 range) \
+             must be in server SANs, or in-cluster clients on this range fail TLS validation"
+        );
+        assert!(
+            !sans
+                .iter()
+                .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "10.96.0.1")),
+            "10.96.0.1 belongs to no Service under a 172.20.0.0/16 service-cluster-ip-range; \
+             a stale hardcoded SAN would silently accept a cert that doesn't match any real \
+             kubernetes ClusterIP"
         );
     }
 
@@ -603,7 +643,7 @@ mod tests {
     /// and the OIDC discovery conformance test fails.
     #[test]
     fn server_cert_includes_in_cluster_kubernetes_svc_sans_so_oidc_and_in_cluster_tls_verify() {
-        let sans = build_server_sans(None).expect("build_server_sans failed");
+        let sans = build_server_sans(None, "10.96.0.0/12").expect("build_server_sans failed");
         let dns_names: Vec<&str> = sans
             .iter()
             .filter_map(|s| {
@@ -633,7 +673,8 @@ mod tests {
     /// (DNS) and the IP address SAN.
     #[test]
     fn build_server_sans_with_ip_includes_both() {
-        let sans = build_server_sans(Some("192.168.5.1")).expect("build_server_sans failed");
+        let sans = build_server_sans(Some("192.168.5.1"), "10.96.0.0/12")
+            .expect("build_server_sans failed");
         let has_lima = sans
             .iter()
             .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal"));
