@@ -374,10 +374,13 @@ form rather than hunting for a kubectl binary inside the VM (there isn't one).
 | Component           | Where                                                          |
 |---------------------|----------------------------------------------------------------|
 | apiserver           | `temp/u7s/apiserver.log`                           |
+| scheduler           | `temp/u7s/scheduler.log`                           |
 | konnectivity-server | `temp/u7s/konnectivity-server.log`                 |
 | KCM                 | `limactl shell <VM> tail -f /tmp/kcm.log`                     |
 | kubelet             | `limactl shell <VM> sudo journalctl -u kubelet --utc -n 50`   |
 | konnectivity-agent  | `kubectl --kubeconfig temp/u7s/kubeconfig logs -n kube-system konnectivity-agent` |
+
+Host-side components (apiserver, scheduler, konnectivity-server) log to `temp/u7s/*.log`; in-VM components (KCM, kubelet) require `limactl shell <VM>` access.
 
 apiserver.log and scheduler.log are always UTC (Rust `tracing` default). `<TIMESTAMP>`
 in run-dir names (below) is also UTC. The VM's system timezone is whatever the host's
