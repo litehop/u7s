@@ -39,6 +39,16 @@
 #   kubectl get nodes
 set -euo pipefail
 
+# Raise the FD limit before launching apiserver/konnectivity-server below. macOS
+# defaults RLIMIT_NOFILE to a soft limit of 256, which sustained load (persistent
+# watch streams, TLS accept sockets, konnectivity tunnels) exceeds trivially — a
+# ~67-minute --all-e2e conformance run hit this and killed u7s-apiserver outright
+# with "Too many open files (os error 24)". Best effort: if the OS hard limit is
+# below 65536, raise as far as possible instead of failing the whole script — the
+# apiserver's own startup-time rlimit raise (crates/apiserver/src/lib.rs) backs
+# this up regardless of how the binary is launched.
+ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 RESET=0

@@ -63,6 +63,37 @@ use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 /// etcd's 1.5 MiB object limit while staying well below OOM risk.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Target soft `RLIMIT_NOFILE`. macOS defaults to a soft limit of 256, which
+/// sustained load — one FD per persistent watch stream, per in-flight TLS
+/// accept, per konnectivity tunnel — exceeds trivially; the resulting EMFILE
+/// used to propagate via `?` straight out of `main()` with no graceful
+/// degradation. Matches upstream kube-apiserver's systemd `LimitNOFILE`
+/// convention (raised further there, but 65536 is ample headroom here).
+const DESIRED_NOFILE_LIMIT: u64 = 65536;
+
+/// Raises the process's own open-file-descriptor limit as far toward
+/// [`DESIRED_NOFILE_LIMIT`] as the OS hard limit (and, on macOS,
+/// `kern.maxfilesperproc`) allows. Makes the binary self-protecting under
+/// sustained load even when launched outside `scripts/u7s-start.sh`, which
+/// also raises the shell-level ulimit before exec'ing this binary. Best
+/// effort: logs and continues on failure rather than refusing to start,
+/// since a lower-than-desired limit only narrows headroom, it doesn't make
+/// the server incorrect.
+fn raise_fd_limit() {
+    match rlimit::increase_nofile_limit(DESIRED_NOFILE_LIMIT) {
+        Ok(limit) if limit < DESIRED_NOFILE_LIMIT => {
+            tracing::warn!(
+                "RLIMIT_NOFILE raised to only {limit} (wanted {DESIRED_NOFILE_LIMIT}) — \
+                 capped by the OS hard limit; sustained load may still hit EMFILE"
+            );
+        }
+        Ok(limit) => tracing::info!("RLIMIT_NOFILE raised to {limit}"),
+        Err(e) => tracing::warn!(
+            "failed to raise RLIMIT_NOFILE: {e} — process may hit EMFILE under sustained load"
+        ),
+    }
+}
+
 pub async fn run(args: Args) -> anyhow::Result<()> {
     // 2. Init tracing.
     tracing_subscriber::fmt()
@@ -72,6 +103,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Raise the FD limit before opening the DB, generating TLS certs, or
+    // binding the listener socket below — see raise_fd_limit's doc comment.
+    raise_fd_limit();
 
     // 3. Compute advertised server address early — needed for endpoint seeding below.
     // Identical logic to step 8; kept here so seed_services gets the right IP before TLS init.
@@ -3520,6 +3555,31 @@ mod tests {
     fn parse_node_kubelet_ports_rejects_non_numeric_port() {
         let entries = vec!["lima-node-2=not-a-port".to_string()];
         assert!(parse_node_kubelet_ports(&entries).is_err());
+    }
+
+    /// If raise_fd_limit regresses to a no-op, the process is left on whatever tiny
+    /// default RLIMIT_NOFILE the OS/shell handed it (256 on stock macOS) and will hit
+    /// EMFILE the first time sustained load — persistent watches, TLS accepts,
+    /// konnectivity tunnels — pushes past it, exactly as happened in production.
+    #[test]
+    fn raise_fd_limit_grows_soft_limit_when_headroom_exists() {
+        let (before_soft, hard) = rlimit::Resource::NOFILE
+            .get()
+            .expect("getrlimit(NOFILE) must succeed on a real OS");
+
+        raise_fd_limit();
+
+        let (after_soft, _) = rlimit::Resource::NOFILE
+            .get()
+            .expect("getrlimit(NOFILE) must succeed on a real OS");
+
+        if before_soft < hard.min(DESIRED_NOFILE_LIMIT) {
+            assert!(
+                after_soft > before_soft,
+                "expected raise_fd_limit to grow the soft NOFILE limit above {before_soft} \
+                 (hard={hard}), but it stayed at {after_soft}"
+            );
+        }
     }
 
     #[tokio::test]

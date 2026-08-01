@@ -54,6 +54,11 @@ limactl shell "$VM_NAME" bash -c \
 limactl shell "$VM_NAME" bash -s <<EOF
 set -euo pipefail
 
+# Raise the FD limit before launching kube-controller-manager below — see
+# u7s-start.sh (host side) for why: sustained load exceeds a low default
+# RLIMIT_NOFILE trivially, and KCM holds a long-lived watch per controller.
+ulimit -n 65536 2>/dev/null || ulimit -n "\$(ulimit -Hn)" 2>/dev/null || true
+
 WORKDIR="$WORKDIR"
 # klog has no --utc flag, so kube-controller-manager renders whatever local time
 # it inherits; force UTC here so kcm.log matches apiserver.log/scheduler.log.

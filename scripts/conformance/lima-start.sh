@@ -384,6 +384,10 @@ ExecStart=/usr/bin/kubelet \\\\
   --tls-private-key-file=/etc/kubelet-tls.key \\\\
   --hostname-override=${VM_NAME} \\\\
   --v=${KUBELET_V}
+# Matches kube-proxy.service's LimitNOFILE below — sustained conformance load
+# (one FD per container log/exec/attach stream) can exceed the systemd default
+# well before kube-proxy's own limit would ever be hit.
+LimitNOFILE=1048576
 EOF"
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
   echo "Kubelet client-ca-file and TLS serving cert configured."
