@@ -6,6 +6,11 @@
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
 
+# Raise the FD limit before launching the scheduler below — see u7s-start.sh for
+# why (macOS's default 256 soft RLIMIT_NOFILE is trivially exceeded by a
+# long-running cluster-wide watch under sustained load).
+ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BINARY="${U7S_TARGET_DIR:-$REPO/target}/release/u7s-scheduler"
 
