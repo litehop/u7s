@@ -304,6 +304,25 @@ EOF
 limactl shell "$VM_NAME" sudo systemctl daemon-reload
 limactl shell "$VM_NAME" sudo systemctl restart logrotate.timer
 
+# Raise journald's rate-limit and disk retention so a 16-way conformance run's
+# kubelet/crio log volume on the busiest node isn't rate-limited or rotated away
+# before scripts/conformance/06-run-sonobuoy.sh collects it: the stock
+# RateLimitBurst=10000/30s silently drops lines once a unit's log rate exceeds
+# it, and the stock SystemMaxUse evicts the oldest segment once total journal
+# disk usage crosses a few hundred MB — together these erased the first ~5
+# minutes of one node's kubelet.log/crio.log in a real run while an identically
+# collected, less-loaded node kept the full window. Written on every start so it
+# survives VM reprovisions.
+limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
+[Journal]
+RateLimitBurst=100000
+RateLimitIntervalSec=30s
+SystemMaxUse=2G
+SystemKeepFree=100M
+Storage=persistent
+EOF
+limactl shell "$VM_NAME" sudo systemctl restart systemd-journald
+
 # Rewrite server address to host.lima.internal for in-VM use.
 # Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
 echo "Copying kubeconfig into VM..."
