@@ -364,9 +364,15 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .allow_unauthenticated()
         .build()
         .map_err(|e| anyhow::anyhow!("client verifier: {e}"))?;
-    let server_config = ServerConfig::builder()
+    let mut server_config = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(server_cert_chain, server_key_der)?;
+    // h2 first so clients that support both (kubelet, kubectl, controllers) prefer
+    // multiplexed HTTP/2 — this collapses the one-TCP-connection-per-watch-reflector
+    // pattern that caused mass SYN bursts under many concurrent watches. http/1.1
+    // stays as fallback because exec/attach/portforward's `Connection: Upgrade`
+    // websocket handshake has no HTTP/2 equivalent wired up in serve_tls().
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let server_cert_der = server_cert.der().to_vec();
     let admin_cert_der = admin_cert.der().to_vec();
