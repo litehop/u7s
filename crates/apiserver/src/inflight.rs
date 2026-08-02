@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{Method, Request, Response, StatusCode};
+use axum::http::{header, Method, Request, Response, StatusCode};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 use tower_service::Service;
@@ -73,7 +73,22 @@ fn is_mutating(method: &Method) -> bool {
     )
 }
 
-fn too_many_requests_response() -> Response<Body> {
+fn too_many_requests_response(req: &Request<Body>, limit_kind: &str) -> Response<Body> {
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // No other log line ever sees this request — InflightLayer runs before
+    // ContentTypeLayer's access log, so a rejected request would otherwise
+    // vanish from apiserver.log entirely.
+    tracing::warn!(
+        method = %req.method(),
+        uri = %req.uri(),
+        limit_kind,
+        user_agent,
+        "inflight limit reached, returning 429",
+    );
     let status = Status {
         kind: "Status",
         api_version: "v1",
@@ -114,7 +129,10 @@ where
         // Try to acquire the total inflight permit (non-blocking).
         let inflight_permit = match Arc::clone(&self.inflight).try_acquire_owned() {
             Ok(p) => p,
-            Err(_) => return Box::pin(async move { Ok(too_many_requests_response()) }),
+            Err(_) => {
+                let resp = too_many_requests_response(&req, "inflight");
+                return Box::pin(async move { Ok(resp) });
+            }
         };
 
         // Try to acquire the mutating permit if applicable.
@@ -124,7 +142,8 @@ where
                 Err(_) => {
                     // Release inflight permit before returning.
                     drop(inflight_permit);
-                    return Box::pin(async move { Ok(too_many_requests_response()) });
+                    let resp = too_many_requests_response(&req, "mutating");
+                    return Box::pin(async move { Ok(resp) });
                 }
             }
         } else {
@@ -315,5 +334,80 @@ mod tests {
         assert_eq!(json["status"], "Failure");
         assert_eq!(json["reason"], "TooManyRequests");
         assert_eq!(json["code"], 429);
+    }
+
+    // In-memory sink for tracing-subscriber's fmt layer, so the 429 log test can assert
+    // on the rendered field set without adding a tracing-test dependency.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_429_rejection_is_logged_with_method_uri_and_limit_kind() {
+        // Before this test existed, an InflightLayer 429 was invisible in apiserver.log:
+        // InflightLayer runs before ContentTypeLayer's access log, so a rejected request
+        // never reached the only other log line that recorded method/uri/status. Without
+        // this warn!, diagnosing rate-limit pressure required forensic reconstruction from
+        // request-density timing instead of a grep. If the log call is ever dropped, this
+        // test must fail.
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let inflight = Arc::new(Semaphore::new(0)); // immediately exhausted
+        let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
+
+        let layer = InflightLayer {
+            inflight: Arc::clone(&inflight),
+            mutating: Arc::clone(&mutating),
+        };
+        let mut svc = layer.layer(OkService);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces")
+            .header("user-agent", "e2e.test/v1.34.0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("POST") && log.contains("/api/v1/namespaces"),
+            "429 rejection log must record method and uri so operators can identify which \
+             request was rejected without cross-referencing response bodies; log was: {log}"
+        );
+        assert!(
+            log.contains("limit_kind") && log.contains("inflight"),
+            "429 rejection log must record which cap tripped (inflight vs mutating) — \
+             the caller already knows this from which semaphore failed to acquire, and \
+             discarding it forces guesswork about which limit needs raising; log was: {log}"
+        );
+        assert!(
+            log.contains("e2e.test/v1.34.0"),
+            "429 rejection log must record the user-agent so operators can tell which \
+             client (e2e.test vs kube-controller-manager vs kubelet) is generating the \
+             rejected load; log was: {log}"
+        );
     }
 }
