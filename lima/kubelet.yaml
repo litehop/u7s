@@ -125,7 +125,10 @@ provision:
 
       # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
       mkdir -p /etc/systemd/system/kubelet.service.d
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\n' > /etc/kubelet-config.yaml
+      # serializeImagePulls/maxParallelImagePulls: HTTP/2 removed the pod-admission pacing that used to hide
+      # the upstream-default single-worker image-pull queue's cost under 16-way conformance load (mayor-w98yt).
+      # NOTE: maxParallelImagePulls has no CLI flag equivalent — it must be set here, not via kubelet ExecStart.
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\n' > /etc/kubelet-config.yaml
       printf '[Service]\nExecStart=\nExecStart=/usr/bin/kubelet \\\n  --config=/etc/kubelet-config.yaml \\\n  --kubeconfig=/etc/kubelet-kubeconfig \\\n  --hostname-override=lima-node \\\n  --v=2\n' > /etc/systemd/system/kubelet.service.d/u7s.conf
       systemctl daemon-reload
 
