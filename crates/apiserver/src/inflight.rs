@@ -21,8 +21,8 @@ use tower_service::Service;
 
 use crate::status::Status;
 
-const MAX_INFLIGHT: usize = 50;
-const MAX_MUTATING: usize = 20;
+const MAX_INFLIGHT: usize = 200;
+const MAX_MUTATING: usize = 100;
 
 // ---------------------------------------------------------------------------
 // InflightLayer
