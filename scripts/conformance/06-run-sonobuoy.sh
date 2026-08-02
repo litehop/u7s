@@ -134,7 +134,7 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig"
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
