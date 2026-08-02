@@ -3527,6 +3527,13 @@ async fn serve_tls(
     server_config: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<()> {
     let acceptor = TlsAcceptor::from(server_config);
+    // Auto-negotiating builder: dispatches each connection to HTTP/1.1 or HTTP/2 by
+    // peeking at the first bytes for the HTTP/2 connection preface. Clients that
+    // saw h2 win ALPN (rustls ServerConfig.alpn_protocols in tls.rs) send that
+    // preface immediately, so in practice ALPN is what steers this — but the
+    // dispatch itself works from the wire, independent of the ALPN result.
+    let conn_builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     tracing::info!("listening on {}", listener.local_addr()?);
 
     loop {
@@ -3534,6 +3541,7 @@ async fn serve_tls(
         configure_accepted_socket(&tcp_stream);
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let conn_builder = conn_builder.clone();
 
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(tcp_stream).await {
@@ -3566,13 +3574,17 @@ async fn serve_tls(
                     Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
                 }
             });
-            // with_upgrades() is required for HTTP/1.1 WebSocket upgrades (exec/attach/portforward).
-            // Without it, hyper sends the 101 Switching Protocols response but never hands the
-            // connection off to the upgrade handler — the on_upgrade callback never runs, the
-            // splice never starts, and kubectl times out with "unexpected output from server".
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .with_upgrades()
+            // serve_connection_with_upgrades() preserves WebSocket-upgrade support for
+            // connections that negotiate HTTP/1.1 (exec/attach/portforward use
+            // `Connection: Upgrade`, which has no HTTP/2 equivalent wired up here).
+            // Without it, hyper sends the 101 Switching Protocols response but never
+            // hands the connection off to the upgrade handler — the on_upgrade callback
+            // never runs, the splice never starts, and kubectl times out with
+            // "unexpected output from server". Connections that negotiate HTTP/2
+            // (kubelet's watch reflectors) skip this path entirely and get hyper's
+            // native h2 stream multiplexing instead of one TCP connection per watch.
+            if let Err(e) = conn_builder
+                .serve_connection_with_upgrades(io, service)
                 .await
             {
                 tracing::debug!("connection error: {e}");
@@ -7862,7 +7874,10 @@ mod tests {
 
         // Spawn the server using our serve_connection pattern WITH with_upgrades().
         // This mirrors what serve_tls() does (minus TLS) and is the exact code path
-        // that had the missing with_upgrades() bug.
+        // that had the missing with_upgrades() bug. It uses the same auto::Builder
+        // serve_tls() uses so this test still exercises the real production dispatch:
+        // a plain HTTP/1.1 WebSocket handshake (no ALPN, no h2 preface) must still
+        // route to the h1-with-upgrades branch, not silently drop the upgrade.
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let io = hyper_util::rt::TokioIo::new(tcp);
@@ -7876,10 +7891,10 @@ mod tests {
             });
             // with_upgrades() is the fix — removing it causes this test to fail
             // because the on_upgrade closure never runs and the client recv() blocks.
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .with_upgrades()
-                .await;
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
         });
 
         // Connect a WebSocket client and exchange one message.
@@ -7924,6 +7939,194 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP/2 (ALPN h2) multiplexing regression test
+    //
+    // Before this fix the apiserver was HTTP/1.1-only: no `alpn_protocols` in
+    // generate_tls()'s rustls ServerConfig and a hardcoded http1::Builder in
+    // serve_tls(). HTTP/1.1 cannot run two requests concurrently on one TCP
+    // connection, so kubelet's client-go stack had no choice but to open one
+    // dedicated TCP connection per watch reflector. Under 16-way [Conformance]
+    // runs, ~150-200 reflectors reconnecting together produced a SYN burst
+    // that overwhelmed the shared `limactl usernet` process and caused
+    // `dial tcp 10.96.0.1:443: i/o timeout` failures elsewhere in the suite.
+    //
+    // This test proves the fix end-to-end, mirroring kubelet's real behavior:
+    // a client offers ALPN ["h2", "http/1.1"] (client-go's default order) and
+    // then relies on the server having picked h2 to multiplex many concurrent
+    // requests over that one connection.
+    // -----------------------------------------------------------------------
+
+    /// The server must negotiate ALPN h2 (not fall back to http/1.1) and must
+    /// actually run N concurrent requests over the single resulting connection.
+    ///
+    /// This test MUST fail if reverted:
+    /// - If generate_tls() stops setting `alpn_protocols`, the assertion on
+    ///   `alpn_protocol()` fails immediately (server negotiates nothing).
+    /// - If serve_tls()'s auto::Builder reverts to a plain http1::Builder, the
+    ///   HTTP/2 client handshake below never completes (the server's HTTP/1.1
+    ///   parser cannot make sense of the raw HTTP/2 connection preface), and
+    ///   the surrounding timeout fires.
+    /// - If the server ever silently serialized requests instead of truly
+    ///   multiplexing them (e.g. a broken auto-detect that fell back to
+    ///   handling one stream at a time), the barrier every handler waits on
+    ///   would deadlock, since no single request can complete until all N
+    ///   have been received concurrently — the surrounding timeout catches
+    ///   that too.
+    #[tokio::test]
+    async fn http2_alpn_negotiated_and_multiplexes_concurrent_requests_on_one_connection() {
+        use axum::routing::get;
+        use bytes::Bytes;
+        use http_body_util::Empty;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use rustls::pki_types::CertificateDer;
+        use rustls::{ClientConfig, RootCertStore};
+        use std::time::Duration;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::Barrier;
+
+        const N: usize = 20;
+
+        rustls_post_quantum::provider().install_default().ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "u7s-h2-alpn-test-{}-{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: "./kubeconfig".into(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+            service_cluster_ip_range: "10.96.0.0/12".into(),
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            node_kubelet_port: vec![],
+            konnectivity_proxy_addr: None,
+        };
+        let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");
+
+        // --- Server: the real, unmodified serve_tls() — the exact production
+        // dispatcher under test, not a hand-rolled mirror of it. A route handler
+        // that blocks on a barrier proves genuine HTTP/2 multiplexing: if
+        // serve_tls() ever fell back to serializing requests, request 2 could
+        // never arrive until request 1's handler had already returned, and this
+        // would deadlock instead of completing.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind must succeed");
+        let server_addr = listener.local_addr().unwrap();
+        let barrier = Arc::new(Barrier::new(N));
+        let app = Router::new().route(
+            "/",
+            get({
+                let barrier = Arc::clone(&barrier);
+                move || {
+                    let barrier = Arc::clone(&barrier);
+                    async move {
+                        barrier.wait().await;
+                        "ok"
+                    }
+                }
+            }),
+        );
+        tokio::spawn(serve_tls(listener, app, tls.server_config.clone()));
+
+        // --- Client: offer ALPN [h2, http/1.1] in that order, exactly like
+        // client-go's net/http.Transport (confirmed via live pcap in
+        // ai/findings/alpn-check-2026-08-02.md) — then require h2 to have won. ---
+        let mut root_store = RootCertStore::empty();
+        root_store
+            .add(CertificateDer::from(tls.ca_cert_der.clone()))
+            .expect("add CA cert to root store");
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = TcpStream::connect(server_addr)
+            .await
+            .expect("TCP connect must succeed");
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls_stream =
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
+                .await
+                .expect("TLS handshake must not hang")
+                .expect("TLS handshake must succeed");
+
+        let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        assert_eq!(
+            negotiated.as_deref(),
+            Some(b"h2".as_slice()),
+            "server offered ALPN [h2, http/1.1] like kubelet does, but negotiated \
+             {negotiated:?} instead of h2 — kubelet's watch reflectors would fall back \
+             to one dedicated TCP connection per watch, reproducing the mass SYN-burst \
+             regression this test guards against"
+        );
+
+        let io = TokioIo::new(tls_stream);
+        let (send_request, connection) = tokio::time::timeout(
+            Duration::from_secs(5),
+            hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, Empty<Bytes>>(io),
+        )
+        .await
+        .expect(
+            "HTTP/2 handshake must not hang — a server still speaking HTTP/1.1 \
+             under the hood would misparse the raw HTTP/2 connection preface",
+        )
+        .expect("HTTP/2 handshake must succeed");
+        tokio::spawn(connection);
+
+        // Fire N concurrent requests over the SAME h2 connection by cloning the
+        // sender — this is exactly what client-go's pooled h2 transport does for
+        // kubelet's N concurrent watch reflectors instead of dialing N sockets.
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let mut sender = send_request.clone();
+            handles.push(tokio::spawn(async move {
+                let req = axum::http::Request::builder()
+                    .uri("/")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                sender.send_request(req).await
+            }));
+        }
+
+        // All N requests are sent over the one TCP connection opened above (bounded
+        // by construction: we never call TcpStream::connect() a second time, and
+        // send_request.clone() shares the same underlying HTTP/2 connection — the
+        // same pooling behavior client-go's transport applies once it has
+        // negotiated h2 with a peer). What the barrier below actually proves is
+        // that the server can genuinely service N requests concurrently on that
+        // single connection rather than one-at-a-time.
+        for handle in handles {
+            let resp = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect(
+                    "all N concurrent requests must complete within 5s — if the server \
+                     failed to multiplex them on one h2 connection, the shared barrier \
+                     would deadlock waiting for streams that never arrived",
+                )
+                .expect("request task must not panic")
+                .expect("request must succeed");
+            assert_eq!(resp.status(), 200);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// Requests to unregistered routes must return HTTP 404 with a valid
