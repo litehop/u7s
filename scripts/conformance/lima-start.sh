@@ -632,8 +632,13 @@ PULLEOF
   limactl shell "$VM_NAME" sudo rm -f /tmp/kubelet-pods/kube-proxy-pull.yaml
 fi
 
-# Install ipset (required by kube-proxy IPVS mode).
-limactl shell "$VM_NAME" sudo apt-get install -y ipset 2>/dev/null | tail -1 || true
+# Install ipset (required by kube-proxy IPVS mode) and conntrack (network diagnostics).
+# Both are load-bearing — failure here means kube-proxy will crashloop silently,
+# making the kubernetes Service VIP unreachable for the entire run. No output
+# suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
+# if either command fails, rather than continuing with a half-provisioned VM.
+limactl shell "$VM_NAME" sudo apt-get update
+limactl shell "$VM_NAME" sudo apt-get install -y ipset conntrack
 
 # Load IPVS and bridge netfilter kernel modules.
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through
@@ -667,6 +672,28 @@ SVCEOF
 limactl shell "$VM_NAME" sudo systemctl daemon-reload
 limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
 limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
+
+# Verify kube-proxy actually reached the active state (not stuck crashlooping).
+# Without this check, any silent failure (missing ipset, missing kernel module,
+# bad config) leaves kube-proxy dead and the kubernetes Service VIP unreachable —
+# sonobuoy then hangs indefinitely on "dial tcp 10.96.0.1:443: i/o timeout" with
+# no actionable signal to the operator.
+KUBE_PROXY_ACTIVE=0
+for i in $(seq 1 15); do
+  STATUS=$(limactl shell "$VM_NAME" sudo systemctl is-active kube-proxy 2>&1 || true)
+  if [ "$STATUS" = "active" ]; then
+    KUBE_PROXY_ACTIVE=1
+    break
+  fi
+  sleep 1
+done
+
+if [ "$KUBE_PROXY_ACTIVE" -eq 0 ]; then
+  echo "ERROR: kube-proxy failed to reach active state (last status: $STATUS)" >&2
+  echo "--- kube-proxy log (last 30 lines) ---" >&2
+  limactl shell "$VM_NAME" sudo journalctl -u kube-proxy --no-pager -n 30 >&2
+  exit 1
+fi
 
 echo "kube-proxy systemd service started (logs: limactl shell ${VM_NAME} sudo journalctl -u kube-proxy -n 20)"
 
