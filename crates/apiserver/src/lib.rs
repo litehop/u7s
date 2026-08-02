@@ -43,6 +43,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
@@ -92,6 +93,79 @@ fn raise_fd_limit() {
             "failed to raise RLIMIT_NOFILE: {e} — process may hit EMFILE under sustained load"
         ),
     }
+}
+
+/// Requested TCP accept-queue depth. ~32x macOS's default `kern.ipc.somaxconn` clamp of
+/// 128: on Linux (usually unclamped, or clamped much higher) this gives real headroom
+/// under bursty conformance load; on macOS the kernel silently truncates it back to 128
+/// regardless — [`backlog_clamp_warning`] is how that gets surfaced in logs instead of
+/// hidden.
+const LISTEN_BACKLOG: i32 = 4096;
+
+/// Binds and listens on `addr` with an explicit [`LISTEN_BACKLOG`], instead of the OS
+/// default `TcpListener::bind` would silently inherit (128 on stock macOS). A too-small
+/// backlog means SYNs arriving faster than `accept()` drains the queue get dropped by the
+/// kernel before user code ever sees them — invisible to the apiserver's own
+/// request-completion logs, which is exactly what made the VIP-timeout family of
+/// conformance failures hard to pin down.
+fn bind_listener(addr: &str) -> anyhow::Result<TcpListener> {
+    let addr: std::net::SocketAddr = addr.parse()?;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+    tracing::info!("bound TCP listener on {addr} with backlog={LISTEN_BACKLOG}");
+    if let Some(msg) = backlog_clamp_warning(LISTEN_BACKLOG, os_backlog_ceiling()) {
+        tracing::warn!("{msg}");
+    }
+    Ok(TcpListener::from_std(socket.into())?)
+}
+
+/// Best-effort read of the OS's accept-queue ceiling (Linux: `/proc/sys/net/core/somaxconn`;
+/// macOS: `kern.ipc.somaxconn`), so [`bind_listener`] can warn when it silently truncates
+/// [`LISTEN_BACKLOG`]. `None` on read failure or an unrecognized platform — treated as
+/// "can't tell", not as evidence there's no clamp, since this is purely observational.
+fn os_backlog_ceiling() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "kern.ipc.somaxconn"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Pure decision logic behind [`bind_listener`]'s clamp warning, split out from the
+/// `tracing::warn!` call so it's unit-testable without capturing log output. Returns
+/// `Some(message)` naming both the requested and clamped values when the OS ceiling
+/// truncated `requested`, so an operator reading logs doesn't have to re-derive which
+/// number is which.
+fn backlog_clamp_warning(requested: i32, ceiling: Option<i32>) -> Option<String> {
+    let ceiling = ceiling?;
+    (ceiling < requested).then(|| {
+        format!(
+            "requested TCP listen backlog {requested}, but OS ceiling (somaxconn) is only \
+             {ceiling} — the kernel silently truncated it; raise somaxconn if sustained \
+             connection bursts risk dropping SYNs before the apiserver ever sees them"
+        )
+    })
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -361,8 +435,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    // 12. Bind TLS listener and serve.
-    let listener = TcpListener::bind(&args.listen).await?;
+    // 12. Bind TLS listener and serve. Uses bind_listener (socket2) rather than
+    //     TcpListener::bind so we can set an explicit accept-queue backlog — see
+    //     LISTEN_BACKLOG's doc comment for why the OS default isn't enough headroom.
+    let listener = bind_listener(&args.listen)?;
     serve_tls(listener, app, tls_material.server_config).await?;
     Ok(())
 }
@@ -3580,6 +3656,60 @@ mod tests {
                  (hard={hard}), but it stayed at {after_soft}"
             );
         }
+    }
+
+    /// A too-small OS ceiling must not be silently absorbed — this is the entire point
+    /// of the warning (mirrors macOS's real default of 128 vs our requested 4096, the
+    /// exact gap the VIP-timeout audit flagged as a candidate for dropped SYNs under
+    /// bursty conformance load).
+    #[test]
+    fn backlog_clamp_warning_fires_when_os_ceiling_is_lower() {
+        let msg = backlog_clamp_warning(4096, Some(128))
+            .expect("OS ceiling 128 < requested 4096 must produce a warning");
+        assert!(
+            msg.contains("128") && msg.contains("4096"),
+            "warning must name both the requested and clamped values so an operator \
+             doesn't have to re-derive which is which: {msg}"
+        );
+    }
+
+    /// A sufficiently high OS ceiling (e.g. an untuned Linux host with no clamp) must
+    /// stay silent — a warning that fires unconditionally would train operators to
+    /// ignore this log line, defeating the point of adding it.
+    #[test]
+    fn backlog_clamp_warning_silent_when_os_ceiling_is_sufficient() {
+        assert_eq!(backlog_clamp_warning(4096, Some(65536)), None);
+    }
+
+    /// An unrecognized platform or failed sysctl/proc read must not be conflated with
+    /// "no clamp exists" — staying silent is the honest behavior when we genuinely
+    /// don't know the ceiling.
+    #[test]
+    fn backlog_clamp_warning_silent_when_ceiling_unknown() {
+        assert_eq!(backlog_clamp_warning(4096, None), None);
+    }
+
+    /// Regression guard for the socket2 refactor in `bind_listener`: it builds the
+    /// listener manually (non-blocking, reuse-addr, bind, listen) instead of going
+    /// through `TcpListener::bind`, so a future edit that drops `set_nonblocking` or
+    /// otherwise misconfigures the socket must fail this test rather than silently
+    /// producing a listener tokio can't actually accept connections on.
+    #[tokio::test]
+    async fn bind_listener_produces_a_working_listener() {
+        let listener =
+            bind_listener("127.0.0.1:0").expect("bind_listener must succeed on an ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("bound listener must report its local address");
+
+        let accept = tokio::spawn(async move { listener.accept().await });
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("a client must be able to connect to the freshly bound listener");
+        accept
+            .await
+            .expect("accept task must not panic")
+            .expect("listener must successfully accept the pending connection");
     }
 
     #[tokio::test]
