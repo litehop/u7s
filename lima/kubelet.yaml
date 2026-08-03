@@ -105,6 +105,36 @@ provision:
       fi
       printf 'runtime-endpoint: unix:///var/run/crio/crio.sock\nimage-endpoint: unix:///var/run/crio/crio.sock\ntimeout: 10\ndebug: false\n' > /etc/crictl.yaml
 
+      # Pre-pull the e2e-test-images conformance set into cri-o's local cache at provision
+      # time, so runtime [Conformance] test pulls never touch registry.k8s.io/S3 at all —
+      # avoids the usernet burst-drop failure mode where a parallel-ginkgo pod-creation burst
+      # fires 10 concurrent outbound PullImage flows and the shared limactl usernet layer
+      # blackholes them for tens of seconds, which upstream e2e's fail-fast pod-watch step
+      # turns into a hard test failure even though kubelet's own retry loop recovers moments
+      # later (see ai/findings/image-pull-timeout-investigation-2026-08-03.md). kube-proxy,
+      # coredns, kas-network-proxy/proxy-agent and pause are not listed here — they're already
+      # pulled as an unavoidable side effect of normal cluster bootstrap (kube-proxy binary
+      # extraction and the konnectivity-agent pod in scripts/conformance/lima-start.sh, the
+      # CoreDNS Deployment u7s applies on startup, and the first-ever pod sandbox respectively)
+      # before any conformance test runs.
+      # No `|| true`: set -euo pipefail above means one failed pull aborts provisioning loudly
+      # instead of silently leaving a partial cache that would defeat the point of pre-pulling.
+      E2E_TEST_IMAGES=(
+        "registry.k8s.io/conformance:v1.36.0"
+        "registry.k8s.io/e2e-test-images/busybox:1.37.0-1"
+        "registry.k8s.io/e2e-test-images/nginx:1.15-4"
+        "registry.k8s.io/e2e-test-images/agnhost:2.55"
+        "registry.k8s.io/e2e-test-images/agnhost:2.63.0"
+        "registry.k8s.io/e2e-test-images/glibc-dns-testing:2.0.0"
+        "registry.k8s.io/e2e-test-images/kitten:1.8"
+        "registry.k8s.io/e2e-test-images/nautilus:1.8"
+        "registry.k8s.io/e2e-test-images/nonewprivs:1.4"
+        "registry.k8s.io/e2e-test-images/sample-apiserver:1.29.2"
+      )
+      for img in "${E2E_TEST_IMAGES[@]}"; do
+        crictl pull "$img"
+      done
+
       # Install sonobuoy — static binary, used for local conformance runs against u7s on host.
       # Detect VM arch: aarch64 → arm64, x86_64 → amd64.
       SONOBUOY_VERSION="0.57.3"
@@ -148,3 +178,8 @@ probes:
       #!/bin/bash
       command -v crictl >/dev/null
     hint: "crictl not found — re-provision: limactl delete lima-node && scripts/lima-start.sh"
+  - description: e2e-test-images conformance set is pre-pulled
+    script: |
+      #!/bin/bash
+      test "$(crictl images | grep -c 'registry.k8s.io/e2e-test-images\|registry.k8s.io/conformance')" -ge 10
+    hint: "e2e-test-images not fully pre-pulled (crictl pull failed during provisioning) — re-provision: limactl delete lima-node && scripts/lima-start.sh"
