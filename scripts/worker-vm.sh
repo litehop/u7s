@@ -66,7 +66,12 @@ case "$COMMAND" in
       sudo ifconfig lo0 alias "$IP" 2>/dev/null || true
     fi
 
-    if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${NAME}$"; then
+    # Use the instance directory as authoritative existence check — limactl list
+    # can transiently return empty output if lima is busy, which would otherwise
+    # cause the provisioning branch to run and hit "instance already exists"
+    # (see scripts/conformance/lima-start.sh for the same fix).
+    VM_DIR="${HOME}/.lima/${NAME}"
+    if [ -d "$VM_DIR" ]; then
       STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${NAME} / {print \$2}")
       if [ "$STATUS" = "Running" ]; then
         echo "VM '$NAME' is already running."
@@ -115,6 +120,14 @@ case "$COMMAND" in
       echo "error: 'delete' requires a VM name" >&2; exit 1
     fi
     NAME="$1"
+    # Use the instance directory as authoritative existence check — limactl list
+    # can transiently return empty output if lima is busy, which would otherwise
+    # cause the "not Running" branch below to fire even for a live VM
+    # (see scripts/conformance/lima-start.sh for the same fix).
+    VM_DIR="${HOME}/.lima/${NAME}"
+    if [ ! -d "$VM_DIR" ]; then
+      echo "error: VM '$NAME' does not exist" >&2; exit 1
+    fi
     STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${NAME} / {print \$2}" || true)
     if [ "$STATUS" = "Running" ]; then
       echo "VM '$NAME' is currently running."
