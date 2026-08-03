@@ -684,6 +684,11 @@ pub(crate) async fn replace_pod<S: Store>(
     let stored_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
     let spec_before = stored_obj.body["spec"].clone();
+    // PUT to the main /pods endpoint updates spec+metadata only; status is managed by
+    // the /status subresource. Client bodies may carry stale status (e.g. a local cache
+    // from before kubelet's latest status patch), which would silently clobber real
+    // status updates if not stripped. Mirrors patch_pod's stored_status handling below.
+    let stored_status = stored_obj.body["status"].clone();
     // metadata.generation is server-managed. Restore the stored value so a
     // client-supplied generation (e.g. the conformance test case that sends
     // generation=1 on a pod already at generation=5) cannot downgrade it.
@@ -730,6 +735,11 @@ pub(crate) async fn replace_pod<S: Store>(
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
+
+    // Restore the stored status now that spec/metadata processing is done: whatever
+    // status the client's PUT body carried (see stored_status comment above) is
+    // discarded in favor of the server's own record.
+    obj.body["status"] = stored_status;
 
     // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
     // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
@@ -11015,6 +11025,96 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A plain PUT to the main /pods endpoint must never let the client body's `.status`
+    /// clobber the server's stored status: status is owned by the /status subresource (a
+    /// distinct RBAC grant from `update pods`), and any client with a locally cached copy
+    /// (client-go `Update()`, `kubectl replace`, a controller's informer cache) commonly
+    /// carries stale or zeroed status fields. Regression: kubelet's status PATCH set
+    /// `observedGeneration=5`, then a legitimate metadata-only PUT from a test helper
+    /// silently reset it to 0 — every later read saw the wrong value and a wait loop timed
+    /// out. This test fails if replace_pod stops restoring the stored status before writing.
+    #[tokio::test]
+    async fn replace_pod_ignores_body_status_uses_stored_status() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        // Set status via the /status subresource, the way kubelet does.
+        let status_app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state.clone());
+
+        let status_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "status": {"phase": "Running", "observedGeneration": 5}
+        });
+        let status_req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&status_body))
+            .unwrap();
+        let status_resp = status_app.oneshot(status_req).await.unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+
+        let stored_rv = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        // Client PUTs to the main endpoint with a stale/zeroed status in the body — e.g. a
+        // client-go Update() built from a local cache predating kubelet's status patch.
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Pending", "observedGeneration": 0}
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "PUT body status (Pending) must be ignored; stored status (Running) set via \
+             the /status subresource must be preserved"
+        );
+        assert_eq!(
+            v["status"]["observedGeneration"], 5,
+            "PUT body's stale observedGeneration=0 must not clobber the real value kubelet \
+             set via /status — this is the exact field that regressed in production"
+        );
     }
 
     // -----------------------------------------------------------------------
