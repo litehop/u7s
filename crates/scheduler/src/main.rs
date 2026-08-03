@@ -83,6 +83,26 @@ enum PreemptionFailure {
     Fail(anyhow::Error),
 }
 
+/// The outcome of one scheduling attempt's core decision in
+/// `handle_pod_event`, controlling exactly when `key` may be released from
+/// `in_flight`.
+///
+/// `Deferred` is the one variant that must NOT release it immediately:
+/// `preempt_and_pick_node` returning `Ok(())` means victims have already been
+/// evicted but the bind itself is deferred until `attempt_deferred_bind`
+/// resolves it (see that function's doc comment) — releasing `in_flight`
+/// here, before that resolution, is exactly the race that let a second,
+/// independent scheduling attempt for the same still-Pending pod start,
+/// preempt an unrelated bystander pod on a different node, and double-bind
+/// the pod. `Skipped` and `Done` both represent an attempt that made no
+/// lasting commitment beyond this point (a transient retry, or an outcome
+/// worth reporting), so `key` is safe to release right away for either.
+enum SchedulingOutcome {
+    Deferred,
+    Skipped,
+    Done(anyhow::Result<String>),
+}
+
 /// Plan preemption for `pending` and evict its victims, retrying up to
 /// `MAX_PREEMPTION_ATTEMPTS` times if `find_preemption_plan`'s atomic
 /// reservation loses to a fresher read.
@@ -259,19 +279,50 @@ async fn evict_victims(
 /// `pending`'s last chance: it stays Pending, still `spec.nodeName`-empty, so
 /// `pods_needing_resync` (see its doc comment) re-plans it from scratch
 /// within `RESYNC_INTERVAL`, exactly as it would for any other stranded pod.
+///
+/// Releases `pending`'s key from `in_flight` once this resolves, whichever
+/// way — this is the OTHER place (besides `handle_pod_event`'s own immediate
+/// bind path) allowed to do so: `preempt_and_pick_node`'s `Ok(())` deliberately
+/// leaves the key reserved so a second, independent scheduling attempt for
+/// this same still-Pending pod can never start while this deferred bind is
+/// outstanding — releasing it any earlier reproduces the exact race where
+/// such a second attempt preempts a DIFFERENT node's innocent bystander pod
+/// and the pod ends up bound twice.
 async fn attempt_deferred_bind(
     connector: &TlsConnector,
     server: &str,
     tally: &Mutex<NodeTally>,
+    in_flight: &Arc<Mutex<HashSet<String>>>,
     pending: PendingPod,
     node_name: String,
 ) {
     let key = format!("{}/{}", pending.namespace, pending.pod_name);
-    let node = match fetch_node(connector, server, &node_name).await {
-        Ok(Some(node)) => node,
-        Ok(None) => {
+    async {
+        let node = match fetch_node(connector, server, &node_name).await {
+            Ok(Some(node)) => node,
+            Ok(None) => {
+                info!(
+                    "deferred bind for {key}: node {node_name} no longer exists — \
+                     leaving pod Pending for the periodic resync to re-plan"
+                );
+                tally
+                    .lock()
+                    .expect("tally lock poisoned")
+                    .remove(&pending.namespace, &pending.pod_name);
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "deferred bind for {key}: failed to re-fetch node {node_name}: {e} — \
+                     leaving pod Pending for the periodic resync to re-plan"
+                );
+                return;
+            }
+        };
+        if !preemption_reservation_still_fits(&pending, &node, tally) {
             info!(
-                "deferred bind for {key}: node {node_name} no longer exists — \
+                "deferred bind for {key}: reservation on {node_name} no longer fits \
+                 (capacity drifted while waiting for the victim's real removal) — \
                  leaving pod Pending for the periodic resync to re-plan"
             );
             tally
@@ -280,57 +331,43 @@ async fn attempt_deferred_bind(
                 .remove(&pending.namespace, &pending.pod_name);
             return;
         }
-        Err(e) => {
-            error!(
-                "deferred bind for {key}: failed to re-fetch node {node_name}: {e} — \
-                 leaving pod Pending for the periodic resync to re-plan"
-            );
-            return;
-        }
-    };
-    if !preemption_reservation_still_fits(&pending, &node, tally) {
         info!(
-            "deferred bind for {key}: reservation on {node_name} no longer fits \
-             (capacity drifted while waiting for the victim's real removal) — \
-             leaving pod Pending for the periodic resync to re-plan"
+            "deferred bind for {key}: every victim confirmed gone and fit re-verified — \
+             attempting bind to {node_name}"
         );
-        tally
-            .lock()
-            .expect("tally lock poisoned")
-            .remove(&pending.namespace, &pending.pod_name);
-        return;
-    }
-    info!(
-        "deferred bind for {key}: every victim confirmed gone and fit re-verified — \
-         attempting bind to {node_name}"
-    );
-    match bind_reserved_node(connector, server, tally, &pending, &node_name).await {
-        Ok(()) => {
-            let message = format!(
-                "Successfully assigned {}/{} to {node_name}",
-                pending.namespace, pending.pod_name
-            );
-            if let Err(e) = emit_scheduling_event(
-                connector,
-                server,
-                &pending.namespace,
-                &pending.pod_name,
-                "Scheduled",
-                &message,
-                "Normal",
-            )
-            .await
-            {
-                error!("failed to emit Scheduled event for {key}: {e}");
+        match bind_reserved_node(connector, server, tally, &pending, &node_name).await {
+            Ok(()) => {
+                let message = format!(
+                    "Successfully assigned {}/{} to {node_name}",
+                    pending.namespace, pending.pod_name
+                );
+                if let Err(e) = emit_scheduling_event(
+                    connector,
+                    server,
+                    &pending.namespace,
+                    &pending.pod_name,
+                    "Scheduled",
+                    &message,
+                    "Normal",
+                )
+                .await
+                {
+                    error!("failed to emit Scheduled event for {key}: {e}");
+                }
+            }
+            Err(e) => {
+                error!(
+                    "deferred bind failed for {key}: {e} — leaving pod Pending for \
+                     the periodic resync to re-plan"
+                );
             }
         }
-        Err(e) => {
-            error!(
-                "deferred bind failed for {key}: {e} — leaving pod Pending for \
-                 the periodic resync to re-plan"
-            );
-        }
     }
+    .await;
+    in_flight
+        .lock()
+        .expect("in_flight lock poisoned")
+        .remove(&key);
 }
 
 /// How often the periodic resync (spawned in `main`) re-lists `/api/v1/pods`
@@ -385,11 +422,13 @@ fn handle_pod_event(
         let connector_clone = connector.clone();
         let server_clone = server.to_string();
         let tally_clone = tally.clone();
+        let in_flight_clone = in_flight.clone();
         tokio::spawn(async move {
             attempt_deferred_bind(
                 &connector_clone,
                 &server_clone,
                 &tally_clone,
+                &in_flight_clone,
                 pending,
                 node_name,
             )
@@ -504,13 +543,9 @@ fn handle_pod_event(
                 return;
             }
         }
-        // None means "skip silently, let the watch retry" — the preemption
-        // arm can hit that same transient-GET-failure case `first_pick`
-        // already handles above, but one level deeper (inside this
-        // async block, possibly after victims have already been evicted),
-        // where a bare early `return` doesn't type-check. Some(_) is a real
-        // outcome (success or genuine failure) worth an Event.
-        let outcome: Option<anyhow::Result<String>> = async {
+        // See `SchedulingOutcome` for why `Deferred` must NOT release `key`
+        // from `in_flight` the way `Skipped`/`Done` do.
+        let outcome: SchedulingOutcome = async {
             let node = match first_pick {
                 Ok(node) => node,
                 Err(_no_capacity) => {
@@ -533,23 +568,25 @@ fn handle_pod_event(
                             // confirms they're actually gone (see
                             // `preempt_and_pick_node`'s doc comment and
                             // `attempt_deferred_bind`). Nothing to report
-                            // yet — no Scheduled/FailedScheduling event, `key`
-                            // stays out of `in_flight` below exactly as it
-                            // would on any other "wait for the next tick"
-                            // outcome.
-                            return None;
+                            // yet — no Scheduled/FailedScheduling event, and
+                            // `key` stays IN `in_flight`: `attempt_deferred_bind`
+                            // is what releases it, once this deferred bind
+                            // actually resolves.
+                            return SchedulingOutcome::Deferred;
                         }
                         Err(PreemptionFailure::Skip(e)) => {
                             error!(
                                 "find_preemption_plan could not reach the API server while scheduling {key}: {e} — retrying on next watch tick"
                             );
-                            return None;
+                            return SchedulingOutcome::Skipped;
                         }
-                        Err(PreemptionFailure::Fail(e)) => return Some(Err(e)),
+                        Err(PreemptionFailure::Fail(e)) => {
+                            return SchedulingOutcome::Done(Err(e))
+                        }
                     }
                 }
             };
-            Some(
+            SchedulingOutcome::Done(
                 bind_reserved_node(
                     &connector_clone,
                     &server_clone,
@@ -562,14 +599,25 @@ fn handle_pod_event(
             )
         }
         .await;
-        // Always remove the key, whether binding succeeded, failed, or was skipped.
-        in_flight_clone
-            .lock()
-            .expect("in_flight lock poisoned")
-            .remove(&key);
 
-        let Some(outcome) = outcome else {
-            return;
+        let outcome = match outcome {
+            // `key` stays in `in_flight` — `attempt_deferred_bind` releases
+            // it once the deferred bind this pod is now waiting on resolves.
+            SchedulingOutcome::Deferred => return,
+            SchedulingOutcome::Skipped => {
+                in_flight_clone
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .remove(&key);
+                return;
+            }
+            SchedulingOutcome::Done(outcome) => {
+                in_flight_clone
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .remove(&key);
+                outcome
+            }
         };
 
         let (reason, message, event_type) = match &outcome {
@@ -731,7 +779,23 @@ async fn main() -> anyhow::Result<()> {
     loop {
         info!("starting pod watch on {POD_WATCH_PATH}");
         let path = POD_WATCH_PATH;
-        tally.lock().expect("tally lock poisoned").clear();
+        // Any preemption plan still waiting on a victim's real removal is
+        // abandoned by this clear — release `in_flight` for each one too, or
+        // a pod whose deferred bind can now never resolve (see
+        // `attempt_deferred_bind`) would stay wrongly deduped forever instead
+        // of being re-planned by the next watch tick or resync.
+        let abandoned_deferred_binds = tally.lock().expect("tally lock poisoned").clear();
+        if !abandoned_deferred_binds.is_empty() {
+            let mut guard = in_flight.lock().expect("in_flight lock poisoned");
+            for key in &abandoned_deferred_binds {
+                info!(
+                    "watch reconnect: releasing in_flight for {key} — its deferred \
+                     preemption bind was abandoned; the fresh watch replay or periodic \
+                     resync will re-plan it from scratch"
+                );
+                guard.remove(key);
+            }
+        }
 
         // Collect events; for each ADDED/MODIFIED pod with empty nodeName, schedule it.
         // We clone connector per loop iteration (cheap Arc clone inside).
@@ -755,6 +819,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use u7s_scheduler::ResourceRequests;
 
     #[test]
     fn pod_watch_path_requests_allow_watch_bookmarks() {
@@ -766,6 +832,275 @@ mod tests {
             POD_WATCH_PATH.contains("allowWatchBookmarks=true"),
             "pod watch path must request allowWatchBookmarks=true to avoid \
              spurious idle-timeout reconnects on a quiet cluster; got: {POD_WATCH_PATH}"
+        );
+    }
+
+    /// Poll `cond` up to a 2s budget, yielding to the runtime between checks
+    /// so the spawned tasks `handle_pod_event` fires off actually get to run
+    /// on this test's single-threaded executor. Panics with `what` if the
+    /// budget is exhausted — a hang here means the scheduling task this test
+    /// is waiting on never made the progress it should have.
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        for _ in 0..400 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// Regression for the exact race live-reproduced against
+    /// `validates basic preemption works`/`validates lower priority pod
+    /// preemption by critical pod`: `handle_pod_event` used to release a
+    /// pod's `in_flight` key the instant `preempt_and_pick_node` returned
+    /// `Ok(())` — the moment its victim's graceful DELETE was ISSUED, not the
+    /// moment the pod actually got bound (which waits for the victim's real,
+    /// kubelet-confirmed removal via `PreemptionWaiters`). A second,
+    /// independent "unscheduled pod detected" tick for the SAME still-Pending
+    /// pod arriving in that window used to sail straight past the dedup
+    /// check, run its own preemption cycle, evict a completely unrelated
+    /// bystander pod on a DIFFERENT node, and eventually double-bind the pod
+    /// once both deferred binds resolved.
+    ///
+    /// Drives `handle_pod_event` itself (not a reimplementation of its
+    /// logic) against a real in-process TLS mock server, exactly mirroring
+    /// the production sequence: first tick evicts the legitimate victim and
+    /// defers the bind; a second tick for the same pod arrives before that
+    /// bind resolves; only then are both victims' real removals confirmed
+    /// (as a live kubelet's DELETED watch events would). If the fix
+    /// regresses, the second tick evicts the bystander and both deferred
+    /// binds go on to succeed, corrupting two nodes' capacity accounting
+    /// instead of one.
+    #[tokio::test]
+    async fn second_scheduling_attempt_for_same_pod_is_deduped_while_first_deferred_bind_pending() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // Two single-victim-capacity nodes: "worker-0" hosts the legitimate
+        // preemption victim, "worker-1" hosts an unrelated bystander that
+        // must NEVER be touched if the second tick is correctly deduped.
+        let node_list_body = json!({
+            "items": [
+                {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}},
+                {"metadata": {"name": "worker-1"}, "status": {"allocatable": {"cpu": "1000m"}}},
+            ]
+        })
+        .to_string();
+
+        let delete_victim_count = Arc::new(AtomicUsize::new(0));
+        let delete_bystander_count = Arc::new(AtomicUsize::new(0));
+        let bind_count = Arc::new(AtomicUsize::new(0));
+        let delete_victim_count_srv = delete_victim_count.clone();
+        let delete_bystander_count_srv = delete_bystander_count.clone();
+        let bind_count_srv = bind_count.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let node_list_body = node_list_body.clone();
+                let delete_victim_count = delete_victim_count_srv.clone();
+                let delete_bystander_count = delete_bystander_count_srv.clone();
+                let bind_count = bind_count_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0usize;
+                    loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf[..total]);
+                    let request_line = request.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+
+                    let body = if method == "GET" && path == "/api/v1/nodes" {
+                        node_list_body
+                    } else {
+                        r#"{"kind":"Status","status":"Success"}"#.to_owned()
+                    };
+                    if method == "DELETE" && path == "/api/v1/namespaces/default/pods/victim" {
+                        delete_victim_count.fetch_add(1, Ordering::SeqCst);
+                    } else if method == "DELETE"
+                        && path == "/api/v1/namespaces/default/pods/bystander"
+                    {
+                        delete_bystander_count.fetch_add(1, Ordering::SeqCst);
+                    } else if method == "POST" && path.ends_with("/binding") {
+                        bind_count.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.assume(
+                "default",
+                "victim",
+                "worker-0",
+                0,
+                ResourceRequests {
+                    cpu_milli: 1000,
+                    ..Default::default()
+                },
+            );
+            guard.assume(
+                "default",
+                "bystander",
+                "worker-1",
+                0,
+                ResourceRequests {
+                    cpu_milli: 1000,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let pod_added_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "preemptor", "namespace": "default"},
+                "spec": {
+                    "priority": 1000,
+                    "containers": [{"resources": {"requests": {"cpu": "1000m"}}}]
+                },
+                "status": {}
+            }
+        });
+        let deleted_event = |name: &str| {
+            json!({
+                "type": "DELETED",
+                "object": {"metadata": {"name": name, "namespace": "default"}}
+            })
+        };
+
+        // First tick: pick_node finds no room on either node, so this falls
+        // to preemption, which evicts "victim" on worker-0 and defers the
+        // bind. Wait for that eviction to actually land — this is the exact
+        // "victims evicted, bind not yet attempted" window the race lived in.
+        handle_pod_event(
+            pod_added_event.clone(),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+        wait_until(
+            || delete_victim_count.load(Ordering::SeqCst) >= 1,
+            "the first attempt's preemption to evict the legitimate victim",
+        )
+        .await;
+        // Let the first attempt's task fully settle into its post-eviction
+        // state (waiter registered, `in_flight` decision made) before racing
+        // it — on real loopback this is comfortably sub-millisecond, so this
+        // is generous, and it mirrors production's much larger real window.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // THE RACE: a second, independent watch tick for the SAME
+        // still-unscheduled pod (spec.nodeName is still empty — the deferred
+        // bind from the first tick has not landed yet). With the fix, `key`
+        // is still in `in_flight` and this is deduped synchronously, right
+        // here, before any network call. Without the fix, this spawns its
+        // own preempt_and_pick_node cycle.
+        handle_pod_event(pod_added_event, &connector, &server, &in_flight, &tally);
+
+        // Give a would-be second preemption cycle (the bug) time to run to
+        // completion against the in-process mock server — everything here is
+        // loopback TLS with an instant response, so this is generous.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Now confirm each victim's real removal, exactly as a live
+        // kubelet's own DELETED watch event would — this is what resolves
+        // whichever `PreemptionWaiters` plan(s) are actually outstanding.
+        handle_pod_event(
+            deleted_event("victim"),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+        handle_pod_event(
+            deleted_event("bystander"),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+        wait_until(
+            || bind_count.load(Ordering::SeqCst) >= 1,
+            "the deferred bind to actually complete",
+        )
+        .await;
+        // Drain a second, spurious deferred bind if the fix regressed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            delete_bystander_count.load(Ordering::SeqCst),
+            0,
+            "a second, undeduped scheduling attempt for the same still-Pending pod must never \
+             run its own preemption cycle while the first attempt's deferred bind is \
+             outstanding — evicting this innocent bystander pod is exactly the collateral \
+             damage the race caused live"
+        );
+        assert_eq!(
+            bind_count.load(Ordering::SeqCst),
+            1,
+            "the pod must be bound exactly once — a second successful bind means it was \
+             double-scheduled onto two different nodes, corrupting both nodes' capacity \
+             accounting"
         );
     }
 }
