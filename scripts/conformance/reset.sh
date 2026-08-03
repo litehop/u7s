@@ -75,10 +75,17 @@ for name in apiserver scheduler; do
 done
 
 # Fallback: kill apiserver on this port and scheduler bound to this worktree.
-API_PID=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
-if [ -n "$API_PID" ]; then
-  echo "[reset]   killing apiserver on port $PORT (PID $API_PID)"
-  kill "$API_PID" 2>/dev/null || true
+# lsof -ti can return multiple newline-separated PIDs for one port; collecting
+# them into an array and passing each as its own argv to kill is required —
+# 'kill "$API_PID"' with a multi-line string is a single argument containing
+# embedded newlines, which kill silently fails to parse as a PID (confirmed
+# live), leaving every PID but the first one running despite the log claiming
+# success.
+# shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
+API_PIDS=($(lsof -ti tcp:"$PORT" 2>/dev/null || true))
+if [ "${#API_PIDS[@]}" -gt 0 ]; then
+  echo "[reset]   killing apiserver on port $PORT (PID(s): ${API_PIDS[*]})"
+  kill "${API_PIDS[@]}" 2>/dev/null || true
 fi
 pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
 
@@ -87,11 +94,13 @@ pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
 # serving its old CA-signed cert. If left running, the next run's fresh CA/agent
 # reject that stale cert with "certificate signed by unknown authority ... ECDSA
 # verification failure" — kill whatever holds these ports before regenerating certs.
+# Same multi-PID-on-one-port hazard as the apiserver fallback above applies here.
 for kp in "$KONNECTIVITY_SERVER_PORT" "$KONNECTIVITY_AGENT_PORT" "$KONNECTIVITY_ADMIN_PORT" "$KONNECTIVITY_HEALTH_PORT"; do
-  KP_PID=$(lsof -ti tcp:"$kp" 2>/dev/null || true)
-  if [ -n "$KP_PID" ]; then
-    echo "[reset]   killing konnectivity-server on port $kp (PID $KP_PID)"
-    kill "$KP_PID" 2>/dev/null || true
+  # shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
+  KP_PIDS=($(lsof -ti tcp:"$kp" 2>/dev/null || true))
+  if [ "${#KP_PIDS[@]}" -gt 0 ]; then
+    echo "[reset]   killing konnectivity-server on port $kp (PID(s): ${KP_PIDS[*]})"
+    kill "${KP_PIDS[@]}" 2>/dev/null || true
   fi
 done
 
