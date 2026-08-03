@@ -2031,6 +2031,9 @@ fn gen_pod_status_to_json(status: core_v1::PodStatus) -> serde_json::Value {
     if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
         m.insert("phase".to_string(), serde_json::Value::String(v));
     }
+    if let Some(v) = status.observed_generation.filter(|&v| v != 0) {
+        m.insert("observedGeneration".to_string(), v.into());
+    }
     if !status.conditions.is_empty() {
         let conditions: Vec<serde_json::Value> = status
             .conditions
@@ -3280,6 +3283,40 @@ mod tests {
             false_count, 2,
             "both Ready and ContainersReady must decode with status=False — a caller \
              replacing pod status via protobuf must see its own write reflected back"
+        );
+    }
+
+    /// Pod status.observedGeneration (top-level, distinct from the per-condition field)
+    /// survives the generated-path decode.
+    ///
+    /// Controllers watching PodStatus use this to tell whether a status reflects the
+    /// latest spec generation. Without it, a protobuf `UpdateStatus` call always reports
+    /// back observedGeneration=0, so callers can never confirm their status write was
+    /// based on the generation they intended.
+    #[test]
+    fn generated_pod_preserves_status_observed_generation() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("pod-test".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::PodStatus {
+                phase: Some("Running".to_string()),
+                observed_generation: Some(7),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).expect("prost encode must succeed");
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with status must decode via generated path");
+
+        assert_eq!(
+            result["status"]["observedGeneration"], 7,
+            "status.observedGeneration must survive"
         );
     }
 
