@@ -1302,10 +1302,25 @@ pub fn resource_fits(
         })
 }
 
-/// Select the first node from `list` that qualifies for `pod`
-/// (see `node_qualifies_for_pod`) AND that has at least one free pod slot AND
-/// enough uncommitted cpu/memory/ephemeral-storage/extended resources to fit
-/// `pod.requests` (NodeResourcesFit).
+/// Among every node in `list` that qualifies for `pod` (see
+/// `node_qualifies_for_pod`) AND has at least one free pod slot AND enough
+/// uncommitted cpu/memory/ephemeral-storage/extended resources to fit
+/// `pod.requests` (NodeResourcesFit), select the LEAST LOADED one.
+///
+/// "Least loaded" ranks primarily by tallied pod count, then (as a tie-break
+/// only) by tallied cpu/memory/ephemeral-storage requests. Pod count must lead
+/// the ranking, not requests alone: BestEffort pods (the overwhelming
+/// majority of e2e/conformance test workloads) request nothing, so a
+/// requests-only comparison sees every qualifying node tied at zero and can
+/// never break the tie. Before this ranking existed, `find` just returned the
+/// first qualifying node, so every request-less pod deterministically piled
+/// onto whichever node sorted first in `list` — confirmed live in a 2-node
+/// conformance run where the second node carried exactly one pod (a mandatory
+/// per-node system daemon) for the run's entire duration while the first
+/// carried the whole test fleet, eventually OOM-killing it. Ranking by pod
+/// count directly spreads that BestEffort majority; the request-based
+/// tie-break still matters for nodes with equal pod counts but different
+/// committed load.
 ///
 /// `node_usage` maps node name → current non-terminated pod count and summed
 /// resource requests, as computed by `NodeTally::usage_by_node`.  If a node's
@@ -1326,25 +1341,40 @@ pub fn select_node_with_capacity(
     pod: &PendingPod,
     node_usage: &std::collections::HashMap<String, NodeUsage>,
 ) -> anyhow::Result<String> {
-    let found = list.items.into_iter().find(|n| {
-        if !node_qualifies_for_pod(n, pod) {
-            return false;
-        }
-        let usage = node_usage
-            .get(&n.metadata.name)
-            .cloned()
-            .unwrap_or_default();
-        // Resolve pod-count capacity: prefer allocatable, fall back to capacity.
-        let cap_str = if !n.status.allocatable.pods.is_empty() {
-            &n.status.allocatable.pods
-        } else {
-            &n.status.capacity.pods
-        };
-        let cap = parse_pod_capacity(cap_str);
-        if cap != 0 && usage.pod_count >= cap {
-            return false;
-        }
-        resource_fits(&n.status.allocatable, &usage.requests, &pod.requests)
+    let usage_of = |name: &str| node_usage.get(name).cloned().unwrap_or_default();
+    let candidates: Vec<NodeItem> = list
+        .items
+        .into_iter()
+        .filter(|n| {
+            if !node_qualifies_for_pod(n, pod) {
+                return false;
+            }
+            let usage = usage_of(&n.metadata.name);
+            // Resolve pod-count capacity: prefer allocatable, fall back to capacity.
+            let cap_str = if !n.status.allocatable.pods.is_empty() {
+                &n.status.allocatable.pods
+            } else {
+                &n.status.capacity.pods
+            };
+            let cap = parse_pod_capacity(cap_str);
+            if cap != 0 && usage.pod_count >= cap {
+                return false;
+            }
+            resource_fits(&n.status.allocatable, &usage.requests, &pod.requests)
+        })
+        .collect();
+    // `min_by_key` returns the FIRST minimal element on a tie, preserving
+    // `list`'s original order as the final tie-break — the same order the old
+    // first-fit `.find()` used, so a single qualifying node (or several tied
+    // on both pod count and requests) behaves exactly as before.
+    let found = candidates.into_iter().min_by_key(|n| {
+        let usage = usage_of(&n.metadata.name);
+        (
+            usage.pod_count,
+            usage.requests.cpu_milli,
+            usage.requests.memory_milli,
+            usage.requests.ephemeral_storage_milli,
+        )
     });
     found.map(|n| n.metadata.name).context(
         "no node satisfies the pod's nodeSelector/tolerations with free pod/resource capacity (NodeResourcesFit)",
@@ -1668,10 +1698,11 @@ pub enum PickNodeError {
     ApiError(#[from] anyhow::Error),
 }
 
-/// Return the name of the first node that qualifies for `pod`
-/// (see `node_qualifies_for_pod`), has at least one free pod slot, and has
-/// enough uncommitted cpu/memory/ephemeral-storage for `pod.requests`
-/// (NodeResourcesFit predicate). On success, atomically reserves `pod` on
+/// Return the name of the least-loaded node that qualifies for `pod`
+/// (see `select_node_with_capacity`): it must qualify (`node_qualifies_for_pod`),
+/// have at least one free pod slot, and have enough uncommitted
+/// cpu/memory/ephemeral-storage for `pod.requests` (NodeResourcesFit
+/// predicate). On success, atomically reserves `pod` on
 /// the chosen node in `tally` (see `NodeTally::assume`) before returning it.
 ///
 /// Fetches the node list from the API server; per-node usage comes from
@@ -4418,6 +4449,88 @@ mod tests {
             result.unwrap(),
             "worker-free",
             "must skip the full node and pick the one with free capacity"
+        );
+    }
+
+    /// When two nodes both qualify and both have free capacity, the LESS
+    /// LOADED one (fewer tallied pods) must be picked, even though it sorts
+    /// second in `list` — reverting to the old first-fit `.find()` would pick
+    /// "worker-busy" here purely because it happens to come first, exactly
+    /// the bug that piled every pod onto one node in a real 2-node cluster.
+    #[test]
+    fn select_node_with_capacity_prefers_least_loaded_node_among_qualifying_nodes() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity("worker-busy", &[], "110"),
+                make_node_with_capacity("worker-idle", &[], "110"),
+            ],
+        };
+        let pod = empty_pending_pod();
+        let counts: std::collections::HashMap<String, NodeUsage> = [
+            ("worker-busy".to_owned(), usage_with_pod_count(5)),
+            ("worker-idle".to_owned(), usage_with_pod_count(1)),
+        ]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_eq!(
+            result.unwrap(),
+            "worker-idle",
+            "the node with fewer tallied pods must be preferred over the one \
+             listed first — otherwise a busier node keeps accumulating pods \
+             just because of list order"
+        );
+    }
+
+    /// The exact live-reproduced regression this scoring exists to fix: a run
+    /// of BestEffort (zero-request) pods — the overwhelming majority of
+    /// e2e/conformance workloads — scheduled one at a time via
+    /// `select_node_with_capacity` + `NodeTally::assume`, mirroring
+    /// `select_and_reserve_node`'s real call pattern. Since every pod here
+    /// requests nothing, `resource_fits` is a permanent no-op (0+0 always
+    /// fits) for both nodes on every iteration — pod count is the ONLY signal
+    /// that can ever break the tie. Before this fix, `.find()` returned
+    /// whichever node sorted first in `list` every single time, so all 10
+    /// pods landed on "lima-node" and "lima-node-3" carried zero of them —
+    /// the exact shape of the live 2-node conformance run where one node ran
+    /// the whole test fleet (eventually OOM-killing it) while the other sat
+    /// idle with only its mandatory system daemon.
+    #[test]
+    fn select_node_with_capacity_spreads_besteffort_pods_by_tallied_pod_count() {
+        let mut tally = NodeTally::default();
+
+        for i in 0..10 {
+            let list = NodeList {
+                items: vec![
+                    make_node_with_capacity("lima-node", &[], "110"),
+                    make_node_with_capacity("lima-node-3", &[], "110"),
+                ],
+            };
+            let pod = empty_pending_pod(); // BestEffort: zero cpu/memory/ephemeral requests
+            let usage = tally.usage_by_node();
+            let chosen = select_node_with_capacity(list, &pod, &usage)
+                .unwrap_or_else(|e| panic!("pod {i} failed to schedule: {e}"));
+            tally.assume(
+                "default",
+                &format!("besteffort-{i}"),
+                &chosen,
+                0,
+                ResourceRequests::default(),
+            );
+        }
+
+        let usage = tally.usage_by_node();
+        assert_eq!(
+            usage.get("lima-node").map(|u| u.pod_count).unwrap_or(0),
+            5,
+            "10 BestEffort pods scheduled one at a time must split 5/5 across \
+             two equally-qualifying nodes, not all pile onto the first"
+        );
+        assert_eq!(
+            usage.get("lima-node-3").map(|u| u.pod_count).unwrap_or(0),
+            5,
+            "lima-node-3 must receive its fair share of BestEffort pods — a \
+             count of 0 here reproduces the live incident where the second \
+             node never got used at all"
         );
     }
 
