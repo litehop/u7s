@@ -6,7 +6,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, Mutex};
 
-const RING_CAPACITY: usize = 1000;
+/// Observed 16-way conformance load cycles through ~36 cluster-wide writes/sec (see
+/// ai/findings/watch-ring-redesign-scoping-2026-08-03.md). At the old value of 1000, the
+/// ring fully turns over in well under a minute, which is shorter than the gap a client can
+/// see between its LIST call and opening the follow-up watch — that gap alone was enough to
+/// trigger spurious HTTP 410 "too old resource version" failures (e.g. the [sig-apps]
+/// StatefulSet status-endpoints conformance test). 100_000 gives ~46 minutes of retention at
+/// the observed rate, a wide safety margin over any realistic LIST-to-Watch latency, at an
+/// acceptable memory cost (~100-200MB for a typical Pod/Lease-heavy mix). This ring is still
+/// global across all resource types (per-resource-type sharding is tracked separately), so a
+/// single busy resource type can still evict a quiet one's history — just with 100x more
+/// headroom before it does.
+const RING_CAPACITY: usize = 100_000;
 const BROADCAST_CAPACITY: usize = 2048;
 
 /// Deletion-log storage: `by_key` gives O(1) lookup for evict-on-recreate and the
@@ -1955,6 +1966,104 @@ mod tests {
             "field-selector list by namespace=prod must return 1 pod; returning 0 means the \
              ns indexed column was not correctly populated by the single-parse put path, \
              breaking all namespace-scoped list queries"
+        );
+    }
+
+    /// RING_CAPACITY must retain many times more than the old 1000-entry window that
+    /// reliably triggered premature HTTP 410s under 16-way conformance load.
+    ///
+    /// Why it matters: this is the actual regression mayor-jzlon fixes. At the old
+    /// RING_CAPACITY=1000 and the observed ~36 events/sec cluster-wide write rate under
+    /// 16-way conformance, 5000 writes (5x the old capacity) would have evicted 4000 of them,
+    /// advancing compaction_horizon well past zero — exactly the premature-eviction window
+    /// that made a client's LIST-captured resourceVersion go stale by the time it opened the
+    /// follow-up watch (e.g. the [sig-apps] StatefulSet status-endpoints conformance test).
+    /// This test MUST fail if RING_CAPACITY is ever reverted toward 1000: compaction_horizon
+    /// would advance off zero and the ring would shrink to the old cap instead of holding all
+    /// 5000 events.
+    #[tokio::test]
+    async fn ring_capacity_retains_far_more_than_the_old_1000_entry_window() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // 5x the OLD RING_CAPACITY (1000) — deliberately not derived from the RING_CAPACITY
+        // constant itself, so this assertion is anchored to the old buggy value rather than
+        // trivially passing at whatever RING_CAPACITY happens to be set to.
+        const PAST_OLD_CAPACITY: u64 = 5_000;
+        for i in 0..PAST_OLD_CAPACITY {
+            store.push_event(Arc::new(InternalEvent {
+                key: format!("/registry/core/configmaps/default/cm-{i}"),
+                revision: i + 1,
+                value: Some(svc_value(&format!("cm-{i}"), i + 1)),
+                is_create: true,
+                deleted_body: None,
+            }));
+        }
+
+        assert_eq!(
+            store.compaction_horizon(),
+            0,
+            "compaction_horizon must still be 0 after only 5000 writes — 5x the OLD \
+             RING_CAPACITY of 1000, which is well within a single-digit-second burst under \
+             16-way conformance load; a nonzero horizon here means the ring is evicting far \
+             too early again, reintroducing the premature-410 bug mayor-jzlon fixes"
+        );
+        let guard = store.ring.read().expect("ring poisoned");
+        assert_eq!(
+            guard.len(),
+            PAST_OLD_CAPACITY as usize,
+            "the ring must retain all 5000 events — at the old RING_CAPACITY=1000 only the \
+             most recent 1000 would survive, silently dropping the other 4000 from watch replay"
+        );
+    }
+
+    /// The ring buffer must cap at exactly RING_CAPACITY entries and advance
+    /// compaction_horizon to the revision of the new oldest entry every time it evicts.
+    ///
+    /// Why it matters: this is the invariant the mayor-jzlon 1000 -> 100_000 RING_CAPACITY
+    /// bump depends on — watch-history retention scales directly with RING_CAPACITY (100k
+    /// entries at the observed ~36 events/sec cluster-wide 16-way-conformance rate gives
+    /// ~46 minutes of retention). If a future change to `push_event_locked` let the ring grow
+    /// past RING_CAPACITY unboundedly, memory would grow without bound on a long-running
+    /// server; if eviction fired but `compaction_horizon` failed to advance to match, watchers
+    /// requesting an already-evicted resourceVersion would silently replay from a
+    /// too-generous horizon instead of getting an immediate HTTP 410, and would miss events
+    /// that were actually dropped.
+    #[tokio::test]
+    async fn ring_buffer_caps_at_ring_capacity_and_advances_horizon_on_evict() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Push exactly RING_CAPACITY + 1 events so eviction fires exactly once, on the final
+        // push. Revisions are assigned 1..=RING_CAPACITY+1 in insertion order.
+        for i in 0..=RING_CAPACITY as u64 {
+            store.push_event(Arc::new(InternalEvent {
+                key: format!("/registry/core/configmaps/default/cm-{i}"),
+                revision: i + 1,
+                value: Some(svc_value(&format!("cm-{i}"), i + 1)),
+                is_create: true,
+                deleted_body: None,
+            }));
+        }
+
+        {
+            let guard = store.ring.read().expect("ring poisoned");
+            assert_eq!(
+                guard.len(),
+                RING_CAPACITY,
+                "ring must cap at exactly RING_CAPACITY entries after RING_CAPACITY+1 pushes; \
+                 growing past this means the 100_000-entry retention budget (and its ~100-200MB \
+                 memory estimate) no longer holds, and the ring would grow unboundedly on a \
+                 long-running server"
+            );
+        }
+
+        assert_eq!(
+            store.compaction_horizon(),
+            2,
+            "evicting the oldest entry (revision=1) must advance compaction_horizon to the \
+             revision of the new oldest entry (revision=2); a stale horizon would let a watcher \
+             request a resourceVersion whose event was actually evicted from the ring, causing \
+             it to silently miss events instead of getting an immediate HTTP 410 telling it to \
+             relist"
         );
     }
 
