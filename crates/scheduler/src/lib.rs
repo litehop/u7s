@@ -971,8 +971,17 @@ impl PreemptionWaiters {
         ready
     }
 
-    fn clear(&mut self) {
-        self.plans.clear();
+    /// Drop every waiting plan, returning each abandoned plan's pod key
+    /// ("namespace/name") so the caller (`NodeTally::clear`, then `main.rs`)
+    /// can release it from `in_flight` too — a plan dropped here can never
+    /// resolve via `resolve` any more, so nothing else would ever clear that
+    /// pod's dedup entry, permanently stranding it as "already being
+    /// scheduled" even though nothing is scheduling it any more.
+    fn clear(&mut self) -> Vec<String> {
+        self.plans
+            .drain(..)
+            .map(|p| format!("{}/{}", p.pod.namespace, p.pod.pod_name))
+            .collect()
     }
 }
 
@@ -1134,10 +1143,18 @@ impl NodeTally {
     /// — see `PreemptionWaiters`'s doc comment for why losing it costs only
     /// latency (the periodic resync re-plans the still-Pending pod from
     /// scratch), never correctness.
-    pub fn clear(&mut self) {
+    ///
+    /// Returns the "namespace/name" key of each abandoned plan's pod —
+    /// `main.rs` holds that key in `in_flight` for the plan's entire
+    /// preempt-then-wait lifetime (see `attempt_deferred_bind`), and since a
+    /// dropped plan can never reach that function's own release point any
+    /// more, the caller here must release it instead, or the pod would stay
+    /// wrongly deduped forever.
+    #[must_use]
+    pub fn clear(&mut self) -> Vec<String> {
         self.pods.clear();
         self.reserved_victims.clear();
-        self.waiters.clear();
+        self.waiters.clear()
     }
 
     /// Defer `pod`'s bind to `node_name` until every one of `victims` has a
@@ -5156,6 +5173,37 @@ mod tests {
             after_second.len(),
             1,
             "the plan must resolve once the LAST awaited victim is confirmed gone"
+        );
+    }
+
+    /// `main.rs` now holds a pod's `in_flight` dedup key reserved for the
+    /// whole preempt-then-wait sequence a registered waiter represents (see
+    /// `attempt_deferred_bind`'s doc comment) — so if a watch reconnect drops
+    /// that waiter here before it ever resolves, `clear` MUST hand back its
+    /// pod key so `main.rs` can release `in_flight` too. Without this, a pod
+    /// whose deferred bind was abandoned this way would stay wrongly deduped
+    /// as "already being scheduled" forever, even though nothing is
+    /// scheduling it any more — a stuck-forever pod, worse than the race this
+    /// whole in_flight-retention fix closes.
+    #[test]
+    fn node_tally_clear_returns_abandoned_waiters_pod_keys() {
+        let mut tally = NodeTally::default();
+        let mut preemptor = empty_pending_pod();
+        preemptor.pod_name = "preemptor-pod".to_owned();
+        tally.register_preemption_waiter(
+            preemptor,
+            "worker-0".to_owned(),
+            &["default/victim".to_owned()],
+        );
+
+        let abandoned = tally.clear();
+
+        assert_eq!(
+            abandoned,
+            vec!["default/preemptor-pod".to_owned()],
+            "clear must report every waiting plan's pod key it just dropped, so the caller \
+             can release it from in_flight — losing this silently strands that pod as \
+             permanently deduped"
         );
     }
 
