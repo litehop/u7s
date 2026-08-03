@@ -357,6 +357,29 @@ pub(crate) async fn replace_namespace<S: Store>(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+    let key = cluster_object_key("namespaces", &name);
+
+    // Namespace has a dedicated /status subresource (has_status_subresource=true, see
+    // patch_namespace below) — a plain PUT to this main endpoint must not let the client's
+    // body (a stale client-go cache, a metadata-only kubectl replace, ...) clobber
+    // status.phase/status.conditions that the real namespace controller last wrote via
+    // /status. Mirrors replace_pod's stored_status handling and the generic
+    // replace_namespaced_resource in resource.rs.
+    let stored_status = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok())
+        .map(|v| v["status"].clone());
+    match stored_status {
+        Some(ref s) if !s.is_null() => {
+            obj.body["status"] = s.clone();
+        }
+        _ => {
+            obj.body.as_object_mut().map(|m| m.remove("status"));
+        }
+    }
 
     // Post-replace: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let replace_meta: ObjectMeta =
@@ -370,7 +393,6 @@ pub(crate) async fn replace_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
 
-    let key = cluster_object_key("namespaces", &name);
     if deletion_ts_set && finalizers_empty {
         state
             .store
@@ -1606,6 +1628,186 @@ mod tests {
         assert_eq!(
             body["metadata"]["labels"]["env"], "prod",
             "replace must persist the updated labels"
+        );
+    }
+
+    // A plain PUT to the main /namespaces endpoint must never let the client body's
+    // `.status` clobber the server's stored status: status is owned by the dedicated
+    // `/status` subresource (see put_namespace_status), and any client holding a locally
+    // cached copy (client-go Update(), kubectl replace, a controller's informer cache)
+    // commonly carries stale status.phase. Regression this guards against: the real
+    // namespace controller sets status.phase=Terminating via /status mid-drain, then a
+    // concurrent metadata-only PUT from a client still holding an Active snapshot would
+    // silently resurrect the namespace as Active — breaking the drain and letting
+    // create_namespaced_resource's Terminating-namespace rejection be bypassed. Also
+    // verifies that simply omitting `status` from the PUT body (the common case) does
+    // not wipe it either. This test fails if replace_namespace stops restoring the
+    // stored status before writing.
+    #[tokio::test]
+    async fn replace_namespace_ignores_body_status_uses_stored_status() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Set status.phase=Terminating via the /status subresource, as the real
+        // namespace controller does mid-drain.
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "status-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let rv = stored_val["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1")
+            .to_string();
+        let uid = stored_val["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "status-ns", "resourceVersion": rv },
+                "status": { "phase": "Terminating" }
+            })
+            .to_string(),
+        );
+        assert!(
+            put_namespace_status(
+                State(state.clone()),
+                Path("status-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "put_namespace_status must succeed"
+        );
+
+        // A client PUTs to the main endpoint carrying a stale/bogus status (Active) in
+        // the body — e.g. a client-go Update() built from a local cache predating the
+        // drain.
+        let fetch_rv_and_uid = |v: &serde_json::Value| {
+            (
+                v["metadata"]["resourceVersion"]
+                    .as_str()
+                    .unwrap_or("1")
+                    .to_string(),
+                v["metadata"]["uid"].as_str().unwrap_or("").to_string(),
+            )
+        };
+        let after_status = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "status-ns"))
+            .await
+            .expect("store get")
+            .expect("must exist");
+        let after_status_val: serde_json::Value =
+            serde_json::from_slice(&after_status.value).expect("parse");
+        let (rv2, uid2) = fetch_rv_and_uid(&after_status_val);
+        assert_eq!(uid2, uid, "uid must be stable across the /status write");
+
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "status-ns",
+                    "uid": uid2,
+                    "resourceVersion": rv2,
+                    "labels": { "env": "prod" }
+                },
+                "status": { "phase": "Active" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_namespace(
+                State(state.clone()),
+                Path("status-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                put_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        let after_bogus_status = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "status-ns"))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let after_bogus_val: serde_json::Value =
+            serde_json::from_slice(&after_bogus_status.value).expect("parse final");
+        assert_eq!(
+            after_bogus_val["status"]["phase"], "Terminating",
+            "PUT body status (Active) must be ignored; stored status (Terminating) set \
+             via the /status subresource must be preserved — otherwise a metadata-only \
+             PUT could silently resurrect a draining namespace as Active"
+        );
+        assert_eq!(
+            after_bogus_val["metadata"]["labels"]["env"], "prod",
+            "the PUT's actual metadata update (labels) must still apply"
+        );
+
+        // A second PUT that omits `status` entirely (the common case for a metadata-only
+        // update) must also preserve the stored status, not wipe it.
+        let (rv3, uid3) = fetch_rv_and_uid(&after_bogus_val);
+        let put_body_no_status = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "status-ns",
+                    "uid": uid3,
+                    "resourceVersion": rv3,
+                    "labels": { "env": "staging" }
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_namespace(
+                State(state.clone()),
+                Path("status-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                put_body_no_status,
+            )
+            .await
+            .is_ok(),
+            "replace without a status field must succeed"
+        );
+
+        let final_val = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "status-ns"))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let final_body: serde_json::Value =
+            serde_json::from_slice(&final_val.value).expect("parse final");
+        assert_eq!(
+            final_body["status"]["phase"], "Terminating",
+            "omitting `status` from the PUT body must not wipe the stored status either"
         );
     }
 
