@@ -981,7 +981,7 @@ pub async fn put_crd_status<S: Store>(
         }
     }
 
-    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body);
+    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -1052,7 +1052,7 @@ pub async fn patch_crd_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch);
+            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, KIND);
         }
     }
 

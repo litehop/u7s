@@ -2369,7 +2369,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
 
     current_obj.body["status"] = incoming["status"].clone();
 
-    crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming);
+    crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
 
     // CAS on the INCOMING body's resourceVersion, not the stored object's: a client
     // holding a stale snapshot must get 409 and retry, not silently clobber a concurrent
@@ -2482,7 +2482,7 @@ pub(crate) fn apply_status_patch(
     // finalizer), so without this guard every kubelet status update would restore the
     // finalizer that KCM just removed, causing a livelock where the finalizer is never
     // permanently removed and pods stay Terminating forever.
-    crate::handlers::status::merge_incoming_metadata(&mut result, patch);
+    crate::handlers::status::merge_incoming_metadata(&mut result, patch, "Pod");
 
     // Enforce hostNetwork invariant: a pod sharing the host network namespace has
     // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets

@@ -654,7 +654,11 @@ pub(crate) async fn put_namespace_status<S: Store>(
         }
     }
 
-    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body);
+    crate::handlers::status::merge_incoming_metadata(
+        &mut current.body,
+        &incoming.body,
+        "Namespace",
+    );
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -726,7 +730,11 @@ pub(crate) async fn patch_namespace_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch);
+            crate::handlers::status::merge_incoming_metadata(
+                &mut current.body,
+                &patch,
+                "Namespace",
+            );
         }
     }
 

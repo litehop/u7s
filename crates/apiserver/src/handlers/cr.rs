@@ -3094,7 +3094,7 @@ pub async fn put_cr_status<S: Store>(
         }
     }
 
-    crate::handlers::status::merge_incoming_metadata(&mut current, &incoming);
+    crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
 
     let incoming_meta: crate::types::ObjectMeta =
         serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();

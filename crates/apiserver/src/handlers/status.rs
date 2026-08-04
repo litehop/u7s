@@ -36,12 +36,22 @@ use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 /// unprotected: CronJob and other controllers rely on setting annotations via /status, and
 /// annotations do not gate policy the way labels do.
 ///
+/// `Node` is the one built-in exception to the `labels` rule: upstream's
+/// `nodeStatusStrategy.PrepareForUpdate` (pkg/registry/core/node/strategy.go) only resets
+/// `.spec` on a status update and deliberately leaves labels alone, because kubelet holds
+/// only `nodes/status` RBAC and relies on exactly this path (`nodeinfomanager.go`'s
+/// `updateNode`/`PatchNodeStatus`) to publish arch/os labels and CSI topology labels.
+/// Protecting labels here for Node silently drops those labels and breaks CSI
+/// topology-aware provisioning: the external-provisioner sidecar can never find a node
+/// carrying the driver's topology key, so PVCs never leave Pending.
+///
 /// Restore semantics: if the field was absent (null) in the stored object, the field is
 /// removed after merge even if the incoming body added it. If it was present, it is
 /// restored to its stored value unconditionally.
 pub(crate) fn merge_incoming_metadata(
     current: &mut serde_json::Value,
     incoming: &serde_json::Value,
+    kind: &str,
 ) {
     let incoming_meta = &incoming["metadata"];
     if !incoming_meta.is_object() {
@@ -60,6 +70,7 @@ pub(crate) fn merge_incoming_metadata(
     ];
     let saved: Vec<(&str, serde_json::Value)> = PROTECTED
         .iter()
+        .filter(|&&k| !(kind == "Node" && k == "labels"))
         .map(|&k| (k, current["metadata"][k].clone()))
         .collect();
 
@@ -125,7 +136,7 @@ pub async fn put_resource_status<S: Store>(
             current.body["status"] = v.clone();
         }
     }
-    merge_incoming_metadata(&mut current.body, &incoming.body);
+    merge_incoming_metadata(&mut current.body, &incoming.body, &meta.kind);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -193,7 +204,7 @@ pub async fn patch_resource_status<S: Store>(
                     }
                 }
             }
-            merge_incoming_metadata(&mut current.body, &patch);
+            merge_incoming_metadata(&mut current.body, &patch, &meta.kind);
         }
     }
 
@@ -278,7 +289,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
             current.body["status"] = v.clone();
         }
     }
-    merge_incoming_metadata(&mut current.body, &incoming.body);
+    merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
@@ -366,7 +377,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
                     }
                 }
             }
-            merge_incoming_metadata(&mut current.body, &patch);
+            merge_incoming_metadata(&mut current.body, &patch, &kind);
         }
     }
 
@@ -2462,6 +2473,74 @@ mod tests {
         );
         assert_eq!(
             v["status"]["lastScheduleTime"], "2024-01-01T00:00:00Z",
+            "the legitimate status change in the same patch must still apply"
+        );
+    }
+
+    /// Unlike every other kind, a merge-patch to `/api/v1/nodes/{name}/status` MUST apply
+    /// `metadata.labels`. kubelet holds only `nodes/status` RBAC (never bare `nodes` write
+    /// access) and relies on exactly this path — upstream's `nodeinfomanager.go` calls
+    /// `PatchNodeStatus`, which bundles a labels change into a status-subresource patch —
+    /// to publish CSI topology labels once a driver registers. If this endpoint dropped
+    /// labels the way the generic protection above does for every other resource, the
+    /// external-provisioner sidecar could never find a node carrying the driver's topology
+    /// key, so every PVC using that storage class would stay Pending forever (confirmed via
+    /// a live conformance repro: CSINode.spec.drivers populated correctly, but the Node
+    /// object's labels never gained the topology key, and `external-provisioner` logged
+    /// "topologyKeys ... were not found on any nodes" for the full 5-minute bind wait).
+    #[tokio::test]
+    async fn patch_resource_status_merge_patch_allows_metadata_labels_for_node() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-1", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        let key = "/registry/nodes/worker-1";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "metadata": { "labels": { "topology.hostpath.csi/node": "worker-1" } },
+            "status": { "nodeInfo": { "architecture": "arm64" } }
+        });
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path(("".into(), "v1".into(), "nodes".into(), "worker-1".into())),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a merge-patch to node/status must still succeed"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["labels"]["topology.hostpath.csi/node"], "worker-1",
+            "CSI topology labels published via node/status must persist — kubelet has no \
+             other RBAC-permitted way to set them, and without this label \
+             external-provisioner can never bind a PVC to this node's storage class"
+        );
+        assert_eq!(
+            v["status"]["nodeInfo"]["architecture"], "arm64",
             "the legitimate status change in the same patch must still apply"
         );
     }

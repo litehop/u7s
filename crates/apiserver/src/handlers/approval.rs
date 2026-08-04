@@ -71,7 +71,7 @@ pub async fn put_approval<S: Store>(
     // status.certificate. kubectl certificate approve/deny sends the whole object back,
     // and clients (e.g. this conformance test) also PATCH/PUT annotations via /approval.
     merge_approval_conditions(&mut current, &incoming);
-    merge_incoming_metadata(&mut current.body, &incoming.body);
+    merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
 
     let new_rv = state
         .store
@@ -157,7 +157,7 @@ pub async fn patch_approval<S: Store>(
             }
             // Merge metadata (labels/annotations) from the patch — kubectl certificate
             // approve/deny and this conformance test also patch annotations via /approval.
-            merge_incoming_metadata(&mut current.body, &patch);
+            merge_incoming_metadata(&mut current.body, &patch, KIND);
         }
     }
 
