@@ -846,18 +846,20 @@ pub(crate) async fn delete_collection_pods<S: Store>(
             }
 
             // Mirror delete_pod's soft/hard-delete decision instead of always hard-deleting:
-            // a pod already Terminating with no finalizers left hard-deletes, every other pod
-            // (not yet Terminating, or still holding a finalizer) is soft-deleted so its
-            // kubelet/finalizer-owning controller observes deletionTimestamp instead of the
-            // pod vanishing outright. The real KCM namespace-controller drains pods via
-            // exactly this endpoint (DeleteCollection) during OrderedNamespaceDeletion —
-            // unconditionally hard-deleting here would silently bypass every pod's
-            // finalizers.
+            // a pod already Terminating (or force-deleted with an explicit gracePeriodSeconds=0)
+            // with no finalizers left hard-deletes, every other pod (not yet Terminating and not
+            // forced, or still holding a finalizer) is soft-deleted so its kubelet/finalizer-owning
+            // controller observes deletionTimestamp instead of the pod vanishing outright. The real
+            // KCM namespace-controller drains pods via exactly this endpoint (DeleteCollection)
+            // during OrderedNamespaceDeletion — unconditionally hard-deleting here would silently
+            // bypass every pod's finalizers.
             let meta: ObjectMeta =
                 serde_json::from_value(parsed["metadata"].clone()).unwrap_or_default();
             let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
             let already_terminating = meta.deletion_timestamp.is_some();
-            if !already_terminating || has_finalizers {
+            let force_requested = requested_grace == Some(0);
+            let hard_delete_now = !has_finalizers && (already_terminating || force_requested);
+            if !hard_delete_now {
                 let mut updated = parsed;
                 let grace = effective_grace_period_seconds(requested_grace, &updated);
                 updated["metadata"]["deletionTimestamp"] =
@@ -948,18 +950,30 @@ pub(crate) async fn delete_pod<S: Store>(
             serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
         let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
         let already_terminating = meta.deletion_timestamp.is_some();
+        // `kubectl delete --grace-period=0 --force` sends an explicit gracePeriodSeconds=0 —
+        // the caller has accepted the documented "may continue running on the cluster
+        // indefinitely" warning and wants the object gone now, not once some other actor
+        // confirms it's safe. Without this, a pod scheduled onto a node whose kubelet died
+        // before creating any container (or a node that has otherwise gone dark) stays
+        // soft-deleted forever: nothing ever sends the confirming second DELETE, since
+        // node-lifecycle-controller (the only thing that would evict its pods) is disabled in
+        // this deployment.
+        let force_requested = requested_grace == Some(0);
 
         // Real Kubernetes apiserver always soft-deletes pods first (sets deletionTimestamp)
         // so the kubelet receives a MODIFIED event and gracefully terminates the container via SIGTERM.
-        // Hard-delete only when the pod is already in the Terminating state AND has no finalizers —
-        // this is the path taken when the kubelet calls DELETE a second time after stopping the container.
+        // Hard-delete when the pod is already in the Terminating state (the kubelet calling DELETE
+        // a second time after stopping the container) or the caller explicitly forced an immediate
+        // delete — in both cases only if no finalizers are blocking it.
         //
-        // Without this: pods are immediately hard-deleted, the kubelet only receives a DELETED event
+        // Without the "already terminating" half: pods are immediately hard-deleted on a routine
+        // `kubectl delete pod` (no explicit grace period), the kubelet only receives a DELETED event
         // with a minimal tombstone (no spec), and the container is never sent SIGTERM — it keeps
         // running indefinitely while the StatefulSet controller waits for the pod to terminate.
-        if already_terminating && !has_finalizers {
-            // Hard-delete: pod is already Terminating and all finalizers are gone. No
-            // resourceVersion precondition is passed here, so this path cannot RevisionMismatch.
+        if !has_finalizers && (already_terminating || force_requested) {
+            // Hard-delete: pod is already Terminating, or the caller forced it, and all
+            // finalizers are gone. No resourceVersion precondition is passed here, so this
+            // path cannot RevisionMismatch.
             state
                 .store
                 .delete(&key, None)
@@ -9287,6 +9301,131 @@ mod handler_tests {
         );
     }
 
+    /// `kubectl delete pod --grace-period=0 --force` (explicit gracePeriodSeconds=0 in the
+    /// DeleteOptions body) on a pod with no finalizers must hard-delete on the very FIRST
+    /// DELETE call, not just stamp deletionTimestamp and wait for a second call.
+    ///
+    /// Real Kubernetes pods are normally purged by a second actor observing deletionTimestamp:
+    /// the kubelet (once it confirms no containers are running) or KCM's pod-GC/node-lifecycle
+    /// controller (for unscheduled or orphaned pods). A pod scheduled onto a node whose kubelet
+    /// died before creating any container — or a node that has otherwise gone dark — has no
+    /// such actor left, and this deployment disables node-lifecycle-controller entirely. Without
+    /// this immediate purge, `--force` cannot force anything: the object stays soft-deleted with
+    /// deletionGracePeriodSeconds=0 forever, `kubectl get pod` keeps reporting Terminating, and
+    /// downstream re-runs that try to recreate an object with the same name hit "the server
+    /// reported a conflict" on the stale copy.
+    ///
+    /// Fails on revert: reverting the `force_requested` check makes this pod only get
+    /// soft-deleted (deletionTimestamp stamped, object still present) on this single call.
+    #[tokio::test]
+    async fn delete_pod_explicit_grace_zero_without_finalizers_hard_deletes_on_first_call() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/stuck-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "stuck-pod", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": { "phase": "Pending" }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": 0
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/stuck-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "force-delete must return 200 on the first call"
+        );
+
+        let stored = store.get(key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "an explicit gracePeriodSeconds=0 delete (--grace-period=0 --force) on a pod with \
+             no finalizers must purge it immediately — waiting for a second DELETE that may \
+             never come (dead kubelet, no node-lifecycle-controller) leaves it Terminating forever"
+        );
+    }
+
+    /// `--grace-period=0 --force` must NOT bypass finalizers — only skip waiting on a
+    /// container/kubelet confirmation. A pod with a finalizer must still be soft-deleted so its
+    /// owning controller gets a chance to observe deletionTimestamp and clear the finalizer
+    /// itself; forcing removal here would let the apiserver silently violate the finalizer
+    /// contract just because a bystander client happened to pass --force.
+    #[tokio::test]
+    async fn delete_pod_explicit_grace_zero_with_finalizers_still_soft_deletes() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/finalized-forced-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-forced-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": 0
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/finalized-forced-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().expect(
+            "a finalizer'd pod must survive a forced delete — the finalizer contract \
+                     is not something --force is allowed to bypass",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must still be stamped so the finalizer-owning controller knows \
+             to act"
+        );
+    }
+
     /// DELETE a pod with finalizers must soft-delete: stamp deletionTimestamp, keep object.
     #[tokio::test]
     async fn delete_pod_with_finalizers_stamps_deletion_timestamp() {
@@ -9488,6 +9627,102 @@ mod handler_tests {
             stored_terminating.is_none(),
             "a pod already Terminating with no finalizers must be hard-deleted by \
              DeleteCollection — otherwise it lingers forever since nothing else removes it"
+        );
+    }
+
+    /// `DeleteCollection` with an explicit `gracePeriodSeconds: 0` (e.g. a cleanup script's
+    /// `kubectl delete pods --all --grace-period=0 --force`) must hard-delete a not-yet-
+    /// terminating, finalizer-free pod immediately — mirroring delete_pod's own
+    /// force_requested handling — while a finalizer'd pod is still only soft-deleted.
+    ///
+    /// Fails on revert: reverting `hard_delete_now` back to `!already_terminating ||
+    /// has_finalizers` would leave the finalizer-free pod merely soft-deleted, stuck
+    /// Terminating forever if nothing else ever confirms its removal.
+    #[tokio::test]
+    async fn delete_collection_pods_force_grace_zero_hard_deletes_finalizer_free_pods() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let plain_key = "/registry/pods/default/forced-plain-pod";
+        let plain_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "forced-plain-pod", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(
+                plain_key,
+                Bytes::from(serde_json::to_vec(&plain_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let finalized_key = "/registry/pods/default/forced-finalized-pod";
+        let finalized_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "forced-finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(
+                finalized_key,
+                Bytes::from(serde_json::to_vec(&finalized_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods",
+                delete(delete_collection_pods),
+            )
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let delete_opts = serde_json::json!({
+            "kind": "DeleteOptions",
+            "apiVersion": "v1",
+            "gracePeriodSeconds": 0
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&delete_opts))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored_plain = store.get(plain_key).await.unwrap();
+        assert!(
+            stored_plain.is_none(),
+            "a finalizer-free pod must be hard-deleted by a force (gracePeriodSeconds=0) \
+             DeleteCollection immediately, not left soft-deleted waiting on a confirmation \
+             that may never come"
+        );
+
+        let stored_finalized = store
+            .get(finalized_key)
+            .await
+            .unwrap()
+            .expect("a finalizer'd pod must survive a forced DeleteCollection");
+        let finalized_body: serde_json::Value =
+            serde_json::from_slice(&stored_finalized.value).unwrap();
+        assert!(
+            finalized_body["metadata"]["deletionTimestamp"].is_string(),
+            "finalizer'd pod must still have deletionTimestamp stamped even under --force"
         );
     }
 
