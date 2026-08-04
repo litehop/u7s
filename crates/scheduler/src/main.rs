@@ -25,25 +25,31 @@ use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
-    failed_scheduling_status_patch, fetch_node, find_preemption_plan, http_get, needs_scheduling,
-    nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
-    preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
+    failed_scheduling_status_patch, fetch_node, find_preemption_plan, http_get,
+    is_bind_already_assigned, needs_scheduling, nominated_node_name_patch, patch_pod_status,
+    pick_node, pods_needing_resync, preemption_reservation_still_fits,
+    scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
-    stream_watch_events, NodeTally, PendingPod, PodList,
+    stream_watch_events, BindError, NodeTally, PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
 /// `tally` atomically with its fit check (see `pick_node`'s doc comment for
 /// why the reservation must not happen in a second, later lock acquisition
 /// here instead). Rolls the reservation back if the bind itself fails, so a
-/// failed bind never permanently overcounts `node`'s tallied usage.
+/// failed bind never permanently overcounts `node`'s tallied usage — UNLESS
+/// the bind was rejected as `BindError::AlreadyAssigned`: that means an
+/// EARLIER, successful bind of this exact pod already claimed this
+/// reservation, so it is already correct and must be left alone (removing it
+/// here would under-count `node`'s real usage for a pod that is actually
+/// running fine).
 async fn bind_reserved_node(
     connector: &TlsConnector,
     server: &str,
     tally: &Mutex<NodeTally>,
     pending: &PendingPod,
     node: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), BindError> {
     if let Err(e) = bind_pod(
         connector,
         server,
@@ -53,10 +59,12 @@ async fn bind_reserved_node(
     )
     .await
     {
-        tally
-            .lock()
-            .expect("tally lock poisoned")
-            .remove(&pending.namespace, &pending.pod_name);
+        if !is_bind_already_assigned(&e) {
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .remove(&pending.namespace, &pending.pod_name);
+        }
         return Err(e);
     }
     Ok(())
@@ -97,6 +105,12 @@ enum PreemptionFailure {
 /// the pod. `Skipped` and `Done` both represent an attempt that made no
 /// lasting commitment beyond this point (a transient retry, or an outcome
 /// worth reporting), so `key` is safe to release right away for either.
+/// `Skipped` also covers a bind rejected as `BindError::AlreadyAssigned`
+/// (see `bind_reserved_node`): the pod was already correctly bound by an
+/// earlier attempt, so there is nothing left to report — no
+/// Scheduled/FailedScheduling event, no PodScheduled patch — and the pod's
+/// own `spec.nodeName` (already set from that earlier bind) keeps it out of
+/// `needs_scheduling` on every future tick anyway.
 enum SchedulingOutcome {
     Deferred,
     Skipped,
@@ -586,17 +600,27 @@ fn handle_pod_event(
                     }
                 }
             };
-            SchedulingOutcome::Done(
-                bind_reserved_node(
-                    &connector_clone,
-                    &server_clone,
-                    &tally_clone,
-                    &pending,
-                    &node,
-                )
+            match bind_reserved_node(&connector_clone, &server_clone, &tally_clone, &pending, &node)
                 .await
-                .map(|()| node),
-            )
+            {
+                Ok(()) => SchedulingOutcome::Done(Ok(node)),
+                Err(e) if is_bind_already_assigned(&e) => {
+                    // The apiserver rejected this bind because the pod is
+                    // ALREADY correctly bound (an earlier bind of this exact
+                    // pod already succeeded) — a benign no-op, not a
+                    // scheduling failure. Do not patch PodScheduled=False or
+                    // emit FailedScheduling onto a pod that is actually
+                    // running fine, and do not roll back its tally
+                    // reservation (see `bind_reserved_node`'s doc comment).
+                    info!(
+                        "bind for {key} rejected as already-assigned: {e} — pod is already \
+                         correctly bound from an earlier bind; treating as a no-op, not a \
+                         scheduling failure"
+                    );
+                    SchedulingOutcome::Skipped
+                }
+                Err(e) => SchedulingOutcome::Done(Err(e.into())),
+            }
         }
         .await;
 
@@ -1101,6 +1125,280 @@ mod tests {
             "the pod must be bound exactly once — a second successful bind means it was \
              double-scheduled onto two different nodes, corrupting both nodes' capacity \
              accounting"
+        );
+    }
+
+    // bind-outcome classification tests — before `BindError::AlreadyAssigned`
+    // existed, a bind rejected because the pod was ALREADY correctly bound
+    // (e.g. by a stray duplicate bind attempt for a pod whose earlier bind
+    // already succeeded) was folded into the exact same FailedScheduling
+    // path as a genuine bind failure: `handle_pod_event` patched
+    // PodScheduled=False, emitted FailedScheduling, and `bind_reserved_node`
+    // rolled back the tally reservation that was still correctly counting
+    // that pod's real usage — corrupting the status of a pod that was
+    // actually running fine. Both tests below drive `handle_pod_event`
+    // itself (not a reimplementation of its bind-outcome handling) against a
+    // real in-process TLS mock server, exactly as
+    // `second_scheduling_attempt_for_same_pod_is_deduped_while_first_deferred_bind_pending`
+    // above does.
+
+    /// How many times each side effect `handle_pod_event`'s bind-outcome
+    /// handling must (or must not) trigger was recorded by
+    /// `spawn_bind_outcome_mock_server` against.
+    #[derive(Default)]
+    struct BindOutcomeCounts {
+        bind: std::sync::atomic::AtomicUsize,
+        patch_status: std::sync::atomic::AtomicUsize,
+        event: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Spin up an in-process TLS mock server for the two bind-outcome tests
+    /// below: serves a single-node `/api/v1/nodes` list with `worker-0`
+    /// always having room, answers every `POST .../binding` with
+    /// `(bind_status, bind_body)`, and answers every other request with a
+    /// bare 200 OK — while recording how many `POST .../binding`,
+    /// `PATCH .../status`, and `POST .../events` calls it saw in the
+    /// returned `BindOutcomeCounts`, which is what each test asserts on.
+    async fn spawn_bind_outcome_mock_server(
+        bind_status: u16,
+        bind_body: &'static str,
+    ) -> (TlsConnector, String, Arc<BindOutcomeCounts>) {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let node_list_body = json!({
+            "items": [
+                {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}},
+            ]
+        })
+        .to_string();
+
+        let counts = Arc::new(BindOutcomeCounts::default());
+        let counts_srv = counts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let node_list_body = node_list_body.clone();
+                let counts = counts_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0usize;
+                    loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf[..total]);
+                    let request_line = request.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+
+                    let (status_line, body): (String, String) =
+                        if method == "GET" && path == "/api/v1/nodes" {
+                            ("200 OK".to_owned(), node_list_body)
+                        } else if method == "POST" && path.ends_with("/binding") {
+                            counts.bind.fetch_add(1, Ordering::SeqCst);
+                            (format!("{bind_status} bind-response"), bind_body.to_owned())
+                        } else if method == "PATCH" && path.ends_with("/status") {
+                            counts.patch_status.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK".to_owned(),
+                                r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                            )
+                        } else if method == "POST" && path.ends_with("/events") {
+                            counts.event.fetch_add(1, Ordering::SeqCst);
+                            ("201 Created".to_owned(), r#"{"kind":"Event"}"#.to_owned())
+                        } else {
+                            (
+                                "200 OK".to_owned(),
+                                r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                            )
+                        };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        (connector, server, counts)
+    }
+
+    /// One unscheduled pod, shared by both bind-outcome tests: no
+    /// schedulingGates and no existing conditions, so `pick_node` reserves
+    /// it on `worker-0` without any preemption or gating detour, isolating
+    /// the test to the bind-outcome classification itself.
+    fn bind_outcome_test_pod_event() -> serde_json::Value {
+        json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}]
+                },
+                "status": {}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn bind_rejected_as_already_assigned_is_treated_as_a_benign_no_op() {
+        use std::sync::atomic::Ordering;
+
+        // The exact 409 body the apiserver's own binding handler returns
+        // when `spec.nodeName` is already set — see
+        // `crates/apiserver/src/handlers/pods.rs`'s `bind_pod`.
+        let (connector, server, counts) = spawn_bind_outcome_mock_server(
+            409,
+            r#"{"kind":"Status","status":"Failure","message":"Pod \"web-0\" is already assigned to node \"worker-0\"","reason":"Conflict","code":409}"#,
+        )
+        .await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+
+        handle_pod_event(
+            bind_outcome_test_pod_event(),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+        wait_until(
+            || counts.bind.load(Ordering::SeqCst) >= 1,
+            "the bind attempt to reach the mock server",
+        )
+        .await;
+        // Give a would-be PodScheduled patch or FailedScheduling event (the
+        // bug this test guards against) time to fire against the mock
+        // server before asserting they never did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            counts.patch_status.load(Ordering::SeqCst),
+            0,
+            "a bind rejected because the pod is ALREADY correctly bound elsewhere must never \
+             patch PodScheduled=False — the pod's containers are actually running fine, and \
+             this exact patch is what corrupted a live conformance run's PodScheduled status"
+        );
+        assert_eq!(
+            counts.event.load(Ordering::SeqCst),
+            0,
+            "a bind rejected as already-assigned must never emit a FailedScheduling (or any \
+             other) event — nothing about this pod's scheduling actually failed"
+        );
+        assert_eq!(
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .pods_on("worker-0")
+                .len(),
+            1,
+            "the tally reservation pick_node made for this pod must survive an \
+             already-assigned bind rejection — it is already correctly counting this pod's \
+             real usage from the earlier, successful bind, so removing it here would \
+             under-count worker-0's real usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_rejected_for_another_reason_still_reports_failed_scheduling() {
+        use std::sync::atomic::Ordering;
+
+        // Regression guard for the SAME classification: a bind rejected for
+        // any OTHER reason (here, a plain 500, not the "already assigned to
+        // node" 409) must still be a genuine scheduling failure, exactly as
+        // before `BindError::AlreadyAssigned` existed. Without this test, an
+        // over-broadened classification could silently swallow a real
+        // scheduling failure too.
+        let (connector, server, counts) = spawn_bind_outcome_mock_server(
+            500,
+            r#"{"kind":"Status","status":"Failure","message":"internal error","reason":"InternalError","code":500}"#,
+        )
+        .await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+
+        handle_pod_event(
+            bind_outcome_test_pod_event(),
+            &connector,
+            &server,
+            &in_flight,
+            &tally,
+        );
+        wait_until(
+            || counts.event.load(Ordering::SeqCst) >= 1,
+            "the FailedScheduling event for a genuine bind failure",
+        )
+        .await;
+
+        assert_eq!(
+            counts.patch_status.load(Ordering::SeqCst),
+            1,
+            "a bind rejected for a genuine (non-already-assigned) reason must still patch \
+             PodScheduled=False exactly as before — weakening this path for every OTHER bind \
+             failure, not just the already-assigned no-op, would leave a truly unschedulable \
+             pod's status stuck Pending forever"
+        );
+        assert_eq!(
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .pods_on("worker-0")
+                .len(),
+            0,
+            "a genuine bind failure must still roll back its tally reservation exactly as \
+             before — otherwise worker-0's capacity accounting would overcount a pod that was \
+             never actually bound"
         );
     }
 }

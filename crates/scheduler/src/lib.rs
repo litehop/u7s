@@ -2139,17 +2139,63 @@ pub fn binding_payload(namespace: &str, pod_name: &str, node_name: &str) -> Valu
     serde_json::to_value(binding).expect("Binding is always serializable")
 }
 
-/// Check a bind response status code and body, returning Err on non-2xx.
+/// Why a bind attempt (`bind_pod`'s `POST .../binding`) failed.
 ///
-/// Extracted as a pure function so the error-returning logic can be unit-tested
-/// without network access. A non-2xx response must surface as Err so the caller
-/// can log and retry; silently returning Ok on 409 Conflict (duplicate bind) or
-/// 404 (pod gone) masks real scheduling failures.
-pub fn check_bind_response(status: u16, body: &str) -> anyhow::Result<()> {
+/// The caller must treat these very differently, mirroring
+/// `PickNodeError`'s `NoCapacity`/`ApiError` split. `AlreadyAssigned` means
+/// the apiserver's own binding handler rejected this bind with 409 Conflict
+/// specifically because `spec.nodeName` was already non-empty — this exact
+/// pod was already bound by an EARLIER, successful bind (typically a stray
+/// duplicate bind attempt for a pod that is already running fine), so it is
+/// a benign no-op: the caller must not patch `PodScheduled=False`, must not
+/// emit a `FailedScheduling` event, and must not roll back the tally
+/// reservation the original successful bind already earned — collapsing
+/// this into a genuine failure (the bug this type replaces) corrupts the
+/// status and capacity accounting of a pod that never actually had a
+/// scheduling problem. `Other` covers every other bind failure (network
+/// error, apiserver down, or a bind rejected for a genuinely different
+/// reason) and must still be treated as a real scheduling failure, exactly
+/// as before this distinction existed.
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+    #[error("{0}")]
+    AlreadyAssigned(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// True when `err` is a bind rejected because the pod was already assigned
+/// to a node — see `BindError::AlreadyAssigned`. Extracted as a pure
+/// predicate (mirroring `should_retry_without_preempting`) so the "this
+/// specific outcome is a benign no-op, not a failure" classification can be
+/// unit-tested without spinning up `handle_pod_event`'s full async task.
+pub fn is_bind_already_assigned(err: &BindError) -> bool {
+    matches!(err, BindError::AlreadyAssigned(_))
+}
+
+/// Classify a bind response status code and body, returning Err on non-2xx.
+///
+/// Extracted as a pure function so the classification logic can be
+/// unit-tested without network access. A non-2xx response must surface as
+/// Err so the caller can log and retry; silently returning Ok on 409
+/// Conflict (duplicate bind) or 404 (pod gone) masks real scheduling
+/// failures. `AlreadyAssigned` requires BOTH a 409 status AND the "already
+/// assigned to node" message the apiserver's own binding handler uses for
+/// this exact rejection (see `crates/apiserver/src/handlers/pods.rs`'s
+/// `bind_pod`) — any OTHER 409 (or any other status) must still classify as
+/// `Other`, a genuine scheduling failure worth reporting.
+pub fn check_bind_response(status: u16, body: &str) -> Result<(), BindError> {
     if (200..300).contains(&status) {
         return Ok(());
     }
-    bail!("bind failed with HTTP {status}: {body}")
+    if status == 409 && body.contains("already assigned to node") {
+        return Err(BindError::AlreadyAssigned(format!(
+            "bind rejected with HTTP 409 (pod already assigned elsewhere): {body}"
+        )));
+    }
+    Err(BindError::Other(anyhow::anyhow!(
+        "bind failed with HTTP {status}: {body}"
+    )))
 }
 
 /// Bind a pod to a node via POST .../pods/:name/binding.
@@ -2159,7 +2205,7 @@ pub async fn bind_pod(
     namespace: &str,
     pod_name: &str,
     node_name: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), BindError> {
     let path = binding_path(namespace, pod_name);
     let payload = binding_payload(namespace, pod_name, node_name);
 
@@ -2596,6 +2642,61 @@ mod tests {
         // 500 Internal Server Error must not be silently swallowed.
         let result = check_bind_response(500, "internal error");
         assert!(result.is_err(), "500 must return Err");
+    }
+
+    // check_bind_response/is_bind_already_assigned tests — a 409 whose body
+    // says the pod is "already assigned to node" means an EARLIER bind of
+    // this exact pod already succeeded; this is a benign no-op, not a
+    // scheduling failure. Before BindError existed, main.rs's caller treated
+    // this identically to any other bind failure: it patched
+    // PodScheduled=False and emitted FailedScheduling onto a pod whose
+    // containers were actually already running fine (live-reproduced against
+    // a duplicate-bind bug that periodically re-issues binds for already-
+    // bound pods once the apiserver started correctly rejecting them with
+    // 409 instead of silently accepting every duplicate).
+
+    #[test]
+    fn check_bind_response_classifies_409_already_assigned_message_as_already_assigned() {
+        let result = check_bind_response(
+            409,
+            r#"{"kind":"Status","message":"Pod \"web-0\" is already assigned to node \"worker-1\""}"#,
+        );
+        let err = result.expect_err("a 409 must still be Err, just classified differently");
+        assert!(
+            is_bind_already_assigned(&err),
+            "a 409 whose body says the pod is already assigned to a node must classify as \
+             AlreadyAssigned, not a generic bind failure — the caller relies on this to skip \
+             the PodScheduled=False patch/FailedScheduling event/tally rollback that would \
+             otherwise corrupt a pod that is actually running fine"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_does_not_classify_other_409s_as_already_assigned() {
+        // A 409 for a DIFFERENT reason (not the "already assigned to node"
+        // message) must still be a genuine failure — over-broadening the
+        // AlreadyAssigned special case here would silently swallow other
+        // conflicts the caller ought to report.
+        let result = check_bind_response(409, "AlreadyExists");
+        let err = result.expect_err("409 must still be Err");
+        assert!(
+            !is_bind_already_assigned(&err),
+            "a 409 without the already-assigned-to-node message must classify as Other, \
+             not AlreadyAssigned"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_does_not_classify_non_409_as_already_assigned() {
+        // Only a 409 with the specific message counts — any other status
+        // (even one whose body happens to mention "already assigned to
+        // node") must not take the benign no-op path.
+        let result = check_bind_response(500, "Pod is already assigned to node worker-1");
+        let err = result.expect_err("500 must still be Err");
+        assert!(
+            !is_bind_already_assigned(&err),
+            "a non-409 status must never classify as AlreadyAssigned, regardless of body text"
+        );
     }
 
     // should_retry_without_preempting tests — before PickNodeError existed, a
