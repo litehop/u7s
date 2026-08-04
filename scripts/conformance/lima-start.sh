@@ -632,13 +632,16 @@ PULLEOF
   limactl shell "$VM_NAME" sudo rm -f /tmp/kubelet-pods/kube-proxy-pull.yaml
 fi
 
-# Install ipset (required by kube-proxy IPVS mode) and conntrack (network diagnostics).
-# Both are load-bearing — failure here means kube-proxy will crashloop silently,
-# making the kubernetes Service VIP unreachable for the entire run. No output
+# Install ipset (required by kube-proxy IPVS mode), conntrack (network diagnostics), and
+# nfs-common (provides the /sbin/mount.nfs helper). All three are load-bearing — without
+# ipset/conntrack kube-proxy crashloops silently, making the kubernetes Service VIP
+# unreachable for the entire run; without nfs-common, kubelet's `mount -t nfs` fails with
+# "bad option; ... need /sbin/mount.<type> helper program" for every nfs/nfs3 driver
+# storage conformance test, even once the PV/PVC bind itself succeeds. No output
 # suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
 # if either command fails, rather than continuing with a half-provisioned VM.
 limactl shell "$VM_NAME" sudo apt-get update
-limactl shell "$VM_NAME" sudo apt-get install -y ipset conntrack
+limactl shell "$VM_NAME" sudo apt-get install -y ipset conntrack nfs-common
 
 # Load IPVS and bridge netfilter kernel modules.
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through
