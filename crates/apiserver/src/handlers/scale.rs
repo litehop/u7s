@@ -239,12 +239,16 @@ fn require_scale_resource(resource: &str) -> Result<(), crate::status::StatusErr
 /// `spec_replicas` is the desired count written by clients (HPA, kubectl scale).
 /// `status_replicas` is the actual count of pods currently managed by the controller;
 /// it may lag `spec_replicas` while pods are being created or terminated.
+/// `selector` is the workload's `spec.selector` rendered as a label selector
+/// string (see `label_selector_to_string`) — the HPA controller treats an
+/// empty selector as a hard error and never computes metrics if this is "".
 pub fn build_scale(
     name: &str,
     ns: &str,
     spec_replicas: i64,
     status_replicas: i64,
     resource_version: &str,
+    selector: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "autoscaling/v1",
@@ -255,8 +259,80 @@ pub fn build_scale(
             "resourceVersion": resource_version
         },
         "spec": { "replicas": spec_replicas },
-        "status": { "replicas": status_replicas, "selector": "" }
+        "status": { "replicas": status_replicas, "selector": selector }
     })
+}
+
+/// Serialize a workload's `spec.selector` into the label-selector string form
+/// required by the Scale subresource's `status.selector` field.
+///
+/// Upstream's HPA controller (`validateAndParseSelector`,
+/// pkg/controller/podautoscaler/horizontal.go) treats an empty selector
+/// string as a hard, unrecoverable error and never proceeds to metric
+/// collection — so an empty result here (when a real selector exists)
+/// permanently breaks HPA against this workload.
+///
+/// `spec.selector` has two on-disk shapes in this codebase (see defaults.rs):
+///   - apps/v1 workloads (Deployment/ReplicaSet/StatefulSet): the structured
+///     LabelSelector — `{"matchLabels": {...}, "matchExpressions": [...]}`.
+///   - core/v1 ReplicationController: a flat `map<string,string>`, never
+///     wrapped in matchLabels.
+///
+/// Equality terms render as `key=value`; matchExpressions render using the
+/// standard Kubernetes selector string syntax (`key In (v1,v2)`, `key
+/// NotIn (v1,v2)`, `key`, `!key`) — the same forms `parse_label_selector`
+/// (handlers/generic.rs) understands, so a selector built here round-trips
+/// through this codebase's own selector matching as well as client-go's
+/// `labels.Parse`. Terms are comma-joined; malformed entries are skipped
+/// rather than erroring, since callers only ever pass already-validated
+/// stored selector values.
+pub fn label_selector_to_string(selector: &serde_json::Value) -> String {
+    let Some(obj) = selector.as_object() else {
+        return String::new();
+    };
+
+    // Flat equality map (ReplicationController) — no matchLabels/matchExpressions keys.
+    if !obj.contains_key("matchLabels") && !obj.contains_key("matchExpressions") {
+        let mut terms: Vec<String> = obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+            .collect();
+        terms.sort();
+        return terms.join(",");
+    }
+
+    let mut terms: Vec<String> = obj
+        .get("matchLabels")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+        .collect();
+    terms.sort();
+
+    if let Some(exprs) = obj.get("matchExpressions").and_then(|v| v.as_array()) {
+        for expr in exprs {
+            let key = expr["key"].as_str().unwrap_or_default();
+            if key.is_empty() {
+                continue;
+            }
+            let values: Vec<&str> = expr["values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect();
+            match expr["operator"].as_str().unwrap_or_default() {
+                "In" => terms.push(format!("{key} In ({})", values.join(","))),
+                "NotIn" => terms.push(format!("{key} NotIn ({})", values.join(","))),
+                "Exists" => terms.push(key.to_string()),
+                "DoesNotExist" => terms.push(format!("!{key}")),
+                _ => {}
+            }
+        }
+    }
+
+    terms.join(",")
 }
 
 /// Extract spec.replicas from a stored workload object (default 0).
@@ -310,12 +386,21 @@ async fn scale_get_impl<S: Store>(
 
     let spec_replicas = extract_replicas(&obj);
     let status_replicas = extract_status_replicas(&obj);
+    let selector = label_selector_to_string(&obj["spec"]["selector"]);
     let rv = obj["metadata"]["resourceVersion"]
         .as_str()
         .unwrap_or("")
         .to_string();
 
-    Ok(Json(build_scale(name, ns, spec_replicas, status_replicas, &rv)).into_response())
+    Ok(Json(build_scale(
+        name,
+        ns,
+        spec_replicas,
+        status_replicas,
+        &rv,
+        &selector,
+    ))
+    .into_response())
 }
 
 async fn scale_put_impl<S: Store>(
@@ -349,6 +434,7 @@ async fn scale_put_impl<S: Store>(
     let old_replicas = extract_replicas(&obj.body);
     // Capture actual pod count before changing spec so the response reflects reality.
     let status_replicas = extract_status_replicas(&obj.body);
+    let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
     obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
 
     // Increment generation when spec.replicas changes — controllers use
@@ -372,6 +458,7 @@ async fn scale_put_impl<S: Store>(
         new_replicas,
         status_replicas,
         &new_rv.to_string(),
+        &selector,
     )))
 }
 
@@ -416,6 +503,7 @@ async fn scale_patch_impl<S: Store>(
     let old_replicas = extract_replicas(&obj.body);
     // Capture actual pod count before changing spec so the response reflects reality.
     let status_replicas = extract_status_replicas(&obj.body);
+    let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
 
     // Extract replicas from patch if present; otherwise keep current value.
     let new_replicas = if let Some(r) = patch_scale_spec.replicas {
@@ -447,6 +535,7 @@ async fn scale_patch_impl<S: Store>(
         new_replicas,
         status_replicas,
         &new_rv.to_string(),
+        &selector,
     )))
 }
 
@@ -578,7 +667,7 @@ mod tests {
     fn build_scale_returns_autoscaling_v1_shape() {
         // The Scale object must be autoscaling/v1 — kubectl and HPA both
         // assert on the apiVersion/kind to identify the response.
-        let scale = build_scale("my-deploy", "default", 3, 3, "42");
+        let scale = build_scale("my-deploy", "default", 3, 3, "42", "app=my-deploy");
         assert_eq!(scale["apiVersion"], "autoscaling/v1");
         assert_eq!(scale["kind"], "Scale");
     }
@@ -589,7 +678,7 @@ mod tests {
         // They may differ while pods are being created or terminated — build_scale
         // must embed each value in the correct field so HPA and test AfterEach loops
         // can distinguish "desired=0" from "actual=0".
-        let scale = build_scale("my-sts", "default", 0, 3, "7");
+        let scale = build_scale("my-sts", "default", 0, 3, "7", "app=my-sts");
         assert_eq!(
             scale["spec"]["replicas"], 0,
             "spec.replicas must reflect the desired count written by kubectl scale"
@@ -604,10 +693,112 @@ mod tests {
 
     #[test]
     fn build_scale_includes_metadata_name_namespace_rv() {
-        let scale = build_scale("my-deploy", "production", 2, 2, "99");
+        let scale = build_scale("my-deploy", "production", 2, 2, "99", "app=my-deploy");
         assert_eq!(scale["metadata"]["name"], "my-deploy");
         assert_eq!(scale["metadata"]["namespace"], "production");
         assert_eq!(scale["metadata"]["resourceVersion"], "99");
+    }
+
+    #[test]
+    fn build_scale_embeds_selector_in_status() {
+        // The Scale object's status.selector is what upstream's HPA controller
+        // (validateAndParseSelector) reads to build its pod-metrics query — an
+        // empty string here is treated as a hard, unrecoverable error and the
+        // HPA never proceeds to compute metrics.
+        let scale = build_scale("my-deploy", "default", 3, 3, "42", "app=my-deploy");
+        assert_eq!(
+            scale["status"]["selector"], "app=my-deploy",
+            "status.selector must carry the caller-supplied selector string, not \
+             a hardcoded empty string — HPA treats \"\" as a fatal configuration error"
+        );
+    }
+
+    // -- label_selector_to_string --
+
+    #[test]
+    fn label_selector_to_string_renders_apps_v1_match_labels_as_equality_terms() {
+        // Deployment/ReplicaSet/StatefulSet store spec.selector as a structured
+        // LabelSelector ({"matchLabels": {...}}). The HPA controller parses
+        // status.selector with client-go's labels.Parse, which expects the
+        // classic "key=value,key2=value2" form — this is the mandatory case
+        // since every real HPA target hits this path.
+        let sel = serde_json::json!({ "matchLabels": { "app": "web", "tier": "frontend" } });
+        assert_eq!(label_selector_to_string(&sel), "app=web,tier=frontend");
+    }
+
+    #[test]
+    fn label_selector_to_string_renders_replicationcontroller_flat_map_as_equality_terms() {
+        // ReplicationController stores spec.selector as a flat map<string,string>,
+        // never wrapped in matchLabels (see defaults.rs). Without this branch,
+        // RC-backed HPAs would get status.selector="" even though a selector exists.
+        let sel = serde_json::json!({ "app": "web" });
+        assert_eq!(label_selector_to_string(&sel), "app=web");
+    }
+
+    #[test]
+    fn label_selector_to_string_renders_match_expressions_in_standard_selector_syntax() {
+        // A HorizontalPodAutoscaler target may use set-based matchExpressions
+        // instead of/alongside matchLabels. client-go's labels.Parse (and this
+        // codebase's own parse_label_selector) expect "key In (v1,v2)" syntax —
+        // rendering anything else would make the HPA fail to parse the selector.
+        let sel = serde_json::json!({
+            "matchExpressions": [
+                { "key": "env", "operator": "In", "values": ["prod", "staging"] }
+            ]
+        });
+        assert_eq!(label_selector_to_string(&sel), "env In (prod,staging)");
+    }
+
+    #[test]
+    fn label_selector_to_string_combines_match_labels_and_match_expressions() {
+        let sel = serde_json::json!({
+            "matchLabels": { "app": "web" },
+            "matchExpressions": [
+                { "key": "tier", "operator": "NotIn", "values": ["cache"] }
+            ]
+        });
+        assert_eq!(label_selector_to_string(&sel), "app=web,tier NotIn (cache)");
+    }
+
+    #[test]
+    fn label_selector_to_string_returns_empty_string_for_null_selector() {
+        // A workload with no selector at all (should not occur for validated
+        // apps/v1 workloads, but must not panic) renders to "" rather than error.
+        assert_eq!(label_selector_to_string(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn label_selector_to_string_round_trips_through_this_codebase_own_selector_parser() {
+        // The real bar for this helper is not "does the string look right" but
+        // "does a real selector-matching implementation accept it and match the
+        // right pods" — parse_label_selector + apply_label_selector is the
+        // selector-matching path this codebase uses for LIST ?labelSelector=,
+        // and is structurally the same matcher an HPA-adjacent controller would
+        // use. If label_selector_to_string ever produces a string this parser
+        // rejects or matches incorrectly, this test fails.
+        use crate::handlers::generic::{apply_label_selector, parse_label_selector};
+
+        let sel = serde_json::json!({ "matchLabels": { "app": "web", "tier": "frontend" } });
+        let selector_string = label_selector_to_string(&sel);
+
+        let terms = parse_label_selector(&selector_string)
+            .expect("a selector string built by label_selector_to_string must parse");
+
+        let matching_pod = serde_json::json!({
+            "metadata": { "labels": { "app": "web", "tier": "frontend", "extra": "ignored" } }
+        });
+        let other_pod = serde_json::json!({
+            "metadata": { "labels": { "app": "web", "tier": "backend" } }
+        });
+
+        let matched = apply_label_selector(vec![matching_pod.clone(), other_pod], &terms);
+        assert_eq!(
+            matched,
+            vec![matching_pod],
+            "the selector string round-tripped through parse_label_selector/apply_label_selector \
+             must match exactly the pods carrying all of the workload's selector labels — this is \
+             the real end-to-end guarantee HPA depends on, not just string formatting"
+        );
     }
 
     // -- extract_replicas --
@@ -823,6 +1014,60 @@ mod handler_tests {
         assert_eq!(json["metadata"]["namespace"], "default");
     }
 
+    /// GET scale on a Deployment with a real spec.selector must populate
+    /// status.selector with the equivalent selector string, not "".
+    ///
+    /// This is the direct regression test for the HPA-breaking bug: upstream's
+    /// HPA controller (validateAndParseSelector) treats status.selector=="" as
+    /// a hard, unrecoverable error and never computes metrics — every HPA
+    /// targeting any Deployment would fail permanently if this regresses.
+    #[tokio::test]
+    async fn get_scale_populates_status_selector_from_deployment_spec_selector() {
+        let (state, store) = make_state();
+        let key = "/registry/apps/deployments/default/my-deploy";
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-deploy", "namespace": "default", "resourceVersion": "1" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "my-deploy" } }
+            },
+            "status": { "replicas": 3 }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&deploy).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["status"]["selector"], "app=my-deploy",
+            "status.selector must reflect the Deployment's spec.selector — an empty \
+             string here makes every HorizontalPodAutoscaler targeting this Deployment \
+             fail permanently with kube-controller-manager's \"selector is required\" error"
+        );
+    }
+
     /// GET scale on a StatefulSet whose spec.replicas=0 but status.replicas=3 (pods still running)
     /// must return status.replicas=3, not 0.
     ///
@@ -1027,6 +1272,63 @@ mod handler_tests {
         let stored = store.get(key).await.unwrap().unwrap();
         let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(stored_obj["spec"]["replicas"], 5);
+    }
+
+    /// PUT scale on a workload with spec.selector must also populate status.selector
+    /// in the response — HPA reads the Scale response returned from its own PUT/PATCH
+    /// call, not just from a separate GET, so this path must carry the selector too.
+    #[tokio::test]
+    async fn put_scale_populates_status_selector_from_spec_selector() {
+        let (state, store) = make_state();
+        let key = "/registry/apps/statefulsets/default/web";
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default", "resourceVersion": "1" },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "web", "tier": "backend" } }
+            },
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&sts).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 5 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            json["status"]["selector"], "app=web,tier=backend",
+            "PUT /scale response must carry status.selector from the stored workload's \
+             spec.selector — an empty string here breaks HPA on this StatefulSet identically \
+             to the GET path"
+        );
     }
 
     /// PUT scale with invalid JSON must return 400.
@@ -1737,6 +2039,58 @@ mod handler_tests {
         );
         assert_eq!(json["metadata"]["name"], "my-rc");
         assert_eq!(json["metadata"]["namespace"], "default");
+    }
+
+    /// GET scale on a ReplicationController must render its flat map<string,string>
+    /// spec.selector (not wrapped in matchLabels — see defaults.rs) into status.selector.
+    ///
+    /// RC's selector shape differs from Deployment/ReplicaSet/StatefulSet's structured
+    /// LabelSelector; without handling the flat-map case, RC-backed HPAs would also see
+    /// status.selector="" and fail identically to the apps/v1 case.
+    #[tokio::test]
+    async fn get_rc_scale_populates_status_selector_from_flat_map_selector() {
+        let (state, store) = make_state();
+        let key = "/registry/replicationcontrollers/default/my-rc";
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "my-rc", "namespace": "default", "resourceVersion": "1" },
+            "spec": {
+                "replicas": 2,
+                "selector": { "app": "my-rc" }
+            },
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&rc).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+                get(get_rc_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/replicationcontrollers/my-rc/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["status"]["selector"], "app=my-rc",
+            "status.selector must render the RC's flat-map selector — an empty string \
+             here breaks HPA on ReplicationControllers the same way it does for Deployments"
+        );
     }
 
     /// PATCH scale on an RC writes spec.replicas back to the correct core/v1 store key
