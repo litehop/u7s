@@ -6677,6 +6677,19 @@ pub(crate) async fn bind_pod<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    // A pod may only be bound once. Rejecting unconditionally (not just on a
+    // mismatched target) matches upstream kube-apiserver, which never allows a
+    // second bind even to the same node — a stray duplicate bind call must not
+    // be able to silently reassign or re-trigger scheduling for a pod whose
+    // containers are already running under the original node's kubelet.
+    if let Some(existing) = obj.body["spec"]["nodeName"].as_str() {
+        if !existing.is_empty() {
+            return Err(Status::conflict(format!(
+                "Pod \"{name}\" is already assigned to node \"{existing}\""
+            )));
+        }
+    }
+
     obj.body["spec"]["nodeName"] = serde_json::Value::String(node_name);
 
     // Set PodScheduled=True now that the pod has a node assignment.
@@ -10702,6 +10715,127 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A second bind to a DIFFERENT node must be rejected, and the pod's stored
+    /// spec.nodeName must remain the ORIGINAL value.
+    ///
+    /// Without this guard, a stray duplicate bind call (e.g. a scheduler retry,
+    /// or a race between two scheduling attempts) could silently reassign a
+    /// Running pod's spec.nodeName to a different node while its containers
+    /// keep running under the original kubelet — risking duplicate execution or
+    /// an involuntary kill/restart of a pod, including one with
+    /// restartPolicy=Never that must never be silently restarted.
+    #[tokio::test]
+    async fn bind_pod_rejects_rebind_to_different_node() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "bound-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+
+        let bind_to = |node: &str| {
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Binding",
+                "metadata": {"name": "bound-pod", "namespace": "default"},
+                "target": {"kind": "Node", "name": node}
+            })
+        };
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/bound-pod/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&bind_to("worker-1")))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "first bind must succeed"
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/bound-pod/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&bind_to("worker-2")))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a second bind to a different node must be rejected, not silently applied"
+        );
+
+        let key = "/registry/pods/default/bound-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["nodeName"], "worker-1",
+            "the rejected rebind must NOT overwrite spec.nodeName — the pod's containers are \
+             still running under worker-1's kubelet, so the stored assignment must stay worker-1"
+        );
+    }
+
+    /// A second bind to the SAME node must also be rejected.
+    ///
+    /// Upstream kube-apiserver rejects unconditionally on `NodeName != ""`, not only on a
+    /// mismatch. Special-casing "same node is fine" would make an idempotent-looking rebind
+    /// silently succeed — exactly the gap that let a periodic stray re-bind go unnoticed
+    /// against an already-Running pod.
+    #[tokio::test]
+    async fn bind_pod_rejects_rebind_to_same_node() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "bound-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+
+        let bind_to_worker_1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Binding",
+            "metadata": {"name": "bound-pod", "namespace": "default"},
+            "target": {"kind": "Node", "name": "worker-1"}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/bound-pod/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&bind_to_worker_1))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "first bind must succeed"
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/bound-pod/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&bind_to_worker_1))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a second bind must be rejected even when it targets the same node — upstream never \
+             allows re-binding an already-assigned pod"
+        );
     }
 
     // -----------------------------------------------------------------------
