@@ -179,12 +179,62 @@ limactl shell "$VM_NAME" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null 
 echo "Retrieving results..."
 # sonobuoy retrieve uses port-forward which produces an EOF against u7s.
 # Instead, locate the tarball from pod logs + kubelet emptyDir on the VM.
+#
+# Live incident 2026-08-04: sonobuoy's own scheduler placed the aggregator
+# pod on the extra node instead of the primary, and every blocking call
+# below had no timeout -- the script hung with zero output and no error,
+# even though it has explicit "tarball not found" exit paths, because those
+# paths only fire if a call actually RETURNS. NODES lists every node in the
+# run so the tarball search isn't hardcoded to the primary; run_with_timeout
+# below bounds every blocking call so a stall surfaces loudly instead.
+NODES=("$VM_NAME")
+[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+CALL_TIMEOUT=30
+
+# run_with_timeout <label> <secs> <suppress_stderr:0|1> <cmd...>
+# Kills <cmd...> if it hasn't finished within <secs> seconds and prints a
+# specific "'<label>' timed out" message so a stalled call is diagnosable
+# instead of hanging the whole script forever with no output. No
+# 'timeout'/'gtimeout' binary is assumed present on the macOS host running
+# this script (confirmed absent even with Homebrew coreutils uninstalled),
+# so the deadline is enforced by polling with 'kill -0' rather than a second
+# backgrounded 'wait' -- the latter was tried first and, under this script's
+# own 'set -e', hung indefinitely in bash 3.2 (macOS's shipped /bin/bash)
+# waiting on a SIGKILL-terminated background job; polling avoids that
+# entirely. suppress_stderr redirects only <cmd...>'s own stderr (e.g.
+# find's benign "No such file or directory" on nodes without the pod) -- it
+# must NOT swallow this function's own timeout message below, so it is
+# applied directly to the "$@" command, never to the whole function's output.
+run_with_timeout() {
+  local label="$1" secs="$2" suppress_stderr="$3"
+  shift 3
+  if [ "$suppress_stderr" = "1" ]; then
+    "$@" 2>/dev/null &
+  else
+    "$@" &
+  fi
+  local cmd_pid=$! waited=0
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -9 "$cmd_pid" 2>/dev/null
+      wait "$cmd_pid" 2>/dev/null || true
+      echo "error: '$label' timed out after ${secs}s" >&2
+      return 124
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  local status=0
+  wait "$cmd_pid" || status=$?
+  return "$status"
+}
 
 # Find tarball name from aggregator logs (host-side kubectl, no SPDY needed).
-TARBALL_NAME=$(kubectl --kubeconfig="$KUBECONFIG" logs -n sonobuoy sonobuoy 2>/dev/null \
+TARBALL_NAME=$(run_with_timeout "kubectl logs -n sonobuoy sonobuoy" "$CALL_TIMEOUT" 1 \
+    kubectl --kubeconfig="$KUBECONFIG" logs -n sonobuoy sonobuoy \
   | grep "Results available at" \
   | tail -1 \
-  | grep -oE '[^ /]+\.tar\.gz')
+  | grep -oE '[^ /]+\.tar\.gz') || true
 
 if [ -z "$TARBALL_NAME" ]; then
   if [ "${SONOBUOY_EXIT:-0}" -ne 0 ]; then
@@ -195,29 +245,48 @@ if [ -z "$TARBALL_NAME" ]; then
 fi
 
 # Get the aggregator pod UID to locate its emptyDir on the VM.
-POD_UID=$(kubectl --kubeconfig="$KUBECONFIG" get pod \
+POD_UID=$(run_with_timeout "kubectl get pod -n sonobuoy sonobuoy" "$CALL_TIMEOUT" 0 \
+    kubectl --kubeconfig="$KUBECONFIG" get pod \
     -n sonobuoy sonobuoy \
-    -o jsonpath='{.metadata.uid}')
+    -o jsonpath='{.metadata.uid}') || true
 
-HOST_PATH=$(limactl shell "$VM_NAME" sudo find \
-    "/var/lib/kubelet/pods/${POD_UID}/volumes/kubernetes.io~empty-dir" \
-    -name "$TARBALL_NAME" 2>/dev/null | head -1)
+# Search every node in the run -- sonobuoy's own scheduler can (and did,
+# live) place the aggregator pod on the extra node, not just $VM_NAME.
+HOST_PATH=""
+FOUND_NODE=""
+for NODE in "${NODES[@]}"; do
+  CANDIDATE=$(run_with_timeout "limactl shell $NODE sudo find (results tarball)" "$CALL_TIMEOUT" 1 \
+      limactl shell "$NODE" sudo find \
+      "/var/lib/kubelet/pods/${POD_UID}/volumes/kubernetes.io~empty-dir" \
+      -name "$TARBALL_NAME" | head -1) || true
+  if [ -n "$CANDIDATE" ]; then
+    HOST_PATH="$CANDIDATE"
+    FOUND_NODE="$NODE"
+    break
+  fi
+done
 
 if [ -z "$HOST_PATH" ]; then
   if [ "${SONOBUOY_EXIT:-0}" -ne 0 ]; then
-    echo "warning: results tarball not found under kubelet pod volume (run was killed before completion)" >&2
+    echo "warning: results tarball not found under kubelet pod volume on any node (${NODES[*]}) (run was killed before completion)" >&2
     exit "${SONOBUOY_EXIT}"
   fi
-  echo "error: tarball not found under kubelet pod volume for uid=${POD_UID}" >&2; exit 1
+  echo "error: tarball not found under kubelet pod volume for uid=${POD_UID} on any node (${NODES[*]})" >&2; exit 1
 fi
 
-limactl shell "$VM_NAME" sudo cp "$HOST_PATH" /tmp/sonobuoy-results.tar.gz
+if ! run_with_timeout "limactl shell $FOUND_NODE sudo cp (stage results tarball)" "$CALL_TIMEOUT" 0 \
+    limactl shell "$FOUND_NODE" sudo cp "$HOST_PATH" /tmp/sonobuoy-results.tar.gz; then
+  echo "error: failed to stage results tarball on $FOUND_NODE" >&2; exit 1
+fi
 
 TIMESTAMP=$(date -u +%m%d-%H%M)
 FOCUS_SLUG=$(echo "${FOCUS:-conformance}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')
 OUTFILE="$WORKDIR/../e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
 mkdir -p "$WORKDIR/../e2e"
-limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"
+if ! run_with_timeout "limactl copy results tarball from $FOUND_NODE" "$CALL_TIMEOUT" 0 \
+    limactl copy "${FOUND_NODE}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"; then
+  echo "error: failed to copy results tarball from $FOUND_NODE to host" >&2; exit 1
+fi
 echo "Results: $OUTFILE"
 
 # Collect host-side and VM-side logs into <run>/host-logs/ for post-run diagnosis.
@@ -234,8 +303,7 @@ mkdir -p "$HOST_LOGS_DIR"
 [ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
 [ -f "$WORKDIR/scheduler.log" ]              && cp "$WORKDIR/scheduler.log"   "$HOST_LOGS_DIR/scheduler.log"
 [ -f "$WORKDIR/konnectivity-server.log" ]    && cp "$WORKDIR/konnectivity-server.log" "$HOST_LOGS_DIR/konnectivity-server.log"
-NODES=("$VM_NAME")
-[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+# NODES was already computed above for the tarball search; reused here.
 for NODE in "${NODES[@]}"; do
   SUFFIX=""
   [ "$NODE" != "$VM_NAME" ] && SUFFIX="-${NODE}"
