@@ -2570,6 +2570,17 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
     });
     if let Some(spec) = pv.spec {
         let mut spec_map = serde_json::Map::new();
+        // capacity drives kube-controller-manager's static PV/PVC matching
+        // (findBestMatchForClaim compares requested size against volume.Spec.Capacity):
+        // without it, every PV looks like it has zero capacity and is skipped as "too
+        // small" for any claim, so the claim falls through to dynamic provisioning and
+        // fails with "storageclass ... not found" even though a matching PV exists.
+        if !spec.capacity.is_empty() {
+            let capacity = gen_quantity_map_to_json(spec.capacity);
+            if capacity.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                spec_map.insert("capacity".to_string(), capacity);
+            }
+        }
         if !spec.access_modes.is_empty() {
             spec_map.insert(
                 "accessModes".to_string(),
@@ -2580,6 +2591,12 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                         .collect(),
                 ),
             );
+        }
+        // claimRef is how a test pre-binds a PV to a not-yet-created PVC by name; without
+        // it, kube-controller-manager sees the PV as unclaimed and routes the PVC through
+        // normal (capacity/class) matching instead of completing the pre-bind.
+        if let Some(v) = spec.claim_ref {
+            spec_map.insert("claimRef".to_string(), gen_object_reference_to_json(v));
         }
         if let Some(v) = spec
             .persistent_volume_reclaim_policy
@@ -2593,8 +2610,87 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
         if let Some(v) = spec.storage_class_name.filter(|s| !s.is_empty()) {
             spec_map.insert("storageClassName".to_string(), serde_json::Value::String(v));
         }
+        if !spec.mount_options.is_empty() {
+            spec_map.insert(
+                "mountOptions".to_string(),
+                serde_json::Value::Array(
+                    spec.mount_options
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
         if let Some(v) = spec.volume_mode.filter(|s| !s.is_empty()) {
             spec_map.insert("volumeMode".to_string(), serde_json::Value::String(v));
+        }
+        // nodeAffinity is required for local volumes: it is how kubelet learns which node
+        // may mount this PV. Without it, a pod bound to a local PV on the wrong node would
+        // never be rejected, and (for local volumes specifically) real kube-apiserver would
+        // never have accepted the PV in the first place without this field.
+        if let Some(na) = spec.node_affinity {
+            if let Some(req) = na.required {
+                spec_map.insert(
+                    "nodeAffinity".to_string(),
+                    serde_json::json!({
+                        "required": {
+                            "nodeSelectorTerms": req
+                                .node_selector_terms
+                                .into_iter()
+                                .map(gen_node_selector_term_to_json)
+                                .collect::<Vec<_>>(),
+                        }
+                    }),
+                );
+            }
+        }
+        if let Some(v) = spec.volume_attributes_class_name.filter(|s| !s.is_empty()) {
+            spec_map.insert(
+                "volumeAttributesClassName".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        // persistentVolumeSource fields are inlined directly into PersistentVolumeSpec in
+        // the JSON/REST representation (there is no nested "persistentVolumeSource" key).
+        // Only the volume types conformance actually exercises against a real apiserver
+        // (local, hostPath, nfs) are decoded here — the many deprecated in-tree cloud
+        // plugins (gcePD, awsEBS, glusterfs, ...) have no conformance coverage and are
+        // intentionally left unhandled, matching this codebase's existing precedent of
+        // decoding what has a live consumer rather than the full upstream field set.
+        if let Some(src) = spec.persistent_volume_source {
+            if let Some(local) = src.local {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = local.path.filter(|s| !s.is_empty()) {
+                    m.insert("path".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = local.fs_type.filter(|s| !s.is_empty()) {
+                    m.insert("fsType".to_string(), serde_json::Value::String(v));
+                }
+                spec_map.insert("local".to_string(), serde_json::Value::Object(m));
+            }
+            if let Some(host_path) = src.host_path {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = host_path.path.filter(|s| !s.is_empty()) {
+                    m.insert("path".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = host_path.r#type.filter(|s| !s.is_empty()) {
+                    m.insert("type".to_string(), serde_json::Value::String(v));
+                }
+                spec_map.insert("hostPath".to_string(), serde_json::Value::Object(m));
+            }
+            if let Some(nfs) = src.nfs {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = nfs.server.filter(|s| !s.is_empty()) {
+                    m.insert("server".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = nfs.path.filter(|s| !s.is_empty()) {
+                    m.insert("path".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = nfs.read_only {
+                    m.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                }
+                spec_map.insert("nfs".to_string(), serde_json::Value::Object(m));
+            }
         }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
@@ -3514,6 +3610,91 @@ mod tests {
         assert_eq!(
             result["status"]["reason"], "E2E",
             "status.reason must survive proto decode"
+        );
+    }
+
+    /// decode_persistentvolume_proto_gen must preserve spec.capacity, spec.claimRef,
+    /// spec.nodeAffinity, and the spec.local volume source.
+    ///
+    /// Before this fix, a protobuf-encoded PersistentVolume create (the default wire format
+    /// for any client-go client, including e2e.test and any real CSI/local-volume-provisioning
+    /// workload) silently lost these fields. With capacity dropped, the stored PV's capacity
+    /// was implicitly zero, so kube-controller-manager's static PV/PVC matching
+    /// (findBestMatchForClaim, which skips any PV smaller than the claim's request) rejected
+    /// every PV as "too small" and fell through to dynamic provisioning, which then failed with
+    /// "storageclass ... not found" even though a matching PV existed — this was the dominant
+    /// cause of PVC/PV bind-timeout conformance failures for the "local" storage driver. With
+    /// claimRef dropped, a test's explicit PV-to-PVC pre-bind was silently undone. With
+    /// nodeAffinity/local dropped, a pod that did bind could never learn which node/path to
+    /// actually mount.
+    #[test]
+    fn decode_persistentvolume_proto_gen_preserves_capacity_claim_ref_affinity_and_local_source() {
+        let pv = core_v1::PersistentVolume {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("local-pv".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeSpec {
+                capacity: std::collections::HashMap::from([(
+                    "storage".to_string(),
+                    crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                        string: Some("5Gi".to_string()),
+                    },
+                )]),
+                claim_ref: Some(core_v1::ObjectReference {
+                    name: Some("my-pvc".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }),
+                node_affinity: Some(core_v1::VolumeNodeAffinity {
+                    required: Some(core_v1::NodeSelector {
+                        node_selector_terms: vec![core_v1::NodeSelectorTerm {
+                            match_expressions: vec![core_v1::NodeSelectorRequirement {
+                                key: Some("kubernetes.io/hostname".to_string()),
+                                operator: Some("In".to_string()),
+                                values: vec!["node-1".to_string()],
+                            }],
+                            ..Default::default()
+                        }],
+                    }),
+                }),
+                persistent_volume_source: Some(core_v1::PersistentVolumeSource {
+                    local: Some(core_v1::LocalVolumeSource {
+                        path: Some("/mnt/disks/vol1".to_string()),
+                        fs_type: Some("ext4".to_string()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolume_proto_gen(&buf).expect("PV with spec must decode");
+
+        assert_eq!(
+            result["spec"]["capacity"]["storage"], "5Gi",
+            "spec.capacity must survive proto decode — without it every PV looks like it has \
+             zero storage, so static PV/PVC matching always rejects it as too small"
+        );
+        assert_eq!(
+            result["spec"]["claimRef"]["name"], "my-pvc",
+            "spec.claimRef must survive proto decode — without it a test's explicit PV-to-PVC \
+             pre-bind is silently lost"
+        );
+        assert_eq!(
+            result["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"]
+                [0]["key"],
+            "kubernetes.io/hostname",
+            "spec.nodeAffinity must survive proto decode — without it kubelet has no way to \
+             know which node a local PV may be mounted from"
+        );
+        assert_eq!(
+            result["spec"]["local"]["path"], "/mnt/disks/vol1",
+            "spec.local (the local volume source) must survive proto decode — without it \
+             kubelet has no path to bind-mount for a local PV"
         );
     }
 
