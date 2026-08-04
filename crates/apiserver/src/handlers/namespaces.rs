@@ -995,6 +995,45 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
     }
 }
 
+/// Stamp deletionTimestamp + Terminating status on a namespace whose cascade found a real
+/// per-object finalizer still blocking deletion, persist it, then immediately re-run the
+/// completion check.
+///
+/// The re-run closes a TOCTOU race: `cascade_delete_namespace_resources_until_stable`
+/// soft-deletes the blocking object — stamping ITS deletionTimestamp — before this function
+/// stamps the NAMESPACE's own deletionTimestamp. If the object's owning controller observes
+/// its deletionTimestamp, clears its finalizer, and hard-deletes it inside that window, the
+/// `maybe_finalize_terminating_namespace` call that fires from that hard-delete reads the
+/// namespace's deletionTimestamp as still unset and is a no-op — `maybe_finalize_terminating_
+/// namespace` is only ever invoked from specific event-triggered call sites, so nothing else
+/// will ever re-check, and the namespace is stuck Terminating forever even though its
+/// completion condition (zero remaining finalizer'd objects) was already true. Calling it
+/// again here, right after our own deletionTimestamp write lands, closes that window.
+async fn stamp_terminating_and_recheck_completion<S: Store>(
+    state: &AppState<S>,
+    key: &str,
+    name: &str,
+    mut obj: Object,
+) -> Result<Object, crate::status::StatusError> {
+    obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    obj.body["status"] = serde_json::to_value(NamespaceStatus {
+        phase: Some(NamespacePhase::Terminating),
+        rest: serde_json::Value::Object(Default::default()),
+    })
+    .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
+    let expected_rv = parse_resource_version(obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(key, obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, name))?;
+    obj.set_resource_version(new_rv);
+
+    maybe_finalize_terminating_namespace(state, name).await;
+
+    Ok(obj)
+}
+
 pub(crate) async fn delete_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -1090,20 +1129,7 @@ pub(crate) async fn delete_namespace<S: Store>(
             // genuine Terminating lifecycle instead, matching the "kubernetes"-finalized
             // path above, so maybe_finalize_terminating_namespace re-fires once the
             // object's controller clears the finalizer.
-            obj.body["metadata"]["deletionTimestamp"] =
-                serde_json::Value::String(utc_now_rfc3339());
-            obj.body["status"] = serde_json::to_value(NamespaceStatus {
-                phase: Some(NamespacePhase::Terminating),
-                rest: serde_json::Value::Object(Default::default()),
-            })
-            .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
-            let expected_rv = parse_resource_version(obj.resource_version())?;
-            let new_rv = state
-                .store
-                .put(&key, obj.to_bytes(), expected_rv)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
-            obj.set_resource_version(new_rv);
+            obj = stamp_terminating_and_recheck_completion(&state, &key, &name, obj).await?;
             return Ok(Json(obj.body).into_response());
         }
         CascadeResult::RetryExhausted { remaining } => {
@@ -4914,6 +4940,144 @@ mod tests {
                  waits forever for a finalizer removal that will never happen"
             ),
         }
+    }
+
+    /// Regression: a namespace must not orphan in Terminating forever when its own
+    /// deletionTimestamp write loses a race with the owning controller clearing a contained
+    /// object's finalizer.
+    ///
+    /// `delete_namespace`'s "no spec.finalizers" branch calls
+    /// `cascade_delete_namespace_resources_until_stable`, which soft-deletes a blocking
+    /// object (stamping ITS OWN deletionTimestamp) BEFORE the namespace's own
+    /// deletionTimestamp is ever persisted. Live evidence showed the owning controller can
+    /// observe the object's deletionTimestamp, clear its finalizer, and hard-delete it in
+    /// that exact window — its `maybe_finalize_terminating_namespace` completion-trigger call
+    /// reads the namespace's own deletionTimestamp as still unset and is a no-op. Nothing else
+    /// ever re-checks: the namespace is stuck Terminating forever even though its completion
+    /// condition (zero remaining finalizer'd objects) was true the whole time.
+    ///
+    /// This test reproduces the interleaving directly (the same order of operations the live
+    /// race traced) and asserts the namespace still completes instead of orphaning.
+    ///
+    /// Fails on revert: without `stamp_terminating_and_recheck_completion`'s re-run of
+    /// `maybe_finalize_terminating_namespace` after its own deletionTimestamp write, the
+    /// namespace record would remain in the store forever — this test's final assertion
+    /// would fail.
+    #[tokio::test]
+    async fn delete_namespace_completes_when_finalizer_cleared_before_own_deletion_timestamp_lands()
+    {
+        let state = make_state();
+
+        // Namespace WITHOUT spec.finalizers — the "no lifecycle controller" branch that still
+        // runs the cascade itself (e.g. seeded directly, matching the other cascade tests
+        // above).
+        let ns_key = crate::keys::cluster_object_key("namespaces", "race-ns");
+        state
+            .store
+            .put(
+                &ns_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": { "name": "race-ns" },
+                        "spec": {}
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("namespace seed must succeed");
+
+        // A namespaced pod with a real finalizer — the object the cascade will soft-delete.
+        let pod_key = crate::keys::object_key("pods", "race-ns", "race-pod");
+        state
+            .store
+            .put(
+                &pod_key,
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "race-pod",
+                            "namespace": "race-ns",
+                            "finalizers": ["test.io/cleanup"]
+                        },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pod seed must succeed");
+
+        // Step 1: run the cascade exactly as delete_namespace's "no spec.finalizers" branch
+        // does. It finds race-pod's finalizer, soft-deletes it (stamping ITS OWN
+        // deletionTimestamp), and reports FinalizerPending.
+        let cascade_result =
+            cascade_delete_namespace_resources_until_stable(&state, "race-ns").await;
+        assert_eq!(
+            cascade_result,
+            CascadeResult::FinalizerPending,
+            "cascade must find race-pod's finalizer and defer to its owning controller"
+        );
+
+        // Step 2: simulate race-pod's owning controller observing its deletionTimestamp and
+        // clearing its finalizer — BEFORE the namespace's own deletionTimestamp has been
+        // persisted, matching the live race's timing exactly. patch_pod's drain-complete path
+        // (handlers/pods.rs) hard-deletes the pod once its finalizers are empty and its
+        // deletionTimestamp is set, then fires this same completion trigger.
+        state
+            .store
+            .delete(&pod_key, None)
+            .await
+            .expect("pod hard-delete must succeed");
+        maybe_finalize_terminating_namespace(&state, "race-ns").await;
+
+        // Sanity: this must reproduce the documented race exactly. The namespace's own
+        // deletionTimestamp is not stamped yet, so the completion trigger above must have
+        // been a no-op and the namespace must still be present — if this fails, the test
+        // no longer models the bug at all.
+        let ns_before = state
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not error")
+            .expect(
+                "namespace must still be present: maybe_finalize_terminating_namespace must \
+                 have no-op'd because its own deletionTimestamp isn't stamped yet — if it's \
+                 gone already, this test stopped modeling the race",
+            );
+
+        // Step 3: delete_namespace's FinalizerPending branch now runs — stamping the
+        // namespace's own deletionTimestamp and (the fix under test) re-running the
+        // completion check.
+        let obj = Object::from_bytes(&ns_before.value).expect("stored namespace must parse");
+        stamp_terminating_and_recheck_completion(&state, &ns_key, "race-ns", obj)
+            .await
+            .expect("stamp+recheck must succeed");
+
+        // The namespace's completion condition (zero remaining finalizer'd objects) was true
+        // for the entire race window. Without re-checking here, this namespace would stay
+        // Terminating forever — nothing else would ever look at it again, exactly as the
+        // live audit found (job-8968 stuck Terminating 7+ hours with an already-empty
+        // namespace).
+        assert!(
+            state
+                .store
+                .get(&ns_key)
+                .await
+                .expect("store get must not error")
+                .is_none(),
+            "namespace must complete deletion once its own deletionTimestamp lands and finds \
+             zero remaining finalizer'd objects, even though that emptiness was discovered by \
+             a concurrent completion-trigger call that fired too early to see the namespace's \
+             own deletionTimestamp — without re-checking here the namespace orphans in \
+             Terminating forever with nothing left to ever re-drive it"
+        );
     }
 }
 
