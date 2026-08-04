@@ -6,8 +6,9 @@
 /// /attach: WebSocket proxy — upgrades the inbound kubectl connection (v5.channel.k8s.io)
 ///          and opens a matching WebSocket to the kubelet, then splices them.
 ///
-/// /exec: WebSocket proxy — upgrades the inbound kubectl connection (v4.channel.k8s.io)
-///        and opens a matching WebSocket to the kubelet exec endpoint, then splices them.
+/// /exec: WebSocket proxy — upgrades the inbound kubectl connection (v4 or v5.channel.k8s.io)
+///        and opens a matching v5.channel.k8s.io WebSocket to the kubelet exec endpoint,
+///        then splices them.
 /// /portforward: fully implemented as a WebSocket proxy.
 use axum::{
     body::Body,
@@ -738,16 +739,33 @@ pub struct ExecQuery {
 
 /// Exec subprotocol for the kubelet-side connection.
 ///
-/// Use v4.channel.k8s.io — the baseline exec subprotocol that kubelet supports.
-/// This is what the Kubernetes apiserver uses when connecting to kubelet for exec.
-const EXEC_KUBELET_SUBPROTOCOL: &str = "v4.channel.k8s.io";
+/// Must be v5.channel.k8s.io, not v4. `kubectl exec`'s real websocket executor
+/// (client-go's `NewWebSocketExecutor`) only ever offers v5 — v5 is the version
+/// that "adds support for a CLOSE signal" (a `[255, streamID]` control frame
+/// sent when the client's local stdin reaches EOF, so the remote process's
+/// stdin can be half-closed without tearing down the whole multiplexed
+/// connection). Since kubectl only speaks v5, apiserver always negotiates v5
+/// with it (see `EXEC_KUBECTL_PROTOCOLS`). If this outbound leg then dialed
+/// kubelet with v4, kubelet's v4 handler doesn't understand the CLOSE frame —
+/// it silently discards a message for stream id 255 — so the exec'd process's
+/// stdin pipe is never closed. Commands that read stdin until EOF (e.g. `tar
+/// xf -` when streaming a file via `kubectl exec -i`) receive all their data
+/// successfully but then hang forever waiting for a close that never comes,
+/// exactly like the real kube-apiserver's SPDY→websocket CLOSE-signal
+/// translation this project doesn't (and shouldn't need to) replicate: kubelet
+/// natively supports v5, so both legs can simply speak v5 directly. v4/v5
+/// framing for channels 0-4 is otherwise identical, so this is a strict
+/// superset — safe even for the rare v4-only client (see
+/// `EXEC_KUBECTL_PROTOCOLS`), which will simply never emit a CLOSE frame.
+const EXEC_KUBELET_SUBPROTOCOL: &str = "v5.channel.k8s.io";
 
 /// Exec subprotocols accepted from kubectl.
 ///
 /// kubectl sends `Sec-WebSocket-Protocol: v5.channel.k8s.io` by default for exec.
 /// We accept both v5 and v4 so kubectl can negotiate successfully. The protocol
 /// framing for stdin/stdout/stderr is identical in both; v5 adds an optional
-/// resize channel that kubectl won't use without a TTY.
+/// resize channel that kubectl won't use without a TTY, and the CLOSE signal
+/// (see `EXEC_KUBELET_SUBPROTOCOL`).
 const EXEC_KUBECTL_PROTOCOLS: &[&str] = &["v4.channel.k8s.io", "v5.channel.k8s.io"];
 
 /// Resolved kubelet exec target — returned by the pure lookup helper so the
@@ -930,8 +948,9 @@ pub async fn resolve_exec_target<S: Store>(
 /// Flow:
 ///   1. Extract raw query string from the URI (contains multi-valued command= params).
 ///   2. Look up pod → node → node_ip (via resolve_exec_target).
-///   3. Upgrade inbound request to WebSocket (kubectl side), subprotocol v4.channel.k8s.io.
-///   4. Open outbound WebSocket to kubelet exec endpoint with the same subprotocol.
+///   3. Upgrade inbound request to WebSocket (kubectl side), subprotocol v4 or v5.channel.k8s.io.
+///   4. Open outbound WebSocket to kubelet exec endpoint, always v5.channel.k8s.io
+///      (see `EXEC_KUBELET_SUBPROTOCOL` for why this must not mirror the inbound choice).
 ///   5. Splice the two connections bidirectionally via BiStream trait.
 ///
 /// The v4 channel protocol multiplexes stdin/stdout/stderr/resize over a single
@@ -1014,7 +1033,7 @@ pub async fn pod_exec_post<S: Store>(
     ))
 }
 
-/// Channel byte values used by the exec subprotocol (v4.channel.k8s.io).
+/// Channel byte values used by the exec subprotocol (v4/v5.channel.k8s.io).
 ///
 /// Kubelet sends a status/close message on channel 3 (error channel) when the
 /// command exits. The real kube-apiserver absorbs this frame and never forwards
@@ -4374,6 +4393,43 @@ mod tests {
             "kubelet_ws_url must embed node IP so connect_async_tls_with_config \
              can dial without a separate node_ip field: {}",
             target.kubelet_ws_url
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // exec proxy: kubelet-side subprotocol must support the CLOSE signal
+    //
+    // Regression: `kubectl exec -i` piping a large/real stdin stream (e.g.
+    // `tar cf - <dir> | kubectl exec -i <pod> -- tar xf - -C /dest`) hung
+    // forever after all data arrived. Root cause: kubectl's websocket exec
+    // executor only ever negotiates v5.channel.k8s.io with apiserver (v5
+    // "adds support for a CLOSE signal" — a [255, streamID] control frame
+    // sent when local stdin hits EOF, so the remote process's stdin can be
+    // half-closed without tearing down the whole multiplexed connection).
+    // If the outbound (kubelet-side) leg dialed with v4.channel.k8s.io
+    // instead, kubelet's v4 handler doesn't understand that frame and
+    // silently drops it, so the exec'd process's stdin is never closed —
+    // it blocks on read() forever even though it already has all its data.
+    // This test fails if EXEC_KUBELET_SUBPROTOCOL regresses to v4.
+    // -----------------------------------------------------------------------
+
+    /// EXEC_KUBELET_SUBPROTOCOL must be v5.channel.k8s.io, not v4.
+    ///
+    /// v4 lacks the CLOSE signal that kubectl's stdin needs to half-close a
+    /// stdin-streaming exec session (e.g. `kubectl exec -i ... | tar xf -`).
+    /// Reverting this to v4 reproduces the hang: the conformance run this
+    /// guards against went silent for ~10 minutes until a watchdog force-
+    /// killed the pod, because the tar process never saw EOF on stdin.
+    #[test]
+    fn exec_kubelet_subprotocol_is_v5_not_v4() {
+        assert_eq!(
+            EXEC_KUBELET_SUBPROTOCOL, "v5.channel.k8s.io",
+            "the kubelet-side exec connection must use v5.channel.k8s.io — kubectl's \
+             real websocket exec executor only ever offers v5, and only v5 carries the \
+             CLOSE signal kubectl sends when local stdin reaches EOF. Dialing kubelet \
+             with v4 silently drops that signal, so the exec'd process's stdin is never \
+             closed and stdin-streaming execs (e.g. `kubectl exec -i ... | tar xf -`) \
+             hang forever after all data has already arrived."
         );
     }
 
