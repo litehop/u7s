@@ -1225,6 +1225,29 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                         }
                         vm.insert("image".to_string(), serde_json::Value::Object(img_map));
                     }
+                    // ephemeral (GenericEphemeralVolume) — client-go clientsets (including
+                    // kube-controller-manager's, which the e2e test framework uses to create
+                    // pods) send protobuf by default. Without this branch, the derived PVC
+                    // template is silently dropped on decode, so the stored Pod never has
+                    // spec.volumes[].ephemeral set, KCM's ephemeral-volume-controller (whose
+                    // enqueuePod gate is `vol.Ephemeral != nil`) never enqueues the pod, and
+                    // the auto-generated PVC is never created — the pod is stuck
+                    // ContainerCreating forever waiting on a PVC that will never exist.
+                    if let Some(eph) = src.ephemeral {
+                        if let Some(tmpl) = eph.volume_claim_template {
+                            let claim = gen_persistent_volume_claim_to_json(
+                                core_v1::PersistentVolumeClaim {
+                                    metadata: tmpl.metadata,
+                                    spec: tmpl.spec,
+                                    ..Default::default()
+                                },
+                            );
+                            vm.insert(
+                                "ephemeral".to_string(),
+                                serde_json::json!({ "volumeClaimTemplate": claim }),
+                            );
+                        }
+                    }
                 }
                 serde_json::Value::Object(vm)
             })
@@ -5050,6 +5073,81 @@ mod tests {
         assert_eq!(
             volumes[0]["image"]["pullPolicy"], "Always",
             "spec.volumes[].image.pullPolicy must survive decode"
+        );
+    }
+
+    /// EphemeralVolumeSource (spec.volumes[].ephemeral, the GenericEphemeralVolume feature)
+    /// must survive proto decode.
+    ///
+    /// The volume-source match had no branch for it at all, so a pod created via a protobuf
+    /// client (client-go typed clientsets default to protobuf, which is what the e2e test
+    /// framework and kube-controller-manager itself use) silently lost the
+    /// volumeClaimTemplate on decode. Real kube-controller-manager's ephemeral-volume-
+    /// controller only enqueues a pod when it observes `vol.Ephemeral != nil` on the stored
+    /// Pod object — with the field missing, it never fires, the derived PVC
+    /// (`<pod>-<volume>`) is never created, and the pod is stuck ContainerCreating forever
+    /// waiting on a PVC that will never exist.
+    #[test]
+    fn generated_pod_spec_preserves_ephemeral_volume_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ephemeral-vol-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("my-volume".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        ephemeral: Some(core_v1::EphemeralVolumeSource {
+                            volume_claim_template: Some(core_v1::PersistentVolumeClaimTemplate {
+                                spec: Some(core_v1::PersistentVolumeClaimSpec {
+                                    access_modes: vec!["ReadWriteOnce".to_string()],
+                                    resources: Some(core_v1::VolumeResourceRequirements {
+                                        requests: std::collections::HashMap::from([(
+                                            "storage".to_string(),
+                                            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                                string: Some("1Gi".to_string()),
+                                            },
+                                        )]),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with ephemeral volume must decode");
+
+        let volumes = result["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(
+            volumes[0]["ephemeral"]["volumeClaimTemplate"]["spec"]["accessModes"][0],
+            "ReadWriteOnce",
+            "spec.volumes[].ephemeral.volumeClaimTemplate must survive decode — without it \
+             KCM's ephemeral-volume-controller never sees a reason to auto-create the pod's \
+             derived PersistentVolumeClaim, and the pod is stuck ContainerCreating forever"
+        );
+        assert_eq!(
+            volumes[0]["ephemeral"]["volumeClaimTemplate"]["spec"]["resources"]["requests"]
+                ["storage"],
+            "1Gi",
+            "the volumeClaimTemplate's storage request must survive decode unchanged so the \
+             generated PVC asks for the size the pod author specified"
         );
     }
 
