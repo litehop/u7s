@@ -38,6 +38,12 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumes") = (group, plural) {
         default_pv(obj);
     }
+    if let ("storage.k8s.io", "csidrivers") = (group, plural) {
+        default_csidriver(obj);
+    }
+    if let ("storage.k8s.io", "storageclasses") = (group, plural) {
+        default_storageclass(obj);
+    }
     if let ("", "namespaces") = (group, plural) {
         default_namespace(obj);
     }
@@ -218,6 +224,76 @@ fn default_pv(obj: &mut serde_json::Value) {
     }
     if obj["spec"]["volumeMode"].is_null() {
         obj["spec"]["volumeMode"] = serde_json::Value::String("Filesystem".to_string());
+    }
+}
+
+/// Default the pointer-typed fields of `CSIDriver.spec`, matching upstream
+/// `SetDefaults_CSIDriver` (pkg/apis/storage/v1/defaults.go).
+///
+/// A real CSI driver's install manifest (helm charts, kustomize bases, the e2e storage
+/// test framework's own `deploy.go`) commonly omits some or all of these fields,
+/// relying on the apiserver to default them the way every other typed field is defaulted.
+/// Without `requiresRepublish` specifically defaulted, a live repro against csi-hostpath
+/// showed kubelet's (unmodified upstream) volume manager panicking with a nil-pointer
+/// dereference in `csiPlugin.RequiresRemount` (`pkg/volume/csi/csi_plugin.go`, which
+/// unconditionally dereferences `*csiDriver.Spec.RequiresRepublish`), crash-looping
+/// kubelet on every node running a pod with a CSI volume and permanently blocking that
+/// pod (and the whole node's pod churn) from progressing. The other fields default here
+/// too because they are the same upstream function's peer fields on the same object,
+/// each read the same way by kubelet/kube-controller-manager's CSI code paths.
+///
+/// Idempotent: if a field is already set it is not overwritten. `seLinuxMount` and
+/// `preventPodSchedulingIfMissing` are intentionally not defaulted here — upstream only
+/// sets them when their alpha/beta feature gates are enabled, which this codebase does
+/// not model.
+fn default_csidriver(obj: &mut serde_json::Value) {
+    if obj["spec"]["attachRequired"].is_null() {
+        obj["spec"]["attachRequired"] = serde_json::Value::Bool(true);
+    }
+    if obj["spec"]["podInfoOnMount"].is_null() {
+        obj["spec"]["podInfoOnMount"] = serde_json::Value::Bool(false);
+    }
+    if obj["spec"]["storageCapacity"].is_null() {
+        obj["spec"]["storageCapacity"] = serde_json::Value::Bool(false);
+    }
+    if obj["spec"]["fsGroupPolicy"].is_null() {
+        obj["spec"]["fsGroupPolicy"] =
+            serde_json::Value::String("ReadWriteOnceWithFSTypeFSGroupPolicy".to_string());
+    }
+    if obj["spec"]["volumeLifecycleModes"]
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(true)
+    {
+        obj["spec"]["volumeLifecycleModes"] =
+            serde_json::Value::Array(vec![serde_json::Value::String("Persistent".to_string())]);
+    }
+    if obj["spec"]["requiresRepublish"].is_null() {
+        obj["spec"]["requiresRepublish"] = serde_json::Value::Bool(false);
+    }
+}
+
+/// Default `reclaimPolicy` and `volumeBindingMode` on a StorageClass, matching upstream
+/// `SetDefaults_StorageClass` (pkg/apis/storage/v1/defaults.go). Unlike CSIDriver these
+/// two fields sit directly on the object, not under `.spec` — StorageClass has no spec
+/// wrapper.
+///
+/// The e2e storage test framework's own StorageClass helper (and most hand-written
+/// manifests) omits both fields, relying on apiserver defaulting. Without
+/// `reclaimPolicy` defaulted, a live repro against the nfs3 in-tree driver showed the
+/// external `nfs-provisioner` sidecar (unmodified upstream,
+/// `pkg/volume/provision.go`) panic with a nil-pointer dereference on
+/// `*options.StorageClass.ReclaimPolicy`, crashing the provisioner pod every time it
+/// tried to provision a volume — so no PV was ever created and the PVC stayed Pending
+/// until the test's bind-wait timed out.
+///
+/// Idempotent: if a field is already set it is not overwritten.
+fn default_storageclass(obj: &mut serde_json::Value) {
+    if obj["reclaimPolicy"].is_null() {
+        obj["reclaimPolicy"] = serde_json::Value::String("Delete".to_string());
+    }
+    if obj["volumeBindingMode"].is_null() {
+        obj["volumeBindingMode"] = serde_json::Value::String("Immediate".to_string());
     }
 }
 
@@ -2468,6 +2544,164 @@ mod tests {
             obj["status"]["phase"], "Bound",
             "existing status.phase must not be overwritten — resetting Bound to \
              Pending would break controllers that track binding state"
+        );
+    }
+
+    /// A CSIDriver whose manifest omits spec.requiresRepublish (as most real-world
+    /// installs do, relying on apiserver defaulting) must have it defaulted to false,
+    /// along with the rest of upstream `SetDefaults_CSIDriver`'s pointer-typed fields.
+    ///
+    /// Before this fix, apply_defaults had zero dispatch arm for csidrivers, so
+    /// requiresRepublish stayed null. A live repro against csi-hostpath showed this
+    /// crash kubelet: `pkg/volume/csi/csi_plugin.go`'s `RequiresRemount` unconditionally
+    /// dereferences `*csiDriver.Spec.RequiresRepublish`, so a nil value SIGSEGVs the
+    /// whole kubelet process (goroutine panic, `status=2/INVALIDARGUMENT` exit) every
+    /// time it processes a pod using that CSI volume — crash-looping kubelet and
+    /// blocking every pod on the node, not just the one using the CSI volume.
+    #[test]
+    fn csidriver_pointer_fields_default_when_absent() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSIDriver",
+            "metadata": { "name": "csi-hostpath.example.com" },
+            "spec": {}
+        });
+
+        apply_defaults("storage.k8s.io", "csidrivers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["requiresRepublish"],
+            serde_json::Value::Bool(false),
+            "spec.requiresRepublish must default to false — left null, kubelet's \
+             csiPlugin.RequiresRemount panics on an unconditional pointer dereference \
+             and crash-loops"
+        );
+        assert_eq!(
+            obj["spec"]["attachRequired"],
+            serde_json::Value::Bool(true),
+            "spec.attachRequired must default to true, matching upstream SetDefaults_CSIDriver"
+        );
+        assert_eq!(
+            obj["spec"]["podInfoOnMount"],
+            serde_json::Value::Bool(false),
+            "spec.podInfoOnMount must default to false, matching upstream SetDefaults_CSIDriver"
+        );
+        assert_eq!(
+            obj["spec"]["storageCapacity"],
+            serde_json::Value::Bool(false),
+            "spec.storageCapacity must default to false, matching upstream SetDefaults_CSIDriver"
+        );
+        assert_eq!(
+            obj["spec"]["fsGroupPolicy"], "ReadWriteOnceWithFSTypeFSGroupPolicy",
+            "spec.fsGroupPolicy must default to ReadWriteOnceWithFSTypeFSGroupPolicy, \
+             matching upstream SetDefaults_CSIDriver"
+        );
+        assert_eq!(
+            obj["spec"]["volumeLifecycleModes"],
+            serde_json::json!(["Persistent"]),
+            "spec.volumeLifecycleModes must default to [\"Persistent\"], matching upstream \
+             SetDefaults_CSIDriver"
+        );
+    }
+
+    /// A CSIDriver with explicit values for these fields must not have them overwritten.
+    #[test]
+    fn csidriver_existing_pointer_fields_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSIDriver",
+            "metadata": { "name": "csi-hostpath.example.com" },
+            "spec": {
+                "requiresRepublish": true,
+                "attachRequired": false,
+                "podInfoOnMount": true,
+                "storageCapacity": true,
+                "fsGroupPolicy": "None",
+                "volumeLifecycleModes": ["Ephemeral"]
+            }
+        });
+
+        apply_defaults("storage.k8s.io", "csidrivers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["requiresRepublish"],
+            serde_json::Value::Bool(true),
+            "existing spec.requiresRepublish must not be overwritten"
+        );
+        assert_eq!(
+            obj["spec"]["attachRequired"],
+            serde_json::Value::Bool(false),
+            "existing spec.attachRequired must not be overwritten"
+        );
+        assert_eq!(
+            obj["spec"]["fsGroupPolicy"], "None",
+            "existing spec.fsGroupPolicy must not be overwritten"
+        );
+        assert_eq!(
+            obj["spec"]["volumeLifecycleModes"],
+            serde_json::json!(["Ephemeral"]),
+            "existing non-empty spec.volumeLifecycleModes must not be overwritten"
+        );
+    }
+
+    /// A StorageClass whose manifest omits reclaimPolicy/volumeBindingMode (as the e2e
+    /// storage test framework's own helper and most hand-written manifests do) must have
+    /// both defaulted.
+    ///
+    /// Before this fix, apply_defaults had zero dispatch arm for storageclasses, so
+    /// reclaimPolicy stayed null. A live repro against the nfs3 in-tree driver showed
+    /// this crash the external `nfs-provisioner` sidecar (unmodified upstream,
+    /// `pkg/volume/provision.go`) with a nil-pointer dereference on
+    /// `*options.StorageClass.ReclaimPolicy` on every single provision attempt — no PV
+    /// was ever created, and every PVC using that StorageClass stayed Pending until the
+    /// test's bind-wait timed out.
+    #[test]
+    fn storageclass_reclaim_policy_and_binding_mode_default_when_absent() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "nfs3-sc" },
+            "provisioner": "example.com/nfs"
+        });
+
+        apply_defaults("storage.k8s.io", "storageclasses", &mut obj);
+
+        assert_eq!(
+            obj["reclaimPolicy"], "Delete",
+            "reclaimPolicy must default to Delete — left null, the nfs-provisioner \
+             sidecar (and any other external provisioner following the same upstream \
+             library) panics on an unconditional pointer dereference and crashes \
+             instead of ever creating a PV"
+        );
+        assert_eq!(
+            obj["volumeBindingMode"], "Immediate",
+            "volumeBindingMode must default to Immediate, matching upstream \
+             SetDefaults_StorageClass"
+        );
+    }
+
+    /// A StorageClass with explicit reclaimPolicy/volumeBindingMode must not have them
+    /// overwritten.
+    #[test]
+    fn storageclass_existing_reclaim_policy_and_binding_mode_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "nfs3-sc" },
+            "provisioner": "example.com/nfs",
+            "reclaimPolicy": "Retain",
+            "volumeBindingMode": "WaitForFirstConsumer"
+        });
+
+        apply_defaults("storage.k8s.io", "storageclasses", &mut obj);
+
+        assert_eq!(
+            obj["reclaimPolicy"], "Retain",
+            "existing reclaimPolicy must not be overwritten"
+        );
+        assert_eq!(
+            obj["volumeBindingMode"], "WaitForFirstConsumer",
+            "existing volumeBindingMode must not be overwritten"
         );
     }
 

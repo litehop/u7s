@@ -1896,6 +1896,20 @@ fn gen_object_reference_to_json(r: core_v1::ObjectReference) -> serde_json::Valu
     serde_json::Value::Object(m)
 }
 
+/// Used by `decode_persistentvolume_proto_gen`'s `spec.csi.*SecretRef` fields — unlike
+/// `ObjectReference`, a `SecretReference` only ever carries name/namespace (no kind/uid/
+/// resourceVersion/etc.), matching upstream's narrower type for CSI secret refs.
+fn gen_secret_reference_to_json(r: core_v1::SecretReference) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = r.namespace.filter(|s| !s.is_empty()) {
+        m.insert("namespace".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 // ---- Decoder A: Namespace --------------------------------------------------
 
 pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -2653,7 +2667,7 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
         // persistentVolumeSource fields are inlined directly into PersistentVolumeSpec in
         // the JSON/REST representation (there is no nested "persistentVolumeSource" key).
         // Only the volume types conformance actually exercises against a real apiserver
-        // (local, hostPath, nfs) are decoded here — the many deprecated in-tree cloud
+        // (local, hostPath, nfs, csi) are decoded here — the many deprecated in-tree cloud
         // plugins (gcePD, awsEBS, glusterfs, ...) have no conformance coverage and are
         // intentionally left unhandled, matching this codebase's existing precedent of
         // decoding what has a live consumer rather than the full upstream field set.
@@ -2690,6 +2704,72 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                     m.insert("readOnly".to_string(), serde_json::Value::Bool(v));
                 }
                 spec_map.insert("nfs".to_string(), serde_json::Value::Object(m));
+            }
+            // csi is how every CSI driver (e.g. csi-hostpath, the conformance-suite's
+            // dynamic-provisioning exemplar) backs a PersistentVolume: external-provisioner
+            // creates the PV with this field set, driver+volumeHandle identifying the
+            // backing volume for every later NodeStageVolume/NodePublishVolume call. Without
+            // it, the stored PV round-trips with no volume source at all, and kubelet's
+            // volume plugin manager (which selects a plugin by inspecting
+            // spec.PersistentVolume.Spec.CSI) rejects the pod with "no volume plugin
+            // matched" and the mount is never even attempted, even though the PVC is
+            // already genuinely Bound.
+            if let Some(csi) = src.csi {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = csi.driver.filter(|s| !s.is_empty()) {
+                    m.insert("driver".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = csi.volume_handle.filter(|s| !s.is_empty()) {
+                    m.insert("volumeHandle".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = csi.read_only {
+                    m.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = csi.fs_type.filter(|s| !s.is_empty()) {
+                    m.insert("fsType".to_string(), serde_json::Value::String(v));
+                }
+                if !csi.volume_attributes.is_empty() {
+                    let attrs: serde_json::Map<String, serde_json::Value> = csi
+                        .volume_attributes
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect();
+                    m.insert(
+                        "volumeAttributes".to_string(),
+                        serde_json::Value::Object(attrs),
+                    );
+                }
+                if let Some(v) = csi.controller_publish_secret_ref {
+                    m.insert(
+                        "controllerPublishSecretRef".to_string(),
+                        gen_secret_reference_to_json(v),
+                    );
+                }
+                if let Some(v) = csi.node_stage_secret_ref {
+                    m.insert(
+                        "nodeStageSecretRef".to_string(),
+                        gen_secret_reference_to_json(v),
+                    );
+                }
+                if let Some(v) = csi.node_publish_secret_ref {
+                    m.insert(
+                        "nodePublishSecretRef".to_string(),
+                        gen_secret_reference_to_json(v),
+                    );
+                }
+                if let Some(v) = csi.controller_expand_secret_ref {
+                    m.insert(
+                        "controllerExpandSecretRef".to_string(),
+                        gen_secret_reference_to_json(v),
+                    );
+                }
+                if let Some(v) = csi.node_expand_secret_ref {
+                    m.insert(
+                        "nodeExpandSecretRef".to_string(),
+                        gen_secret_reference_to_json(v),
+                    );
+                }
+                spec_map.insert("csi".to_string(), serde_json::Value::Object(m));
             }
         }
         if !spec_map.is_empty() {
@@ -3695,6 +3775,81 @@ mod tests {
             result["spec"]["local"]["path"], "/mnt/disks/vol1",
             "spec.local (the local volume source) must survive proto decode — without it \
              kubelet has no path to bind-mount for a local PV"
+        );
+    }
+
+    /// decode_persistentvolume_proto_gen must preserve the `csi` (CSIPersistentVolumeSource)
+    /// volume source.
+    ///
+    /// Before this fix, a protobuf-encoded PV create (client-go's default wire format, used
+    /// by external-provisioner for every dynamically-provisioned CSI volume) silently lost
+    /// spec.csi entirely — the decoder handled local/hostPath/nfs but not csi. A live
+    /// conformance repro against csi-hostpath showed the PVC actually reaching Bound (the
+    /// binder itself works), but the pod then failed to start with kubelet event
+    /// "failed to get Plugin from volumeSpec ... no volume plugin matched", because the
+    /// stored PV had no volume source at all for kubelet's CSI plugin to recognize.
+    #[test]
+    fn decode_persistentvolume_proto_gen_preserves_csi_source() {
+        let pv = core_v1::PersistentVolume {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("csi-pv".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeSpec {
+                persistent_volume_source: Some(core_v1::PersistentVolumeSource {
+                    csi: Some(core_v1::CsiPersistentVolumeSource {
+                        driver: Some("hostpath.csi.k8s.io".to_string()),
+                        volume_handle: Some("pvc-1234".to_string()),
+                        read_only: Some(false),
+                        fs_type: Some("ext4".to_string()),
+                        volume_attributes: std::collections::HashMap::from([(
+                            "storage.kubernetes.io/csiProvisionerIdentity".to_string(),
+                            "1234-hostpath".to_string(),
+                        )]),
+                        node_publish_secret_ref: Some(core_v1::SecretReference {
+                            name: Some("node-publish-secret".to_string()),
+                            namespace: Some("default".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolume_proto_gen(&buf).expect("PV with csi must decode");
+
+        assert_eq!(
+            result["spec"]["csi"]["driver"], "hostpath.csi.k8s.io",
+            "spec.csi.driver must survive proto decode — kubelet's volume plugin manager \
+             selects the CSI plugin by checking this field is non-nil; without it the pod \
+             fails admission with \"no volume plugin matched\" even though the PVC is Bound"
+        );
+        assert_eq!(
+            result["spec"]["csi"]["volumeHandle"], "pvc-1234",
+            "spec.csi.volumeHandle must survive proto decode — it is the only identifier \
+             the CSI driver has to locate the actual backing volume on NodeStageVolume/\
+             NodePublishVolume"
+        );
+        assert_eq!(
+            result["spec"]["csi"]["fsType"], "ext4",
+            "spec.csi.fsType must survive proto decode"
+        );
+        assert_eq!(
+            result["spec"]["csi"]["volumeAttributes"]
+                ["storage.kubernetes.io/csiProvisionerIdentity"],
+            "1234-hostpath",
+            "spec.csi.volumeAttributes must survive proto decode — CSI drivers rely on these \
+             to make correct NodeStageVolume/NodePublishVolume calls"
+        );
+        assert_eq!(
+            result["spec"]["csi"]["nodePublishSecretRef"]["name"], "node-publish-secret",
+            "spec.csi.nodePublishSecretRef must survive proto decode for drivers that require \
+             credentials on NodePublishVolume"
         );
     }
 
