@@ -976,9 +976,24 @@ pub fn build_review(
 /// CoreDNS and routes through kube-proxy to the pod — hostname verification is always
 /// correct and `danger_accept_invalid_hostnames` is no longer needed.
 ///
-/// `connect_timeout` (5s) bounds the TCP handshake independently of the total timeout.
-/// Without it, a webhook pointing at a deleted service causes reqwest to wait for the OS
-/// TCP timeout (~2min) before the 10s total timeout fires, stalling all subsequent calls.
+/// `connect_timeout` bounds the TCP handshake independently of the total timeout — in
+/// case the outer `.timeout()` doesn't reliably cancel an in-flight connect through the
+/// konnectivity CONNECT-tunnel proxy. Without it, a webhook pointing at a deleted service
+/// causes reqwest to wait for the OS TCP timeout (~2min) before the total timeout fires,
+/// stalling all subsequent calls.
+///
+/// Set to `webhook_connect_timeout(request_timeout)` — equal to the total timeout — rather
+/// than a fixed smaller value: a fixed 5s cap silently shaved margin off any webhook
+/// configured for (or defaulting to) more than 5s. Under concurrent-test load, DNS
+/// resolution for a Service-backed webhook through the konnectivity agent can legitimately
+/// take 5-10s (observed: 3.1s, then >6.7s, for the same target within one conformance
+/// spec) — well under the webhook's own advertised budget, but a fixed 5s connect cap
+/// failed the call anyway. The default 10s total is still far below the ~2min black-hole
+/// scenario above.
+fn webhook_connect_timeout(request_timeout: std::time::Duration) -> std::time::Duration {
+    request_timeout
+}
+
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
@@ -989,6 +1004,7 @@ fn build_webhook_call_client(
 ) -> reqwest::Client {
     let request_timeout =
         std::time::Duration::from_secs(timeout_seconds.unwrap_or(10).max(1) as u64);
+    let connect_timeout = webhook_connect_timeout(request_timeout);
 
     // Resolve the webhook CA certificate from caBundle. Failures are non-fatal:
     // we fall back to the cluster CA (or no pinned CA) rather than refusing the
@@ -1030,12 +1046,12 @@ fn build_webhook_call_client(
         }
         reqwest::Client::builder()
             .timeout(request_timeout)
-            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(connect_timeout)
             .tls_certs_only(certs)
     } else {
         reqwest::Client::builder()
             .timeout(request_timeout)
-            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(connect_timeout)
     };
 
     if let Some(pem) = webhook_identity_pem {
@@ -8159,7 +8175,10 @@ mod tests {
     /// Without connect_timeout, TCP connect to a dead service endpoint blocks for the
     /// OS TCP timeout (~2min), stalling all subsequent webhook calls and sonobuoy tests.
     /// Reverting the fix (removing connect_timeout from the builder) does not crash but
-    /// the test documents the expected behavior.
+    /// the test documents the expected behavior. connect_timeout's actual value (matching
+    /// request_timeout rather than a fixed 5s) is covered by
+    /// `webhook_connect_timeout_matches_request_timeout_not_fixed_five_seconds` below,
+    /// since reqwest::Client doesn't expose it for inspection here.
     #[test]
     fn build_webhook_call_client_applies_per_webhook_timeout() {
         let fallback = reqwest::Client::new();
@@ -8168,10 +8187,38 @@ mod tests {
         let client = build_webhook_call_client(None, None, None, None, &fallback, Some(30));
         drop(client);
 
-        // connect_timeout is always 5s regardless of timeout_seconds — verified indirectly
-        // by the fact that the client builds successfully with both timeouts set.
         let client_default = build_webhook_call_client(None, None, None, None, &fallback, None);
         drop(client_default);
+    }
+
+    /// connect_timeout must scale with the webhook's own advertised timeoutSeconds budget,
+    /// not be capped at a fixed 5s regardless of it.
+    ///
+    /// A real conformance run (`AdmissionWebhook [Privileged:ClusterAdmin] should be able to
+    /// deny pod and configmap creation`) failed because a fixed 5s connect_timeout cut off a
+    /// webhook call before its own advertised 10s budget expired: under concurrent-test
+    /// load, DNS resolution for the Service-backed webhook through the konnectivity agent
+    /// took over 5s (observed 3.1s, then 6.7s+, for the same target) but was still well
+    /// under the 10s the caller was told to expect (visible in the URL `?timeout=10s` and
+    /// the error message). Reverting to a fixed `Duration::from_secs(5)` regardless of
+    /// `request_timeout` makes this fail for any `request_timeout` above 5s.
+    #[test]
+    fn webhook_connect_timeout_matches_request_timeout_not_fixed_five_seconds() {
+        let request_timeout = std::time::Duration::from_secs(10);
+        assert_eq!(
+            webhook_connect_timeout(request_timeout),
+            request_timeout,
+            "connect_timeout must match the webhook's own advertised timeout budget so a \
+             slow-but-legitimate connect under load isn't cut off before that budget expires"
+        );
+
+        // Must also never exceed the caller's own advertised timeout for short budgets.
+        let short = std::time::Duration::from_secs(1);
+        assert_eq!(
+            webhook_connect_timeout(short),
+            short,
+            "connect_timeout must not exceed the caller's own advertised timeout either"
+        );
     }
 
     /// VAP must not be evaluated for resources in the admissionregistration.k8s.io group.
