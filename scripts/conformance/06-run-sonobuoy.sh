@@ -47,8 +47,13 @@ fi
 # namespaces that get stuck terminating or are simply too old.
 #
 # Thresholds:
-#   10 min — force-delete Active namespaces (namespace leak / stuck creation)
-#   15 min — force-delete ANY non-system namespace regardless of phase
+#   10 min — force-delete Active namespaces (namespace leak / stuck creation),
+#            unless another Active namespace is independently also past this
+#            mark right now (see "Adaptive Active threshold" below).
+#   15 min — force-delete ANY non-system namespace regardless of phase. This
+#            ceiling is unconditional and never deferred: it is what actually
+#            guarantees a genuinely stuck/leaked namespace still gets reaped
+#            promptly no matter how the 10-minute check below adapts.
 #
 # The Active threshold must clear the longest-running legitimate [Slow]
 # conformance test, not just the common case: "[sig-apps] CronJob should not
@@ -63,8 +68,47 @@ fi
 # reasonably promptly. 15 min keeps the any-phase net comfortably above the
 # Active threshold without letting a stuck Terminating namespace linger.
 #
+# Adaptive Active threshold: a fixed 10-minute wall-clock value is fragile
+# against a run's own pace varying 2x+ run to run — live forensics confirmed
+# a run at ~2.4x baseline wall-clock force-deleted 6 different, still-
+# progressing [Slow] test namespaces this way, corrupting their results even
+# though nothing was stuck. Hardcoding a bigger number just moves the
+# goalpost until the next run that's slower still. Instead, the 10-minute
+# check below defers to the unconditional 15-minute backstop whenever
+# another Active namespace is ALSO independently past 10 minutes at the same
+# instant: that is concrete, in-run evidence the whole run's pace is
+# currently slow, not that this one namespace is uniquely stuck. A namespace
+# with no such old peer is still force-deleted at 10 minutes exactly as
+# before.
+#
 # System namespaces excluded: default, kube-*, sonobuoy
 # ---------------------------------------------------------------------------
+
+# Counts non-system namespaces that are Active and already at/past the
+# 10-minute Active threshold in this snapshot. watchdog_loop uses this as
+# the peer signal described above: a lone old namespace looks stuck, but
+# several aging past the same mark at once means the run itself is slow.
+count_slow_active_namespaces() {
+  local ns_json="$1" now="$2"
+  local count=0
+  while IFS= read -r line; do
+    local ns phase created created_s
+    ns=$(     printf '%s' "$line" | jq -r '.name')
+    phase=$(  printf '%s' "$line" | jq -r '.phase')
+    created=$(printf '%s' "$line" | jq -r '.created')
+    case "$ns" in
+      default|sonobuoy|kube-*) continue ;;
+    esac
+    [ "$phase" = "Active" ] || continue
+    created_s=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${created}" "+%s" 2>/dev/null) || continue
+    if [ "$(( now - created_s ))" -ge 600 ]; then
+      count=$(( count + 1 ))
+    fi
+  done < <(printf '%s' "$ns_json" \
+    | jq -c '.items[] | {name: .metadata.name, phase: .status.phase, created: .metadata.creationTimestamp}')
+  echo "$count"
+}
+
 watchdog_loop() {
   local kubeconfig="$1"
   while true; do
@@ -75,6 +119,9 @@ watchdog_loop() {
     # Fetch all namespaces as JSON for reliable macOS-host parsing.
     local ns_json
     ns_json=$(kubectl --kubeconfig="$kubeconfig" get ns -o json 2>/dev/null) || continue
+
+    local slow_active_count
+    slow_active_count=$(count_slow_active_namespaces "$ns_json" "$now")
 
     while IFS= read -r line; do
       local ns phase created age_s
@@ -93,12 +140,18 @@ watchdog_loop() {
       age_s=$(( now - created_s ))
 
       local should_delete=0 reason=""
-      if [ "$phase" = "Active" ] && [ "$age_s" -ge 600 ]; then
-        should_delete=1
-        reason="Active for ${age_s}s (>= 10m threshold)"
-      elif [ "$age_s" -ge 900 ]; then
+      if [ "$age_s" -ge 900 ]; then
         should_delete=1
         reason="age=${age_s}s (>= 15m threshold, phase=${phase})"
+      elif [ "$phase" = "Active" ] && [ "$age_s" -ge 600 ]; then
+        # slow_active_count includes this namespace itself, so >= 2 means at
+        # least one OTHER Active namespace is also past 10m right now — defer
+        # to the unconditional 15m backstop above instead of force-deleting a
+        # namespace that may just be a slow but healthy test in a slow run.
+        if [ "$slow_active_count" -lt 2 ]; then
+          should_delete=1
+          reason="Active for ${age_s}s (>= 10m threshold)"
+        fi
       fi
 
       if [ "$should_delete" -eq 1 ]; then
