@@ -186,8 +186,14 @@ if [ -d "$VM_DIR" ]; then
     exit 1
   fi
 else
-  echo "Provisioning VM '$VM_NAME' (first run, takes ~5 min)..."
-  limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
+  echo "Provisioning VM '$VM_NAME' (first run, takes ~15-20 min with the e2e-test-image pre-pull)..."
+  # lima's own default boot-readiness timeout (10m, DefaultWatchHostAgentEventsTimeout
+  # in lima-vm/lima) is tuned for a provision script that doesn't pull ~25 conformance
+  # images -- that alone can take longer than 10m, which made a real run fail with
+  # "did not receive an event with the running status" partway through the pull loop.
+  # 30m matches the value lima's own code already uses as an "extended" timeout for
+  # slow-boot cases (WinDefaultWatchHostAgentEventsTimeout).
+  limactl start --tty=false --timeout 30m --name="$VM_NAME" "$LIMA_YAML"
 fi
 
 # Give this node its own disjoint pod-CIDR /24 out of the CRI-O default 10.85.0.0/16
