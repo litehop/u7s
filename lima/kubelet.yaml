@@ -105,6 +105,61 @@ provision:
       fi
       printf 'runtime-endpoint: unix:///var/run/crio/crio.sock\nimage-endpoint: unix:///var/run/crio/crio.sock\ntimeout: 10\ndebug: false\n' > /etc/crictl.yaml
 
+      # Pre-pull the e2e-test-images/conformance image set at provision time so
+      # these specific images never need a runtime network fetch during a real
+      # conformance run. A ~92s burst-triggered SYN-drop at the limactl usernet
+      # layer once black-holed 10 concurrent image-pull TCP flows mid-run;
+      # kubelet's own backoff eventually recovered them, but upstream e2e's
+      # pod-watch step fails fast on the first ErrImagePull/ImagePullBackOff
+      # event regardless of eventual success. Pulling here, one at a time,
+      # during quiet provisioning (not under 16-way conformance load) sidesteps
+      # that failure mode entirely for this bounded, known set.
+      #
+      # List provenance: registry.k8s.io/e2e-test-images/* tags are copied from
+      # kubernetes/kubernetes test/utils/image/manifest.go (release-1.36),
+      # excluding images that can't or shouldn't be pre-pulled (AgnhostPrivate —
+      # requires private-registry auth; InvalidRegistryImage — deliberately
+      # unresolvable) and images not exercised by the sonobuoy e2e plugin this
+      # project runs (NodePerf*, Perl — test/e2e_node only, not test/e2e;
+      # DistrolessIptables, VolumeNFSServer, VolumeISCSIServer — non-conformance
+      # network/volume tests). registry.k8s.io/sig-storage/* tags are copied from
+      # test/e2e/testing-manifests/storage-csi/hostpath/hostpath/csi-hostpath-plugin.yaml
+      # (same branch) — the CSI hostpath driver pod that inline-ephemeral-volume
+      # tests deploy, whose sidecar image pulls were found to genuinely never
+      # recover within a test's own timeout budget in one audited run.
+      # The conformance image tag tracks whatever kubelet version pkgs.k8s.io
+      # actually installed above, rather than a second hardcoded version string.
+      KUBELET_INSTALLED_VERSION=$(kubelet --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+      for IMG in \
+        "registry.k8s.io/conformance:v${KUBELET_INSTALLED_VERSION}" \
+        "registry.k8s.io/e2e-test-images/agnhost:2.55" \
+        "registry.k8s.io/e2e-test-images/agnhost:2.63.0" \
+        "registry.k8s.io/e2e-test-images/apparmor-loader:1.4" \
+        "registry.k8s.io/e2e-test-images/busybox:1.37.0-1" \
+        "registry.k8s.io/e2e-test-images/glibc-dns-testing:2.0.0" \
+        "registry.k8s.io/e2e-test-images/ipc-utils:1.4" \
+        "registry.k8s.io/e2e-test-images/kitten:1.8" \
+        "registry.k8s.io/e2e-test-images/nautilus:1.8" \
+        "registry.k8s.io/e2e-test-images/nginx:1.15-4" \
+        "registry.k8s.io/e2e-test-images/nginx:1.27-0" \
+        "registry.k8s.io/e2e-test-images/nonewprivs:1.4" \
+        "registry.k8s.io/e2e-test-images/nonroot:1.5" \
+        "registry.k8s.io/e2e-test-images/regression-issue-74839:1.4" \
+        "registry.k8s.io/e2e-test-images/resource-consumer:1.14" \
+        "registry.k8s.io/e2e-test-images/sample-apiserver:1.29.2" \
+        "registry.k8s.io/sig-storage/hostpathplugin:v1.17.1" \
+        "registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.17.0" \
+        "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.16.0" \
+        "registry.k8s.io/sig-storage/livenessprobe:v2.18.0" \
+        "registry.k8s.io/sig-storage/csi-attacher:v4.11.0" \
+        "registry.k8s.io/sig-storage/csi-provisioner:v6.1.1" \
+        "registry.k8s.io/sig-storage/csi-resizer:v2.1.0" \
+        "registry.k8s.io/sig-storage/csi-snapshotter:v8.5.0" \
+        "registry.k8s.io/sig-storage/csi-snapshot-metadata:v0.2.0" \
+      ; do
+        crictl pull "$IMG"
+      done
+
       # Install sonobuoy — static binary, used for local conformance runs against u7s on host.
       # Detect VM arch: aarch64 → arm64, x86_64 → amd64.
       SONOBUOY_VERSION="0.57.3"
