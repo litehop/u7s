@@ -34,6 +34,18 @@
 #                --all-e2e widens). If --stack-only is also given, --stack-only
 #                wins and --all-e2e is ignored (warning printed to stderr), same
 #                as --focus's existing interaction with --stack-only.
+#   -v, -vv, -vvv  Repeatable-flag tiered debug logging, apt-style (--verbose is
+#                kept as an alias for a single -v). -v scopes RUST_LOG to u7s's own
+#                crates: u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,info.
+#                -vv adds hyper=debug,rustls=debug (connection/handshake detail).
+#                -vvv adds h2=debug (full HTTP/2 frame-level tracing). Levels add
+#                (e.g. -v -vv == -vvv). A blanket RUST_LOG=debug is NOT the default
+#                because it also enables h2's per-frame tracing, which on a real
+#                conformance run was 89.9% of a 653MB apiserver.log — burying every
+#                u7s debug! call under third-party noise. Any level >= 1 also raises
+#                kube-controller-manager to --v=5 and kubelet/CRI-O to debug (see
+#                --kcm-v and lima-start.sh's --verbose) — those aren't tiered since
+#                they don't have a third-party-noise problem to scope away from.
 #   --stack-only Bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler) and
 #                then stop — skip step 6 (sonobuoy). The stack is left running so you
 #                can use kubectl or inspect the DB directly. Useful for manual debugging
@@ -106,7 +118,9 @@ while [[ $# -gt 0 ]]; do
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
     --all-e2e) ALL_E2E=1; shift ;;
-    --verbose) export RUST_LOG=debug; VERBOSE=1; shift ;;
+    --verbose|-v) VERBOSE=$((VERBOSE + 1)); shift ;;
+    -vv) VERBOSE=$((VERBOSE + 2)); shift ;;
+    -vvv) VERBOSE=$((VERBOSE + 3)); shift ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
     --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
     --binary) BINARY="$2"; shift 2 ;;
@@ -121,6 +135,20 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+# Tiered RUST_LOG, apt-style: -v scopes debug logging to u7s's own crates instead
+# of a blanket `debug`, which also turns on h2's per-HTTP/2-frame tracing — on a
+# real conformance run that noise alone was 89.9% of a 653MB apiserver.log,
+# burying every u7s debug! call the project actually cares about. -vv/-vvv widen
+# the scope for connection- and frame-level investigations. Untouched (whatever
+# the caller's own RUST_LOG env var says, if anything) when no -v flag is given.
+if [ "$VERBOSE" -ge 3 ]; then
+  export RUST_LOG="u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,hyper=debug,rustls=debug,h2=debug,info"
+elif [ "$VERBOSE" -eq 2 ]; then
+  export RUST_LOG="u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,hyper=debug,rustls=debug,info"
+elif [ "$VERBOSE" -ge 1 ]; then
+  export RUST_LOG="u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,info"
+fi
 
 # --focus narrows test selection, --all-e2e widens it — conceptually opposite,
 # so silently picking one would be a footgun. Error unconditionally (even
@@ -178,15 +206,18 @@ _VERBOSE_ARG=""
 _EXTRA_NODE_ARG=""
 _NODE_KUBELET_PORT_ARG=""
 _ALL_E2E_ARG=""
-# When --verbose is set, raise kube-controller-manager verbosity to --v=5 so both the
-# disruption controller's pod-list / expectedCount decisions (V(4)) and the DaemonSet
-# controller's replacement-reasoning lines ("candidate to replace" / "allowing
-# replacements", V(5)) are visible — V(5) is the ceiling here (no V(6) call sites exist).
-[ "$VERBOSE" -eq 1 ] && _KCM_V_ARG="--kcm-v 5"
+# When any -v level is set (>= 1), raise kube-controller-manager verbosity to --v=5
+# so both the disruption controller's pod-list / expectedCount decisions (V(4)) and
+# the DaemonSet controller's replacement-reasoning lines ("candidate to replace" /
+# "allowing replacements", V(5)) are visible — V(5) is the ceiling here (no V(6)
+# call sites exist). Unlike RUST_LOG, this isn't tiered further at -vv/-vvv: KCM's
+# own klog verbosity has no third-party-noise problem to scope away from.
+[ "$VERBOSE" -ge 1 ] && _KCM_V_ARG="--kcm-v 5"
 # Forwarded to lima-start.sh (and, via add-node.sh, to a 2nd node's lima-start.sh),
 # which raises kubelet to --v=5 (PLEG relist detail) and flips CRI-O's crio.conf.d
 # drop-in to log_level=debug — see lima-start.sh for why both live behind one flag.
-[ "$VERBOSE" -eq 1 ] && _VERBOSE_ARG="--verbose"
+# Same reasoning as _KCM_V_ARG above: a plain on/off, not tiered.
+[ "$VERBOSE" -ge 1 ] && _VERBOSE_ARG="--verbose"
 [ -n "$PORT" ]                    && _PORT_ARG="--port $PORT"
 [ -n "$KUBELET_PORT" ]            && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
 [ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"

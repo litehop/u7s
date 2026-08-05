@@ -3701,6 +3701,70 @@ mod tests {
         assert_eq!(backlog_clamp_warning(4096, None), None);
     }
 
+    // In-memory sink for tracing-subscriber's fmt layer, so the RUST_LOG-scoping
+    // test below can assert on which events actually got rendered, mirroring the
+    // pattern used for access-log tests elsewhere in this crate.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `run-all.sh`'s `-v` tier sets `RUST_LOG` to
+    /// `u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,info` — this test
+    /// mirrors that exact string through the same `EnvFilter` construction `run()`
+    /// uses above. Before this tiering existed, `--verbose` set a blanket
+    /// `RUST_LOG=debug`, which also enabled `h2`'s per-HTTP/2-frame tracing: on a
+    /// real conformance run that noise alone was 89.9% of a 653MB apiserver.log,
+    /// burying every debug! call the project actually added (request timing,
+    /// storage-write internals, admission-chain latency, scheduler decisions). If
+    /// the `-v` preset ever regresses back to a blanket `debug`, `h2`'s debug event
+    /// below starts passing through again and this test must fail.
+    #[test]
+    fn v_tier_rust_log_scopes_debug_to_u7s_crates_not_h2() {
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new(
+            "u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,info",
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::debug!(target: "h2::codec", "frame-level h2 noise");
+        tracing::debug!(target: "u7s_apiserver::handlers::pods", "pod handler detail");
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !log.contains("frame-level h2 noise"),
+            "the -v tier must not enable h2's per-frame debug logging — a blanket \
+             RUST_LOG=debug buried every u7s debug! call under exactly this kind of \
+             third-party noise (89.9% of a 653MB conformance log): {log}"
+        );
+        assert!(
+            log.contains("pod handler detail"),
+            "the -v tier must still enable u7s_apiserver's own debug logging — \
+             that's the entire point of --verbose/-v, so a filter that silences it \
+             along with h2 would defeat the feature: {log}"
+        );
+    }
+
     /// Regression guard for the socket2 refactor in `bind_listener`: it builds the
     /// listener manually (non-blocking, reuse-addr, bind, listen) instead of going
     /// through `TcpListener::bind`, so a future edit that drops `set_nonblocking` or
