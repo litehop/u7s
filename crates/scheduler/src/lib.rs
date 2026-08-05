@@ -974,10 +974,10 @@ struct PreemptionPodListItem {
 /// slot on, its priority (preemption eligibility), its resource requests, and
 /// its hostPort claims.
 ///
-/// `host_ports` is only ever populated via `apply_event` (a real watch event
-/// carries the pod's full `spec.containers`); `assume`'s fast path — recording
-/// a bind this scheduler itself just decided, before the watch echoes it back
-/// — deliberately leaves it empty (see `NodeTally::assume`'s doc comment).
+/// Populated both by `apply_event` (a real watch event carries the pod's full
+/// `spec.containers`) and by `assume`'s fast path (the pending pod's own
+/// already-computed `host_ports`) — see `NodeTally::assume`'s doc comment for
+/// why the latter matters.
 #[derive(Debug, Clone)]
 struct TalliedPod {
     node_name: String,
@@ -1191,14 +1191,15 @@ impl NodeTally {
     /// called the instant the scheduler decides to bind, before the bind's
     /// HTTP call even completes. `remove` undoes this if the bind then fails.
     ///
-    /// Leaves `host_ports` empty: unlike `requests` (known from `pod.requests`
-    /// at decision time), the pending pod's `hostPort` claims aren't threaded
-    /// through this call today, so a hostPort a scheduling decision just
-    /// reserved on `node_name` becomes visible to `usage_by_node`/the
-    /// NodePorts filter only once the real bind's watch event round-trips
-    /// through `apply_event` — a narrow race window analogous to the one
-    /// `requests` closed for cpu/memory (see this struct's doc comment),
-    /// left open here rather than widening this method's signature.
+    /// `host_ports` — like `requests` — is the pending pod's own
+    /// already-computed value at decision time, not something read back from
+    /// a watch event: without it, a hostPort a scheduling decision just
+    /// reserved on `node_name` would stay invisible to `usage_by_node`/the
+    /// NodePorts filter for every OTHER concurrent decision until the real
+    /// bind's watch event round-tripped through `apply_event` — the same
+    /// read-after-write race `requests` already closes for cpu/memory (see
+    /// this struct's doc comment), left open for hostPorts until now only
+    /// because widening this signature required a coordinated `main.rs` edit.
     pub fn assume(
         &mut self,
         namespace: &str,
@@ -1206,6 +1207,7 @@ impl NodeTally {
         node_name: &str,
         priority: i32,
         requests: ResourceRequests,
+        host_ports: Vec<HostPortClaim>,
     ) {
         self.pods.insert(
             format!("{namespace}/{pod_name}"),
@@ -1213,7 +1215,7 @@ impl NodeTally {
                 node_name: node_name.to_owned(),
                 priority,
                 requests,
-                host_ports: Vec::new(),
+                host_ports,
             },
         );
     }
@@ -1941,6 +1943,7 @@ fn select_and_reserve_node(
         &node,
         pod.priority,
         pod.requests.clone(),
+        pod.host_ports.clone(),
     );
     Ok(node)
 }
@@ -2173,6 +2176,7 @@ fn verify_and_reserve_preemption(
         &plan.node_name,
         pod.priority,
         pod.requests.clone(),
+        pod.host_ports.clone(),
     );
     // Claim the victims under this SAME lock acquisition, not a later one —
     // otherwise a fresher concurrent plan's search could still see them as
@@ -4758,6 +4762,7 @@ mod tests {
                 &chosen,
                 0,
                 ResourceRequests::default(),
+                Vec::new(),
             );
         }
 
@@ -4923,7 +4928,14 @@ mod tests {
         let mut tally = NodeTally::default();
         // Mirrors pick_node: the tally is updated the instant a pod's node is
         // decided, not after its HTTP bind call returns.
-        tally.assume("default", "filler", "worker-0", 0, requests(5600, 0, 0));
+        tally.assume(
+            "default",
+            "filler",
+            "worker-0",
+            0,
+            requests(5600, 0, 0),
+            Vec::new(),
+        );
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
         node.status.allocatable.cpu = "8".to_owned(); // 8000m allocatable
@@ -5031,8 +5043,22 @@ mod tests {
         let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
         {
             let mut guard = tally.lock().expect("tally lock poisoned");
-            guard.assume("default", "victim-a", "worker-0", 0, requests(1000, 0, 0));
-            guard.assume("default", "victim-b", "worker-0", 0, requests(1000, 0, 0));
+            guard.assume(
+                "default",
+                "victim-a",
+                "worker-0",
+                0,
+                requests(1000, 0, 0),
+                Vec::new(),
+            );
+            guard.assume(
+                "default",
+                "victim-b",
+                "worker-0",
+                0,
+                requests(1000, 0, 0),
+                Vec::new(),
+            );
         }
 
         const CONTENDERS: usize = 8;
@@ -5106,6 +5132,7 @@ mod tests {
                     "worker-0",
                     100,
                     requests(1000, 0, 0),
+                    Vec::new(),
                 );
             }
         }
@@ -5208,8 +5235,22 @@ mod tests {
         let tally = std::sync::Arc::new(std::sync::Mutex::new(NodeTally::default()));
         {
             let mut guard = tally.lock().expect("tally lock poisoned");
-            guard.assume("default", "filler-a", "worker-0", 100, requests(1000, 0, 0));
-            guard.assume("default", "filler-b", "worker-0", 100, requests(1000, 0, 0));
+            guard.assume(
+                "default",
+                "filler-a",
+                "worker-0",
+                100,
+                requests(1000, 0, 0),
+                Vec::new(),
+            );
+            guard.assume(
+                "default",
+                "filler-b",
+                "worker-0",
+                100,
+                requests(1000, 0, 0),
+                Vec::new(),
+            );
         }
         // Saturated by the two fillers — the first plan needs to evict
         // exactly one of them to fit.
@@ -5270,6 +5311,7 @@ mod tests {
             "worker-0",
             100,
             requests(1000, 0, 0),
+            Vec::new(),
         );
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -5301,6 +5343,7 @@ mod tests {
             "worker-0",
             100,
             requests(1000, 0, 0),
+            Vec::new(),
         );
 
         // Now saturated by preemptor-1 + the recreated filler-a; a second
@@ -5337,7 +5380,14 @@ mod tests {
     #[test]
     fn node_tally_remove_frees_capacity_for_the_next_decision() {
         let mut tally = NodeTally::default();
-        tally.assume("default", "filler", "worker-0", 0, requests(8000, 0, 0));
+        tally.assume(
+            "default",
+            "filler",
+            "worker-0",
+            0,
+            requests(8000, 0, 0),
+            Vec::new(),
+        );
         tally.remove("default", "filler");
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -5399,6 +5449,7 @@ mod tests {
             "worker-0",
             1000,
             requests(1000, 0, 0),
+            Vec::new(),
         );
 
         // Mirrors the nominatedNodeName status PATCH's watch-echo: same pod,
@@ -5591,6 +5642,62 @@ mod tests {
         );
     }
 
+    /// `NodeTally::assume`'s fast path — recording a scheduler-decided bind
+    /// before its own HTTP bind call even completes — must make the bind's
+    /// hostPort claim visible to the very next scheduling decision, with NO
+    /// window where a watch event round-trip through `apply_event` is
+    /// needed. Before `assume` threaded `host_ports` through (it used to
+    /// hardcode `Vec::new()`), a pod scheduled immediately after another that
+    /// just claimed the same hostPort would see the candidate node as having
+    /// zero hostPort claims — `usage_by_node`'s only source for
+    /// `host_ports` was `apply_event` — and could be bound to that same
+    /// node/hostPort too; the loser then crashes at container-start with
+    /// "address already in use" instead of staying Pending where a
+    /// controller could retry it elsewhere. The sequential conformance test
+    /// never exercises this: each pod there is created and waited-on before
+    /// the next, giving the real watch event time to round-trip through
+    /// `apply_event` first — only concurrent scheduling load hits this race.
+    #[test]
+    fn assume_records_host_port_claim_visible_to_the_very_next_scheduling_decision() {
+        let mut tally = NodeTally::default();
+        let list = || NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+
+        let mut pod_a = empty_pending_pod();
+        pod_a.pod_name = "pod-a".to_owned();
+        pod_a.host_ports = vec![host_port_claim(8080, "", "TCP")];
+        let chosen = select_node_with_capacity(list(), &pod_a, &tally.usage_by_node())
+            .expect("pod-a has no competing claim yet, so it must schedule");
+        tally.assume(
+            "default",
+            "pod-a",
+            &chosen,
+            0,
+            ResourceRequests::default(),
+            pod_a.host_ports.clone(),
+        );
+
+        // No `apply_event` call in between — pod-b's decision must not need
+        // one to see pod-a's just-`assume`d claim.
+        let mut pod_b = empty_pending_pod();
+        pod_b.pod_name = "pod-b".to_owned();
+        pod_b.host_ports = vec![host_port_claim(8080, "", "TCP")];
+        let result = select_node_with_capacity(list(), &pod_b, &tally.usage_by_node());
+
+        assert!(
+            result.is_err(),
+            "pod-a's assume()d hostPort claim must be visible to pod-b's \
+             scheduling decision without waiting for a watch event \
+             round-trip — otherwise two pods requesting the same hostPort \
+             can both be bound to the same node under concurrent scheduling \
+             load, and the loser crashes at container-start with 'address \
+             already in use' instead of never being scheduled there; got \
+             {:?}",
+            result.ok()
+        );
+    }
+
     /// `needs_scheduling` must extract hostPort/hostIP/protocol from a
     /// container's ports — if this parsing is dropped, `PendingPod.host_ports`
     /// is always empty and the NodePorts filter above can never fire for any
@@ -5746,6 +5853,7 @@ mod tests {
             "worker-0",
             1000,
             ResourceRequests::default(),
+            Vec::new(),
         );
         tally.register_preemption_waiter(
             preemptor,
@@ -5877,6 +5985,7 @@ mod tests {
             "worker-0",
             1000,
             pod.requests.clone(),
+            Vec::new(),
         );
 
         // Baseline: with nothing else on the node, the reservation still
@@ -5895,6 +6004,7 @@ mod tests {
             "worker-0",
             0,
             requests(1000, 0, 0),
+            Vec::new(),
         );
 
         assert!(

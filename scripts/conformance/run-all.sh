@@ -25,14 +25,17 @@
 #                with --all-e2e (error if both given).
 #   --all-e2e    Widen sonobuoy beyond the default --mode=certified-conformance
 #                (the [Conformance]-tagged subset) to the full e2e ginkgo set via
-#                --e2e-focus=".*" --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]".
-#                Surfaces plain ginkgo.It specs (e.g. SSA field-manager tests)
-#                that certified-conformance never runs. Wall-clock: ~6-12h vs
-#                certified's ~25min (PR #966 made ginkgo's --procs=16 the
-#                default, replacing a silently-serial certified-conformance
-#                path — re-measure if that default ever changes) — a
-#                deliberate discovery/perf-baseline run, not a default.
-#                Mutually exclusive with --focus (error if both
+#                --e2e-focus=".*" --e2e-skip="\[Flaky\]" — a genuine superset of
+#                certified-conformance (only upstream's known-unreliable
+#                [Flaky] specs are excluded; [Disruptive]/[Slow] are NOT
+#                skipped since some of those are also [Conformance], see
+#                06-run-sonobuoy.sh). Surfaces plain ginkgo.It specs (e.g. SSA
+#                field-manager tests) that certified-conformance never runs.
+#                Wall-clock: ~6-12h vs certified's ~25min (PR #966 made
+#                ginkgo's --procs=16 the default, replacing a silently-serial
+#                certified-conformance path — re-measure if that default
+#                ever changes) — a deliberate discovery/perf-baseline run,
+#                not a default. Mutually exclusive with --focus (error if both
 #                given — they're conceptually opposite: --focus narrows,
 #                --all-e2e widens). If --stack-only is also given, --stack-only
 #                wins and --all-e2e is ignored (warning printed to stderr), same

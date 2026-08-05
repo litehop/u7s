@@ -1066,6 +1066,7 @@ mod tests {
                     cpu_milli: 1000,
                     ..Default::default()
                 },
+                Vec::new(),
             );
             guard.assume(
                 "default",
@@ -1076,6 +1077,7 @@ mod tests {
                     cpu_milli: 1000,
                     ..Default::default()
                 },
+                Vec::new(),
             );
         }
 

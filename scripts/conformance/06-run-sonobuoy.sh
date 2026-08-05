@@ -153,10 +153,21 @@ if [ -n "$FOCUS" ]; then
 elif [ "$ALL_E2E" -eq 1 ]; then
   # Full ginkgo set (~7500 specs) instead of just the [Conformance]-tagged
   # subset — surfaces plain ginkgo.It cases (e.g. SSA field-manager tests)
-  # certified-conformance never runs. Skips are upstream's own release-qual
-  # exclusions: [Disruptive] needs multi-node infra our lima setup lacks,
-  # [Flaky] is upstream-known-flaky (not signal), [Slow] (>5min specs) would
-  # otherwise balloon wall-clock unpredictably.
+  # certified-conformance never runs. Only [Flaky] is skipped: it's
+  # upstream's own known-unreliable set (not signal), and by definition can
+  # never overlap with [Conformance] (a certified suite must be
+  # deterministic), so skipping it never drops conformance coverage.
+  # [Disruptive] and [Slow] are deliberately NOT skipped (unlike an earlier
+  # version of this script) — checked against upstream's release-1.36
+  # test/conformance/testdata/conformance.yaml, 2 [Disruptive] and 6 [Slow]
+  # specs are ALSO [Conformance]. Skipping them made --all-e2e silently drop
+  # conformance-tagged tests that --mode=certified-conformance covers,
+  # contradicting run-all.sh's --all-e2e doc comment ("widen sonobuoy beyond
+  # certified-conformance" implies a superset, not a smaller, different set).
+  # Running the [Disruptive] conformance tests needs real 2-node capability
+  # (this script's own --extra-node flag, driven by run-all.sh's
+  # --extra-node/--extra-kubelet-port) — this project has had that for weeks,
+  # so the old comment claiming lima lacked multi-node infra was stale.
   # Wall-clock for this mode is ~6-12h (see run-all.sh's --all-e2e doc
   # comment); sonobuoy's own --timeout (aggregator wait-for-plugins budget,
   # in seconds) defaults to 21600 (6h), which killed a real overnight run at
@@ -165,7 +176,7 @@ elif [ "$ALL_E2E" -eq 1 ]; then
   # shellcheck disable=SC2086
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS \
     --e2e-focus=".*" \
-    --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]" \
+    --e2e-skip="\[Flaky\]" \
     --timeout "$ALL_E2E_TIMEOUT_SECONDS" || SONOBUOY_EXIT=$?
 else
   # shellcheck disable=SC2086
