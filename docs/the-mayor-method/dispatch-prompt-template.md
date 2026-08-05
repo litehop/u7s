@@ -486,8 +486,10 @@ scripts/conformance/run-all.sh --vm lima-node-smoke --port 6444 --workdir ./temp
 ```
 
 **⚠️ NEVER dispatch a bare `run-all.sh` (no `--focus`, no `--stack-only`).** A bare
-invocation runs the FULL conformance suite (~2h at current state — faster than the old
-~6h, but still far too slow to iterate on, and a runaway burn if unintended). Every VM
+invocation runs the FULL conformance suite (~25min at current state — PR #966 made
+ginkgo's `--procs=16` the default, replacing a silently-serial certified-conformance
+path (was ~2h before that fix, ~6h before an earlier optimization) — still far too
+slow to iterate on, and a runaway burn if unintended). Every VM
 dispatch prompt MUST tell the worker to use EITHER `--stack-only` (investigate via
 kubectl / direct DB, no sonobuoy at all) OR `--focus <regex>` (run one targeted test),
 and to reserve any `--focus` run for a FINAL confirmation gate — never a bare full run

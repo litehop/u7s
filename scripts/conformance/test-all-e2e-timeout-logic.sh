@@ -14,8 +14,9 @@
 # This test proves the --timeout flag reaches the --all-e2e branch's actual
 # sonobuoy argv with a value that clears sonobuoy's own 6h default, while
 # staying OUT of the --focus and certified-conformance branches (those
-# ~10min/~2h runs don't need it, and adding it there would just be an
-# unreviewed behavior change beyond what this fix asks for).
+# ~10min/~25min runs -- certified-conformance sped up once PR #966 made
+# ginkgo's --procs=16 the default -- don't need it, and adding it there would
+# just be an unreviewed behavior change beyond what this fix asks for).
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
@@ -86,8 +87,9 @@ assert "(regression guard) pre-fix --all-e2e argv genuinely lacks --timeout" \
 
 # ---------------------------------------------------------------------------
 # 2. --focus and certified-conformance (default) argvs are untouched -- their
-#    ~10min/~2h runs never approach sonobuoy's 6h default, so silently adding
-#    a flag there would be an unreviewed behavior change this fix didn't ask for.
+#    ~10min/~25min runs (certified-conformance sped up post PR #966's --procs=16
+#    default) never approach sonobuoy's 6h default, so silently adding a flag
+#    there would be an unreviewed behavior change this fix didn't ask for.
 # ---------------------------------------------------------------------------
 FOCUS_ARGS=$(build_sonobuoy_args "AdmissionWebhook" 0 "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS")
 assert "--focus argv is unaffected by the --all-e2e timeout fix" \

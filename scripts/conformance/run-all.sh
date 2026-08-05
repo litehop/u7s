@@ -28,8 +28,11 @@
 #                --e2e-focus=".*" --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]".
 #                Surfaces plain ginkgo.It specs (e.g. SSA field-manager tests)
 #                that certified-conformance never runs. Wall-clock: ~6-12h vs
-#                certified's ~2h — a deliberate discovery/perf-baseline run, not
-#                a default. Mutually exclusive with --focus (error if both
+#                certified's ~25min (PR #966 made ginkgo's --procs=16 the
+#                default, replacing a silently-serial certified-conformance
+#                path — re-measure if that default ever changes) — a
+#                deliberate discovery/perf-baseline run, not a default.
+#                Mutually exclusive with --focus (error if both
 #                given — they're conceptually opposite: --focus narrows,
 #                --all-e2e widens). If --stack-only is also given, --stack-only
 #                wins and --all-e2e is ignored (warning printed to stderr), same
@@ -50,7 +53,9 @@
 #                then stop — skip step 6 (sonobuoy). The stack is left running so you
 #                can use kubectl or inspect the DB directly. Useful for manual debugging
 #                without triggering a sonobuoy run. Note: a bare invocation (no --focus,
-#                no --stack-only) runs the FULL conformance suite (~6h at current state).
+#                no --stack-only) runs the FULL conformance suite (~25min at current
+#                state — PR #966's --procs=16 default replaced a silently-serial
+#                certified-conformance path; re-measure if that default changes).
 #                If --focus is also supplied it is ignored (warning printed to stderr).
 #   --vm      Lima VM name to use (default: lima-node). Sets U7S_VM_NAME so all
 #             child scripts (lima-start, 04-start-kcm, 06-run-sonobuoy) use the
