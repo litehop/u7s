@@ -12,6 +12,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
+ALL_E2E_TIMEOUT_SECONDS="${SONOBUOY_ALL_E2E_TIMEOUT_SECONDS:-43200}"
 WORKDIR="$PWD/temp/u7s"
 UNPACK=1
 PORT="${U7S_PORT:-6443}"
@@ -156,10 +157,16 @@ elif [ "$ALL_E2E" -eq 1 ]; then
   # exclusions: [Disruptive] needs multi-node infra our lima setup lacks,
   # [Flaky] is upstream-known-flaky (not signal), [Slow] (>5min specs) would
   # otherwise balloon wall-clock unpredictably.
+  # Wall-clock for this mode is ~6-12h (see run-all.sh's --all-e2e doc
+  # comment); sonobuoy's own --timeout (aggregator wait-for-plugins budget,
+  # in seconds) defaults to 21600 (6h), which killed a real overnight run at
+  # exactly 6h00m00s. Raise it to match this mode's own documented budget
+  # instead of an unrelated default silently truncating it.
   # shellcheck disable=SC2086
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS \
     --e2e-focus=".*" \
-    --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]" || SONOBUOY_EXIT=$?
+    --e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]" \
+    --timeout "$ALL_E2E_TIMEOUT_SECONDS" || SONOBUOY_EXIT=$?
 else
   # shellcheck disable=SC2086
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=certified-conformance || SONOBUOY_EXIT=$?
