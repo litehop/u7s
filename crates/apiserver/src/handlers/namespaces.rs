@@ -11,7 +11,7 @@ use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::{
-        generic::apply_delete_policy,
+        generic::{apply_delete_policy, parse_field_selector},
         json_patch::{
             apply_json_patch, detect_patch_type, ssa_body_to_json, PatchQuery, PatchType,
         },
@@ -92,9 +92,25 @@ pub(crate) async fn list_namespaces<S: Store>(
         .await;
     }
 
+    // Mirrors the generic resource list path (handlers/resource.rs) — without threading
+    // field_selector into ListOptions here too, a plain (non-watch) `kubectl get namespaces
+    // --field-selector=status.phase=Terminating` silently ignores the filter and returns
+    // every namespace.
+    let store_field_selector = query
+        .field_selector
+        .as_deref()
+        .map(parse_field_selector)
+        .transpose()?;
+
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector: store_field_selector,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1249,6 +1265,91 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("chunked"),
             "watch response must use chunked transfer encoding"
+        );
+    }
+
+    // The non-watch LIST path used to call state.store.list with ListOptions::default(),
+    // dropping query.field_selector entirely — only the watch=true branch ever read it. A
+    // user running `kubectl get namespaces --field-selector=status.phase=Terminating` (the
+    // exact diagnostic command used to hunt a stuck namespace) got back every namespace,
+    // silently defeating the filter. This test fails on revert: without threading
+    // field_selector into ListOptions on the plain-LIST branch, both namespaces would come
+    // back and the length/name assertions below would fail.
+    #[tokio::test]
+    async fn list_namespaces_non_watch_honors_field_selector_for_terminating_phase() {
+        use axum::body::to_bytes;
+
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("term-ns"),
+            )
+            .await
+            .is_ok(),
+            "create of term-ns must succeed"
+        );
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("active-ns"),
+            )
+            .await
+            .is_ok(),
+            "create of active-ns must succeed"
+        );
+
+        // create_namespace auto-stamps the "kubernetes" finalizer, so this soft-deletes
+        // term-ns and sets status.phase=Terminating without hard-deleting it — matching
+        // how a real cluster's namespace controller leaves a draining namespace visible.
+        assert!(
+            delete_namespace(
+                State(state.clone()),
+                Path("term-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
+            "delete of term-ns must not error"
+        );
+
+        let query = crate::handlers::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: None,
+            field_selector: Some("status.phase=Terminating".to_string()),
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        };
+
+        let resp = list_namespaces(State(state), Query(query), test_user())
+            .await
+            .expect("list with a valid field selector must not error");
+
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
+        let names: Vec<&str> = body["items"]
+            .as_array()
+            .expect("items must be an array")
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().unwrap_or(""))
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["term-ns"],
+            "field_selector=status.phase=Terminating must return exactly the Terminating \
+             namespace and exclude the Active one — a client filtering for stuck-terminating \
+             namespaces must not silently get back the full unfiltered list"
         );
     }
 
