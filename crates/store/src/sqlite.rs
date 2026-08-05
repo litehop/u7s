@@ -1,6 +1,6 @@
 use super::*;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -691,7 +691,12 @@ fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result
 }
 
 fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<ListResponse> {
-    conn.execute_batch("BEGIN DEFERRED")?;
+    // Transaction guard: any `?` early-return below rolls back automatically on drop
+    // (rusqlite::Transaction defaults to DropBehavior::Rollback), so the many fallible
+    // queries in this function can't abandon the connection mid-transaction the way a
+    // bare `execute_batch("BEGIN ...")` + manual COMMIT would.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let conn: &Connection = &tx;
 
     let upper = prefix_upper_bound(prefix);
     let ck = opts.continue_key.as_deref().unwrap_or("");
@@ -936,7 +941,7 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         }
     };
 
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
 
     Ok(ListResponse {
         items,
@@ -2938,5 +2943,45 @@ mod tests {
                 .await
                 .expect("reset namespace to active");
         }
+    }
+
+    /// `list_sync` runs many fallible queries between `BEGIN DEFERRED` and `COMMIT` (one per
+    /// field-selector fast path, plus the snapshot-revision and remaining-count reads). If any
+    /// of them errors out via `?` without rolling back, the connection is abandoned
+    /// mid-transaction — frozen on whatever snapshot existed when the transaction opened.
+    /// `Store::get()` happens to recover from this today via its stale-revision fallback to
+    /// `write_conn`, but any future read path without that specific fallback would silently
+    /// serve stale data forever from a wedged connection. This test forces list_sync's
+    /// snapshot-revision read to fail (by deleting the `meta` revision row) after it has
+    /// already opened the transaction, then checks the connection is back in autocommit mode —
+    /// i.e. rolled back, not left open.
+    #[test]
+    fn list_sync_error_path_rolls_back_transaction() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+             revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+             CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .expect("schema");
+        // No 'revision' row in meta: list_sync's snapshot-revision query_row (which requires
+        // exactly one row) fails with QueryReturnedNoRows partway through the transaction,
+        // after the objects scan has already succeeded.
+
+        let err = list_sync(&conn, "/registry/pods/", &ListOptions::default())
+            .expect_err("a missing meta.revision row must surface as an error, not succeed");
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected list_sync's early return to be a sqlite error from the missing meta row, \
+             got {err:?}"
+        );
+
+        assert!(
+            conn.is_autocommit(),
+            "list_sync's error path left the connection mid-transaction (BEGIN DEFERRED with \
+             no matching ROLLBACK/COMMIT); a caller reusing this connection without \
+             Store::get()'s stale-revision retry would be stuck reading a frozen snapshot from \
+             the abandoned transaction"
+        );
     }
 }
