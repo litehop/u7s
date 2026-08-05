@@ -1130,11 +1130,11 @@ impl NodeTally {
         self.pods.remove(&format!("{namespace}/{pod_name}"));
     }
 
-    /// Drop all tallied state. Called on watch reconnect: the reconnected
-    /// watch always replays the full ring-buffer history from scratch, and
-    /// without clearing first, a pod deleted while disconnected (and since
-    /// aged out of the ring buffer) would leave a phantom entry this tally
-    /// could never otherwise correct.
+    /// Drop all tallied state. Called on watch reconnect: `POD_WATCH_PATH`'s
+    /// `sendInitialEvents=true` makes every reconnect relist current pod
+    /// state as ADDED events from scratch, and without clearing first, a pod
+    /// deleted while disconnected (and so absent from that fresh relist)
+    /// would leave a phantom entry this tally could never otherwise correct.
     ///
     /// Also drops every deferred preemption plan (`waiters`): a reconnect
     /// wipes `pods`, which is where each plan's own `assume`d reservation

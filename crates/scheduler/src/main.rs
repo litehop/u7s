@@ -401,7 +401,28 @@ const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// per-frame idle timeout (`WATCH_IDLE_TIMEOUT` in `kubeconfig::lib`) never
 /// trips on a healthy cluster that is simply quiet — without it, an idle
 /// cluster forces a harmless but unnecessary reconnect every 5 minutes.
-const POD_WATCH_PATH: &str = "/api/v1/pods?watch=true&allowWatchBookmarks=true";
+///
+/// `sendInitialEvents=true` is load-bearing: this watch never carries a
+/// `resourceVersion`, so the apiserver's default for a bare `resourceVersion`-
+/// less watch is `from_revision=0` — which replays the store's raw
+/// ring-buffer write history (every ADDED/MODIFIED write still retained),
+/// NOT a snapshot of current state. Without `sendInitialEvents=true`, EVERY
+/// (re)connect on this path — including the one the apiserver forces on any
+/// open watch after its ~30-minute default `stream_timeout_secs` — replays
+/// each pod's original, long-superseded creation event (`spec.nodeName`
+/// still empty at that point in history) alongside its later bind. Because
+/// `needs_scheduling` only ever looks at the event's own embedded object
+/// body, it cannot tell that stale replayed ADDED apart from a genuinely new
+/// unscheduled pod, and re-issues a bind for a pod that has been Running for
+/// however long — wasted apiserver load and confusing 201/404 log noise,
+/// every ~30 minutes, for the life of the scheduler process. With
+/// `sendInitialEvents=true`, every (re)connect instead gets one ADDED event
+/// per currently-existing pod reflecting its CURRENT `spec.nodeName`
+/// (`fetch_initial_events`/`core_list_resource` LIST the store, they don't
+/// replay history), so `needs_scheduling`'s already-scheduled check works
+/// the same on a reconnect as it does on the live tail.
+const POD_WATCH_PATH: &str =
+    "/api/v1/pods?watch=true&allowWatchBookmarks=true&sendInitialEvents=true";
 
 /// Handle one pod watch event — a real one from the live watch, or a
 /// synthetic `{"type": "MODIFIED", "object": ...}` manufactured by the
@@ -856,6 +877,31 @@ mod tests {
             POD_WATCH_PATH.contains("allowWatchBookmarks=true"),
             "pod watch path must request allowWatchBookmarks=true to avoid \
              spurious idle-timeout reconnects on a quiet cluster; got: {POD_WATCH_PATH}"
+        );
+    }
+
+    #[test]
+    fn pod_watch_path_requests_send_initial_events() {
+        // This watch never carries a resourceVersion, so without
+        // sendInitialEvents=true the apiserver's from_revision=0 default replays
+        // raw ring-buffer write history on every (re)connect — including the one
+        // the apiserver forces on every long-lived watch roughly every 30
+        // minutes. That history includes each pod's ORIGINAL creation event
+        // (spec.nodeName still empty at that point), which needs_scheduling
+        // cannot tell apart from a genuinely new unscheduled pod: in production
+        // this manifested as the scheduler re-issuing POST .../binding for
+        // EVERY pod it had ever bound, roughly every 30 minutes, for the life
+        // of the process — wasted apiserver load and confusing log noise on a
+        // live cluster. sendInitialEvents=true makes a (re)connect relist
+        // CURRENT pod state (one ADDED per pod, from a LIST) instead, so an
+        // already-bound pod's ADDED event carries its real spec.nodeName and
+        // needs_scheduling correctly skips it, the same as it does on the live
+        // tail.
+        assert!(
+            POD_WATCH_PATH.contains("sendInitialEvents=true"),
+            "pod watch path must request sendInitialEvents=true so a watch \
+             reconnect relists CURRENT pod state instead of replaying stale \
+             historical ADDED events for pods already bound; got: {POD_WATCH_PATH}"
         );
     }
 
