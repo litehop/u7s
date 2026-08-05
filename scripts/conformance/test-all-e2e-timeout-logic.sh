@@ -36,7 +36,7 @@ assert() {
 
 # ---------------------------------------------------------------------------
 # build_sonobuoy_args() -- mirrors 06-run-sonobuoy.sh's three invocation
-# branches (:150-172) closely enough to prove which branch gets --timeout
+# branches (:150-184) closely enough to prove which branch gets --timeout
 # and with what value. Keep in sync if those branches change.
 # ---------------------------------------------------------------------------
 build_sonobuoy_args() {
@@ -45,7 +45,7 @@ build_sonobuoy_args() {
   if [ -n "$focus" ]; then
     echo "$base --e2e-focus=$focus"
   elif [ "$all_e2e" -eq 1 ]; then
-    echo "$base --e2e-focus=.* --e2e-skip=\[Disruptive\]|\[Flaky\]|\[Slow\] --timeout $timeout_secs"
+    echo "$base --e2e-focus=.* --e2e-skip=\[Flaky\] --timeout $timeout_secs"
   else
     echo "$base --mode=certified-conformance"
   fi
