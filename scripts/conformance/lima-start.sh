@@ -204,6 +204,11 @@ else
   POD_SUBNET_OCTET=$(( ${NODE_SUFFIX#-} - 1 ))
 fi
 POD_SUBNET="10.85.${POD_SUBNET_OCTET}.0/24"
+# `|| true` here is safe: a failure to read the current subnet (e.g. a transient
+# `limactl shell` hiccup) just falls through to the "unset" branch below, which
+# re-asserts the same rewrite this run would have wanted anyway — it never masks
+# a failure that leaves the VM in a broken state, only ever costs an extra (idempotent)
+# rewrite + crio restart on an already-correct subnet.
 CURRENT_POD_SUBNET=$(limactl shell "$VM_NAME" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
 if [ "$CURRENT_POD_SUBNET" != "$POD_SUBNET" ]; then
   echo "Rewriting CNI bridge pod subnet: ${CURRENT_POD_SUBNET:-<unset>} -> ${POD_SUBNET}"
@@ -452,8 +457,16 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent
 
 # Resolve the Mac host IP so the agent pod can reach the konnectivity-server.
 # CoreDNS inside the pod does not know host.lima.internal; inject it as a hostAlias.
+# 192.168.5.x (Lima's old default network) used to be hardcoded here as a fallback,
+# but this deployment's `networks: - lima: user-v2` (lima/kubelet.yaml) gets a
+# different DHCP-assigned subnet (observed: 192.168.104.x) — that fallback would
+# silently point the agent's hostAlias at an address that isn't even on this VM's
+# network. Fail loud instead, matching the LIMA_VM_IP check above.
 LIMA_HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
-LIMA_HOST_IP="${LIMA_HOST_IP:-192.168.5.2}"
+if [ -z "$LIMA_HOST_IP" ]; then
+  echo "error: could not resolve host.lima.internal inside ${VM_NAME} for the konnectivity-agent's hostAlias" >&2
+  exit 1
+fi
 
 # Run the agent as a Pod in kube-system so it uses CoreDNS: service DNS names like
 # e2e-test-webhook.webhook-N.svc resolve correctly inside the pod network.
@@ -507,7 +520,13 @@ echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnecti
 # continuously recreate the sandbox). The binary uses IPVS mode because the Lima VM's
 # iptables uses nf_tables which lacks the userspace extension library for protocol matching.
 
-# Detect kubelet version to pull the matching kube-proxy binary.
+# Detect kubelet version to pull the matching kube-proxy binary. A wrong/stale
+# fallback version here is safe, not silent: it only feeds the image tag for the
+# "still missing" pull path below, and if that pulls the wrong version and the
+# binary still never lands at /usr/local/bin/kube-proxy, the KUBE_PROXY_ACTIVE
+# check further down (systemd can't exec a nonexistent binary) already fails the
+# script loud with a journalctl dump — this fallback can't produce a silently
+# broken kube-proxy.
 KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 KUBELET_VERSION="${KUBELET_VERSION:-1.36.2}"
 
@@ -549,9 +568,15 @@ subjects:
   namespace: kube-system
 RBACEOF
 
-# Generate a long-lived token for kube-proxy to authenticate with u7s.
+# Generate a long-lived token for kube-proxy to authenticate with u7s. No output
+# suppression / fallback here: an empty token does not crash kube-proxy — it starts,
+# systemd reports it "active", and it just spins forever as system:anonymous,
+# failing every List/Watch call ("... is not allowed to list nodes") without ever
+# programming an IPVS rule. That is indistinguishable from success to the
+# KUBE_PROXY_ACTIVE check below, so a `create token` failure must stop the script
+# right here instead of surfacing as an unexplained Service-routing failure later.
 KUBE_PROXY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" create token kube-proxy \
-  -n kube-system --duration=8760h 2>/dev/null || echo "")
+  -n kube-system --duration=8760h)
 
 # Write config files to the VM filesystem.
 limactl shell "$VM_NAME" sudo mkdir -p /etc/kube-proxy
@@ -647,11 +672,18 @@ limactl shell "$VM_NAME" sudo apt-get install -y ipset conntrack nfs-common
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through
 # netfilter hooks; without it, IPVS DNAT for ClusterIP services never fires for
 # traffic originating from pods, breaking in-pod DNS and service connectivity.
+# modprobe of an already-loaded module is a documented no-op (exit 0), so this
+# does NOT need `|| true` to be safe on repeat runs — but a genuinely missing
+# module (wrong kernel, module not built) also exits nonzero with a FATAL
+# message, and that case is load-bearing for kube-proxy's ipvs mode. No
+# suppression here (nor on the whole block, previously via a trailing
+# `2>/dev/null`): let `set -euo pipefail` fail loud with the real modprobe/sysctl
+# error text instead of silently leaving IPVS unable to program any rules.
 limactl shell "$VM_NAME" sudo bash -c '
-  modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh 2>/dev/null || true
-  modprobe br_netfilter 2>/dev/null || true
+  modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh
+  modprobe br_netfilter
   sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 >/dev/null
-' 2>/dev/null
+'
 
 # Write the systemd service unit.
 limactl shell "$VM_NAME" sudo bash -c "cat > /etc/systemd/system/kube-proxy.service" <<SVCEOF
@@ -673,6 +705,12 @@ WantedBy=multi-user.target
 SVCEOF
 
 limactl shell "$VM_NAME" sudo systemctl daemon-reload
+# `systemctl enable`'s own confirmation ("Created symlink ...") is written to
+# stderr, not stdout, on a real Linux system — 2>/dev/null here only hides that
+# noise. It does not hide a real failure: no `|| true` follows, and verified this
+# construct's exit code still propagates through `limactl shell` under
+# `set -euo pipefail` (tested against a nonexistent unit: exit 1 as expected), so
+# a genuine `enable` failure still stops the script.
 limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
 limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
 
@@ -700,24 +738,31 @@ fi
 
 echo "kube-proxy systemd service started (logs: limactl shell ${VM_NAME} sudo journalctl -u kube-proxy -n 20)"
 
-# Resolve the host gateway IP used to route the kubernetes ClusterIP.
+# Resolve the host gateway IP used to route the kubernetes ClusterIP. This (and the
+# patch below) used to only WARN and continue on failure — but skipping either one
+# leaves kube-proxy's IPVS rule for 10.96.0.1:443 pointed at 127.0.0.1 (this node's
+# own loopback) instead of the host, which silently breaks every in-cluster Service
+# call (including sonobuoy's own liveness dial) while the rest of this script still
+# reports success. Fail loud instead.
 HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
 if [ -z "$HOST_IP" ]; then
-  echo "WARNING: could not resolve host.lima.internal — skipping EndpointSlice patch" >&2
-else
-  limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
-  # Patch the kubernetes EndpointSlice with the host IP so kube-proxy's IPVS rule
-  # routes 10.96.0.1:443 → host (not 127.0.0.1 which is the VM's own loopback).
-  # The apiserver seeds 127.0.0.1 as a safe default; we correct it here once we
-  # know the host gateway IP.
-  echo "Patching kubernetes EndpointSlice with host IP ${HOST_IP}..."
-  kubectl --kubeconfig="$KUBECONFIG_PATH" patch endpointslice kubernetes -n default \
-    --type=json \
-    -p="[{\"op\":\"replace\",\"path\":\"/endpoints/0/addresses/0\",\"value\":\"${HOST_IP}\"}]" \
-    2>/dev/null && echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:${PORT}" \
-    || echo "WARNING: EndpointSlice patch failed — kube-proxy IPVS may route incorrectly" >&2
+  echo "error: could not resolve host.lima.internal inside ${VM_NAME} — cannot patch the kubernetes EndpointSlice with the host gateway IP" >&2
+  exit 1
 fi
+limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Patch the kubernetes EndpointSlice with the host IP so kube-proxy's IPVS rule
+# routes 10.96.0.1:443 → host (not 127.0.0.1 which is the VM's own loopback).
+# The apiserver seeds 127.0.0.1 as a safe default; we correct it here once we
+# know the host gateway IP.
+echo "Patching kubernetes EndpointSlice with host IP ${HOST_IP}..."
+if ! kubectl --kubeconfig="$KUBECONFIG_PATH" patch endpointslice kubernetes -n default \
+    --type=json \
+    -p="[{\"op\":\"replace\",\"path\":\"/endpoints/0/addresses/0\",\"value\":\"${HOST_IP}\"}]"; then
+  echo "error: EndpointSlice patch failed — kube-proxy IPVS will keep routing 10.96.0.1:443 to 127.0.0.1 instead of the host, breaking cluster Service routing for every pod" >&2
+  exit 1
+fi
+echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:${PORT}"
 
 # Wait for the node to appear.
 echo "Waiting for ${VM_NAME} to register (up to 60s)..."
