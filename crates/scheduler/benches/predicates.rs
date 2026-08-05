@@ -24,6 +24,7 @@ fn realistic_pending_pod() -> PendingPod {
             ephemeral_storage_milli: 0,
             extended: Default::default(),
         },
+        host_ports: Vec::new(),
     }
 }
 

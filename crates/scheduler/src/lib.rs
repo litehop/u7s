@@ -162,17 +162,87 @@ struct PodSpec {
 }
 
 /// Minimal typed view of a container's `resources.requests` — cpu/memory/
-/// ephemeral-storage quantity strings, as needed by NodeResourcesFit.
+/// ephemeral-storage quantity strings, as needed by NodeResourcesFit — plus
+/// `ports`, as needed by the NodePorts predicate.
 #[derive(Debug, Default, Deserialize)]
 struct ContainerSpec {
     #[serde(default)]
     resources: ContainerResources,
+    /// `containerPort` entries; only those with a nonzero `hostPort` are ever
+    /// turned into a `HostPortClaim` by `container_host_ports` — a plain
+    /// `containerPort` binds nothing on the node's own network namespace and
+    /// can never conflict with another pod.
+    ///
+    /// `Option`, not a bare `Vec` with `#[serde(default)]`: a real apiserver
+    /// response serializes an unset `ports` as literal JSON `null`, not an
+    /// absent key, and `#[serde(default)]` only covers the latter — a bare
+    /// `Vec<ContainerPortSpec>` here fails to deserialize `null` and (via
+    /// `needs_scheduling`'s deserialize-error fallback) silently drops every
+    /// such pod from the scheduling cycle, live-reproduced against a real
+    /// conformance stack where sonobuoy's own pod (no `ports` set) never got
+    /// scheduled at all. Mirrors `PodSpec`'s existing `tolerations`/
+    /// `scheduling_gates`/`node_selector` fields, which use the same
+    /// `Option<Vec<_>>` shape for exactly this reason.
+    #[serde(default)]
+    ports: Option<Vec<ContainerPortSpec>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ContainerResources {
     #[serde(default)]
     requests: std::collections::HashMap<String, String>,
+}
+
+/// One `container.ports[]` entry — only the fields the NodePorts predicate
+/// needs (`containerPort`/`name` are irrelevant to host conflict detection).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContainerPortSpec {
+    host_port: Option<i32>,
+    /// `v1.ContainerPort`'s JSON field is the irregularly-cased `hostIP`
+    /// (capital IP), not the `hostIp` that `rename_all = "camelCase"` would
+    /// derive from `host_ip` — an explicit rename is required or this field
+    /// silently never deserializes and every hostPort claim looks wildcard.
+    #[serde(default, rename = "hostIP")]
+    host_ip: String,
+    protocol: Option<String>,
+}
+
+/// One `hostPort` claim derived from a pod's container ports — the
+/// (hostPort, hostIP, protocol) tuple the NodePorts predicate conflicts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPortClaim {
+    pub host_port: u16,
+    /// Empty string is the wildcard, matching upstream's `v1.ContainerPort`
+    /// default: it means "every interface on the host", and conflicts with
+    /// ANY other hostIP claiming the same hostPort+protocol — see
+    /// `host_ports_conflict`. Literal `"0.0.0.0"` means the same thing (the
+    /// exact scenario the NodePorts conformance test exercises: one pod
+    /// leaves hostIP empty, the other sets it to the node's real IP, and
+    /// they must still be treated as conflicting).
+    pub host_ip: String,
+    /// Always upper-cased ("TCP"/"UDP"/"SCTP") — defaults to "TCP" to match
+    /// `v1.ContainerPort`'s own default when `protocol` is omitted.
+    pub protocol: String,
+}
+
+/// Extract every `hostPort`-claiming port across `containers` — ports with no
+/// `hostPort`, or `hostPort <= 0`, bind nothing on the host and are skipped
+/// (mirrors upstream `pkg/scheduler/util.GetHostPorts`'s `HostPort > 0` gate).
+/// Init containers are not accounted for, matching `sum_container_requests`'s
+/// existing MVP scope decision to sum only steady-state (regular) containers.
+fn container_host_ports(containers: &[ContainerSpec]) -> Vec<HostPortClaim> {
+    containers
+        .iter()
+        .filter_map(|c| c.ports.as_ref())
+        .flatten()
+        .filter(|p| p.host_port.is_some_and(|hp| hp > 0))
+        .map(|p| HostPortClaim {
+            host_port: p.host_port.unwrap_or(0) as u16,
+            host_ip: p.host_ip.clone(),
+            protocol: p.protocol.as_deref().unwrap_or("TCP").to_ascii_uppercase(),
+        })
+        .collect()
 }
 
 /// A pod's `spec.affinity`. Only `nodeAffinity` is modeled — the scheduler has
@@ -308,6 +378,9 @@ pub struct PendingPod {
     /// Summed `resources.requests.{cpu,memory,ephemeral-storage}` across the
     /// pod's containers — the NodeResourcesFit predicate's resource dimension.
     pub requests: ResourceRequests,
+    /// Every `hostPort`-claiming container port across the pod's containers —
+    /// the NodePorts predicate's conflict-detection dimension.
+    pub host_ports: Vec<HostPortClaim>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -367,6 +440,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         .affinity
         .and_then(|a| a.node_affinity);
     let requests = sum_container_requests(&watch_event.object.spec.containers);
+    let host_ports = container_host_ports(&watch_event.object.spec.containers);
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
@@ -375,6 +449,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         tolerations,
         node_affinity,
         requests,
+        host_ports,
     })
 }
 
@@ -859,13 +934,15 @@ struct PodListItemStatus {
 }
 
 /// A node's already-committed usage from its non-terminated pods: the pod
-/// count (against `status.allocatable.pods`) and summed cpu/memory/
-/// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`).
-/// Computed by `NodeTally::usage_by_node`.
+/// count (against `status.allocatable.pods`), summed cpu/memory/
+/// ephemeral-storage requests (against `status.allocatable.{cpu,memory,ephemeral-storage}`),
+/// and every hostPort already claimed by those pods (the NodePorts
+/// predicate's conflict-detection dimension). Computed by `NodeTally::usage_by_node`.
 #[derive(Debug, Default, Clone)]
 pub struct NodeUsage {
     pub pod_count: u32,
     pub requests: ResourceRequests,
+    pub host_ports: Vec<HostPortClaim>,
 }
 
 /// A pod already on a node, as needed by preemption victim selection: its
@@ -894,12 +971,19 @@ struct PreemptionPodListItem {
 }
 
 /// One pod's contribution to `NodeTally`: which node it currently occupies a
-/// slot on, its priority (preemption eligibility), and its resource requests.
+/// slot on, its priority (preemption eligibility), its resource requests, and
+/// its hostPort claims.
+///
+/// `host_ports` is only ever populated via `apply_event` (a real watch event
+/// carries the pod's full `spec.containers`); `assume`'s fast path — recording
+/// a bind this scheduler itself just decided, before the watch echoes it back
+/// — deliberately leaves it empty (see `NodeTally::assume`'s doc comment).
 #[derive(Debug, Clone)]
 struct TalliedPod {
     node_name: String,
     priority: i32,
     requests: ResourceRequests,
+    host_ports: Vec<HostPortClaim>,
 }
 
 /// A preemption plan whose victims have all had their graceful DELETE issued
@@ -1059,6 +1143,7 @@ impl NodeTally {
         );
         let priority = watch_event.object.spec.priority.unwrap_or(0);
         let requests = sum_container_requests(&watch_event.object.spec.containers);
+        let host_ports = container_host_ports(&watch_event.object.spec.containers);
         let node_name = watch_event.object.spec.node_name.filter(|n| !n.is_empty());
         match node_name {
             Some(node_name) if !terminal => {
@@ -1068,6 +1153,7 @@ impl NodeTally {
                         node_name,
                         priority,
                         requests,
+                        host_ports,
                     },
                 );
                 Vec::new()
@@ -1104,6 +1190,15 @@ impl NodeTally {
     /// Record that `namespace/pod_name` now occupies a slot on `node_name` —
     /// called the instant the scheduler decides to bind, before the bind's
     /// HTTP call even completes. `remove` undoes this if the bind then fails.
+    ///
+    /// Leaves `host_ports` empty: unlike `requests` (known from `pod.requests`
+    /// at decision time), the pending pod's `hostPort` claims aren't threaded
+    /// through this call today, so a hostPort a scheduling decision just
+    /// reserved on `node_name` becomes visible to `usage_by_node`/the
+    /// NodePorts filter only once the real bind's watch event round-trips
+    /// through `apply_event` — a narrow race window analogous to the one
+    /// `requests` closed for cpu/memory (see this struct's doc comment),
+    /// left open here rather than widening this method's signature.
     pub fn assume(
         &mut self,
         namespace: &str,
@@ -1118,6 +1213,7 @@ impl NodeTally {
                 node_name: node_name.to_owned(),
                 priority,
                 requests,
+                host_ports: Vec::new(),
             },
         );
     }
@@ -1202,8 +1298,9 @@ impl NodeTally {
         }
     }
 
-    /// Non-terminal pod count and summed resource requests per node — the
-    /// shape `select_node_with_capacity` consumes in place of a live GET.
+    /// Non-terminal pod count, summed resource requests, and claimed
+    /// hostPorts per node — the shape `select_node_with_capacity` consumes in
+    /// place of a live GET.
     pub fn usage_by_node(&self) -> std::collections::HashMap<String, NodeUsage> {
         let mut usage: std::collections::HashMap<String, NodeUsage> =
             std::collections::HashMap::new();
@@ -1211,6 +1308,7 @@ impl NodeTally {
             let entry = usage.entry(pod.node_name.clone()).or_default();
             entry.pod_count += 1;
             entry.requests = entry.requests.clone() + pod.requests.clone();
+            entry.host_ports.extend(pod.host_ports.iter().cloned());
         }
         usage
     }
@@ -1302,10 +1400,51 @@ pub fn resource_fits(
         })
 }
 
+/// Return true when `ip` is the wildcard hostIP — "every interface on the
+/// host" — matching upstream's `HostPortInfo.sanitize`/`DefaultBindAllHostIP`:
+/// an absent `hostIP` (empty string, the field's own zero value) and the
+/// literal `"0.0.0.0"` are the same thing, not two different addresses.
+fn is_wildcard_host_ip(ip: &str) -> bool {
+    ip.is_empty() || ip == "0.0.0.0"
+}
+
+/// Return true when two hostPort claims conflict: same hostPort, same
+/// protocol, and a hostIP that is identical OR where either side is the
+/// wildcard (0.0.0.0/empty) — the exact semantics of upstream's NodePorts
+/// predicate (`HostPortInfo.CheckConflict`). Without the wildcard half of
+/// this check, a pod that leaves `hostIP` empty (binding all interfaces)
+/// would NOT be seen as conflicting with a second pod that pins the node's
+/// real IP on the same hostPort+protocol, even though both pods are
+/// fighting over the same physical socket and the kubelet can only start one
+/// of them.
+fn host_ports_conflict(a: &HostPortClaim, b: &HostPortClaim) -> bool {
+    a.host_port == b.host_port
+        && a.protocol == b.protocol
+        && (a.host_ip == b.host_ip
+            || is_wildcard_host_ip(&a.host_ip)
+            || is_wildcard_host_ip(&b.host_ip))
+}
+
+/// The NodePorts predicate: true when none of `pod_ports` conflicts with any
+/// hostPort already claimed by pods tallied on the candidate node
+/// (`node_ports`) — see `host_ports_conflict` for the exact conflict rule.
+///
+/// `pub` (not module-private) for the same reason `resource_fits` is: a
+/// criterion bench in `benches/predicates.rs` may exercise it directly.
+pub fn host_ports_fit(node_ports: &[HostPortClaim], pod_ports: &[HostPortClaim]) -> bool {
+    !pod_ports.iter().any(|want| {
+        node_ports
+            .iter()
+            .any(|have| host_ports_conflict(have, want))
+    })
+}
+
 /// Among every node in `list` that qualifies for `pod` (see
 /// `node_qualifies_for_pod`) AND has at least one free pod slot AND enough
 /// uncommitted cpu/memory/ephemeral-storage/extended resources to fit
-/// `pod.requests` (NodeResourcesFit), select the LEAST LOADED one.
+/// `pod.requests` (NodeResourcesFit) AND has no hostPort conflict with
+/// `pod.host_ports` (NodePorts — see `host_ports_fit`), select the LEAST
+/// LOADED one.
 ///
 /// "Least loaded" ranks primarily by tallied pod count, then (as a tie-break
 /// only) by tallied cpu/memory/ephemeral-storage requests. Pod count must lead
@@ -1361,6 +1500,7 @@ pub fn select_node_with_capacity(
                 return false;
             }
             resource_fits(&n.status.allocatable, &usage.requests, &pod.requests)
+                && host_ports_fit(&usage.host_ports, &pod.host_ports)
         })
         .collect();
     // `min_by_key` returns the FIRST minimal element on a tie, preserving
@@ -4461,13 +4601,14 @@ mod tests {
         NodeUsage {
             pod_count,
             requests: ResourceRequests::default(),
+            host_ports: Vec::new(),
         }
     }
 
     /// A minimal PendingPod for tests that only care about capacity/taint/affinity
     /// gating, not identity or priority — empty selector (matches any node), no
     /// tolerations (tolerates nothing but taint-free nodes), no nodeAffinity
-    /// (matches any node), no resource requests.
+    /// (matches any node), no resource requests, no hostPort claims.
     fn empty_pending_pod() -> PendingPod {
         PendingPod {
             namespace: "default".to_owned(),
@@ -4477,6 +4618,7 @@ mod tests {
             tolerations: Vec::new(),
             node_affinity: None,
             requests: ResourceRequests::default(),
+            host_ports: Vec::new(),
         }
     }
 
@@ -5282,6 +5424,290 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // NodePorts predicate: hostPort/hostIP/protocol conflict detection between a
+    // pending pod and pods already tallied on a candidate node.
+    //
+    // Before this fix, crates/scheduler/src/lib.rs had ZERO handling of
+    // spec.containers[].ports[].hostPort anywhere — select_node_with_capacity
+    // would happily bind two pods requesting the same hostPort/protocol onto
+    // the same node. The kubelet can only actually bind one of them to that
+    // socket; the loser crashes at container-start time ("address already in
+    // use") instead of staying Pending, where a controller could safely retry
+    // it elsewhere. This is the upstream conformance-tagged scenario
+    // "Scheduling, HostPort and Protocol match, HostIPs different but one is
+    // default HostIP (0.0.0.0)" (predicates.go:706).
+    // ---------------------------------------------------------------------------
+
+    fn host_port_claim(host_port: u16, host_ip: &str, protocol: &str) -> HostPortClaim {
+        HostPortClaim {
+            host_port,
+            host_ip: host_ip.to_owned(),
+            protocol: protocol.to_owned(),
+        }
+    }
+
+    /// Two pods claiming the identical hostIP/hostPort/protocol must conflict
+    /// — the base case every other test in this section builds on.
+    #[test]
+    fn host_ports_conflict_true_for_identical_claims() {
+        let a = host_port_claim(8080, "10.0.0.5", "TCP");
+        let b = host_port_claim(8080, "10.0.0.5", "TCP");
+        assert!(
+            host_ports_conflict(&a, &b),
+            "two pods binding the exact same hostIP:hostPort/protocol must be \
+             seen as a conflict — the kubelet can only start one of them"
+        );
+    }
+
+    /// Different protocols on the same hostIP/hostPort must NOT conflict — TCP
+    /// and UDP bind independent sockets. Matches upstream's (non-conformance)
+    /// "validates that there is no conflict between pods with same hostPort
+    /// but different hostIP and protocol" (pod2 TCP vs pod3 UDP, same
+    /// hostIP:port).
+    #[test]
+    fn host_ports_conflict_false_for_different_protocol() {
+        let tcp = host_port_claim(54321, "10.0.0.5", "TCP");
+        let udp = host_port_claim(54321, "10.0.0.5", "UDP");
+        assert!(
+            !host_ports_conflict(&tcp, &udp),
+            "TCP and UDP claims on the same hostIP:hostPort are independent \
+             sockets — treating them as conflicting would wrongly block a \
+             schedulable pod"
+        );
+    }
+
+    /// Different concrete (non-wildcard) hostIPs on the same hostPort/protocol
+    /// must NOT conflict — each binds a different network interface. Matches
+    /// upstream's pod1 (127.0.0.1) vs pod2 (the node's real IP), same
+    /// port/TCP.
+    #[test]
+    fn host_ports_conflict_false_for_different_concrete_host_ips() {
+        let a = host_port_claim(54321, "127.0.0.1", "TCP");
+        let b = host_port_claim(54321, "192.168.1.5", "TCP");
+        assert!(
+            !host_ports_conflict(&a, &b),
+            "two distinct, non-wildcard hostIPs bind different interfaces and \
+             must not conflict — over-broad matching here would wrongly reject \
+             a node with free capacity on the interface the pending pod \
+             actually wants"
+        );
+    }
+
+    /// THE conformance scenario (predicates.go:706): one pod leaves hostIP
+    /// empty (binds ALL interfaces — the 0.0.0.0 wildcard), the other pins the
+    /// node's real IP, same hostPort/protocol. These must conflict — the
+    /// wildcard pod's socket already occupies that port on the interface the
+    /// second pod would also try to use, so the kubelet cannot start both.
+    /// Without treating "" (and the literal "0.0.0.0") as a wildcard, this
+    /// scheduler would never detect this conflict at all — the exact gap this
+    /// fix closes.
+    #[test]
+    fn host_ports_conflict_true_when_either_side_is_wildcard_host_ip() {
+        let wildcard = host_port_claim(54322, "", "TCP");
+        let concrete = host_port_claim(54322, "203.0.113.10", "TCP");
+        assert!(
+            host_ports_conflict(&wildcard, &concrete),
+            "an empty (wildcard) hostIP binds every interface on the host, so \
+             it must conflict with ANY other hostIP claiming the same \
+             hostPort/protocol — not just an exact string match"
+        );
+        let literal_wildcard = host_port_claim(54322, "0.0.0.0", "TCP");
+        assert!(
+            host_ports_conflict(&literal_wildcard, &concrete),
+            "the literal string \"0.0.0.0\" means the exact same thing as an \
+             absent hostIP and must be treated as the same wildcard"
+        );
+    }
+
+    /// `host_ports_fit` (the aggregate check `select_node_with_capacity`
+    /// calls) must reject when ANY of the pod's ports conflicts with ANY
+    /// already-claimed node port — not just when every port conflicts, since
+    /// a pod cannot be partially scheduled.
+    #[test]
+    fn host_ports_fit_false_when_any_port_conflicts() {
+        let node_ports = vec![host_port_claim(8080, "", "TCP")];
+        let pod_ports = vec![
+            host_port_claim(9090, "", "TCP"),         // no conflict
+            host_port_claim(8080, "10.0.0.1", "TCP"), // conflicts via wildcard
+        ];
+        assert!(
+            !host_ports_fit(&node_ports, &pod_ports),
+            "a single conflicting port among several must fail the whole \
+             check — a pod cannot be partially scheduled"
+        );
+    }
+
+    /// `select_node_with_capacity` must skip a node whose already-tallied pod
+    /// holds a hostPort that conflicts with the pending pod's — the actual
+    /// Filter-phase wiring, not just the pure predicate. Reproduces
+    /// predicates.go:706's pod4-vs-pod5: pod4 is already bound with
+    /// hostIP="" (wildcard), pod5 wants the same hostPort/protocol on the
+    /// node's real hostIP.
+    #[test]
+    fn select_node_with_capacity_skips_node_with_conflicting_host_port() {
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+        let mut pod = empty_pending_pod();
+        pod.host_ports = vec![host_port_claim(54322, "203.0.113.10", "TCP")];
+        let mut usage = usage_with_pod_count(1);
+        usage.host_ports = vec![host_port_claim(54322, "", "TCP")];
+        let counts: std::collections::HashMap<String, NodeUsage> =
+            [("worker-0".to_owned(), usage)].into();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert!(
+            result.is_err(),
+            "a node already holding a wildcard-hostIP claim on the pending \
+             pod's requested hostPort/protocol must be rejected — without \
+             this check, both pods are bound to the same node and the loser \
+             crashes at container-start with 'address already in use' \
+             instead of staying Pending — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// `select_node_with_capacity` must still select a node when the pending
+    /// pod's hostPort request does NOT conflict with anything already there
+    /// (different protocol) — guards against an over-broad implementation
+    /// that blocks otherwise-schedulable pods. Matches upstream's
+    /// non-conformance "no conflict ... different protocol" scenario.
+    #[test]
+    fn select_node_with_capacity_allows_node_with_non_conflicting_host_port() {
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+        let mut pod = empty_pending_pod();
+        pod.host_ports = vec![host_port_claim(54321, "10.0.0.5", "UDP")];
+        let mut usage = usage_with_pod_count(1);
+        usage.host_ports = vec![host_port_claim(54321, "10.0.0.5", "TCP")];
+        let counts: std::collections::HashMap<String, NodeUsage> =
+            [("worker-0".to_owned(), usage)].into();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_eq!(
+            result.unwrap(),
+            "worker-0",
+            "a different protocol on the same hostIP:hostPort must not block \
+             scheduling — TCP and UDP are independent sockets"
+        );
+    }
+
+    /// `needs_scheduling` must extract hostPort/hostIP/protocol from a
+    /// container's ports — if this parsing is dropped, `PendingPod.host_ports`
+    /// is always empty and the NodePorts filter above can never fire for any
+    /// real pod, no matter how correct the conflict logic is.
+    #[test]
+    fn needs_scheduling_extracts_host_port_claims() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "hostport-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [{
+                        "ports": [{
+                            "hostPort": 54322,
+                            "containerPort": 8080,
+                            "protocol": "TCP",
+                            "hostIP": "203.0.113.10"
+                        }]
+                    }]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            pending.host_ports,
+            vec![host_port_claim(54322, "203.0.113.10", "TCP")],
+            "container.ports[].hostPort/hostIP/protocol must be captured into \
+             PendingPod.host_ports verbatim"
+        );
+    }
+
+    /// A container port with no `hostPort` is a plain `containerPort` — it
+    /// binds nothing on the node's own network namespace and must NOT become
+    /// a hostPort claim, or an ordinary pod using `containerPort` purely for
+    /// documentation would spuriously conflict with anything.
+    #[test]
+    fn needs_scheduling_ignores_container_ports_without_host_port() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "plain-port-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [{
+                        "ports": [{ "containerPort": 8080 }]
+                    }]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert!(
+            pending.host_ports.is_empty(),
+            "a containerPort with no hostPort must not produce a hostPort claim"
+        );
+    }
+
+    /// An absent `protocol` must default to TCP, matching `v1.ContainerPort`'s
+    /// own API default — if this scheduler defaulted to empty/unknown instead,
+    /// a TCP-vs-TCP conflict would be missed whenever one side omits the field.
+    #[test]
+    fn needs_scheduling_defaults_host_port_protocol_to_tcp() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "no-protocol-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [{
+                        "ports": [{ "hostPort": 8080 }]
+                    }]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            pending.host_ports,
+            vec![host_port_claim(8080, "", "TCP")],
+            "an omitted protocol must default to TCP, and an omitted hostIP \
+             must default to the empty-string wildcard"
+        );
+    }
+
+    /// A container whose `ports` field is a real, present JSON `null` (not an
+    /// absent key) must still be scheduled with an empty `host_ports` list —
+    /// live-reproduced against a real conformance stack: this apiserver
+    /// serializes an unset `ports` as literal `null`, and a first-cut
+    /// `#[serde(default)] ports: Vec<ContainerPortSpec>` only covers an
+    /// ABSENT key, not an explicit `null`. That first cut made deserializing
+    /// the whole `PodObject` fail, which `needs_scheduling`'s catch-all
+    /// fallback silently turns into "not ADDED/MODIFIED" — so the pod (e.g.
+    /// sonobuoy's own aggregator pod, which never sets `ports`) never entered
+    /// the scheduling cycle at all and stayed Pending forever, with no error
+    /// logged anywhere. Reverting `ports` from `Option<Vec<_>>` back to a bare
+    /// `Vec<_>` reproduces this exact silent total-scheduling-outage.
+    #[test]
+    fn needs_scheduling_tolerates_null_ports_field() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "sonobuoy-like-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [{ "name": "kube-sonobuoy", "ports": null }]
+                }
+            }
+        });
+        let pending = needs_scheduling(&event);
+        assert!(
+            pending.is_some(),
+            "a container with an explicit JSON null `ports` field must still \
+             deserialize successfully and enter the scheduling cycle — a \
+             bare Vec<_> field silently drops the whole pod instead"
+        );
+        assert!(
+            pending.unwrap().host_ports.is_empty(),
+            "a null ports field carries no hostPort claims"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // PreemptionWaiters / deferred preemption bind (Option A)
     //
     // Regression coverage for the exact race live-reproduced against
@@ -5757,6 +6183,7 @@ mod tests {
             NodeUsage {
                 pod_count: 1,
                 requests: requests(4000, 0, 0), // node already fully committed at 4 cores
+                host_ports: Vec::new(),
             },
         )]
         .into();
@@ -5783,6 +6210,7 @@ mod tests {
             NodeUsage {
                 pod_count: 1,
                 requests: requests(1000, 0, 0), // 1 of 4 cores already used
+                host_ports: Vec::new(),
             },
         )]
         .into();
