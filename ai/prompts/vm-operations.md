@@ -46,8 +46,9 @@ For full stack bringup (build + apiserver + kubelet + KCM + sonobuoy), use `run-
 Your CWD is the worktree root. `--workdir` defaults to `$PWD/temp/u7s` — omit it entirely.
 
 **WARNING: bare `run-all.sh` (no `--focus`, no `--stack-only`) runs the FULL conformance
-suite (~2h at current state — faster than it used to be, but still far too slow to
-iterate on). Prefer the fast ladder: `--stack-only` to confirm the stack STARTS (no
+suite (~25min at current state — PR #966 made ginkgo's `--procs=16` the default,
+replacing a silently-serial certified-conformance path; still far too slow to iterate
+on). Prefer the fast ladder: `--stack-only` to confirm the stack STARTS (no
 sonobuoy), then `--focus <regex>` for a targeted gate. A full run is a deliberate,
 explicitly-authorized act — never a default and never something to reach for to "check
 it works." (`sonobuoy --quick` also exists as a known-fast single-test cluster-liveness
@@ -111,7 +112,9 @@ pre-built binary; for normal worktree iteration, omit it.
 set instead (`--e2e-focus=".*"` with `--e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]"`),
 surfacing plain `ginkgo.It` specs (e.g. SSA field-manager tests) that certified-conformance
 never exercises. This is a periodic discovery / perf-baseline run, NOT a per-PR gate —
-**wall-clock is ~6-12h, vs certified's ~2h.** Only run it when explicitly asked to.
+**wall-clock is ~6-12h, vs certified's ~25min** (PR #966 made ginkgo's `--procs=16`
+the default, replacing a silently-serial certified-conformance path). Only run it
+when explicitly asked to.
 
 Mutually exclusive with `--focus` (the two are conceptually opposite — narrow vs. widen —
 so combining them errors out rather than silently picking one). Composes with
@@ -136,7 +139,8 @@ and then stop, leaving the stack running for kubectl or direct-DB investigation.
 
 This is the correct tool when you want to inspect cluster state, run kubectl commands
 manually, or debug the API surface without waiting for sonobuoy. It avoids accidentally
-triggering the full ~2h suite. **Use `--stack-only` even for "does the stack come up?"
+triggering the full ~25min suite (PR #966's `--procs=16` default — was silently serial
+before that). **Use `--stack-only` even for "does the stack come up?"
 reproduction/verification runs** — do NOT run a bare `run-all.sh` just to see the
 bring-up succeed, because once bring-up succeeds a bare run continues straight into the
 full sonobuoy suite.
