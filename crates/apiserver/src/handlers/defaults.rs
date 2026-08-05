@@ -53,6 +53,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "replicationcontrollers") = (group, plural) {
         default_replicationcontroller(obj);
     }
+    if let ("autoscaling", "horizontalpodautoscalers") = (group, plural) {
+        default_hpa(obj);
+    }
     if group == "rbac.authorization.k8s.io"
         && (plural == "rolebindings" || plural == "clusterrolebindings")
     {
@@ -892,6 +895,62 @@ fn default_deployment(obj: &mut serde_json::Value) {
         if obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"].is_null() {
             obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"] =
                 serde_json::Value::String("25%".into());
+        }
+    }
+}
+
+/// Default `spec.behavior.scaleUp`/`scaleDown` scaling rules on a HorizontalPodAutoscaler,
+/// matching upstream `SetDefaults_HorizontalPodAutoscalerBehavior`
+/// (pkg/apis/autoscaling/v2/defaults.go).
+///
+/// Vendored kube-controller-manager's `stabilizeRecommendationWithBehaviors`
+/// (pkg/controller/podautoscaler/horizontal.go) unconditionally dereferences
+/// `*Behavior.ScaleUp.StabilizationWindowSeconds` once `spec.behavior != nil`, relying entirely
+/// on the apiserver to have already defaulted it — there is no runtime nil-guard for ScaleUp
+/// (unlike ScaleDown, which kcm patches up itself). Without this defaulting, an HPA created
+/// with e.g. `behavior.scaleUp = {tolerance: "20m"}` and no explicit `stabilizationWindowSeconds`
+/// stores exactly that shape, and kcm nil-derefs and crashes the entire controller-manager
+/// process the first time it reconciles that HPA.
+///
+/// Per-field overlay (matches upstream `copyHPAScalingRules`): only fields the caller left
+/// unset get a default; fields the caller set are left untouched. `scaleDown`'s
+/// `stabilizationWindowSeconds` is intentionally never defaulted here — upstream's own default
+/// leaves it nil too ("we cannot rewrite the command line option from here"); kcm initializes it
+/// itself at reconcile time via `maybeInitScaleDownStabilizationWindow`.
+///
+/// Idempotent: only null/absent fields are defaulted, so re-running on update never clobbers a
+/// value the client (or a previous defaulting pass) already set.
+fn default_hpa(obj: &mut serde_json::Value) {
+    if !obj["spec"]["behavior"].is_object() {
+        return;
+    }
+
+    if obj["spec"]["behavior"]["scaleUp"].is_object() {
+        if obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"].is_null() {
+            obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"] =
+                serde_json::Value::Number(0.into());
+        }
+        if obj["spec"]["behavior"]["scaleUp"]["selectPolicy"].is_null() {
+            obj["spec"]["behavior"]["scaleUp"]["selectPolicy"] =
+                serde_json::Value::String("Max".to_string());
+        }
+        if obj["spec"]["behavior"]["scaleUp"]["policies"].is_null() {
+            obj["spec"]["behavior"]["scaleUp"]["policies"] = serde_json::json!([
+                { "type": "Pods", "value": 4, "periodSeconds": 15 },
+                { "type": "Percent", "value": 100, "periodSeconds": 15 }
+            ]);
+        }
+    }
+
+    if obj["spec"]["behavior"]["scaleDown"].is_object() {
+        if obj["spec"]["behavior"]["scaleDown"]["selectPolicy"].is_null() {
+            obj["spec"]["behavior"]["scaleDown"]["selectPolicy"] =
+                serde_json::Value::String("Max".to_string());
+        }
+        if obj["spec"]["behavior"]["scaleDown"]["policies"].is_null() {
+            obj["spec"]["behavior"]["scaleDown"]["policies"] = serde_json::json!([
+                { "type": "Percent", "value": 100, "periodSeconds": 15 }
+            ]);
         }
     }
 }
@@ -4121,6 +4180,193 @@ mod tests {
         assert!(
             result.is_ok(),
             "ValidatingWebhookConfiguration without matchConditions must pass validation"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // HorizontalPodAutoscaler behavior defaulting
+    // ---------------------------------------------------------------------------
+
+    /// An HPA with no spec.behavior at all must be left untouched.
+    ///
+    /// Upstream only runs behavior defaulting when spec.behavior is non-nil; if u7s
+    /// invented a spec.behavior block for every HPA it would diverge from what most
+    /// HPAs (which never set behavior) actually look like on real Kubernetes.
+    #[test]
+    fn hpa_without_behavior_is_untouched() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "scaleTargetRef": { "kind": "Deployment", "name": "consumer" },
+                "minReplicas": 10,
+                "maxReplicas": 12
+            }
+        });
+        let original = obj.clone();
+
+        apply_defaults("autoscaling", "horizontalpodautoscalers", &mut obj);
+
+        assert_eq!(
+            obj, original,
+            "spec.behavior must not be invented out of thin air when the caller never set it"
+        );
+    }
+
+    /// An HPA with an empty scaleUp object must be fully defaulted.
+    ///
+    /// empty scaleUp must be fully defaulted or vendored kcm nil-derefs at
+    /// horizontal.go:1213 (kubernetes/kubernetes#107038 reproduces).
+    #[test]
+    fn hpa_empty_scale_up_gets_fully_defaulted() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "scaleTargetRef": { "kind": "Deployment", "name": "consumer" },
+                "minReplicas": 10,
+                "maxReplicas": 12,
+                "behavior": { "scaleUp": {} }
+            }
+        });
+
+        apply_defaults("autoscaling", "horizontalpodautoscalers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"], 0,
+            "empty scaleUp must be fully defaulted or vendored kcm nil-derefs at \
+             horizontal.go:1213 (kubernetes/kubernetes#107038 reproduces)"
+        );
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["selectPolicy"], "Max",
+            "empty scaleUp must be fully defaulted or vendored kcm nil-derefs at \
+             horizontal.go:1213 (kubernetes/kubernetes#107038 reproduces)"
+        );
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["policies"],
+            serde_json::json!([
+                { "type": "Pods", "value": 4, "periodSeconds": 15 },
+                { "type": "Percent", "value": 100, "periodSeconds": 15 }
+            ]),
+            "empty scaleUp must be fully defaulted or vendored kcm nil-derefs at \
+             horizontal.go:1213 (kubernetes/kubernetes#107038 reproduces)"
+        );
+    }
+
+    /// An HPA with scaleUp = {tolerance: "20m"} (the exact shape the failing
+    /// HPAConfigurableTolerance e2e test constructs) must get tolerance preserved and
+    /// every other scaleUp field defaulted.
+    ///
+    /// Defaulting must be per-field, not object-level: a caller who sets only one field
+    /// (tolerance) must not lose the field-level default for stabilizationWindowSeconds
+    /// that this whole fix exists to guarantee.
+    #[test]
+    fn hpa_scale_up_with_only_tolerance_set_keeps_tolerance_and_defaults_rest() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "scaleTargetRef": { "kind": "Deployment", "name": "consumer" },
+                "minReplicas": 10,
+                "maxReplicas": 12,
+                "behavior": { "scaleUp": { "tolerance": "20m" } }
+            }
+        });
+
+        apply_defaults("autoscaling", "horizontalpodautoscalers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["tolerance"], "20m",
+            "caller-set tolerance must survive defaulting — overwriting it would silently \
+             change the e2e test's requested scale-up tolerance"
+        );
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"], 0,
+            "stabilizationWindowSeconds must still be defaulted per-field even though the \
+             caller only set tolerance — this exact shape is what crashed kcm at \
+             horizontal.go:1213"
+        );
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["selectPolicy"], "Max",
+            "selectPolicy must be defaulted per-field alongside tolerance"
+        );
+    }
+
+    /// An HPA with an empty scaleDown object must get selectPolicy/policies defaulted,
+    /// but stabilizationWindowSeconds must stay absent.
+    ///
+    /// Upstream intentionally never defaults scaleDown.stabilizationWindowSeconds at the
+    /// apiserver ("we cannot rewrite the command line option from here") — kcm defaults it
+    /// itself at reconcile time. If u7s defaulted it here too, that value would silently
+    /// override whatever --horizontal-pod-autoscaler-downscale-stabilization flag kcm was
+    /// started with.
+    #[test]
+    fn hpa_empty_scale_down_defaults_policy_but_not_stabilization_window() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "scaleTargetRef": { "kind": "Deployment", "name": "consumer" },
+                "minReplicas": 10,
+                "maxReplicas": 12,
+                "behavior": { "scaleDown": {} }
+            }
+        });
+
+        apply_defaults("autoscaling", "horizontalpodautoscalers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleDown"]["selectPolicy"], "Max",
+            "empty scaleDown must get selectPolicy defaulted, matching upstream \
+             defaultHPAScaleDownRules"
+        );
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleDown"]["policies"],
+            serde_json::json!([{ "type": "Percent", "value": 100, "periodSeconds": 15 }]),
+            "empty scaleDown must get the default Percent policy, matching upstream \
+             defaultHPAScaleDownRules"
+        );
+        assert!(
+            obj["spec"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"].is_null(),
+            "scaleDown.stabilizationWindowSeconds must stay absent — upstream leaves it \
+             for kcm's own maybeInitScaleDownStabilizationWindow runtime default, and \
+             defaulting it here would silently override the --horizontal-pod-autoscaler- \
+             downscale-stabilization flag kcm was started with"
+        );
+    }
+
+    /// A caller-set scaleUp.stabilizationWindowSeconds must survive a second apply_defaults
+    /// call unchanged.
+    ///
+    /// apply_defaults runs on every write (create AND update). If re-running it clobbered
+    /// an already-defaulted or caller-set value back to the default, a user's explicit
+    /// stabilization window would silently reset to 0 on the very next PATCH/PUT.
+    #[test]
+    fn hpa_scale_up_stabilization_window_survives_second_apply_defaults_call() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "scaleTargetRef": { "kind": "Deployment", "name": "consumer" },
+                "minReplicas": 10,
+                "maxReplicas": 12,
+                "behavior": { "scaleUp": { "stabilizationWindowSeconds": 60 } }
+            }
+        });
+
+        apply_defaults("autoscaling", "horizontalpodautoscalers", &mut obj);
+        apply_defaults("autoscaling", "horizontalpodautoscalers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"], 60,
+            "caller-set stabilizationWindowSeconds must not be overwritten on a repeat \
+             apply_defaults call (e.g. a subsequent update) — that would silently reset a \
+             user's explicit scale-up stabilization window back to 0"
         );
     }
 }
