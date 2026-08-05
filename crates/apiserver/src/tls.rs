@@ -227,6 +227,21 @@ pub struct TlsMaterial {
     pub kubelet_client_cert_pem: Vec<u8>,
     /// PEM-encoded kubelet client private key.
     pub kubelet_client_key_pem: Vec<u8>,
+    /// Bearer token embedded in the admin kubeconfig alongside the client cert.
+    ///
+    /// kubectl/KCM authenticate to us via the admin cert (mTLS) only, so the HTTP request
+    /// they send never carries an Authorization header for the aggregation proxy
+    /// (`handlers::aggregation::proxy_middleware`) to forward — it only forwards whatever
+    /// Authorization header is already present, it does not mint one from the resolved
+    /// x509 identity. Without this token, an aggregated backend (e.g. metrics-server) sees
+    /// every such request as unauthenticated and denies it, even though u7s's own RBAC
+    /// already granted the caller full access. `client-go`'s transport sends the bearer
+    /// token in the Authorization header independently of presenting the TLS client cert,
+    /// so both credentials travel on the same request; main.rs seeds this token into
+    /// `token_map` so u7s's own authenticate() (which uses the bearer token whenever the
+    /// request carries one, only falling back to the client cert when it does not) still
+    /// resolves the caller to the identical admin/system:masters identity.
+    pub admin_bearer_token: String,
     /// Configured rustls ServerConfig for the axum server.
     pub server_config: Arc<ServerConfig>,
 }
@@ -387,6 +402,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         admin_key_pem: admin_key.serialize_pem().into_bytes(),
         kubelet_client_cert_pem,
         kubelet_client_key_pem: kubelet_client_key.serialize_pem().into_bytes(),
+        admin_bearer_token: uuid::Uuid::new_v4().to_string(),
         server_config: Arc::new(server_config),
     })
 }
@@ -411,6 +427,7 @@ struct Kubeconfig {
     ca_data: String,
     cert_data: String,
     key_data: String,
+    token: String,
 }
 
 impl Kubeconfig {
@@ -425,6 +442,7 @@ impl Kubeconfig {
             ca_data: b64.encode(&ca_pem),
             cert_data: b64.encode(&cert_pem),
             key_data: b64.encode(&tls.admin_key_pem),
+            token: tls.admin_bearer_token.clone(),
         }
     }
 
@@ -447,11 +465,13 @@ impl Kubeconfig {
              - name: admin\n\
              \x20 user:\n\
              \x20   client-certificate-data: {cert_data}\n\
-             \x20   client-key-data: {key_data}\n",
+             \x20   client-key-data: {key_data}\n\
+             \x20   token: {token}\n",
             server = self.server,
             ca_data = self.ca_data,
             cert_data = self.cert_data,
             key_data = self.key_data,
+            token = self.token,
         )
     }
 }
@@ -1053,6 +1073,39 @@ mod tests {
         assert!(
             yaml.contains("certificate-authority-data:"),
             "kubeconfig YAML must contain 'certificate-authority-data:' field; got: {yaml}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Regression test: kubectl/KCM authenticate to us via the admin client cert only, so
+    /// their requests carry no Authorization header at all. Before admin_bearer_token
+    /// existed, an aggregated backend (e.g. metrics-server) reached through
+    /// handlers::aggregation's proxy — which only forwards an Authorization header that
+    /// already exists on the request, it never mints one from the resolved x509 identity —
+    /// saw every such request as unauthenticated ("system:anonymous") and denied it, even
+    /// though u7s's own RBAC already granted the caller full access. Confirmed live: before
+    /// this fix, `kubectl top nodes` failed with "User \"system:anonymous\" cannot list
+    /// resource \"nodes\" in API group \"metrics.k8s.io\"" despite kubectl's own request to
+    /// u7s succeeding as admin. Revert the token line from Kubeconfig::to_yaml and this
+    /// test fails again.
+    #[test]
+    fn kubeconfig_yaml_embeds_admin_bearer_token_for_aggregation_proxy_forwarding() {
+        let dir = test_temp_dir("kubeconfig-token");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let kc = Kubeconfig::new("https://127.0.0.1:6443", &tls);
+        let yaml = kc.to_yaml();
+
+        assert!(
+            yaml.contains(&format!("token: {}", tls.admin_bearer_token)),
+            "kubeconfig YAML must embed the exact admin_bearer_token, or the aggregation \
+             proxy has nothing to forward to an aggregated backend on kubectl/KCM's \
+             cert-only requests; got: {yaml}"
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
