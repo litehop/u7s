@@ -406,6 +406,27 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Minimal borrowed shape of a stored object's body, deserialized directly from the store's
+/// bytes instead of a full `serde_json::Value` tree. `object_is_live` only ever reads
+/// `metadata.uid` and `metadata.deletionTimestamp` — every other field (kind, spec, status,
+/// `metadata.name`/`.namespace`/labels/etc.) is irrelevant here (the caller already knows
+/// the namespace/name via `key`) and is silently skipped by serde's default
+/// unknown-field behavior. `Value` trees are the single largest source of apiserver JSON
+/// allocation (see `ai/findings/json-serde-optimization-scoping-2026-08-06.md`); this
+/// callsite alone accounted for ~7% of all of it.
+#[derive(Deserialize)]
+struct LivenessCheckFields<'a> {
+    #[serde(borrow)]
+    metadata: LivenessMetadata<'a>,
+}
+
+#[derive(Deserialize)]
+struct LivenessMetadata<'a> {
+    uid: Option<&'a str>,
+    #[serde(rename = "deletionTimestamp")]
+    deletion_timestamp: Option<&'a str>,
+}
+
 /// Verify that the store object at `key` still exists, has `metadata.uid == expected_uid`,
 /// and — if it has been marked for deletion — that the deletion happened no more than
 /// `DELETION_LEEWAY_SECS` ago.
@@ -424,20 +445,18 @@ async fn object_is_live<S: Store>(store: &S, key: &str, expected_uid: &str) -> b
             return false;
         }
     };
-    let val: serde_json::Value = match serde_json::from_slice(&obj.value) {
-        Ok(v) => v,
+    let fields: LivenessCheckFields = match serde_json::from_slice(&obj.value) {
+        Ok(f) => f,
         Err(e) => {
             tracing::warn!("SA JWT liveness check: failed to parse stored object {key}: {e}");
             return false;
         }
     };
-    let meta: crate::types::ObjectMeta =
-        serde_json::from_value(val["metadata"].clone()).unwrap_or_default();
-    if meta.uid.as_deref() != Some(expected_uid) {
+    if fields.metadata.uid != Some(expected_uid) {
         return false;
     }
-    if let Some(ts) = meta.deletion_timestamp {
-        match rfc3339_to_unix_secs(&ts) {
+    if let Some(ts) = fields.metadata.deletion_timestamp {
+        match rfc3339_to_unix_secs(ts) {
             Some(deleted_at) if (unix_now() as i64) - deleted_at > DELETION_LEEWAY_SECS => {
                 return false;
             }
@@ -2598,6 +2617,100 @@ mod tests {
             before + 1,
             "accepting a token past its warnafter must increment the stale-token metric so \
              operators can detect reliance on the pod-bound-token expiration extension"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // object_is_live minimal-field deserialize (mayor-e555b)
+    // -----------------------------------------------------------------------
+    // Replaces the full `serde_json::Value` tree parse in `object_is_live` with the
+    // minimal `LivenessCheckFields` struct above — see
+    // `ai/findings/json-serde-optimization-scoping-2026-08-06.md`. This callsite alone
+    // accounted for ~7.2%/8.6% of all apiserver JSON allocation bytes/events over a
+    // 60-minute conformance run, entirely spent building and immediately discarding a
+    // `Value` tree to read two scalar fields on every SA-JWT-authenticated request.
+
+    /// A body containing only the fields `object_is_live` actually reads (`metadata.uid`,
+    /// `metadata.deletionTimestamp`) must deserialize successfully — proves the minimal
+    /// struct does not accidentally require any other field (e.g. `metadata.name`/
+    /// `.namespace`, which the function never reads — the caller already has those from the
+    /// store key) to be present.
+    #[test]
+    fn liveness_check_fields_deserializes_minimal_body() {
+        let body = br#"{"metadata":{"uid":"abc-123","deletionTimestamp":"2026-01-01T00:00:00Z"}}"#;
+        let fields: LivenessCheckFields<'_> =
+            serde_json::from_slice(body).expect("minimal metadata-only body must deserialize");
+        assert_eq!(fields.metadata.uid, Some("abc-123"));
+        assert_eq!(
+            fields.metadata.deletion_timestamp,
+            Some("2026-01-01T00:00:00Z")
+        );
+    }
+
+    /// A real stored object carries many fields the liveness check doesn't need (kind,
+    /// apiVersion, spec, status, metadata.name/.namespace/.labels/.resourceVersion/...).
+    /// These must be silently ignored rather than cause a deserialization failure —
+    /// otherwise every SA-JWT-authenticated request would start failing the moment any
+    /// resource type's schema changed, which is exactly the fragility a hand-rolled minimal
+    /// struct risks introducing if it isn't permissive about unknown fields.
+    #[test]
+    fn liveness_check_fields_ignores_fields_beyond_uid_and_deletion_timestamp() {
+        let body = serde_json::json!({
+            "kind": "Pod",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "uid": "abc-123",
+                "resourceVersion": "42",
+                "labels": {"app": "web"},
+                "annotations": {"some/annotation": "value"},
+            },
+            "spec": {"containers": [{"name": "c", "image": "nginx"}]},
+            "status": {"phase": "Running"},
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let fields: LivenessCheckFields<'_> = serde_json::from_slice(&bytes)
+            .expect("extra top-level and metadata fields must not cause a parse failure");
+        assert_eq!(fields.metadata.uid, Some("abc-123"));
+        assert_eq!(
+            fields.metadata.deletion_timestamp, None,
+            "deletionTimestamp absent on a live object must decode as None, not error"
+        );
+    }
+
+    /// Regression test for mayor-e555b: `object_is_live` must not deserialize the stored
+    /// object's bytes into a `serde_json::Value` tree.
+    ///
+    /// It used to do so on every SA-JWT-authenticated request (every bound ServiceAccount,
+    /// and every bound Pod for pod-bound tokens) solely to read `metadata.uid` and
+    /// `metadata.deletionTimestamp` via `from_value::<ObjectMeta>` after building the whole
+    /// tree. Measured cost: ~1.22GB / 10.68M allocation events over a 60-minute conformance
+    /// run — the single largest JSON allocation callsite in the apiserver. This test scans
+    /// the function's own source for the parse call site rather than instrumenting
+    /// allocations, mirroring the pattern used for the sibling
+    /// `content_type::reencode_proto_response` fix (mayor-g7g2m): a purely behavioral test
+    /// cannot catch a reintroduction of this dead-weight parse, since the bool
+    /// `object_is_live` returns is identical either way.
+    #[test]
+    fn object_is_live_does_not_build_a_json_value_tree() {
+        let source = include_str!("auth.rs");
+        let fn_start = source
+            .find("async fn object_is_live")
+            .expect("object_is_live must still exist in this file");
+        let after_start = &source[fn_start..];
+        let fn_end = after_start
+            .find("\n}\n")
+            .expect("object_is_live's closing brace must be found");
+        let fn_body = &after_start[..fn_end];
+
+        assert!(
+            !fn_body.contains("serde_json::Value") && !fn_body.contains("serde_json::from_value"),
+            "object_is_live must not parse the stored object into a serde_json::Value tree — \
+             it only ever reads metadata.uid and metadata.deletionTimestamp, so building a \
+             full recursive Value tree (94.5% of all apiserver JSON allocation bytes per \
+             ai/findings/json-serde-optimization-scoping-2026-08-06.md) for two scalar \
+             fields is pure waste on every SA-JWT-authenticated request:\n{fn_body}"
         );
     }
 
