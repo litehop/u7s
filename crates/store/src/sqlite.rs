@@ -191,6 +191,12 @@ fn push_event_locked(
                 );
             }
         }
+        // Unconditional (not just on eviction): this is the only write path onto the ring, so
+        // this is the one place that can cheaply observe true occupancy on every push, not just
+        // once the ring is already full. Sampled after the eviction check above so it always
+        // reflects final post-eviction occupancy. Still holding the write guard — length
+        // already computed, zero extra lock acquisition.
+        crate::metrics::WATCH_RING_OCCUPANCY.set(guard.len() as i64);
     }
     // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
     // compaction can still receive DELETED events for objects deleted before compaction.
@@ -235,6 +241,10 @@ fn push_event_locked(
                 guard.by_revision.remove(&old.revision);
             }
         }
+        // Unconditional (not just on eviction), same reasoning as WATCH_RING_OCCUPANCY above:
+        // this is the only write path onto the deletion log, so this cheaply observes its true
+        // length on every write, still holding the write guard.
+        crate::metrics::DELETION_LOG_LEN.set(guard.by_key.len() as i64);
     }
     // Best-effort broadcast of the specific event.
     let event_revision = event.revision;
@@ -1363,8 +1373,11 @@ impl Store for SqliteStore {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // The broadcast channel dropped messages because this receiver was too slow.
+                        // Labeled by prefix_bucket, not the raw prefix: a namespace-scoped watch
+                        // prefix includes the namespace segment, which would otherwise mint one
+                        // time series per namespace a long conformance run ever creates.
                         crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-                            .with_label_values(&[&prefix_owned])
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
                             .inc_by(n);
                         // Attempt recovery: re-subscribe (to capture all future events) then
                         // re-scan the ring buffer for events missed during the lag.  This avoids
@@ -1376,6 +1389,13 @@ impl Store for SqliteStore {
                         // fall back to yielding Compacted so the client can relist from a valid
                         // revision rather than silently skipping events.
                         rx = tx_clone.subscribe();
+                        // Timed separately from the `for event in &catchup { yield ... }` loop
+                        // below: `yield` inside this generator suspends on the consumer's poll
+                        // rate (backpressure), which would fold client-drain latency into this
+                        // measurement. This histogram exists to isolate the O(ring) scan itself
+                        // — the part that runs synchronously while holding `ring_arc`'s read
+                        // lock and blocks whichever tokio worker is polling this stream.
+                        let recovery_scan_started = std::time::Instant::now();
                         let catchup: Vec<Arc<InternalEvent>> = {
                             let guard = ring_arc.read().expect("ring poisoned");
                             guard
@@ -1386,6 +1406,9 @@ impl Store for SqliteStore {
                                 .cloned()
                                 .collect()
                         };
+                        crate::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
+                            .observe(recovery_scan_started.elapsed().as_secs_f64());
                         for event in &catchup {
                             last_replayed = last_replayed.max(event.revision);
                             yield internal_to_watch(event);
@@ -2756,6 +2779,97 @@ mod tests {
             after > before,
             "a receiver that missed more than BROADCAST_CAPACITY messages must increment \
              u7s_watch_broadcast_lagged_total for its prefix once polled; before={before} after={after}"
+        );
+    }
+
+    /// `u7s_watch_broadcast_lagged_total` must be labeled by `prefix_bucket`, not the raw
+    /// (namespace-including) watch prefix — otherwise every namespace a long conformance run
+    /// creates mints its own permanent, never-shrinking time series for this counter. Fails on
+    /// revert if the label were switched back to the raw prefix: two different namespace-scoped
+    /// watches under the same resource type would then land on two separate series instead of
+    /// accumulating onto one.
+    #[tokio::test]
+    async fn broadcast_lag_total_buckets_by_resource_type_not_raw_namespace_prefix() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix_a = "/registry/lag-bucket-test/ns-a/";
+        let prefix_b = "/registry/lag-bucket-test/ns-b/";
+        let bucket = super::metrics::prefix_bucket(prefix_a);
+        assert_eq!(
+            bucket,
+            super::metrics::prefix_bucket(prefix_b),
+            "test setup invariant: both namespace-scoped prefixes must share one resource-type \
+             bucket, or this test would not actually exercise the cardinality-bounding behavior"
+        );
+
+        // Neither stream is polled while this burst is written, so both fall behind the shared
+        // broadcast channel — Lagged is a property of the receiver's own channel state, not of
+        // which key each buffered event targets.
+        let stream_a = store.watch(prefix_a, 0).await.expect("watch a");
+        futures_util::pin_mut!(stream_a);
+        let stream_b = store.watch(prefix_b, 0).await.expect("watch b");
+        futures_util::pin_mut!(stream_b);
+
+        let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket])
+            .get();
+
+        let writes = BROADCAST_CAPACITY as u64 + 1;
+        for i in 0..writes {
+            let key = format!("/registry/lag-bucket-test/unrelated/obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream_a.next()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream_b.next()).await;
+
+        let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket])
+            .get();
+        assert!(
+            after > before,
+            "two different namespace-scoped watches under the same resource type must \
+             accumulate onto the SAME prefix_bucket series; before={before} after={after}"
+        );
+    }
+
+    /// A real `RecvError::Lagged` recovery must record a sample in
+    /// `u7s_watch_lag_recovery_duration_seconds` under this watch's `prefix_bucket` — this is
+    /// the metric an operator correlates against ring occupancy to confirm (or refute) whether a
+    /// filling ring is making lag-recovery scans expensive enough to compound into further lag.
+    /// Fails on revert if the `.observe()` call at the recovery-scan site were deleted: a real
+    /// lag+recovery would leave this bucket permanently absent instead of gaining a sample.
+    #[tokio::test]
+    async fn lagged_recovery_records_a_duration_sample_for_its_prefix_bucket() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/lag-recovery-duration-test/";
+        let bucket = super::metrics::prefix_bucket(prefix);
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let before = super::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+            .with_label_values(&[bucket])
+            .get_sample_count();
+
+        let writes = BROADCAST_CAPACITY as u64 + 1;
+        for i in 0..writes {
+            let key = format!("{prefix}obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let after = super::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+            .with_label_values(&[bucket])
+            .get_sample_count();
+        assert!(
+            after > before,
+            "a Lagged recovery scan on this prefix must record a duration sample under its \
+             prefix_bucket; before={before} after={after}"
         );
     }
 

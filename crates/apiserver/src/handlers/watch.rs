@@ -755,11 +755,19 @@ async fn watch_generic_impl<S: Store>(
         None => from_revision,
     };
 
+    // This call performs the store's initial ring-buffer replay scan synchronously inside its
+    // own body (no `.await` point precedes it) before ever constructing the returned stream, so
+    // timing the whole call captures that scan's real cost — the mechanism behind the ring's
+    // occupancy-scaling watch-open latency.
+    let watch_open_started = std::time::Instant::now();
     let event_stream = state
         .store
         .watch(&prefix, watch_from_rv)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+    crate::metrics::WATCH_OPEN_DURATION_SECONDS
+        .with_label_values(&[&group, &plural])
+        .observe(watch_open_started.elapsed().as_secs_f64());
 
     // From this point the watch is committed to opening — count it as a successful request
     // now, matching upstream's counting of the initial HTTP response code for watch requests
@@ -1762,6 +1770,66 @@ mod tests {
             result.is_ok(),
             "rv=0 (full watch) must not trigger the 410 expiry check, \
              even when a compaction horizon exists"
+        );
+    }
+
+    /// A successful watch open must record a duration sample in
+    /// `apiserver_watch_open_duration_seconds` under this request's exact `{group, resource}` —
+    /// the signal an operator uses to see the ring-buffer replay scan's cost scale with ring
+    /// occupancy over a run. Fails on revert if the `.observe()` call around
+    /// `state.store.watch(...)` were deleted: a real successful watch open would leave this
+    /// series permanently absent instead of gaining a sample.
+    #[tokio::test]
+    async fn watch_generic_open_records_a_duration_sample_for_its_group_and_resource() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let plural = "watch-open-duration-test";
+        let before = crate::metrics::WATCH_OPEN_DURATION_SECONDS
+            .with_label_values(&["", plural])
+            .get_sample_count();
+
+        let result = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/watch-open-duration-test/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: plural.into(),
+                timeout_seconds: None,
+            },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "watch open must succeed for a fresh in-memory store"
+        );
+
+        let after = crate::metrics::WATCH_OPEN_DURATION_SECONDS
+            .with_label_values(&["", plural])
+            .get_sample_count();
+        assert!(
+            after > before,
+            "a successful watch open must record a duration sample for its {{group,resource}}; \
+             before={before} after={after}"
         );
     }
 

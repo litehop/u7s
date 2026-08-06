@@ -46,13 +46,13 @@ mod tests {
     use u7s_store::SqliteStore;
 
     /// `/metrics` must serve the standard Prometheus text-exposition format and include all
-    /// six Phase-1 metric names — this is the operator-confirmed metric set for this bead; if
+    /// ten Phase-1 metric names — this is the operator-confirmed metric set for this bead; if
     /// any of them silently stop being registered (e.g. a typo'd metric name, a dropped
     /// registration), a Prometheus scraper's dashboards go blank for exactly that series
     /// without any error, which is why this is asserted as a single end-to-end request rather
     /// than by inspecting the metric statics directly.
     #[tokio::test]
-    async fn metrics_endpoint_exposes_all_six_phase_one_metrics_in_text_format() {
+    async fn metrics_endpoint_exposes_all_ten_phase_one_metrics_in_text_format() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store,
@@ -108,6 +108,19 @@ mod tests {
         u7s_store::metrics::WATCH_BROADCAST_LAGGED_TOTAL
             .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
             .inc_by(0);
+        // The two new bare gauges have no handler-side `.set()` call (unlike
+        // u7s_watch_broadcast_receivers, set every scrape from real store state) — they are
+        // only ever set from push_event_locked's write path (see sqlite.rs), which this test
+        // never exercises. Touch them directly so their `LazyLock` registers, same reasoning
+        // as the Vec touches above.
+        u7s_store::metrics::WATCH_RING_OCCUPANCY.set(0);
+        u7s_store::metrics::DELETION_LOG_LEN.set(0);
+        u7s_store::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+            .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
+            .observe(0.0);
+        crate::metrics::WATCH_OPEN_DURATION_SECONDS
+            .with_label_values(&["", "metrics-endpoint-test-touch"])
+            .observe(0.0);
 
         let resp = metrics(State(state)).await;
         assert_eq!(
@@ -147,6 +160,10 @@ mod tests {
             "u7s_watch_broadcast_lagged_total",
             "u7s_watch_broadcast_receivers",
             "u7s_watch_closed_total",
+            "u7s_watch_ring_occupancy",
+            "u7s_deletion_log_len",
+            "u7s_watch_lag_recovery_duration_seconds",
+            "apiserver_watch_open_duration_seconds",
         ] {
             assert!(
                 text.contains(&format!("# TYPE {metric_name} ")),
