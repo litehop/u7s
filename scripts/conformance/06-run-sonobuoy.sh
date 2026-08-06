@@ -379,7 +379,18 @@ if ! run_with_timeout "limactl shell $FOUND_NODE sudo cp (stage results tarball)
 fi
 
 TIMESTAMP=$(date -u +%m%d-%H%M)
-FOCUS_SLUG=$(echo "${FOCUS:-conformance}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')
+# --all-e2e with no --focus used to fall through to the "conformance"
+# default below, mislabeling the result folder as a --mode=certified-
+# conformance run (e.g. temp/e2e/0805-2202-conformance was really a 12.6h
+# --all-e2e run). --focus still wins when set -- a focus regex is
+# descriptive of what actually ran (--all-e2e/--focus are already mutually
+# exclusive by the time this line runs, enforced at run-all.sh:181).
+if [ "$ALL_E2E" -eq 1 ] && [ -z "$FOCUS" ]; then
+  SLUG_INPUT="all-e2e"
+else
+  SLUG_INPUT="${FOCUS:-conformance}"
+fi
+FOCUS_SLUG=$(echo "$SLUG_INPUT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')
 OUTFILE="$WORKDIR/../e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
 mkdir -p "$WORKDIR/../e2e"
 if ! run_with_timeout "limactl copy results tarball from $FOUND_NODE" "$CALL_TIMEOUT" 0 \
