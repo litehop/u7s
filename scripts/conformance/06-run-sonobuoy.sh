@@ -8,7 +8,6 @@
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
