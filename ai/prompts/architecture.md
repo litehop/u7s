@@ -1,6 +1,8 @@
 # u7s Architecture Overview
 
-**Status:** RFC-grade implementation prompt. Last updated: 2026-05-18.
+**Status:** RFC-grade implementation prompt. Last updated: 2026-05-18. Substantially
+superseded by shipped code in places (see §10) — treat `roadmap.md` as the current
+source of truth for what is and is not implemented.
 
 ---
 
@@ -538,13 +540,22 @@ The following are explicitly **not** implemented in u7s, at least through the Ar
 - **Control plane HA:** Single control plane node only. No leader election, no distributed consensus between API servers.
 - **Cluster Autoscaler:** No node provisioning or deprovisioning.
 - **Cloud provider integration:** No CCM (Cloud Controller Manager), no LoadBalancer service type provisioning.
-- **Admission webhooks:** No MutatingAdmissionWebhook or ValidatingAdmissionWebhook infrastructure. Built-in admission plugins only (e.g., service account admission is built into the API server).
-- **Horizontal Pod Autoscaler (HPA):** No metrics server integration.
-- **Pod Disruption Budgets:** No PDB controller.
 - **Network policies:** Policy objects can be stored (Argo CD may apply them) but enforcement is the CNI plugin's responsibility — u7s does not implement a network policy enforcement engine.
 - **Volume plugins beyond hostPath and emptyDir:** No CSI driver integration in Phase 1–4. Static PV/PVC with hostPath is the limit.
 - **Image registry mirroring or caching:** Node agent delegates all image pulls to the CRI runtime.
 - **Audit logging:** Not implemented initially.
-- **Aggregated API server / API aggregation layer:** CRDs are the only extension mechanism.
 - **Multi-tenancy / virtual clusters:** Single flat cluster model.
 - **Windows nodes:** Linux only.
+
+The following were originally listed here as out of scope but are now implemented —
+see `roadmap.md` for the shipped decision in each case:
+
+- **Admission webhooks:** MutatingWebhookConfiguration and ValidatingWebhookConfiguration are implemented (`crates/apiserver/src/admission.rs`), not just built-in plugins.
+- **Aggregated API server / API aggregation layer:** `apiregistration.k8s.io` APIService aggregation is implemented (`crates/apiserver/src/handlers/aggregation.rs`); CRDs are no longer the only extension mechanism.
+- **Horizontal Pod Autoscaler (HPA):** A metrics-server addon is deployed by the API server (`seed_metrics_server`) and the `scale` subresource is implemented (`crates/apiserver/src/handlers/scale.rs`), unblocking CPU/memory HPA targets.
+
+**Pod Disruption Budgets** remain accurately scoped above: u7s has no PDB *controller*
+of its own (no reimplementation of `disruptionsAllowed` computation) — it delegates
+that reconciliation to the real upstream kube-controller-manager's DisruptionController
+and only enforces the resulting `status.disruptionsAllowed` at eviction time
+(`crates/apiserver/src/handlers/pods.rs`).
