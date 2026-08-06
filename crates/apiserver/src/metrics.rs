@@ -116,9 +116,6 @@ pub static WATCH_BROADCAST_RECEIVERS: LazyLock<IntGauge> = LazyLock::new(|| {
 /// `u7s_` prefix, matching this file's other `apiserver_*` siblings (`apiserver_watch_events_total`
 /// etc.): this measures a request-lifecycle event squarely in upstream's naming territory, even
 /// though no literal upstream metric of this exact name exists.
-// Not yet observed anywhere — the call site is added in a follow-up commit that wraps
-// Store::watch() in handlers/watch.rs. Remove this allow once that lands.
-#[cfg_attr(not(test), allow(dead_code))]
 pub static WATCH_OPEN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     let histogram = HistogramVec::new(
         HistogramOpts::new(

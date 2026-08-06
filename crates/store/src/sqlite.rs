@@ -191,6 +191,12 @@ fn push_event_locked(
                 );
             }
         }
+        // Unconditional (not just on eviction): this is the only write path onto the ring, so
+        // this is the one place that can cheaply observe true occupancy on every push, not just
+        // once the ring is already full. Sampled after the eviction check above so it always
+        // reflects final post-eviction occupancy. Still holding the write guard — length
+        // already computed, zero extra lock acquisition.
+        crate::metrics::WATCH_RING_OCCUPANCY.set(guard.len() as i64);
     }
     // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
     // compaction can still receive DELETED events for objects deleted before compaction.
@@ -235,6 +241,10 @@ fn push_event_locked(
                 guard.by_revision.remove(&old.revision);
             }
         }
+        // Unconditional (not just on eviction), same reasoning as WATCH_RING_OCCUPANCY above:
+        // this is the only write path onto the deletion log, so this cheaply observes its true
+        // length on every write, still holding the write guard.
+        crate::metrics::DELETION_LOG_LEN.set(guard.by_key.len() as i64);
     }
     // Best-effort broadcast of the specific event.
     let event_revision = event.revision;
@@ -1376,6 +1386,13 @@ impl Store for SqliteStore {
                         // fall back to yielding Compacted so the client can relist from a valid
                         // revision rather than silently skipping events.
                         rx = tx_clone.subscribe();
+                        // Timed separately from the `for event in &catchup { yield ... }` loop
+                        // below: `yield` inside this generator suspends on the consumer's poll
+                        // rate (backpressure), which would fold client-drain latency into this
+                        // measurement. This histogram exists to isolate the O(ring) scan itself
+                        // — the part that runs synchronously while holding `ring_arc`'s read
+                        // lock and blocks whichever tokio worker is polling this stream.
+                        let recovery_scan_started = std::time::Instant::now();
                         let catchup: Vec<Arc<InternalEvent>> = {
                             let guard = ring_arc.read().expect("ring poisoned");
                             guard
@@ -1386,6 +1403,9 @@ impl Store for SqliteStore {
                                 .cloned()
                                 .collect()
                         };
+                        crate::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
+                            .observe(recovery_scan_started.elapsed().as_secs_f64());
                         for event in &catchup {
                             last_replayed = last_replayed.max(event.revision);
                             yield internal_to_watch(event);
@@ -2756,6 +2776,45 @@ mod tests {
             after > before,
             "a receiver that missed more than BROADCAST_CAPACITY messages must increment \
              u7s_watch_broadcast_lagged_total for its prefix once polled; before={before} after={after}"
+        );
+    }
+
+    /// A real `RecvError::Lagged` recovery must record a sample in
+    /// `u7s_watch_lag_recovery_duration_seconds` under this watch's `prefix_bucket` — this is
+    /// the metric an operator correlates against ring occupancy to confirm (or refute) whether a
+    /// filling ring is making lag-recovery scans expensive enough to compound into further lag.
+    /// Fails on revert if the `.observe()` call at the recovery-scan site were deleted: a real
+    /// lag+recovery would leave this bucket permanently absent instead of gaining a sample.
+    #[tokio::test]
+    async fn lagged_recovery_records_a_duration_sample_for_its_prefix_bucket() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/lag-recovery-duration-test/";
+        let bucket = super::metrics::prefix_bucket(prefix);
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let before = super::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+            .with_label_values(&[bucket])
+            .get_sample_count();
+
+        let writes = BROADCAST_CAPACITY as u64 + 1;
+        for i in 0..writes {
+            let key = format!("{prefix}obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+        let after = super::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
+            .with_label_values(&[bucket])
+            .get_sample_count();
+        assert!(
+            after > before,
+            "a Lagged recovery scan on this prefix must record a duration sample under its \
+             prefix_bucket; before={before} after={after}"
         );
     }
 
