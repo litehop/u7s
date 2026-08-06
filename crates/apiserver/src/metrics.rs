@@ -160,6 +160,57 @@ pub static STALE_SA_TOKENS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
+/// Counter of SA-JWT signature-verify cache hits — a hit means the RSA modexp
+/// (`num_bigint_dig::biguint::monty::montgomery`, 4.4% apiserver self-time per the
+/// 2026-08-06 samply triage) was skipped because this exact token's signature bytes were
+/// already verified valid and the cached result hasn't reached the token's `exp` yet. See
+/// `sa_sig_cache` module doc for the cache-key and TTL invariants.
+pub static SA_SIG_CACHE_HITS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "u7s_sa_sig_cache_hits_total",
+        "Total number of SA JWT authentications that skipped RSA signature verification via \
+         the signature-verify cache.",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_sa_sig_cache_hits_total is registered exactly once per process");
+    counter
+});
+
+/// Counter of SA-JWT signature-verify cache misses (new token, expired entry, or entry
+/// evicted under load) — every miss falls through to a full RSA modexp. Compared against
+/// `u7s_sa_sig_cache_hits_total`, a persistently low hit rate signals the cache cap
+/// (`--sa-sig-cache-size` / `U7S_SA_SIG_CACHE_SIZE`) is too small for the deployment's
+/// unique-token cardinality.
+pub static SA_SIG_CACHE_MISSES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "u7s_sa_sig_cache_misses_total",
+        "Total number of SA JWT authentications that missed the signature-verify cache and \
+         ran a full RSA signature verification.",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_sa_sig_cache_misses_total is registered exactly once per process");
+    counter
+});
+
+/// Current number of entries held in the SA-JWT signature-verify cache. Set on every insert
+/// and eviction (`sa_sig_cache::SigCache::insert`) rather than derived at scrape time, since
+/// the cache is behind a `std::sync::RwLock` shared across request-handling tasks.
+pub static SA_SIG_CACHE_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "u7s_sa_sig_cache_size",
+        "Current number of entries in the SA JWT signature-verify cache.",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .expect("u7s_sa_sig_cache_size is registered exactly once per process");
+    gauge
+});
+
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;

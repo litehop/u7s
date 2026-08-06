@@ -22,6 +22,7 @@ use u7s_store::{SqliteStore, Store};
 use crate::keys::object_key;
 use crate::metrics::record_request_total;
 use crate::rbac::{AuthzRequest, RbacIndex};
+use crate::sa_sig_cache::{self, SigCache};
 use crate::status::Status;
 use crate::util::{rfc3339_to_unix_secs, validate_cli_path};
 
@@ -75,6 +76,21 @@ struct SaClaims {
     /// carries `namespace`/`serviceaccount` unconditionally and `pod`/`node` when bound.
     #[serde(rename = "kubernetes.io", default)]
     kubernetes_io: KubernetesIoClaims,
+    /// Token expiry, Unix seconds. `jsonwebtoken::decode` already validates this internally
+    /// via its own separate deserialization pass (see `jsonwebtoken::validation::validate`),
+    /// so this field exists purely so the SA-signature-verify cache (`sa_sig_cache`,
+    /// mayor-6sbvc) can derive its own TTL bound from the same value — see that module's doc
+    /// for the "cache entry never outlives the token's real exp" invariant.
+    exp: u64,
+    /// Intended audiences. u7s's own token minter (`handlers::tokens::create_token`) always
+    /// emits this as a JSON array (`CreateTokenClaims.aud: Vec<String>`), never a bare
+    /// string, so a plain `Vec<String>` deserializes every token this apiserver ever mints.
+    /// Re-checked explicitly below on EVERY call — including signature-verify cache hits —
+    /// because the caller-supplied acceptable-audiences list varies per call site
+    /// (`authenticate` always uses the default; `authenticate_token_with_audiences` takes the
+    /// caller's `TokenReview.spec.audiences`). A cached signature result must never let a
+    /// token pass an audience check it wasn't actually evaluated against for THIS call.
+    aud: Vec<String>,
 }
 
 /// Bound-object + identity claims embedded by `handlers::tokens::create_token` under the
@@ -216,6 +232,7 @@ async fn authenticate<S: Store>(
     sa_decoding_key: Option<&DecodingKey>,
     peer_cert: Option<&PeerCertificate>,
     store: &S,
+    sig_cache: &SigCache,
 ) -> AuthnResult {
     match auth_header {
         None => {
@@ -253,7 +270,7 @@ async fn authenticate<S: Store>(
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
                 if let Some(key) = sa_decoding_key {
-                    if let Some(user) = try_verify_sa_jwt(token, key, &[], store).await {
+                    if let Some(user) = try_verify_sa_jwt(token, key, &[], store, sig_cache).await {
                         return AuthnResult::Identified(user);
                     }
                 }
@@ -358,6 +375,7 @@ pub async fn authenticate_token_with_audiences<S: Store>(
     sa_decoding_key: Option<&DecodingKey>,
     audiences: &[String],
     store: &S,
+    sig_cache: &SigCache,
 ) -> Option<UserInfo> {
     if let Some(info) = ct_token_lookup(token_map, token) {
         let mut user = info.clone();
@@ -371,7 +389,7 @@ pub async fn authenticate_token_with_audiences<S: Store>(
     }
     if let Some(key) = sa_decoding_key {
         // try_verify_sa_jwt already appends system:authenticated.
-        if let Some(user) = try_verify_sa_jwt(token, key, audiences, store).await {
+        if let Some(user) = try_verify_sa_jwt(token, key, audiences, store, sig_cache).await {
             return Some(user);
         }
     }
@@ -445,28 +463,78 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     key: &DecodingKey,
     audiences: &[String],
     store: &S,
+    sig_cache: &SigCache,
 ) -> Option<UserInfo> {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&["https://kubernetes.default.svc"]);
-    if audiences.is_empty() {
-        validation.set_audience(&["https://kubernetes.default.svc"]);
-    } else {
-        let refs: Vec<&str> = audiences.iter().map(|s| s.as_str()).collect();
-        validation.set_audience(&refs);
-    }
+    // Audience is validated manually below (against `SaClaims::aud`) rather than through
+    // jsonwebtoken's own `Validation`, so the identical check runs whether the claims came
+    // from a fresh RSA verify or a signature-cache hit — see the audience check below and
+    // `SaClaims::aud`'s doc for why a cache hit must never skip it.
+    validation.validate_aud = false;
     // No leeway: reject tokens that are even 1 second past expiry.
     validation.leeway = 0;
 
-    let data = match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::debug!("SA JWT verification failed: {e}");
-            return None;
+    // Signature-verify cache (mayor-6sbvc): skip the RSA modexp when this exact token's
+    // signature bytes were already verified valid and the cached entry hasn't reached the
+    // token's real `exp` yet (see `sa_sig_cache` module doc for the full design). A
+    // malformed token makes `signature_hash` return `None`, which naturally falls through
+    // to the full decode below and its own proper rejection.
+    let sig_key = sa_sig_cache::signature_hash(token);
+    let cache_hit =
+        sig_key.is_some_and(|k| sig_cache.get(&k, std::time::Instant::now()) == Some(true));
+
+    let claims = if cache_hit {
+        // Signature already verified for this exact byte-for-byte token: RS256/PKCS#1v1.5
+        // signing is deterministic per (message, key), so an identical signature can only
+        // have been produced by an identical header+payload — every claim decoded here is
+        // exactly what a fresh `jsonwebtoken::decode` would have produced too. Skips the RSA
+        // verify, not claim decoding.
+        match jsonwebtoken::dangerous::insecure_decode::<SaClaims>(token) {
+            Ok(data) => data.claims,
+            Err(e) => {
+                tracing::debug!("SA JWT verification failed (cached-signature claim decode): {e}");
+                return None;
+            }
         }
+    } else {
+        sig_cache.record_verify_attempt();
+        let data = match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::debug!("SA JWT verification failed: {e}");
+                return None;
+            }
+        };
+        if let Some(k) = sig_key {
+            let now = std::time::Instant::now();
+            let expires_at = sa_sig_cache::capped_expiry(data.claims.exp, unix_now(), now);
+            sig_cache.insert(k, None, expires_at, now);
+        }
+        data.claims
     };
 
-    let jti = data.claims.jti;
-    let sub = data.claims.sub;
+    // Audience check (see `validation.validate_aud = false` above for why this runs
+    // manually rather than via jsonwebtoken's Validation): the token's own `aud` claim is
+    // fixed once signed, but the caller's acceptable-audience list varies per call site, so
+    // this must be re-evaluated on every call — cache hit or miss alike.
+    let default_aud = ["https://kubernetes.default.svc".to_owned()];
+    let allowed_audiences: &[String] = if audiences.is_empty() {
+        &default_aud
+    } else {
+        audiences
+    };
+    if !claims.aud.iter().any(|a| allowed_audiences.contains(a)) {
+        tracing::debug!(
+            "SA JWT rejected: aud {:?} not in allowed set {:?}",
+            claims.aud,
+            allowed_audiences
+        );
+        return None;
+    }
+
+    let jti = claims.jti;
+    let sub = claims.sub;
     tracing::debug!("SA JWT verified: sub={sub}");
     // sub format: system:serviceaccount:{ns}:{name}
     // Validate before use: a malformed sub silently omits the
@@ -485,7 +553,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     // ServiceAccount (or, for a pod-bound token, the Pod) it was minted for is the only way
     // to invalidate a u7s SA token before its JWT `exp`; there is no JTI-based revocation
     // list (upstream Kubernetes doesn't have one either — see module-level notes).
-    let kio = &data.claims.kubernetes_io;
+    let kio = &claims.kubernetes_io;
     if !object_is_live(
         store,
         &object_key("serviceaccounts", &kio.namespace, &kio.serviceaccount.name),
@@ -555,7 +623,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     // calls TokenReview on such a token and asserts these extra entries are
     // present with values matching the actual bound pod/node — omit them
     // entirely for legacy tokens that carry no binding rather than fabricate.
-    if let Some(pod) = data.claims.kubernetes_io.pod {
+    if let Some(pod) = claims.kubernetes_io.pod {
         if !pod.name.is_empty() && !pod.uid.is_empty() {
             extra.insert(
                 "authentication.kubernetes.io/pod-name".to_owned(),
@@ -567,7 +635,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
             );
         }
     }
-    if let Some(node) = data.claims.kubernetes_io.node {
+    if let Some(node) = claims.kubernetes_io.node {
         if !node.name.is_empty() {
             extra.insert(
                 "authentication.kubernetes.io/node-name".to_owned(),
@@ -857,6 +925,7 @@ pub struct AuthLayer {
     token_map: Arc<HashMap<String, UserInfo>>,
     sa_decoding_key: Option<Arc<DecodingKey>>,
     store: Arc<SqliteStore>,
+    sig_cache: Arc<SigCache>,
 }
 
 impl AuthLayer {
@@ -865,12 +934,14 @@ impl AuthLayer {
         token_map: HashMap<String, UserInfo>,
         sa_decoding_key: Option<Arc<DecodingKey>>,
         store: Arc<SqliteStore>,
+        sig_cache: Arc<SigCache>,
     ) -> Self {
         AuthLayer {
             rbac_index,
             token_map: Arc::new(token_map),
             sa_decoding_key,
             store,
+            sig_cache,
         }
     }
 }
@@ -885,6 +956,7 @@ impl<S> Layer<S> for AuthLayer {
             token_map: Arc::clone(&self.token_map),
             sa_decoding_key: self.sa_decoding_key.clone(),
             store: Arc::clone(&self.store),
+            sig_cache: Arc::clone(&self.sig_cache),
         }
     }
 }
@@ -900,6 +972,7 @@ pub struct AuthService<S> {
     token_map: Arc<HashMap<String, UserInfo>>,
     sa_decoding_key: Option<Arc<DecodingKey>>,
     store: Arc<SqliteStore>,
+    sig_cache: Arc<SigCache>,
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -935,6 +1008,7 @@ where
         let token_map = Arc::clone(&self.token_map);
         let sa_decoding_key = self.sa_decoding_key.clone();
         let store = Arc::clone(&self.store);
+        let sig_cache = Arc::clone(&self.sig_cache);
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -951,6 +1025,7 @@ where
                 sa_decoding_key.as_deref(),
                 peer_cert.as_ref(),
                 store.as_ref(),
+                sig_cache.as_ref(),
             )
             .await
             {
@@ -1204,6 +1279,14 @@ mod tests {
         SqliteStore::new(":memory:").expect("open in-memory store")
     }
 
+    /// Fresh, empty signature-verify cache for tests that don't specifically exercise
+    /// mayor-6sbvc's caching behavior — a fresh instance per test (rather than a shared
+    /// static) means every test starts from a guaranteed-cold cache regardless of test
+    /// execution order, matching `make_test_store`'s per-test isolation.
+    fn make_test_sig_cache() -> SigCache {
+        SigCache::new_with_capacity(sa_sig_cache::DEFAULT_CAPACITY)
+    }
+
     /// Seed a ServiceAccount object so a minted token's bound-object liveness check
     /// (try_verify_sa_jwt) finds a live, UID-matching ServiceAccount at namespace/name.
     async fn seed_service_account(store: &SqliteStore, ns: &str, name: &str, uid: &str) {
@@ -1259,7 +1342,15 @@ mod tests {
         // Without an Authorization header, caller must be anonymous.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        let result = authenticate(auth_header(&req), &map, None, None, &make_test_store()).await;
+        let result = authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await;
         match result {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
@@ -1283,7 +1374,16 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
             AuthnResult::BadToken => panic!("expected Identified"),
         }
@@ -1296,7 +1396,16 @@ mod tests {
         // silently downgraded to anonymous access.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer wrong-token"));
-        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
@@ -1707,7 +1816,16 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(auth_header(&req), &HashMap::new(), Some(&dec), None, &store).await {
+        match authenticate(
+            auth_header(&req),
+            &HashMap::new(),
+            Some(&dec),
+            None,
+            &store,
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:serviceaccount:default:my-sa");
                 assert!(
@@ -1733,7 +1851,16 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(auth_header(&req), &HashMap::new(), Some(&dec), None, &store).await {
+        match authenticate(
+            auth_header(&req),
+            &HashMap::new(),
+            Some(&dec),
+            None,
+            &store,
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:serviceaccounts".to_owned()),
@@ -1770,6 +1897,7 @@ mod tests {
             Some(&dec),
             None,
             &make_test_store(),
+            &make_test_sig_cache(),
         )
         .await
         {
@@ -1795,6 +1923,7 @@ mod tests {
             Some(&dec),
             None,
             &make_test_store(),
+            &make_test_sig_cache(),
         )
         .await
         {
@@ -1822,6 +1951,7 @@ mod tests {
             Some(&dec2),
             None,
             &make_test_store(),
+            &make_test_sig_cache(),
         )
         .await
         {
@@ -1860,9 +1990,15 @@ mod tests {
         let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
 
         // Must fail with default (https://kubernetes.default.svc) audience.
-        let result_default =
-            authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &[], &store)
-                .await;
+        let result_default = authenticate_token_with_audiences(
+            &token,
+            &HashMap::new(),
+            Some(&dec),
+            &[],
+            &store,
+            &make_test_sig_cache(),
+        )
+        .await;
         assert!(
             result_default.is_none(),
             "token with non-default audience must NOT authenticate when no audiences specified"
@@ -1870,9 +2006,15 @@ mod tests {
 
         // Must succeed when the correct audience is explicitly requested.
         let aud = vec!["system:konnectivity-server".to_owned()];
-        let result =
-            authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &aud, &store)
-                .await;
+        let result = authenticate_token_with_audiences(
+            &token,
+            &HashMap::new(),
+            Some(&dec),
+            &aud,
+            &store,
+            &make_test_sig_cache(),
+        )
+        .await;
         let user = result.expect(
             "token with system:konnectivity-server audience must authenticate \
              when that audience is explicitly requested via TokenReview spec.audiences — \
@@ -1889,6 +2031,247 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // SA-JWT signature-verify cache (mayor-6sbvc)
+    // -----------------------------------------------------------------------
+    // See `sa_sig_cache` module doc for the full design. These 4 tests are all
+    // fail-on-revert per Rule 9: reverting the cache-check in try_verify_sa_jwt to always
+    // fall through to a full decode makes `verify_count` assertions below fail immediately.
+
+    /// The whole point of this cache is to avoid re-running the RSA modexp
+    /// (`num_bigint_dig::biguint::monty::montgomery`, 4.4% of apiserver self-time per the
+    /// 2026-08-06 samply triage) for a client that reuses the same token across many
+    /// requests — this proves that actually happens, not just that auth still works.
+    #[tokio::test]
+    async fn valid_token_caches_after_first_verify_and_skips_modexp_on_second() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let sig_cache = make_test_sig_cache();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+
+        let first = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+        assert!(
+            first.is_some(),
+            "valid token bound to a live SA must authenticate"
+        );
+        assert_eq!(
+            sig_cache.verify_count(),
+            1,
+            "the first presentation of a token must run the real RSA signature verification"
+        );
+
+        for _ in 0..100 {
+            let user = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+            assert!(
+                user.is_some(),
+                "a cache hit must still authenticate the same token"
+            );
+        }
+        assert_eq!(
+            sig_cache.verify_count(),
+            1,
+            "100 repeat presentations of the identical token must all hit the signature \
+             cache — if this regresses, every request from a long-lived client re-pays the \
+             RSA modexp cost this cache exists to eliminate"
+        );
+    }
+
+    /// SECURITY INVARIANT: the cache must never serve a "valid" result past the token's own
+    /// real `exp` — the cache-hit path decodes claims via
+    /// `jsonwebtoken::dangerous::insecure_decode` (which performs NO exp validation at all),
+    /// so an over-generous cache TTL would let an already-expired token keep authenticating
+    /// indefinitely off a stale cached result. `try_verify_sa_jwt` samples `Instant::now()`
+    /// internally (kept out of its parameter list so its signature matches every other
+    /// production call site), so this test uses real sleeps rather than a mock clock.
+    ///
+    /// Two assertions, each catching a different regression:
+    /// - immediately after the first verify (well before `exp`), a second call must still be
+    ///   a cache HIT (`verify_count` stays at 1) — this is what actually fails if the cache
+    ///   check is reverted to "always fall through" (mayor-6sbvc's prescribed regression
+    ///   test), since `jsonwebtoken::decode`'s own exp check would otherwise mask a
+    ///   cache-never-consulted bug by independently rejecting the token once truly expired.
+    /// - after the token's real `exp` has passed, a third call must be a cache MISS
+    ///   (`verify_count` reaches 2) — this is what fails if the TTL cap ever stopped
+    ///   respecting the real `exp` (e.g. a bug that always used the 5-minute cap), since a
+    ///   too-generous TTL would still show a HIT here despite the real token being expired.
+    #[tokio::test]
+    async fn cache_entry_expires_at_or_before_token_exp_never_later() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "short-lived", TEST_SA_UID).await;
+        let sig_cache = make_test_sig_cache();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:short-lived", 2);
+
+        let first = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+        assert!(
+            first.is_some(),
+            "freshly minted, non-expired token must authenticate"
+        );
+        assert_eq!(
+            sig_cache.verify_count(),
+            1,
+            "first verify must run the real RSA check"
+        );
+
+        // Well before exp: this MUST be a cache hit. A "cache check always falls through"
+        // regression shows up here as verify_count becoming 2 immediately, with no need to
+        // wait for real expiry at all.
+        let immediate = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+        assert!(
+            immediate.is_some(),
+            "a live cached token must still authenticate"
+        );
+        assert_eq!(
+            sig_cache.verify_count(),
+            1,
+            "a repeat call well within the token's exp must hit the signature cache, not \
+             re-run the RSA verify — if this fails, the cache is never actually being \
+             consulted regardless of what exp does"
+        );
+
+        // `mint_sa_jwt`'s `exp` is derived from `SystemTime::now().as_secs()`, which
+        // truncates to the current Unix second — a token minted at the very start of a
+        // second can have up to ~1s more real remaining lifetime than its nominal offset.
+        // Sleep past the worst case (offset + 1s) with margin, not just the nominal offset.
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+        let after_expiry = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+        assert_eq!(
+            sig_cache.verify_count(),
+            2,
+            "past the token's real exp, the cache entry must have expired too — a real \
+             verify must fire again rather than serving a stale cached 'valid' result"
+        );
+        assert!(
+            after_expiry.is_none(),
+            "a token past its real exp must never authenticate, cached signature or not"
+        );
+    }
+
+    /// A cache keyed on signature bytes must never let a tampered token piggyback on a
+    /// different (valid) token's cached result — otherwise, once ANY valid token has warmed
+    /// the cache, an attacker able to flip bits in a signature could bypass RSA verification
+    /// entirely as long as some unrelated valid entry happens to occupy the cache.
+    #[tokio::test]
+    async fn tampered_signature_never_gets_cache_hit_shortcut() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
+        let sig_cache = make_test_sig_cache();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+
+        let valid = try_verify_sa_jwt(&token, &dec, &[], &store, &sig_cache).await;
+        assert!(
+            valid.is_some(),
+            "valid token must authenticate and populate the cache"
+        );
+        assert_eq!(
+            sig_cache.verify_count(),
+            1,
+            "first verify must run the real RSA check"
+        );
+
+        // Build a NEW token string with the same header+payload but one flipped bit in the
+        // DECODED signature bytes — a well-formed (valid base64url), cryptographically wrong
+        // signature, not a malformed token that would be rejected before ever reaching the
+        // cache logic.
+        let segments: Vec<&str> = token.splitn(3, '.').collect();
+        assert_eq!(
+            segments.len(),
+            3,
+            "test fixture must be a 3-segment compact JWS"
+        );
+        let mut sig_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            segments[2],
+        )
+        .expect("mint_sa_jwt's own signature segment must be valid base64url");
+        sig_bytes[0] ^= 0x01;
+        let tampered_sig = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &sig_bytes,
+        );
+        let tampered_token = format!("{}.{}.{}", segments[0], segments[1], tampered_sig);
+
+        let tampered = try_verify_sa_jwt(&tampered_token, &dec, &[], &store, &sig_cache).await;
+        assert_eq!(
+            sig_cache.verify_count(),
+            2,
+            "a different (tampered) signature must be a cache miss and trigger a real RSA \
+             verify — a hit here would mean a tampered token could ride the valid token's \
+             cached result and skip signature verification entirely"
+        );
+        assert!(
+            tampered.is_none(),
+            "a tampered signature must never authenticate"
+        );
+    }
+
+    /// Capacity-bounded eviction must not violate correctness under sustained overflow. This
+    /// also documents (see `sa_sig_cache` module doc, "Eviction") why insertion-order (FIFO)
+    /// eviction is sufficient here rather than true access-order LRU: replaying the exact
+    /// same over-capacity sequence twice is the classic "sequential scan defeats LRU/FIFO"
+    /// pattern, so BOTH eviction policies must re-verify every token on the second pass —
+    /// this test's assertion (2x total, not just once) is that exact behavior, not a bug.
+    #[tokio::test]
+    async fn lru_eviction_under_load_does_not_violate_correctness() {
+        let (enc, dec) = test_rsa_keypair();
+        let store = make_test_store();
+        // Small capacity keeps this test fast; the eviction behavior under test does not
+        // depend on the production default (512).
+        let capacity = 8;
+        let sig_cache = SigCache::new_with_capacity(capacity);
+        let total = capacity + 100;
+
+        let mut tokens = Vec::with_capacity(total);
+        for i in 0..total {
+            let name = format!("sa-{i}");
+            seed_service_account(&store, "default", &name, TEST_SA_UID).await;
+            tokens.push(mint_sa_jwt(
+                &enc,
+                &format!("system:serviceaccount:default:{name}"),
+                3600,
+            ));
+        }
+
+        // First pass: every token is a cold miss.
+        for token in &tokens {
+            let user = try_verify_sa_jwt(token, &dec, &[], &store, &sig_cache).await;
+            assert!(
+                user.is_some(),
+                "every freshly minted token must authenticate"
+            );
+        }
+        assert_eq!(
+            sig_cache.verify_count(),
+            total,
+            "first pass over unique tokens must run a real verify for every one of them"
+        );
+        assert!(
+            sig_cache.len() <= capacity,
+            "cache must never hold more entries than its configured capacity"
+        );
+
+        // Second pass over the identical sequence: since total > capacity, this must
+        // re-verify every token again — the exact assertion the bead specifies
+        // (2x(cap+100), not just once).
+        for token in &tokens {
+            let user = try_verify_sa_jwt(token, &dec, &[], &store, &sig_cache).await;
+            assert!(
+                user.is_some(),
+                "every token must still authenticate on the second pass"
+            );
+        }
+        assert_eq!(
+            sig_cache.verify_count(),
+            2 * total,
+            "a second full pass over a working set larger than the cache's capacity must \
+             re-run the real verify for every token — retaining more hits here would mean \
+             the cache grew past its configured capacity"
+        );
+    }
+
     #[tokio::test]
     async fn sa_jwt_with_malformed_sub_is_rejected() {
         // A JWT whose sub is missing the name segment (only 3 colon-separated
@@ -1901,7 +2284,14 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         // Only three parts — missing the service account name.
         let token = mint_sa_jwt(&enc, "system:serviceaccount:only-three", 3600);
-        let result = try_verify_sa_jwt(&token, &dec, &[], &make_test_store()).await;
+        let result = try_verify_sa_jwt(
+            &token,
+            &dec,
+            &[],
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await;
         assert!(
             result.is_none(),
             "JWT with malformed sub (missing name segment) must be rejected, \
@@ -1943,7 +2333,7 @@ mod tests {
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
 
-        let user = try_verify_sa_jwt(&token, &dec, &[], &store)
+        let user = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache())
             .await
             .expect("bound SA JWT with valid signature and a live SA+Pod must authenticate");
 
@@ -1980,7 +2370,7 @@ mod tests {
         let store = make_test_store();
         seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
-        let user = try_verify_sa_jwt(&token, &dec, &[], &store)
+        let user = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache())
             .await
             .expect("valid unbound SA JWT with a live SA must authenticate");
         assert!(
@@ -2058,7 +2448,7 @@ mod tests {
             "my-pod",
             "pod-uid-1",
         );
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_none(),
             "a token whose ServiceAccount UID doesn't match the live object must be rejected \
@@ -2078,7 +2468,7 @@ mod tests {
         // No pod seeded at all — simulates the pod having been hard-deleted.
         let token =
             mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_none(),
             "a token bound to a Pod that no longer exists must be rejected — without this, \
@@ -2098,7 +2488,7 @@ mod tests {
         seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", Some(10)).await;
         let token =
             mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_some(),
             "a token bound to a pod deleted less than 60s ago must still authenticate — \
@@ -2118,7 +2508,7 @@ mod tests {
         seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", Some(120)).await;
         let token =
             mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_none(),
             "a token bound to a pod deleted more than 60s ago must be rejected — otherwise a \
@@ -2138,7 +2528,7 @@ mod tests {
         seed_pod_with_deletion(&store, "default", "my-pod", "pod-uid-1", None).await;
         let token =
             mint_pod_bound_sa_jwt(&enc, "default", "my-sa", "sa-uid-1", "my-pod", "pod-uid-1");
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_some(),
             "a pod-bound token whose pod is alive with a matching UID must authenticate — \
@@ -2156,7 +2546,7 @@ mod tests {
         let store = make_test_store();
         seed_service_account(&store, "default", "my-sa", TEST_SA_UID).await;
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_some(),
             "an unbound token with a live, UID-matching ServiceAccount must authenticate — \
@@ -2196,7 +2586,7 @@ mod tests {
         let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
 
         let before = crate::metrics::STALE_SA_TOKENS_TOTAL.get();
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         assert!(
             result.is_some(),
             "a token past its warnafter timestamp but still within its real exp must still \
@@ -2270,6 +2660,7 @@ mod tests {
             Some(&dec),
             None,
             &make_test_store(),
+            &make_test_sig_cache(),
         )
         .await
         {
@@ -2362,6 +2753,7 @@ mod tests {
             None,
             Some(&cert),
             &make_test_store(),
+            &make_test_sig_cache(),
         )
         .await
         {
@@ -2396,6 +2788,7 @@ mod tests {
             None,
             Some(&cert),
             &make_test_store(),
+            &make_test_sig_cache(),
         )
         .await
         {
@@ -2423,7 +2816,16 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(auth_header(&req), &HashMap::new(), Some(&dec), None, &store).await {
+        match authenticate(
+            auth_header(&req),
+            &HashMap::new(),
+            Some(&dec),
+            None,
+            &store,
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:authenticated".to_owned()),
@@ -2465,7 +2867,16 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:authenticated".to_owned()),
@@ -2485,7 +2896,16 @@ mod tests {
         // unauthenticated and must only get system:unauthenticated.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        match authenticate(auth_header(&req), &map, None, None, &make_test_store()).await {
+        match authenticate(
+            auth_header(&req),
+            &map,
+            None,
+            None,
+            &make_test_store(),
+            &make_test_sig_cache(),
+        )
+        .await
+        {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
                 assert!(
@@ -2671,6 +3091,7 @@ mod tests {
                 token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         // Request as alice, impersonating bob.
@@ -2731,6 +3152,7 @@ mod tests {
                 token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         let req = Request::builder()
@@ -2780,6 +3202,7 @@ mod tests {
                 token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         let req = Request::builder()
@@ -2826,7 +3249,7 @@ mod tests {
         let jti = "test-jti-conformance-abc";
         let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
 
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         let user = result.expect("valid SA JWT with jti and a live SA must authenticate");
 
         let cred_id_key = "authentication.kubernetes.io/credential-id";
@@ -2861,7 +3284,7 @@ mod tests {
         // mint_sa_jwt produces a token WITHOUT a jti claim (legacy format).
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:legacy-sa", 3600);
 
-        let result = try_verify_sa_jwt(&token, &dec, &[], &store).await;
+        let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
         let user = result.expect("SA JWT without jti and a live SA must still authenticate");
 
         assert!(
@@ -2995,6 +3418,7 @@ mod tests {
                 token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         // Exactly the request client-go's ConfigMap informer issues: a LIST (not watch)
@@ -3072,6 +3496,7 @@ mod tests {
                 token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         let req = Request::builder()
@@ -3171,6 +3596,7 @@ mod tests {
                 token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         let cases: [(&str, &str, &str); 3] = [
@@ -3280,8 +3706,14 @@ mod tests {
             },
         );
 
-        let mut svc = AuthLayer::new(idx, token_map, None, Arc::new(make_test_store()))
-            .layer(ChunkedWatchService);
+        let mut svc = AuthLayer::new(
+            idx,
+            token_map,
+            None,
+            Arc::new(make_test_store()),
+            Arc::new(make_test_sig_cache()),
+        )
+        .layer(ChunkedWatchService);
 
         let before = REQUEST_TOTAL
             .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200"])
@@ -3347,6 +3779,7 @@ mod tests {
                 empty_token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         let before_401 = REQUEST_TOTAL
@@ -3399,6 +3832,7 @@ mod tests {
                 unprivileged_token_map,
                 None,
                 Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
             ));
 
         let before_403 = REQUEST_TOTAL
