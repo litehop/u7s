@@ -241,13 +241,22 @@ pub(crate) async fn get_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj);
     inject_type_meta(&mut obj, &group, &version, &meta.kind);
 
-    // kubectl's default Accept header requests Table format; without this, kubectl can't
-    // decode the response and falls back to printing only NAME/AGE (list_resource already
-    // handles this for LIST — see above).
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+
+    // kcm's GC verifies owner references via metadata-only Get() calls
+    // (garbagecollector.go's isDangling); without this, it receives a typed object it can't
+    // decode and retries the owner-check forever, so newly-orphaned dependents are never
+    // identified as dangling and never collected.
+    if wants_partial_object_metadata(accept) {
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
+    }
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE (list_resource already
+    // handles this for LIST — see above).
     if super::table::wants_table(accept) {
         return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
     }
@@ -1507,13 +1516,22 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj);
     inject_type_meta(&mut obj, &group, &version, &meta.kind);
 
-    // kubectl's default Accept header requests Table format; without this, kubectl can't
-    // decode the response and falls back to printing only NAME/AGE (list_namespaced_resource
-    // already handles this for LIST — see above).
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+
+    // kcm's GC verifies owner references via metadata-only Get() calls
+    // (garbagecollector.go's isDangling); without this, it receives a typed object it can't
+    // decode and retries the owner-check forever, so newly-orphaned dependents are never
+    // identified as dangling and never collected.
+    if wants_partial_object_metadata(accept) {
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
+    }
+
+    // kubectl's default Accept header requests Table format; without this, kubectl can't
+    // decode the response and falls back to printing only NAME/AGE (list_namespaced_resource
+    // already handles this for LIST — see above).
     if super::table::wants_table(accept) {
         return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
     }
@@ -4910,6 +4928,169 @@ mod tests {
         assert_eq!(
             rows[0]["object"]["metadata"]["name"], "worker-1",
             "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
+    }
+
+    /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`
+    /// when verifying an owner reference still exists (garbagecollector.go:434-444
+    /// isDangling). Before this fix, get_resource always returned the full typed object,
+    /// which the GC's metadata-only decoder rejects; the owner-check retries forever and
+    /// newly-orphaned dependents (of any resource type) are never identified as dangling,
+    /// so they leak indefinitely on any long-running u7s cluster.
+    #[tokio::test]
+    async fn get_resource_returns_partial_object_metadata_when_requested() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" },
+            "spec": { "drivers": [] }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            ),
+        );
+
+        let resp = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("get_resource with PartialObjectMetadata accept must return 200")
+        });
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1",
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert_eq!(
+            v["kind"], "PartialObjectMetadata",
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert!(
+            v.get("spec").is_none(),
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert!(
+            v.get("status").is_none(),
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+    }
+
+    /// Negative case: a plain `Accept: application/json` (no `as=PartialObjectMetadata`) must
+    /// still return the full typed object. Prevents a broad-match bug in
+    /// `wants_partial_object_metadata` from accidentally wrapping every GET response and
+    /// breaking every non-metadata-only client (kubectl, controllers using typed listers).
+    #[tokio::test]
+    async fn get_resource_without_partial_object_metadata_accept_returns_full_object() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" },
+            "spec": { "drivers": [] }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let resp = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_resource with plain JSON accept must return 200"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["kind"], "CSINode",
+            "a plain Accept header must not trigger PartialObjectMetadata wrapping — \
+             every non-metadata-only client (kubectl, typed-lister controllers) depends on \
+             receiving the real typed object here"
+        );
+        assert_eq!(
+            v["spec"]["drivers"],
+            serde_json::json!([]),
+            "the full object's spec must survive when PartialObjectMetadata was not \
+             requested; a spec-stripping regression here would silently break every \
+             non-metadata-only GET client"
         );
     }
 
@@ -11480,6 +11661,91 @@ mod tests {
         assert_eq!(
             rows[0]["object"]["metadata"]["name"], "my-cm",
             "kubectl reads the row's embedded object to resolve the resource on selection"
+        );
+    }
+
+    /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`
+    /// when verifying a namespaced owner reference still exists (garbagecollector.go:434-444
+    /// isDangling). Before this fix, get_namespaced_resource always returned the full typed
+    /// object, which the GC's metadata-only decoder rejects; the owner-check retries forever
+    /// and newly-orphaned dependents leak indefinitely on any long-running u7s cluster.
+    #[tokio::test]
+    async fn get_namespaced_resource_returns_partial_object_metadata_when_requested() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "my-cm", "namespace": "default" },
+            "data": { "key": "value" }
+        });
+
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ConfigMap POST must succeed; got: {e:?}"));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            ),
+        );
+
+        let get_resp = get_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "my-cm".into(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("ConfigMap GET with PartialObjectMetadata accept must succeed; got: {e:?}")
+        })
+        .into_response();
+
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1",
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert_eq!(
+            v["kind"], "PartialObjectMetadata",
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert!(
+            v.get("data").is_none(),
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
         );
     }
 

@@ -631,6 +631,16 @@ pub(crate) async fn get_pod<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
 
+    // kcm's GC verifies owner references via metadata-only Get() calls
+    // (garbagecollector.go's isDangling); without this, it receives a typed Pod object it
+    // can't decode and retries the owner-check forever, so newly-orphaned dependents are
+    // never identified as dangling and never collected.
+    if super::generic::wants_partial_object_metadata(accept) {
+        let pod: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(Json(super::watch::to_partial_object_metadata(&pod)).into_response());
+    }
+
     // kubectl's default Accept header requests Table format; without this, kubectl can't
     // decode the response and falls back to printing only NAME/AGE instead of the usual
     // READY/STATUS/RESTARTS columns (list_pods already handles this — see above).
@@ -8306,6 +8316,65 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    /// kcm's GC sends `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`
+    /// when verifying a Pod owner reference still exists (garbagecollector.go:434-444
+    /// isDangling). Before this fix, get_pod always returned the full typed Pod object,
+    /// which the GC's metadata-only decoder rejects; the owner-check retries forever and
+    /// newly-orphaned Pods leak indefinitely on any long-running u7s cluster.
+    #[tokio::test]
+    async fn get_pod_returns_partial_object_metadata_when_requested() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header(
+                "accept",
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1",
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert_eq!(
+            v["kind"], "PartialObjectMetadata",
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert!(
+            v.get("spec").is_none(),
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
+        assert!(
+            v.get("status").is_none(),
+            "blocks vendored kcm GC's isDangling owner-reference verification \
+             (garbagecollector.go:434-444); leaked orphans compound on any long-running \
+             u7s cluster."
+        );
     }
 
     // -----------------------------------------------------------------------
