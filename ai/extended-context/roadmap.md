@@ -82,8 +82,10 @@ milestone toward that, not the end goal.
 - Typed structs: PodSpec, PodStatus, CSRSpec/Status, NamespaceStatus
 
 ### Explicitly deferred out of Phase 2 (now Phase 3/4 work)
-- DB-04: scheduler — external kube-scheduler binary acceptable for compat testing.
-  **Trigger: needed for sonobuoy conformance run (Pods stay Pending without it).**
+- DB-04: scheduler — **RESOLVED in Phase 3.** Trigger fired (sonobuoy conformance run
+  needed it; Pods stayed Pending without one) and the custom Rust scheduler
+  (`crates/scheduler`) shipped as the answer — see Architecture summary below and
+  `docs/decisions/custom-bin-spread-scheduler.md`.
 - DB-05: controller-manager SA token provisioning — KCM still uses system:masters admin
   cert. JWT minting works. Real SA-based kubeconfig for KCM not yet wired.
   **Trigger: conformance or Argo CD install exposes auth gap.**
@@ -111,7 +113,7 @@ point where Argo CD can be installed and operated.
 
 ### Conformance stack: COMPLETE (as of 2026-05-24)
 `scripts/conformance/run-all.sh` runs: build → apiserver → lima VM + kubelet → kcm →
-kube-scheduler (on Mac host) → sonobuoy. `reset.sh` + `--reset` flag added for clean
+u7s-scheduler (on Mac host) → sonobuoy. `reset.sh` + `--reset` flag added for clean
 restarts. **Stack is feature-complete and ready to run.**
 
 ### Phase 3 deferred items (explicit triggers — do not let these rot)
@@ -183,7 +185,6 @@ allocation hotspots left on the LIST/watch/bind hot paths.
 | mayor-rvkq (P3, DEFERRED) | CRD CEL validation (x-kubernetes-validations) | Future workload uses CEL; Argo CD audit found zero hits |
 | mayor-6w76 (P3, OPEN) | Pod proto decoder native impl | Real proto decode failure observed in the wild |
 | mayor-j7to (P2, DEFERRED) | Argo CD RBAC seeding | Argo CD install fails specifically on this gap |
-| — | crates/scheduler full custom impl | External kube-scheduler binary covers conformance; custom impl is Phase 4+ |
 
 ---
 
