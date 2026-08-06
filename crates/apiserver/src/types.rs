@@ -320,6 +320,79 @@ pub struct APIGroupList {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregated discovery (v2/v2beta1) wire types — `APIGroupDiscoveryList`
+//
+// Field declaration order matches ascending key order deliberately: without the
+// `preserve_order` serde_json feature (not enabled anywhere in this workspace,
+// see Cargo.lock), `serde_json::Value`'s Map is a `BTreeMap`, so the pre-migration
+// `serde_json::json!`-built response always serialized object keys in ascending
+// order regardless of literal insertion order. A `#[derive(Serialize)]` struct,
+// by contrast, serializes fields in declaration order — so these fields are
+// declared alphabetically to reproduce that same wire order byte-for-byte.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct APIGroupDiscoveryList {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub items: Vec<APIGroupDiscovery>,
+    pub kind: &'static str,
+    pub metadata: APIGroupDiscoveryListMeta,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIGroupDiscoveryListMeta {
+    #[serde(rename = "resourceVersion")]
+    pub resource_version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIGroupDiscovery {
+    pub metadata: APIGroupDiscoveryMeta,
+    pub versions: Vec<APIVersionDiscovery>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIGroupDiscoveryMeta {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIVersionDiscovery {
+    pub freshness: &'static str,
+    pub resources: Vec<APIResourceDiscovery>,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIResourceDiscovery {
+    pub resource: String,
+    #[serde(rename = "responseKind")]
+    pub response_kind: DiscoveryResponseKind,
+    pub scope: &'static str,
+    #[serde(rename = "shortNames", skip_serializing_if = "Vec::is_empty")]
+    pub short_names: Vec<String>,
+    #[serde(rename = "singularResource")]
+    pub singular_resource: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subresources: Vec<APISubresourceDiscovery>,
+    pub verbs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoveryResponseKind {
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APISubresourceDiscovery {
+    #[serde(rename = "responseKind")]
+    pub response_kind: DiscoveryResponseKind,
+    pub subresource: String,
+    pub verbs: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Namespace domain type
 // ---------------------------------------------------------------------------
 

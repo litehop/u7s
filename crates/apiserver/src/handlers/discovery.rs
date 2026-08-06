@@ -9,7 +9,10 @@ use u7s_store::{ListOptions, Store};
 use crate::handlers::crd::CustomResourceDefinition;
 use crate::state::AppState;
 use crate::types::{
-    APIGroup, APIGroupList, APIVersions, ApiResourceList, GroupVersionForDiscovery,
+    APIGroup, APIGroupDiscovery, APIGroupDiscoveryList, APIGroupDiscoveryListMeta,
+    APIGroupDiscoveryMeta, APIGroupList, APIResourceDiscovery, APISubresourceDiscovery,
+    APIVersionDiscovery, APIVersions, ApiResourceList, DiscoveryResponseKind,
+    GroupVersionForDiscovery,
 };
 
 pub async fn version() -> Json<serde_json::Value> {
@@ -77,18 +80,15 @@ pub async fn api_versions<S: Store>(
         // include_core=true here, and /apis uses include_core=false to avoid duplicates.
         let authorization = headers.get(axum::http::header::AUTHORIZATION);
         let body = build_aggregated_discovery(&state, version, true, authorization).await;
-        let items = body["items"].as_array().cloned().unwrap_or_default();
-        let resource_version = body["metadata"]["resourceVersion"].clone();
-        let core_only = items
+        let core_only = body
+            .items
             .into_iter()
-            .filter(|i| i["metadata"]["name"] == "")
-            .collect::<Vec<_>>();
-        let core_body = serde_json::json!({
-            "kind": "APIGroupDiscoveryList",
-            "apiVersion": format!("apidiscovery.k8s.io/{version}"),
-            "metadata": { "resourceVersion": resource_version },
-            "items": core_only
-        });
+            .filter(|i| i.metadata.name.is_empty())
+            .collect();
+        let core_body = APIGroupDiscoveryList {
+            items: core_only,
+            ..body
+        };
         return (
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -290,24 +290,25 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
     discovery_version: &str,
     include_core: bool,
     authorization: Option<&axum::http::HeaderValue>,
-) -> serde_json::Value {
+) -> APIGroupDiscoveryList {
     // Collect all groups+versions (same logic as api_group_list_inner).
     let group_list = api_group_list_inner(state).await;
 
-    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut items: Vec<APIGroupDiscovery> = Vec::new();
 
     if include_core {
         // Build the core group item (group="", apiVersion="v1").
         let core_resources = api_resources_to_discovery_resources(&api_v1_resource_list_value());
-        let core_item = serde_json::json!({
-            "metadata": { "name": "" },
-            "versions": [{
-                "version": "v1",
-                "resources": core_resources,
-                "freshness": "Current"
-            }]
+        items.push(APIGroupDiscovery {
+            metadata: APIGroupDiscoveryMeta {
+                name: String::new(),
+            },
+            versions: vec![APIVersionDiscovery {
+                freshness: "Current",
+                resources: core_resources,
+                version: "v1".to_string(),
+            }],
         });
-        items.push(core_item);
     }
 
     // Build one item per non-core group. Every group+version is resolved as an independent
@@ -326,28 +327,30 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
                 authorization,
             )
             .await;
-            serde_json::json!({
-                "version": gv.version,
-                "resources": resources,
-                "freshness": "Current"
-            })
+            APIVersionDiscovery {
+                freshness: "Current",
+                resources,
+                version: gv.version.clone(),
+            }
         });
-        serde_json::json!({
-            "metadata": { "name": group.name },
-            "versions": futures_util::future::join_all(version_futures).await
-        })
+        APIGroupDiscovery {
+            metadata: APIGroupDiscoveryMeta {
+                name: group.name.clone(),
+            },
+            versions: futures_util::future::join_all(version_futures).await,
+        }
     });
     items.extend(futures_util::future::join_all(group_futures).await);
 
     // Compute a simple ETag from the number of items (sufficient for conformance).
     let resource_version = format!("{}", items.len());
 
-    serde_json::json!({
-        "kind": "APIGroupDiscoveryList",
-        "apiVersion": format!("apidiscovery.k8s.io/{discovery_version}"),
-        "metadata": { "resourceVersion": resource_version },
-        "items": items
-    })
+    APIGroupDiscoveryList {
+        api_version: format!("apidiscovery.k8s.io/{discovery_version}"),
+        items,
+        kind: "APIGroupDiscoveryList",
+        metadata: APIGroupDiscoveryListMeta { resource_version },
+    }
 }
 
 /// Resolve the resource list for one group+version in the aggregated-discovery response.
@@ -363,14 +366,13 @@ async fn resolve_group_version_resources<S: Store>(
     group: &str,
     version: &str,
     authorization: Option<&axum::http::HeaderValue>,
-) -> serde_json::Value {
+) -> Vec<APIResourceDiscovery> {
     if let Some(rl) = static_group_resources(group, version) {
         return api_resources_to_discovery_resources(&rl);
     }
     // Dynamic group (CRD-backed): look up resources from the store.
     let crd_resources = crd_group_resources(state, group, version).await;
-    let crd_is_empty = crd_resources.as_array().is_none_or(|a| a.is_empty());
-    if !crd_is_empty {
+    if !crd_resources.is_empty() {
         return crd_resources;
     }
     // Not a CRD either: try an APIService-backed (aggregated) group.
@@ -392,7 +394,7 @@ async fn crd_group_resources<S: Store>(
     state: &AppState<S>,
     group: &str,
     version: &str,
-) -> serde_json::Value {
+) -> Vec<APIResourceDiscovery> {
     let Ok(resp) = state
         .store
         .list(
@@ -401,15 +403,19 @@ async fn crd_group_resources<S: Store>(
         )
         .await
     else {
-        return serde_json::Value::Array(vec![]);
+        return vec![];
     };
 
-    let resources: Vec<serde_json::Value> = resp
-        .items
+    resp.items
         .iter()
         .filter_map(|obj| serde_json::from_slice::<CustomResourceDefinition>(&obj.value).ok())
         .filter(|crd| {
-            crd.spec.group == group && crd.spec.versions.iter().any(|v| v.name == version && v.served)
+            crd.spec.group == group
+                && crd
+                    .spec
+                    .versions
+                    .iter()
+                    .any(|v| v.name == version && v.served)
         })
         .map(|crd| {
             let scope = if crd.spec.scope == "Namespaced" {
@@ -417,97 +423,113 @@ async fn crd_group_resources<S: Store>(
             } else {
                 "Cluster"
             };
-            let mut entry = serde_json::json!({
-                "resource": crd.spec.names.plural,
-                "responseKind": { "kind": crd.spec.names.kind },
-                "scope": scope,
-                "singularResource": crd.spec.names.singular,
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            });
-            if !crd.spec.names.short_names.is_empty() {
-                entry["shortNames"] = serde_json::Value::Array(
-                    crd.spec.names.short_names.iter().cloned().map(serde_json::Value::String).collect(),
-                );
+            APIResourceDiscovery {
+                resource: crd.spec.names.plural.clone(),
+                response_kind: DiscoveryResponseKind {
+                    kind: crd.spec.names.kind.clone(),
+                },
+                scope,
+                short_names: crd.spec.names.short_names.clone(),
+                singular_resource: crd.spec.names.singular.clone(),
+                subresources: vec![],
+                verbs: [
+                    "create",
+                    "delete",
+                    "deletecollection",
+                    "get",
+                    "list",
+                    "patch",
+                    "update",
+                    "watch",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             }
-            entry
         })
-        .collect();
-
-    serde_json::Value::Array(resources)
+        .collect()
 }
 
-/// Convert an `APIResourceList` JSON value into the `APIGroupDiscovery` resource entry array.
-fn api_resources_to_discovery_resources(resource_list: &serde_json::Value) -> serde_json::Value {
+/// Convert a `serde_json::Value` array of strings into a `Vec<String>`, defaulting to empty
+/// on anything malformed. `resource_list` may come straight from an external `APIService`
+/// backend's own discovery response (see `discovery_resources_for_apiservice`), so this stays
+/// defensive rather than a strict typed deserialize of the whole document.
+fn value_to_string_vec(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Convert an `APIResourceList` JSON value into the `APIGroupDiscovery` resource entry list.
+///
+/// `resource_list` stays `&serde_json::Value` rather than a typed `ApiResourceList` because
+/// this is also fed an APIService backend's own live discovery document (arbitrary external
+/// JSON, see `discovery_resources_for_apiservice`) — indexing defensively here means an
+/// unexpected/missing field on that document degrades a single resource entry instead of
+/// failing the whole aggregated-discovery response.
+fn api_resources_to_discovery_resources(
+    resource_list: &serde_json::Value,
+) -> Vec<APIResourceDiscovery> {
     let empty = vec![];
     let resources = resource_list["resources"].as_array().unwrap_or(&empty);
-    let entries: Vec<serde_json::Value> = resources
+    resources
         .iter()
-        .map(|r| {
+        .filter_map(|r| {
             let name = r["name"].as_str().unwrap_or("");
             // Skip subresources (names with "/") — they appear as subresources in their parent.
-            let is_subresource = name.contains('/');
+            if name.contains('/') {
+                return None;
+            }
             let kind = r["kind"].as_str().unwrap_or("");
             let singular = r["singularName"].as_str().unwrap_or("");
             let namespaced = r["namespaced"].as_bool().unwrap_or(false);
             let scope = if namespaced { "Namespaced" } else { "Cluster" };
-            let verbs = r["verbs"].clone();
+            let verbs = value_to_string_vec(&r["verbs"]);
             let short_names = r
                 .get("shortNames")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+                .map(value_to_string_vec)
+                .unwrap_or_default();
 
             // Find subresources that belong to this resource.
-            let sub_entries: Vec<serde_json::Value> = if !is_subresource {
-                let prefix = format!("{name}/");
-                resources
-                    .iter()
-                    .filter(|s| {
-                        s["name"]
-                            .as_str()
-                            .map(|n| n.starts_with(&prefix))
-                            .unwrap_or(false)
-                    })
-                    .map(|s| {
-                        let sub_name = s["name"].as_str().unwrap_or("").trim_start_matches(&prefix);
-                        let sub_kind = s["kind"].as_str().unwrap_or("");
-                        serde_json::json!({
-                            "subresource": sub_name,
-                            "responseKind": { "kind": sub_kind },
-                            "verbs": s["verbs"]
-                        })
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
+            let prefix = format!("{name}/");
+            let subresources: Vec<APISubresourceDiscovery> = resources
+                .iter()
+                .filter(|s| {
+                    s["name"]
+                        .as_str()
+                        .map(|n| n.starts_with(&prefix))
+                        .unwrap_or(false)
+                })
+                .map(|s| APISubresourceDiscovery {
+                    response_kind: DiscoveryResponseKind {
+                        kind: s["kind"].as_str().unwrap_or("").to_string(),
+                    },
+                    subresource: s["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim_start_matches(&prefix)
+                        .to_string(),
+                    verbs: value_to_string_vec(&s["verbs"]),
+                })
+                .collect();
 
-            if is_subresource {
-                return serde_json::Value::Null; // filtered out below
-            }
-
-            let mut entry = serde_json::json!({
-                "resource": name,
-                "responseKind": { "kind": kind },
-                "scope": scope,
-                "singularResource": singular,
-                "verbs": verbs
-            });
-            if !short_names.is_null()
-                && short_names
-                    .as_array()
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false)
-            {
-                entry["shortNames"] = short_names;
-            }
-            if !sub_entries.is_empty() {
-                entry["subresources"] = serde_json::Value::Array(sub_entries);
-            }
-            entry
+            Some(APIResourceDiscovery {
+                resource: name.to_string(),
+                response_kind: DiscoveryResponseKind {
+                    kind: kind.to_string(),
+                },
+                scope,
+                short_names,
+                singular_resource: singular.to_string(),
+                subresources,
+                verbs,
+            })
         })
-        .filter(|v| !v.is_null())
-        .collect();
-    serde_json::Value::Array(entries)
+        .collect()
 }
 
 /// Return the core v1 resource list as a JSON value (for aggregated discovery).
@@ -5079,12 +5101,7 @@ mod tests {
         let body = build_aggregated_discovery(&state, "v2beta1", false, None).await;
         let elapsed = start.elapsed();
 
-        let names: Vec<String> = body["items"]
-            .as_array()
-            .expect("items must be an array")
-            .iter()
-            .filter_map(|i| i["metadata"]["name"].as_str().map(str::to_owned))
-            .collect();
+        let names: Vec<String> = body.items.iter().map(|i| i.metadata.name.clone()).collect();
         for i in 0..BACKEND_COUNT {
             let expected = format!("slowgroup{i}.example.com");
             assert!(
@@ -5102,6 +5119,119 @@ mod tests {
              single backend's own latency ({DELAY:?}) regardless of how many other backends \
              are also slow, got {elapsed:?}",
             DELAY * BACKEND_COUNT as u32
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_aggregated_discovery — typed-struct migration (mayor-ohh8o)
+    // ---------------------------------------------------------------------------
+
+    /// Regression test for mayor-ohh8o: `build_aggregated_discovery` must serialize to the
+    /// exact same bytes it did before migrating its `serde_json::json!`-built `Value` tree to
+    /// the typed `APIGroupDiscoveryList`/`APIResourceDiscovery` family in `types.rs`. client-go's
+    /// discovery cache stores this response verbatim and diffs it byte-for-byte on the next
+    /// fetch, so a field-order or field-presence change here (even one that keeps the same JSON
+    /// *meaning*) silently breaks discovery caching for every real client.
+    ///
+    /// The golden fixture was captured from the pre-migration `json!`-based implementation
+    /// against an empty in-memory store (only the built-in `STATIC_GROUPS` and core v1
+    /// resources appear — deterministic, no CRDs/APIServices/network calls involved).
+    ///
+    /// Note: because `serde_json::Value`'s `Map` is a `BTreeMap` (no `preserve_order` feature
+    /// enabled anywhere in this workspace — see the doc comment on `types::APIGroupDiscoveryList`),
+    /// the old `json!`-built output was *already* key-sorted, and this test's typed struct fields
+    /// were deliberately declared in that same sorted order — so this assertion alone cannot
+    /// distinguish the typed path from a reverted `json!` path (both produce identical bytes).
+    /// See `build_aggregated_discovery_body_contains_no_untyped_json_value_construction` below
+    /// for the test that actually fails on revert.
+    #[tokio::test]
+    async fn build_aggregated_discovery_output_is_byte_identical_to_pre_migration_golden() {
+        let state = make_state();
+        let body = build_aggregated_discovery(&state, "v2beta1", true, None).await;
+        let actual = serde_json::to_string(&body).unwrap();
+        let golden = include_str!("testdata/aggregated_discovery_golden.json");
+        assert_eq!(
+            actual, golden,
+            "build_aggregated_discovery's serialized output no longer matches the \
+             pre-migration golden fixture byte-for-byte -- if this is an intentional wire \
+             format change, regenerate testdata/aggregated_discovery_golden.json; otherwise \
+             this breaks client-go's discovery response caching, which compares this body \
+             verbatim"
+        );
+    }
+
+    /// Regression test for mayor-ohh8o, and the actual fail-on-revert half of the pair above:
+    /// `build_aggregated_discovery`'s own body must not construct its output via
+    /// `serde_json::json!`/`serde_json::Value`. Mirrors the source-scan pattern used for the
+    /// sibling perf fixes `content_type::reencode_proto_response` (mayor-g7g2m) and
+    /// `auth::object_is_live` (mayor-e555b): a purely byte-equality test cannot catch a
+    /// reintroduction of the untyped `Value`-tree-building path here, because
+    /// `serde_json::Value`'s `Map` sorts keys the same way a hand-declared, alphabetically
+    /// ordered struct does (see the test above) -- so the old and new code paths are
+    /// byte-identical on the wire even though one path pays for building and dropping a full
+    /// recursive `Value` tree per discovery request and the other does not.
+    #[test]
+    fn build_aggregated_discovery_body_contains_no_untyped_json_value_construction() {
+        let source = include_str!("discovery.rs");
+        let fn_start = source
+            .find("pub(crate) async fn build_aggregated_discovery")
+            .expect("build_aggregated_discovery must still exist in this file");
+        let after_start = &source[fn_start..];
+        let fn_end = after_start
+            .find("\n}\n")
+            .expect("build_aggregated_discovery's closing brace must be found");
+        let fn_body = &after_start[..fn_end];
+
+        assert!(
+            !fn_body.contains("serde_json::json!") && !fn_body.contains("serde_json::Value"),
+            "build_aggregated_discovery must build its response via the typed \
+             APIGroupDiscoveryList/APIGroupDiscovery/APIVersionDiscovery structs, not \
+             serde_json::json!/Value -- the byte-equality golden test above cannot catch this \
+             regression on its own (see its doc comment), so this scans the function's own \
+             source instead; fn body was:\n{fn_body}"
+        );
+    }
+
+    /// Regression guard: `api_resources_to_discovery_resources` reads `resource_list` as a raw
+    /// `serde_json::Value` (not a strict typed deserialize) precisely because it is also fed an
+    /// external `APIService` backend's own live discovery document (see
+    /// `aggregation::discovery_resources_for_apiservice`) -- arbitrary JSON this apiserver does
+    /// not control. This test proves an unrecognized extra field on a resource entry is safely
+    /// ignored rather than causing a panic or dropping the fields we *do* recognize, since a
+    /// strict `#[derive(Deserialize)]` on that shape would instead reject or silently drop the
+    /// whole entry the moment a real backend adds a field u7s doesn't yet know about (e.g. a
+    /// newer Kubernetes minor version's `APIResourceList.categories`).
+    #[test]
+    fn api_resources_to_discovery_resources_ignores_unknown_extra_fields() {
+        let resource_list = serde_json::json!({
+            "resources": [{
+                "name": "widgets",
+                "singularName": "widget",
+                "namespaced": true,
+                "kind": "Widget",
+                "verbs": ["get", "list"],
+                "categories": ["all"],
+                "storageVersionHash": "abc123=="
+            }]
+        });
+
+        let resources = api_resources_to_discovery_resources(&resource_list);
+
+        assert_eq!(
+            resources.len(),
+            1,
+            "an unrecognized extra field (categories/storageVersionHash) must not cause the \
+             resource entry to be dropped"
+        );
+        let widgets = &resources[0];
+        assert_eq!(widgets.resource, "widgets");
+        assert_eq!(widgets.response_kind.kind, "Widget");
+        assert_eq!(widgets.scope, "Namespaced");
+        assert_eq!(widgets.singular_resource, "widget");
+        assert_eq!(
+            widgets.verbs,
+            vec!["get".to_string(), "list".to_string()],
+            "recognized fields must still be extracted correctly alongside ignored ones"
         );
     }
 }
