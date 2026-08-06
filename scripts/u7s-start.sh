@@ -32,6 +32,13 @@
 # Environment variables:
 #   U7S_HOST_IP   IP to bind and advertise (default: 127.0.0.1).
 #                 The apiserver, konnectivity-server, and readiness checks all use this address.
+#   U7S_DHAT_HEAP_FILE  Path for a --features dhat apiserver's heap profile (see
+#                 crates/apiserver/src/main.rs). On a fresh --reset, --background
+#                 launches the apiserver twice (Phase 1 without
+#                 --konnectivity-proxy-addr while ca.crt doesn't exist yet, Phase 2
+#                 once it does) — Phase 1 is diverted to a scratch path so its
+#                 few-seconds bootstrap heap can't overwrite this path before
+#                 Phase 2 (the real, long-running instance) ever gets SIGTERM'd.
 #
 # After starting (foreground mode):
 #   export KUBECONFIG=./temp/u7s/kubeconfig   (relative to CWD / active worktree)
@@ -207,6 +214,22 @@ fi
 
 ADVERTISE_ARG="--advertise-address https://$HOST_IP:$PORT"
 
+# When ca.crt doesn't exist yet, the launch below is "Phase 1" (bootstraps
+# the CA, no --konnectivity-proxy-addr) and gets killed + restarted as
+# "Phase 2" further down once konnectivity-server is up. Both phases would
+# otherwise inherit the SAME U7S_DHAT_HEAP_FILE, so under a --features dhat
+# build Phase 1's few-seconds bootstrap heap silently overwrites the
+# operator-requested path via dhat's Drop-based flush before Phase 2 (the
+# real, many-minutes run) ever gets SIGTERM'd — the profile that actually
+# matters is lost. Divert Phase 1 to a scratch path; restored below right
+# before the Phase 2 relaunch.
+_DHAT_PHASE1_DIVERTED=0
+if [ -n "${U7S_DHAT_HEAP_FILE:-}" ] && [ "$BACKGROUND" -eq 1 ] && [ ! -f "$WORKDIR/ca.crt" ]; then
+  _DHAT_PHASE1_DIVERTED=1
+  _DHAT_HEAP_FILE_FINAL="$U7S_DHAT_HEAP_FILE"
+  export U7S_DHAT_HEAP_FILE="/tmp/u7s-dhat-phase1-$$.json"
+fi
+
 if [ "$BACKGROUND" -eq 1 ]; then
   LOG="$WORKDIR/apiserver.log"
   echo "Starting u7s-apiserver (logs: $LOG) ..."
@@ -317,6 +340,12 @@ EXTEOF
   if nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null && [ "$BACKGROUND" -eq 1 ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     sleep 1
+    # Restore the operator-requested dhat path (diverted above) — this is
+    # Phase 2, the real, long-running instance whose heap is the one that
+    # matters.
+    if [ "$_DHAT_PHASE1_DIVERTED" -eq 1 ]; then
+      export U7S_DHAT_HEAP_FILE="$_DHAT_HEAP_FILE_FINAL"
+    fi
     "$BINARY" \
       --db         "$WORKDIR/state.db" \
       --listen     "$HOST_IP:$PORT" \
