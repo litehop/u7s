@@ -616,7 +616,7 @@ fn delete_namespace_sync(
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     // Collect all keys and their current bodies in the namespace.
-    let mut stmt = conn.prepare("SELECT key, value FROM objects WHERE ns = ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT key, value FROM objects WHERE ns = ?1")?;
     let pairs: Vec<(String, Bytes)> = stmt
         .query_map(params![namespace], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -1181,7 +1181,7 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt =
-                conn.prepare("SELECT key, value, revision FROM objects WHERE ns = ?1")?;
+                conn.prepare_cached("SELECT key, value, revision FROM objects WHERE ns = ?1")?;
             let items: Vec<StoreObject> = stmt
                 .query_map(rusqlite::params![ns], |r| {
                     Ok((
@@ -3096,6 +3096,58 @@ mod tests {
              no matching ROLLBACK/COMMIT); a caller reusing this connection without \
              Store::get()'s stale-revision retry would be stuck reading a frozen snapshot from \
              the abandoned transaction"
+        );
+    }
+
+    /// `list_namespace_objects` is the hottest LIST path in the conformance samply trace
+    /// (ai/findings/samply-triage-2026-08-06.md) — it must reuse a cached prepared statement
+    /// across calls instead of re-parsing the same SQL text from scratch on every request.
+    ///
+    /// This is checked via SQLite's per-statement `Run` status counter rather than timing:
+    /// `prepare_cached` returns the *same* underlying `sqlite3_stmt` object on every call for
+    /// identical SQL on the same connection, so its `Run` counter accumulates across calls and
+    /// is still readable afterward by re-fetching that statement from the connection's cache.
+    /// If the LIST path instead calls plain `conn.prepare`, every call compiles and finalizes
+    /// its own one-off statement, nothing is ever left in the connection's cache, and
+    /// re-fetching afterward hits a fresh statement with a `Run` counter of 0 — the fail mode
+    /// this test exists to catch.
+    #[tokio::test]
+    async fn list_namespace_objects_reuses_cached_prepared_statement() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        for i in 0..3 {
+            store
+                .put(
+                    &format!("/registry/services/default/svc-{i}"),
+                    svc_value(&format!("svc-{i}"), 0),
+                    None,
+                )
+                .await
+                .expect("seed object");
+        }
+
+        const LIST_CALLS: i32 = 5;
+        for _ in 0..LIST_CALLS {
+            store
+                .list_namespace_objects("default")
+                .await
+                .expect("list_namespace_objects");
+        }
+
+        // Re-fetch the statement list_namespace_objects prepares (identical SQL text, same
+        // write_conn). With prepare_cached this pulls the exact statement object reused by
+        // every call above; with plain prepare it would be a brand-new statement instead.
+        let conn = store.write_conn.lock().await;
+        let stmt = conn
+            .prepare_cached("SELECT key, value, revision FROM objects WHERE ns = ?1")
+            .expect("prepare_cached probe");
+        let run_count = stmt.get_status(rusqlite::StatementStatus::Run);
+        assert_eq!(
+            run_count, LIST_CALLS,
+            "expected the LIST path's prepared statement to still be sitting in write_conn's \
+             statement cache with a Run count of {LIST_CALLS} (one per list_namespace_objects \
+             call above); got {run_count} — this means list_namespace_objects is re-parsing \
+             its SQL from scratch on every call instead of reusing a cached statement"
         );
     }
 }
