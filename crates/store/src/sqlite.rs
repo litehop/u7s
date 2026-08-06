@@ -1373,8 +1373,11 @@ impl Store for SqliteStore {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // The broadcast channel dropped messages because this receiver was too slow.
+                        // Labeled by prefix_bucket, not the raw prefix: a namespace-scoped watch
+                        // prefix includes the namespace segment, which would otherwise mint one
+                        // time series per namespace a long conformance run ever creates.
                         crate::metrics::WATCH_BROADCAST_LAGGED_TOTAL
-                            .with_label_values(&[&prefix_owned])
+                            .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
                             .inc_by(n);
                         // Attempt recovery: re-subscribe (to capture all future events) then
                         // re-scan the ring buffer for events missed during the lag.  This avoids
@@ -2776,6 +2779,58 @@ mod tests {
             after > before,
             "a receiver that missed more than BROADCAST_CAPACITY messages must increment \
              u7s_watch_broadcast_lagged_total for its prefix once polled; before={before} after={after}"
+        );
+    }
+
+    /// `u7s_watch_broadcast_lagged_total` must be labeled by `prefix_bucket`, not the raw
+    /// (namespace-including) watch prefix — otherwise every namespace a long conformance run
+    /// creates mints its own permanent, never-shrinking time series for this counter. Fails on
+    /// revert if the label were switched back to the raw prefix: two different namespace-scoped
+    /// watches under the same resource type would then land on two separate series instead of
+    /// accumulating onto one.
+    #[tokio::test]
+    async fn broadcast_lag_total_buckets_by_resource_type_not_raw_namespace_prefix() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix_a = "/registry/lag-bucket-test/ns-a/";
+        let prefix_b = "/registry/lag-bucket-test/ns-b/";
+        let bucket = super::metrics::prefix_bucket(prefix_a);
+        assert_eq!(
+            bucket,
+            super::metrics::prefix_bucket(prefix_b),
+            "test setup invariant: both namespace-scoped prefixes must share one resource-type \
+             bucket, or this test would not actually exercise the cardinality-bounding behavior"
+        );
+
+        // Neither stream is polled while this burst is written, so both fall behind the shared
+        // broadcast channel — Lagged is a property of the receiver's own channel state, not of
+        // which key each buffered event targets.
+        let stream_a = store.watch(prefix_a, 0).await.expect("watch a");
+        futures_util::pin_mut!(stream_a);
+        let stream_b = store.watch(prefix_b, 0).await.expect("watch b");
+        futures_util::pin_mut!(stream_b);
+
+        let before = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket])
+            .get();
+
+        let writes = BROADCAST_CAPACITY as u64 + 1;
+        for i in 0..writes {
+            let key = format!("/registry/lag-bucket-test/unrelated/obj-{i}");
+            store
+                .put(&key, svc_value(&format!("obj-{i}"), i), None)
+                .await
+                .expect("put must succeed");
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream_a.next()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream_b.next()).await;
+
+        let after = super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+            .with_label_values(&[bucket])
+            .get();
+        assert!(
+            after > before,
+            "two different namespace-scoped watches under the same resource type must \
+             accumulate onto the SAME prefix_bucket series; before={before} after={after}"
         );
     }
 
