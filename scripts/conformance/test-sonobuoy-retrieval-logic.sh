@@ -195,6 +195,98 @@ assert "suppress_stderr hides the wrapped command's stderr but not run_with_time
      && ! grep -q "inner noise" "$STDERR_SUPPRESSED" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# evacuate_pod_logs() -- mirrors 06-run-sonobuoy.sh's per-node log-evacuation
+# loop (NODES computed once above the loop; tar's own stderr no longer
+# suppressed so a failure prints a warning instead of vanishing; copy/rm
+# still swallow failures so one bad node doesn't abort the whole script).
+# Keep in sync if that loop changes. fake_tar_pod_logs/fake_copy_pod_logs
+# stand in for the real 'limactl shell $NODE sudo tar ...'/'limactl copy ...'
+# calls so this test needs no real VM.
+# ---------------------------------------------------------------------------
+fake_tar_pod_logs() {
+  local node="$1"
+  tar -czf "$TMPDIR_TEST/$node/pod-logs-evacuation.tar.gz" \
+    -C "$TMPDIR_TEST/$node" pods
+}
+
+fake_copy_pod_logs() {
+  local node="$1" dest="$2"
+  cp "$TMPDIR_TEST/$node/pod-logs-evacuation.tar.gz" "$dest" 2>/dev/null || true
+}
+
+evacuate_pod_logs() {
+  local workdir="$1"; shift
+  local node
+  for node in "$@"; do
+    fake_tar_pod_logs "$node" \
+      || echo "warning: pod log evacuation failed on $node" >&2
+    fake_copy_pod_logs "$node" "$workdir/pod-logs-evacuation-${node}.tar.gz"
+  done
+}
+
+# The pre-fix version -- hardcoded to only ever evacuate $VM_NAME, mirroring
+# the exact bug at 06-run-sonobuoy.sh:189-195 before this fix (the NODES list
+# used to be computed AFTER evacuation and only used for the tarball search,
+# never taught to the evacuation step itself).
+evacuate_pod_logs_primary_only() {
+  local workdir="$1" vm_name="$2"
+  fake_tar_pod_logs "$vm_name" \
+    || echo "warning: pod log evacuation failed on $vm_name" >&2
+  fake_copy_pod_logs "$vm_name" "$workdir/pod-logs-evacuation-${vm_name}.tar.gz"
+}
+
+# ---------------------------------------------------------------------------
+# 5. evacuates_from_all_nodes -- a 2-node --all-e2e run's sonobuoy e2e-job pod
+#    can schedule onto EITHER node; evacuating only $VM_NAME silently lost
+#    every pod log when it landed on the extra node in a real run
+#    (temp/e2e/0805-2202-conformance). Both nodes must produce a tarball.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMPDIR_TEST/lima-a/pods/ns_pod-a_uid/container" "$TMPDIR_TEST/lima-b/pods/ns_pod-b_uid/container"
+echo "log from lima-a" > "$TMPDIR_TEST/lima-a/pods/ns_pod-a_uid/container/0.log"
+echo "log from lima-b" > "$TMPDIR_TEST/lima-b/pods/ns_pod-b_uid/container/0.log"
+EVAC_WORKDIR="$TMPDIR_TEST/host-workdir"
+mkdir -p "$EVAC_WORKDIR"
+
+evacuate_pod_logs "$EVAC_WORKDIR" "lima-a" "lima-b"
+assert "evacuation produces one tarball per node -- a multi-node run losing the extra node's pod logs is undiagnosable post-mortem" \
+  "$([ -f "$EVAC_WORKDIR/pod-logs-evacuation-lima-a.tar.gz" ] && [ -f "$EVAC_WORKDIR/pod-logs-evacuation-lima-b.tar.gz" ] && echo 1 || echo 0)"
+
+# Regression guard: prove the OLD primary-only evacuation genuinely misses the
+# extra node's tarball in this same scenario, so this test would catch a
+# revert back to primary-only evacuation.
+rm -rf "$EVAC_WORKDIR"; mkdir -p "$EVAC_WORKDIR"
+evacuate_pod_logs_primary_only "$EVAC_WORKDIR" "lima-a"
+assert "(regression guard) pre-fix primary-only evacuation genuinely never produces a tarball for the extra node" \
+  "$([ -f "$EVAC_WORKDIR/pod-logs-evacuation-lima-a.tar.gz" ] && [ ! -f "$EVAC_WORKDIR/pod-logs-evacuation-lima-b.tar.gz" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 6. fails_loud_on_tar_error -- a failed evacuation (VM unreachable, or
+#    /var/log/pods missing) must print a warning, not vanish silently the way
+#    the swallowed '2>/dev/null || true' did in the 0805-2202 incident.
+# ---------------------------------------------------------------------------
+EVAC_STDERR="$TMPDIR_TEST/evac-stderr.txt"
+rm -rf "$EVAC_WORKDIR"; mkdir -p "$EVAC_WORKDIR"
+evacuate_pod_logs "$EVAC_WORKDIR" "nonexistent-vm" 2>"$EVAC_STDERR" || true
+assert "a failed tar on an unreachable/nonexistent node prints a specific warning to stderr instead of vanishing" \
+  "$(grep -q "warning: pod log evacuation failed on nonexistent-vm" "$EVAC_STDERR" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 7. rotated_log_files_are_included -- cri-o rotates
+#    /var/log/pods/<pod>/<container>/0.log to 0.log.YYYYMMDDT... while
+#    keeping the live 0.log; a live evacuation must capture BOTH or the
+#    earlier ~90% of a long --all-e2e run's output is lost once cri-o's
+#    RemoveContainer later deletes the pod dir wholesale.
+# ---------------------------------------------------------------------------
+mkdir -p "$TMPDIR_TEST/rotation-src/foo/bar"
+echo "live" > "$TMPDIR_TEST/rotation-src/foo/bar/0.log"
+echo "rotated" > "$TMPDIR_TEST/rotation-src/foo/bar/0.log.20260806-000000"
+ROTATION_TARBALL="$TMPDIR_TEST/rotation.tar.gz"
+tar -czf "$ROTATION_TARBALL" -C "$TMPDIR_TEST/rotation-src" foo
+ROTATION_CONTENTS=$(tar -tzf "$ROTATION_TARBALL")
+assert "tar -czf on a pod log dir picks up both the live 0.log and rotated 0.log.YYYYMMDDT... variants -- no separate glob needed" \
+  "$(printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log$" && printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log.20260806-000000$" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

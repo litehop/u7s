@@ -186,13 +186,29 @@ if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
 fi
 
+# NODES lists every node in the run (computed here, before evacuation, so
+# both this step and the tarball search below use the same list).
+NODES=("$VM_NAME")
+[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+
 # Evacuate pod logs immediately — before namespace GC removes them.
 # sonobuoy --wait returns after the e2e binary exits but before namespace teardown,
-# so /var/log/pods/ still has the container logs at this point.
-echo "Evacuating pod logs from VM..."
-limactl shell "$VM_NAME" sudo tar -czf /tmp/pod-logs-evacuation.tar.gz /var/log/pods/ 2>/dev/null || true
-limactl copy "${VM_NAME}:/tmp/pod-logs-evacuation.tar.gz" "$WORKDIR/pod-logs-evacuation.tar.gz" 2>/dev/null || true
-limactl shell "$VM_NAME" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+# so /var/log/pods/ still has the container logs at this point. Looped over every
+# node in NODES, not just $VM_NAME: the sonobuoy e2e-job pod (and therefore
+# /var/log/pods/ contents) can land on either node, and a primary-only evacuation
+# silently lost every pod log on a 2-node --all-e2e run where the pod scheduled
+# onto the extra node (temp/e2e/0805-2202-conformance). tar's own recursive walk
+# of /var/log/pods/ already picks up rotated 0.log.YYYYMMDDT... variants
+# alongside the live 0.log, so no separate glob is needed for those. stderr is
+# no longer suppressed on the tar itself -- a failed evacuation must print a
+# warning, not vanish silently (the exact failure mode that lost 0805-2202's logs).
+echo "Evacuating pod logs from VM(s): ${NODES[*]}..."
+for NODE in "${NODES[@]}"; do
+  limactl shell "$NODE" sudo tar -czf /tmp/pod-logs-evacuation.tar.gz /var/log/pods/ \
+    || echo "warning: pod log evacuation failed on $NODE" >&2
+  limactl copy "${NODE}:/tmp/pod-logs-evacuation.tar.gz" "$WORKDIR/pod-logs-evacuation-${NODE}.tar.gz" 2>/dev/null || true
+  limactl shell "$NODE" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+done
 
 echo "Retrieving results..."
 # sonobuoy retrieve uses port-forward which produces an EOF against u7s.
@@ -202,11 +218,10 @@ echo "Retrieving results..."
 # pod on the extra node instead of the primary, and every blocking call
 # below had no timeout -- the script hung with zero output and no error,
 # even though it has explicit "tarball not found" exit paths, because those
-# paths only fire if a call actually RETURNS. NODES lists every node in the
-# run so the tarball search isn't hardcoded to the primary; run_with_timeout
-# below bounds every blocking call so a stall surfaces loudly instead.
-NODES=("$VM_NAME")
-[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+# paths only fire if a call actually RETURNS. NODES (computed above, for log
+# evacuation) lists every node in the run so the tarball search isn't
+# hardcoded to the primary; run_with_timeout below bounds every blocking
+# call so a stall surfaces loudly instead.
 CALL_TIMEOUT=30
 
 # run_with_timeout <label> <secs> <suppress_stderr:0|1> <cmd...>
@@ -363,13 +378,19 @@ if [ "$UNPACK" -eq 1 ]; then
         | grep -v "BeforeSuite\|AfterSuite\|ReportBefore\|ReportAfter\|Synchronized" \
         | sed 's/^/    /'
 
-      # Print container logs from the evacuated tarball (copied before namespace GC).
+      # Print container logs from the evacuated tarballs (one per node, copied before namespace GC).
       E2E_LOG="$UNPACK_DIR/plugins/e2e/results/global/e2e.log"
-      if [ -f "$E2E_LOG" ] && [ -f "$WORKDIR/pod-logs-evacuation.tar.gz" ]; then
-        POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
-        mkdir -p "$POD_LOGS_DIR"
-        tar -xzf "$WORKDIR/pod-logs-evacuation.tar.gz" -C "$POD_LOGS_DIR" 2>/dev/null || true
-
+      POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
+      HAVE_POD_LOGS=0
+      for NODE in "${NODES[@]}"; do
+        EVAC_TARBALL="$WORKDIR/pod-logs-evacuation-${NODE}.tar.gz"
+        if [ -f "$EVAC_TARBALL" ]; then
+          mkdir -p "$POD_LOGS_DIR"
+          tar -xzf "$EVAC_TARBALL" -C "$POD_LOGS_DIR" 2>/dev/null || true
+          HAVE_POD_LOGS=1
+        fi
+      done
+      if [ -f "$E2E_LOG" ] && [ "$HAVE_POD_LOGS" -eq 1 ]; then
         echo ""
         echo "  Pod logs from failed test namespaces:"
         FAIL_NAMESPACES=$(grep -oE 'namespace "[a-z0-9-]+"' "$E2E_LOG" | \
