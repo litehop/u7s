@@ -1,6 +1,9 @@
 # u7s Scheduler Implementation Spec
 
-**Status:** Implementation spec. Last updated: 2026-05-18.
+**Status:** Implementation spec. Last updated: 2026-05-18. `crates/scheduler` has since
+grown beyond this bootstrap spec in places (see the out-of-scope list below) — for
+current scope and shipped decisions, treat `roadmap.md` and
+`docs/decisions/custom-bin-spread-scheduler.md` as authoritative.
 **Phase:** Phase 3 deliverable. Phase 1 bypasses scheduler entirely (manual `spec.nodeName`).
 
 ---
@@ -22,11 +25,15 @@ The u7s scheduler is a custom bin-spreading scheduler written in Rust, approxima
 **Explicitly out of scope (deferred to escape hatch):**
 - Pod affinity and anti-affinity (`spec.affinity`)
 - Topology spread constraints (`spec.topologySpreadConstraints`)
-- Preemption (evicting lower-priority pods to schedule higher-priority ones)
-- `PodFitsHostPorts` (port conflict detection)
 - `VolumeBinding` (matching PVCs to PVs by storage class, access mode, topology)
 - `PodTopologySpread` (zone/region awareness)
 - Custom scheduler plugins
+
+Preemption (evicting lower-priority pods) and `PodFitsHostPorts` (port conflict
+detection) were originally deferred here too, but are now implemented in
+`crates/scheduler` — see `find_preemption_plan`/`select_preemption_victims` and
+`container_host_ports`/`host_ports_fit`, validated against SchedulerPreemption and
+SchedulerPredicates conformance.
 
 ### Escape hatch: upstream kube-scheduler
 
@@ -416,8 +423,10 @@ The retry queue is purely in-memory. If the scheduler restarts, unscheduled pods
 - Pod affinity or anti-affinity (`spec.affinity.podAffinity`, `spec.affinity.podAntiAffinity`)
 - Node affinity beyond simple `nodeSelector` (`spec.affinity.nodeAffinity`)
 - Topology spread constraints (`spec.topologySpreadConstraints`)
-- Preemption (scheduling higher-priority pods by evicting lower-priority ones)
 - Custom scheduler plugins via the K8s scheduling framework
+
+(Preemption is no longer a reason to reach for this escape hatch — it is implemented
+natively in `crates/scheduler`; see §1.)
 
 **How to swap:**
 

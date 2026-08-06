@@ -38,7 +38,7 @@ A Kubernetes-compatible control plane implementation in Rust, targeting severely
 - **API server:** Implemented from scratch in Rust (axum). No upstream binary wrapping.
 - **State store:** SQLite WAL (rusqlite bundled). See `docs/decisions/sqlite-over-lmdb.md`.
 - **Container runtime:** CRI-O + crun. See `docs/decisions/crio-over-containerd.md`.
-- **Scheduler:** External kube-scheduler binary for Phase 3 conformance; custom bin-spread scheduler planned for Phase 4+.
+- **Scheduler:** Custom Rust scheduler (`crates/scheduler`). See `roadmap.md`'s Architecture summary table and `docs/decisions/custom-bin-spread-scheduler.md`.
 - **Networking:** CNI plugin model (no built-in overlay). WebSocket-only exec/attach/portforward (no SPDY).
 - **CRD validation:** boon crate (full openAPIV3Schema). See `docs/decisions/boon-for-crd-schema-validation.md`.
 

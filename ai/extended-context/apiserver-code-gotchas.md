@@ -19,7 +19,26 @@ So the proxy must map e.g. inbound `stdin=true&stdout=true&command=echo` → out
 In a real cluster, CSINode (storage.k8s.io/v1) has a custom status subresource and admission logic. The u7s generic handler serves CSINode without these. The kubelet does NOT depend on it for basic node registration, so it's not a startup blocker, but it IS a conformance gap — revisit when working on storage conformance or related sonobuoy failures.
 
 ## ⚠️ PATTERN — proto-decode field drops (the single most recurring bug class)
-When kubectl/client-go/KCM send an object as `application/vnd.kubernetes.protobuf`, u7s decodes it with a hand-written `prost` struct in `crates/apiserver/src/proto.rs`. **If a field exists in the upstream k8s `*.proto` but is NOT declared (with the correct field number) in the u7s prost struct, that field is SILENTLY DROPPED on decode** — the JSON u7s stores is missing it, with no error and no compile-time signal. This has bitten conformance repeatedly, each time as a separate "mysterious missing field" investigation:
+When kubectl/client-go/KCM send an object as `application/vnd.kubernetes.protobuf`, u7s
+decodes it via `prost-build`-**generated** types compiled by `crates/apiserver/build.rs`
+straight from the real vendored upstream `*.proto` files under `proto-include/` (protoc,
+not hand-authored structs — see `bd memory proto-rs-hand-rolled-structs-are-dead-code`).
+The hand-rolled structs that used to live in `proto.rs` (`PodSpec`, `Container`, etc.) are
+gone entirely; `decode_proto_by_kind_and_version` (`proto.rs`) dispatches by Kind/apiVersion
+to a `decode_<kind>_proto_gen` function in the matching per-group adapter module —
+`core_gen_adapter.rs`, `apps_gen_adapter.rs`, `batch_gen_adapter.rs`, `rbac_gen_adapter.rs`,
+and siblings for the other API groups.
+
+Because the generated types are structurally complete and protoc-assigned (no possibility
+of a hand-authored tag mismatch), **the field is never actually missing from the decoded
+struct** — the drop happens one layer up: `decode_<kind>_proto_gen` calls the generated
+type's `::decode()`, getting a fully-populated struct, then hands it to a `gen_<kind>_to_json`
+(or a nested `gen_<field>_to_json`) helper that manually copies fields into the served JSON
+`Value` — and that helper simply doesn't read every field. This has bitten conformance
+repeatedly, each time as a separate "mysterious missing field" investigation (kept here as
+historical instances of the pattern, from back when the cause genuinely was a missing prost
+tag in the old hand-rolled `proto.rs` structs, through the post-codegen-migration instances
+where the cause is a `gen_*_to_json` field the adapter forgot to copy):
 - PodSpec.enableServiceLinks (tag 26) — #605
 - PodSpec.runtimeClassName (tag 29) — #600
 - Service.status (was opaque bytes, now typed ServiceStatus) — #597
@@ -27,13 +46,21 @@ When kubectl/client-go/KCM send an object as `application/vnd.kubernetes.protobu
 - PersistentVolumeClaim.status (no status field in the struct) — #622
 - PodDisruptionBudget.status.disruptedPods (field 3 status not decoded) — #627
 - ObjectMeta.ownerReferences not decoded by object_meta_to_json — #626
-- Container.resizePolicy (field 23) — mayor-op18 (open)
-- ReplicationController.status (bytes, never emitted) — mayor-cokf / PR #TBD
-- DaemonSet.status (field entirely absent from prost struct) — mayor-cokf / PR #TBD
-- Job.status (bytes, never emitted) — mayor-cokf / PR #TBD
-- CronJob.status (bytes, never emitted) — mayor-cokf / PR #TBD
+- Container.resizePolicy (field 23) — #631 (mayor-op18)
+- ReplicationController.status, DaemonSet.status, Job.status, CronJob.status (decoded but never emitted to JSON) — #636 (mayor-cokf)
 
-**Rule when touching ANY proto struct / fixing a "field is missing after a write" bug:** the cause is almost always a missing field in the prost struct. Add the field with the correct upstream field NUMBER (check k8s `staging/src/k8s.io/api/<group>/<v>/generated.proto`), decode it, and add a proto-round-trip regression test (`decode_<kind>_proto_preserves_<field>`). **Higher-leverage move:** when fixing one, AUDIT the rest of that struct's fields against the upstream .proto in the same pass — there are likely siblings also missing. A systematic proto-struct-vs-upstream audit (its own bead) would surface the remaining drops in one sweep instead of one-conformance-spec-at-a-time.
+**Rule when touching ANY proto decode / fixing a "field is missing after a write" bug:**
+first check whether the field is present on the **generated** type (`cargo doc --open -p
+u7s-apiserver` or grep the vendored `proto-include/.../generated.proto` for the field) —
+if it is, the fix is in the corresponding `gen_<kind>_to_json`/`gen_<field>_to_json`
+function in the matching `*_gen_adapter.rs`: read the field off the already-decoded struct
+and add it to the JSON `Value`. Add a proto-round-trip regression test
+(`decode_<kind>_proto_gen_preserves_<field>`). Only if the field is missing from the
+**generated** type too does the vendored `.proto` under `proto-include/` need updating from
+upstream — that is rare and a different (bigger) fix than the usual adapter oversight.
+**Higher-leverage move:** when fixing one, AUDIT the rest of that `gen_<kind>_to_json`
+function's fields against the generated struct in the same pass — there are likely
+siblings also missing.
 
 ## ⚠️ PATTERN — ObjectMeta serde round-trip drops ownerReferences (and any field ObjectMeta doesn't declare)
 Several handlers round-trip an object's metadata through the typed `ObjectMeta` struct: `serde_json::from_value::<ObjectMeta>(obj["metadata"])` then `to_value(...)` back. **`ObjectMeta` does NOT declare every metadata field — notably `ownerReferences` — so the round-trip SILENTLY DROPS undeclared fields.** This dropped ownerReferences on EVERY create / decode until found, breaking GC/ownership cluster-wide. Bitten 3×, each a different code path:
