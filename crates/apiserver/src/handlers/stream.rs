@@ -194,6 +194,100 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Raw byte-stream impl (outbound: apiserver → kubelet, no websocket framing)
+// ---------------------------------------------------------------------------
+
+/// Wraps a raw `AsyncRead + AsyncWrite` connection (e.g. a hijacked HTTP/1.1 Upgrade)
+/// so it satisfies `BiStream` with no message framing at all — `recv()` yields
+/// whatever-sized chunk the socket produces, `send()` writes bytes verbatim.
+///
+/// `prefix`, if non-empty, is replayed as the first `recv()` result before any further
+/// socket reads. This exists because manually scanning a raw HTTP/1.1 upgrade response
+/// for its header terminator can read past it in the same TCP segment — those trailing
+/// bytes are already the start of the real (SPDY) payload and must not be discarded.
+pub struct RawStream<S> {
+    io: S,
+    prefix: bytes::Bytes,
+}
+
+impl<S> RawStream<S> {
+    pub fn new(io: S) -> Self {
+        Self {
+            io,
+            prefix: bytes::Bytes::new(),
+        }
+    }
+
+    pub fn new_with_prefix(io: S, prefix: bytes::Bytes) -> Self {
+        Self { io, prefix }
+    }
+}
+
+pub struct RawStreamReader<S> {
+    prefix: Option<bytes::Bytes>,
+    inner: tokio::io::ReadHalf<S>,
+}
+
+pub struct RawStreamWriter<S> {
+    inner: tokio::io::WriteHalf<S>,
+}
+
+impl<S> BiStream for RawStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    type Reader = RawStreamReader<S>;
+    type Writer = RawStreamWriter<S>;
+
+    fn split(self) -> (RawStreamReader<S>, RawStreamWriter<S>) {
+        let (inner_r, inner_w) = tokio::io::split(self.io);
+        (
+            RawStreamReader {
+                prefix: (!self.prefix.is_empty()).then_some(self.prefix),
+                inner: inner_r,
+            },
+            RawStreamWriter { inner: inner_w },
+        )
+    }
+}
+
+impl<S> BiStreamReader for RawStreamReader<S>
+where
+    S: tokio::io::AsyncRead + Send + 'static,
+{
+    async fn recv(&mut self) -> Option<bytes::Bytes> {
+        if let Some(p) = self.prefix.take() {
+            return Some(p);
+        }
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 16 * 1024];
+        match self.inner.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => Some(bytes::Bytes::copy_from_slice(&buf[..n])),
+            Err(_) => None,
+        }
+    }
+}
+
+impl<S> BiStreamWriter for RawStreamWriter<S>
+where
+    S: tokio::io::AsyncWrite + Send + 'static,
+{
+    async fn send(&mut self, data: bytes::Bytes) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        self.inner
+            .write_all(&data)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    async fn close(&mut self) {
+        use tokio::io::AsyncWriteExt as _;
+        let _ = self.inner.shutdown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Splice helper — bidirectional byte relay between two BiStream impls
 // ---------------------------------------------------------------------------
 
@@ -515,6 +609,68 @@ mod tests {
             captured,
             vec![Bytes::from("a"), Bytes::from("b")],
             "send() must append messages to the outgoing buffer in order"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RawStream — prefix replay regression test
+    //
+    // Dialing kubelet's raw-SPDY-over-HTTP portforward endpoint means manually
+    // scanning a TLS byte stream for the "\r\n\r\n" HTTP header terminator; a single
+    // TCP read can carry bytes past that terminator, which are already the start of
+    // kubelet's real SPDY payload. If those bytes were dropped instead of replayed,
+    // kubectl's SPDY decoder on the other end would desync on the very first frame.
+    // -----------------------------------------------------------------------
+
+    /// RawStreamReader::recv must yield the constructor's prefix bytes before any
+    /// bytes from the underlying socket.
+    ///
+    /// This fails if `new_with_prefix`'s prefix is ignored (e.g. `RawStream::new` used
+    /// instead) — the test's duplex stream never sends "socket-data" as its first
+    /// bytes, so a dropped prefix would make the first assertion see "socket-data"
+    /// instead of "prefix-data", or hang waiting for bytes that were already consumed.
+    #[tokio::test]
+    async fn raw_stream_recv_replays_prefix_before_socket_reads() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut server_io, client_io) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server_io.write_all(b"socket-data").await.unwrap();
+        });
+
+        let raw = RawStream::new_with_prefix(client_io, Bytes::from("prefix-data"));
+        let (mut reader, _writer) = raw.split();
+
+        assert_eq!(
+            reader.recv().await,
+            Some(Bytes::from("prefix-data")),
+            "the buffered prefix must be replayed first — dropping it would lose the \
+             start of kubelet's SPDY response"
+        );
+        assert_eq!(
+            reader.recv().await,
+            Some(Bytes::from("socket-data")),
+            "after the prefix is drained, recv() must continue reading the live socket"
+        );
+    }
+
+    /// RawStreamReader::recv must return None on EOF, with no prefix configured.
+    ///
+    /// Guards the common case (no over-read bytes during upgrade negotiation) —
+    /// `RawStream::new` must behave like a plain passthrough, not hang forever
+    /// waiting for a prefix that was never set.
+    #[tokio::test]
+    async fn raw_stream_recv_returns_none_on_eof_without_prefix() {
+        let (server_io, client_io) = tokio::io::duplex(1024);
+        drop(server_io); // closing the peer immediately produces EOF on client_io
+
+        let raw = RawStream::new(client_io);
+        let (mut reader, _writer) = raw.split();
+
+        assert_eq!(
+            reader.recv().await,
+            None,
+            "recv() must return None on EOF when no prefix was configured"
         );
     }
 
