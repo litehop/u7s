@@ -79,7 +79,7 @@ pub async fn api_versions<S: Store>(
         // client-go's GroupsAndMaybeResources() handles /api and /apis separately;
         // include_core=true here, and /apis uses include_core=false to avoid duplicates.
         let authorization = headers.get(axum::http::header::AUTHORIZATION);
-        let body = build_aggregated_discovery(&state, version, true, authorization).await;
+        let body = build_aggregated_discovery(&state, version, true, authorization, "/api").await;
         let core_only = body
             .items
             .into_iter()
@@ -148,7 +148,7 @@ pub async fn api_group_list<S: Store>(
         // The core group is returned by /api; client-go merges both separately.
         // Including core here would cause duplicate kind registrations (Namespace, Pod, etc.).
         let authorization = headers.get(axum::http::header::AUTHORIZATION);
-        let body = build_aggregated_discovery(&state, version, false, authorization).await;
+        let body = build_aggregated_discovery(&state, version, false, authorization, "/apis").await;
         return (
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -285,12 +285,48 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 /// `authorization` is the caller's own bearer token (forwarded to APIService backends for
 /// their live discovery fetch — see `discovery_resources_for_apiservice`'s doc for why an
 /// aggregated group would otherwise silently show zero resources).
+///
+/// `route` identifies which caller fired this build (`/api`, `/apis`, or `/discovery/v2`) —
+/// used only to label `u7s_discovery_build_total`, never to change behavior.
+///
+/// APIService cache-safety constraint (read this before adding a cache here): `authorization`
+/// above is forwarded, unmodified, from `resolve_group_version_resources` into
+/// `aggregation::discovery_resources_for_apiservice`'s outbound request to the backend (see the
+/// `discovery_resources_for_apiservice` call inside `resolve_group_version_resources`, this
+/// file, currently at line 417) so a live `APIService` backend can enforce its own per-caller
+/// authorization on the discovery document it returns. That means two different callers can
+/// legitimately get two different discovery results for the exact same
+/// `(discovery_version, include_core)` inputs whenever any `APIService` is registered — a cache
+/// keyed only on those inputs would silently leak one caller's backend-authorized discovery
+/// response to a different caller.
+///
+/// The follow-on discovery-cache implementation must respect this constraint. Four options were
+/// on the table when this was written, and none had been chosen yet:
+///   (a) cache only the core-groups portion (no caller-token forwarding there) and pass
+///       APIService-backed groups through per-request, uncached;
+///   (b) key the cache on `(caller-token-hash, ...)` so each caller gets its own entry;
+///   (c) bypass the cache entirely whenever any `APIService` is registered (`has_apiservice`
+///       below already computes exactly that signal);
+///   (d) a hybrid, explicitly proposed and explicitly approved before it ships.
+/// This function is where any cache-hit / cache-bypass branch belongs.
 pub(crate) async fn build_aggregated_discovery<S: Store>(
     state: &AppState<S>,
     discovery_version: &str,
     include_core: bool,
     authorization: Option<&axum::http::HeaderValue>,
+    route: &str,
 ) -> APIGroupDiscoveryList {
+    let has_apiservice = !super::aggregation::list_apiservice_groups(state)
+        .await
+        .is_empty();
+    crate::metrics::DISCOVERY_BUILD_TOTAL
+        .with_label_values(&[
+            route,
+            if include_core { "true" } else { "false" },
+            if has_apiservice { "true" } else { "false" },
+        ])
+        .inc();
+
     // Collect all groups+versions (same logic as api_group_list_inner).
     let group_list = api_group_list_inner(state).await;
 
@@ -549,7 +585,10 @@ pub async fn aggregated_discovery_v2<S: Store>(
             axum::http::header::CONTENT_TYPE,
             "application/json;g=apidiscovery.k8s.io;v=v2beta1",
         )],
-        Json(build_aggregated_discovery(&state, "v2beta1", true, authorization).await),
+        Json(
+            build_aggregated_discovery(&state, "v2beta1", true, authorization, "/discovery/v2")
+                .await,
+        ),
     )
         .into_response()
 }
@@ -4941,6 +4980,39 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // build_aggregated_discovery — u7s_discovery_build_total
+    // ---------------------------------------------------------------------------
+
+    /// `/api`, `/apis` and `/discovery/v2` are all on the auth exempt-list, so
+    /// `apiserver_request_total` never gets a series for them (see `auth::is_exempt` /
+    /// `AuthService::call`'s early return for exempt paths) -- `u7s_discovery_build_total` is
+    /// the only per-request signal a future discovery cache's hit-rate work can measure against.
+    /// If the increment in `build_aggregated_discovery` is ever dropped (e.g. during a refactor),
+    /// that measurement silently goes back to zero series with no test failure elsewhere to
+    /// catch it -- this test is that catch.
+    #[tokio::test]
+    async fn build_aggregated_discovery_increments_discovery_build_total() {
+        let state = make_state();
+        let label_values = ["/discovery/v2", "true", "false"];
+        let before = crate::metrics::DISCOVERY_BUILD_TOTAL
+            .with_label_values(&label_values)
+            .get();
+
+        build_aggregated_discovery(&state, "v2beta1", true, None, "/discovery/v2").await;
+
+        let after = crate::metrics::DISCOVERY_BUILD_TOTAL
+            .with_label_values(&label_values)
+            .get();
+        assert_eq!(
+            after,
+            before + 1,
+            "a single build_aggregated_discovery call with include_core=true and no \
+             APIServices registered must increment exactly the \
+             {{version=/discovery/v2, include_core=true, has_apiservice=false}} series by 1"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // build_aggregated_discovery — concurrent per-backend resolution
     // ---------------------------------------------------------------------------
 
@@ -5098,7 +5170,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let body = build_aggregated_discovery(&state, "v2beta1", false, None).await;
+        let body = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
         let elapsed = start.elapsed();
 
         let names: Vec<String> = body.items.iter().map(|i| i.metadata.name.clone()).collect();
@@ -5147,7 +5219,7 @@ mod tests {
     #[tokio::test]
     async fn build_aggregated_discovery_output_is_byte_identical_to_pre_migration_golden() {
         let state = make_state();
-        let body = build_aggregated_discovery(&state, "v2beta1", true, None).await;
+        let body = build_aggregated_discovery(&state, "v2beta1", true, None, "/discovery/v2").await;
         let actual = serde_json::to_string(&body).unwrap();
         let golden = include_str!("testdata/aggregated_discovery_golden.json");
         assert_eq!(
