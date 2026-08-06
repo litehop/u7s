@@ -1,6 +1,8 @@
 use std::sync::LazyLock;
 
-use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts};
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+};
 
 /// Identifies this apiserver in the `component` label of upstream-named metrics — mirrors
 /// real kube-apiserver's `component="apiserver"` self-identification so a client scraping
@@ -105,6 +107,40 @@ pub static WATCH_BROADCAST_RECEIVERS: LazyLock<IntGauge> = LazyLock::new(|| {
         .register(Box::new(gauge.clone()))
         .expect("u7s_watch_broadcast_receivers is registered exactly once per process");
     gauge
+});
+
+/// Time spent inside `Store::watch()`'s initial-connect call, labeled by the exact resource
+/// identity (`group`, `resource`) already in scope at the call site via `WatchConfig`. This
+/// call synchronously performs the ring-buffer replay scan before the returned stream is even
+/// constructed, so timing the outer call captures that scan's real cost. Named without the
+/// `u7s_` prefix, matching this file's other `apiserver_*` siblings (`apiserver_watch_events_total`
+/// etc.): this measures a request-lifecycle event squarely in upstream's naming territory, even
+/// though no literal upstream metric of this exact name exists.
+// Not yet observed anywhere — the call site is added in a follow-up commit that wraps
+// Store::watch() in handlers/watch.rs. Remove this allow once that lands.
+#[cfg_attr(not(test), allow(dead_code))]
+pub static WATCH_OPEN_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "apiserver_watch_open_duration_seconds",
+            "Time spent opening a watch stream (including the initial ring-buffer replay \
+             scan), by group and resource.",
+        )
+        // 5us..82ms exponential (factor 2, 15 buckets) — brackets the measured O(ring) scan-cost
+        // range (10.9us at 1k ring occupancy to 670.8us at 100k occupancy, per a throwaway
+        // microbenchmark). Shared bucket shape with the store crate's sibling
+        // u7s_watch_lag_recovery_duration_seconds so the two are directly comparable.
+        .buckets(
+            prometheus::exponential_buckets(5e-6, 2.0, 15)
+                .expect("static bucket definition is valid"),
+        ),
+        &["group", "resource"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(histogram.clone()))
+        .expect("apiserver_watch_open_duration_seconds is registered exactly once per process");
+    histogram
 });
 
 /// Counter of SA JWT authentications accepted past their `kubernetes.io.warnafter` claim —

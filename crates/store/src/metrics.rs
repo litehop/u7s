@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use prometheus::{IntCounterVec, Opts};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts};
 
 /// Total watch events dropped because a watcher fell behind the shared broadcast channel
 /// (`tokio::sync::broadcast::error::RecvError::Lagged`), by store key prefix.
@@ -69,6 +69,101 @@ pub fn prime_watch_closed_total() {
     }
 }
 
+/// Current length of the watch replay ring buffer (`SqliteStore::ring`) — the direct answer to
+/// "how full is the buffer during a run," needed before deciding whether the ring's replay/
+/// lag-recovery scans warrant sharding by resource-type prefix.
+///
+/// Bare (unlabeled) gauge: the ring is one global structure today, so a per-prefix breakdown
+/// would either be fake precision (only one series would ever populate) or require re-deriving
+/// per-prefix occupancy via a full ring scan on every write — reintroducing the exact O(ring)
+/// cost on the write hot path that this metric exists to help diagnose on the watch hot path.
+/// Sharding the ring gets a real per-shard version of this for free as a side effect.
+pub static WATCH_RING_OCCUPANCY: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "u7s_watch_ring_occupancy",
+        "Current number of events held in the watch replay ring buffer.",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .expect("u7s_watch_ring_occupancy is registered exactly once per process");
+    gauge
+});
+
+/// Current length of the deletion-tombstone log (`SqliteStore::deletion_log`) — same class of
+/// blind spot as the ring buffer above (a capped structure whose length was previously only
+/// ever logged on its own eviction path, at `debug!` level).
+pub static DELETION_LOG_LEN: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "u7s_deletion_log_len",
+        "Current number of tombstones held in the deletion log.",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .expect("u7s_deletion_log_len is registered exactly once per process");
+    gauge
+});
+
+/// 5us..82ms exponential (factor 2, 15 buckets). Brackets the measured O(ring) scan-cost range
+/// (10.9us at 1k ring occupancy to 670.8us at 100k occupancy, per a throwaway microbenchmark)
+/// with headroom on both ends for lock-contention cases worse than an isolated benchmark.
+/// Shared with the apiserver crate's `apiserver_watch_open_duration_seconds` so the two
+/// histograms — same underlying scan cost, different call sites — are directly comparable on
+/// one dashboard.
+fn watch_scan_duration_buckets() -> Vec<f64> {
+    prometheus::exponential_buckets(5e-6, 2.0, 15).expect("static bucket definition is valid")
+}
+
+/// Time spent re-scanning the ring buffer to recover from a `RecvError::Lagged` watch event — the
+/// literal signal for the hypothesized compounding mechanism: a filling ring makes each
+/// Lagged-recovery scan more expensive, which blocks a tokio worker longer, which makes the next
+/// watcher more likely to lag too.
+///
+/// Labeled by `prefix_bucket`, not the raw watch prefix — see `prefix_bucket`'s own doc for why.
+pub static WATCH_LAG_RECOVERY_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "u7s_watch_lag_recovery_duration_seconds",
+            "Time spent re-scanning the ring buffer to recover from a watch broadcast Lagged \
+             event, by coarse prefix bucket.",
+        )
+        .buckets(watch_scan_duration_buckets()),
+        &["prefix_bucket"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(histogram.clone()))
+        .expect("u7s_watch_lag_recovery_duration_seconds is registered exactly once per process");
+    histogram
+});
+
+/// Collapse a watch key/prefix down to its first two `/`-delimited path segments (e.g.
+/// `/registry/configmaps/default/name` -> `/registry/configmaps/`), to bound
+/// `u7s_watch_lag_recovery_duration_seconds`'s cardinality by resource-type-ish grouping instead
+/// of by every namespace a long conformance run ever creates.
+///
+/// Approximation, not exact resource identity: a non-core group whose plural is its own path
+/// segment (e.g. `/registry/apps/deployments/...` vs. `/registry/apps/statefulsets/...`)
+/// collapses both to `/registry/apps/`. Accepted for Phase 1 because the investigated pathology
+/// (KCM's serviceaccount/token/root-ca controllers) is entirely core-group resources, which are
+/// single-segment and bucket exactly. Threading the handler layer's exact `{group, plural}`
+/// identity through here instead would require changing `Store::watch()`'s signature across
+/// every impl for a metrics-only change — not worth it before it's known whether sharding is
+/// actually needed.
+pub fn prefix_bucket(prefix: &str) -> &str {
+    let mut slashes = 0;
+    for (idx, ch) in prefix.char_indices() {
+        if ch == '/' {
+            slashes += 1;
+            if slashes == 3 {
+                return &prefix[..=idx];
+            }
+        }
+    }
+    prefix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +210,115 @@ mod tests {
             "store_closed must never be primed — it can never be incremented, so a zero for it \
              would misrepresent an unmonitored condition as a monitored-and-healthy one; seen \
              reasons: {seen_reasons:?}"
+        );
+    }
+
+    /// A bare `IntGauge` only shows up in `prometheus::gather()` once something dereferences its
+    /// `LazyLock` — this test fails on revert (e.g. if `WATCH_RING_OCCUPANCY`'s `.set()` call
+    /// site in `push_event_locked` were deleted) because it asserts the *gathered* value, not
+    /// just that the static compiles and `.set()`/`.get()` round-trip in isolation. Without this
+    /// wired up, an operator scraping a freshly started process could not tell "ring occupancy
+    /// is zero" from "this metric was never registered."
+    #[test]
+    fn watch_ring_occupancy_reflects_the_value_it_was_set_to_in_gather() {
+        WATCH_RING_OCCUPANCY.set(42);
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "u7s_watch_ring_occupancy")
+            .expect("u7s_watch_ring_occupancy must appear in gathered metric families once set");
+        let value = family.get_metric()[0].get_gauge().get_value();
+        assert_eq!(
+            value, 42.0,
+            "gathered value must match the last .set() call — a mismatch here means the \
+             registered Collector is not the same instance push_event_locked is setting"
+        );
+    }
+
+    /// Same reasoning as `watch_ring_occupancy_reflects_the_value_it_was_set_to_in_gather`,
+    /// for the deletion-tombstone-log gauge.
+    #[test]
+    fn deletion_log_len_reflects_the_value_it_was_set_to_in_gather() {
+        DELETION_LOG_LEN.set(7);
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "u7s_deletion_log_len")
+            .expect("u7s_deletion_log_len must appear in gathered metric families once set");
+        let value = family.get_metric()[0].get_gauge().get_value();
+        assert_eq!(
+            value, 7.0,
+            "gathered value must match the last .set() call — a mismatch here means the \
+             registered Collector is not the same instance push_event_locked is setting"
+        );
+    }
+
+    /// A `HistogramVec` only shows a `prefix_bucket` series once that bucket has been observed
+    /// at least once — this test fails on revert if the Lagged-recovery instrumentation stopped
+    /// calling `.observe()`, which is exactly the scenario an operator needs to detect (a
+    /// silently-broken smoking-gun metric looks identical to "no lag has ever occurred," the
+    /// deliberately-desired absent state for buckets that truly never lagged).
+    #[test]
+    fn watch_lag_recovery_duration_seconds_records_an_observation_for_its_bucket_label() {
+        let bucket = "/registry/metrics-test-lag-recovery/";
+        WATCH_LAG_RECOVERY_DURATION_SECONDS
+            .with_label_values(&[bucket])
+            .observe(0.001);
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "u7s_watch_lag_recovery_duration_seconds")
+            .expect(
+                "u7s_watch_lag_recovery_duration_seconds must appear in gathered metric families \
+                 once a bucket has been observed",
+            );
+        let has_bucket_label = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label())
+            .any(|l| l.name() == "prefix_bucket" && l.value() == bucket);
+        assert!(
+            has_bucket_label,
+            "gathered output must carry a series labeled prefix_bucket={bucket:?} after \
+             observing it — without this, a Lagged-recovery scan on that resource type would be \
+             invisible to a scraper even though it happened"
+        );
+    }
+
+    /// `prefix_bucket` must collapse a namespace-scoped watch prefix down to its resource-type
+    /// root — this is the entire cardinality-bounding mechanism `u7s_watch_lag_recovery_
+    /// duration_seconds` relies on. If this regressed to passing the raw prefix through
+    /// unchanged, a long conformance run's thousands of ephemeral namespaces would each mint
+    /// their own time series, exactly the unbounded-cardinality footgun this helper exists to
+    /// avoid.
+    #[test]
+    fn prefix_bucket_collapses_to_first_two_path_segments() {
+        assert_eq!(
+            prefix_bucket("/registry/pods/namespace-x/name-y"),
+            "/registry/pods/",
+            "a namespace-scoped core-resource prefix must bucket to its resource-type root, \
+             dropping the namespace and name segments that would otherwise explode cardinality"
+        );
+        assert_eq!(
+            prefix_bucket("/registry/apps.v1.deployments/foo/bar"),
+            "/registry/apps.v1.deployments/",
+            "the second path segment is kept verbatim regardless of its own internal shape \
+             (dots included) — bucketing only ever counts '/' delimiters, not group syntax"
+        );
+        assert_eq!(
+            prefix_bucket(""),
+            "",
+            "an empty prefix has no path segments to collapse — must return unchanged rather \
+             than panicking on out-of-bounds indexing"
+        );
+        assert_eq!(
+            prefix_bucket("/registry/"),
+            "/registry/",
+            "a prefix with fewer than two path segments has nothing further to collapse — must \
+             return unchanged rather than panicking when the third '/' never appears"
         );
     }
 }
