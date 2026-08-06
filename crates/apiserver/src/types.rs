@@ -702,6 +702,398 @@ pub struct CsrCondition {
 }
 
 // ---------------------------------------------------------------------------
+// Defaulting typed structs — handlers/defaults.rs
+//
+// Each struct types only the fields a `default_X` function in
+// handlers/defaults.rs reads or writes; every other field round-trips
+// opaquely via `rest`. This is the same minimal-field pattern as `PodSpec`/
+// `NamespaceStatus` above, applied to the defaulting surface: the direct
+// motivation is PR #1024 (mayor-xv1pk), where a field the apiserver was
+// supposed to default was missing entirely from a Value-tree-based codebase
+// with no compiler-checked inventory of "which fields does this function
+// reason about" to catch the gap during review.
+// ---------------------------------------------------------------------------
+
+/// Shared `status` shape for PersistentVolume and PersistentVolumeClaim —
+/// only `phase` is defaulted by either resource's `default_X` function.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeStatusFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// Shared `spec` shape for PersistentVolume and PersistentVolumeClaim — only
+/// `volumeMode` is defaulted by either resource's `default_X` function.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeSpecFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_mode: Option<String>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a CSIDriver — the pointer-typed fields upstream's
+/// `SetDefaults_CSIDriver` defaults when a client omits them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CsiDriverSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_info_on_mount: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_capacity: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_group_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_lifecycle_modes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_republish: Option<bool>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// Top-level fields of a StorageClass — `reclaimPolicy`/`volumeBindingMode` sit
+/// directly on the object, not under a `.spec` wrapper.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageClassFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_binding_mode: Option<String>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a Lease — only `leaseTransitions` is defaulted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_transitions: Option<i32>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `roleRef` of a RoleBinding/ClusterRoleBinding — only `apiGroup` is defaulted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleRefFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_group: Option<String>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a ReplicationController.
+///
+/// `selector` is a flat equality-based map<string,string> — NOT the set-based
+/// `{matchLabels: {...}}` shape used by ReplicaSet/StatefulSet/Deployment.
+/// Encoding that distinction in the type itself (rather than a shared `Value`
+/// field) makes it impossible to accidentally wrap an RC selector in
+/// `matchLabels`, which would make KCM fail to parse it as an RC selector.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationControllerSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// Read-only peek at a pod template's `metadata.labels`, used by ReplicaSet,
+/// StatefulSet, Deployment, and ReplicationController to default
+/// `spec.selector` from `spec.template.metadata.labels` when the caller omits
+/// an explicit selector. Never serialized back — the underlying template
+/// Value is only read, so no `rest` catch-all is needed here.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TemplateLabelsPeek {
+    #[serde(default)]
+    pub metadata: TemplateMetaLabelsPeek,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TemplateMetaLabelsPeek {
+    #[serde(default)]
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// `spec` of a ReplicaSet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaSetSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a StatefulSet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulSetSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_management_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_strategy: Option<StatefulSetUpdateStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_history_limit: Option<i32>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulSetUpdateStrategy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_update: Option<StatefulSetRollingUpdate>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulSetRollingUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a DaemonSet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSetSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_strategy: Option<DaemonSetUpdateStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_history_limit: Option<i32>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSetUpdateStrategy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_update: Option<DaemonSetRollingUpdate>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSetRollingUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<Value>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a Deployment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_history_limit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_deadline_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<DeploymentStrategy>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentStrategy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_update: Option<DeploymentRollingUpdate>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentRollingUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<Value>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// A pod template that gets *written back* by defaulting (Job's
+/// `spec.template`, CronJob's `spec.jobTemplate.spec.template`). Unlike
+/// `TemplateLabelsPeek` (read-only), this type must preserve every field the
+/// template already has on round-trip — `metadata`/`spec` each carry their
+/// own `rest` so that e.g. `containers` (on `spec`) or `ownerReferences` (on
+/// `metadata`, in principle) are never dropped when the template is
+/// re-serialized after defaulting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DefaultingPodTemplate {
+    #[serde(default)]
+    pub metadata: DefaultingPodTemplateMeta,
+    #[serde(default)]
+    pub spec: DefaultingPodTemplateSpec,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DefaultingPodTemplateMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<serde_json::Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Map<String, Value>>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultingPodTemplateSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_service_links: Option<bool>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a Job. `template` is intentionally NOT included here:
+/// `default_job` defaults it via a separate `DefaultingPodTemplate`
+/// round-trip scoped to `spec.template` alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_limit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_selector: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<Value>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec` of a Service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_affinity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_affinity_config: Option<SessionAffinityConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<ServicePort>>,
+    #[serde(default, rename = "clusterIP", skip_serializing_if = "Option::is_none")]
+    pub cluster_ip: Option<String>,
+    #[serde(
+        default,
+        rename = "clusterIPs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cluster_ips: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_families: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_family_policy: Option<String>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAffinityConfig {
+    #[serde(default, rename = "clientIP", skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<ClientIpConfig>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientIpConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i64>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicePort {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<i64>,
+    /// `IntOrString` upstream (may be a named container port) — kept opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_port: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_port: Option<Value>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+/// `spec.behavior` of a HorizontalPodAutoscaler.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HpaBehavior {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up: Option<HpaScalingRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_down: Option<HpaScalingRules>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HpaScalingRules {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stabilization_window_seconds: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select_policy: Option<String>,
+    /// Kept opaque: `default_hpa` only ever checks presence and overwrites
+    /// the whole array with a literal default; it never reads individual
+    /// policy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policies: Option<Value>,
+    #[serde(flatten)]
+    pub rest: Value,
+}
+
+// ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
 

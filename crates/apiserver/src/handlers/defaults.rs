@@ -1,3 +1,10 @@
+use crate::types::{
+    CsiDriverSpec, DaemonSetSpec, DefaultingPodTemplate, DeploymentSpec, HpaBehavior, JobSpec,
+    LeaseSpec, PersistentVolumeSpecFields, PersistentVolumeStatusFields, ReplicaSetSpec,
+    ReplicationControllerSpec, RoleRefFields, ServiceSpec, StatefulSetSpec, StorageClassFields,
+    TemplateLabelsPeek,
+};
+
 /// Apply upstream-compatible field defaults to a stored object.
 ///
 /// Equivalent to what kube-apiserver does via `scheme.Default()` after decode
@@ -196,14 +203,29 @@ pub fn increment_endpointslice_generation_if_changed(
 ///
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_pvc(obj: &mut serde_json::Value) {
-    if obj["status"]["phase"].is_null() {
-        if !obj["status"].is_object() {
-            obj["status"] = serde_json::json!({});
-        }
-        obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
+    let mut status: PersistentVolumeStatusFields =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let mut spec: PersistentVolumeSpecFields =
+        serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    default_volume_status_and_mode(&mut status, &mut spec);
+    obj["status"] =
+        serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
+    obj["spec"] =
+        serde_json::to_value(&spec).expect("PersistentVolumeSpecFields is always serializable");
+}
+
+/// The actual reasoning shared by PV and PVC defaulting: `status.phase`
+/// defaults to "Pending"; `spec.volumeMode` defaults to "Filesystem".
+/// Idempotent: if a field is already set it is not overwritten.
+fn default_volume_status_and_mode(
+    status: &mut PersistentVolumeStatusFields,
+    spec: &mut PersistentVolumeSpecFields,
+) {
+    if status.phase.is_none() {
+        status.phase = Some("Pending".to_string());
     }
-    if obj["spec"]["volumeMode"].is_null() {
-        obj["spec"]["volumeMode"] = serde_json::Value::String("Filesystem".to_string());
+    if spec.volume_mode.is_none() {
+        spec.volume_mode = Some("Filesystem".to_string());
     }
 }
 
@@ -219,15 +241,15 @@ fn default_pvc(obj: &mut serde_json::Value) {
 ///
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_pv(obj: &mut serde_json::Value) {
-    if obj["status"]["phase"].is_null() {
-        if !obj["status"].is_object() {
-            obj["status"] = serde_json::json!({});
-        }
-        obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
-    }
-    if obj["spec"]["volumeMode"].is_null() {
-        obj["spec"]["volumeMode"] = serde_json::Value::String("Filesystem".to_string());
-    }
+    let mut status: PersistentVolumeStatusFields =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let mut spec: PersistentVolumeSpecFields =
+        serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    default_volume_status_and_mode(&mut status, &mut spec);
+    obj["status"] =
+        serde_json::to_value(&status).expect("PersistentVolumeStatusFields is always serializable");
+    obj["spec"] =
+        serde_json::to_value(&spec).expect("PersistentVolumeSpecFields is always serializable");
 }
 
 /// Default the pointer-typed fields of `CSIDriver.spec`, matching upstream
@@ -250,29 +272,34 @@ fn default_pv(obj: &mut serde_json::Value) {
 /// sets them when their alpha/beta feature gates are enabled, which this codebase does
 /// not model.
 fn default_csidriver(obj: &mut serde_json::Value) {
-    if obj["spec"]["attachRequired"].is_null() {
-        obj["spec"]["attachRequired"] = serde_json::Value::Bool(true);
+    let mut spec: CsiDriverSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    default_csidriver_spec(&mut spec);
+    obj["spec"] = serde_json::to_value(&spec).expect("CsiDriverSpec is always serializable");
+}
+
+fn default_csidriver_spec(spec: &mut CsiDriverSpec) {
+    if spec.attach_required.is_none() {
+        spec.attach_required = Some(true);
     }
-    if obj["spec"]["podInfoOnMount"].is_null() {
-        obj["spec"]["podInfoOnMount"] = serde_json::Value::Bool(false);
+    if spec.pod_info_on_mount.is_none() {
+        spec.pod_info_on_mount = Some(false);
     }
-    if obj["spec"]["storageCapacity"].is_null() {
-        obj["spec"]["storageCapacity"] = serde_json::Value::Bool(false);
+    if spec.storage_capacity.is_none() {
+        spec.storage_capacity = Some(false);
     }
-    if obj["spec"]["fsGroupPolicy"].is_null() {
-        obj["spec"]["fsGroupPolicy"] =
-            serde_json::Value::String("ReadWriteOnceWithFSTypeFSGroupPolicy".to_string());
+    if spec.fs_group_policy.is_none() {
+        spec.fs_group_policy = Some("ReadWriteOnceWithFSTypeFSGroupPolicy".to_string());
     }
-    if obj["spec"]["volumeLifecycleModes"]
-        .as_array()
-        .map(|a| a.is_empty())
+    if spec
+        .volume_lifecycle_modes
+        .as_ref()
+        .map(|m| m.is_empty())
         .unwrap_or(true)
     {
-        obj["spec"]["volumeLifecycleModes"] =
-            serde_json::Value::Array(vec![serde_json::Value::String("Persistent".to_string())]);
+        spec.volume_lifecycle_modes = Some(vec!["Persistent".to_string()]);
     }
-    if obj["spec"]["requiresRepublish"].is_null() {
-        obj["spec"]["requiresRepublish"] = serde_json::Value::Bool(false);
+    if spec.requires_republish.is_none() {
+        spec.requires_republish = Some(false);
     }
 }
 
@@ -292,12 +319,14 @@ fn default_csidriver(obj: &mut serde_json::Value) {
 ///
 /// Idempotent: if a field is already set it is not overwritten.
 fn default_storageclass(obj: &mut serde_json::Value) {
-    if obj["reclaimPolicy"].is_null() {
-        obj["reclaimPolicy"] = serde_json::Value::String("Delete".to_string());
+    let mut fields: StorageClassFields = serde_json::from_value(obj.clone()).unwrap_or_default();
+    if fields.reclaim_policy.is_none() {
+        fields.reclaim_policy = Some("Delete".to_string());
     }
-    if obj["volumeBindingMode"].is_null() {
-        obj["volumeBindingMode"] = serde_json::Value::String("Immediate".to_string());
+    if fields.volume_binding_mode.is_none() {
+        fields.volume_binding_mode = Some("Immediate".to_string());
     }
+    *obj = serde_json::to_value(&fields).expect("StorageClassFields is always serializable");
 }
 
 /// Set status.phase to "Active" for a newly created Namespace, matching upstream
@@ -313,12 +342,12 @@ fn default_storageclass(obj: &mut serde_json::Value) {
 /// Idempotent: an existing status.phase (e.g. "Terminating", stamped by delete) is
 /// never overwritten.
 fn default_namespace(obj: &mut serde_json::Value) {
-    if obj["status"]["phase"].is_null() {
-        if !obj["status"].is_object() {
-            obj["status"] = serde_json::json!({});
-        }
-        obj["status"]["phase"] = serde_json::Value::String("Active".to_string());
+    let mut status: crate::types::NamespaceStatus =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    if status.phase.is_none() {
+        status.phase = Some(crate::types::NamespacePhase::Active);
     }
+    obj["status"] = serde_json::to_value(&status).expect("NamespaceStatus is always serializable");
 }
 
 /// Default `spec.selector` and `spec.replicas` on a ReplicationController when absent.
@@ -337,19 +366,26 @@ fn default_namespace(obj: &mut serde_json::Value) {
 ///
 /// Idempotent: an existing non-null selector is never overwritten.
 fn default_replicationcontroller(obj: &mut serde_json::Value) {
+    let mut spec: ReplicationControllerSpec =
+        serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let template_labels: TemplateLabelsPeek =
+        serde_json::from_value(obj["spec"]["template"].clone()).unwrap_or_default();
+
     // Default spec.selector from template labels when absent.
     // RC selector is a flat map<string,string> — NOT wrapped in matchLabels.
-    if obj["spec"]["selector"].is_null() {
-        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
-        if labels.is_object() {
-            obj["spec"]["selector"] = labels;
+    if spec.selector.is_none() {
+        if let Some(labels) = template_labels.metadata.labels {
+            spec.selector = Some(labels);
         }
     }
 
     // Default spec.replicas to 1 when absent.
-    if obj["spec"]["replicas"].is_null() {
-        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    if spec.replicas.is_none() {
+        spec.replicas = Some(1);
     }
+
+    obj["spec"] =
+        serde_json::to_value(&spec).expect("ReplicationControllerSpec is always serializable");
 }
 
 /// Default `spec.leaseTransitions` to `0` on a Lease when absent.
@@ -359,9 +395,11 @@ fn default_replicationcontroller(obj: &mut serde_json::Value) {
 /// test reads it back and expects `0`. Without this default, the field stays null
 /// and the test fails with "unexpected leaseTransitions: <nil>".
 fn default_lease(obj: &mut serde_json::Value) {
-    if obj["spec"]["leaseTransitions"].is_null() {
-        obj["spec"]["leaseTransitions"] = serde_json::json!(0i32);
+    let mut spec: LeaseSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    if spec.lease_transitions.is_none() {
+        spec.lease_transitions = Some(0);
     }
+    obj["spec"] = serde_json::to_value(&spec).expect("LeaseSpec is always serializable");
 }
 
 /// Default `roleRef.apiGroup` to `"rbac.authorization.k8s.io"` when absent or empty on a
@@ -378,10 +416,12 @@ fn default_lease(obj: &mut serde_json::Value) {
 /// extension-apiserver-authentication-reader RoleBinding never take effect for the sample
 /// API server conformance test.
 fn default_role_ref_api_group(obj: &mut serde_json::Value) {
-    let api_group = &mut obj["roleRef"]["apiGroup"];
-    if api_group.as_str().is_none_or(str::is_empty) {
-        *api_group = serde_json::json!("rbac.authorization.k8s.io");
+    let mut role_ref: RoleRefFields =
+        serde_json::from_value(obj["roleRef"].clone()).unwrap_or_default();
+    if role_ref.api_group.as_deref().is_none_or(str::is_empty) {
+        role_ref.api_group = Some("rbac.authorization.k8s.io".to_string());
     }
+    obj["roleRef"] = serde_json::to_value(&role_ref).expect("RoleRefFields is always serializable");
 }
 
 /// Apply all Service defaults in the correct order.
@@ -396,49 +436,54 @@ fn default_role_ref_api_group(obj: &mut serde_json::Value) {
 /// 4. Skip ClusterIP-family defaults for ExternalName — ExternalName services must not
 ///    have ipFamilies/ipFamilyPolicy/clusterIPs set (they have no cluster IP at all).
 fn default_service(obj: &mut serde_json::Value) {
-    // Ensure spec exists as an object.
-    if !obj["spec"].is_object() {
-        obj["spec"] = serde_json::json!({});
-    }
+    let mut spec: ServiceSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    default_service_spec(&mut spec);
+    obj["spec"] = serde_json::to_value(&spec).expect("ServiceSpec is always serializable");
+}
 
+fn default_service_spec(spec: &mut ServiceSpec) {
     // 1. Default spec.type to "ClusterIP".
-    if obj["spec"]["type"].is_null() {
-        obj["spec"]["type"] = serde_json::Value::String("ClusterIP".to_string());
+    if spec.r#type.is_none() {
+        spec.r#type = Some("ClusterIP".to_string());
     }
 
     // 2. Default spec.sessionAffinity to "None" (matches upstream SetDefaults_Service).
-    if obj["spec"]["sessionAffinity"].is_null() {
-        obj["spec"]["sessionAffinity"] = serde_json::Value::String("None".to_string());
+    if spec.session_affinity.is_none() {
+        spec.session_affinity = Some("None".to_string());
     }
 
     // When sessionAffinity is ClientIP, default the timeout to 10800s (3h) unless set.
-    if obj["spec"]["sessionAffinity"].as_str() == Some("ClientIP")
-        && obj["spec"]["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"].is_null()
-    {
-        obj["spec"]["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"] =
-            serde_json::Value::Number(serde_json::Number::from(10800i32));
+    if spec.session_affinity.as_deref() == Some("ClientIP") {
+        let affinity_cfg = spec
+            .session_affinity_config
+            .get_or_insert_with(Default::default);
+        let client_ip = affinity_cfg.client_ip.get_or_insert_with(Default::default);
+        if client_ip.timeout_seconds.is_none() {
+            client_ip.timeout_seconds = Some(10800);
+        }
     }
 
-    let svc_type = obj["spec"]["type"]
-        .as_str()
-        .unwrap_or("ClusterIP")
-        .to_string();
+    let svc_type = spec
+        .r#type
+        .clone()
+        .unwrap_or_else(|| "ClusterIP".to_string());
 
     // 3. Allocate NodePorts for NodePort and LoadBalancer services.
     if svc_type == "NodePort" || svc_type == "LoadBalancer" {
-        default_node_ports(obj);
+        default_node_ports(spec);
     }
 
-    if let Some(ports) = obj["spec"]["ports"].as_array_mut() {
+    if let Some(ports) = spec.ports.as_mut() {
         for port_entry in ports.iter_mut() {
-            if port_entry["targetPort"].is_null() || port_entry["targetPort"].as_i64() == Some(0) {
-                if let Some(port_num) = port_entry["port"].as_i64() {
-                    port_entry["targetPort"] =
-                        serde_json::Value::Number(serde_json::Number::from(port_num));
+            let needs_target_port = port_entry.target_port.is_none()
+                || port_entry.target_port.as_ref().and_then(|v| v.as_i64()) == Some(0);
+            if needs_target_port {
+                if let Some(port_num) = port_entry.port {
+                    port_entry.target_port = Some(serde_json::Value::Number(port_num.into()));
                 }
             }
-            if port_entry["protocol"].is_null() {
-                port_entry["protocol"] = serde_json::Value::String("TCP".to_string());
+            if port_entry.protocol.is_none() {
+                port_entry.protocol = Some("TCP".to_string());
             }
         }
     }
@@ -448,17 +493,17 @@ fn default_service(obj: &mut serde_json::Value) {
     // any previously assigned clusterIP, clusterIPs, and nodePort fields must be cleared.
     // Without this, GET after the type-change PATCH still returns the old IP/nodePort.
     if svc_type == "ExternalName" {
-        obj["spec"]["clusterIP"] = serde_json::Value::String(String::new());
-        obj["spec"]["clusterIPs"] = serde_json::json!([]);
-        if let Some(ports) = obj["spec"]["ports"].as_array_mut() {
+        spec.cluster_ip = Some(String::new());
+        spec.cluster_ips = Some(vec![]);
+        if let Some(ports) = spec.ports.as_mut() {
             for port in ports.iter_mut() {
-                port["nodePort"] = serde_json::Value::Number(0.into());
+                port.node_port = Some(serde_json::Value::Number(0.into()));
             }
         }
         return;
     }
 
-    default_service_ip_fields(obj);
+    default_service_ip_fields_spec(spec);
 }
 
 /// Assign NodePorts to ports that don't have one yet.
@@ -468,8 +513,8 @@ fn default_service(obj: &mut serde_json::Value) {
 /// object. The range 30000-32767 matches the Kubernetes default nodePort range.
 ///
 /// Idempotent: ports that already have a nodePort are not modified.
-fn default_node_ports(obj: &mut serde_json::Value) {
-    let ports = match obj["spec"]["ports"].as_array_mut() {
+fn default_node_ports(spec: &mut ServiceSpec) {
+    let ports = match spec.ports.as_mut() {
         Some(p) => p,
         None => return,
     };
@@ -477,7 +522,7 @@ fn default_node_ports(obj: &mut serde_json::Value) {
     // Collect already-assigned NodePorts so we don't re-use them.
     let mut used: std::collections::HashSet<u16> = ports
         .iter()
-        .filter_map(|p| p["nodePort"].as_u64())
+        .filter_map(|p| p.node_port.as_ref().and_then(|v| v.as_u64()))
         .filter(|&n| (30000..=32767).contains(&n))
         .map(|n| n as u16)
         .collect();
@@ -486,7 +531,7 @@ fn default_node_ports(obj: &mut serde_json::Value) {
 
     for port in ports.iter_mut() {
         // Skip ports that already have a nodePort.
-        if !port["nodePort"].is_null() {
+        if port.node_port.is_some() {
             continue;
         }
 
@@ -499,7 +544,7 @@ fn default_node_ports(obj: &mut serde_json::Value) {
             }
         }
 
-        port["nodePort"] = serde_json::Value::Number(next_candidate.into());
+        port.node_port = Some(serde_json::Value::Number(next_candidate.into()));
         used.insert(next_candidate);
         next_candidate += 1;
     }
@@ -591,31 +636,32 @@ fn alias_event_field(obj: &mut serde_json::Value, core_field: &str, events_v1_fi
 ///
 /// Must NOT be called for ExternalName services (they have no ClusterIP family).
 pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
-    // Ensure spec exists as an object.
-    if !obj["spec"].is_object() {
-        obj["spec"] = serde_json::json!({});
-    }
+    let mut spec: ServiceSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    default_service_ip_fields_spec(&mut spec);
+    obj["spec"] = serde_json::to_value(&spec).expect("ServiceSpec is always serializable");
+}
 
-    let cluster_ip = obj["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+fn default_service_ip_fields_spec(spec: &mut ServiceSpec) {
+    let cluster_ip = spec.cluster_ip.clone().unwrap_or_default();
 
     // ipFamilyPolicy
-    if obj["spec"]["ipFamilyPolicy"].is_null() {
-        obj["spec"]["ipFamilyPolicy"] = serde_json::Value::String("SingleStack".to_string());
+    if spec.ip_family_policy.is_none() {
+        spec.ip_family_policy = Some("SingleStack".to_string());
     }
 
     // ipFamilies
-    if obj["spec"]["ipFamilies"].is_null() {
+    if spec.ip_families.is_none() {
         let family = if cluster_ip.contains(':') {
             "IPv6"
         } else {
             "IPv4"
         };
-        obj["spec"]["ipFamilies"] = serde_json::json!([family]);
+        spec.ip_families = Some(vec![family.to_string()]);
     }
 
     // clusterIPs
-    if obj["spec"]["clusterIPs"].is_null() && !cluster_ip.is_empty() && cluster_ip != "None" {
-        obj["spec"]["clusterIPs"] = serde_json::json!([cluster_ip]);
+    if spec.cluster_ips.is_none() && !cluster_ip.is_empty() && cluster_ip != "None" {
+        spec.cluster_ips = Some(vec![cluster_ip]);
     }
 }
 
@@ -682,84 +728,85 @@ fn validate_selector(obj: &serde_json::Value, kind: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Default `selector` to `{matchLabels: <template labels>}` when absent, by peeking
+/// (read-only) at the pod template's `metadata.labels`. Shared by ReplicaSet,
+/// StatefulSet, and Deployment — all three use the same set-based selector shape,
+/// unlike ReplicationController's flat equality selector (see `default_replicationcontroller`).
+fn default_selector_from_template_labels(
+    selector: &mut Option<serde_json::Value>,
+    template: &serde_json::Value,
+) {
+    if selector.is_none() {
+        let peek: TemplateLabelsPeek = serde_json::from_value(template.clone()).unwrap_or_default();
+        if let Some(labels) = peek.metadata.labels {
+            *selector = Some(serde_json::json!({ "matchLabels": labels }));
+        }
+    }
+}
+
 fn default_replicaset(obj: &mut serde_json::Value) {
+    let mut spec: ReplicaSetSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Real kube-apiserver rejects ReplicaSets without spec.selector. Without
     // defaulting, validate_resource rejects objects that omit selector when
     // template labels are present (conformance pattern used by workload tests).
-    if obj["spec"]["selector"].is_null() {
-        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
-        if labels.is_object() {
-            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
-        }
-    }
+    default_selector_from_template_labels(&mut spec.selector, &obj["spec"]["template"]);
 
-    if obj["spec"]["replicas"].is_null() {
-        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    if spec.replicas.is_none() {
+        spec.replicas = Some(1);
     }
+    obj["spec"] = serde_json::to_value(&spec).expect("ReplicaSetSpec is always serializable");
 }
 
 fn default_statefulset(obj: &mut serde_json::Value) {
+    let mut spec: StatefulSetSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Real kube-apiserver rejects StatefulSets without spec.selector. Without
     // defaulting, validate_resource rejects objects that omit selector when
     // template labels are present (conformance pattern used by workload tests).
-    if obj["spec"]["selector"].is_null() {
-        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
-        if labels.is_object() {
-            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
-        }
-    }
+    default_selector_from_template_labels(&mut spec.selector, &obj["spec"]["template"]);
 
-    if obj["spec"]["replicas"].is_null() {
-        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    if spec.replicas.is_none() {
+        spec.replicas = Some(1);
     }
-    if obj["spec"]["podManagementPolicy"].is_null() {
-        obj["spec"]["podManagementPolicy"] = serde_json::Value::String("OrderedReady".into());
+    if spec.pod_management_policy.is_none() {
+        spec.pod_management_policy = Some("OrderedReady".to_string());
     }
-    if obj["spec"]["updateStrategy"]["type"].is_null() {
-        if !obj["spec"]["updateStrategy"].is_object() {
-            obj["spec"]["updateStrategy"] = serde_json::json!({});
-        }
-        obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    let strategy = spec.update_strategy.get_or_insert_with(Default::default);
+    if strategy.r#type.is_none() {
+        strategy.r#type = Some("RollingUpdate".to_string());
     }
-    if obj["spec"]["updateStrategy"]["type"].as_str() == Some("RollingUpdate") {
-        if !obj["spec"]["updateStrategy"]["rollingUpdate"].is_object() {
-            obj["spec"]["updateStrategy"]["rollingUpdate"] = serde_json::json!({});
-        }
-        if obj["spec"]["updateStrategy"]["rollingUpdate"]["partition"].is_null() {
-            obj["spec"]["updateStrategy"]["rollingUpdate"]["partition"] =
-                serde_json::Value::Number(0.into());
+    if strategy.r#type.as_deref() == Some("RollingUpdate") {
+        let rolling_update = strategy.rolling_update.get_or_insert_with(Default::default);
+        if rolling_update.partition.is_none() {
+            rolling_update.partition = Some(0);
         }
     }
-    if obj["spec"]["revisionHistoryLimit"].is_null() {
-        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    if spec.revision_history_limit.is_none() {
+        spec.revision_history_limit = Some(10);
     }
+    obj["spec"] = serde_json::to_value(&spec).expect("StatefulSetSpec is always serializable");
 }
 
 fn default_daemonset(obj: &mut serde_json::Value) {
-    if obj["spec"]["updateStrategy"]["type"].is_null() {
-        if !obj["spec"]["updateStrategy"].is_object() {
-            obj["spec"]["updateStrategy"] = serde_json::json!({});
-        }
-        obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    let mut spec: DaemonSetSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let strategy = spec.update_strategy.get_or_insert_with(Default::default);
+    if strategy.r#type.is_none() {
+        strategy.r#type = Some("RollingUpdate".to_string());
     }
-    if obj["spec"]["updateStrategy"]["type"].as_str() == Some("RollingUpdate") {
-        if !obj["spec"]["updateStrategy"]["rollingUpdate"].is_object() {
-            obj["spec"]["updateStrategy"]["rollingUpdate"] = serde_json::json!({});
+    if strategy.r#type.as_deref() == Some("RollingUpdate") {
+        let rolling_update = strategy.rolling_update.get_or_insert_with(Default::default);
+        if rolling_update.max_unavailable.is_none() {
+            rolling_update.max_unavailable = Some(serde_json::Value::Number(1.into()));
         }
-        if obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"].is_null() {
-            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"] =
-                serde_json::Value::Number(1.into());
-        }
-        if obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"].is_null() {
-            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"] =
-                serde_json::Value::Number(0.into());
+        if rolling_update.max_surge.is_none() {
+            rolling_update.max_surge = Some(serde_json::Value::Number(0.into()));
         }
     }
-    if obj["spec"]["revisionHistoryLimit"].is_null() {
-        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    if spec.revision_history_limit.is_none() {
+        spec.revision_history_limit = Some(10);
     }
+    obj["spec"] = serde_json::to_value(&spec).expect("DaemonSetSpec is always serializable");
 }
 
 /// Remove null-valued fields from `spec.template.metadata` on workload objects.
@@ -780,30 +827,36 @@ fn strip_null_template_metadata(obj: &mut serde_json::Value) {
 }
 
 fn default_pod_template(template: &mut serde_json::Value) {
-    if !template["metadata"].is_object() {
-        template["metadata"] = serde_json::json!({});
+    let mut typed: DefaultingPodTemplate =
+        serde_json::from_value(template.clone()).unwrap_or_default();
+    default_pod_template_fields(&mut typed);
+    *template = serde_json::to_value(&typed).expect("DefaultingPodTemplate is always serializable");
+}
+
+fn default_pod_template_fields(template: &mut DefaultingPodTemplate) {
+    if template.metadata.labels.is_none() {
+        template.metadata.labels = Some(serde_json::Map::new());
     }
-    if template["metadata"]["labels"].is_null() {
-        template["metadata"]["labels"] = serde_json::json!({});
+    if template.metadata.annotations.is_none() {
+        template.metadata.annotations = Some(serde_json::Map::new());
     }
-    if template["metadata"]["annotations"].is_null() {
-        template["metadata"]["annotations"] = serde_json::json!({});
-    }
-    if !template["spec"].is_object() {
-        template["spec"] = serde_json::json!({});
-    }
-    if template["spec"]["enableServiceLinks"].is_null() {
-        template["spec"]["enableServiceLinks"] = serde_json::Value::Bool(true);
+    if template.spec.enable_service_links.is_none() {
+        template.spec.enable_service_links = Some(true);
     }
 }
 
 fn default_job(obj: &mut serde_json::Value) {
-    default_pod_template(&mut obj["spec"]["template"]);
-    if obj["spec"]["backoffLimit"].is_null() {
-        obj["spec"]["backoffLimit"] = serde_json::Value::Number(6.into());
+    let mut spec: JobSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+
+    let mut template: DefaultingPodTemplate =
+        serde_json::from_value(spec.rest["template"].clone()).unwrap_or_default();
+    default_pod_template_fields(&mut template);
+
+    if spec.backoff_limit.is_none() {
+        spec.backoff_limit = Some(6);
     }
-    if obj["spec"]["parallelism"].is_null() {
-        obj["spec"]["parallelism"] = serde_json::Value::Number(1.into());
+    if spec.parallelism.is_none() {
+        spec.parallelism = Some(1);
     }
 
     // Generate selector and inject controller-uid/job-name labels into the pod template
@@ -815,27 +868,43 @@ fn default_job(obj: &mut serde_json::Value) {
     // so Job pods are never created and every Job conformance test times out.
     //
     // Guard: idempotent on GET/LIST/WATCH paths (selector already populated after create).
-    let manual_selector = obj["spec"]["manualSelector"] == serde_json::Value::Bool(true);
-    if obj["spec"]["selector"].is_null() && !manual_selector {
+    let manual_selector = spec.manual_selector == Some(true);
+    if spec.selector.is_none() && !manual_selector {
         let uid = obj["metadata"]["uid"].as_str().unwrap_or("").to_string();
         let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
         // Only generate when uid is present (create path always has uid via stamp_metadata).
         if !uid.is_empty() {
             // Inject 4 labels into the pod template (prefixed + legacy, matching upstream).
-            let labels = &mut obj["spec"]["template"]["metadata"]["labels"];
-            labels["batch.kubernetes.io/controller-uid"] = serde_json::Value::String(uid.clone());
-            labels["batch.kubernetes.io/job-name"] = serde_json::Value::String(name.clone());
-            labels["controller-uid"] = serde_json::Value::String(uid.clone());
-            labels["job-name"] = serde_json::Value::String(name.clone());
+            let labels = template
+                .metadata
+                .labels
+                .get_or_insert_with(Default::default);
+            labels.insert(
+                "batch.kubernetes.io/controller-uid".to_string(),
+                serde_json::Value::String(uid.clone()),
+            );
+            labels.insert(
+                "batch.kubernetes.io/job-name".to_string(),
+                serde_json::Value::String(name.clone()),
+            );
+            labels.insert(
+                "controller-uid".to_string(),
+                serde_json::Value::String(uid.clone()),
+            );
+            labels.insert("job-name".to_string(), serde_json::Value::String(name));
 
             // Set spec.selector.matchLabels to the prefixed controller-uid label.
-            obj["spec"]["selector"] = serde_json::json!({
+            spec.selector = Some(serde_json::json!({
                 "matchLabels": {
                     "batch.kubernetes.io/controller-uid": uid
                 }
-            });
+            }));
         }
     }
+
+    spec.rest["template"] =
+        serde_json::to_value(&template).expect("DefaultingPodTemplate is always serializable");
+    obj["spec"] = serde_json::to_value(&spec).expect("JobSpec is always serializable");
 }
 
 fn default_cronjob(obj: &mut serde_json::Value) {
@@ -849,54 +918,46 @@ fn strip_null_cronjob_template_metadata(obj: &mut serde_json::Value) {
 }
 
 fn default_deployment(obj: &mut serde_json::Value) {
+    let mut spec: DeploymentSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Upstream kube-apiserver rejects Deployments without spec.selector; u7s stores
     // them as-is, so the KCM deployment-controller hits a nil selector and panics.
-    if obj["spec"]["selector"].is_null() {
-        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
-        if labels.is_object() {
-            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
-        }
-    }
+    default_selector_from_template_labels(&mut spec.selector, &obj["spec"]["template"]);
 
     // spec.replicas defaults to 1
-    if obj["spec"]["replicas"].is_null() {
-        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    if spec.replicas.is_none() {
+        spec.replicas = Some(1);
     }
 
     // spec.revisionHistoryLimit defaults to 10
-    if obj["spec"]["revisionHistoryLimit"].is_null() {
-        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    if spec.revision_history_limit.is_none() {
+        spec.revision_history_limit = Some(10);
     }
 
     // spec.progressDeadlineSeconds defaults to 600
-    if obj["spec"]["progressDeadlineSeconds"].is_null() {
-        obj["spec"]["progressDeadlineSeconds"] = serde_json::Value::Number(600.into());
+    if spec.progress_deadline_seconds.is_none() {
+        spec.progress_deadline_seconds = Some(600);
     }
 
     // spec.strategy.type defaults to "RollingUpdate"
-    if obj["spec"]["strategy"]["type"].is_null() {
-        // Ensure spec.strategy exists as an object before writing into it.
-        if !obj["spec"]["strategy"].is_object() {
-            obj["spec"]["strategy"] = serde_json::json!({});
-        }
-        obj["spec"]["strategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    let strategy = spec.strategy.get_or_insert_with(Default::default);
+    if strategy.r#type.is_none() {
+        strategy.r#type = Some("RollingUpdate".to_string());
     }
 
     // spec.strategy.rollingUpdate defaults only when strategy type is RollingUpdate.
-    if obj["spec"]["strategy"]["type"].as_str() == Some("RollingUpdate") {
-        if !obj["spec"]["strategy"]["rollingUpdate"].is_object() {
-            obj["spec"]["strategy"]["rollingUpdate"] = serde_json::json!({});
+    if strategy.r#type.as_deref() == Some("RollingUpdate") {
+        let rolling_update = strategy.rolling_update.get_or_insert_with(Default::default);
+        if rolling_update.max_surge.is_none() {
+            rolling_update.max_surge = Some(serde_json::Value::String("25%".to_string()));
         }
-        if obj["spec"]["strategy"]["rollingUpdate"]["maxSurge"].is_null() {
-            obj["spec"]["strategy"]["rollingUpdate"]["maxSurge"] =
-                serde_json::Value::String("25%".into());
-        }
-        if obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"].is_null() {
-            obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"] =
-                serde_json::Value::String("25%".into());
+        if rolling_update.max_unavailable.is_none() {
+            rolling_update.max_unavailable = Some(serde_json::Value::String("25%".to_string()));
         }
     }
+
+    obj["spec"] = serde_json::to_value(&spec).expect("DeploymentSpec is always serializable");
 }
 
 /// Default `spec.behavior.scaleUp`/`scaleDown` scaling rules on a HorizontalPodAutoscaler,
@@ -925,32 +986,37 @@ fn default_hpa(obj: &mut serde_json::Value) {
         return;
     }
 
-    if obj["spec"]["behavior"]["scaleUp"].is_object() {
-        if obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"].is_null() {
-            obj["spec"]["behavior"]["scaleUp"]["stabilizationWindowSeconds"] =
-                serde_json::Value::Number(0.into());
+    let mut behavior: HpaBehavior =
+        serde_json::from_value(obj["spec"]["behavior"].clone()).unwrap_or_default();
+    default_hpa_behavior(&mut behavior);
+    obj["spec"]["behavior"] =
+        serde_json::to_value(&behavior).expect("HpaBehavior is always serializable");
+}
+
+fn default_hpa_behavior(behavior: &mut HpaBehavior) {
+    if let Some(scale_up) = behavior.scale_up.as_mut() {
+        if scale_up.stabilization_window_seconds.is_none() {
+            scale_up.stabilization_window_seconds = Some(0);
         }
-        if obj["spec"]["behavior"]["scaleUp"]["selectPolicy"].is_null() {
-            obj["spec"]["behavior"]["scaleUp"]["selectPolicy"] =
-                serde_json::Value::String("Max".to_string());
+        if scale_up.select_policy.is_none() {
+            scale_up.select_policy = Some("Max".to_string());
         }
-        if obj["spec"]["behavior"]["scaleUp"]["policies"].is_null() {
-            obj["spec"]["behavior"]["scaleUp"]["policies"] = serde_json::json!([
+        if scale_up.policies.is_none() {
+            scale_up.policies = Some(serde_json::json!([
                 { "type": "Pods", "value": 4, "periodSeconds": 15 },
                 { "type": "Percent", "value": 100, "periodSeconds": 15 }
-            ]);
+            ]));
         }
     }
 
-    if obj["spec"]["behavior"]["scaleDown"].is_object() {
-        if obj["spec"]["behavior"]["scaleDown"]["selectPolicy"].is_null() {
-            obj["spec"]["behavior"]["scaleDown"]["selectPolicy"] =
-                serde_json::Value::String("Max".to_string());
+    if let Some(scale_down) = behavior.scale_down.as_mut() {
+        if scale_down.select_policy.is_none() {
+            scale_down.select_policy = Some("Max".to_string());
         }
-        if obj["spec"]["behavior"]["scaleDown"]["policies"].is_null() {
-            obj["spec"]["behavior"]["scaleDown"]["policies"] = serde_json::json!([
+        if scale_down.policies.is_none() {
+            scale_down.policies = Some(serde_json::json!([
                 { "type": "Percent", "value": 100, "periodSeconds": 15 }
-            ]);
+            ]));
         }
     }
 }
@@ -4367,6 +4433,362 @@ mod tests {
             "caller-set stabilizationWindowSeconds must not be overwritten on a repeat \
              apply_defaults call (e.g. a subsequent update) — that would silently reset a \
              user's explicit scale-up stabilization window back to 0"
+        );
+    }
+}
+
+/// Regression tests for the typed-struct migration itself (mayor-ds8hb).
+///
+/// These tests exist independently of the behavioral tests above: they exist to
+/// verify the *migration's own safety property* — that fields a `default_X`
+/// function does not know about survive a defaulting pass unchanged (the
+/// `rest: Value` catch-all). PR #1024 (mayor-xv1pk) shipped because a
+/// Value-tree-based defaulting path had no structural guarantee that an
+/// unlisted-but-real field would survive; a struct with a named field for
+/// every reasoned-about value and `rest` for everything else makes that class
+/// of silent field loss structurally impossible to reintroduce here.
+#[cfg(test)]
+mod typed_struct_migration_tests {
+    use super::*;
+    use crate::types::{CsiDriverSpec, HpaBehavior, HpaScalingRules};
+
+    /// CSIDriver defaulting must preserve a spec field this codebase intentionally
+    /// does not model (`seLinuxMount`, gated upstream behind an alpha feature flag —
+    /// see the doc comment on `default_csidriver`) alongside applying its own defaults.
+    /// If `CsiDriverSpec`'s `rest` flatten were removed or misconfigured, this field
+    /// would silently vanish on the very first write after create.
+    #[test]
+    fn csidriver_defaulting_preserves_unmodeled_spec_field() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSIDriver",
+            "metadata": { "name": "csi.example.com" },
+            "spec": { "seLinuxMount": true }
+        });
+
+        apply_defaults("storage.k8s.io", "csidrivers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["seLinuxMount"], true,
+            "seLinuxMount is not reasoned about by default_csidriver but must survive \
+             the defaulting pass via CsiDriverSpec::rest — losing it would silently \
+             disable a field the client explicitly set"
+        );
+        assert_eq!(
+            obj["spec"]["attachRequired"], true,
+            "known fields must still be defaulted alongside the passthrough field"
+        );
+    }
+
+    /// Directly exercises the typed core function (no JSON round-trip) to prove the
+    /// struct's own field defaulting logic is correct independent of serde wiring.
+    #[test]
+    fn csidriver_spec_fields_default_reads_and_writes_round_trip_on_the_struct_itself() {
+        let mut spec = CsiDriverSpec::default();
+        default_csidriver_spec(&mut spec);
+
+        assert_eq!(spec.attach_required, Some(true));
+        assert_eq!(spec.pod_info_on_mount, Some(false));
+        assert_eq!(spec.storage_capacity, Some(false));
+        assert_eq!(
+            spec.fs_group_policy.as_deref(),
+            Some("ReadWriteOnceWithFSTypeFSGroupPolicy")
+        );
+        assert_eq!(
+            spec.volume_lifecycle_modes.as_deref(),
+            Some(["Persistent".to_string()].as_slice())
+        );
+        assert_eq!(spec.requires_republish, Some(false));
+    }
+
+    /// StorageClass defaulting must preserve top-level fields it never reasons about
+    /// (`allowVolumeExpansion`, `mountOptions`, `parameters`) — these sit at the same
+    /// level as `reclaimPolicy`/`volumeBindingMode` (StorageClass has no `.spec`
+    /// wrapper), so a struct missing its `rest` flatten would drop them entirely.
+    #[test]
+    fn storageclass_defaulting_preserves_unreasoned_top_level_fields() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "custom-sc" },
+            "provisioner": "example.com/driver",
+            "allowVolumeExpansion": true,
+            "mountOptions": ["debug"],
+            "parameters": { "type": "gp3" }
+        });
+
+        apply_defaults("storage.k8s.io", "storageclasses", &mut obj);
+
+        assert_eq!(
+            obj["reclaimPolicy"], "Delete",
+            "reclaimPolicy must still be defaulted"
+        );
+        assert_eq!(
+            obj["allowVolumeExpansion"], true,
+            "allowVolumeExpansion must survive — StorageClassFields does not name this field"
+        );
+        assert_eq!(
+            obj["mountOptions"],
+            serde_json::json!(["debug"]),
+            "mountOptions must survive via StorageClassFields::rest"
+        );
+        assert_eq!(
+            obj["parameters"]["type"], "gp3",
+            "parameters must survive via StorageClassFields::rest"
+        );
+        assert_eq!(
+            obj["provisioner"], "example.com/driver",
+            "provisioner must survive — it is a top-level field StorageClassFields does not name"
+        );
+    }
+
+    /// PVC defaulting must preserve spec/status fields it never reasons about
+    /// (`storageClassName`, `accessModes`, `capacity`) alongside `status.phase`/
+    /// `spec.volumeMode` defaulting.
+    #[test]
+    fn pvc_defaulting_preserves_unreasoned_spec_and_status_fields() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "data", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "fast-ssd",
+                "resources": { "requests": { "storage": "5Gi" } }
+            },
+            "status": {
+                "capacity": { "storage": "5Gi" },
+                "accessModes": ["ReadWriteOnce"]
+            }
+        });
+
+        apply_defaults("", "persistentvolumeclaims", &mut obj);
+
+        assert_eq!(
+            obj["status"]["phase"], "Pending",
+            "phase must still be defaulted"
+        );
+        assert_eq!(
+            obj["spec"]["volumeMode"], "Filesystem",
+            "volumeMode must still be defaulted"
+        );
+        assert_eq!(
+            obj["spec"]["storageClassName"], "fast-ssd",
+            "storageClassName must survive — PersistentVolumeSpecFields only names volumeMode"
+        );
+        assert_eq!(
+            obj["spec"]["resources"]["requests"]["storage"], "5Gi",
+            "resources must survive via PersistentVolumeSpecFields::rest"
+        );
+        assert_eq!(
+            obj["status"]["capacity"]["storage"], "5Gi",
+            "status.capacity must survive via PersistentVolumeStatusFields::rest"
+        );
+    }
+
+    /// Service defaulting must preserve a spec-level field it never reasons about
+    /// (`externalTrafficPolicy`) and a per-port field it never reasons about
+    /// (`appProtocol`, `name`) alongside type/sessionAffinity/targetPort/protocol
+    /// defaulting.
+    #[test]
+    fn service_defaulting_preserves_unreasoned_spec_and_port_fields() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "externalTrafficPolicy": "Local",
+                "selector": { "app": "web" },
+                "ports": [{ "name": "https", "port": 443, "appProtocol": "https" }]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["type"], "ClusterIP",
+            "type must still be defaulted"
+        );
+        assert_eq!(
+            obj["spec"]["externalTrafficPolicy"], "Local",
+            "externalTrafficPolicy must survive — ServiceSpec does not name this field"
+        );
+        assert_eq!(
+            obj["spec"]["selector"]["app"], "web",
+            "selector must survive via ServiceSpec::rest"
+        );
+        assert_eq!(
+            obj["spec"]["ports"][0]["name"], "https",
+            "port name must survive — ServicePort does not name this field"
+        );
+        assert_eq!(
+            obj["spec"]["ports"][0]["appProtocol"], "https",
+            "appProtocol must survive via ServicePort::rest"
+        );
+        assert_eq!(
+            obj["spec"]["ports"][0]["targetPort"], 443,
+            "targetPort must still be defaulted from port"
+        );
+    }
+
+    /// Deployment defaulting must preserve spec fields it never reasons about
+    /// (`paused`, `minReadySeconds`) and a strategy.rollingUpdate field it never
+    /// reasons about, alongside selector/replicas/strategy defaulting.
+    #[test]
+    fn deployment_defaulting_preserves_unreasoned_spec_and_strategy_fields() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "web" },
+            "spec": {
+                "paused": true,
+                "minReadySeconds": 5,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {},
+                "strategy": { "rollingUpdate": { "maxSurge": 1 } }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["strategy"]["type"], "RollingUpdate",
+            "strategy.type must still default"
+        );
+        assert_eq!(
+            obj["spec"]["paused"], true,
+            "paused must survive — DeploymentSpec does not name this field"
+        );
+        assert_eq!(
+            obj["spec"]["minReadySeconds"], 5,
+            "minReadySeconds must survive via DeploymentSpec::rest"
+        );
+        assert_eq!(
+            obj["spec"]["strategy"]["rollingUpdate"]["maxSurge"], 1,
+            "an explicit maxSurge must not be overwritten by the 25% default"
+        );
+        assert_eq!(
+            obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"], "25%",
+            "maxUnavailable must still be defaulted per-field, independent of maxSurge"
+        );
+    }
+
+    /// Job defaulting must preserve pod template fields it never reasons about
+    /// (`containers`, `restartPolicy`) alongside the label-injection and
+    /// backoffLimit/parallelism defaulting.
+    #[test]
+    fn job_defaulting_preserves_unreasoned_pod_template_fields() {
+        let uid = "11111111-2222-3333-4444-555555555555";
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "my-job", "namespace": "default", "uid": uid },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [{ "name": "c", "image": "busybox" }]
+                    }
+                }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["backoffLimit"], 6,
+            "backoffLimit must still be defaulted"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["spec"]["restartPolicy"], "Never",
+            "restartPolicy must survive — DefaultingPodTemplateSpec does not name this field"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["spec"]["containers"][0]["image"], "busybox",
+            "containers must survive via DefaultingPodTemplateSpec::rest — losing them \
+             would silently empty every Job's pod template"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"]["batch.kubernetes.io/controller-uid"],
+            uid,
+            "label injection must still happen on the same template object whose \
+             unreasoned fields were preserved"
+        );
+    }
+
+    /// HorizontalPodAutoscaler behavior defaulting must preserve a field on
+    /// `scaleUp` it never reasons about (`tolerance`) alongside
+    /// stabilizationWindowSeconds/selectPolicy/policies defaulting. Exercises the
+    /// typed core function directly, independent of JSON wiring.
+    #[test]
+    fn hpa_behavior_fields_preserve_unreasoned_tolerance_field() {
+        let mut behavior = HpaBehavior {
+            scale_up: Some(HpaScalingRules {
+                stabilization_window_seconds: None,
+                select_policy: None,
+                policies: None,
+                rest: serde_json::json!({ "tolerance": "20m" }),
+            }),
+            scale_down: None,
+            rest: serde_json::Value::Object(Default::default()),
+        };
+
+        default_hpa_behavior(&mut behavior);
+
+        let scale_up = behavior.scale_up.unwrap();
+        assert_eq!(scale_up.stabilization_window_seconds, Some(0));
+        assert_eq!(scale_up.select_policy.as_deref(), Some("Max"));
+        assert!(scale_up.policies.is_some());
+        assert_eq!(
+            scale_up.rest["tolerance"], "20m",
+            "tolerance must survive on the struct itself via HpaScalingRules::rest"
+        );
+    }
+
+    /// A CSIDriver with `spec` entirely absent must still get every pointer-typed
+    /// field defaulted — matching the existing Value-tree behavior, where indexing
+    /// into a missing `spec` autovivifies it to `{}` before the field checks run.
+    /// This is the "missing field" contract the typed struct must preserve: an
+    /// absent `spec` is not a rejection path here (validation, if any, happens
+    /// elsewhere in the request pipeline), it is treated identically to `spec: {}`.
+    #[test]
+    fn csidriver_with_spec_entirely_absent_still_gets_full_defaults() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSIDriver",
+            "metadata": { "name": "csi.example.com" }
+        });
+
+        apply_defaults("storage.k8s.io", "csidrivers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["attachRequired"], true,
+            "an entirely absent spec must be treated as an empty object, not skipped — \
+             CsiDriverSpec::default() plus unwrap_or_default() must reproduce the same \
+             autovivify-then-default behavior the raw Value indexing had"
+        );
+        assert_eq!(obj["spec"]["requiresRepublish"], false);
+    }
+
+    /// RoleBinding defaulting must preserve `roleRef.kind`/`roleRef.name` — fields
+    /// `RoleRefFields` does not name — alongside the `apiGroup` default.
+    #[test]
+    fn role_ref_defaulting_preserves_kind_and_name() {
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "b", "namespace": "default" },
+            "roleRef": { "kind": "Role", "name": "my-role" }
+        });
+
+        apply_defaults("rbac.authorization.k8s.io", "rolebindings", &mut obj);
+
+        assert_eq!(obj["roleRef"]["apiGroup"], "rbac.authorization.k8s.io");
+        assert_eq!(
+            obj["roleRef"]["kind"], "Role",
+            "roleRef.kind must survive — RoleRefFields only names apiGroup"
+        );
+        assert_eq!(
+            obj["roleRef"]["name"], "my-role",
+            "roleRef.name must survive via RoleRefFields::rest"
         );
     }
 }
