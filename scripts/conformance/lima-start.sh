@@ -479,6 +479,7 @@ fi
 
 # Create cert Secret for konnectivity-agent pod so the pod can mount the mTLS certs
 # without copying binaries or tokens into the VM host filesystem.
+# shellcheck disable=SC2086
 kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent-certs${NODE_SUFFIX} \
   --from-file=ca.crt="$WORKDIR/ca.pem" \
   --from-file=tls.crt="$WORKDIR/konnectivity-agent.crt" \
