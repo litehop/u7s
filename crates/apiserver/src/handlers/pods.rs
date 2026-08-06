@@ -4171,6 +4171,36 @@ fn validate_pod_sysctls(pod: &serde_json::Value) -> Result<(), String> {
     }
 }
 
+/// Extract the effective tag from a container image reference, mirroring upstream
+/// `ParseImageName` (pkg/util/parsers/parsers.go @ v1.36.0), which itself wraps
+/// `dockerref.ParseNormalizedNamed`.
+///
+/// Registry hosts may embed a port (`registry.example.com:5000/nginx:v1`), so a colon
+/// is only a tag delimiter when it occurs strictly after the last `/` — a colon before
+/// the last slash is part of the host:port, not a tag. A bare reference with neither
+/// tag nor digest (`nginx`, `registry:5000/nginx`) is `:latest` by Docker convention.
+/// A digest-only reference (`nginx@sha256:...`) has no tag — upstream's
+/// `ParseImageName` only backfills "latest" when BOTH tag and digest are absent, so
+/// a digest pin does NOT get treated as "latest" even though it also has no explicit tag.
+fn parse_image_tag(image: &str) -> &str {
+    let (name_and_tag, has_digest) = match image.split_once('@') {
+        Some((n, _)) => (n, true),
+        None => (image, false),
+    };
+    let slash_idx = name_and_tag.rfind('/');
+    let colon_idx = name_and_tag.rfind(':');
+    let tag = match (colon_idx, slash_idx) {
+        (Some(c), Some(s)) if c > s => &name_and_tag[c + 1..],
+        (Some(c), None) => &name_and_tag[c + 1..],
+        _ => "",
+    };
+    if tag.is_empty() && !has_digest {
+        "latest"
+    } else {
+        tag
+    }
+}
+
 /// Apply spec-only defaults to a pod's spec fields.
 ///
 /// This must NOT touch pod.status — callers on the update path rely on it being
@@ -4357,6 +4387,22 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
                 {
                     container["terminationMessagePolicy"] =
                         serde_json::Value::String("File".to_string());
+                }
+                // imagePullPolicy: default per upstream SetDefaults_Container
+                // (pkg/apis/core/v1/defaults.go:82-93 @ v1.36.0) when absent or empty.
+                // The kubelet's imagePullPrecheck (image_manager.go:117-127) is a `switch
+                // pullPolicy` over Always/IfNotPresent/Never with NO default case — an
+                // empty policy falls through to the same unconditional-repull path as
+                // PullAlways, so every container start re-pulls the image regardless of
+                // whether it's already cached locally.
+                if container["imagePullPolicy"].is_null() || container["imagePullPolicy"] == "" {
+                    let image = container["image"].as_str().unwrap_or("");
+                    let policy = if parse_image_tag(image) == "latest" {
+                        "Always"
+                    } else {
+                        "IfNotPresent"
+                    };
+                    container["imagePullPolicy"] = serde_json::Value::String(policy.to_string());
                 }
                 if let Some(env) = container["env"].as_array_mut() {
                     for var in env {
@@ -6313,6 +6359,235 @@ mod create_defaults_tests {
             pod["spec"]["containers"][0]["terminationMessagePolicy"], "File",
             "the pre-existing container's terminationMessagePolicy must be unchanged by \
              the second pass — the re-apply must be idempotent, not just additive"
+        );
+    }
+
+    // --- imagePullPolicy defaulting tests ---
+    //
+    // NOTE: idempotency for this field is already covered by the pre-existing
+    // `applying_defaults_twice_is_idempotent` test above (full-pod equality across two
+    // passes) — the bare "nginx" image there exercises the "no tag -> Always" default,
+    // so a regression here would already fail that test too.
+
+    /// A container with a pinned, non-latest tag and no explicit imagePullPolicy must
+    /// default to IfNotPresent, matching upstream SetDefaults_Container
+    /// (pkg/apis/core/v1/defaults.go:82-93 @ v1.36.0).
+    ///
+    /// Without this default, kubelet's imagePullPrecheck (image_manager.go:117-127) is a
+    /// `switch pullPolicy` with NO default case: an empty policy falls through to the
+    /// same unconditional-repull path as PullAlways, so u7s re-pulls the same image on
+    /// every container start regardless of local cache state — verified 29x for a single
+    /// digest in the mayor-xv1pk 0806-0217 csi-hostpath run, versus exactly once for a
+    /// sibling container that had an explicit IfNotPresent.
+    #[test]
+    fn container_without_image_pull_policy_and_non_latest_tag_defaults_to_if_not_present() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:v1.2"}]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["imagePullPolicy"],
+            serde_json::json!("IfNotPresent"),
+            "a pinned non-latest tag must default to IfNotPresent — leaving it empty \
+             falls through kubelet's unhandled-default switch and re-pulls the image on \
+             every container start, defeating the local image cache"
+        );
+    }
+
+    /// A container with an explicit ":latest" tag and no imagePullPolicy must default to
+    /// Always, matching upstream SetDefaults_Container — latest-tag content is expected
+    /// to drift, so kubelet must re-check the registry on every start.
+    #[test]
+    fn container_without_image_pull_policy_and_latest_tag_defaults_to_always() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:latest"}]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["imagePullPolicy"],
+            serde_json::json!("Always"),
+            "an explicit :latest tag must default imagePullPolicy to Always, matching \
+             upstream SetDefaults_Container — latest is expected to drift and must always \
+             be re-checked against the registry"
+        );
+    }
+
+    /// A bare image reference with no tag at all (`nginx`) is `:latest` by Docker
+    /// convention, so it must get the same Always default as an explicit `:latest`.
+    #[test]
+    fn container_without_image_pull_policy_and_no_tag_defaults_to_always() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["imagePullPolicy"],
+            serde_json::json!("Always"),
+            "a bare image reference with no tag is implicitly :latest per Docker \
+             convention and upstream's ParseImageName — defaulting it to IfNotPresent \
+             instead would pin a pod to whatever happened to be cached at first pull"
+        );
+    }
+
+    /// An explicit imagePullPolicy must never be overwritten by the default, even when
+    /// the image tag would otherwise suggest a different policy (here: latest -> Always).
+    #[test]
+    fn container_with_explicit_image_pull_policy_is_preserved() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx:latest",
+                    "imagePullPolicy": "IfNotPresent"
+                }]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["imagePullPolicy"],
+            serde_json::json!("IfNotPresent"),
+            "an explicit imagePullPolicy must not be overwritten by the tag-based default \
+             — a user who deliberately pinned IfNotPresent on a :latest image (e.g. to \
+             avoid registry calls in an air-gapped cluster) must keep that choice"
+        );
+    }
+
+    /// initContainers and ephemeralContainers must receive the same imagePullPolicy
+    /// default as regular containers — the kubelet applies imagePullPrecheck identically
+    /// to all three container kinds, so leaving init/ephemeral containers undefaulted
+    /// would reintroduce the unconditional-repull bug for exactly those container kinds.
+    #[test]
+    fn init_container_and_ephemeral_container_are_also_defaulted() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:v1"}],
+                "initContainers": [{"name": "init", "image": "busybox:1.36"}],
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox:1.36"}]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["initContainers"][0]["imagePullPolicy"],
+            serde_json::json!("IfNotPresent"),
+            "initContainers must be defaulted identically to containers — kubelet's \
+             imagePullPrecheck applies to init containers too, so skipping them here \
+             would leave init containers re-pulling on every restart"
+        );
+        assert_eq!(
+            pod["spec"]["ephemeralContainers"][0]["imagePullPolicy"],
+            serde_json::json!("IfNotPresent"),
+            "ephemeralContainers must be defaulted identically to containers — \
+             `kubectl debug` injects these, and an undefaulted policy would re-pull the \
+             debug image on every ephemeral container (re)start"
+        );
+    }
+
+    /// Registry hosts may embed a port (`host:5000/image:tag`); the tag-parsing logic
+    /// must not mistake the port for a tag. This is the classic image-reference parsing
+    /// pitfall (naively splitting on the first or last ':' in the whole string).
+    #[test]
+    fn image_with_registry_port_does_not_confuse_tag_parsing() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "registry.example.com:5000/nginx:v1"
+                }]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["imagePullPolicy"],
+            serde_json::json!("IfNotPresent"),
+            "the registry's port (:5000) must not be mistaken for the image tag — doing \
+             so would read the tag as '5000' (not 'v1'), which is never 'latest' by \
+             coincidence, but is fragile and diverges from upstream's actual parser \
+             (dockerref.ParseNormalizedNamed), which uses the last colon after the last \
+             slash as the tag delimiter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_image_tag_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_tag_is_extracted_verbatim() {
+        assert_eq!(
+            parse_image_tag("nginx:v1.2.3"),
+            "v1.2.3",
+            "a pinned tag must be returned as-is — this is what upstream's \
+             SetDefaults_Container compares against \"latest\" to choose IfNotPresent"
+        );
+    }
+
+    #[test]
+    fn explicit_latest_tag_is_extracted() {
+        assert_eq!(
+            parse_image_tag("nginx:latest"),
+            "latest",
+            "an explicit :latest tag must round-trip as \"latest\" so the caller defaults \
+             imagePullPolicy to Always, matching upstream's drift-expected semantics"
+        );
+    }
+
+    #[test]
+    fn absent_tag_and_digest_defaults_to_latest() {
+        assert_eq!(
+            parse_image_tag("nginx"),
+            "latest",
+            "Docker treats a bare name with no tag as :latest — upstream's ParseImageName \
+             backfills \"latest\" only when BOTH tag and digest are absent"
+        );
+    }
+
+    /// Upstream's `ParseImageName` only backfills "latest" when BOTH tag and digest are
+    /// absent (parsers.go: `if len(tag) == 0 && len(digest) == 0`). A digest pins exact
+    /// content, so a digest-only reference must NOT be treated as "latest" even though it
+    /// also has no explicit tag — otherwise a digest-pinned image would get PullAlways,
+    /// causing a needless registry round-trip on every start despite being immutable.
+    #[test]
+    fn digest_only_reference_is_not_treated_as_latest() {
+        assert_ne!(
+            parse_image_tag(
+                "nginx@sha256:2cd1d97f2f7ab93c8b7c2c2c8e6e6d6e40d0e1a49e2c4b1e5a4b3c2d1e0f9a8b"
+            ),
+            "latest",
+            "a digest-only reference must not be treated as :latest — upstream's parser \
+             only defaults the tag to latest when there is no digest either; digest \
+             content is pinned and immutable"
+        );
+    }
+
+    #[test]
+    fn registry_port_before_last_slash_is_not_mistaken_for_a_tag() {
+        assert_eq!(
+            parse_image_tag("registry.example.com:5000/nginx:v1"),
+            "v1",
+            "a colon before the last slash is part of host:port, not a tag delimiter — \
+             mistaking :5000 for the tag would misclassify every image pulled from a \
+             registry running on a non-default port"
+        );
+    }
+
+    #[test]
+    fn registry_port_with_no_tag_defaults_to_latest() {
+        assert_eq!(
+            parse_image_tag("registry.example.com:5000/nginx"),
+            "latest",
+            "a registry-with-port reference and no tag is still implicitly :latest — the \
+             port colon (before the last slash) must not be mistaken for an explicit tag \
+             that would otherwise suppress the latest default"
         );
     }
 }
