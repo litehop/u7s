@@ -11,13 +11,19 @@ use tokio::sync::{broadcast, Mutex};
 /// ring fully turns over in well under a minute, which is shorter than the gap a client can
 /// see between its LIST call and opening the follow-up watch — that gap alone was enough to
 /// trigger spurious HTTP 410 "too old resource version" failures (e.g. the [sig-apps]
-/// StatefulSet status-endpoints conformance test). 100_000 gives ~46 minutes of retention at
-/// the observed rate, a wide safety margin over any realistic LIST-to-Watch latency, at an
-/// acceptable memory cost (~100-200MB for a typical Pod/Lease-heavy mix). This ring is still
-/// global across all resource types (per-resource-type sharding is tracked separately), so a
-/// single busy resource type can still evict a quiet one's history — just with 100x more
-/// headroom before it does.
-const RING_CAPACITY: usize = 100_000;
+/// StatefulSet status-endpoints conformance test). mayor-jzlon bumped this to 100_000 on
+/// 2026-08-03 for that scenario, giving ~46 minutes of retention at the observed burst rate.
+///
+/// A full 60-minute conformance run measured on 2026-08-06
+/// (ai/findings/stamp-resource-version-growth-investigation-2026-08-06.md) put actual
+/// sustained load at only ~20,229 ring-pushes total (~5.6 events/sec) — the ring never
+/// evicted a single entry at the 100k cap. Reduced to 10_000 (mayor-h3zlt): still ~30
+/// minutes of retention at the observed sustained rate, far longer than any realistic
+/// LIST-to-Watch reconnect gap, at an acceptable memory cost (~10-20MB for a typical
+/// Pod/Lease-heavy mix). This ring is still global across all resource types
+/// (per-resource-type sharding is tracked separately), so a single busy resource type can
+/// still evict a quiet one's history — just with 10x more headroom before it does.
+const RING_CAPACITY: usize = 10_000;
 const BROADCAST_CAPACITY: usize = 2048;
 
 /// Deletion-log storage: `by_key` gives O(1) lookup for evict-on-recreate and the
@@ -2078,8 +2084,9 @@ mod tests {
                 guard.len(),
                 RING_CAPACITY,
                 "ring must cap at exactly RING_CAPACITY entries after RING_CAPACITY+1 pushes; \
-                 growing past this means the 100_000-entry retention budget (and its ~100-200MB \
-                 memory estimate) no longer holds, and the ring would grow unboundedly on a \
+                 growing past this means the RING_CAPACITY-entry retention budget (and its \
+                 accompanying memory estimate, see the constant's doc comment) no longer holds, \
+                 and the ring would grow unboundedly on a \
                  long-running server"
             );
         }
@@ -2092,6 +2099,61 @@ mod tests {
              request a resourceVersion whose event was actually evicted from the ring, causing \
              it to silently miss events instead of getting an immediate HTTP 410 telling it to \
              relist"
+        );
+    }
+
+    /// RING_CAPACITY was cut from 100_000 to 10_000 (mayor-h3zlt) after measuring the full
+    /// 60-minute 0806-1102 conformance run: only ~20,229 ring-pushes total (~5.6 events/sec
+    /// sustained), and the 100k ring never evicted a single entry — 5x more capacity than the
+    /// sustained load needs. A 10k ring still holds ~30 minutes of history at that rate, well
+    /// past any realistic LIST-to-Watch reconnect gap.
+    ///
+    /// Why it matters: `ring_buffer_caps_at_ring_capacity_and_advances_horizon_on_evict` above
+    /// asserts eviction purely in terms of the `RING_CAPACITY` symbol, so it passes unchanged
+    /// no matter what value the constant holds — it cannot catch an accidental revert back
+    /// toward 100_000 (re-inflating the ring's memory footprint ~10x with zero measured
+    /// benefit). This test pins the concrete value and independently confirms eviction drops
+    /// exactly the overflow amount, oldest-first.
+    #[tokio::test]
+    async fn ring_capacity_is_pinned_to_10k_and_evicts_oldest_first() {
+        assert_eq!(
+            RING_CAPACITY, 10_000,
+            "RING_CAPACITY must stay at the measured-and-justified 10_000 (mayor-h3zlt); if \
+             this fails, someone changed the constant without updating this pinned assertion — \
+             confirm the new value is backed by fresh measurement, not a guess, before adjusting \
+             this test"
+        );
+
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        const OVERFLOW: u64 = 100;
+        for i in 0..(RING_CAPACITY as u64 + OVERFLOW) {
+            store.push_event(Arc::new(InternalEvent {
+                key: format!("/registry/core/configmaps/default/cm-{i}"),
+                revision: i + 1,
+                value: Some(svc_value(&format!("cm-{i}"), i + 1)),
+                is_create: true,
+                deleted_body: None,
+            }));
+        }
+
+        let guard = store.ring.read().expect("ring poisoned");
+        assert_eq!(
+            guard.len(),
+            RING_CAPACITY,
+            "pushing RING_CAPACITY + 100 events must leave the ring at exactly RING_CAPACITY \
+             entries — anything more means the reduced 10k cap no longer bounds memory as \
+             intended"
+        );
+        assert_eq!(
+            guard
+                .front()
+                .expect("ring must not be empty after pushes")
+                .revision,
+            OVERFLOW + 1,
+            "the oldest surviving entry must be revision 101 — the first 100 pushed events \
+             (revisions 1..=100) must have been evicted to make room; a lower revision here \
+             means eviction fired too few times, silently growing the ring past its cap"
         );
     }
 
