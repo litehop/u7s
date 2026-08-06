@@ -56,9 +56,23 @@ pub(crate) async fn core_list_resource<S: Store>(
                 )));
             }
         }
+        // metrics-server's cluster-wide Pod-metadata informer (and kcm's GC) negotiate this
+        // Accept header on LIST+WATCH; without honoring it here, their metadata-only decoder
+        // rejects the typed Pod/PodList response and the informer never populates (metrics-server
+        // silently returns empty PodMetrics for every labelSelector-filtered query, which is
+        // exactly what the HPA controller always issues).
+        let pom = super::generic::wants_partial_object_metadata(accept);
 
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
+            let (watch_api_version, watch_kind) = if pom {
+                (
+                    "meta.k8s.io/v1".to_string(),
+                    "PartialObjectMetadata".to_string(),
+                )
+            } else {
+                ("v1".to_string(), "Pod".to_string())
+            };
             let from_rv = query.resource_version.unwrap_or(0);
             // Fetch initial events with field-selector filtering applied.
             // Without filtering, kubelet (which watches with fieldSelector=spec.nodeName=<node>)
@@ -99,15 +113,15 @@ pub(crate) async fn core_list_resource<S: Store>(
                 state,
                 WatchConfig {
                     prefix,
-                    api_version: "v1".into(),
-                    kind: "Pod".into(),
+                    api_version: watch_api_version,
+                    kind: watch_kind,
                     from_revision: from_rv,
                     initial_items: initial,
                     label_selector: query.label_selector,
                     field_selector: query.field_selector,
                     allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
                     username: user.username,
-                    as_partial_object_metadata: false,
+                    as_partial_object_metadata: pom,
                     group: "".into(),
                     plural: "pods".into(),
                     timeout_seconds: query.timeout_seconds,
@@ -162,6 +176,20 @@ pub(crate) async fn core_list_resource<S: Store>(
             items
         };
         tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
+
+        if pom {
+            let pom_items: Vec<serde_json::Value> = items
+                .iter()
+                .map(super::watch::to_partial_object_metadata)
+                .collect();
+            let body = serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadataList",
+                "metadata": { "resourceVersion": list_revision.to_string() },
+                "items": pom_items
+            });
+            return Ok(Json(body).into_response());
+        }
 
         // `kubectl get pods -A` sends the same Accept: application/json;as=Table;... header
         // as `kubectl get pods -n <ns>` (list_pods, which already handles this). Without this,
@@ -836,6 +864,195 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    /// metrics-server's cluster-wide Pod-metadata informer negotiates
+    /// `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1` on
+    /// `GET /api/v1/pods`. Before this fix, core_list_resource's pods branch always returned
+    /// a plain PodList, which metrics-server's metadata-only decoder rejects; the informer's
+    /// LIST+WATCH never succeeds, its Pod-label cache never populates, and every
+    /// labelSelector-filtered PodMetrics query the HPA controller issues then returns empty,
+    /// silently breaking every HPA scale-up decision.
+    #[tokio::test]
+    async fn core_list_pods_returns_partial_object_metadata_list_when_requested() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "ns-a"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(
+                "/registry/pods/ns-a/pod-a",
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "metrics-server".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/pods")
+            .header(
+                "accept",
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1",
+            "metrics-server's Pod-metadata cache never populates without \
+             PartialObjectMetadata-shaped LIST/WATCH responses; every labelSelector-filtered \
+             PodMetrics query then returns empty, silently breaking every HPA scale-up decision."
+        );
+        assert_eq!(
+            v["kind"], "PartialObjectMetadataList",
+            "metrics-server's Pod-metadata cache never populates without \
+             PartialObjectMetadata-shaped LIST/WATCH responses; every labelSelector-filtered \
+             PodMetrics query then returns empty, silently breaking every HPA scale-up decision."
+        );
+        let items = v["items"].as_array().expect("must have items");
+        assert_eq!(items.len(), 1, "must return the one seeded pod");
+        assert_eq!(
+            items[0]["kind"], "PartialObjectMetadata",
+            "each POM item must have kind=PartialObjectMetadata, not Pod"
+        );
+        assert!(
+            items[0].get("spec").is_none() && items[0].get("status").is_none(),
+            "POM items must strip spec/status — metrics-server only needs metadata for its \
+             label cache; leaking spec/status here defeats the point of the metadata-only \
+             informer this fix exists to unblock"
+        );
+    }
+
+    /// Same failure mode as the LIST case above, but on the WATCH path: metrics-server's
+    /// reflector opens `watch=true&sendInitialEvents=true` with the PartialObjectMetadata
+    /// Accept header. Before this fix, core_list_resource's watch branch hardcoded
+    /// `apiVersion: "v1"`/`kind: "Pod"`, so the reflector's decode fails with
+    /// "no kind \"Pod\" is registered" and it never completes its initial cache sync.
+    #[tokio::test]
+    async fn core_list_pods_watch_emits_partial_object_metadata_events() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "ns-a"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(
+                "/registry/pods/ns-a/pod-a",
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "metrics-server".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(
+                "/api/v1/pods?watch=true&resourceVersion=0&sendInitialEvents=true&\
+                 allowWatchBookmarks=true&timeoutSeconds=1",
+            )
+            .header(
+                "accept",
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        use tokio::time::{timeout, Duration};
+        let bytes = timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .unwrap_or(Ok(bytes::Bytes::new()))
+        .unwrap_or_default();
+
+        let text = std::str::from_utf8(&bytes).unwrap_or("");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        let added = lines
+            .iter()
+            .find(|v| v["type"] == "ADDED")
+            .expect("watch with sendInitialEvents must emit an ADDED event for the seeded pod");
+        assert_eq!(
+            added["object"]["apiVersion"], "meta.k8s.io/v1",
+            "metrics-server's Pod-metadata cache never populates without \
+             PartialObjectMetadata-shaped LIST/WATCH responses; every labelSelector-filtered \
+             PodMetrics query then returns empty, silently breaking every HPA scale-up decision."
+        );
+        assert_eq!(
+            added["object"]["kind"], "PartialObjectMetadata",
+            "metrics-server's Pod-metadata cache never populates without \
+             PartialObjectMetadata-shaped LIST/WATCH responses; every labelSelector-filtered \
+             PodMetrics query then returns empty, silently breaking every HPA scale-up decision."
+        );
     }
 
     /// `kubectl get service <name>` (and every other core v1 type — configmaps, secrets, ...)
