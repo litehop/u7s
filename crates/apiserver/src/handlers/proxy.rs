@@ -1037,20 +1037,22 @@ pub async fn pod_exec_post<S: Store>(
 
 /// Channel byte values used by the exec subprotocol (v4/v5.channel.k8s.io).
 ///
-/// Kubelet sends a status/close message on channel 3 (error channel) when the
-/// command exits. The real kube-apiserver absorbs this frame and never forwards
-/// it to kubectl. We must do the same: the conformance test reads the first WS
-/// message and asserts it is channel 1 (stdout); if channel 3 arrives first the
-/// test fails with "Got message from server that didn't start with channel 1".
+/// Kubelet sends a JSON-encoded `metav1.Status` on channel 3 (error channel) when
+/// the command exits — `{"status":"Success"}` on a clean exit, or
+/// `{"status":"Failure","reason":"NonZeroExitCode",...}` otherwise. Channel 4 is
+/// the resize/error channel in the v5 subprotocol; also checked for safety.
 ///
-/// Channel 4 is the error channel in the v5 subprotocol; also filtered for safety.
+/// A frame on one of these channels is a *candidate* for absorption, not an
+/// automatic drop — see `exec_status_frame_is_success`, which decides whether it
+/// is actually safe to swallow.
 const EXEC_STATUS_CHANNELS: &[u8] = &[3, 4];
 
-/// Is this a kubelet status/close frame that must not be forwarded to kubectl?
+/// Is this a frame on a channel that may carry a kubelet exec status message?
 ///
 /// Returns true if `data` is non-empty and its first byte is a channel number
-/// that carries only status information (not stdout/stderr data). These frames
-/// are absorbed by the real kube-apiserver and must not reach the kubectl client.
+/// that carries status information rather than stdout/stderr data. This only
+/// identifies the *channel*; whether the frame is actually safe to drop depends
+/// on its JSON payload (see `exec_status_frame_is_success`).
 ///
 /// This function is `pub(crate)` so the regression test can call it directly
 /// without going through a real WebSocket connection.
@@ -1059,12 +1061,37 @@ pub(crate) fn is_exec_status_frame(data: &bytes::Bytes) -> bool {
         .is_some_and(|ch| EXEC_STATUS_CHANNELS.contains(ch))
 }
 
+/// Does this channel-3/4 frame carry a genuine `{"status":"Success"}` exec status?
+///
+/// Kubelet's exec status frame is a JSON-encoded `metav1.Status` (`data[0]` is the
+/// channel byte, `data[1..]` is the JSON body). On a clean exit it is
+/// `{"status":"Success"}`; on a nonzero exit it is `{"status":"Failure",
+/// "reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode",...}]}}`.
+///
+/// Only genuine success frames are absorbed by `run_exec_proxy` — some clients
+/// (e.g. the legacy `channel.k8s.io` conformance test in
+/// `test/e2e/common/node/pods.go`) read raw frames off the wire and fail if any
+/// message other than channel 1 (stdout) arrives first. Failure frames — and
+/// anything that doesn't parse as a recognizable status object — must be
+/// forwarded unchanged: client-go's `remotecommand.StreamExecutor` blocks on this
+/// channel and decodes it into the `exec.CodeExitError` that `kubectl exec`
+/// relies on to report a nonzero exit code (see upstream `errorDecoderV4.decode`).
+/// Dropping failure frames unconditionally — the bug this function fixes — makes
+/// every nonzero exec exit look like a clean success to the caller.
+fn exec_status_frame_is_success(data: &bytes::Bytes) -> bool {
+    data.get(1..)
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_owned))
+        .is_some_and(|status| status == "Success")
+}
+
 /// Open outbound WebSocket to kubelet exec endpoint and relay to inbound kubectl WebSocket.
 ///
-/// Unlike `splice`, this relay filters out kubelet status frames (channel 3/4) in the
-/// kubelet→kubectl direction. Kubelet sends a `{"status":"Success"}` message on channel 3
-/// when the command exits. The real kube-apiserver absorbs this frame; we must do the
-/// same because the conformance test asserts the first received frame is channel 1 (stdout).
+/// Unlike `splice`, this relay absorbs kubelet's genuine success status frame (channel
+/// 3/4, `{"status":"Success"}`) in the kubelet→kubectl direction — the real
+/// kube-apiserver does the same, and some clients fail if it arrives ahead of stdout
+/// (see `exec_status_frame_is_success`). Failure status frames are forwarded unchanged
+/// so `kubectl exec` can report the real exit code.
 ///
 /// The kubectl→kubelet direction is relayed unchanged.
 async fn run_exec_proxy(inbound: WebSocket, target: ExecTarget) -> anyhow::Result<()> {
@@ -1107,17 +1134,20 @@ async fn run_exec_proxy(inbound: WebSocket, target: ExecTarget) -> anyhow::Resul
         }
     });
 
-    // kubelet→kubectl: filter out status frames (channel 3/4) before forwarding.
+    // kubelet→kubectl: absorb only genuine success status frames (channel 3/4);
+    // forward everything else, including failure/NonZeroExitCode status frames,
+    // unchanged so kubectl can see the real exit code.
     let read_kubelet = tokio::spawn(async move {
         while let Some(data) = kubelet_r.recv().await {
-            if is_exec_status_frame(&data) {
-                // Absorb kubelet status/close frames — do not forward to kubectl.
-                // The real kube-apiserver does the same. Forwarding these causes the
-                // conformance test to fail: "Got message from server that didn't start
-                // with channel 1 (STDOUT)".
+            if is_exec_status_frame(&data) && exec_status_frame_is_success(&data) {
+                // Absorb kubelet's success status frame — do not forward to kubectl.
+                // The real kube-apiserver does the same, and forwarding it can cause
+                // clients that read raw frames (e.g. the legacy channel.k8s.io
+                // conformance test) to fail with "Got message from server that didn't
+                // start with channel 1 (STDOUT)". Failure frames fall through below.
                 tracing::debug!(
                     channel = data.first().copied().unwrap_or(0),
-                    "absorbing kubelet exec status frame (not forwarded to kubectl)"
+                    "absorbing kubelet exec success status frame (not forwarded to kubectl)"
                 );
                 continue;
             }
@@ -5830,6 +5860,278 @@ mod tests {
         assert!(
             !is_exec_status_frame(&frame),
             "empty frame must not be filtered — there is no channel byte to inspect"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // exec_status_frame_is_success: content-based decision, not just channel byte
+    //
+    // mayor-n74cf: bd2b58cc's fix dropped every channel-3/4 frame unconditionally,
+    // regardless of payload, so kubelet's NonZeroExitCode failure frame was
+    // silently discarded along with genuine success frames. client-go's
+    // remotecommand.StreamExecutor never saw the failure, so `kubectl exec` of any
+    // nonzero-exit command reported exit 0. These tests pin the payload-parsing
+    // logic that decides which frames may actually be absorbed.
+    // -----------------------------------------------------------------------
+
+    /// A genuine `{"status":"Success"}` frame is the only kind that may be absorbed.
+    #[test]
+    fn exec_status_frame_is_success_true_for_success_status() {
+        let frame = bytes::Bytes::from(b"\x03{\"status\":\"Success\"}".to_vec());
+        assert!(
+            exec_status_frame_is_success(&frame),
+            "a clean-exit status frame must be recognized as safe to absorb"
+        );
+    }
+
+    /// A `NonZeroExitCode` failure frame must NOT be classified as success — this is
+    /// the exact frame that bd2b58cc's blanket filter (and the bug in mayor-n74cf)
+    /// discarded, causing `kubectl exec` to report exit 0 for every failing command.
+    #[test]
+    fn exec_status_frame_is_success_false_for_failure_nonzero_exit() {
+        let frame = bytes::Bytes::from(
+            b"\x04{\"status\":\"Failure\",\"reason\":\"NonZeroExitCode\",\"details\":{\"causes\":[{\"reason\":\"ExitCode\",\"message\":\"1\"}]}}".to_vec(),
+        );
+        assert!(
+            !exec_status_frame_is_success(&frame),
+            "a NonZeroExitCode failure frame must never be treated as success — doing \
+             so would absorb it and hide the real exit code from kubectl, reproducing \
+             mayor-n74cf"
+        );
+    }
+
+    /// A payload that isn't a recognizable status object must not be treated as
+    /// success either — when in doubt, forward it rather than silently discard data.
+    #[test]
+    fn exec_status_frame_is_success_false_for_unparseable_payload() {
+        let frame = bytes::Bytes::from(b"\x03not json".to_vec());
+        assert!(
+            !exec_status_frame_is_success(&frame),
+            "unparseable payloads must not be absorbed — silently discarding data we \
+             can't identify as a genuine success frame can only hide information from \
+             the client"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_exec_proxy end-to-end: kubelet status-frame content must control
+    // whether kubectl sees it (mayor-n74cf)
+    //
+    // These tests drive the real relay (not just the pure predicate) through a
+    // mock TLS kubelet and a real axum server, exactly like the
+    // `portforward_v4_channel_pairs_data_and_error_streams_per_port` test above,
+    // to prove the fix holds at the wire level client-go actually sees.
+    // -----------------------------------------------------------------------
+
+    /// Seed a schedulable pod and its node so `resolve_exec_target` succeeds —
+    /// shared setup for the real-server exec proxy tests below.
+    async fn seed_exec_pod(store: &Arc<SqliteStore>) {
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "exec-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "exec-node", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "exec-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "exec-node", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]}
+        });
+        store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "exec-node"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+    }
+
+    /// Echo `EXEC_KUBELET_SUBPROTOCOL` in the mock kubelet's handshake response —
+    /// tungstenite's client-side handshake validation rejects a 101 that omits
+    /// this header when the client requested a subprotocol (see
+    /// `echo_v4_subprotocol` above for the same requirement on the portforward leg).
+    #[allow(clippy::result_large_err)]
+    fn echo_exec_subprotocol(
+        _req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        response.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            EXEC_KUBELET_SUBPROTOCOL.parse().unwrap(),
+        );
+        Ok(response)
+    }
+
+    /// Run a real `/exec` session through `run_exec_proxy`: a mock TLS kubelet sends
+    /// exactly `kubelet_frames` (channel byte + payload) and then closes, exactly like
+    /// the real kubelet closing the exec websocket once the command exits. Returns
+    /// every Binary frame the kubectl-side client actually received, in order.
+    async fn exec_round_trip(kubelet_frames: Vec<(u8, Vec<u8>)>) -> Vec<Vec<u8>> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let kubelet_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = kubelet_listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_exec_subprotocol)
+                .await
+                .unwrap();
+            for (channel, payload) in kubelet_frames {
+                let mut frame = vec![channel];
+                frame.extend_from_slice(&payload);
+                ws.send(Message::Binary(frame.into())).await.unwrap();
+            }
+            let _ = ws.close(None).await;
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_exec_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+        let url =
+            format!("ws://{addr}/api/v1/namespaces/default/pods/exec-pod/exec?stdout=1&stderr=1");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            EXEC_KUBELET_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (mut ws, _resp) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect("exec websocket handshake must succeed");
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Binary(b)))) => received.push(b.to_vec()),
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => panic!("websocket error while reading exec frames: {e}"),
+                Err(_) => break,
+            }
+        }
+        received
+    }
+
+    /// The nonzero-exit status frame kubelet sends at the end of an exec session must
+    /// reach kubectl unchanged — this is the wire signal client-go's
+    /// `remotecommand.StreamExecutor` (`errorDecoderV4.decode`) turns into
+    /// `exec.CodeExitError`. Before this fix, `run_exec_proxy` dropped every
+    /// channel-3/4 frame unconditionally (bd2b58cc's overcorrection), so this frame
+    /// never reached kubectl and every nonzero exec exit looked like exit 0
+    /// (mayor-n74cf). This test fails if that unconditional drop is restored.
+    #[tokio::test]
+    async fn exec_proxy_forwards_channel_4_failure_frame_nonzero_exit() {
+        let failure = b"{\"status\":\"Failure\",\"reason\":\"NonZeroExitCode\",\"details\":{\"causes\":[{\"reason\":\"ExitCode\",\"message\":\"1\"}]}}".to_vec();
+        let frames = exec_round_trip(vec![(4, failure)]).await;
+        assert!(
+            frames.iter().any(|f| {
+                f.first() == Some(&4)
+                    && String::from_utf8_lossy(&f[1..]).contains("NonZeroExitCode")
+            }),
+            "kubelet's channel-4 NonZeroExitCode status frame must reach kubectl \
+             unchanged — dropping it (as the pre-fix code did for every channel-3/4 \
+             frame) makes client-go's remotecommand see a clean close and report \
+             exit 0 for a command that actually failed. Frames received: {frames:?}"
+        );
+    }
+
+    /// A genuine `{"status":"Success"}` frame must still be absorbed, not forwarded —
+    /// preserving bd2b58cc's original intent. That fix existed because a client that
+    /// reads raw frames off the wire in arrival order (the legacy `channel.k8s.io`
+    /// conformance test in upstream `test/e2e/common/node/pods.go`) fails outright if
+    /// any message other than channel 1 (stdout) arrives; forwarding the success
+    /// frame here would regress that fix even though this test dials with v5.
+    #[tokio::test]
+    async fn exec_proxy_preserves_bd2b58cc_intent_for_success_frames() {
+        let frames = exec_round_trip(vec![
+            (1, b"hi\n".to_vec()),
+            (3, b"{\"status\":\"Success\"}".to_vec()),
+        ])
+        .await;
+        let mut expected_stdout = vec![1u8];
+        expected_stdout.extend_from_slice(b"hi\n");
+        assert_eq!(
+            frames,
+            vec![expected_stdout],
+            "a genuine success status frame must be absorbed, matching the real \
+             kube-apiserver and bd2b58cc's original fix — only the stdout frame \
+             should reach kubectl. Frames received: {frames:?}"
+        );
+    }
+
+    /// If kubelet's status frame is dropped, kubectl's websocket just closes with no
+    /// data at all — indistinguishable from a successful, silent exec. This
+    /// simulates a command that exits nonzero with no stdout/stderr output at all
+    /// (e.g. `sh -c 'exit 2'`) and asserts the client actually receives the failure
+    /// frame before close, not just a bare close: the exact symptom mayor-n74cf
+    /// reports, where every nonzero exec looked like exit 0 because there was no
+    /// in-band failure signal at all.
+    #[tokio::test]
+    async fn exec_proxy_nonzero_exit_status_reaches_client() {
+        let failure = b"{\"status\":\"Failure\",\"reason\":\"NonZeroExitCode\",\"details\":{\"causes\":[{\"reason\":\"ExitCode\",\"message\":\"2\"}]}}".to_vec();
+        let frames = exec_round_trip(vec![(3, failure)]).await;
+        assert!(
+            !frames.is_empty(),
+            "kubectl must receive the exit-status frame before the websocket closes \
+             — zero frames means a silent clean close, exactly the bug where \
+             client-go reports err == nil (exit 0) for every nonzero exec exit"
+        );
+        assert_eq!(
+            frames[0][0], 3,
+            "the one frame kubectl receives must be the channel-3 status frame \
+             carrying the real exit code, not something else"
         );
     }
 
