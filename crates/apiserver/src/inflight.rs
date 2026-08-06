@@ -1,8 +1,8 @@
 // inflight.rs — Tower middleware for concurrent request limiting.
 //
 // Enforces two limits:
-//   - MAX_INFLIGHT (50): total concurrent requests across all methods.
-//   - MAX_MUTATING (20): concurrent requests for mutating methods
+//   - MAX_INFLIGHT (200): total concurrent requests across all methods.
+//   - MAX_MUTATING (100): concurrent requests for mutating methods
 //     (POST, PUT, PATCH, DELETE).
 //
 // When a limit is exceeded the request is rejected immediately with
@@ -203,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inflight_limit_returns_429() {
-        // When all 50 inflight slots are consumed, the 51st request must get 429.
+        // When all 200 inflight slots are consumed, the 201st request must get 429.
         // This validates that the total concurrency cap is enforced — without it,
         // an unbounded server could OOM under load.
         let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
@@ -232,9 +232,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_mutating_limit_returns_429() {
-        // When all 20 mutating slots are consumed, the 21st mutating request
+        // When all 100 mutating slots are consumed, the 101st mutating request
         // must get 429.  This validates that write concurrency is bounded — without
-        // it, 20 concurrent writes could exceed SQLite lock contention budget.
+        // it, 100 concurrent writes could exceed SQLite lock contention budget.
         let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
         let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
 
