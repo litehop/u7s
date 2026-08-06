@@ -1,6 +1,8 @@
 # u7s API Server — Implementation Spec
 
-**Status:** RFC-grade. Last updated: 2026-05-18.
+**Status:** RFC-grade. Last updated: 2026-05-18. The non-goals list below is
+substantially superseded by shipped code (see the note after it) — treat
+`roadmap.md`'s phase status as the current source of truth for scope.
 **Audience:** A senior Rust engineer building this component from scratch.
 **Read first:** `architecture.md` — this document assumes familiarity with §§3.1, 4, 5, 6, 8.
 
@@ -25,16 +27,20 @@
 
 ### Explicit non-goals (do not implement)
 
-- **Aggregation layer / API aggregation:** No `APIService` routing to remote servers. CRDs are the only extension mechanism.
-- **Admission webhooks:** No `MutatingAdmissionWebhook` or `ValidatingAdmissionWebhook` infrastructure in Phase 1–3. Built-in validation is done in handlers.
 - **etcd:** Never. The storage backend is SQLite or LMDB via the `Store` trait (architecture.md §6).
-- **OpenAPI v2/v3 schema endpoint (`/openapi/v2`, `/openapi/v3`):** Not required for Argo CD compatibility. Defer indefinitely.
-- **Conversion webhooks:** No cross-version conversion. Each CRD is served at exactly one stored version.
 - **Audit logging:** Deferred to Phase 5+.
-- **Metrics endpoint:** Deferred to Phase 5.
 - **Control plane HA:** Single process, no leader election.
 - **Priority and Fairness (APF):** No request priority queuing. Add a simple concurrency limit (tower middleware) to prevent unbounded connection storms.
-- **Pod exec/attach/port-forward:** Out of scope for Argo CD milestone; these require WebSocket or SPDY upgrades.
+
+The following were originally listed here as non-goals but are now implemented —
+see `roadmap.md` for the shipped decision in each case:
+
+- **Aggregation layer / API aggregation:** `APIService` routing to remote servers is implemented (`crates/apiserver/src/handlers/aggregation.rs`); CRDs are no longer the only extension mechanism.
+- **Admission webhooks:** `MutatingWebhookConfiguration`/`ValidatingWebhookConfiguration` infrastructure is implemented (`crates/apiserver/src/admission.rs`), invoked from the resource handlers in addition to built-in validation.
+- **OpenAPI v2/v3 schema endpoint (`/openapi/v2`, `/openapi/v3`):** Implemented (`crates/apiserver/src/handlers/discovery.rs`: `openapi_v2`, `openapi_v3`, `openapi_v3_group`), validated against the `CustomResourcePublishOpenAPI` conformance test.
+- **Conversion webhooks:** Cross-version CRD conversion is implemented (`call_conversion_webhook` in `crates/apiserver/src/handlers/cr.rs`, dispatched from `admission.rs`/`handlers/watch.rs`); a CRD is no longer limited to exactly one stored version.
+- **Metrics endpoint:** `/metrics` is implemented (`crates/apiserver/src/lib.rs`), separate from the metrics-server addon workload the API server deploys for HPA.
+- **Pod exec/attach/port-forward:** Implemented as WebSocket-proxied calls to kubelet (`crates/apiserver/src/handlers/proxy.rs`: `pod_exec`, `pod_attach`, `pod_portforward`).
 
 ---
 
@@ -1209,7 +1215,6 @@ Acceptance: `kubectl apply -f argocd-install.yaml` installs Argo CD. Argo CD can
 - TLS cert rotation (hot-reload)
 - CEL validation for CRDs (`x-kubernetes-validations`)
 - Pod log streaming (live, via CRI API on node agent, relayed through the API server)
-- Metrics endpoint (`/metrics`)
 - Watch history compaction tuning
 - Request concurrency limit (tower middleware)
 
