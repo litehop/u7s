@@ -739,6 +739,14 @@ pub struct NodeItem {
 pub struct NodeSpec {
     #[serde(default)]
     pub taints: Vec<Taint>,
+    /// `spec.unschedulable` — set by `kubectl cordon` (a PATCH) or present on
+    /// a node object from creation (e.g. upstream e2e's fake unschedulable
+    /// node). `None`/`Some(false)` behave identically; `Some(true)` blocks
+    /// scheduling in `node_qualifies_for_pod` unless the pod carries the
+    /// override toleration, mirroring upstream's always-on
+    /// `NodeUnschedulable` default Filter plugin.
+    #[serde(default)]
+    pub unschedulable: Option<bool>,
 }
 
 /// A node taint (`spec.taints[]`). Only `NoSchedule`/`NoExecute` effects block
@@ -1343,7 +1351,8 @@ impl NodeTally {
 /// Return true when `node` is eligible to host `pod` at all, independent of
 /// capacity: its labels satisfy the pod's `nodeSelector` AND (if present)
 /// required `nodeAffinity`, AND every scheduling-blocking taint on the node
-/// is tolerated.
+/// is tolerated, AND (if `spec.unschedulable` is set, e.g. by `kubectl
+/// cordon`) the pod carries the override toleration.
 ///
 /// Shared by `select_node_with_capacity` (direct scheduling) and
 /// `find_preemption_plan`, so preemption never evicts pods on a node the
@@ -1356,6 +1365,22 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
             pod.node_affinity.as_ref(),
         )
         && node_taints_tolerated(&node.spec.taints, &pod.tolerations)
+        // Mirrors upstream's `NodeUnschedulable` default Filter plugin: a
+        // cordoned node (`spec.unschedulable=true`) is rejected unless the
+        // pod tolerates the well-known `node.kubernetes.io/unschedulable`
+        // NoSchedule taint (reusing the same toleration-matching logic
+        // `node_taints_tolerated` uses for real taints).
+        && (node.spec.unschedulable != Some(true)
+            || pod.tolerations.iter().any(|tol| {
+                toleration_matches_taint(
+                    tol,
+                    &Taint {
+                        key: "node.kubernetes.io/unschedulable".to_owned(),
+                        value: String::new(),
+                        effect: "NoSchedule".to_owned(),
+                    },
+                )
+            }))
 }
 
 /// Return true when adding `requested` to a node's already-committed `used`
@@ -4209,6 +4234,89 @@ mod tests {
         assert!(
             node_taints_tolerated(&[], &[]),
             "a node with zero taints has nothing to tolerate"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // spec.unschedulable (kubectl cordon): the scheduler must not bind an
+    // untolerating pod to a cordoned node. Before this fix, NodeSpec never
+    // deserialized `unschedulable` at all, so `kubectl cordon` had zero effect
+    // on new scheduling decisions (see mayor-3vko3 / the 0806-1102 conformance
+    // flake investigation for the deterministic failure this caused).
+    // ---------------------------------------------------------------------------
+
+    /// A cordoned node (`spec.unschedulable=true`) with no matching toleration
+    /// must never qualify — this is exactly what `kubectl cordon` relies on to
+    /// stop new pods landing on a node under maintenance.
+    #[test]
+    fn unschedulable_node_rejected_when_pod_has_no_toleration() {
+        let mut node = make_node("cordoned-node", &[]);
+        node.spec.unschedulable = Some(true);
+        let pod = empty_pending_pod();
+        assert!(
+            !node_qualifies_for_pod(&node, &pod),
+            "a cordoned node must reject a pod with no unschedulable toleration — \
+             reverting this leaves `kubectl cordon` broken end-to-end, since the \
+             scheduler would keep binding fresh pods onto the cordoned node"
+        );
+    }
+
+    /// A pod carrying the well-known override toleration must still be
+    /// schedulable onto a cordoned node — mirrors upstream's
+    /// `NodeUnschedulable` Filter plugin, which lets DaemonSet-style pods
+    /// (and anything else that opts in) bypass cordon.
+    #[test]
+    fn unschedulable_node_accepted_when_pod_tolerates() {
+        let mut node = make_node("cordoned-node", &[]);
+        node.spec.unschedulable = Some(true);
+        let mut pod = empty_pending_pod();
+        // The exact shape the DaemonSet controller injects automatically
+        // (`addDefaultTolerationsForDaemonSetPod` upstream): operator Exists,
+        // no value, so it matches any taint value for the key.
+        pod.tolerations = vec![Toleration {
+            key: Some("node.kubernetes.io/unschedulable".to_owned()),
+            operator: Some("Exists".to_owned()),
+            value: None,
+            effect: Some("NoSchedule".to_owned()),
+        }];
+        assert!(
+            node_qualifies_for_pod(&node, &pod),
+            "a pod tolerating node.kubernetes.io/unschedulable:NoSchedule must \
+             still qualify for a cordoned node, matching upstream's override semantics"
+        );
+    }
+
+    /// The deterministic conformance-flake scenario: a cordoned node with zero
+    /// pods is the least-loaded candidate by raw pod count, but it must never
+    /// be picked over loaded, schedulable nodes. Before this fix,
+    /// `select_node_with_capacity` had no way to see `spec.unschedulable` and
+    /// always won ties toward the emptiest node — which is exactly how upstream's
+    /// `[sig-node] Node Lifecycle` fake unschedulable node stole unconstrained
+    /// pods from `[sig-network] Networking Granular Checks` in the 0806-1102 run.
+    #[test]
+    fn unschedulable_node_rejected_even_when_least_loaded() {
+        let loaded_a = make_node_with_capacity("loaded-a", &[], "110");
+        let loaded_b = make_node_with_capacity("loaded-b", &[], "110");
+        let mut cordoned = make_node_with_capacity("cordoned-empty", &[], "110");
+        cordoned.spec.unschedulable = Some(true);
+        let list = NodeList {
+            items: vec![loaded_a, loaded_b, cordoned],
+        };
+        let pod = empty_pending_pod();
+        let counts: std::collections::HashMap<String, NodeUsage> = [
+            ("loaded-a".to_owned(), usage_with_pod_count(5)),
+            ("loaded-b".to_owned(), usage_with_pod_count(3)),
+            // "cordoned-empty" absent from `counts` — zero pods, the
+            // least-loaded candidate by pod count alone.
+        ]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_ne!(
+            result.ok(),
+            Some("cordoned-empty".to_owned()),
+            "the cordoned node must never be selected even though it has the \
+             fewest pods — picking it here is the exact mechanism that caused \
+             the 0806-1102 deterministic conformance failure"
         );
     }
 
