@@ -10,8 +10,8 @@
 #   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
-#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--all-e2e] [--stack-only]
-#                                  [--vm <name>] [--binary <path>] [--port <N>]
+#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--unsafe-focus] [--all-e2e]
+#                                  [--stack-only] [--vm <name>] [--binary <path>] [--port <N>]
 #                                  [--workdir <path>] [--konnectivity-server-port <N>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #
@@ -23,6 +23,20 @@
 #   --focus      Passed through to sonobuoy to narrow test selection.
 #                Also settable via SONOBUOY_FOCUS env var. Mutually exclusive
 #                with --all-e2e (error if both given).
+#   --unsafe-focus  Escape hatch for --focus only: wipes the FeatureGate
+#                label-filter AND the [Flaky] skip for this invocation, so a
+#                named test that would otherwise run 0 specs (its FeatureGate
+#                label isn't in the allow-set) actually runs. The safe
+#                default (bare --focus) keeps both filters applied so naming
+#                a known-crashing test (e.g. the Beta-gated
+#                HPAConfigurableTolerance spec that crashed vendored kcm 14
+#                minutes into a 12.6h --all-e2e run) can't accidentally
+#                re-trigger it without deliberate opt-in. Meaningless without
+#                --focus -- --all-e2e and the bare certified-conformance run
+#                always apply both filters regardless of this flag, so it's a
+#                no-op there rather than an error (see 06-run-sonobuoy.sh for
+#                the FeatureGate allow-set itself and this no-op-vs-error
+#                choice).
 #   --all-e2e    Widen sonobuoy beyond the default --mode=certified-conformance
 #                (the [Conformance]-tagged subset) to the full e2e ginkgo set via
 #                --e2e-focus=".*" --e2e-skip="\[Flaky\]" — a genuine superset of
@@ -110,6 +124,7 @@ DIR="$REPO/scripts/conformance"
 WORKDIR="$PWD/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
+UNSAFE_FOCUS=0
 RESET=0
 VERBOSE=0
 STACK_ONLY=0
@@ -126,6 +141,7 @@ while [[ $# -gt 0 ]]; do
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
     --all-e2e) ALL_E2E=1; shift ;;
+    --unsafe-focus) UNSAFE_FOCUS=1; shift ;;
     --verbose|-v) VERBOSE=$((VERBOSE + 1)); shift ;;
     -vv) VERBOSE=$((VERBOSE + 2)); shift ;;
     -vvv) VERBOSE=$((VERBOSE + 3)); shift ;;
@@ -214,6 +230,7 @@ _VERBOSE_ARG=""
 _EXTRA_NODE_ARG=""
 _NODE_KUBELET_PORT_ARG=""
 _ALL_E2E_ARG=""
+_UNSAFE_FOCUS_ARG=""
 # When any -v level is set (>= 1), raise kube-controller-manager verbosity to --v=5
 # so both the disruption controller's pod-list / expectedCount decisions (V(4)) and
 # the DaemonSet controller's replacement-reasoning lines ("candidate to replace" /
@@ -238,6 +255,7 @@ _WORKDIR_ARG="--workdir $WORKDIR"
 # restart/reload once the node actually joins. See --node-kubelet-port in u7s-apiserver.
 [ -n "$EXTRA_NODE" ] && _NODE_KUBELET_PORT_ARG="--node-kubelet-port ${EXTRA_NODE}=${EXTRA_KUBELET_PORT}"
 [ "$ALL_E2E" -eq 1 ] && _ALL_E2E_ARG="--all-e2e"
+[ "$UNSAFE_FOCUS" -eq 1 ] && _UNSAFE_FOCUS_ARG="--unsafe-focus"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -309,7 +327,7 @@ else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
-  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG}
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG}
 fi
 
 if [ -n "$DHAT_HEAP_FILE" ]; then

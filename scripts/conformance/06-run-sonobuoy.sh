@@ -17,11 +17,20 @@ WORKDIR="$PWD/temp/u7s"
 UNPACK=1
 PORT="${U7S_PORT:-6443}"
 EXTRA_NODE=""
+# --unsafe-focus only has an effect inside the --focus branch below (it wipes
+# that branch's FeatureGate/[Flaky] filters). Given with --all-e2e or bare
+# (certified-conformance), it's a structural no-op: neither of those branches
+# ever reads it, so there's nothing to "unsafely" wipe -- a deliberate choice
+# over erroring, since --all-e2e/--focus are already mutually exclusive at
+# run-all.sh, and erroring here too would just be a second enforcement of the
+# same rule.
+UNSAFE_FOCUS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
     --all-e2e) ALL_E2E=1; shift ;;
+    --unsafe-focus) UNSAFE_FOCUS=1; shift ;;
     --no-unpack) UNPACK=0; shift ;;
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -135,7 +144,51 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
+# Allow-set for FeatureGate-tagged tests u7s knowingly supports beyond GA.
+# Grow item-by-item as new gates surface, always checking the new gate
+# against upstream's release-1.36 test/conformance/testdata/conformance.yaml
+# for a [Conformance] overlap FIRST -- Go's RE2 has no negative lookahead, so
+# "skip every FeatureGate:* except X" cannot be expressed as an --e2e-skip
+# regex; a curated ginkgo --label-filter allow-set is the correct shape.
+# VolumeAttributesClass is GA-since-1.34 and the ONLY FeatureGate-labeled
+# spec that overlaps [Conformance] at release-1.36 -- the label itself is
+# stale test metadata upstream hasn't removed yet (see
+# ai/findings/featuregate-conformance-resolution-2026-08-06.md). Ginkgo's
+# isSubsetOf semantics: a spec with no FeatureGate label always matches (the
+# empty set), a spec tagged [FeatureGate:VolumeAttributesClass] matches, any
+# OTHER [FeatureGate:X] is skipped -- this is what stops a Beta-gated spec
+# like HPAConfigurableTolerance (which crashed vendored kcm 14 minutes into a
+# 12.6h --all-e2e run, temp/e2e/0805-2202-conformance) from running at all.
+FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass}'
+
+# build_filter_args populates the FILTER_ARGS array with the sonobuoy argv
+# elements for this invocation. apply=1 wires in the FeatureGate allow-set
+# above plus the existing [Flaky] skip; apply=0 (the --unsafe-focus escape
+# hatch) omits both, carrying only --procs=16.
+#
+# The label-filter value needs an internal space ("FeatureGate: isSubsetOf
+# {...}" -- ginkgo's own tokenizer requires it), so it must survive as ONE
+# argv element end-to-end (this script -> limactl shell -> sonobuoy's own
+# flag parser) -- hence building it into an array (never word-split, unlike
+# $SONOBUOY_BASE_ARGS below) instead of appending it to that flat string.
+# Separately, go-runner (the conformance image's entrypoint) space-splits
+# E2E_EXTRA_GINKGO_ARGS by default before re-assembling ginkgo's own argv,
+# which would tear the label-filter value apart at its internal space --
+# E2E_EXTRA_ARGS_SEP repoints that split character to '|' instead.
+build_filter_args() {
+  local apply="$1"
+  if [ "$apply" -eq 1 ]; then
+    FILTER_ARGS=(
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16|--label-filter=${FEATUREGATE_LABEL_FILTER}"
+      "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
+      "--e2e-skip=\[Flaky\]"
+    )
+  else
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16")
+  fi
+}
+
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
@@ -148,15 +201,28 @@ echo "[watchdog] started (pid=${_WATCHDOG_PID})"
 # even when the run fails.
 SONOBUOY_EXIT=0
 if [ -n "$FOCUS" ]; then
+  # Filters apply by default even to a named --focus test: a test whose
+  # FeatureGate label isn't in the allow-set above runs 0 specs rather than
+  # silently re-triggering a known-crashing test (e.g. HPAConfigurableTolerance)
+  # just because an operator happened to name it. --unsafe-focus is the
+  # deliberate, explicit escape hatch for the rare case a filtered test needs
+  # to actually run once (e.g. to reproduce a bug on record).
+  APPLY_FILTERS=1
+  [ "$UNSAFE_FOCUS" -eq 1 ] && APPLY_FILTERS=0
+  build_filter_args "$APPLY_FILTERS"
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
 elif [ "$ALL_E2E" -eq 1 ]; then
   # Full ginkgo set (~7500 specs) instead of just the [Conformance]-tagged
   # subset — surfaces plain ginkgo.It cases (e.g. SSA field-manager tests)
-  # certified-conformance never runs. Only [Flaky] is skipped: it's
-  # upstream's own known-unreliable set (not signal), and by definition can
-  # never overlap with [Conformance] (a certified suite must be
-  # deterministic), so skipping it never drops conformance coverage.
+  # certified-conformance never runs. [Flaky] is skipped: it's upstream's own
+  # known-unreliable set (not signal), and by definition can never overlap
+  # with [Conformance] (a certified suite must be deterministic), so skipping
+  # it never drops conformance coverage. The FeatureGate allow-set above is
+  # ALWAYS applied here too (never gated behind --unsafe-focus, which is only
+  # meaningful for a named --focus test): --all-e2e's own ".*" focus is
+  # exactly what surfaced the HPAConfigurableTolerance crash in the first
+  # place, since certified-conformance never runs Beta+ gated specs at all.
   # [Disruptive] and [Slow] are deliberately NOT skipped (unlike an earlier
   # version of this script) — checked against upstream's release-1.36
   # test/conformance/testdata/conformance.yaml, 2 [Disruptive] and 6 [Slow]
@@ -173,14 +239,15 @@ elif [ "$ALL_E2E" -eq 1 ]; then
   # in seconds) defaults to 21600 (6h), which killed a real overnight run at
   # exactly 6h00m00s. Raise it to match this mode's own documented budget
   # instead of an unrelated default silently truncating it.
+  build_filter_args 1
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS \
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" \
     --e2e-focus=".*" \
-    --e2e-skip="\[Flaky\]" \
     --timeout "$ALL_E2E_TIMEOUT_SECONDS" || SONOBUOY_EXIT=$?
 else
+  build_filter_args 0
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=certified-conformance || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" --mode=certified-conformance || SONOBUOY_EXIT=$?
 fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
