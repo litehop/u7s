@@ -109,14 +109,23 @@
 #             apiserver as --node-kubelet-port at step 2 (before the node joins) so
 #             kubectl logs/exec/attach/port-forward against a pod on the 2nd node
 #             reach ITS kubelet forward instead of the primary's.
-#   --profile  Rebuild u7s-apiserver with --features dhat after the normal build so
-#             the conformance workload runs under dhat's allocation profiler. The
-#             profile (dhat-heap.json) is written into --workdir, but only once the
-#             apiserver actually exits — dhat flushes it from a Drop impl that never
-#             runs while the server keeps serving, and run-all.sh intentionally leaves
-#             the stack running at the end (for sonobuoy log retrieval / --stack-only
-#             debugging). Ignored (with a warning) if --binary is also given, since
-#             that binary's feature set is the caller's responsibility.
+#   --profile  Rebuild u7s-apiserver with --features dhat before stack bring-up so
+#             the conformance workload runs under dhat's allocation profiler — no
+#             separate manual `cargo build --features dhat` step needed. dhat only
+#             flushes its heap JSON from a Drop impl that runs on a graceful exit
+#             (main.rs:29-33 catches SIGTERM), so once sonobuoy retrieval + log
+#             evacuation finish, run-all.sh sends SIGTERM to the apiserver (plus
+#             scheduler and konnectivity-server, for full cleanup) and waits for
+#             exit before moving the flushed heap into THIS run's own
+#             temp/e2e/<TIMESTAMP>-<slug>/ directory (alongside host-logs/, the
+#             sonobuoy tarball, etc.) as dhat-heap-apiserver-<TIMESTAMP>.json — no
+#             separate manual move step either. Skipped under --stack-only, which
+#             leaves the whole stack running on purpose for kubectl exploration;
+#             the apiserver keeps running under dhat there too, but the operator
+#             must stop it manually to flush the heap (a reminder is printed).
+#             Mutually exclusive with --binary (error if both given): --profile's
+#             whole point is the --features dhat rebuild, which a pre-built
+#             --binary bypasses by definition.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -192,8 +201,8 @@ if [ "$STACK_ONLY" -eq 1 ] && [ "$ALL_E2E" -eq 1 ]; then
 fi
 
 if [ "$PROFILE" -eq 1 ] && [ -n "$BINARY" ]; then
-  echo "--profile ignored with --binary (pre-built binary's features are not rebuilt)" >&2
-  PROFILE=0
+  echo "error: --profile and --binary are mutually exclusive — --profile always rebuilds with --features dhat, but --binary points at a pre-built binary whose feature set is the caller's responsibility" >&2
+  exit 1
 fi
 
 # Both flags are required together: a 2nd node needs its own kubelet port, and a
@@ -323,19 +332,94 @@ fi
 # Step 06: Run sonobuoy.
 if [ "$STACK_ONLY" -eq 1 ]; then
   banner "Step 6/6: Run sonobuoy (skipped — --stack-only)"
+  if [ "$PROFILE" -eq 1 ]; then
+    echo ""
+    echo "Allocation profile: apiserver is running under dhat. --stack-only leaves"
+    echo "it running on purpose (for kubectl exploration), so dhat's Drop-based"
+    echo "flush ($DHAT_HEAP_FILE) hasn't fired yet — stop it yourself when done:"
+    echo "  kill -TERM \$(lsof -ti tcp:${PORT:-6443} -sTCP:LISTEN)"
+  fi
 else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
   bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG}
-fi
 
-if [ -n "$DHAT_HEAP_FILE" ]; then
-  echo ""
-  echo "Allocation profile: apiserver is running under dhat. dhat only flushes"
-  echo "$DHAT_HEAP_FILE on a graceful exit, so it does not exist yet — stop the"
-  echo "apiserver with SIGTERM when you're done exercising it, e.g.:"
-  echo "  kill -TERM \$(lsof -ti tcp:${PORT:-6443} -sTCP:LISTEN)"
+  if [ "$PROFILE" -eq 1 ]; then
+    banner "Profile: stopping apiserver to flush dhat heap"
+    # main.rs:29-33 only writes $DHAT_HEAP_FILE from dhat::Profiler's Drop
+    # impl, which runs on a graceful return from run() -- triggered by
+    # SIGTERM, never by run-all.sh just exiting while the stack keeps
+    # serving (the normal, non-profile workflow). Stop it now, right after
+    # sonobuoy retrieval + log evacuation are done reading from the live
+    # stack, so the real, full-run heap lands on disk instead of staying
+    # trapped in a process nobody signals (observed live: PID 27958 sat
+    # running for 20+ minutes after a run finished, dhat heap trapped in
+    # memory, until an operator noticed and killed it by hand).
+    # shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
+    API_PIDS=($(lsof -ti tcp:"${PORT:-6443}" -sTCP:LISTEN 2>/dev/null || true))
+    if [ "${#API_PIDS[@]}" -gt 0 ]; then
+      echo "Sending SIGTERM to apiserver (PID(s): ${API_PIDS[*]}) ..."
+      kill "${API_PIDS[@]}" 2>/dev/null || true
+      # Poll the PID(s) themselves, not the listening port: tokio::select!
+      # (main.rs:29-33) cancels the server's own future -- which drops its
+      # listener and frees the port -- the instant SIGTERM is observed, but
+      # dhat::Profiler::drop (serializing a real run's allocation trace to
+      # JSON) keeps the process itself alive for measurably longer.
+      # Confirmed live: a port-based check on a 1-minute --focus run raced
+      # ahead of a 928,953-block/4.27MB heap file that hadn't finished
+      # writing yet, even though the port had already closed.
+      any_alive() {
+        local pid
+        for pid in "${API_PIDS[@]}"; do
+          kill -0 "$pid" 2>/dev/null && return 0
+        done
+        return 1
+      }
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        any_alive || break
+        sleep 1
+      done
+      if any_alive; then
+        echo "warning: apiserver (PID(s): ${API_PIDS[*]}) still running 10s after SIGTERM — dhat heap may not have flushed" >&2
+      fi
+    else
+      echo "warning: no apiserver found listening on port ${PORT:-6443} — dhat heap may already be stale" >&2
+    fi
+    # scheduler + konnectivity-server aren't dhat-instrumented, but leaving
+    # them running after the apiserver they talk to is gone just leaves
+    # orphans — same full-cleanup scope as reset.sh.
+    pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
+    WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
+    pkill -f "konnectivity-server.*${WORKDIR_ABS}" 2>/dev/null || true
+
+    # Route the flushed heap into this run's own temp/e2e/<TIMESTAMP>-<slug>/
+    # directory (same place as host-logs/, the sonobuoy tarball, etc.)
+    # instead of leaving it under --workdir for the operator to move by
+    # hand. That directory's TIMESTAMP is only known to 06-run-sonobuoy.sh
+    # (stamped at retrieval time, long after this apiserver was launched
+    # with $DHAT_HEAP_FILE) -- find it as the most-recently-created entry
+    # under temp/e2e/ rather than duplicating that script's own slug logic
+    # here. `|| true` on the assignment: an empty glob match makes `ls`
+    # exit non-zero even with stderr suppressed, which `set -e` would
+    # otherwise treat as fatal for what's meant to be a soft lookup.
+    # shellcheck disable=SC2012 # `ls -t` for mtime-sort has no `find` equivalent; these dirs are our own sanitized TIMESTAMP-slug names, never adversarial filenames.
+    RUN_DIR=$(ls -td "$WORKDIR"/../e2e/*/ 2>/dev/null | head -1) || true
+    RUN_DIR="${RUN_DIR%/}"
+    if [ -f "$DHAT_HEAP_FILE" ] && [ -n "$RUN_DIR" ]; then
+      TIMESTAMP=$(basename "$RUN_DIR" | cut -d- -f1,2)
+      DEST="$RUN_DIR/dhat-heap-apiserver-${TIMESTAMP}.json"
+      if mv "$DHAT_HEAP_FILE" "$DEST" 2>/dev/null; then
+        echo "Allocation profile: $DEST"
+      else
+        echo "warning: failed to move dhat heap to $DEST — left at $DHAT_HEAP_FILE" >&2
+      fi
+    elif [ -f "$DHAT_HEAP_FILE" ]; then
+      echo "warning: could not resolve this run's temp/e2e/ output dir — dhat heap left at $DHAT_HEAP_FILE" >&2
+    else
+      echo "warning: $DHAT_HEAP_FILE was not produced — apiserver may not have exited cleanly" >&2
+    fi
+  fi
 fi
 
 banner "Done"
