@@ -287,6 +287,34 @@ assert "tar -czf on a pod log dir picks up both the live 0.log and rotated 0.log
   "$(printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log$" && printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log.20260806-000000$" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 8. journald_system_max_use_is_6g -- lima-start.sh's journald drop-in caps
+#    disk usage; 2G was measured insufficient for an 11h --all-e2e run under
+#    16-way load (the 0805-2202 run's collected kubelet.log/crio.log covered
+#    only the LAST 1h54m of that run, losing the 09:33-09:35 DiskPressure
+#    incident window entirely). A regression back to 2G (or any value below
+#    6G) would silently start truncating forensic evidence again.
+# ---------------------------------------------------------------------------
+LIMA_START="$(dirname "${BASH_SOURCE[0]}")/lima-start.sh"
+assert "journald_system_max_use_is_6g -- 2G was measured insufficient for an 11h --all-e2e run under 16-way load (0805-2202 run lost its own DiskPressure incident window); regression here silently truncates forensic evidence again" \
+  "$(grep -q '^SystemMaxUse=6G$' "$LIMA_START" && ! grep -q '^SystemMaxUse=2G$' "$LIMA_START" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 9. journal_is_rotated_and_vacuumed_after_config_apply -- lima-start.sh runs
+#    on every invocation, not just --reset ones, so a VM reused across several
+#    conformance sessions can carry journal volume from EARLIER sessions into
+#    a NEW run, silently shrinking how much of the current run's own window
+#    the configured budget actually covers. 'journalctl --rotate' must fire
+#    BEFORE '--vacuum-size': vacuuming without rotating first leaves the
+#    active (still being written to) segment's stale volume intact, so
+#    reordering these two calls would quietly reintroduce the exact bug this
+#    is meant to fix.
+# ---------------------------------------------------------------------------
+ROTATE_LINE="$(grep -n 'journalctl --rotate' "$LIMA_START" | head -1 | cut -d: -f1)"
+VACUUM_LINE="$(grep -n 'journalctl --vacuum-size' "$LIMA_START" | head -1 | cut -d: -f1)"
+assert "journal_is_rotated_and_vacuumed_after_config_apply -- vacuum without a prior rotate leaves the active journal segment's stale volume intact, silently reintroducing truncated forensic logs" \
+  "$([ -n "$ROTATE_LINE" ] && [ -n "$VACUUM_LINE" ] && [ "$ROTATE_LINE" -lt "$VACUUM_LINE" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
