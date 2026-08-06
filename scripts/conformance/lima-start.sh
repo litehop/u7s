@@ -391,12 +391,14 @@ if [ -f "$CA_CERT" ]; then
 
   # Get the lima VM IP so it can be included as a SAN (needed if kubelet-preferred-address
   # is not set and the apiserver connects via the VM's InternalIP instead of 127.0.0.1).
-  # eth0 is the VM's sole interface (the user-v2 network in lima/kubelet.yaml); its
-  # address is DHCP-assigned per node, so there is no sane hardcoded fallback — fail
+  # The user-v2 network in lima/kubelet.yaml gives the VM a sole non-loopback interface;
+  # select by "scope global" rather than a hardcoded interface name since Ubuntu 26.04's
+  # first-boot NIC rename to eth0 can fail (LP: #2136392), leaving it as e.g. enp0s1.
+  # Its address is DHCP-assigned per node, so there is no sane hardcoded fallback — fail
   # loud instead of silently signing a cert for an address the node doesn't have.
-  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show eth0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
+  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
   if [ -z "$LIMA_VM_IP" ]; then
-    echo "error: could not determine ${VM_NAME}'s eth0 address for the kubelet serving cert SAN" >&2
+    echo "error: could not determine ${VM_NAME}'s IP for the kubelet serving cert SAN" >&2
     exit 1
   fi
 
@@ -823,10 +825,10 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 # joins; whichever node's lima-start.sh runs re-asserts the pairing both ways, so a
 # stale route on either side self-heals the next time either node reconnects.
 PEERS=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-THIS_NODE_IP=$(limactl shell "$VM_NAME" ip -4 addr show eth0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
+THIS_NODE_IP=$(limactl shell "$VM_NAME" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
 for PEER in $PEERS; do
   [ "$PEER" = "$VM_NAME" ] && continue
-  PEER_IP=$(limactl shell "$PEER" ip -4 addr show eth0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
+  PEER_IP=$(limactl shell "$PEER" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
   PEER_SUBNET=$(limactl shell "$PEER" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
   if [ -z "$PEER_IP" ] || [ -z "$PEER_SUBNET" ] || [ -z "$THIS_NODE_IP" ]; then
     echo "WARNING: could not resolve route info for peer '${PEER}' — skipping inter-node route" >&2
