@@ -203,52 +203,13 @@ async fn reencode_proto_response(uri: &str, resp: Response<Body>) -> Response<Bo
         }
     };
 
-    // Parse as JSON.  If not valid JSON, pass through unchanged.
-    let json_val: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(_) => {
-            return Response::from_parts(parts, Body::from(body_bytes));
-        }
-    };
-
-    // Discovery meta-types are NOT re-encoded as proto.
-    //
-    // client-go 1.36+ sends Accept: application/vnd.kubernetes.protobuf for
-    // discovery requests (GET /api, /api/v1, /apis, /apis/{group}/{version})
-    // but its discovery decoder path decodes these types from JSON, not from
-    // our Unknown-envelope-with-JSON-inside proto format. Re-encoding them as
-    // proto causes "proto: illegal wireType 6" in kubectl because the Go proto
-    // decoder encounters unexpected bytes when trying to decode the discovery
-    // response as a typed proto message.
-    //
-    // Node/NodeList responses are also NOT re-encoded as proto.
-    //
-    // When the kubelet reads its own node (GET /api/v1/nodes/{name}?timeout=10s),
-    // client-go's typed proto decoder does not reliably honour the
-    // contentType=application/json field inside the Unknown envelope. It tries to
-    // decode Unknown.raw as a typed proto Node message, encounters JSON bytes that
-    // produce "proto: illegal wireType 7" (e.g. the `/` in a CIDR or `o` in
-    // "conditions" aligns to a varint byte whose low 3 bits are 0b111). Returning
-    // JSON is legal because Accept includes "application/json" as a fallback.
-    let kind = json_val["kind"].as_str().unwrap_or("");
-
-    // client-go's typed proto decoders do not reliably honour the
-    // contentType=application/json field inside the Unknown envelope — they
-    // attempt to decode Unknown.raw as a native typed proto message and
-    // produce "proto: illegal wireType N" when JSON bytes happen to align
-    // to invalid wire types.  Returning JSON is always valid: Accept
-    // includes "application/json" as a fallback, and client-go falls back
-    // to JSON decoding transparently.
-    //
-    // We previously re-encoded only non-discovery types as proto (to avoid
-    // a different wireType 6 error in kubectl for discovery responses), but
-    // that created a growing exclusion list (Node, NodeList, Pod, PodList,
-    // …).  The correct fix is to skip re-encoding for all types.
-    tracing::debug!(
-        uri = %uri,
-        kind = %kind,
-        "skip proto re-encode: returning JSON (always valid per Accept header)"
-    );
+    // Every response reaches here unchanged regardless of its `kind` — proto
+    // re-encoding was abandoned for all types (see module doc comment above:
+    // client-go's typed proto decoders don't reliably honour the
+    // contentType=application/json field inside a proto Unknown envelope, so
+    // re-encoding produces "proto: illegal wireType N" for discovery, Node,
+    // NodeList, and others). There is nothing left to inspect the body for, so
+    // it is never parsed as JSON here.
     Response::from_parts(parts, Body::from(body_bytes))
 }
 
@@ -1276,6 +1237,40 @@ mod tests {
             resp.headers().get("transfer-encoding").unwrap(),
             "chunked",
             "transfer-encoding must be preserved unchanged on a watch response"
+        );
+    }
+
+    /// Regression test for mayor-g7g2m: `reencode_proto_response` must not deserialize
+    /// the response body into a `serde_json::Value` tree.
+    ///
+    /// It used to do so on every non-chunked JSON GET a protobuf-preferring client made
+    /// (i.e. essentially every kubelet request) solely to extract `kind` for a
+    /// `tracing::debug!` field — a value that never affected the returned bytes, since
+    /// the function unconditionally passes the original JSON through unchanged (proto
+    /// re-encoding was already abandoned). Measured cost: ~1.06GB / 8.25M allocation
+    /// events over one hour-long conformance run, all spent building a `Value` tree
+    /// that was thrown away after reading one field for a log line. This test scans
+    /// the function's own source for the parse call site rather than instrumenting
+    /// allocations, because the output bytes are identical whether or not the parse
+    /// runs (see other tests in this module), so a bytes-equality test alone cannot
+    /// catch a reintroduction of this dead work.
+    #[test]
+    fn reencode_response_does_not_build_a_json_value_tree() {
+        let source = include_str!("content_type.rs");
+        let fn_start = source
+            .find("async fn reencode_proto_response")
+            .expect("reencode_proto_response must still exist in this file");
+        let after_start = &source[fn_start..];
+        let fn_end = after_start
+            .find("\n}\n")
+            .expect("reencode_proto_response's closing brace must be found");
+        let fn_body = &after_start[..fn_end];
+
+        assert!(
+            !fn_body.contains("serde_json::Value") && !fn_body.contains("serde_json::from_slice"),
+            "reencode_proto_response must not parse the response body into a \
+             serde_json::Value — it always returns the body bytes unchanged, so doing \
+             so only wastes allocations (mayor-g7g2m); fn body was:\n{fn_body}"
         );
     }
 }
