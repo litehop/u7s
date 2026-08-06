@@ -2,8 +2,8 @@
 # Download and start kube-controller-manager inside the lima VM.
 #
 # Setup (download, cert conversion, kubeconfig rewrite) runs foreground so
-# the script only returns after kcm is ready. Only the final binary launch
-# is backgrounded.
+# the script only returns after kcm is ready. Only the final launch — now a
+# crash supervisor (kcm-supervisor.sh) wrapping the binary — is backgrounded.
 #
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
@@ -48,6 +48,12 @@ fi
 # quoted pattern text below from matching itself).
 limactl shell "$VM_NAME" bash -c \
   "if pgrep -f 'kube-controller-manager-[0-9]' >/dev/null 2>&1; then echo 'WARNING: kube-controller-manager already running — killing and restarting' >&2; pkill -f 'kube-controller-manager-[0-9]' 2>/dev/null || true; sleep 1; fi"
+
+# Copy the crash supervisor onto the VM — it wraps the final binary launch
+# below so a kcm panic gets restarted (bounded exponential backoff) instead
+# of silently blacking out the control plane for the rest of an unattended
+# run. See kcm-supervisor.sh for the backoff/circuit-breaker logic.
+limactl copy "$REPO/scripts/conformance/kcm-supervisor.sh" "${VM_NAME}:/tmp/kcm-supervisor.sh"
 
 # Run setup foreground (download, cert conversion, kubeconfig rewrite),
 # then background only the final binary launch.
@@ -118,8 +124,10 @@ if grep -qE "https://127\." "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" 
   KUBECONFIG_FILE="\$TMPDIR_KCM/kubeconfig"
 fi
 
-echo "Starting kube-controller-manager v\${K8S_VERSION} ..."
-setsid "\$KCM_BINARY" \\
+echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
+SUPERVISOR_LOG="/tmp/kcm-supervisor.log"
+chmod +x /tmp/kcm-supervisor.sh
+setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
@@ -131,9 +139,10 @@ setsid "\$KCM_BINARY" \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\
   \$KCM_V_FLAG \\
-  > "\$KCM_LOG" 2>&1 &
+  > "\$SUPERVISOR_LOG" 2>&1 &
 
-echo "kube-controller-manager running (PID \$!, log: \$KCM_LOG)"
+echo "kube-controller-manager supervisor running (PID \$!, kcm log: \$KCM_LOG, supervisor log: \$SUPERVISOR_LOG)"
 EOF
 
 echo "To tail: limactl shell $VM_NAME tail -f $KCM_LOG"
+echo "Supervisor log (restarts/crashes): limactl shell $VM_NAME tail -f /tmp/kcm-supervisor.log"
