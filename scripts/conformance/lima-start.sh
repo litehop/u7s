@@ -324,15 +324,39 @@ limactl shell "$VM_NAME" sudo systemctl restart logrotate.timer
 # minutes of one node's kubelet.log/crio.log in a real run while an identically
 # collected, less-loaded node kept the full window. Written on every start so it
 # survives VM reprovisions.
+#
+# SystemMaxUse=2G (this drop-in's original value) still wasn't enough: the
+# 0805-2202 --all-e2e run's collected kubelet.log/crio.log covered only the
+# LAST 1h54m of an 11h run (measured directly off that node's timestamps,
+# 20:08-22:02) under 16-way load — losing the 09:33-09:35 DiskPressure incident
+# entirely. 6G buys a fresh run roughly 5-6x that headroom at the same growth
+# rate; going further eats into the 20GiB VM disk conformance tests themselves
+# need (~14G free observed with only base images pulled — DiskPressure
+# investigations already show that margin gets tight mid-run), so 6G is a
+# deliberate compromise, not full 11h coverage.
 limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
 [Journal]
 RateLimitBurst=100000
 RateLimitIntervalSec=30s
-SystemMaxUse=2G
+SystemMaxUse=6G
 SystemKeepFree=100M
 Storage=persistent
 EOF
 limactl shell "$VM_NAME" sudo systemctl restart systemd-journald
+
+# This block re-runs on every invocation, not only --reset ones (reset.sh does
+# a full 'limactl delete --force', but a plain re-run against an existing VM
+# hits this same code path). On a VM reused across several conformance
+# sessions without --reset in between, journal volume from EARLIER sessions
+# is still sitting in the budget when a NEW run starts, silently shrinking how
+# much of the fresh run's own window that 6G actually covers. --rotate forces
+# the currently-active file closed so --vacuum-size can delete it along with
+# any older archived segments (a raw --vacuum-size alone leaves the active
+# file alone), reclaiming the full budget for THIS run. Safe to discard here
+# because any prior run's data that mattered was already evacuated to the
+# host by 06-run-sonobuoy.sh's end-of-run collection.
+limactl shell "$VM_NAME" sudo journalctl --rotate
+limactl shell "$VM_NAME" sudo journalctl --vacuum-size=1M
 
 # Rewrite server address to host.lima.internal for in-VM use.
 # Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
