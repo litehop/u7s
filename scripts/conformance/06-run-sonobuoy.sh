@@ -17,11 +17,20 @@ WORKDIR="$PWD/temp/u7s"
 UNPACK=1
 PORT="${U7S_PORT:-6443}"
 EXTRA_NODE=""
+# --unsafe-focus only has an effect inside the --focus branch below (it wipes
+# that branch's FeatureGate/[Flaky] filters). Given with --all-e2e or bare
+# (certified-conformance), it's a structural no-op: neither of those branches
+# ever reads it, so there's nothing to "unsafely" wipe -- a deliberate choice
+# over erroring, since --all-e2e/--focus are already mutually exclusive at
+# run-all.sh, and erroring here too would just be a second enforcement of the
+# same rule.
+UNSAFE_FOCUS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
     --all-e2e) ALL_E2E=1; shift ;;
+    --unsafe-focus) UNSAFE_FOCUS=1; shift ;;
     --no-unpack) UNPACK=0; shift ;;
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -135,7 +144,51 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
+# Allow-set for FeatureGate-tagged tests u7s knowingly supports beyond GA.
+# Grow item-by-item as new gates surface, always checking the new gate
+# against upstream's release-1.36 test/conformance/testdata/conformance.yaml
+# for a [Conformance] overlap FIRST -- Go's RE2 has no negative lookahead, so
+# "skip every FeatureGate:* except X" cannot be expressed as an --e2e-skip
+# regex; a curated ginkgo --label-filter allow-set is the correct shape.
+# VolumeAttributesClass is GA-since-1.34 and the ONLY FeatureGate-labeled
+# spec that overlaps [Conformance] at release-1.36 -- the label itself is
+# stale test metadata upstream hasn't removed yet (see
+# ai/findings/featuregate-conformance-resolution-2026-08-06.md). Ginkgo's
+# isSubsetOf semantics: a spec with no FeatureGate label always matches (the
+# empty set), a spec tagged [FeatureGate:VolumeAttributesClass] matches, any
+# OTHER [FeatureGate:X] is skipped -- this is what stops a Beta-gated spec
+# like HPAConfigurableTolerance (which crashed vendored kcm 14 minutes into a
+# 12.6h --all-e2e run, temp/e2e/0805-2202-conformance) from running at all.
+FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass}'
+
+# build_filter_args populates the FILTER_ARGS array with the sonobuoy argv
+# elements for this invocation. apply=1 wires in the FeatureGate allow-set
+# above plus the existing [Flaky] skip; apply=0 (the --unsafe-focus escape
+# hatch) omits both, carrying only --procs=16.
+#
+# The label-filter value needs an internal space ("FeatureGate: isSubsetOf
+# {...}" -- ginkgo's own tokenizer requires it), so it must survive as ONE
+# argv element end-to-end (this script -> limactl shell -> sonobuoy's own
+# flag parser) -- hence building it into an array (never word-split, unlike
+# $SONOBUOY_BASE_ARGS below) instead of appending it to that flat string.
+# Separately, go-runner (the conformance image's entrypoint) space-splits
+# E2E_EXTRA_GINKGO_ARGS by default before re-assembling ginkgo's own argv,
+# which would tear the label-filter value apart at its internal space --
+# E2E_EXTRA_ARGS_SEP repoints that split character to '|' instead.
+build_filter_args() {
+  local apply="$1"
+  if [ "$apply" -eq 1 ]; then
+    FILTER_ARGS=(
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16|--label-filter=${FEATUREGATE_LABEL_FILTER}"
+      "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
+      "--e2e-skip=\[Flaky\]"
+    )
+  else
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16")
+  fi
+}
+
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
@@ -148,15 +201,28 @@ echo "[watchdog] started (pid=${_WATCHDOG_PID})"
 # even when the run fails.
 SONOBUOY_EXIT=0
 if [ -n "$FOCUS" ]; then
+  # Filters apply by default even to a named --focus test: a test whose
+  # FeatureGate label isn't in the allow-set above runs 0 specs rather than
+  # silently re-triggering a known-crashing test (e.g. HPAConfigurableTolerance)
+  # just because an operator happened to name it. --unsafe-focus is the
+  # deliberate, explicit escape hatch for the rare case a filtered test needs
+  # to actually run once (e.g. to reproduce a bug on record).
+  APPLY_FILTERS=1
+  [ "$UNSAFE_FOCUS" -eq 1 ] && APPLY_FILTERS=0
+  build_filter_args "$APPLY_FILTERS"
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
 elif [ "$ALL_E2E" -eq 1 ]; then
   # Full ginkgo set (~7500 specs) instead of just the [Conformance]-tagged
   # subset — surfaces plain ginkgo.It cases (e.g. SSA field-manager tests)
-  # certified-conformance never runs. Only [Flaky] is skipped: it's
-  # upstream's own known-unreliable set (not signal), and by definition can
-  # never overlap with [Conformance] (a certified suite must be
-  # deterministic), so skipping it never drops conformance coverage.
+  # certified-conformance never runs. [Flaky] is skipped: it's upstream's own
+  # known-unreliable set (not signal), and by definition can never overlap
+  # with [Conformance] (a certified suite must be deterministic), so skipping
+  # it never drops conformance coverage. The FeatureGate allow-set above is
+  # ALWAYS applied here too (never gated behind --unsafe-focus, which is only
+  # meaningful for a named --focus test): --all-e2e's own ".*" focus is
+  # exactly what surfaced the HPAConfigurableTolerance crash in the first
+  # place, since certified-conformance never runs Beta+ gated specs at all.
   # [Disruptive] and [Slow] are deliberately NOT skipped (unlike an earlier
   # version of this script) — checked against upstream's release-1.36
   # test/conformance/testdata/conformance.yaml, 2 [Disruptive] and 6 [Slow]
@@ -173,26 +239,43 @@ elif [ "$ALL_E2E" -eq 1 ]; then
   # in seconds) defaults to 21600 (6h), which killed a real overnight run at
   # exactly 6h00m00s. Raise it to match this mode's own documented budget
   # instead of an unrelated default silently truncating it.
+  build_filter_args 1
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS \
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" \
     --e2e-focus=".*" \
-    --e2e-skip="\[Flaky\]" \
     --timeout "$ALL_E2E_TIMEOUT_SECONDS" || SONOBUOY_EXIT=$?
 else
+  build_filter_args 0
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=certified-conformance || SONOBUOY_EXIT=$?
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "${FILTER_ARGS[@]}" --mode=certified-conformance || SONOBUOY_EXIT=$?
 fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
 fi
 
+# NODES lists every node in the run (computed here, before evacuation, so
+# both this step and the tarball search below use the same list).
+NODES=("$VM_NAME")
+[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+
 # Evacuate pod logs immediately — before namespace GC removes them.
 # sonobuoy --wait returns after the e2e binary exits but before namespace teardown,
-# so /var/log/pods/ still has the container logs at this point.
-echo "Evacuating pod logs from VM..."
-limactl shell "$VM_NAME" sudo tar -czf /tmp/pod-logs-evacuation.tar.gz /var/log/pods/ 2>/dev/null || true
-limactl copy "${VM_NAME}:/tmp/pod-logs-evacuation.tar.gz" "$WORKDIR/pod-logs-evacuation.tar.gz" 2>/dev/null || true
-limactl shell "$VM_NAME" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+# so /var/log/pods/ still has the container logs at this point. Looped over every
+# node in NODES, not just $VM_NAME: the sonobuoy e2e-job pod (and therefore
+# /var/log/pods/ contents) can land on either node, and a primary-only evacuation
+# silently lost every pod log on a 2-node --all-e2e run where the pod scheduled
+# onto the extra node (temp/e2e/0805-2202-conformance). tar's own recursive walk
+# of /var/log/pods/ already picks up rotated 0.log.YYYYMMDDT... variants
+# alongside the live 0.log, so no separate glob is needed for those. stderr is
+# no longer suppressed on the tar itself -- a failed evacuation must print a
+# warning, not vanish silently (the exact failure mode that lost 0805-2202's logs).
+echo "Evacuating pod logs from VM(s): ${NODES[*]}..."
+for NODE in "${NODES[@]}"; do
+  limactl shell "$NODE" sudo tar -czf /tmp/pod-logs-evacuation.tar.gz /var/log/pods/ \
+    || echo "warning: pod log evacuation failed on $NODE" >&2
+  limactl copy "${NODE}:/tmp/pod-logs-evacuation.tar.gz" "$WORKDIR/pod-logs-evacuation-${NODE}.tar.gz" 2>/dev/null || true
+  limactl shell "$NODE" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+done
 
 echo "Retrieving results..."
 # sonobuoy retrieve uses port-forward which produces an EOF against u7s.
@@ -202,11 +285,10 @@ echo "Retrieving results..."
 # pod on the extra node instead of the primary, and every blocking call
 # below had no timeout -- the script hung with zero output and no error,
 # even though it has explicit "tarball not found" exit paths, because those
-# paths only fire if a call actually RETURNS. NODES lists every node in the
-# run so the tarball search isn't hardcoded to the primary; run_with_timeout
-# below bounds every blocking call so a stall surfaces loudly instead.
-NODES=("$VM_NAME")
-[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+# paths only fire if a call actually RETURNS. NODES (computed above, for log
+# evacuation) lists every node in the run so the tarball search isn't
+# hardcoded to the primary; run_with_timeout below bounds every blocking
+# call so a stall surfaces loudly instead.
 CALL_TIMEOUT=30
 
 # run_with_timeout <label> <secs> <suppress_stderr:0|1> <cmd...>
@@ -363,13 +445,19 @@ if [ "$UNPACK" -eq 1 ]; then
         | grep -v "BeforeSuite\|AfterSuite\|ReportBefore\|ReportAfter\|Synchronized" \
         | sed 's/^/    /'
 
-      # Print container logs from the evacuated tarball (copied before namespace GC).
+      # Print container logs from the evacuated tarballs (one per node, copied before namespace GC).
       E2E_LOG="$UNPACK_DIR/plugins/e2e/results/global/e2e.log"
-      if [ -f "$E2E_LOG" ] && [ -f "$WORKDIR/pod-logs-evacuation.tar.gz" ]; then
-        POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
-        mkdir -p "$POD_LOGS_DIR"
-        tar -xzf "$WORKDIR/pod-logs-evacuation.tar.gz" -C "$POD_LOGS_DIR" 2>/dev/null || true
-
+      POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
+      HAVE_POD_LOGS=0
+      for NODE in "${NODES[@]}"; do
+        EVAC_TARBALL="$WORKDIR/pod-logs-evacuation-${NODE}.tar.gz"
+        if [ -f "$EVAC_TARBALL" ]; then
+          mkdir -p "$POD_LOGS_DIR"
+          tar -xzf "$EVAC_TARBALL" -C "$POD_LOGS_DIR" 2>/dev/null || true
+          HAVE_POD_LOGS=1
+        fi
+      done
+      if [ -f "$E2E_LOG" ] && [ "$HAVE_POD_LOGS" -eq 1 ]; then
         echo ""
         echo "  Pod logs from failed test namespaces:"
         FAIL_NAMESPACES=$(grep -oE 'namespace "[a-z0-9-]+"' "$E2E_LOG" | \
