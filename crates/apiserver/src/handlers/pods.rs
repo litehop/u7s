@@ -4159,6 +4159,32 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
     }
 
+    // schedulerName: default to "default-scheduler" when absent or empty, mirroring
+    // upstream's `obj.SchedulerName == "" { obj.SchedulerName = v1.DefaultSchedulerName }`
+    // in SetDefaults_PodSpec. Real kube-scheduler's HandlesSchedulerName looks up the pod's
+    // schedulerName in a map keyed by each profile's name, which itself defaults to
+    // "default-scheduler" and is never "" — so a pod stored with schedulerName:"" is
+    // invisible to it and never gets scheduled.
+    if pod["spec"]["schedulerName"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty()
+    {
+        pod["spec"]["schedulerName"] = serde_json::json!("default-scheduler");
+    }
+
+    // restartPolicy: default to "Always" when absent or empty, mirroring upstream's
+    // unconditional default in SetDefaults_PodSpec. Defense-in-depth: kubelet's
+    // ShouldContainerBeRestarted already tolerates "" today (falls through to restart),
+    // but other RestartPolicy switches (e.g. pod-phase computation) are not guaranteed to.
+    if pod["spec"]["restartPolicy"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty()
+    {
+        pod["spec"]["restartPolicy"] = serde_json::json!("Always");
+    }
+
     // securityContext: default to an empty object when absent, mirroring upstream's
     // unconditional `obj.SecurityContext = &v1.PodSecurityContext{}` in SetDefaults_PodSpec.
     // The kubelet's generatePodSandboxLinuxConfig only calls NamespacesForPod (which computes
@@ -5254,6 +5280,136 @@ mod create_defaults_tests {
             serde_json::json!("None"),
             "dnsPolicy=None must be preserved — user-managed DNS pods configure \
              nameservers via dnsConfig; overriding would silently redirect DNS traffic"
+        );
+    }
+
+    // --- schedulerName defaulting tests ---
+
+    /// create_pod must default spec.schedulerName to "default-scheduler" when absent.
+    ///
+    /// Real vendored kube-scheduler's HandlesSchedulerName (pkg/scheduler/profile/profile.go)
+    /// looks the pod's schedulerName up in a map keyed by each profile's name, which itself
+    /// defaults to "default-scheduler" and is never the empty string. A pod stored with
+    /// schedulerName:"" is therefore invisible to it and never gets scheduled.
+    #[test]
+    fn pod_without_scheduler_name_gets_default() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["schedulerName"],
+            serde_json::json!("default-scheduler"),
+            "empty schedulerName is invisible to real kube-scheduler's HandlesSchedulerName \
+             (profile.go:68) — the pod would never be scheduled"
+        );
+    }
+
+    /// create_pod must NOT override an explicit schedulerName value.
+    ///
+    /// Overwriting a caller's custom scheduler name would silently redirect the pod to
+    /// the default scheduler instead of the custom one the user (or a scheduling
+    /// framework like kube-batch) intended to handle it.
+    #[test]
+    fn pod_with_custom_scheduler_name_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "schedulerName": "my-scheduler",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["schedulerName"],
+            serde_json::json!("my-scheduler"),
+            "an explicit schedulerName must not be overwritten by the default — doing so \
+             would silently hand the pod to the wrong scheduler"
+        );
+    }
+
+    // --- restartPolicy defaulting tests ---
+
+    /// create_pod must default spec.restartPolicy to "Always" when absent.
+    ///
+    /// Matches upstream SetDefaults_PodSpec (pkg/apis/core/v1/defaults.go:211-232 @
+    /// release-1.36), which unconditionally defaults RestartPolicy to Always. Defense in
+    /// depth: kubelet's ShouldContainerBeRestarted tolerates "" today, but other
+    /// RestartPolicy switches are not guaranteed to.
+    #[test]
+    fn pod_without_restart_policy_gets_always() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["restartPolicy"],
+            serde_json::json!("Always"),
+            "restartPolicy must default to Always when absent, matching upstream \
+             SetDefaults_PodSpec @ release-1.36:211-232"
+        );
+    }
+
+    /// create_pod must NOT override an explicit restartPolicy value.
+    ///
+    /// A Job's pod template commonly sets restartPolicy: Never or OnFailure; silently
+    /// forcing it back to Always would break the Job controller's completion tracking.
+    #[test]
+    fn pod_with_custom_restart_policy_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "job-pod", "namespace": "default"},
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["restartPolicy"],
+            serde_json::json!("Never"),
+            "an explicit restartPolicy must not be overwritten by the default — doing so \
+             would break Job completion tracking for pods that must not restart"
+        );
+    }
+
+    /// Running apply_pod_spec_defaults twice on an already-defaulted pod must be a no-op.
+    ///
+    /// apply_pod_spec_defaults runs on every write (create AND update). If a second pass
+    /// re-defaulted an already-set field, an update to an unrelated field could silently
+    /// mutate schedulerName/restartPolicy/dnsPolicy back to their defaults.
+    #[test]
+    fn applying_defaults_twice_is_idempotent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "schedulerName": "my-scheduler",
+                "restartPolicy": "Never",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_spec_defaults(&mut pod);
+        let once_defaulted = pod.clone();
+        apply_pod_spec_defaults(&mut pod);
+        assert_eq!(
+            pod, once_defaulted,
+            "a second apply_pod_spec_defaults pass (e.g. on an unrelated update) must not \
+             change a single field already set by the first pass"
         );
     }
 
