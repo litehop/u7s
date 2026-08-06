@@ -211,6 +211,34 @@ pub static SA_SIG_CACHE_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+/// Counter of aggregated-discovery documents built by `build_aggregated_discovery`, broken out
+/// by which discovery route triggered the build (`/api`, `/apis`, `/discovery/v2`), whether the
+/// core `/api/v1` group was included, and whether any `APIService` was registered at build time.
+/// `/api`, `/apis` and `/discovery/v2` are all on `auth::is_exempt`'s exempt list, so
+/// `AuthService::call` returns before `record_request_total` ever runs for them --
+/// `apiserver_request_total` has zero series for these routes. This counter is the only
+/// per-request signal available for measuring discovery request volume; `has_apiservice`
+/// specifically exists so a future discovery cache's design can be checked against the baseline
+/// rate of calls that involve a live APIService backend -- see the caller-token-forwarding
+/// cache-safety doc on `build_aggregated_discovery` itself for why that case cannot be served
+/// from a naive shared cache.
+pub static DISCOVERY_BUILD_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_discovery_build_total",
+            "Total number of aggregated-discovery documents built, broken out by discovery \
+             route, whether the core group was included, and whether an APIService was \
+             registered at build time.",
+        ),
+        &["version", "include_core", "has_apiservice"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_discovery_build_total is registered exactly once per process");
+    counter
+});
+
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;
