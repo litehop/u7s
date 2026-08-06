@@ -536,6 +536,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         }
     }
 
@@ -738,6 +739,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
 
         // First call: generates and writes CA files.
@@ -870,6 +872,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
 
         let tls = generate_tls(&args).expect("generate_tls must succeed");
@@ -1006,6 +1009,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
         let result = generate_tls(&args);
         assert!(
@@ -1056,6 +1060,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         let server_url = "https://127.0.0.1:6443";
@@ -1157,6 +1162,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
@@ -1199,6 +1205,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
 
@@ -1262,6 +1269,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
 

@@ -634,6 +634,7 @@ pub async fn token_review<S: Store>(
         state.sa_decoding_key.as_deref(),
         &req.spec.audiences,
         state.store.as_ref(),
+        state.sa_sig_cache.as_ref(),
     )
     .await;
 
@@ -912,8 +913,11 @@ mod tests {
         );
 
         let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store");
+        let sig_cache =
+            crate::sa_sig_cache::SigCache::new_with_capacity(crate::sa_sig_cache::DEFAULT_CAPACITY);
         let result =
-            authenticate_token_with_audiences("argocd-token", &map, None, &[], &store).await;
+            authenticate_token_with_audiences("argocd-token", &map, None, &[], &store, &sig_cache)
+                .await;
         let user = result.expect("known token must resolve to a user");
         assert_eq!(user.username, "argocd-admin");
         assert!(user.groups.contains(&"system:authenticated".to_owned()));
@@ -928,8 +932,11 @@ mod tests {
 
         let map = HashMap::new();
         let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store");
+        let sig_cache =
+            crate::sa_sig_cache::SigCache::new_with_capacity(crate::sa_sig_cache::DEFAULT_CAPACITY);
         let result =
-            authenticate_token_with_audiences("unknown-token", &map, None, &[], &store).await;
+            authenticate_token_with_audiences("unknown-token", &map, None, &[], &store, &sig_cache)
+                .await;
         assert!(result.is_none(), "unrecognized token must not authenticate");
     }
 

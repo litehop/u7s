@@ -29,6 +29,7 @@ mod rbac;
 mod rbac_authz_authn_gen;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
+mod sa_sig_cache;
 mod state;
 mod status;
 mod storage_node_flow_gen;
@@ -347,6 +348,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         sa_public_key_pem,
     });
     state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
+    // Resolve the SA-JWT signature-verify cache capacity: --sa-sig-cache-size, then
+    // U7S_SA_SIG_CACHE_SIZE, then the default. Overwrites the AppStateConfig-default cache
+    // AppState::new_with_config already built — see sa_sig_cache field's doc for why this
+    // isn't threaded through AppStateConfig like most other fields.
+    let sa_sig_cache_capacity = args.sa_sig_cache_size.unwrap_or_else(|| {
+        std::env::var("U7S_SA_SIG_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(sa_sig_cache::DEFAULT_CAPACITY)
+    });
+    state.sa_sig_cache = Arc::new(sa_sig_cache::SigCache::new_with_capacity(
+        sa_sig_cache_capacity,
+    ));
 
     // 10a. Populate RBAC index from persisted objects before serving.
     state.init().await;
@@ -447,6 +461,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
             Arc::clone(&state.store),
+            Arc::clone(&state.sa_sig_cache),
         ))
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -5973,6 +5988,7 @@ mod tests {
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
             std::sync::Arc::clone(&state.store),
+            std::sync::Arc::clone(&state.sa_sig_cache),
         ));
 
         for path in ["/openapi/v2", "/openapi/v3"] {
@@ -6622,12 +6638,15 @@ mod tests {
         // 5. Authenticate the minted token via the auth middleware path.
         //    This verifies the full round-trip: the JWT the handler mints can be
         //    verified by the same decoding key used in production.
+        let sig_cache =
+            crate::sa_sig_cache::SigCache::new_with_capacity(crate::sa_sig_cache::DEFAULT_CAPACITY);
         let user = auth::authenticate_token_with_audiences(
             token,
             &std::collections::HashMap::new(),
             Some(&dec_key),
             &[],
             store.as_ref(),
+            &sig_cache,
         )
         .await
         .expect("minted SA token must authenticate successfully — round-trip broken if None");
@@ -8623,6 +8642,7 @@ mod tests {
             kubelet_port: 10250,
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
         };
         let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");
 

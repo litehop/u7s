@@ -8,6 +8,7 @@ use u7s_store::{ListOptions, SqliteStore, Store};
 use crate::admission::WebhookEntry;
 use crate::auth::UserInfo;
 use crate::rbac::RbacIndex;
+use crate::sa_sig_cache::SigCache;
 use crate::types::{ResourceKey, ResourceMeta};
 
 /// Sentinel key prefix for allocated service IPs.
@@ -476,6 +477,12 @@ pub struct AppState<S = SqliteStore> {
     /// resourceVersion, target apiVersion). See `CrConversionCache` for the cache-key
     /// rationale and invalidation strategy.
     pub cr_conversion_cache: Arc<CrConversionCache>,
+    /// Cache of SA-JWT signature-verification outcomes, so repeat presentation of the same
+    /// token skips the RSA modexp. Not part of `AppStateConfig` (same reasoning as
+    /// `node_kubelet_ports`: no test caller needs a non-default capacity at construction
+    /// time) — `run()` overwrites this field directly once `--sa-sig-cache-size` /
+    /// `U7S_SA_SIG_CACHE_SIZE` has been resolved. See `sa_sig_cache` module doc.
+    pub sa_sig_cache: Arc<SigCache>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -541,6 +548,7 @@ impl<S> Clone for AppState<S> {
             quota_admission_locks: self.quota_admission_locks.clone(),
             cr_schema_cache: self.cr_schema_cache.clone(),
             cr_conversion_cache: self.cr_conversion_cache.clone(),
+            sa_sig_cache: self.sa_sig_cache.clone(),
         }
     }
 }
@@ -734,6 +742,11 @@ impl<S: Store> AppState<S> {
             quota_admission_locks: QuotaAdmissionLocks::new(),
             cr_schema_cache: Arc::new(CrSchemaCache::new()),
             cr_conversion_cache: Arc::new(CrConversionCache::new()),
+            // See the field's doc: overwritten by run() once the CLI/env-resolved capacity
+            // is known; every test gets the default, matching node_kubelet_ports' pattern.
+            sa_sig_cache: Arc::new(SigCache::new_with_capacity(
+                crate::sa_sig_cache::DEFAULT_CAPACITY,
+            )),
         }
     }
 

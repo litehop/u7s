@@ -82,4 +82,10 @@ pub struct Args {
     /// Mac host. Format: "host:port" (e.g. "127.0.0.1:8135"). Omit to disable proxying.
     #[arg(long)]
     pub(crate) konnectivity_proxy_addr: Option<String>,
+
+    /// Max number of distinct SA-JWT signatures cached to skip the RSA verify (modular
+    /// exponentiation) on repeat presentation of the same token. Falls back to the
+    /// U7S_SA_SIG_CACHE_SIZE env var, then 512, when unset — see `sa_sig_cache` module doc.
+    #[arg(long)]
+    pub(crate) sa_sig_cache_size: Option<usize>,
 }
