@@ -1256,9 +1256,7 @@ pub(crate) async fn validate_portforward<S: Store>(
 }
 
 /// Subprotocol every supported kubectl release (1.34-1.36) offers on its primary
-/// port-forward dialer attempt (`portforward.NewSPDYOverWebsocketDialer`). There is no
-/// v4/v5 versioning for port-forward — that concept applies only to exec/attach's
-/// channel protocol (see `EXEC_KUBELET_SUBPROTOCOL`) and does not exist here. A prior
+/// port-forward dialer attempt (`portforward.NewSPDYOverWebsocketDialer`). A prior
 /// implementation advertised `v5.portforward.k8s.io`, which appears nowhere in
 /// upstream Kubernetes — no real kubectl client could ever negotiate it.
 const PORTFORWARD_KUBECTL_SUBPROTOCOL: &str = "SPDY/3.1+portforward.k8s.io";
@@ -1268,27 +1266,54 @@ const PORTFORWARD_KUBECTL_SUBPROTOCOL: &str = "SPDY/3.1+portforward.k8s.io";
 /// prefixed by) the `SPDY/3.1+` websocket-tunneling wrapper above.
 const PORTFORWARD_KUBELET_PROTOCOL: &str = "portforward.k8s.io";
 
-/// Reject a client's requested WebSocket subprotocols unless they include the one
-/// subprotocol every supported kubectl release offers for port-forward.
+/// The native (non-SPDY) channel-multiplexed port-forward protocol. Offered by
+/// `test/e2e/framework/websocket/websocket.go`'s raw websocket test client — the
+/// only client class in u7s's supported conformance surface that speaks it; no
+/// supported kubectl release (1.34-1.36) ever offers it. Wire format (per
+/// `k8s.io/cri-streaming/pkg/streaming/portforward/websocket.go`'s
+/// `handleWebSocketStreams`): one binary-message channel byte prefix per message,
+/// a (data, error) channel pair per forwarded port in request order, and a
+/// little-endian uint16 port preamble written as the first payload on each
+/// channel when the connection opens.
+const PORTFORWARD_V4_SUBPROTOCOL: &str = "v4.channel.k8s.io";
+
+/// Which wire protocol a client's WebSocket handshake resolved to.
+#[derive(Debug, PartialEq, Eq)]
+enum PortforwardSubprotocol {
+    /// `SPDY/3.1+portforward.k8s.io` — byte-pump translated to legacy
+    /// raw-SPDY-over-HTTP on the kubelet leg (`portforward_proxy_tunneled`).
+    KubectlSpdy,
+    /// `v4.channel.k8s.io` — relayed verbatim to kubelet's native v4 handler
+    /// (`portforward_proxy_v4`); both legs speak the identical protocol.
+    V4Channel,
+}
+
+/// Resolve a client's requested WebSocket subprotocols to one u7s can serve.
 ///
 /// Silently accepting an unrecognized offer (which is what axum's `.protocols()`
 /// does on its own — it just completes the handshake without a
 /// `Sec-WebSocket-Protocol` header) produces a "successful" upgrade that neither
-/// kubectl nor kubelet can actually exchange SPDY-framed traffic over — exactly the
-/// failure mode the fabricated `v5.portforward.k8s.io` subprotocol produced. Empty
-/// offers are accepted, matching upstream's lenient handling of subprotocol-less
-/// clients.
-fn validate_portforward_subprotocol(requested: &[String]) -> Result<(), String> {
+/// end can actually exchange traffic over — exactly the failure mode the
+/// fabricated `v5.portforward.k8s.io` subprotocol produced. Empty offers default
+/// to `KubectlSpdy`, matching upstream's lenient handling of subprotocol-less
+/// clients. SPDY is preferred over v4 when (synthetically) both are offered — no
+/// real client offers both, since kubectl never sends v4 and the e2e websocket
+/// client never sends SPDY, but a fixed precedence keeps resolution
+/// order-independent.
+fn resolve_portforward_subprotocol(requested: &[String]) -> Result<PortforwardSubprotocol, String> {
     if requested.is_empty()
         || requested
             .iter()
             .any(|p| p == PORTFORWARD_KUBECTL_SUBPROTOCOL)
     {
-        Ok(())
+        Ok(PortforwardSubprotocol::KubectlSpdy)
+    } else if requested.iter().any(|p| p == PORTFORWARD_V4_SUBPROTOCOL) {
+        Ok(PortforwardSubprotocol::V4Channel)
     } else {
         Err(format!(
             "unsupported Sec-WebSocket-Protocol {requested:?}; only \
-             {PORTFORWARD_KUBECTL_SUBPROTOCOL:?} is supported"
+             {PORTFORWARD_KUBECTL_SUBPROTOCOL:?} or {PORTFORWARD_V4_SUBPROTOCOL:?} \
+             is supported"
         ))
     }
 }
@@ -1332,20 +1357,27 @@ fn parse_https_url(url: &str) -> anyhow::Result<(String, u16, String)> {
     Ok((host.to_owned(), port, format!("/{path}")))
 }
 
-/// portforward proxy: kubectl → apiserver → kubelet.
+/// portforward proxy: kubectl (or a raw v4.channel.k8s.io websocket client) →
+/// apiserver → kubelet.
 ///
 /// kubectl's client-go dialer always tries a websocket-tunneled-SPDY GET first
 /// (`Sec-WebSocket-Protocol: SPDY/3.1+portforward.k8s.io`) and falls back to a raw
 /// SPDY-over-HTTP POST (`Upgrade: SPDY/3.1`) only if that fails — both must reach this
 /// handler, so it takes the raw request rather than axum's GET-only `WebSocketUpgrade`
-/// extractor (which 405s any POST before the handler body runs at all).
+/// extractor (which 405s any POST before the handler body runs at all). A third
+/// client class — `test/e2e/framework/websocket/websocket.go`'s raw websocket test
+/// client — offers only `v4.channel.k8s.io`, never SPDY; see
+/// `PORTFORWARD_V4_SUBPROTOCOL`.
 ///
-/// Neither leg is SPDY-parsed: real SPDY stream multiplexing happens end-to-end
-/// between kubectl and kubelet, and the outbound leg to kubelet is always legacy raw
-/// SPDY-over-HTTP regardless of which shape the client used — kubelet's
-/// `handleHTTPStreams` accepts it unconditionally on every supported release, unlike
-/// its native websocket path (beta, kubelet-1.36-only, not something u7s can assume a
-/// given kubelet has enabled).
+/// The SPDY leg is never SPDY-parsed: real SPDY stream multiplexing happens
+/// end-to-end between kubectl and kubelet, and the outbound leg to kubelet is
+/// always legacy raw SPDY-over-HTTP regardless of which shape the client used —
+/// kubelet's `handleHTTPStreams` accepts it unconditionally on every supported
+/// release, unlike its native websocket path (beta, kubelet-1.36-only, not
+/// something u7s can assume a given kubelet has enabled). The v4 leg needs no such
+/// translation: kubelet's native v4 handler is accepted unconditionally on every
+/// supported release too, so both legs speak the identical protocol and are
+/// spliced verbatim (`portforward_proxy_v4`).
 pub async fn pod_portforward<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
@@ -1364,21 +1396,32 @@ pub async fn pod_portforward<S: Store>(
             .requested_protocols()
             .filter_map(|v| v.to_str().ok().map(str::to_owned))
             .collect();
-        validate_portforward_subprotocol(&requested).map_err(Status::bad_request)?;
+        let subprotocol =
+            resolve_portforward_subprotocol(&requested).map_err(Status::bad_request)?;
 
-        return Ok(ws.protocols([PORTFORWARD_KUBECTL_SUBPROTOCOL]).on_upgrade(
-            move |inbound_socket| async move {
-                if let Err(e) = portforward_proxy_tunneled(inbound_socket, params).await {
-                    tracing::warn!("portforward proxy error: {e}");
-                }
-            },
-        ));
+        return Ok(match subprotocol {
+            PortforwardSubprotocol::KubectlSpdy => ws
+                .protocols([PORTFORWARD_KUBECTL_SUBPROTOCOL])
+                .on_upgrade(move |inbound_socket| async move {
+                    if let Err(e) = portforward_proxy_tunneled(inbound_socket, params).await {
+                        tracing::warn!("portforward proxy error: {e}");
+                    }
+                }),
+            PortforwardSubprotocol::V4Channel => ws
+                .protocols([PORTFORWARD_V4_SUBPROTOCOL])
+                .on_upgrade(move |inbound_socket| async move {
+                    if let Err(e) = portforward_proxy_v4(inbound_socket, params).await {
+                        tracing::warn!("portforward proxy error: {e}");
+                    }
+                }),
+        });
     }
 
     if !is_raw_spdy_upgrade_request(&req) {
         return Err(Status::bad_request(
             "portforward requires a WebSocket upgrade (Sec-WebSocket-Protocol: \
-             SPDY/3.1+portforward.k8s.io) or a raw SPDY/3.1 upgrade (Upgrade: SPDY/3.1)"
+             SPDY/3.1+portforward.k8s.io or v4.channel.k8s.io) or a raw SPDY/3.1 \
+             upgrade (Upgrade: SPDY/3.1)"
                 .to_string(),
         ));
     }
@@ -1469,6 +1512,85 @@ async fn portforward_proxy_tunneled(
     params: PortforwardParams,
 ) -> anyhow::Result<()> {
     let kubelet = dial_kubelet_portforward(&params).await?;
+    splice(AxumWs(inbound), kubelet).await;
+    Ok(())
+}
+
+/// Dial kubelet's native `v4.channel.k8s.io` websocket portforward endpoint.
+///
+/// Unlike `dial_kubelet_portforward` (legacy raw-SPDY-over-HTTP), kubelet's
+/// `handleWebSocketStreams` accepts this subprotocol unconditionally on every
+/// supported release — `ServePortForward` dispatches to it purely on the presence
+/// of an `Upgrade: websocket` header (`k8s.io/cri-streaming/pkg/streaming/
+/// portforward/portforward.go`), with no feature-gate dependency the way the
+/// SPDY-over-websocket class has (`ExtendWebSocketsToKubelet`, beta,
+/// kubelet-1.36-only). Same `/portForward/<ns>/<pod>` path as the SPDY leg, but
+/// NOT the same query parameter name: `NewV4Options` (`.../portforward/websocket.go`)
+/// reads `req.URL.Query()[PortHeader]` where `PortHeader = "port"` (singular,
+/// `.../portforward/constants.go`) — the legacy SPDY leg's `?ports=` (plural) is a
+/// u7s/apiserver-only convention that kubelet's SPDY path never actually inspects
+/// (real SPDY streams carry their port dynamically per SYN_STREAM header instead),
+/// so reusing it unchanged here produces kubelet's own `query parameter "port" is
+/// required` 400 — silently wrong query key name, not a protocol mismatch.
+async fn dial_kubelet_portforward_v4(
+    params: &PortforwardParams,
+) -> anyhow::Result<TungsteniteWs<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let tls_config = build_kubelet_tls_config(
+        params.cluster_ca_der.as_deref(),
+        params.client_identity_pem.as_deref(),
+    )?;
+    let connector = tokio_tungstenite::Connector::Rustls(tls_config);
+
+    let wss_url = params
+        .kubelet_url
+        .strip_prefix("https://")
+        .map(|rest| format!("wss://{rest}"))
+        .ok_or_else(|| anyhow::anyhow!("kubelet URL must use https://: {}", params.kubelet_url))?
+        .replace("?ports=", "?port=");
+
+    let mut req = wss_url
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("invalid kubelet URL: {e}"))?;
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        PORTFORWARD_V4_SUBPROTOCOL
+            .parse()
+            .expect("valid header value"),
+    );
+
+    let (outbound_ws, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
+            .await
+            .map_err(|e| {
+                if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
+                    anyhow::anyhow!(
+                        "kubelet v4 portforward connect failed: HTTP {} headers={:?} body={:?}",
+                        resp.status(),
+                        resp.headers(),
+                        resp.body().as_deref()
+                    )
+                } else {
+                    anyhow::anyhow!("kubelet v4 portforward connect failed: {e}")
+                }
+            })?;
+
+    Ok(TungsteniteWs(outbound_ws))
+}
+
+/// Splice the client's `v4.channel.k8s.io` connection with kubelet's native v4
+/// handler.
+///
+/// Both legs speak the identical channel-multiplexed protocol — a channel-number
+/// byte prefix per binary message, and a little-endian uint16 port preamble
+/// kubelet writes as the first payload on each (data, error) channel pair when it
+/// accepts the connection (`handleWebSocketStreams`) — so this is a pure byte-pump
+/// with zero channel interpretation on u7s's part, exactly like /attach and
+/// /exec's data path (`run_attach_proxy`). u7s never constructs or parses the
+/// preamble itself: kubelet writes it, and it is relayed to the client verbatim.
+async fn portforward_proxy_v4(inbound: WebSocket, params: PortforwardParams) -> anyhow::Result<()> {
+    let kubelet = dial_kubelet_portforward_v4(&params).await?;
     splice(AxumWs(inbound), kubelet).await;
     Ok(())
 }
@@ -3642,6 +3764,33 @@ mod tests {
             .expect("bind test listener")
     }
 
+    /// Echo the client's requested subprotocol in a mock kubelet's websocket
+    /// handshake response.
+    ///
+    /// Real kubelet's `golang.org/x/net/websocket`-based wsstream server always
+    /// echoes the negotiated `Config.Protocol` in its 101 response; tungstenite's
+    /// client-side handshake validation (used by `dial_kubelet_portforward_v4`)
+    /// rejects a 101 that omits this header when the client requested a
+    /// subprotocol, so a mock kubelet that skips this would fail even a correct
+    /// dial implementation.
+    ///
+    /// `ErrorResponse` is tungstenite's `Callback` trait signature, not something
+    /// this test-only helper controls the size of.
+    #[allow(clippy::result_large_err)]
+    fn echo_v4_subprotocol(
+        _req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        response.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            PORTFORWARD_V4_SUBPROTOCOL.parse().unwrap(),
+        );
+        Ok(response)
+    }
+
     /// The primary GET handshake must advertise exactly `SPDY/3.1+portforward.k8s.io`,
     /// never the fabricated `v5.portforward.k8s.io`.
     ///
@@ -3707,17 +3856,19 @@ mod tests {
         );
     }
 
-    /// A client offering only an unsupported subprotocol (e.g. the invented
-    /// `v4.channel.k8s.io`, never used for port-forward by any real Kubernetes
-    /// component) must be rejected, not silently accepted with no subprotocol at all.
+    /// A client offering only a completely unrecognized subprotocol must be
+    /// rejected, not silently accepted with no subprotocol at all.
     ///
     /// axum's `WebSocketUpgrade::protocols()` alone would not catch this: when none of
     /// the offered candidates match, it completes the handshake with no
     /// `Sec-WebSocket-Protocol` header rather than rejecting — exactly the failure
     /// shape the fabricated `v5.portforward.k8s.io` subprotocol produced: a connection
-    /// that "succeeds" but neither end can exchange usable traffic over.
+    /// that "succeeds" but neither end can exchange usable traffic over. This must
+    /// keep failing loudly even after `v4.channel.k8s.io` becomes a second accepted
+    /// protocol — silently widening acceptance to "anything" would be the same bug
+    /// in a different shape.
     #[tokio::test]
-    async fn portforward_rejects_unsupported_subprotocol() {
+    async fn portforward_rejects_completely_unknown_subprotocol() {
         use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
 
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
@@ -3748,7 +3899,7 @@ mod tests {
         let mut request = url.into_client_request().unwrap();
         request.headers_mut().insert(
             "Sec-WebSocket-Protocol",
-            "v4.channel.k8s.io".parse().unwrap(),
+            "some.invented.thing.k8s.io".parse().unwrap(),
         );
 
         let result =
@@ -3771,6 +3922,126 @@ mod tests {
                  got: {other:?}"
             ),
         }
+    }
+
+    /// `e2ewebsocket.OpenWebSocketForURL` (`test/e2e/framework/websocket/websocket.go`)
+    /// offers ONLY `v4.channel.k8s.io` — no SPDY subprotocol at all. Rejecting it
+    /// silently fails the sig-cli "should support forwarding over websockets"
+    /// conformance tests, exactly like the fabricated `v5.portforward.k8s.io`
+    /// subprotocol failed every kubectl port-forward before that fix.
+    #[tokio::test]
+    async fn portforward_accepts_v4_channel_k8s_io_subprotocol() {
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_portforward_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+
+        let url =
+            format!("ws://{addr}/api/v1/namespaces/default/pods/pf-pod/portforward?ports=8080");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            PORTFORWARD_V4_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (_ws, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect(
+                    "a portforward websocket GET offering only v4.channel.k8s.io must \
+                     upgrade (101) — rejecting it is what breaks e2ewebsocket.\
+                     OpenWebSocketForURL with 'bad status'",
+                );
+
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some(PORTFORWARD_V4_SUBPROTOCOL),
+            "the echoed subprotocol must be v4.channel.k8s.io, matching what the \
+             client offered"
+        );
+    }
+
+    /// When a client offers both `SPDY/3.1+portforward.k8s.io` and
+    /// `v4.channel.k8s.io`, SPDY must win — matching kubectl's own dialer, which is
+    /// the overwhelmingly more common client. No real client offers both today, but
+    /// resolution must stay order-independent and not regress kubectl's path as a
+    /// side effect of adding v4 support.
+    #[tokio::test]
+    async fn portforward_still_accepts_spdy_subprotocol_when_v4_offered_second() {
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_portforward_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+
+        let url =
+            format!("ws://{addr}/api/v1/namespaces/default/pods/pf-pod/portforward?ports=8080");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            format!("{PORTFORWARD_KUBECTL_SUBPROTOCOL}, {PORTFORWARD_V4_SUBPROTOCOL}")
+                .parse()
+                .unwrap(),
+        );
+
+        let (_ws, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect("a portforward websocket GET must upgrade (101)");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some(PORTFORWARD_KUBECTL_SUBPROTOCOL),
+            "SPDY must be preferred over v4 when both are offered — kubectl's own \
+             dialer must keep working exactly as before v4 support was added"
+        );
     }
 
     /// GET and POST to /portforward must both reach `pod_portforward`'s own
@@ -3942,6 +4213,359 @@ mod tests {
             ),
             other => panic!("expected a Binary message, got: {other:?}"),
         }
+    }
+
+    /// The little-endian uint16 port preamble kubelet writes on a v4.channel.k8s.io
+    /// data channel when it opens the connection must reach the client bit-for-bit.
+    ///
+    /// `k8s.io/cri-streaming/pkg/streaming/portforward/websocket.go`'s
+    /// `handleWebSocketStreams` writes `binary.LittleEndian.PutUint16(portBytes,
+    /// uint16(port))` as the very first payload on each data/error channel. u7s never
+    /// constructs this preamble itself (kubelet does, and u7s relays kubelet's v4
+    /// connection to the client verbatim) — but if the relay ever fragmented,
+    /// reordered, or otherwise mangled these 3 bytes (channel byte + 2-byte port),
+    /// `test/e2e/framework/websocket/websocket.go`'s raw client would decode the
+    /// wrong port and misattribute every subsequent read/write on this connection.
+    #[tokio::test]
+    async fn portforward_v4_channel_encodes_port_preamble_as_little_endian_uint16() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        const PORT: u16 = 8080;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let kubelet_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = kubelet_listener.local_addr().unwrap().port();
+
+        // Mock kubelet's handleWebSocketStreams: accept the v4 websocket upgrade,
+        // then write the little-endian uint16 port preamble on the data channel (0)
+        // and error channel (1) for the single requested port — matching
+        // websocket.go:130-134 exactly.
+        tokio::spawn(async move {
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_v4_subprotocol)
+                .await
+                .unwrap();
+            let port_bytes = PORT.to_le_bytes();
+            ws.send(Message::Binary(
+                vec![0, port_bytes[0], port_bytes[1]].into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Binary(
+                vec![1, port_bytes[0], port_bytes[1]].into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_portforward_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+
+        let url =
+            format!("ws://{addr}/api/v1/namespaces/default/pods/pf-pod/portforward?ports={PORT}");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            PORTFORWARD_V4_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (mut ws, _resp) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect("portforward v4 websocket handshake must succeed");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("must receive kubelet's data-channel preamble before timing out")
+            .expect("stream must not end before the preamble arrives")
+            .expect("message must be Ok");
+        let data = match msg {
+            Message::Binary(b) => b,
+            other => panic!("expected a Binary message, got: {other:?}"),
+        };
+
+        assert_eq!(
+            data[0], 0,
+            "the first message must carry the data channel byte (0), unmodified by \
+             the relay"
+        );
+        assert_eq!(
+            u16::from_le_bytes([data[1], data[2]]),
+            PORT,
+            "the port preamble must decode as little-endian uint16 — if the relay ever \
+             reordered these two bytes (e.g. mistakenly treating them as big-endian), \
+             the e2e websocket client would resolve the wrong forwarded port"
+        );
+    }
+
+    /// A v4.channel.k8s.io connection must carry exactly one (data, error) channel
+    /// pair per forwarded port, and neither channel may be dropped or reordered.
+    ///
+    /// The codebase already has precedent for channel-based filtering going wrong on
+    /// this data path: /exec's relay absorbs kubelet's status frames on channels 3/4
+    /// (`is_exec_status_frame`). If that pattern were mistakenly copied here — e.g.
+    /// treating odd-numbered (error) channels as absorbable status frames — the
+    /// error stream for every forwarded port would be silently dropped instead of
+    /// reaching the client, and connection failures would appear to hang instead of
+    /// surfacing kubelet's error text.
+    #[tokio::test]
+    async fn portforward_v4_channel_pairs_data_and_error_streams_per_port() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        const PORTS: [u16; 2] = [8080, 9090];
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let kubelet_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = kubelet_listener.local_addr().unwrap().port();
+
+        // Mock kubelet: two requested ports means two (data, error) channel pairs —
+        // channels (0,1) for the first port, (2,3) for the second — matching
+        // websocket.go's `streams[i*2+dataChannel]` / `streams[i*2+errorChannel]`.
+        tokio::spawn(async move {
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_v4_subprotocol)
+                .await
+                .unwrap();
+            for (i, port) in PORTS.iter().enumerate() {
+                let port_bytes = port.to_le_bytes();
+                let data_channel = (i * 2) as u8;
+                let error_channel = (i * 2 + 1) as u8;
+                ws.send(Message::Binary(
+                    vec![data_channel, port_bytes[0], port_bytes[1]].into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Binary(
+                    vec![error_channel, port_bytes[0], port_bytes[1]].into(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_portforward_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+
+        // A single comma-joined `ports=` value, matching upstream's own
+        // `strings.Split(portString, ",")` parsing (NewV4Options) — not two
+        // repeated `ports=` keys.
+        let ports_qs = PORTS
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let url = format!(
+            "ws://{addr}/api/v1/namespaces/default/pods/pf-pod/portforward?ports={ports_qs}"
+        );
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            PORTFORWARD_V4_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (mut ws, _resp) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect("portforward v4 websocket handshake must succeed");
+
+        async fn expect_binary(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            label: &'static str,
+        ) -> Vec<u8> {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+                .await
+                .unwrap_or_else(|_| panic!("must receive {label} before timing out"))
+                .unwrap_or_else(|| panic!("stream must not end before {label} arrives"))
+                .expect("message must be Ok");
+            match msg {
+                Message::Binary(b) => b.to_vec(),
+                other => panic!("expected a Binary message for {label}, got: {other:?}"),
+            }
+        }
+
+        for (i, port) in PORTS.iter().enumerate() {
+            let data = expect_binary(&mut ws, "the data-channel preamble").await;
+            assert_eq!(
+                data[0],
+                (i * 2) as u8,
+                "port {port}'s data channel must be channel {} — a shifted or dropped \
+                 pair would misattribute this port's traffic to a different port's \
+                 local listener",
+                i * 2
+            );
+            assert_eq!(
+                u16::from_le_bytes([data[1], data[2]]),
+                *port,
+                "port {port}'s data channel preamble must carry its own port number"
+            );
+
+            let error = expect_binary(&mut ws, "the error-channel preamble").await;
+            assert_eq!(
+                error[0],
+                (i * 2 + 1) as u8,
+                "port {port}'s error channel must immediately follow its data channel \
+                 as channel {} — if error channels were filtered like /exec's status \
+                 frames (channels 3/4), this message would never arrive",
+                i * 2 + 1
+            );
+            assert_eq!(
+                u16::from_le_bytes([error[1], error[2]]),
+                *port,
+                "port {port}'s error channel preamble must carry its own port number"
+            );
+        }
+    }
+
+    /// The v4 kubelet dial must send `?port=`, not the legacy SPDY leg's `?ports=`.
+    ///
+    /// `k8s.io/cri-streaming/pkg/streaming/portforward/websocket.go`'s `NewV4Options`
+    /// reads `req.URL.Query()[PortHeader]` where `PortHeader = "port"` (constants.go,
+    /// singular) — real kubelet's SPDY-over-HTTP leg never reads the URL query at all
+    /// (each SPDY stream carries its own port via a SYN_STREAM header), so `?ports=`
+    /// silently working there masked this: reusing that exact query string verbatim
+    /// for the v4 leg makes kubelet answer `query parameter "port" is required` (400)
+    /// even though the websocket handshake itself succeeds — confirmed live against a
+    /// real kubelet on lima-node-4 before this fix.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite's Callback trait signature
+    async fn portforward_v4_kubelet_dial_uses_port_not_ports_query_param() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = listener.local_addr().unwrap().port();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let tx = std::sync::Mutex::new(Some(tx));
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let _ws = tokio_tungstenite::accept_hdr_async(
+                tls,
+                move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(req.uri().query().unwrap_or("").to_string());
+                    }
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        PORTFORWARD_V4_SUBPROTOCOL.parse().unwrap(),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let params = PortforwardParams {
+            kubelet_url: format!(
+                "https://127.0.0.1:{kubelet_port}/portForward/default/mypod?ports=8080"
+            ),
+            cluster_ca_der: Some(cert_der),
+            client_identity_pem: None,
+        };
+
+        let result = dial_kubelet_portforward_v4(&params).await;
+        assert!(
+            result.is_ok(),
+            "dial must succeed once the query key matches kubelet's NewV4Options: {:?}",
+            result.err()
+        );
+
+        let query = rx.await.unwrap();
+        assert!(
+            query.contains("port=8080") && !query.contains("ports="),
+            "expected the outbound query to use 'port=', not 'ports=' — got {query:?}"
+        );
     }
 
     /// The kubelet-facing dial must use legacy raw SPDY-over-HTTP — a plain POST with
