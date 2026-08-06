@@ -84,7 +84,7 @@ Use in-memory SQLite per test. The store crate's `SqliteStore::new(":memory:")`
 gives a fresh, isolated DB with no disk I/O:
 
 ```rust
-let store = SqliteStore::new(":memory:").await.unwrap();
+let store = SqliteStore::new(":memory:").expect("in-memory store");
 ```
 
 Never share a store instance across tests. In-memory databases are
