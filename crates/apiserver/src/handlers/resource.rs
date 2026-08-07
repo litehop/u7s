@@ -1301,9 +1301,10 @@ async fn storage_class_allows_expansion<S: Store>(state: &AppState<S>, sc_name: 
     }
 }
 
-/// Rejects a PersistentVolumeClaim UPDATE that grows `spec.resources.requests.storage`
-/// past `old_size` unless `old_sc_name`'s StorageClass explicitly allows it. Mirrors
-/// upstream's PersistentVolumeClaimResize admission plugin: without this check, e2e's
+/// Rejects a PersistentVolumeClaim UPDATE that changes `spec.resources.requests.storage`
+/// in a way upstream disallows: shrinking below `old_size` is always rejected, and growing
+/// past `old_size` is rejected unless `old_sc_name`'s StorageClass explicitly allows it.
+/// Mirrors upstream's PersistentVolumeClaimResize admission plugin: without this check, e2e's
 /// "should not allow expansion of pvcs without AllowVolumeExpansion property" observes
 /// the size increase silently succeed instead of a 403 Forbidden.
 async fn reject_disallowed_pvc_expansion<S: Store>(
@@ -1323,7 +1324,15 @@ async fn reject_disallowed_pvc_expansion<S: Store>(
     else {
         return Ok(());
     };
-    if new_size <= old_size || storage_class_allows_expansion(state, old_sc_name).await {
+    if new_size < old_size {
+        // Kubernetes does not support volume shrinking (upstream:
+        // pkg/apis/core/validation/validation.go:2584).
+        return Err(Status::forbidden(format!(
+            "{plural} \"{name}\" is forbidden: spec.resources.requests.storage: field can not \
+             be less than previous value"
+        )));
+    }
+    if new_size == old_size || storage_class_allows_expansion(state, old_sc_name).await {
         return Ok(());
     }
     Err(Status::forbidden(format!(
@@ -16540,6 +16549,200 @@ mod tests {
                 "PATCH growing PersistentVolumeClaim.spec.resources.requests.storage must be \
                  rejected when the bound StorageClass has allowVolumeExpansion: false — the \
                  resize check is missing from do_patch"
+            ),
+        }
+    }
+
+    /// PUT shrinking a PVC's `spec.resources.requests.storage` must return 403 Forbidden
+    /// even when the bound StorageClass has `allowVolumeExpansion: true` — upstream rejects
+    /// shrink unconditionally (pkg/apis/core/validation/validation.go:2579-2589: "Kubernetes
+    /// does not actually support volume shrinking"). Without this check, u7s accepts the
+    /// shrink and the PVC is left with spec.storage < status.capacity forever, since no CSI
+    /// driver actually shrinks the underlying volume.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_pvc_shrink() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "can-expand-shrink" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": true
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "shrink-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "can-expand-shrink",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let shrunk = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "shrink-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "can-expand-shrink",
+                "resources": { "requests": { "storage": "500Mi" } }
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "shrink-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&shrunk).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => {
+                assert_eq!(
+                    err.0,
+                    axum::http::StatusCode::FORBIDDEN,
+                    "PUT shrinking a PVC's storage request must return 403 Forbidden — \
+                     upstream rejects volume shrink unconditionally regardless of \
+                     allowVolumeExpansion, since no CSI driver actually shrinks storage"
+                );
+                assert_eq!(
+                    err.1.message,
+                    "persistentvolumeclaims \"shrink-pvc\" is forbidden: \
+                     spec.resources.requests.storage: field can not be less than previous value",
+                    "error message must match upstream verbatim — client-go callers that \
+                     match on the message text must see the same behavior"
+                );
+            }
+            Ok(_) => panic!(
+                "PUT shrinking PersistentVolumeClaim.spec.resources.requests.storage must be \
+                 rejected — accepting it leaves spec.storage < status.capacity forever, a \
+                 state upstream deliberately prevents because volumes cannot actually shrink"
+            ),
+        }
+    }
+
+    /// PATCH shrinking a PVC's `spec.resources.requests.storage` must return 403 Forbidden.
+    ///
+    /// Mirrors the PUT test above but for PATCH (strategic-merge-patch), exercising the
+    /// do_patch code path. `kubectl patch pvc` is the common way users resize a claim, so
+    /// both write paths must enforce the same "no shrink" admission rule.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_pvc_shrink() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "shrink-patch-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({
+            "spec": { "resources": { "requests": { "storage": "500Mi" } } }
+        });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "shrink-patch-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => {
+                assert_eq!(
+                    err.0,
+                    axum::http::StatusCode::FORBIDDEN,
+                    "PATCH shrinking a PVC's storage request must return 403 Forbidden, \
+                     matching the PUT check in replace_namespaced_resource"
+                );
+                assert_eq!(
+                    err.1.message,
+                    "persistentvolumeclaims \"shrink-patch-pvc\" is forbidden: \
+                     spec.resources.requests.storage: field can not be less than previous value",
+                    "error message must match upstream verbatim — client-go callers that \
+                     match on the message text must see the same behavior"
+                );
+            }
+            Ok(_) => panic!(
+                "PATCH shrinking PersistentVolumeClaim.spec.resources.requests.storage must \
+                 be rejected — the shrink check is missing from do_patch"
             ),
         }
     }
