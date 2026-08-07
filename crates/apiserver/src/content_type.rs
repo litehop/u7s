@@ -962,30 +962,8 @@ mod tests {
         }
     }
 
-    // In-memory sink for tracing-subscriber's fmt layer, so access-log tests can assert on
-    // the rendered field set without adding a tracing-test dependency.
-    #[derive(Clone, Default)]
-    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
-        type Writer = SharedBuf;
-        fn make_writer(&'w self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn captured_log(buf: &SharedBuf) -> String {
-        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    fn captured_log(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
     }
 
     /// The access log must carry `user_agent`, `latency_ms` and `request_id` on the plain
@@ -995,12 +973,9 @@ mod tests {
     /// with the exact log line that produced it (request_id).
     #[tokio::test]
     async fn access_log_carries_user_agent_latency_and_correlatable_request_id() {
-        let buf = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
         let svc = FixedService {
             status: StatusCode::OK,
@@ -1054,12 +1029,9 @@ mod tests {
     /// can read, effectively handing out impersonation access to anyone with log access.
     #[tokio::test]
     async fn access_log_never_leaks_authorization_header_value() {
-        let buf = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
         let svc = FixedService {
             status: StatusCode::OK,
@@ -1114,12 +1086,9 @@ mod tests {
     /// must not silently disappear from correlation-by-user_agent/request_id tooling.
     #[tokio::test]
     async fn access_log_field_set_is_consistent_across_all_branches() {
-        let buf = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
         // openapi passthrough branch
         let svc = FixedService {
