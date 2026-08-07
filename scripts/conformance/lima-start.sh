@@ -40,6 +40,8 @@
 set -euo pipefail
 
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
+# shellcheck source=scripts/conformance/_lib.sh
+source "$(dirname "$0")/_lib.sh"
 
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
@@ -150,25 +152,8 @@ find_kubeconfig() {
 # hostPort forward: whichever hostagent boots first wins the bind silently, and the
 # loser's apiserver ends up exec/log/attach-ing to the WINNER's kubelet instead of its
 # own — which fails as a cryptic rustls BadSignature (every u7s CA shares the same
-# hardcoded CN) rather than an obvious "wrong kubelet" error. Operator decision: hard-fail
-# here rather than auto-allocate a free port, so the operator stays the source of truth
-# for which stack owns which port (see ai/prompts/vm-operations.md's slot table).
-check_kubelet_port_free() {
-  local port="$1"
-  local holder=""
-  if command -v lsof &>/dev/null; then
-    holder=$(lsof -n -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)
-  elif command -v nc &>/dev/null && nc -z 127.0.0.1 "$port" 2>/dev/null; then
-    holder="unknown (lsof not installed; nc -z detected a listener)"
-  fi
-  if [ -n "$holder" ]; then
-    echo "error: host port 127.0.0.1:${port} is already bound (a previous stack or another VM is using it)." >&2
-    echo "  Pass --kubelet-port <N> to assign a different port for this stack." >&2
-    echo "  Standard slot ports: 10251, 10252, 10253, 10254, 10255 (see ai/prompts/vm-operations.md's slot table)." >&2
-    echo "  To see what's holding the port: lsof -n -i :${port}" >&2
-    exit 1
-  fi
-}
+# hardcoded CN) rather than an obvious "wrong kubelet" error. check_port_free (_lib.sh)
+# hard-fails on this instead of auto-allocating a free port.
 
 check_deps
 
@@ -190,7 +175,7 @@ VM_DIR="${HOME}/.lima/${VM_NAME}"
 if [ -d "$VM_DIR" ]; then
   STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
   if [ "$STATUS" != "Running" ]; then
-    check_kubelet_port_free "$KUBELET_PORT"
+    check_port_free "$KUBELET_PORT" "kubelet"
     echo "Starting stopped VM '$VM_NAME'..."
     limactl start "$VM_NAME"
   else
@@ -218,7 +203,7 @@ else
   # "did not receive an event with the running status" partway through the pull loop.
   # 30m matches the value lima's own code already uses as an "extended" timeout for
   # slow-boot cases (WinDefaultWatchHostAgentEventsTimeout).
-  check_kubelet_port_free "$KUBELET_PORT"
+  check_port_free "$KUBELET_PORT" "kubelet"
   limactl start --tty=false --timeout 30m --name="$VM_NAME" "$LIMA_YAML"
 fi
 
