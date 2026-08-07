@@ -7,7 +7,7 @@ use hyper::{Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 use u7s_kubeconfig::HyperApiClient;
 
 // ---------------------------------------------------------------------------
@@ -159,6 +159,35 @@ struct PodSpec {
     /// already bound to a node) and `PreemptionPodListItem`.
     #[serde(default)]
     containers: Vec<ContainerSpec>,
+    /// The pod's volumes — read for `referenced_pvc_names`'s selected-node
+    /// stamping. `Option<Vec<_>>`, not a bare `Vec`, for the same reason as
+    /// `ContainerSpec::ports`: a real apiserver response serializes an unset
+    /// `volumes` as literal JSON `null`.
+    #[serde(default)]
+    volumes: Option<Vec<PodVolume>>,
+}
+
+/// One `spec.volumes[]` entry — only the two sources that reference a PVC
+/// (directly, or via an ephemeral volumeClaimTemplate) matter to
+/// `referenced_pvc_names`; every other volume source is irrelevant to
+/// selected-node stamping.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodVolume {
+    name: String,
+    #[serde(default)]
+    persistent_volume_claim: Option<PersistentVolumeClaimVolumeSource>,
+    /// Only presence is checked — an ephemeral volume's derived PVC name
+    /// comes from `name` (see `referenced_pvc_names`), not from any field
+    /// inside this value.
+    #[serde(default)]
+    ephemeral: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentVolumeClaimVolumeSource {
+    claim_name: String,
 }
 
 /// Minimal typed view of a container's `resources.requests` — cpu/memory/
@@ -381,6 +410,11 @@ pub struct PendingPod {
     /// Every `hostPort`-claiming container port across the pod's containers —
     /// the NodePorts predicate's conflict-detection dimension.
     pub host_ports: Vec<HostPortClaim>,
+    /// PVC names this pod's volumes reference (direct or ephemeral-derived)
+    /// — see `referenced_pvc_names`. Each is a candidate for
+    /// `stamp_selected_node_for_pvcs`'s selected-node annotation once this
+    /// pod is bound to a node.
+    pub pvc_names: Vec<String>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -441,6 +475,10 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         .and_then(|a| a.node_affinity);
     let requests = sum_container_requests(&watch_event.object.spec.containers);
     let host_ports = container_host_ports(&watch_event.object.spec.containers);
+    let pvc_names = referenced_pvc_names(
+        pod_name,
+        watch_event.object.spec.volumes.as_deref().unwrap_or(&[]),
+    );
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
@@ -450,7 +488,28 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         node_affinity,
         requests,
         host_ports,
+        pvc_names,
     })
+}
+
+/// Every PVC name `pod_name`'s volumes reference — direct
+/// (`persistentVolumeClaim.claimName`) or ephemeral-derived. Upstream's
+/// ephemeral-volume controller always names an ephemeral volume's PVC
+/// `<pod-name>-<volume-name>` (`pkg/controller/volume/ephemeral/controller.go`),
+/// so that name can be derived here without ever reading the PVC itself.
+fn referenced_pvc_names(pod_name: &str, volumes: &[PodVolume]) -> Vec<String> {
+    volumes
+        .iter()
+        .filter_map(|v| {
+            if let Some(pvc) = &v.persistent_volume_claim {
+                Some(pvc.claim_name.clone())
+            } else if v.ephemeral.is_some() {
+                Some(format!("{pod_name}-{}", v.name))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// The `PodScheduled` condition type name — matches `v1.PodScheduled`.
@@ -2367,6 +2426,266 @@ pub fn check_bind_response(status: u16, body: &str) -> Result<(), BindError> {
     )))
 }
 
+// ---------------------------------------------------------------------------
+// VolumeBinding — stamps volume.kubernetes.io/selected-node on unbound
+// WaitForFirstConsumer PVCs at bind time, mirroring upstream kube-scheduler's
+// VolumeBinding plugin (pkg/scheduler/framework/plugins/volumebinding).
+// External-provisioner sidecars watch this annotation as their sole signal
+// for which node to provision a topology-aware volume on — without it, a
+// WaitForFirstConsumer PVC stays Pending forever and its pod never leaves
+// ContainerCreating.
+// ---------------------------------------------------------------------------
+
+const SELECTED_NODE_ANNOTATION: &str = "volume.kubernetes.io/selected-node";
+
+/// Build the path for a namespaced PVC.
+fn pvc_path(namespace: &str, name: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}")
+}
+
+/// Build the path for a (cluster-scoped) StorageClass.
+fn storage_class_path(name: &str) -> String {
+    format!("/apis/storage.k8s.io/v1/storageclasses/{name}")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PvcObject {
+    #[serde(default)]
+    metadata: PvcMetadata,
+    #[serde(default)]
+    spec: PvcSpecView,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PvcMetadata {
+    #[serde(default)]
+    annotations: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PvcSpecView {
+    #[serde(default)]
+    volume_name: String,
+    storage_class_name: Option<String>,
+}
+
+/// `volumeBindingMode` sits directly on a StorageClass object, not under a
+/// `.spec` wrapper — mirrors `apiserver::types::StorageClassFields`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageClassObject {
+    volume_binding_mode: Option<String>,
+}
+
+/// The subset of a PVC's state `selected_node_patches` needs to decide
+/// whether it needs stamping.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PvcBindingInfo {
+    /// `spec.volumeName` — non-empty means the PVC is already bound to a PV
+    /// and must never be re-stamped.
+    volume_name: String,
+    storage_class_name: Option<String>,
+    /// The PVC's current `volume.kubernetes.io/selected-node` annotation
+    /// value, if any — read back so an already-correct stamp is not
+    /// needlessly re-PATCHed.
+    selected_node: Option<String>,
+}
+
+/// One intended selected-node PATCH: which PVC to stamp, and the node name
+/// to stamp it with.
+#[derive(Debug, Clone, PartialEq)]
+struct SelectedNodePatch {
+    pvc_name: String,
+    node_name: String,
+}
+
+/// Decide which of `pvc_names` need `volume.kubernetes.io/selected-node`
+/// stamped for `node_name`.
+///
+/// Pure decision function: `pvc_lookup`/`sc_lookup` supply the PVC's current
+/// state and its StorageClass's `volumeBindingMode` respectively, so this can
+/// be unit-tested with hand-constructed inputs, without a live API server.
+/// `stamp_selected_node_for_pvcs` (the only real caller) is what actually
+/// performs the GETs these closures wrap.
+///
+/// A PVC is stamped only when it is unbound (`volume_name` empty) AND its
+/// StorageClass's `volumeBindingMode` is exactly `"WaitForFirstConsumer"` —
+/// an `Immediate` (or unset/unknown) StorageClass already has its own
+/// provisioning path and must never be touched here, matching upstream's
+/// VolumeBinding plugin (`BindPodVolumes` only acts on
+/// `PodHasUnboundImmediateVolumes`-excluded PVCs).
+fn selected_node_patches(
+    pvc_names: &[String],
+    node_name: &str,
+    pvc_lookup: impl Fn(&str) -> Option<PvcBindingInfo>,
+    sc_lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<SelectedNodePatch> {
+    let mut patches = Vec::new();
+    for pvc_name in pvc_names {
+        let Some(info) = pvc_lookup(pvc_name) else {
+            continue;
+        };
+        if !info.volume_name.is_empty() {
+            continue;
+        }
+        let Some(sc_name) = info.storage_class_name.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(mode) = sc_lookup(sc_name) else {
+            continue;
+        };
+        if mode != "WaitForFirstConsumer" {
+            continue;
+        }
+        if info.selected_node.as_deref() == Some(node_name) {
+            continue;
+        }
+        patches.push(SelectedNodePatch {
+            pvc_name: pvc_name.clone(),
+            node_name: node_name.to_owned(),
+        });
+    }
+    patches
+}
+
+/// Build the merge-patch body that stamps `volume.kubernetes.io/selected-node`
+/// on a PVC.
+fn selected_node_annotation_patch(node_name: &str) -> Value {
+    serde_json::json!({
+        "metadata": {
+            "annotations": {
+                "volume.kubernetes.io/selected-node": node_name
+            }
+        }
+    })
+}
+
+async fn fetch_pvc_binding_info(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    name: &str,
+) -> anyhow::Result<Option<PvcBindingInfo>> {
+    let path = pvc_path(namespace, name);
+    let (status, body) = http_get(connector, server, &path).await?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("GET {path} returned {status}: {body}");
+    }
+    let obj: PvcObject = serde_json::from_str(&body).context("parse PersistentVolumeClaim")?;
+    Ok(Some(PvcBindingInfo {
+        volume_name: obj.spec.volume_name,
+        storage_class_name: obj.spec.storage_class_name,
+        selected_node: obj
+            .metadata
+            .annotations
+            .get(SELECTED_NODE_ANNOTATION)
+            .cloned(),
+    }))
+}
+
+async fn fetch_storage_class_binding_mode(
+    connector: &TlsConnector,
+    server: &str,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let path = storage_class_path(name);
+    let (status, body) = http_get(connector, server, &path).await?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("GET {path} returned {status}: {body}");
+    }
+    let obj: StorageClassObject = serde_json::from_str(&body).context("parse StorageClass")?;
+    Ok(obj.volume_binding_mode)
+}
+
+/// Stamp `volume.kubernetes.io/selected-node` on every one of `pvc_names`
+/// (in `namespace`) that is unbound and whose StorageClass has
+/// `volumeBindingMode: WaitForFirstConsumer` — see this module's doc comment
+/// for why external-provisioner needs this signal.
+///
+/// Called from `bind_reserved_node` (main.rs) BEFORE `bind_pod`'s own POST,
+/// so external-provisioner sees the node choice the moment the pod is bound,
+/// not after. Best-effort: a lookup or PATCH failure here is logged and
+/// skipped rather than surfaced to the caller — the pod's node reservation
+/// already succeeded, and refusing to bind a schedulable pod over an
+/// unrelated PVC's stamping failure would strand it for no reason. A PVC
+/// that misses its stamp this way simply stays Pending for the PVC's own
+/// controller resync, or a future re-bind of this pod, to retry.
+pub async fn stamp_selected_node_for_pvcs(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_names: &[String],
+    node_name: &str,
+) {
+    if pvc_names.is_empty() {
+        return;
+    }
+    let mut pvc_info = std::collections::HashMap::new();
+    for name in pvc_names {
+        match fetch_pvc_binding_info(connector, server, namespace, name).await {
+            Ok(Some(info)) => {
+                pvc_info.insert(name.clone(), info);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!("failed to fetch PVC {namespace}/{name} for selected-node stamping: {e}");
+            }
+        }
+    }
+    let mut sc_mode: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for info in pvc_info.values() {
+        let Some(sc_name) = info.storage_class_name.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if sc_mode.contains_key(sc_name) {
+            continue;
+        }
+        match fetch_storage_class_binding_mode(connector, server, sc_name).await {
+            Ok(Some(mode)) => {
+                sc_mode.insert(sc_name.to_owned(), mode);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!("failed to fetch StorageClass {sc_name} for selected-node stamping: {e}");
+            }
+        }
+    }
+    let patches = selected_node_patches(
+        pvc_names,
+        node_name,
+        |name| pvc_info.get(name).cloned(),
+        |sc_name| sc_mode.get(sc_name).cloned(),
+    );
+    for patch in patches {
+        let path = pvc_path(namespace, &patch.pvc_name);
+        let payload = selected_node_annotation_patch(&patch.node_name);
+        match http_patch_status(connector, server, &path, &payload).await {
+            Ok((status, _)) if status.is_success() => {
+                info!(
+                    pvc = %patch.pvc_name, node = %patch.node_name,
+                    "stamped volume.kubernetes.io/selected-node"
+                );
+            }
+            Ok((status, body)) => {
+                error!("PATCH {path} returned {status}: {body}");
+            }
+            Err(e) => {
+                error!(
+                    "failed to PATCH selected-node annotation on PVC {namespace}/{}: {e}",
+                    patch.pvc_name
+                );
+            }
+        }
+    }
+}
+
 /// Bind a pod to a node via POST .../pods/:name/binding.
 pub async fn bind_pod(
     connector: &TlsConnector,
@@ -2865,6 +3184,211 @@ mod tests {
         assert!(
             !is_bind_already_assigned(&err),
             "a non-409 status must never classify as AlreadyAssigned, regardless of body text"
+        );
+    }
+
+    // referenced_pvc_names tests — needs_scheduling's only source of PVC
+    // candidates for selected-node stamping. A pod whose volumes this
+    // function fails to enumerate correctly never gets its PVC's annotation
+    // stamped at all, silently reproducing the exact bug this feature fixes.
+
+    #[test]
+    fn referenced_pvc_names_includes_direct_claim_name() {
+        let volumes = vec![PodVolume {
+            name: "data".to_owned(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: "data-pvc".to_owned(),
+            }),
+            ephemeral: None,
+        }];
+        assert_eq!(
+            referenced_pvc_names("web-0", &volumes),
+            vec!["data-pvc".to_owned()],
+            "a volume with a direct persistentVolumeClaim source must contribute its \
+             claimName verbatim — that PVC is what needs the selected-node stamp, not \
+             some derived name"
+        );
+    }
+
+    #[test]
+    fn referenced_pvc_names_derives_ephemeral_pvc_name_from_pod_and_volume_name() {
+        let volumes = vec![PodVolume {
+            name: "scratch".to_owned(),
+            persistent_volume_claim: None,
+            ephemeral: Some(json!({"volumeClaimTemplate": {}})),
+        }];
+        assert_eq!(
+            referenced_pvc_names("web-0", &volumes),
+            vec!["web-0-scratch".to_owned()],
+            "an ephemeral volume's PVC is created by upstream's ephemeral-volume controller \
+             as <pod-name>-<volume-name> — any other derived name would look up (and stamp) \
+             a PVC that doesn't exist, leaving the real one never stamped"
+        );
+    }
+
+    #[test]
+    fn referenced_pvc_names_ignores_volumes_with_no_pvc_source() {
+        let volumes = vec![PodVolume {
+            name: "config".to_owned(),
+            persistent_volume_claim: None,
+            ephemeral: None,
+        }];
+        assert!(
+            referenced_pvc_names("web-0", &volumes).is_empty(),
+            "a volume with neither persistentVolumeClaim nor ephemeral (e.g. configMap, \
+             emptyDir) must never be treated as a PVC reference — stamping a nonexistent \
+             PVC name would just be a wasted GET/PATCH cycle"
+        );
+    }
+
+    // selected_node_patches tests — the pure decision behind
+    // stamp_selected_node_for_pvcs. Real PVC/StorageClass lookups are network
+    // calls (fetch_pvc_binding_info/fetch_storage_class_binding_mode), so the
+    // WHICH-PVCs-need-stamping decision is exercised here directly, with
+    // hand-constructed lookups, instead of through a mock API server.
+
+    fn unbound_pvc(storage_class_name: &str) -> PvcBindingInfo {
+        PvcBindingInfo {
+            volume_name: String::new(),
+            storage_class_name: Some(storage_class_name.to_owned()),
+            selected_node: None,
+        }
+    }
+
+    #[test]
+    fn selected_node_patches_stamps_unbound_pvc_on_wait_for_first_consumer_class() {
+        let pvcs = [("data-pvc".to_owned(), unbound_pvc("wfc-class"))]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let patches = selected_node_patches(
+            &["data-pvc".to_owned()],
+            "worker-0",
+            |name| pvcs.get(name).cloned(),
+            |_| Some("WaitForFirstConsumer".to_owned()),
+        );
+        assert_eq!(
+            patches,
+            vec![SelectedNodePatch {
+                pvc_name: "data-pvc".to_owned(),
+                node_name: "worker-0".to_owned(),
+            }],
+            "an unbound PVC on a WaitForFirstConsumer StorageClass is exactly the case \
+             external-provisioner is blocked on — this must produce a stamp, or the PVC \
+             (and the pod waiting on it) hangs forever"
+        );
+    }
+
+    #[test]
+    fn selected_node_patches_skips_immediate_storage_class() {
+        let pvcs = [("cache-pvc".to_owned(), unbound_pvc("immediate-class"))]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let patches = selected_node_patches(
+            &["cache-pvc".to_owned()],
+            "worker-0",
+            |name| pvcs.get(name).cloned(),
+            |_| Some("Immediate".to_owned()),
+        );
+        assert!(
+            patches.is_empty(),
+            "an Immediate StorageClass already provisions without waiting on pod placement — \
+             stamping it too would be a dead write nothing ever reads, not a harmless extra"
+        );
+    }
+
+    #[test]
+    fn selected_node_patches_skips_already_bound_pvc() {
+        let pvcs = [(
+            "data-pvc".to_owned(),
+            PvcBindingInfo {
+                volume_name: "pv-123".to_owned(),
+                storage_class_name: Some("wfc-class".to_owned()),
+                selected_node: None,
+            },
+        )]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        let patches = selected_node_patches(
+            &["data-pvc".to_owned()],
+            "worker-0",
+            |name| pvcs.get(name).cloned(),
+            |_| Some("WaitForFirstConsumer".to_owned()),
+        );
+        assert!(
+            patches.is_empty(),
+            "a PVC with a non-empty spec.volumeName is already bound to a real PV — \
+             re-stamping it would rewrite a decision that's already been made and acted on"
+        );
+    }
+
+    #[test]
+    fn selected_node_patches_is_idempotent_once_already_stamped_for_this_node() {
+        let pvcs = [(
+            "data-pvc".to_owned(),
+            PvcBindingInfo {
+                volume_name: String::new(),
+                storage_class_name: Some("wfc-class".to_owned()),
+                selected_node: Some("worker-0".to_owned()),
+            },
+        )]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        let patches = selected_node_patches(
+            &["data-pvc".to_owned()],
+            "worker-0",
+            |name| pvcs.get(name).cloned(),
+            |_| Some("WaitForFirstConsumer".to_owned()),
+        );
+        assert!(
+            patches.is_empty(),
+            "a PVC already stamped with THIS node must not be re-PATCHed on every re-bind \
+             (e.g. a watch replay) — repeating an already-correct write is a needless \
+             apiserver round trip, not a correctness fix"
+        );
+    }
+
+    #[test]
+    fn selected_node_patches_re_stamps_when_selected_node_differs() {
+        let pvcs = [(
+            "data-pvc".to_owned(),
+            PvcBindingInfo {
+                volume_name: String::new(),
+                storage_class_name: Some("wfc-class".to_owned()),
+                selected_node: Some("worker-1".to_owned()),
+            },
+        )]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        let patches = selected_node_patches(
+            &["data-pvc".to_owned()],
+            "worker-0",
+            |name| pvcs.get(name).cloned(),
+            |_| Some("WaitForFirstConsumer".to_owned()),
+        );
+        assert_eq!(
+            patches,
+            vec![SelectedNodePatch {
+                pvc_name: "data-pvc".to_owned(),
+                node_name: "worker-0".to_owned(),
+            }],
+            "a stale stamp from a PREVIOUS bind attempt on a different node must be \
+             overwritten to match the node this pod is actually bound to now — otherwise \
+             external-provisioner would provision on the wrong node"
+        );
+    }
+
+    #[test]
+    fn selected_node_patches_skips_pvc_missing_from_lookup() {
+        let patches = selected_node_patches(
+            &["ghost-pvc".to_owned()],
+            "worker-0",
+            |_| None,
+            |_| Some("WaitForFirstConsumer".to_owned()),
+        );
+        assert!(
+            patches.is_empty(),
+            "a PVC that GET returned 404 for (deleted between pod creation and bind, or a \
+             lookup that failed) must be skipped, not panic or stamp a nonexistent object"
         );
     }
 
@@ -4731,6 +5255,7 @@ mod tests {
             node_affinity: None,
             requests: ResourceRequests::default(),
             host_ports: Vec::new(),
+            pvc_names: Vec::new(),
         }
     }
 

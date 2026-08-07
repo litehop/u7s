@@ -30,7 +30,7 @@ use u7s_scheduler::{
     pick_node, pods_needing_resync, preemption_reservation_still_fits,
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
-    stream_watch_events, BindError, NodeTally, PendingPod, PodList,
+    stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -50,6 +50,18 @@ async fn bind_reserved_node(
     pending: &PendingPod,
     node: &str,
 ) -> Result<(), BindError> {
+    // Stamp selected-node on any of `pending`'s unbound WaitForFirstConsumer
+    // PVCs BEFORE the bind POST below, so external-provisioner sees the node
+    // choice the instant the pod is bound rather than after (see
+    // `stamp_selected_node_for_pvcs`'s doc comment).
+    stamp_selected_node_for_pvcs(
+        connector,
+        server,
+        &pending.namespace,
+        &pending.pvc_names,
+        node,
+    )
+    .await;
     if let Err(e) = bind_pod(
         connector,
         server,
@@ -1448,6 +1460,269 @@ mod tests {
             "a genuine bind failure must still roll back its tally reservation exactly as \
              before — otherwise worker-0's capacity accounting would overcount a pod that was \
              never actually bound"
+        );
+    }
+
+    // stamp_selected_node_for_pvcs wiring — before this fix, u7s's scheduler
+    // never stamped volume.kubernetes.io/selected-node on a pod's unbound
+    // WaitForFirstConsumer PVCs at bind time, so external-provisioner (which
+    // watches exactly that annotation to learn which node to provision a
+    // topology-aware volume on) never saw any signal at all: the PVC stayed
+    // Pending forever and the pod never left ContainerCreating. Drives
+    // `handle_pod_event` itself (not a reimplementation of the bind-path
+    // wiring) against a real in-process TLS mock server that also serves
+    // PVC/StorageClass GETs, mirroring the bind-outcome tests above.
+
+    /// What `spawn_volume_binding_mock_server` recorded: every PATCH's
+    /// (path, body), and how many binds it saw — what the test below
+    /// asserts on.
+    #[derive(Default)]
+    struct VolumeBindingRecorder {
+        patches: std::sync::Mutex<Vec<(String, String)>>,
+        bind_count: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Spin up an in-process TLS mock server serving: a single-node
+    /// `/api/v1/nodes` list (`worker-0`, always room); two unbound PVCs,
+    /// `data-pvc` (StorageClass `wfc-class`, WaitForFirstConsumer) and
+    /// `cache-pvc` (StorageClass `immediate-class`, Immediate); those two
+    /// StorageClasses' `volumeBindingMode`; and `POST .../binding` (counted,
+    /// always 201 Created). Every PATCH is recorded (path + body) into the
+    /// returned `VolumeBindingRecorder` rather than reasoned about here —
+    /// the test itself decides which PATCHes should or should not exist.
+    async fn spawn_volume_binding_mock_server() -> (TlsConnector, String, Arc<VolumeBindingRecorder>)
+    {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        use rustls::pki_types::PrivateKeyDer;
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("parse IP"))];
+        let cert = params.self_signed(&key).expect("self-sign cert");
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let node_list_body = json!({
+            "items": [
+                {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}},
+            ]
+        })
+        .to_string();
+
+        let recorder = Arc::new(VolumeBindingRecorder::default());
+        let recorder_srv = recorder.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let node_list_body = node_list_body.clone();
+                let recorder = recorder_srv.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0usize;
+                    let header_end = loop {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        total += n;
+                        if let Some(pos) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let request_line = head.lines().next().unwrap_or("");
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_owned();
+                    let path = parts.next().unwrap_or("").to_owned();
+                    // Needed to read the full PATCH body below — the initial
+                    // read above may have captured only the headers if the
+                    // body arrived in a later TCP segment.
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while total < header_end + content_length {
+                        let n = tls.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                    }
+                    let body_end = (header_end + content_length).min(total);
+                    let request_body =
+                        String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
+
+                    let (status_line, resp_body): (String, String) = if method == "GET"
+                        && path == "/api/v1/nodes"
+                    {
+                        ("200 OK".to_owned(), node_list_body)
+                    } else if method == "GET"
+                        && path == "/api/v1/namespaces/default/persistentvolumeclaims/data-pvc"
+                    {
+                        (
+                            "200 OK".to_owned(),
+                            json!({"metadata": {"annotations": {}}, "spec": {"storageClassName": "wfc-class"}})
+                                .to_string(),
+                        )
+                    } else if method == "GET"
+                        && path == "/api/v1/namespaces/default/persistentvolumeclaims/cache-pvc"
+                    {
+                        (
+                            "200 OK".to_owned(),
+                            json!({"metadata": {"annotations": {}}, "spec": {"storageClassName": "immediate-class"}})
+                                .to_string(),
+                        )
+                    } else if method == "GET"
+                        && path == "/apis/storage.k8s.io/v1/storageclasses/wfc-class"
+                    {
+                        (
+                            "200 OK".to_owned(),
+                            json!({"volumeBindingMode": "WaitForFirstConsumer"}).to_string(),
+                        )
+                    } else if method == "GET"
+                        && path == "/apis/storage.k8s.io/v1/storageclasses/immediate-class"
+                    {
+                        (
+                            "200 OK".to_owned(),
+                            json!({"volumeBindingMode": "Immediate"}).to_string(),
+                        )
+                    } else if method == "PATCH" {
+                        recorder
+                            .patches
+                            .lock()
+                            .expect("recorder lock poisoned")
+                            .push((path.clone(), request_body));
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"PersistentVolumeClaim"}"#.to_owned(),
+                        )
+                    } else if method == "POST" && path.ends_with("/binding") {
+                        recorder.bind_count.fetch_add(1, Ordering::SeqCst);
+                        ("201 Created".to_owned(), r#"{"kind":"Binding"}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        )
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = tls.write_all(resp.as_bytes()).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).expect("add cert to root store");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server = format!("https://127.0.0.1:{port}");
+
+        (connector, server, recorder)
+    }
+
+    #[tokio::test]
+    async fn bind_stamps_selected_node_on_unbound_wait_for_first_consumer_pvc_only() {
+        use std::sync::atomic::Ordering;
+
+        let (connector, server, recorder) = spawn_volume_binding_mock_server().await;
+
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+
+        // web-0 references two PVCs directly: one whose StorageClass is
+        // WaitForFirstConsumer (must be stamped once bound to worker-0), one
+        // whose StorageClass is Immediate (must never be touched).
+        let pod_event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {"name": "web-0", "namespace": "default"},
+                "spec": {
+                    "containers": [{"resources": {"requests": {"cpu": "100m"}}}],
+                    "volumes": [
+                        {"name": "data", "persistentVolumeClaim": {"claimName": "data-pvc"}},
+                        {"name": "cache", "persistentVolumeClaim": {"claimName": "cache-pvc"}}
+                    ]
+                },
+                "status": {}
+            }
+        });
+
+        handle_pod_event(pod_event, &connector, &server, &in_flight, &tally);
+        wait_until(
+            || recorder.bind_count.load(Ordering::SeqCst) >= 1,
+            "the pod bind to actually complete",
+        )
+        .await;
+        // Give a spurious cache-pvc PATCH (the bug this test guards against)
+        // time to land before asserting it never did.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let patches = recorder.patches.lock().expect("recorder lock poisoned");
+        let data_pvc_patches: Vec<&(String, String)> = patches
+            .iter()
+            .filter(|(path, _)| path.ends_with("/persistentvolumeclaims/data-pvc"))
+            .collect();
+        let cache_pvc_patches: Vec<&(String, String)> = patches
+            .iter()
+            .filter(|(path, _)| path.ends_with("/persistentvolumeclaims/cache-pvc"))
+            .collect();
+
+        assert_eq!(
+            data_pvc_patches.len(),
+            1,
+            "an unbound PVC whose StorageClass is WaitForFirstConsumer must be PATCHed exactly \
+             once with the selected-node annotation at bind time — without this, \
+             external-provisioner never learns which node to provision the volume on and the \
+             PVC stays Pending forever"
+        );
+        assert!(
+            data_pvc_patches[0]
+                .1
+                .contains(r#""volume.kubernetes.io/selected-node":"worker-0""#),
+            "the PATCH body must set volume.kubernetes.io/selected-node to the bound node's \
+             name; got {:?}",
+            data_pvc_patches[0].1
+        );
+        assert!(
+            cache_pvc_patches.is_empty(),
+            "a PVC whose StorageClass is Immediate must never be stamped — it already has its \
+             own non-topology-gated provisioning path, and stamping it anyway would just be a \
+             dead write nothing ever reads"
         );
     }
 }
