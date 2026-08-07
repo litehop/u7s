@@ -38,6 +38,21 @@ you created: delete your own sonobuoy run if you started one (see the delete com
 later in this doc), leave the apiserver/kubelet/KCM stack running, and leave the VM
 itself running.
 
+**Bumping a VM's memory** (the one case where stopping it is legitimate) has two
+traps: `run-all.sh --reset` silently reverts `limactl edit --memory` because
+`--reset` reprovisions from `lima/kubelet.yaml` (4GiB default, no `--memory`
+override in `lima-start.sh`/`worker-vm.sh`); and `limactl stop`/`start` kills
+kubelet (its systemd unit is disabled in the base image) — restarting KCM alone
+won't bring it back. Safe sequence:
+```bash
+limactl stop <VM> && limactl edit <VM> --memory <N>GiB && limactl start <VM>
+scripts/conformance/run-all.sh --vm <VM> --stack-only --workdir <same-workdir>
+```
+`--stack-only` (no `--reset`) reconnects kubelet without reprovisioning or
+touching the new memory setting. Only `limactl delete` + `run-all.sh --reset`
+gives a clean reprovision from `lima/kubelet.yaml`; use `limactl edit` instead
+when you want to keep disk state (certs, cached images).
+
 ---
 
 ## Primary path — use run-all.sh
