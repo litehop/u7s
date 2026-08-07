@@ -1248,6 +1248,43 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                             );
                         }
                     }
+                    // csi (inline CSI volume, e.g. the CSI Ephemeral-volume conformance
+                    // tests) — client-go clientsets send protobuf by default; without this
+                    // branch the inline CSI volume source is silently dropped on decode, so
+                    // the stored Pod has no volume source at all and the kubelet's volume
+                    // plugin manager can never resolve the mount the container is waiting on.
+                    if let Some(csi) = src.csi {
+                        if let Some(driver) = csi.driver.filter(|s| !s.is_empty()) {
+                            let mut csi_map = serde_json::Map::new();
+                            csi_map.insert("driver".to_string(), serde_json::Value::String(driver));
+                            if let Some(ro) = csi.read_only {
+                                csi_map.insert("readOnly".to_string(), serde_json::Value::Bool(ro));
+                            }
+                            if let Some(fs) = csi.fs_type.filter(|s| !s.is_empty()) {
+                                csi_map.insert("fsType".to_string(), serde_json::Value::String(fs));
+                            }
+                            if !csi.volume_attributes.is_empty() {
+                                let attrs: serde_json::Map<String, serde_json::Value> = csi
+                                    .volume_attributes
+                                    .into_iter()
+                                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                    .collect();
+                                csi_map.insert(
+                                    "volumeAttributes".to_string(),
+                                    serde_json::Value::Object(attrs),
+                                );
+                            }
+                            if let Some(lor) = csi.node_publish_secret_ref {
+                                if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                    csi_map.insert(
+                                        "nodePublishSecretRef".to_string(),
+                                        serde_json::json!({ "name": name }),
+                                    );
+                                }
+                            }
+                            vm.insert("csi".to_string(), serde_json::Value::Object(csi_map));
+                        }
+                    }
                 }
                 serde_json::Value::Object(vm)
             })
@@ -5303,6 +5340,87 @@ mod tests {
             "1Gi",
             "the volumeClaimTemplate's storage request must survive decode unchanged so the \
              generated PVC asks for the size the pod author specified"
+        );
+    }
+
+    /// CSIVolumeSource (spec.volumes[].csi, the CSI Ephemeral-volume feature) must survive
+    /// proto decode.
+    ///
+    /// The volume-source match had no branch for it at all, so a pod created via a
+    /// protobuf client (client-go typed clientsets default to protobuf, which is what the
+    /// e2e test framework uses) silently lost the entire inline CSI volume source on
+    /// decode. The stored Pod ends up with no volume source at all, so the kubelet's
+    /// volume plugin manager can never resolve the mount the container is waiting on, and
+    /// the pod is stuck at ContainerCreating until the PodStart timeout.
+    #[test]
+    fn generated_pod_spec_preserves_csi_volume_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("csi-vol-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("my-csi-volume".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        csi: Some(core_v1::CsiVolumeSource {
+                            driver: Some("csi-hostpath".to_string()),
+                            read_only: Some(true),
+                            fs_type: Some("ext4".to_string()),
+                            volume_attributes: std::collections::HashMap::from([(
+                                "foo".to_string(),
+                                "bar".to_string(),
+                            )]),
+                            node_publish_secret_ref: Some(core_v1::LocalObjectReference {
+                                name: Some("csi-secret".to_string()),
+                            }),
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with csi volume must decode");
+
+        let volumes = result["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(
+            volumes[0]["csi"]["driver"], "csi-hostpath",
+            "spec.volumes[].csi.driver must survive decode — without it the kubelet's \
+             volume plugin manager has no driver name to dispatch NodePublishVolume to, \
+             and the pod is stuck ContainerCreating forever"
+        );
+        assert_eq!(
+            volumes[0]["csi"]["readOnly"], true,
+            "spec.volumes[].csi.readOnly must survive decode — losing it would silently \
+             mount a volume read-write that the pod author explicitly asked to be read-only"
+        );
+        assert_eq!(
+            volumes[0]["csi"]["fsType"], "ext4",
+            "spec.volumes[].csi.fsType must survive decode — without it the driver falls \
+             back to its own default filesystem instead of the one the pod author requested"
+        );
+        assert_eq!(
+            volumes[0]["csi"]["volumeAttributes"]["foo"], "bar",
+            "spec.volumes[].csi.volumeAttributes must survive decode — these are the only \
+             way to pass driver-specific parameters, and losing them breaks NodePublishVolume \
+             for any driver that requires them"
+        );
+        assert_eq!(
+            volumes[0]["csi"]["nodePublishSecretRef"]["name"], "csi-secret",
+            "spec.volumes[].csi.nodePublishSecretRef must survive decode — without it the \
+             CSI driver's NodePublishVolume call is missing the secret reference it needs \
+             and mount authentication fails"
         );
     }
 
