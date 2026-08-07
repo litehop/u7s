@@ -17,8 +17,8 @@ use u7s_store::{ListOptions, Store};
 use crate::{auth::UserInfo, state::AppState, status::Status};
 
 use super::generic::{
-    apply_label_selector, build_list_response, decode_continue, parse_field_selector,
-    parse_label_selector, CollectionQuery,
+    apply_label_selector, build_list_response, decode_continue, parse_label_selector,
+    CollectionQuery,
 };
 use super::json_patch::{CreateQuery, PatchQuery, ReplaceQuery};
 use super::resource::{
@@ -130,11 +130,11 @@ pub(crate) async fn core_list_resource<S: Store>(
             .await
             .map(IntoResponse::into_response);
         }
+        use super::pods::{filter_pods_by_field_selector, pod_store_field_selector};
         let field_selector = query
             .field_selector
             .as_deref()
-            .map(parse_field_selector)
-            .transpose()?;
+            .and_then(pod_store_field_selector);
         // Decode BEFORE listing: on a continuation request this pins the resourceVersion this
         // response (and every later page) must report — see decode_continue's doc for why.
         let continue_decoded = query
@@ -169,6 +169,11 @@ pub(crate) async fn core_list_resource<S: Store>(
                 serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
             items.push(v);
         }
+        let items = if let Some(ref sel) = query.field_selector {
+            filter_pods_by_field_selector(items, sel)
+        } else {
+            items
+        };
         let items = if let Some(ref sel) = query.label_selector {
             let pairs = parse_label_selector(sel)?;
             apply_label_selector(items, &pairs)
@@ -818,6 +823,106 @@ mod tests {
         assert!(
             names.contains(&"pod-a") && names.contains(&"pod-b"),
             "both cross-namespace pods must be present in the Table rows; got {names:?}"
+        );
+    }
+
+    /// `kubectl describe node <name>` issues `GET /api/v1/pods` with fieldSelector
+    /// `spec.nodeName=<node>,status.phase!=Succeeded,status.phase!=Failed` (upstream
+    /// NodeDescriber.Describe, describe.go:3435-3453) to list only non-terminated pods on that
+    /// node. Before this fix, core_list_resource's plain (non-watch) LIST branch parsed this
+    /// multi-term selector with the single-term `parse_field_selector`, which splits on the
+    /// FIRST "!=" in the whole selector string — producing a bogus field/value pair that never
+    /// matches, so the negated-everything-matches fallback returned every pod in the cluster
+    /// for every node's `describe`.
+    #[tokio::test]
+    async fn core_list_resource_cross_namespace_pods_with_multi_term_field_selector_filters_correctly(
+    ) {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let seed_pod = |name: &str, ns: &str, node: &str, phase: &str| {
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": ns},
+                "spec": {"nodeName": node, "containers": []},
+                "status": {"phase": phase}
+            })
+        };
+
+        // Non-terminal and terminal pods spread across three nodes; only the Running pod on
+        // worker-1 should survive the fieldSelector below.
+        let pods = [
+            ("running-w1", "ns-a", "worker-1", "Running"),
+            ("succeeded-w1", "ns-a", "worker-1", "Succeeded"),
+            ("failed-w1", "ns-b", "worker-1", "Failed"),
+            ("running-w2", "ns-a", "worker-2", "Running"),
+            ("running-w3", "ns-c", "worker-3", "Running"),
+        ];
+        for (name, ns, node, phase) in pods {
+            let pod = seed_pod(name, ns, node, phase);
+            store
+                .put(
+                    &format!("/registry/pods/{ns}/{name}"),
+                    bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                    Some(0),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("create {name}"));
+        }
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+
+        let app = Router::new()
+            .route("/api/v1/{resource}", get(super::core_list_resource))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(
+                "/api/v1/pods?fieldSelector=spec.nodeName%3Dworker-1%2Cstatus.phase\
+                 %21%3DSucceeded%2Cstatus.phase%21%3DFailed",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = v["items"]
+            .as_array()
+            .expect("must have items")
+            .iter()
+            .map(|p| p["metadata"]["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["running-w1"],
+            "cross-namespace pods LIST with multi-term fieldSelector must filter correctly; \
+             kubectl describe node breaks otherwise — kubectl issues exactly this selector shape \
+             (upstream describe.go:3435-3453) to list only non-terminated pods on the given \
+             node. Got: {:?}",
+            names
         );
     }
 
