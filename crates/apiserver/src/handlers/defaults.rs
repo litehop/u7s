@@ -68,6 +68,12 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     {
         default_role_ref_api_group(obj);
     }
+    if let ("resource.k8s.io", "resourceclaims") = (group, plural) {
+        default_resourceclaim(obj);
+    }
+    if let ("resource.k8s.io", "resourceclaimtemplates") = (group, plural) {
+        default_resourceclaimtemplate(obj);
+    }
 
     if is_workload_resource(group, plural) || is_endpointslice(group, plural) {
         initialize_workload_generation(obj);
@@ -1017,6 +1023,71 @@ fn default_hpa_behavior(behavior: &mut HpaBehavior) {
             scale_down.policies = Some(serde_json::json!([
                 { "type": "Percent", "value": 100, "periodSeconds": 15 }
             ]));
+        }
+    }
+}
+
+/// Default `spec.devices.requests[].exactly.count` to 1 on a ResourceClaim, matching upstream
+/// `SetDefaults_ExactDeviceRequest` (pkg/apis/resource/v1/defaults.go): "If AllocationMode is
+/// not specified, the default mode is ExactCount. If the mode is ExactCount and count is not
+/// specified, the default count is one."
+///
+/// A ResourceClaim created via the typed Go client with `Exactly.DeviceClassName` set and
+/// `Count` left at its Go zero value serializes with `count` omitted; u7s's generic JSON store
+/// round-trips that as `count: 0`/absent instead of applying the upstream default. Any consumer
+/// that reads this field and assumes upstream defaulting occurred (e.g. a future DRA scheduler
+/// plugin) would treat the request as asking for zero devices and silently allocate nothing.
+///
+/// Idempotent: an explicit non-zero count is never overwritten.
+fn default_resourceclaim(obj: &mut serde_json::Value) {
+    default_exact_device_request_counts(&mut obj["spec"]["devices"]["requests"]);
+}
+
+/// Same defaulting as `default_resourceclaim`, applied to a ResourceClaimTemplate's embedded
+/// claim spec (`spec.spec.devices.requests[]`). Upstream's `SetObjectDefaults_ResourceClaimTemplate`
+/// (zz_generated.defaults.go) runs the identical `SetDefaults_ExactDeviceRequest` over the
+/// template's nested spec, since the ResourceClaim created from a template inherits its
+/// `spec.devices.requests` verbatim.
+fn default_resourceclaimtemplate(obj: &mut serde_json::Value) {
+    default_exact_device_request_counts(&mut obj["spec"]["spec"]["devices"]["requests"]);
+}
+
+/// Walk `requests[]` and default each `exactly.count` to 1 when it is absent, null, or 0 —
+/// the Go zero value for the `int64` `Count` field, indistinguishable on the wire from "omitted".
+///
+/// Only defaults when `allocationMode` is absent or `"ExactCount"`: upstream's own guard ties
+/// the count default to that mode (`Count` is documented as "used only when the count mode is
+/// ExactCount"), so a request explicitly using `"All"` mode must not get a bogus count=1.
+///
+/// A `DeviceRequest` entry without an `exactly` object (e.g. `firstAvailable` subrequests) is
+/// left untouched — this defaulting is specific to `ExactDeviceRequest`.
+fn default_exact_device_request_counts(requests: &mut serde_json::Value) {
+    let Some(requests) = requests.as_array_mut() else {
+        return;
+    };
+    for request in requests {
+        let Some(request_obj) = request.as_object_mut() else {
+            continue;
+        };
+        let Some(exactly) = request_obj
+            .get_mut("exactly")
+            .and_then(|v| v.as_object_mut())
+        else {
+            continue;
+        };
+        let allocation_mode = exactly
+            .get("allocationMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !allocation_mode.is_empty() && allocation_mode != "ExactCount" {
+            continue;
+        }
+        let has_nonzero_count = exactly
+            .get("count")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|c| c != 0);
+        if !has_nonzero_count {
+            exactly.insert("count".to_string(), serde_json::json!(1));
         }
     }
 }
@@ -4789,6 +4860,221 @@ mod typed_struct_migration_tests {
         assert_eq!(
             obj["roleRef"]["name"], "my-role",
             "roleRef.name must survive via RoleRefFields::rest"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // ResourceClaim / ResourceClaimTemplate DeviceRequest.Exactly.Count defaulting
+    // ---------------------------------------------------------------------------
+
+    /// Upstream's `SetDefaults_ExactDeviceRequest` sets `count=1` for ExactCount mode when
+    /// count is not specified. If this default is not applied, a claim created via the typed
+    /// Go client (whose `Count` field defaults to its Go zero value, 0, when unset) round-trips
+    /// through u7s with `count: 0` — a future DRA scheduler reading this field would treat the
+    /// request as asking for zero devices and silently allocate nothing.
+    #[test]
+    fn resourceclaim_omitted_count_defaults_to_one() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": { "name": "claim", "namespace": "default" },
+            "spec": {
+                "devices": {
+                    "requests": [
+                        { "name": "req-0", "exactly": { "deviceClassName": "gpu.example.com" } }
+                    ]
+                }
+            }
+        });
+
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["devices"]["requests"][0]["exactly"]["count"],
+            serde_json::Value::Number(1.into()),
+            "exactly.count must default to 1 when omitted, per upstream ExactCount semantics"
+        );
+    }
+
+    /// A count the user explicitly set (e.g. requesting 5 identical devices) must survive —
+    /// overwriting it would silently change how many devices the claim asks for.
+    #[test]
+    fn resourceclaim_explicit_nonzero_count_is_preserved() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": { "name": "claim", "namespace": "default" },
+            "spec": {
+                "devices": {
+                    "requests": [
+                        {
+                            "name": "req-0",
+                            "exactly": { "deviceClassName": "gpu.example.com", "count": 5 }
+                        }
+                    ]
+                }
+            }
+        });
+
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["devices"]["requests"][0]["exactly"]["count"],
+            serde_json::Value::Number(5.into()),
+            "an explicit count must never be overwritten by defaulting"
+        );
+    }
+
+    /// `count: 0` on the wire is indistinguishable from "omitted" (Go's int64 zero value), so
+    /// upstream defaults it to 1 exactly like the absent case. Treating 0 as a deliberate
+    /// zero-device request would be wrong — a claim can't be satisfied by allocating nothing.
+    #[test]
+    fn resourceclaim_explicit_zero_count_is_treated_as_omitted() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": { "name": "claim", "namespace": "default" },
+            "spec": {
+                "devices": {
+                    "requests": [
+                        {
+                            "name": "req-0",
+                            "exactly": { "deviceClassName": "gpu.example.com", "count": 0 }
+                        }
+                    ]
+                }
+            }
+        });
+
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["devices"]["requests"][0]["exactly"]["count"],
+            serde_json::Value::Number(1.into()),
+            "count=0 is the Go zero value for an unset field, not a real request for zero \
+             devices — it must default to 1 the same as an absent count"
+        );
+    }
+
+    /// A `firstAvailable` subrequest list has no `exactly` object at all. Defaulting must skip
+    /// such entries instead of panicking or fabricating an `exactly` object that was never there.
+    #[test]
+    fn resourceclaim_request_without_exactly_is_left_untouched() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": { "name": "claim", "namespace": "default" },
+            "spec": {
+                "devices": {
+                    "requests": [
+                        {
+                            "name": "req-0",
+                            "firstAvailable": [
+                                { "name": "sub-0", "deviceClassName": "gpu.example.com" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+        let before = obj.clone();
+
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+
+        assert_eq!(
+            obj, before,
+            "a request without an `exactly` object must not be modified — there is no \
+             ExactDeviceRequest.Count field to default"
+        );
+    }
+
+    /// A request whose `allocationMode` is explicitly `"All"` must not get a bogus count=1.
+    /// Upstream's `Count` field doc states it "is used only when the count mode is ExactCount";
+    /// stamping a count onto an All-mode request would misrepresent a request for every
+    /// matching device as a request for exactly one.
+    #[test]
+    fn resourceclaim_all_mode_request_does_not_get_count_defaulted() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": { "name": "claim", "namespace": "default" },
+            "spec": {
+                "devices": {
+                    "requests": [
+                        {
+                            "name": "req-0",
+                            "exactly": {
+                                "deviceClassName": "gpu.example.com",
+                                "allocationMode": "All"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+
+        assert!(
+            obj["spec"]["devices"]["requests"][0]["exactly"]["count"].is_null(),
+            "count must stay unset for allocationMode=All — that mode ignores count entirely"
+        );
+    }
+
+    /// Applying the default twice must be a no-op the second time — apply_defaults runs on
+    /// every create AND every update, so a stored count=1 must never be perturbed on re-save.
+    #[test]
+    fn resourceclaim_count_defaulting_is_idempotent() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": { "name": "claim", "namespace": "default" },
+            "spec": {
+                "devices": {
+                    "requests": [
+                        { "name": "req-0", "exactly": { "deviceClassName": "gpu.example.com" } }
+                    ]
+                }
+            }
+        });
+
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+        let after_first = obj.clone();
+        apply_defaults("resource.k8s.io", "resourceclaims", &mut obj);
+
+        assert_eq!(
+            obj, after_first,
+            "running the default twice (create then update) must not change the object further"
+        );
+    }
+
+    /// ResourceClaimTemplate embeds a full ResourceClaim spec under `spec.spec`; upstream's
+    /// `SetObjectDefaults_ResourceClaimTemplate` runs the identical ExactCount defaulting there,
+    /// since a ResourceClaim created from the template inherits `spec.devices.requests` as-is.
+    #[test]
+    fn resourceclaimtemplate_omitted_count_defaults_to_one() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaimTemplate",
+            "metadata": { "name": "tmpl", "namespace": "default" },
+            "spec": {
+                "spec": {
+                    "devices": {
+                        "requests": [
+                            { "name": "req-0", "exactly": { "deviceClassName": "gpu.example.com" } }
+                        ]
+                    }
+                }
+            }
+        });
+
+        apply_defaults("resource.k8s.io", "resourceclaimtemplates", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["spec"]["devices"]["requests"][0]["exactly"]["count"],
+            serde_json::Value::Number(1.into()),
+            "ResourceClaimTemplate's embedded claim spec must get the same count=1 default \
+             as a standalone ResourceClaim, since the created claim inherits this spec verbatim"
         );
     }
 }
