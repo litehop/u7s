@@ -57,6 +57,8 @@ set -euo pipefail
 ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/conformance/_lib.sh
+source "$REPO/scripts/conformance/_lib.sh"
 
 RESET=0
 BACKGROUND=0
@@ -123,10 +125,9 @@ if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
       sleep 1
     done
   else
-    echo "error: port $HOST_IP:$PORT is already in use." >&2
     echo "If u7s is already running, set KUBECONFIG=$WORKDIR/kubeconfig and use it." >&2
     echo "To start fresh: scripts/u7s-start.sh --reset  (rotates CA, re-join kubelet needed)" >&2
-    exit 1
+    check_port_free "$PORT" "apiserver"
   fi
 fi
 
@@ -302,6 +303,14 @@ fi
 # On first run ca.crt did not exist before the apiserver launched, so we deferred
 # konnectivity startup until after the apiserver is up.
 if [ -f "$WORKDIR/ca.crt" ] && ! nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null; then
+  # This is the first-ever launch of konnectivity-server for this WORKDIR (the
+  # restart path above already owns and self-kills its own prior instance
+  # before respawning) — any occupant found here is a genuinely foreign
+  # process, so hard-fail rather than let the bind fail silently deep inside
+  # $SERVER_BIN's own log.
+  for _kp_port_label in "$KONNECTIVITY_PROXY_PORT:konnectivity-server" "$KONNECTIVITY_AGENT_PORT:konnectivity-agent" "$KONNECTIVITY_ADMIN_PORT:konnectivity-admin" "$KONNECTIVITY_HEALTH_PORT:konnectivity-health"; do
+    check_port_free "${_kp_port_label%%:*}" "${_kp_port_label##*:}"
+  done
   openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$WORKDIR/ca.pem"
   if [ ! -f "$WORKDIR/konnectivity-server.crt" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-server.key"
