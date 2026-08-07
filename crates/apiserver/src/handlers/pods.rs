@@ -6595,7 +6595,13 @@ mod parse_image_tag_tests {
 /// Flip the PodScheduled condition to True in-place.
 ///
 /// Finds an existing PodScheduled entry in `status.conditions` and sets its status to
-/// "True" with reason "PodScheduled".  If no entry exists, appends one.
+/// "True".  If no entry exists, appends one.  Matches upstream's bind-path write
+/// (`pkg/registry/core/pod/storage/storage.go`), which sets only `Type` and `Status` —
+/// no `Reason`/`Message` — so kubelet's cache doesn't drift from the apiserver's copy.
+/// Any stale `reason`/`message` left over from the initial PodScheduled=False condition
+/// (e.g. reason=Unschedulable) is cleared, since upstream's `UpdatePodCondition` replaces
+/// the whole condition struct rather than patching individual fields — leaving the old
+/// reason in place would produce a self-contradictory PodScheduled=True + Unschedulable.
 /// `now` must be an RFC3339 timestamp string (used as `lastTransitionTime`).
 ///
 /// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
@@ -6607,7 +6613,7 @@ pub(crate) fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
         for cond in conditions.iter_mut() {
             if cond["type"].as_str() == Some("PodScheduled") {
                 cond["status"] = serde_json::json!("True");
-                cond["reason"] = serde_json::json!("PodScheduled");
+                cond["reason"] = serde_json::json!("");
                 cond["message"] = serde_json::json!("");
                 cond["lastTransitionTime"] = serde_json::json!(now);
                 return;
@@ -6617,16 +6623,12 @@ pub(crate) fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
         conditions.push(serde_json::json!({
             "type": "PodScheduled",
             "status": "True",
-            "reason": "PodScheduled",
-            "message": "",
             "lastTransitionTime": now
         }));
     } else {
         pod["status"]["conditions"] = serde_json::json!([{
             "type": "PodScheduled",
             "status": "True",
-            "reason": "PodScheduled",
-            "message": "",
             "lastTransitionTime": now
         }]);
     }
@@ -7782,9 +7784,13 @@ mod pure_logic_tests {
             "PodScheduled must be True after bind_pod calls set_pod_scheduled_true — \
              scheduling conformance tests wait for this transition"
         );
-        assert_eq!(
-            scheduled["reason"], "PodScheduled",
-            "reason must change to PodScheduled after binding"
+        assert!(
+            scheduled["reason"].as_str().unwrap_or("").is_empty(),
+            "PodScheduled=True must not carry a reason after bind — upstream apiserver's \
+             bind path writes only Type+Status, so a stray reason (here, a stale \
+             'Unschedulable' surviving the False->True flip) makes kubelet's local cache \
+             disagree with the apiserver on every reconcile tick, causing needsReconcile \
+             log spam and redundant status re-sends"
         );
     }
 
