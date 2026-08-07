@@ -31,13 +31,13 @@ Argo CD needs to: list/watch all API groups it cares about, apply resources via 
 
 ### Why k3s and k0s are insufficient
 
-k3s idles at ~750 MB RSS on a 1 GB node; k0s at ~658 MB. On a 1 GB VPS this leaves under 300 MB for application workloads — unusable for anything real. Both bundle the upstream Go API server which carries the Go runtime, etcd, and reflection-heavy JSON codegen. Rust with an embedded database can hit the same API surface at a fraction of the cost. u7s targets <128 MB idle for the entire control plane, leaving >800 MB for workloads and node agent overhead.
+k3s idles at ~750 MB RSS on a 1 GB node; k0s at ~658 MB. On a 1 GB VPS this leaves under 300 MB for application workloads — unusable for anything real. Both bundle the upstream Go API server which carries the Go runtime, etcd, and reflection-heavy JSON codegen. Rust with an embedded database can hit the same API surface at a fraction of the cost. u7s targets <128 MB idle for the entire control plane, leaving >800 MB for workloads and the real upstream kubelet's own footprint — kubelet is not u7s-specific overhead, it's what any Kubernetes operator runs on a worker node regardless of control plane choice (see §3.5).
 
 ---
 
 ## 2. Memory Budget
 
-**Hard constraint:** All control plane components combined must idle under **128 MB RSS** on the control plane node. The node agent runs on data plane nodes and is not counted here.
+**Hard constraint:** All control plane components combined must idle under **128 MB RSS** on the control plane node. The real upstream kubelet (not a u7s process — see §3.5) runs on data plane nodes and is not counted here.
 
 ### Breakdown
 
@@ -47,7 +47,7 @@ k3s idles at ~750 MB RSS on a 1 GB node; k0s at ~658 MB. On a 1 GB VPS this leav
 | State store (SQLite WAL) | 5–15 MB | Default page cache ~2 MB; with `cache_size=-8000` (8 MB) and WAL. mmap virtual address space is large but physical pages are OS-managed. |
 | State store (LMDB) | 3–10 MB | mmap virtual space is pre-allocated at env open; physical RSS is only resident pages. An empty or small-data env will be near 3 MB RSS. |
 | Controller manager | 8–15 MB | Three reconcile loops (Deployment, RS, StatefulSet) plus shared informer cache. The informer cache is the main risk — it grows with object count. |
-| Scheduler | 5–10 MB | Boundary process; internal design TBD. Assumes a simple scoring loop, not an in-memory copy of the full cluster state. |
+| Scheduler | 5–10 MB | `crates/scheduler` (see §3.4). Watches all pods to maintain an in-memory per-node resource tally rather than issuing a live GET per candidate node on every decision. |
 | Shared libraries, stack, misc | 5–10 MB | libc, TLS stack, signal handlers. |
 | **Total (midpoint estimate)** | **~70 MB** | |
 | **Headroom to 128 MB** | **~58 MB** | Informer caches and watch fan-out grow with object count. |
@@ -124,7 +124,44 @@ only reimplements a controller natively when there's a concrete reason to run it
 
 ### 3.4 Scheduler
 
-A separate binary (or an in-process goroutine-equivalent) that watches for Pods with `spec.nodeName == ""` (unscheduled) and assigns them to nodes by writing `spec.nodeName`. Internal design is TBD (see §9.3). The interface boundary is: read Pods and Nodes from the API server, write `spec.nodeName` back via a `PATCH`. That is the only contract u7s imposes on the scheduler.
+A single binary, `crates/scheduler` (binary `u7s-scheduler`), shipped and running in the
+conformance stack (`docs/decisions/custom-bin-spread-scheduler.md`). It opens one
+cluster-wide watch on `v1/Pods`
+(`GET /api/v1/pods?watch=true&allowWatchBookmarks=true&sendInitialEvents=true`) and, for
+every event:
+
+- Feeds it into an in-memory `NodeTally` — a running per-node tally of committed
+  pod-count/cpu/memory/ephemeral-storage/extended-resource usage that scheduling decisions
+  read instead of a live `GET` per candidate node. This closes a read-after-write race a
+  per-decision GET had: it could observe a just-committed bind as stale and let a second pod
+  be bound onto a node that was actually already full.
+- If the pod is unscheduled (`spec.nodeName == ""`) and not blocked by a non-empty
+  `spec.schedulingGates`, runs it through the scheduling cycle: filter nodes by
+  nodeSelector/nodeAffinity and taint/toleration match, then by free pod-count and
+  cpu/memory/ephemeral-storage capacity against the tally (the NodeResourcesFit/NodePorts
+  predicates), pick the first node that fits, reserve it in `NodeTally` under the same lock
+  acquisition as the fit check (so two decisions racing for the same just-freed slot can
+  never both claim it), and bind via `POST /api/v1/namespaces/:ns/pods/:name/binding`.
+- A gated pod instead gets its `PodScheduled` condition patched to
+  `False`/`SchedulingGated` (mirrors upstream, so a `WaitForPodsSchedulingGated`-style wait
+  observes the right reason) and reset once every gate clears.
+- When no node fits, falls back to preemption: evicts lower-priority pods on the
+  best-qualifying node rather than leaving a higher-priority pod Pending forever. The bind
+  itself is deferred until the pod watch confirms every victim is actually gone — a graceful
+  `DELETE` only stamps `deletionTimestamp`; the real, out-of-process kubelet running the
+  victim keeps its capacity occupied until it finishes tearing the container down.
+- On a failed scheduling attempt, patches `PodScheduled=False`/`Unschedulable` and emits a
+  `FailedScheduling` Event; on success, emits `Scheduled`. An independent 30-second resync
+  (mirroring upstream's `flushUnschedulablePodsLeftover`) re-lists all pods and retries
+  anything still unscheduled, as a backstop against a dropped watch event or a status PATCH
+  that itself failed to land.
+- Stamps the `volume.kubernetes.io/selected-node` annotation on a bound pod's unbound
+  `WaitForFirstConsumer` PVCs at bind time, so external-provisioner sees the node choice
+  immediately rather than after.
+
+No leader election: `--leader-elect` is accepted and silently ignored (u7s runs a single
+control plane node — see §1). `crates/scheduler/src/lib.rs` and `src/main.rs` are the
+authoritative implementation — they change independently of this document.
 
 ### 3.5 Node Runtime (Real Kubelet + CRI-O)
 
@@ -155,21 +192,20 @@ conformant.
 
 ### 3.6 CRI Shim / Container Runtime Interface
 
-The node agent does not call container runtimes directly. It calls an abstract `ContainerRuntime` trait (the CRI boundary). Concrete implementations behind this trait:
-
-- **CRI-O + crun** (via gRPC, CRI protocol) — the primary target. CRI-O does not use persistent shim processes; RSS is flat with pod count, not linear. `crun` (C, not Go) has no Go runtime overhead.
-- **containerd** (via the same gRPC protocol) — should work with the same shim; socket path is the only change
-- **Direct runc/crun** — fallback for minimal environments; no CRI gRPC, calls OCI runtime binary directly
-
-The trait surface: `create_sandbox`, `remove_sandbox`, `create_container`, `start_container`, `stop_container`, `remove_container`, `container_status`, `list_containers`. This mirrors the Kubernetes CRI gRPC service surface but expressed as a Rust async trait.
-
-Decision on default runtime is deferred (see §9.2).
+u7s has no CRI-side code of its own — no `ContainerRuntime` trait, no CRI client, no shim
+process. The real upstream `kubelet` talks CRI directly to real upstream CRI-O + `crun`; see
+§3.5 for the concrete arrangement (provisioning, TLS, `scripts/conformance/lima-start.sh`)
+and `docs/decisions/crio-over-containerd.md` for why CRI-O was picked over containerd.
 
 ### 3.7 CNI Integration Point
 
-The node agent does not implement networking. After a pod sandbox is created, the agent invokes the configured CNI plugin binary (as per CNI spec: exec the binary with environment variables and stdin config, parse stdout for the result). The CNI binary configures the network namespace. u7s does not care which CNI plugin is used (Flannel, Calico, Cilium in non-eBPF mode, etc.).
-
-The integration point is a thin `cni_add(netns_path, pod_name, namespace, uid, config)` → `Result<CniResult>` call that wraps the CNI binary exec.
+u7s does not implement networking or invoke a CNI plugin — that happens inside real
+upstream CRI-O, which execs the configured CNI plugin binary when it creates a pod sandbox
+(per the CNI spec: environment variables + stdin config in, parsed stdout result out). In
+the conformance environment this is the CRI-O bridge plugin's `10-crio-bridge.conflist`,
+whose per-node pod subnet and cross-node routes `scripts/conformance/lima-start.sh` rewrites
+directly on the VM filesystem (see §3.5) — there is no u7s abstraction over CNI to swap in
+a different plugin; that remains CRI-O's own configuration surface.
 
 ---
 
@@ -202,16 +238,16 @@ ReplicaSet Controller (watching apps/v1/ReplicaSets)
   2. Reconcile: current Pod count < desired → create N Pods with spec.nodeName=""
   │
   ▼
-Scheduler (watching v1/Pods with nodeName="")
+Scheduler (watching v1/Pods cluster-wide — see §3.4)
   1. Receives ADDED event for unscheduled Pod
-  2. Scores nodes based on resource availability, taints/tolerations
-  3. PATCHes Pod.spec.nodeName = "node-1"
+  2. Filters nodes by nodeSelector/taints, checks fit against its in-memory tally
+  3. POSTs .../pods/my-pod/binding to assign Pod to "node-1"
   │
   ▼
-Node Agent on node-1 (watching v1/Pods with spec.nodeName="node-1")
+Kubelet on node-1 (real upstream kubelet, watching v1/Pods with spec.nodeName="node-1")
   1. Receives MODIFIED event (Pod now assigned to it)
-  2. Calls CRI shim: create_sandbox → create_container → start_container
-  3. Calls CNI: sets up pod network namespace
+  2. Calls CRI (to CRI-O): RunPodSandbox → CreateContainer → StartContainer
+  3. CRI-O invokes the configured CNI plugin to set up the pod network namespace
   4. Probes liveness/readiness
   5. PATCHes Pod.status.phase = Running, sets containerStatuses
   │
@@ -282,7 +318,7 @@ The API server must expose the following API groups and versions for the Argo CD
 | ConfigMaps | get, list, watch, create, update, patch, delete |
 | Secrets | get, list, watch, create, update, patch, delete |
 | Events | get, list, watch, create, patch |
-| Nodes | get, list, watch, create, update, patch (status subresource used by node agent) |
+| Nodes | get, list, watch, create, update, patch (status subresource used by kubelet) |
 | PersistentVolumes | get, list, watch, create, update, patch, delete |
 | PersistentVolumeClaims | get, list, watch, create, update, patch, delete |
 
@@ -393,47 +429,34 @@ A Kubernetes `resourceVersion` is the decimal string encoding of this counter: `
 
 ---
 
-## 7. Node Agent Design
+## 7. Node Lifecycle
 
-### Registration
+u7s does not implement node join/registration — see §3.5 for why (real upstream kubelet +
+CRI-O; u7s ships no such binary itself). What brings a node up is exactly what an operator would
+otherwise do by hand; for the local dev/CI environment, `scripts/conformance/lima-start.sh`
+does it end to end:
 
-On startup, the node agent:
+- Provisions a Linux VM (Lima) running kubelet + CRI-O — both require a Linux kernel, while
+  the u7s API server itself runs natively on the Mac host (see the script's own header
+  comment for the split).
+- Rewrites and injects the kubeconfig kubelet uses to reach the apiserver, and copies the
+  cluster CA (DER→PEM) so kubelet can verify the apiserver's mTLS client cert on
+  exec/log/attach proxy connections.
+- Generates and signs a kubelet serving cert against that same CA so the apiserver can in
+  turn verify kubelet's TLS on those proxied connections.
+- Rewrites the CRI-O bridge CNI's pod subnet per node (each node gets a disjoint /24 out of
+  CRI-O's default /16) and programs static inter-node routes, since nothing else in this
+  arrangement runs a CNI/BGP control plane of its own.
+- Installs and starts the real upstream `kube-proxy` binary (extracted from the kube-proxy
+  container image) as a systemd service in IPVS mode — not a u7s reimplementation.
 
-1. Reads its node name from the environment or hostname
-2. Calls `PUT /api/v1/nodes/<name>` with a `Node` object describing available CPU, memory, and pod capacity. Uses a retry loop with exponential backoff until the API server is reachable.
-3. Sets `Node.status.conditions[Ready] = False` until the node agent is fully initialized.
-4. Establishes a watch on `GET /api/v1/pods?fieldSelector=spec.nodeName=<name>&watch=true` to receive pod assignments.
-
-### Pod assignment flow
-
-1. Watch delivers a Pod ADDED/MODIFIED event with `spec.nodeName == <self.name>` and `status.phase == ""` (pending).
-2. Node agent pulls the full pod spec.
-3. For each container: resolve image (call CRI `PullImage` if not cached).
-4. Call CRI `RunPodSandbox` (creates network namespace, pause container).
-5. Call CNI `ADD`: exec CNI plugin binary with pod namespace, name, uid, and network config. CNI assigns IP.
-6. For each container: call CRI `CreateContainer` then `StartContainer`.
-7. Update Pod.status: set `podIP`, `containerStatuses`, `phase = Running`.
-8. PATCH Pod status to API server.
-
-### Status reporting
-
-The node agent runs a goroutine-equivalent that:
-- Every 10 s: polls CRI for container statuses, updates Pod.status if changed, sends heartbeat PATCH to Node.status (updates `lastHeartbeatTime` on the Ready condition).
-- On container exit: immediately updates Pod.status.phase to Succeeded or Failed, sets container exit code and reason.
-- On probe failure: marks container as not ready, emits an Event.
-
-### Termination
-
-On receiving a DELETED watch event for a Pod (or `deletionTimestamp` set), the agent:
-1. Sends SIGTERM to containers (respects `terminationGracePeriodSeconds`).
-2. After grace period, SIGKILL.
-3. Calls CRI `StopContainer`, `RemoveContainer`, `StopPodSandbox`, `RemovePodSandbox`.
-4. Calls CNI `DEL` to release the IP.
-5. PATCHes Pod status to Terminated.
-
-### Authentication to the API server
-
-The node agent authenticates using a service account token or a static bearer token provisioned at cluster init time. In Phase 1, a static token is acceptable. In a later phase, implement node bootstrapping (similar to TLS bootstrapping in upstream Kubernetes).
+None of this lives in a u7s crate: there is no node-registration protocol, no bootstrap
+token exchange, and no lifecycle state machine for u7s to maintain. Node registration
+itself is the standard Kubernetes `Node` object kubelet creates on startup; u7s's apiserver
+only serves and validates it like any other resource, exactly as §3.5 describes. This is
+the same "conform, don't reinvent" rationale as §3.3's controller delegation: kubelet's own
+join/registration/lifecycle machinery is substantial, and running the real binary gets it
+for free instead of u7s re-deriving it.
 
 ---
 
@@ -443,13 +466,13 @@ Each phase produces a cluster that can do something real. Do not start a phase u
 
 ### Phase 1: Working API Server + State Store + Single Static Pod
 
-**Goal:** `kubectl get pods` works. A pod can be created by directly writing it with `spec.nodeName` set (bypassing scheduler). The node agent runs it.
+**Goal:** `kubectl get pods` works. A pod can be created by directly writing it with `spec.nodeName` set (bypassing scheduler). Real kubelet + CRI-O run it (see §3.5) — there is nothing else here for u7s to build.
 
 Deliverables:
 - API server serving `/api/v1/{pods,namespaces,nodes}` with get/list/watch/create/update/patch/delete
 - Storage trait + SQLite implementation (WAL mode, basic schema)
 - Static bearer token auth, no RBAC (allow all)
-- Node agent: registration, pod watch, CRI-O integration, CNI exec
+- Real kubelet joins, registers the `Node` object, watches its own pods, and runs them via CRI-O — no u7s-built binary involved (see §3.5)
 - `kubectl get pods/nodes/namespaces` works
 - A Pod with `spec.nodeName` manually set runs a container
 
@@ -469,10 +492,10 @@ Deliverables:
 **Goal:** Pods are placed automatically. StatefulSets with ordered rollout work.
 
 Deliverables:
-- Scheduler: simple bin-packing, resource request/limit awareness, taint/toleration support
+- Scheduler: resource request/limit awareness, taint/toleration support (shipped as `crates/scheduler` — see §3.4 for the actual design, which grew preemption and scheduling-gate support beyond this original scope)
 - StatefulSet controller
 - PersistentVolumeClaim handling (static provisioning only)
-- Node resource reporting from node agent
+- Node resource reporting (kubelet reports `status.allocatable`/`status.capacity` itself — see §3.5)
 
 ### Phase 4: CRD Support + Argo CD Compatibility
 
@@ -492,7 +515,7 @@ Deliverables:
 - Pagination (`continue` tokens on list)
 - Watch bookmark periodic emission
 - Pod log streaming (`pods/log`)
-- Node agent TLS bootstrap
+- Kubelet TLS bootstrap (upstream kubelet's own bootstrap-token flow — see §3.5)
 - Metrics endpoint (`/metrics`, Prometheus scrape)
 
 ---
@@ -523,23 +546,11 @@ Deliverables:
 
 ### 9.2 Container Runtime
 
-**CRI-O + crun (recommended):**
-- Purpose-built for CRI; no plugin system, no image build, no persistent shim processes
-- RSS is flat with pod count: CRI-O execs `crun` per container start and the process exits — no per-pod `containerd-shim` accumulation
-- `crun` is written in C; no Go runtime overhead, fast container start
-- Same gRPC protocol as containerd; node agent code is identical
-
-**containerd (CRI gRPC):**
-- Battle-tested, widest ecosystem support
-- Spawns a persistent `containerd-shim-runc-v2` per pod sandbox — RSS grows linearly with pod count (~5–10 MB per pod)
-- Use if CRI-O proves incompatible with a specific registry or image format
-
-**Direct runc/crun via OCI spec:**
-- No daemon; node agent owns the full OCI lifecycle (image pull, layer unpack, bundle prep)
-- Saves ~20–30 MB daemon RSS but adds ~3,000 lines of implementation
-- Only warranted if node RSS budget is critically tight
-
-**Resolution:** CRI-O + crun. See `container-runtime.md` for the full integration spec.
+Resolved — CRI-O + crun, chosen over containerd for flat (not linear) RSS-per-pod and no
+Go-runtime shim overhead. This is a real upstream kubelet's own
+`--container-runtime-endpoint` choice, not a u7s trait to implement or a decision u7s
+software makes at runtime — see §3.5 for the concrete arrangement and
+`docs/decisions/crio-over-containerd.md` for the full rationale.
 
 ### 9.3 Scheduler Design
 
@@ -570,7 +581,7 @@ The following are explicitly **not** implemented in u7s, at least through the Ar
 - **Cloud provider integration:** No CCM (Cloud Controller Manager), no LoadBalancer service type provisioning.
 - **Network policies:** Policy objects can be stored (Argo CD may apply them) but enforcement is the CNI plugin's responsibility — u7s does not implement a network policy enforcement engine.
 - **Volume plugins beyond hostPath and emptyDir:** No CSI driver integration in Phase 1–4. Static PV/PVC with hostPath is the limit.
-- **Image registry mirroring or caching:** Node agent delegates all image pulls to the CRI runtime.
+- **Image registry mirroring or caching:** Kubelet delegates all image pulls to the CRI runtime (real upstream kubelet — see §3.5).
 - **Audit logging:** Not implemented initially.
 - **Multi-tenancy / virtual clusters:** Single flat cluster model.
 - **Windows nodes:** Linux only.
