@@ -336,28 +336,6 @@ mod tests {
         assert_eq!(json["code"], 429);
     }
 
-    // In-memory sink for tracing-subscriber's fmt layer, so the 429 log test can assert
-    // on the rendered field set without adding a tracing-test dependency.
-    #[derive(Clone, Default)]
-    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
-        type Writer = SharedBuf;
-        fn make_writer(&'w self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[tokio::test]
     async fn test_429_rejection_is_logged_with_method_uri_and_limit_kind() {
         // Before this test existed, an InflightLayer 429 was invisible in apiserver.log:
@@ -366,12 +344,9 @@ mod tests {
         // this warn!, diagnosing rate-limit pressure required forensic reconstruction from
         // request-density timing instead of a grep. If the log call is ever dropped, this
         // test must fail.
-        let buf = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
         let inflight = Arc::new(Semaphore::new(0)); // immediately exhausted
         let mutating = Arc::new(Semaphore::new(MAX_MUTATING));
@@ -391,7 +366,7 @@ mod tests {
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             log.contains("POST") && log.contains("/api/v1/namespaces"),
             "429 rejection log must record method and uri so operators can identify which \

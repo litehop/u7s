@@ -11802,30 +11802,8 @@ mod handler_tests {
         assert_eq!(items[0]["spec"]["nodeName"], "worker-1");
     }
 
-    /// In-memory sink for tracing-subscriber's fmt layer, so debug-visibility tests can
-    /// assert on rendered field content without adding a tracing-test dependency.
-    #[derive(Clone, Default)]
-    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for SharedBuf {
-        type Writer = SharedBuf;
-        fn make_writer(&'w self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn captured_log(buf: &SharedBuf) -> String {
-        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    fn captured_log(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
     }
 
     /// list_pods must emit one DEBUG event per pod, carrying that pod's own phase and
@@ -11836,13 +11814,9 @@ mod handler_tests {
     async fn list_pods_emits_one_debug_event_per_pod_with_lifecycle_fields() {
         use axum::http::method::Method;
 
-        let buf = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
