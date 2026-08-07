@@ -308,6 +308,7 @@ pub async fn pod_log<S: Store>(
     }
 
     let kubelet_resp = client.get(&kubelet_url).send().await.map_err(|e| {
+        tracing::warn!("pod log proxy error: kubelet request to {kubelet_url} failed: {e}");
         crate::status::StatusError(
             axum::http::StatusCode::BAD_GATEWAY,
             crate::status::Status {
