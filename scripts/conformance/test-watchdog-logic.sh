@@ -11,6 +11,10 @@
 #     of a legitimate [Slow] conformance test, e.g. a 5-minute gomega.Consistently
 #     check) must be left alone — the watchdog is a leak/stuck-namespace safety
 #     net, not a bound on how long a healthy test may run.
+#   - A CSI driver namespace (<parent-test-ns>-<random>, per upstream's
+#     storageframework) must be left alone while its parent test namespace
+#     still exists, regardless of age — reaping it kills the driver out from
+#     under the still-running parent test and orphans its PVs.
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
@@ -44,16 +48,34 @@ assert_not_deleted() {
 
 # ---------------------------------------------------------------------------
 # Isolated decision function — mirrors the watchdog_loop body without I/O.
-# Arguments: now_epoch  ns  phase  created_rfc3339
+# Arguments: now_epoch  ns  phase  created_rfc3339  [parent_exists_fn]
+# parent_exists_fn is the name of a function taking one arg (a namespace name)
+# and returning 0 if it exists, 1 otherwise — production wires this to a real
+# `kubectl get ns`, tests inject a stub, so this function never shells out
+# itself and stays hermetic.
 # Prints "force-deleting namespace '<ns>'" when the namespace should be deleted.
 # ---------------------------------------------------------------------------
 watchdog_decide() {
-  local now="$1" ns="$2" phase="$3" created="$4"
+  local now="$1" ns="$2" phase="$3" created="$4" parent_exists_fn="${5:-}"
 
   # Skip system namespaces.
   case "$ns" in
     default|sonobuoy|kube-*) return 0 ;;
   esac
+
+  # Driver-namespace exemption: a namespace matching <slug>-<N>-<M> is the CSI
+  # driver namespace upstream's storageframework provisions as a CHILD of
+  # test namespace <slug>-<N> (test/e2e/storage/drivers/csi.go ->
+  # CreateDriverNamespace -> framework/util.go's CreateTestingNS). Skip the
+  # age-based reap entirely while the parent still exists — the driver may
+  # still be needed for that test's ongoing operations, so its own age is not
+  # a valid signal to reap it on.
+  if [[ "$ns" =~ ^(.+-[0-9]+)-[0-9]+$ ]] && [ -n "$parent_exists_fn" ]; then
+    local parent_ns="${BASH_REMATCH[1]}"
+    if "$parent_exists_fn" "$parent_ns"; then
+      return 0
+    fi
+  fi
 
   # Convert RFC3339 to epoch seconds on macOS.
   local created_s
@@ -142,6 +164,71 @@ assert_not_deleted "Active ns 599s old is below threshold" "e2e-test-just-under"
 OUT=$(watchdog_decide "$NOW" "e2e-test-cronjob-suspended" "Active" "$(ts_ago 360)")
 assert_not_deleted "Active ns 6m old (mid Consistently-check test) is left alone" \
   "e2e-test-cronjob-suspended" "$OUT"
+
+# ---------------------------------------------------------------------------
+# Driver-namespace parent-existence stub — stands in for `kubectl get ns` so
+# these cases never touch a real cluster. A namespace "exists" only if it is
+# listed in EXISTING_PARENT_NAMESPACES for the current case.
+# ---------------------------------------------------------------------------
+EXISTING_PARENT_NAMESPACES=()
+stub_parent_exists() {
+  local candidate
+  # "${arr[@]}" on a genuinely empty array is an unbound-variable error under
+  # `set -u` in bash 3.2 (macOS's shipped /bin/bash) — the ":-" fallback keeps
+  # the "no existing parents" case from crashing the whole test run.
+  for candidate in "${EXISTING_PARENT_NAMESPACES[@]:-}"; do
+    [ "$candidate" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# 12. Driver namespace (multivolume-3161-7041), 11 minutes old, whose parent
+# test namespace (multivolume-3161) is still Active. This is the actual bug:
+# upstream's storageframework runs the CSI driver in this child namespace,
+# and age-only reaping killed it out from under the still-running parent
+# test, orphaning its PVs into 20-minute delete-wait timeouts. Fails on
+# revert of the parent-existence check.
+EXISTING_PARENT_NAMESPACES=("multivolume-3161")
+OUT=$(watchdog_decide "$NOW" "multivolume-3161-7041" "Active" "$(ts_ago 660)" stub_parent_exists)
+assert_not_deleted "Driver-ns is spared while its parent test namespace still exists" \
+  "multivolume-3161-7041" "$OUT"
+
+# 13. Same driver namespace, same age, but its parent test namespace is gone.
+# A driver-ns that outlives its parent has no test left to serve it, so the
+# exemption above must not become a permanent shield — it has to fall back to
+# the unchanged 10m/15m thresholds once the causal reason to keep it is gone.
+EXISTING_PARENT_NAMESPACES=()
+OUT=$(watchdog_decide "$NOW" "multivolume-3161-7041" "Active" "$(ts_ago 660)" stub_parent_exists)
+assert_deleted "Driver-ns reaps normally once its parent test namespace is gone" \
+  "multivolume-3161-7041" "$OUT"
+
+# 14. A regular test namespace with a single numeric suffix (no driver
+# involved), 11 minutes old. Must keep reaping on the unchanged thresholds —
+# the new driver-ns regex must never accidentally exempt an ordinary test
+# namespace just because its name happens to end in digits.
+EXISTING_PARENT_NAMESPACES=()
+OUT=$(watchdog_decide "$NOW" "multivolume-3161" "Active" "$(ts_ago 660)" stub_parent_exists)
+assert_deleted "Regular single-suffix test namespace still reaps unchanged" \
+  "multivolume-3161" "$OUT"
+
+# 15. Nested-suffix edge case: foo-1-2-3. The regex anchors on the TRAILING
+# two numeric suffixes, so the parent lookup resolves to "foo-1-2" (dropping
+# only the final "-3"), not "foo-1". Upstream never nests suffixes this deep
+# in practice; this documents the deliberate choice (greedy match toward the
+# longest valid parent candidate) rather than leaving the behavior undefined.
+EXISTING_PARENT_NAMESPACES=("foo-1-2")
+OUT=$(watchdog_decide "$NOW" "foo-1-2-3" "Active" "$(ts_ago 660)" stub_parent_exists)
+assert_not_deleted "Nested-suffix foo-1-2-3 resolves its parent to foo-1-2 (trailing two suffixes), not foo-1" \
+  "foo-1-2-3" "$OUT"
+
+# 16. Adversarial: foo-9999-9999 whose would-be parent foo-9999 was never a
+# real namespace. Guards against an implementation that treats any
+# two-numeric-suffix name as automatically exempt without truly querying
+# parent existence — it must still reap per the normal thresholds.
+EXISTING_PARENT_NAMESPACES=()
+OUT=$(watchdog_decide "$NOW" "foo-9999-9999" "Active" "$(ts_ago 660)" stub_parent_exists)
+assert_deleted "foo-9999-9999 reaps normally when foo-9999 was never a real namespace" \
+  "foo-9999-9999" "$OUT"
 
 # ---------------------------------------------------------------------------
 # Summary

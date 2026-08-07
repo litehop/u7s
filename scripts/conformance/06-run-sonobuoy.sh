@@ -73,6 +73,17 @@ fi
 # Active threshold without letting a stuck Terminating namespace linger.
 #
 # System namespaces excluded: default, kube-*, sonobuoy
+#
+# Driver-namespace exemption: upstream's storageframework provisions the CSI
+# driver (e.g. csi-hostpathplugin-0) into a namespace named <parent-test-ns>-
+# <random> (test/e2e/storage/drivers/csi.go -> CreateDriverNamespace ->
+# framework/util.go's CreateTestingNS), so a namespace matching <slug>-<N>-<M>
+# is a CHILD of test namespace <slug>-<N>. Reaping it purely on age while the
+# parent test is still running/cleaning up kills the driver out from under
+# that test, orphaning its PVs into 20-minute delete-wait timeouts. Age of
+# the driver-ns itself says nothing about whether it's still needed, so this
+# check gates on the actual causal condition (does the parent test still
+# exist) instead of a timer -- the 10m/15m thresholds above are unchanged.
 # ---------------------------------------------------------------------------
 watchdog_loop() {
   local kubeconfig="$1"
@@ -95,6 +106,15 @@ watchdog_loop() {
       case "$ns" in
         default|sonobuoy|kube-*) continue ;;
       esac
+
+      # Driver-namespace exemption (see comment above watchdog_loop): skip the
+      # reap entirely while the parent test namespace still exists.
+      if [[ "$ns" =~ ^(.+-[0-9]+)-[0-9]+$ ]]; then
+        local parent_ns="${BASH_REMATCH[1]}"
+        if kubectl --kubeconfig="$kubeconfig" get ns "$parent_ns" >/dev/null 2>&1; then
+          continue
+        fi
+      fi
 
       # Convert RFC3339 creationTimestamp to epoch seconds on macOS.
       local created_s
