@@ -4990,15 +4990,26 @@ mod tests {
     /// If the increment in `build_aggregated_discovery` is ever dropped (e.g. during a refactor),
     /// that measurement silently goes back to zero series with no test failure elsewhere to
     /// catch it -- this test is that catch.
+    ///
+    /// Uses a route unused by any other call site so this test's before/after snapshot of the
+    /// shared, process-global `DISCOVERY_BUILD_TOTAL` registry can't be perturbed by other tests'
+    /// `build_aggregated_discovery` calls running concurrently on other `cargo test` threads.
     #[tokio::test]
     async fn build_aggregated_discovery_increments_discovery_build_total() {
         let state = make_state();
-        let label_values = ["/discovery/v2", "true", "false"];
+        let label_values = ["/test-only/discovery-build-total", "true", "false"];
         let before = crate::metrics::DISCOVERY_BUILD_TOTAL
             .with_label_values(&label_values)
             .get();
 
-        build_aggregated_discovery(&state, "v2beta1", true, None, "/discovery/v2").await;
+        build_aggregated_discovery(
+            &state,
+            "v2beta1",
+            true,
+            None,
+            "/test-only/discovery-build-total",
+        )
+        .await;
 
         let after = crate::metrics::DISCOVERY_BUILD_TOTAL
             .with_label_values(&label_values)
