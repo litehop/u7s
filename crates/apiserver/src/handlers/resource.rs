@@ -1137,7 +1137,7 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         if let Some((ref old_size, ref sc_name)) = pvc_before_patch {
-            reject_disallowed_pvc_expansion(
+            reject_disallowed_pvc_resize(
                 state,
                 plural,
                 name,
@@ -1307,7 +1307,7 @@ async fn storage_class_allows_expansion<S: Store>(state: &AppState<S>, sc_name: 
 /// Mirrors upstream's PersistentVolumeClaimResize admission plugin: without this check, e2e's
 /// "should not allow expansion of pvcs without AllowVolumeExpansion property" observes
 /// the size increase silently succeed instead of a 403 Forbidden.
-async fn reject_disallowed_pvc_expansion<S: Store>(
+async fn reject_disallowed_pvc_resize<S: Store>(
     state: &AppState<S>,
     plural: &str,
     name: &str,
@@ -2131,10 +2131,10 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
 
         // A PUT growing spec.resources.requests.storage is only allowed when the bound
         // StorageClass explicitly opts in via allowVolumeExpansion — see
-        // reject_disallowed_pvc_expansion.
+        // reject_disallowed_pvc_resize.
         if is_pvc {
             if let Some(ref stored) = parsed {
-                reject_disallowed_pvc_expansion(
+                reject_disallowed_pvc_resize(
                     &state,
                     &plural,
                     &name,
