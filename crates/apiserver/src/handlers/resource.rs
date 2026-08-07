@@ -1059,6 +1059,23 @@ pub(crate) async fn do_patch<S: Store>(
                 None
             };
 
+        // Capture PVC storage request + StorageClass before patch: growing storage is only
+        // allowed when the bound StorageClass explicitly opts in via allowVolumeExpansion,
+        // checked against the post-patch value below.
+        let pvc_before_patch = if group.is_empty() && plural == "persistentvolumeclaims" {
+            Some((
+                current.body["spec"]["resources"]["requests"]["storage"]
+                    .as_str()
+                    .map(str::to_string),
+                current.body["spec"]["storageClassName"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        } else {
+            None
+        };
+
         // Capture spec before patch for generation tracking on workload resources.
         let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
             Some(current.body["spec"].clone())
@@ -1117,6 +1134,18 @@ pub(crate) async fn do_patch<S: Store>(
                     "{plural}/{name} .value is immutable and cannot be updated"
                 )));
             }
+        }
+
+        if let Some((ref old_size, ref sc_name)) = pvc_before_patch {
+            reject_disallowed_pvc_expansion(
+                state,
+                plural,
+                name,
+                old_size.as_deref(),
+                sc_name,
+                &current.body,
+            )
+            .await?;
         }
 
         if let Some((ref data_before, ref binary_data_before, ref string_data_before)) =
@@ -1251,6 +1280,56 @@ pub(crate) async fn do_patch<S: Store>(
             Err(e) => return Err(store_err(e, name, &meta.kind)),
         }
     }
+}
+
+/// Reports whether StorageClass `sc_name` explicitly allows volume expansion.
+/// A missing StorageClass or an absent/false `allowVolumeExpansion` field are both
+/// treated as "not allowed" — mirrors upstream's PersistentVolumeClaimResize admission
+/// plugin (plugin/pkg/admission/storage/persistentvolume/resize/admission.go), which
+/// defaults to deny rather than fail open when the field can't be resolved.
+async fn storage_class_allows_expansion<S: Store>(state: &AppState<S>, sc_name: &str) -> bool {
+    if sc_name.is_empty() {
+        return false;
+    }
+    let key = group_object_key("storage.k8s.io", "storageclasses", None, sc_name);
+    match state.store.get(&key).await {
+        Ok(Some(stored)) => serde_json::from_slice::<serde_json::Value>(&stored.value)
+            .ok()
+            .and_then(|v| v["allowVolumeExpansion"].as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Rejects a PersistentVolumeClaim UPDATE that grows `spec.resources.requests.storage`
+/// past `old_size` unless `old_sc_name`'s StorageClass explicitly allows it. Mirrors
+/// upstream's PersistentVolumeClaimResize admission plugin: without this check, e2e's
+/// "should not allow expansion of pvcs without AllowVolumeExpansion property" observes
+/// the size increase silently succeed instead of a 403 Forbidden.
+async fn reject_disallowed_pvc_expansion<S: Store>(
+    state: &AppState<S>,
+    plural: &str,
+    name: &str,
+    old_size: Option<&str>,
+    old_sc_name: &str,
+    new_pvc: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let Some(old_size) = old_size.and_then(limit_range::parse_quantity) else {
+        return Ok(());
+    };
+    let Some(new_size) = new_pvc["spec"]["resources"]["requests"]["storage"]
+        .as_str()
+        .and_then(limit_range::parse_quantity)
+    else {
+        return Ok(());
+    };
+    if new_size <= old_size || storage_class_allows_expansion(state, old_sc_name).await {
+        return Ok(());
+    }
+    Err(Status::forbidden(format!(
+        "{plural} \"{name}\" is forbidden: only dynamically provisioned pvc can be resized and \
+         the storageclass that provisions the pvc must support resize"
+    )))
 }
 
 pub(crate) async fn patch_resource<S: Store>(
@@ -1993,10 +2072,12 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // whose PUT body omits it — including a protobuf-content-type PUT, since the wire decoder
     // never emits this field — must not be trusted as "not being deleted".
     let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
+    let is_pvc = group.is_empty() && plural == "persistentvolumeclaims";
     let needs_stored_read = super::defaults::is_workload_resource(&group, &plural)
         || super::defaults::is_endpointslice(&group, &plural)
         || meta.has_status_subresource
         || (group.is_empty() && (plural == "secrets" || plural == "configmaps"))
+        || is_pvc
         || incoming_deletion_timestamp_blank;
     let (
         spec_before_replace,
@@ -2036,6 +2117,23 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
                         )));
                     }
                 }
+            }
+        }
+
+        // A PUT growing spec.resources.requests.storage is only allowed when the bound
+        // StorageClass explicitly opts in via allowVolumeExpansion — see
+        // reject_disallowed_pvc_expansion.
+        if is_pvc {
+            if let Some(ref stored) = parsed {
+                reject_disallowed_pvc_expansion(
+                    &state,
+                    &plural,
+                    &name,
+                    stored["spec"]["resources"]["requests"]["storage"].as_str(),
+                    stored["spec"]["storageClassName"].as_str().unwrap_or(""),
+                    &obj.body,
+                )
+                .await?;
             }
         }
 
@@ -16159,6 +16257,291 @@ mod tests {
             "PATCH changing only PriorityClass.description must succeed — mutable fields must \
              remain patchable even though .value is locked",
         );
+    }
+
+    /// PUT growing a PVC's `spec.resources.requests.storage` must return 403 Forbidden when
+    /// the bound StorageClass has `allowVolumeExpansion: false`.
+    ///
+    /// Mirrors upstream's PersistentVolumeClaimResize admission plugin (plugin/pkg/admission/
+    /// storage/persistentvolume/resize/admission.go). Without this check, u7s silently grows
+    /// the PVC and the e2e conformance test "should not allow expansion of pvcs without
+    /// AllowVolumeExpansion property" observes `Update()` succeed instead of
+    /// `apierrors.IsForbidden(err)`, because no CSI driver would ever actually resize the
+    /// underlying volume for a StorageClass that never advertised support for it.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_pvc_expansion_without_allow_volume_expansion() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "no-expand" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": false
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "my-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "no-expand",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let grown = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "my-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "no-expand",
+                "resources": { "requests": { "storage": "2Gi" } }
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "my-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&grown).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "PUT growing a PVC's storage request without AllowVolumeExpansion must return \
+                 403 Forbidden — client-go's apierrors.IsForbidden(err) drives the upstream e2e \
+                 assertion, so any other status leaves the volume-expand conformance test failing"
+            ),
+            Ok(_) => panic!(
+                "PUT growing PersistentVolumeClaim.spec.resources.requests.storage must be \
+                 rejected when the bound StorageClass has allowVolumeExpansion: false — \
+                 accepting it lets a PVC silently outgrow a driver that never advertised \
+                 support for resizing the underlying volume"
+            ),
+        }
+
+        // Growing storage on a StorageClass that DOES allow expansion must still succeed —
+        // this check must not blanket-reject every storage-size increase.
+        let sc2 = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "can-expand" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": true
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc2).unwrap()),
+        )
+        .await
+        .expect("second StorageClass create must succeed");
+
+        let pvc2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "expandable-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "can-expand",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc2).unwrap()),
+        )
+        .await
+        .expect("second PVC create must succeed");
+
+        let grown2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "expandable-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "can-expand",
+                "resources": { "requests": { "storage": "2Gi" } }
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "expandable-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&grown2).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT growing a PVC's storage request must succeed when the bound StorageClass has \
+             allowVolumeExpansion: true — the resize check must not reject legitimate expansion",
+        );
+    }
+
+    /// PATCH growing a PVC's `spec.resources.requests.storage` must return 403 Forbidden when
+    /// the bound StorageClass has `allowVolumeExpansion: false`.
+    ///
+    /// Mirrors the PUT test above but for PATCH (merge-patch), exercising the do_patch code
+    /// path instead of replace_namespaced_resource. `kubectl patch pvc` is the common way
+    /// users resize a claim, so both write paths must enforce the same admission rule.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_pvc_expansion_without_allow_volume_expansion() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "no-expand-patch" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": false
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "patched-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "no-expand-patch",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({
+            "spec": { "resources": { "requests": { "storage": "2Gi" } } }
+        });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "patched-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "PATCH growing a PVC's storage request without AllowVolumeExpansion must \
+                 return 403 Forbidden, matching the PUT check in replace_namespaced_resource"
+            ),
+            Ok(_) => panic!(
+                "PATCH growing PersistentVolumeClaim.spec.resources.requests.storage must be \
+                 rejected when the bound StorageClass has allowVolumeExpansion: false — the \
+                 resize check is missing from do_patch"
+            ),
+        }
     }
 
     /// Deleting a Job must remove the `batch.kubernetes.io/job-tracking` finalizer from
