@@ -113,6 +113,21 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
 // CA key+cert — persisted across restarts
 // ---------------------------------------------------------------------------
 
+/// Generate a 6-hex-char suffix for the CA Subject CN, unique enough to tell
+/// stacks apart (not a cryptographic requirement — collisions only degrade a
+/// diagnostic, they don't weaken the CA key). `rand` is not a direct dependency
+/// of this crate, so we mix wall-clock nanoseconds with the process ID rather
+/// than pull in a new crate for this.
+fn random_ca_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u32;
+    let mixed = nanos ^ std::process::id();
+    format!("{:06x}", mixed & 0x00ff_ffff)
+}
+
 /// Load-or-generate the CA keypair and cert for signing leaf certificates.
 ///
 /// Returns `(ca_key, ca_params, ca_cert_der)` where:
@@ -172,24 +187,39 @@ fn load_or_generate_ca(
         // We cannot round-trip from DER/PEM back to CertificateParams, so we
         // reconstruct minimal CA params with the same key. The Issuer is used
         // only for signed_by(); no DER is produced here.
+        //
+        // The CN must come from the on-disk cert, not a hardcoded literal:
+        // generation now stamps a random per-stack suffix onto the CN (below),
+        // so hardcoding here would make every leaf's Issuer field mismatch the
+        // real CA Subject on disk, breaking X.509 issuer/subject name matching
+        // for anything signed after this reload. Falling back to the historical
+        // literal keeps CAs with no parseable CN loading unchanged.
+        let ca_cn = crate::auth::extract_client_cert_identity(&ca_cert_der)
+            .map(|id| id.username)
+            .unwrap_or_else(|| "u7s-ca".to_owned());
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "u7s-ca");
+            .push(rcgen::DnType::CommonName, ca_cn);
 
         tracing::info!("loaded CA key from {ca_key_path}; cert DER from {ca_cert_path}");
         return Ok((ca_key, ca_params, ca_cert_der));
     }
 
-    // Generate fresh CA.
+    // Generate fresh CA. The Subject CN gets a random per-stack suffix so that a
+    // client misrouted to a DIFFERENT u7s stack's apiserver fails trust-anchor
+    // lookup by name (rustls UnknownIssuer) instead of matching a wrong-stack CA
+    // by the shared literal name and then failing cryptographic verification
+    // against a leaf signed by a different key (rustls BadSignature — cryptic).
     tracing::info!("generating new CA key+cert → {ca_key_path} / {ca_cert_path}");
     let ca_key = KeyPair::generate().map_err(|e| anyhow::anyhow!("generate CA key: {e}"))?;
+    let ca_cn = format!("u7s-ca-{}", random_ca_suffix());
     let mut ca_params = CertificateParams::default();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "u7s-ca");
+        .push(rcgen::DnType::CommonName, ca_cn);
     let ca_cert_der = ca_params
         .self_signed(&ca_key)
         .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?
@@ -1285,5 +1315,143 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Extract the Issuer CN from a DER-encoded certificate (test-only). Mirrors
+    /// the Subject-CN parsing in `auth::extract_client_cert_identity`, but reads
+    /// the Issuer field instead, so tests can confirm the CA params
+    /// `load_or_generate_ca` reconstructs actually carry forward the on-disk
+    /// CA's real Subject CN (used to sign freshly-issued leaf certs' Issuer
+    /// field) rather than a hardcoded literal.
+    fn issuer_cn(der: &[u8]) -> Option<String> {
+        use x509_cert::der::asn1::{Ia5StringRef, PrintableStringRef, Utf8StringRef};
+        use x509_cert::der::{Decode as _, Tag, Tagged as _};
+        use x509_cert::Certificate;
+
+        let cert = Certificate::from_der(der).ok()?;
+        for atv in cert.tbs_certificate().issuer().iter() {
+            if atv.oid.to_string() != "2.5.4.3" {
+                continue;
+            }
+            return match atv.value.tag() {
+                Tag::Utf8String => atv
+                    .value
+                    .decode_as::<Utf8StringRef<'_>>()
+                    .ok()
+                    .map(|s| s.as_str().to_owned()),
+                Tag::PrintableString => atv
+                    .value
+                    .decode_as::<PrintableStringRef<'_>>()
+                    .ok()
+                    .map(|s| s.as_str().to_owned()),
+                Tag::Ia5String => atv
+                    .value
+                    .decode_as::<Ia5StringRef<'_>>()
+                    .ok()
+                    .map(|s| s.as_str().to_owned()),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Regression: a freshly generated CA's Subject CN must carry a random
+    /// per-stack suffix, not the historical literal "u7s-ca". Every u7s stack
+    /// sharing that literal CN is what let rustls's WebPkiServerVerifier accept
+    /// a name-matching (but wrong) trust anchor from a DIFFERENT stack's CA when
+    /// cert-routing misfired, then fail cryptographic verification against a
+    /// leaf signed by a different key — an opaque BadSignature instead of a
+    /// legible UnknownIssuer. If the CN reverts to the bare literal, the failure
+    /// mode goes cryptic again.
+    #[test]
+    fn generated_ca_cn_is_unique_per_stack_to_surface_cert_misroute_as_unknown_issuer() {
+        let dir = test_temp_dir("ca-cn-unique");
+        let (_, _, ca_cert_der) = run_load_or_generate_ca(&dir).expect("generate CA");
+
+        let cn = crate::auth::extract_client_cert_identity(&ca_cert_der)
+            .map(|id| id.username)
+            .expect("freshly generated CA cert must have a parseable Subject CN");
+
+        assert_ne!(
+            cn, "u7s-ca",
+            "fresh CA CN must not be the bare literal 'u7s-ca' — a CN shared across \
+             every stack is exactly what makes a misrouted-cert failure surface as \
+             opaque BadSignature instead of legible UnknownIssuer"
+        );
+        assert!(
+            cn.starts_with("u7s-ca-"),
+            "fresh CA CN must keep the 'u7s-ca-' prefix so operators can still \
+             recognize it as a u7s cluster CA; got {cn:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Regression: a CA generated by pre-fix code (literal CN="u7s-ca", no
+    /// suffix) must still load without error, and the CertificateParams
+    /// `load_or_generate_ca` reconstructs must carry forward that exact on-disk
+    /// CN rather than a hardcoded string. A hardcoded comparison/regeneration
+    /// here would either reject a perfectly good legacy CA, or silently mint
+    /// leaf certs whose Issuer field doesn't match the actual persisted CA
+    /// Subject — breaking X.509 issuer/subject name matching for every
+    /// certificate signed after the first restart post-upgrade.
+    #[test]
+    fn legacy_ca_with_literal_cn_loads_and_issuer_cn_matches_the_cert_on_disk() {
+        let dir = test_temp_dir("ca-legacy-cn");
+        let ca_key_path = dir.join("ca.key");
+        let ca_cert_path = dir.join("ca.crt");
+
+        // Hand-build a CA the way pre-fix code did: literal CN="u7s-ca".
+        let legacy_key = KeyPair::generate().expect("generate legacy CA key");
+        let mut legacy_params = CertificateParams::default();
+        legacy_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        legacy_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "u7s-ca");
+        let legacy_cert_der = legacy_params
+            .self_signed(&legacy_key)
+            .expect("self-sign legacy CA")
+            .der()
+            .to_vec();
+        write_private_key(&ca_key_path, legacy_key.serialize_pem().as_bytes())
+            .expect("write legacy ca.key");
+        std::fs::write(&ca_cert_path, &legacy_cert_der).expect("write legacy ca.crt"); // lgtm[rust/path-injection]
+
+        let (loaded_key, loaded_params, loaded_cert_der) = load_or_generate_ca(
+            &ca_key_path.to_string_lossy(),
+            &ca_cert_path.to_string_lossy(),
+        )
+        .expect("a pre-fix CA with literal CN=u7s-ca on disk must still load without error");
+
+        assert_eq!(
+            loaded_cert_der, legacy_cert_der,
+            "load_or_generate_ca must load the existing legacy CA cert as-is, not regenerate it"
+        );
+
+        // Sign a leaf with the reconstructed params/key and confirm its Issuer CN
+        // matches the actual on-disk CA Subject ("u7s-ca"), proving the load path
+        // threads the real CN through instead of hardcoding a new or stale value.
+        let ca_issuer = Issuer::new(loaded_params, loaded_key);
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "leaf");
+        let leaf_key = KeyPair::generate().expect("generate leaf key");
+        let leaf_der = leaf_params
+            .signed_by(&leaf_key, &ca_issuer)
+            .expect("sign leaf with reconstructed CA issuer")
+            .der()
+            .to_vec();
+
+        let leaf_issuer_cn =
+            issuer_cn(&leaf_der).expect("leaf cert must have a parseable Issuer CN");
+        assert_eq!(
+            leaf_issuer_cn, "u7s-ca",
+            "leaf cert's Issuer CN must match the on-disk legacy CA Subject CN exactly, \
+             or X.509 issuer/subject name matching fails for anything signed after \
+             this restart of a pre-fix cluster"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 }
