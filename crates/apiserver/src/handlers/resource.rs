@@ -322,6 +322,9 @@ pub(crate) async fn create_resource<S: Store>(
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
+    if meta.kind == "VolumeAttributesClass" {
+        add_vac_protection_finalizer(&mut obj);
+    }
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -3159,6 +3162,31 @@ pub(crate) fn add_orphan_finalizer(obj: &mut Object) {
         }
         None => {
             obj.body["metadata"]["finalizers"] = serde_json::json!([ORPHAN_FINALIZER]);
+        }
+    }
+}
+
+/// Stamp `kubernetes.io/vac-protection` onto a VolumeAttributesClass at CREATE time,
+/// unconditionally — mirroring upstream's `StorageObjectInUseProtection` admission plugin's
+/// `admitVAC` (plugin/pkg/admission/storage/storageobjectinuseprotection/admission.go), which
+/// runs on every VAC create regardless of whether any PV/PVC references it yet. Upstream's own
+/// "should be protected by vac-protection finalizer" conformance test asserts this immediately
+/// after `Create()`, before any PVC exists that could reference the VAC.
+pub(crate) fn add_vac_protection_finalizer(obj: &mut Object) {
+    const VAC_PROTECTION_FINALIZER: &str = "kubernetes.io/vac-protection";
+    match obj.body["metadata"]["finalizers"].as_array_mut() {
+        Some(finalizers) => {
+            if !finalizers
+                .iter()
+                .any(|f| f.as_str() == Some(VAC_PROTECTION_FINALIZER))
+            {
+                finalizers.push(serde_json::Value::String(
+                    VAC_PROTECTION_FINALIZER.to_string(),
+                ));
+            }
+        }
+        None => {
+            obj.body["metadata"]["finalizers"] = serde_json::json!([VAC_PROTECTION_FINALIZER]);
         }
     }
 }
@@ -6966,6 +6994,43 @@ mod tests {
             serde_json::json!(["example.com/cleanup", "orphan"]),
             "must preserve a pre-existing, unrelated finalizer — clobbering it would let that \
              controller's own cleanup be skipped entirely once this object hard-deletes"
+        );
+    }
+
+    /// A VolumeAttributesClass with no finalizers yet must get `kubernetes.io/vac-protection`
+    /// added; a repeat call (e.g. a retried create) must not duplicate it; and a pre-existing,
+    /// unrelated finalizer must survive. Mirrors `add_orphan_finalizer`'s invariants — the
+    /// same class of bug (clobbering vs. duplicating) applies to any finalizer stamp.
+    #[test]
+    fn add_vac_protection_finalizer_appends_without_duplicating_or_clobbering() {
+        let mut obj = Object {
+            body: serde_json::json!({ "metadata": {} }),
+        };
+        add_vac_protection_finalizer(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["finalizers"],
+            serde_json::json!(["kubernetes.io/vac-protection"]),
+            "VAC referenced by a PVC must carry the vac-protection finalizer to survive \
+             delete until the referencing PVC is gone; without this, upstream volume-modify \
+             conformance tests fail (test/e2e/storage/testsuites/volume_modify.go:287)"
+        );
+
+        add_vac_protection_finalizer(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["finalizers"],
+            serde_json::json!(["kubernetes.io/vac-protection"]),
+            "must be idempotent — stamping a VAC that already has the finalizer (e.g. a \
+             retried create) must not duplicate the entry"
+        );
+
+        let mut obj = Object {
+            body: serde_json::json!({ "metadata": { "finalizers": ["example.com/cleanup"] } }),
+        };
+        add_vac_protection_finalizer(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["finalizers"],
+            serde_json::json!(["example.com/cleanup", "kubernetes.io/vac-protection"]),
+            "must preserve a pre-existing, unrelated finalizer rather than clobbering it"
         );
     }
 
@@ -11607,6 +11672,67 @@ mod tests {
         assert!(
             uuid::Uuid::parse_str(uid).is_ok(),
             "metadata.uid must be a valid UUID; got: {uid}"
+        );
+    }
+
+    /// Every VolumeAttributesClass must carry `kubernetes.io/vac-protection` in its
+    /// finalizers immediately on creation — not only once a PVC starts referencing it.
+    /// Upstream's own conformance test ("should be protected by vac-protection finalizer",
+    /// test/e2e/storage/testsuites/volume_modify.go:286-288) asserts this right after
+    /// `Create()`, before any PVC exists. Without this stamp, that test fails with
+    /// "vac-protection finalizer was not set for VolumeAttributesClass".
+    #[tokio::test]
+    async fn create_resource_stamps_vac_protection_finalizer() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let vac = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "VolumeAttributesClass",
+            "metadata": { "name": "my-vac" },
+            "driverName": "hostpath.csi.k8s.io",
+            "parameters": {}
+        });
+
+        let result = create_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "volumeattributesclasses".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+                extra: Default::default(),
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&vac).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("POST VolumeAttributesClass must succeed; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let finalizers = v["metadata"]["finalizers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            finalizers
+                .iter()
+                .any(|f| f.as_str() == Some("kubernetes.io/vac-protection")),
+            "VolumeAttributesClass must carry the vac-protection finalizer to survive delete \
+             until every referencing PVC/PV is gone; without this, upstream volume-modify \
+             conformance tests fail (test/e2e/storage/testsuites/volume_modify.go:287). got \
+             finalizers: {finalizers:?}"
         );
     }
 
