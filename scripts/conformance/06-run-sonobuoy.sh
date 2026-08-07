@@ -132,6 +132,8 @@ trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/de
 sed "s|https://127.0.0.1:${PORT}|https://host.lima.internal:${PORT}|g" "$KUBECONFIG" > "$REWRITTEN"
 limactl shell "$VM_NAME" sudo rm -f /tmp/sonobuoy-kubeconfig
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
+limactl shell "$VM_NAME" sudo rm -f /tmp/sonobuoy-plugin-e2e.yaml
+limactl copy scripts/conformance/sonobuoy-plugin-e2e.yaml "${VM_NAME}:/tmp/sonobuoy-plugin-e2e.yaml"
 
 echo "Cleaning up any previous sonobuoy run..."
 limactl shell "$VM_NAME" sudo sonobuoy delete --all --wait \
@@ -187,7 +189,7 @@ build_filter_args() {
   fi
 }
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
+SONOBUOY_BASE_ARGS="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
