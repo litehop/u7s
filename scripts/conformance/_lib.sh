@@ -17,7 +17,15 @@ check_port_free() {
   local label="$2"
   local holder=""
   if command -v lsof &>/dev/null; then
-    holder=$(lsof -n -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)
+    # lsof exits 1 (not just empty stdout) when it finds no matching
+    # process — the expected, happy-path outcome of THIS check (port is
+    # free). Under the caller's `set -euo pipefail`, an unguarded pipeline
+    # here aborts the whole script on that exit code before the `[ -n
+    # "$holder" ]` check below ever runs, so every genuinely free-port case
+    # (the common case on a fresh --reset) killed run-all.sh silently right
+    # at this line. `|| true` restores the intended semantics: only the
+    # `[ -n "$holder" ]` branch below should ever exit non-zero.
+    holder=$(lsof -n -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
   elif command -v nc &>/dev/null && nc -z 127.0.0.1 "$port" 2>/dev/null; then
     holder="unknown (lsof not installed; nc -z detected a listener)"
   fi
