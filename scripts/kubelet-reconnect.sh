@@ -7,7 +7,7 @@
 # What this does (idempotent, safe to re-run):
 #   - Copies the new kubeconfig and CA cert into the VM
 #   - Rewrites the kubelet drop-in and restarts kubelet
-#   - Re-applies the iptables DNAT rule for in-cluster API access
+#   - Ensures IPVS masquerade forwarding is enabled for in-cluster API access
 #   - Waits for the node to re-register
 #
 # Usage:
@@ -108,19 +108,10 @@ fi
 echo "Restarting kubelet..."
 limactl shell "$VM_NAME" sudo systemctl restart kubelet
 
-# Re-apply iptables DNAT: 10.96.0.1:443 → host apiserver (idempotent delete+add).
-echo "Re-applying iptables DNAT for kubernetes ClusterIP → host apiserver..."
-HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
-if [ -z "$HOST_IP" ]; then
-  echo "WARNING: could not resolve host.lima.internal — skipping DNAT rule" >&2
-else
-  limactl shell "$VM_NAME" sudo iptables -t nat -D OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
-  limactl shell "$VM_NAME" sudo iptables -t nat -A OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
-  limactl shell "$VM_NAME" sudo iptables -t nat -D PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
-  limactl shell "$VM_NAME" sudo iptables -t nat -A PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
-  limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
-fi
+# kube-proxy's IPVS virtual server covers 10.96.0.1:443 → host apiserver routing
+# (no manual DNAT needed here; see removed block in lima-start.sh, commit 42400e1c).
+# IPVS Masq forwarding still requires this sysctl.
+limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Refresh cert Secret and restart the konnectivity-agent pod so it reconnects with
 # new certs to the (re)started server.  The pod runs in kube-system with CoreDNS
