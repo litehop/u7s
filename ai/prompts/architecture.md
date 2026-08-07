@@ -13,14 +13,14 @@ u7s is a Kubernetes-compatible control plane written from scratch in Rust, targe
 ### What u7s is
 
 - A Kubernetes API-compatible server (REST + watch semantics) implemented in Rust
-- A minimal controller manager running the reconciliation loops for Deployment, ReplicaSet, and StatefulSet
-- A node agent (kubelet equivalent) that runs on data plane nodes, registers with the control plane, and drives container lifecycle via a CRI shim
+- A small u7s-native controller manager (ServiceAccount token provisioning, EndpointSlice/EndpointSliceMirroring, ClusterRole aggregation, Namespace lifecycle) that delegates everything else — Deployment, ReplicaSet, StatefulSet, and the rest of the reconcile loops — to the real upstream `kube-controller-manager` (see §3.3)
+- No node agent of its own — pods run under the real upstream kubelet (backed by CRI-O), which u7s provisions per node rather than building its own kubelet-equivalent binary (see §3.5)
 - An embedded state store (SQLite or LMDB — see §9) behind a storage abstraction layer
 - A scheduler boundary (pluggable, design TBD) that places pods on nodes
 
 ### What u7s is not
 
-- It does not bundle etcd, kube-apiserver, kube-controller-manager, kube-scheduler, or any upstream Go binaries
+- It does not bundle etcd, kube-apiserver, or kube-scheduler — those are replaced by u7s's own Rust API server and scheduler (§3.1, §3.4). It does run the real upstream `kube-controller-manager` and `kubelet` (with CRI-O) as separate processes rather than reimplementing them — see §3.3 and §3.5
 - It does not implement control plane HA (single control plane node topology only)
 - It does not implement networking — CNI plugins are user-supplied
 - It is not a general-purpose Kubernetes replacement; it targets the Argo CD GitOps compatibility milestone
@@ -97,33 +97,61 @@ The storage layer is an abstract Rust trait. SQLite and LMDB are the two candida
 
 ### 3.3 Controller Manager
 
-A single binary containing three reconciliation loops:
+Two different things run under the "controller manager" umbrella:
 
-- **Deployment controller:** Watches Deployments and owns ReplicaSets. Creates, scales, and deletes ReplicaSets to achieve the desired rollout state.
-- **ReplicaSet controller:** Watches ReplicaSets and owns Pods. Creates and deletes Pods to match `spec.replicas`.
-- **StatefulSet controller:** Watches StatefulSets and manages ordered Pod creation/deletion with stable network identities and PVC claims.
+**u7s-native** (`crates/controller-manager`, binary `u7s-controller-manager`): a handful of
+controllers u7s reimplements directly — ServiceAccount token provisioning, the EndpointSlice
+and EndpointSliceMirroring controllers, ClusterRole aggregation (needed for Argo CD's
+aggregated `admin`/`edit`/`view` roles), and Namespace lifecycle (finalizer injection and
+resource drain on delete). `crates/controller-manager/src/main.rs` is the authoritative,
+current list — it changes independently of this document.
 
-Each controller runs a reconcile loop: list+watch the owned resources via the API server, compute the delta from desired state, and issue API calls to close the gap. Reconcilers are driven by a work queue — a resource is enqueued when a watch event fires, deduplicated by key (namespace/name), and processed at most one at a time per key.
+**Real upstream `kube-controller-manager`:** everything else — Deployment, ReplicaSet,
+StatefulSet, Job, CronJob, DaemonSet, garbage collection, CSR approving/signing, disruption,
+and the rest of the ~30 controllers upstream ships. `scripts/conformance/04-start-kcm.sh`
+downloads the real binary and runs it against u7s (wrapped by
+`scripts/conformance/kcm-supervisor.sh`, a crash-restart supervisor with backoff), passing
+`--controllers='*,-...'` to enable everything except the controllers that assume a cloud
+provider or a node-lifecycle implementation u7s doesn't have (cloud-node-lifecycle,
+node-ipam, node-lifecycle, node-route, service-lb, service-cidr).
 
-No shared state between controllers except the API server. Controllers communicate exclusively through Kubernetes API objects.
+Why delegate instead of reimplementing: running the real binary gets conformance-level
+correctness — status/condition semantics, edge cases, and cross-controller interactions —
+for dozens of controllers without u7s having to rebuild each one. `roadmap.md`'s guiding
+principle states this directly: "conform, don't reinvent — this is what lets us run REAL
+upstream components (KCM, kubelet, kube-scheduler) against u7s as conformance oracles." u7s
+only reimplements a controller natively when there's a concrete reason to run it itself.
 
 ### 3.4 Scheduler
 
 A separate binary (or an in-process goroutine-equivalent) that watches for Pods with `spec.nodeName == ""` (unscheduled) and assigns them to nodes by writing `spec.nodeName`. Internal design is TBD (see §9.3). The interface boundary is: read Pods and Nodes from the API server, write `spec.nodeName` back via a `PATCH`. That is the only contract u7s imposes on the scheduler.
 
-### 3.5 Node Agent (Kubelet Equivalent)
+### 3.5 Node Runtime (Real Kubelet + CRI-O)
 
-A binary that runs on each **data plane node**. Not on the control plane node.
+u7s does not ship a node agent binary. The node runtime is the real upstream `kubelet`
+(1.36) talking CRI to real upstream CRI-O + `crun`, installed by `lima/kubelet.yaml`'s
+provisioning script and run as an ordinary systemd service inside a Lima VM (Linux is
+required for CRI-O/kubelet; the u7s API server itself runs natively on the Mac host — see
+`scripts/conformance/lima-start.sh`'s header comment for the split). `kube-proxy` is the
+same story: the real upstream binary, run as a systemd service in IPVS mode, not a u7s
+reimplementation.
 
-Responsibilities:
-- Register the node with the control plane on startup (create/update a `Node` object)
-- Watch for Pods scheduled to its node (`spec.nodeName == <self>`)
-- Drive container lifecycle via the CRI shim (see §3.6): create, start, stop, remove
-- Configure pod networking via CNI (see §3.7)
-- Periodically report node resource usage and Pod status back to the API server
-- Implement liveness and readiness probes
+u7s's job is limited to what an operator would otherwise do by hand to join a node:
+- Rewrite and inject the kubeconfig kubelet uses to reach the apiserver
+- Copy the cluster CA (converted DER→PEM) into the VM so kubelet can verify the apiserver's
+  mTLS client cert on exec/log/attach proxy connections
+- Generate and sign a kubelet serving cert against that same CA so the apiserver can in turn
+  verify kubelet's TLS on those proxied connections
+- Rewrite the CRI-O bridge CNI's pod subnet per node and program static inter-node routes
 
-See §7 for detailed design.
+All of this lives in `scripts/conformance/lima-start.sh`, not in a u7s crate — there is no
+`ContainerRuntime` trait, no CRI client, and no custom node-registration protocol to
+maintain. Node registration is the standard Kubernetes `Node` object kubelet creates on
+startup; u7s's apiserver only serves and validates it like any other resource.
+
+`scripts/conformance/06-run-sonobuoy.sh` runs the upstream conformance suite against this
+exact kubelet+CRI-O node — that run, not this document, is the evidence the arrangement is
+conformant.
 
 ### 3.6 CRI Shim / Container Runtime Interface
 
