@@ -819,6 +819,15 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
                 if let Some(v) = vm.sub_path_expr.filter(|s| !s.is_empty()) {
                     m.insert("subPathExpr".to_string(), serde_json::Value::String(v));
                 }
+                if let Some(v) = vm.mount_propagation.filter(|s| !s.is_empty()) {
+                    m.insert("mountPropagation".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = vm.recursive_read_only.filter(|s| !s.is_empty()) {
+                    m.insert(
+                        "recursiveReadOnly".to_string(),
+                        serde_json::Value::String(v),
+                    );
+                }
                 serde_json::Value::Object(m)
             })
             .collect();
@@ -4190,6 +4199,94 @@ mod tests {
             result["spec"]["schedulerName"], "my-scheduler",
             "schedulerName must survive protobuf decode — without it a pod requesting a \
              non-default scheduler is silently handled by the built-in scheduler instead"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve VolumeMount.mountPropagation (field 5).
+    ///
+    /// client-go's typed Clientset (used by e.g. the Kubernetes CSI e2e storage-test
+    /// framework to create a fresh driver StatefulSet per test) sends protobuf by default.
+    /// Dropping mountPropagation: Bidirectional on decode silently downgrades the driver's
+    /// volumeMount to None, so bind mounts the driver later performs under that tree can
+    /// never propagate into kubelet's mount namespace — kubelet then reads a stale
+    /// placeholder and EBUSYs forever trying to unmount it.
+    #[test]
+    fn generated_pod_spec_preserves_volume_mount_propagation() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("bidirectional-mount-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    volume_mounts: vec![core_v1::VolumeMount {
+                        name: Some("plugins-dir".to_string()),
+                        mount_path: Some("/var/lib/kubelet/plugins".to_string()),
+                        mount_propagation: Some("Bidirectional".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["volumeMounts"][0]["mountPropagation"], "Bidirectional",
+            "mountPropagation=Bidirectional must survive protobuf decode — without it a CSI \
+             driver's own bind mounts under the volume never propagate into kubelet's mount \
+             namespace, causing kubelet to EBUSY forever unmounting a stale placeholder"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve VolumeMount.recursiveReadOnly (field 7).
+    ///
+    /// Dropping this on decode silently reverts a container that required a recursively
+    /// read-only mount to the default (non-recursive) behavior, letting it write through
+    /// nested mounts the client explicitly asked to lock down.
+    #[test]
+    fn generated_pod_spec_preserves_volume_mount_recursive_read_only() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("recursive-ro-mount-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    volume_mounts: vec![core_v1::VolumeMount {
+                        name: Some("secret-dir".to_string()),
+                        mount_path: Some("/etc/secret".to_string()),
+                        read_only: Some(true),
+                        recursive_read_only: Some("Enabled".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["volumeMounts"][0]["recursiveReadOnly"], "Enabled",
+            "recursiveReadOnly=Enabled must survive protobuf decode — without it a container \
+             that required a recursively read-only mount silently gets a non-recursive one, \
+             leaving nested mounts writable despite the client's explicit request"
         );
     }
 
