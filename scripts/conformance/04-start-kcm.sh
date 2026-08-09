@@ -133,7 +133,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
   --service-account-private-key-file="\$WORKDIR/sa.key" \\
   --root-ca-file="\$CA_CERT" \\
-  --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
+  --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \\
   --use-service-account-credentials=false \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
