@@ -4,8 +4,9 @@
 // on every request.  This middleware validates incoming requests and passes responses
 // through unchanged.
 //
-// We do NOT re-encode JSON responses as protobuf Unknown envelopes, even when the
-// client sends Accept: protobuf.  Reason: client-go's typed proto decoders ignore the
+// We do not have a response-side re-encoder — see git log for the rationale (feature
+// reverted 2026-05-21 by commit 51d54dec after client-go decoder crash on Unknown
+// envelope).  In short: client-go's typed proto decoders ignore the
 // contentType=application/json field inside the Unknown envelope and attempt to decode
 // Unknown.raw as a native typed proto message.  When JSON bytes happen to align to
 // invalid proto wire types ("proto: illegal wireType N"), the kubelet crashes or hangs.
@@ -19,20 +20,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Request, Response};
 use tower::Layer;
 use tower_service::Service;
-
-const PROTO_CONTENT_TYPE: &str = "application/vnd.kubernetes.protobuf";
-
-/// Returns `true` if the Accept header contains `application/vnd.kubernetes.protobuf`.
-pub fn prefer_proto(headers: &HeaderMap) -> bool {
-    headers.get_all(header::ACCEPT).iter().any(|v| {
-        v.to_str()
-            .map(|s| s.contains(PROTO_CONTENT_TYPE))
-            .unwrap_or(false)
-    })
-}
 
 // ---------------------------------------------------------------------------
 // ContentTypeLayer
@@ -75,7 +65,6 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let wants_proto = prefer_proto(req.headers());
         let method = req.method().clone();
         // `uri` intentionally includes the query string: none of this apiserver's routes
         // accept bearer tokens or secrets as query parameters (auth is Authorization-header
@@ -91,41 +80,27 @@ where
             .to_string();
         let request_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
-        let is_openapi = uri.starts_with("/openapi/");
-        let is_get = method == axum::http::Method::GET;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let resp = inner.call(req).await?;
+            let mut resp = inner.call(req).await?;
 
-            // Only attempt proto re-encoding for GET requests outside /openapi/ when the
-            // client asked for protobuf. OpenAPI has its own content negotiation, and
-            // non-GET/non-proto-accept responses must pass through unchanged (see the
-            // module doc comment for why client-go's proto decoder can't be trusted here).
-            let mut resp = if wants_proto && !is_openapi && is_get {
-                reencode_proto_response(&uri, resp).await
-            } else {
-                resp
-            };
-
-            // Single access-log point for every request, regardless of which branch
-            // above was taken — keeps the field set/level consistent and avoids the
-            // previous bug where a mid-flight 500 (failed body collection) was logged
-            // with the pre-failure status code instead of the one actually returned.
+            // Single access-log point for every request — keeps the field set/level
+            // consistent and ensures the status logged is the one actually returned
+            // to the client, not an intermediate value.
             let status = resp.status().as_u16();
             let request_id_str = request_id.to_string();
 
             // Watch/streaming responses (Transfer-Encoding: chunked) must be passed
-            // through with headers completely untouched, matching the guarantee the
-            // chunked branch above already gives the body: the response's `Body` here
+            // through with headers completely untouched: the response's `Body` here
             // is a long-lived stream backed by a broadcast receiver that was subscribed
             // before this middleware ever ran, so any per-response bookkeeping added
             // here must not touch it. Mutating the header map is header-only and would
             // never touch body bytes, but every other response class on this server is
-            // fully buffered by the time it reaches here, and watch is the one case
-            // where "the response" is still an in-progress operation rather than a
-            // finished value — so it gets the same "leave it alone" treatment the
-            // is_chunked check above already applies to body re-encoding.
+            // fully buffered by its handler by the time it reaches here, and watch is
+            // the one case where "the response" is still an in-progress operation
+            // rather than a finished value — so it gets the same "leave it alone"
+            // treatment.
             let is_streaming = resp
                 .headers()
                 .get(header::TRANSFER_ENCODING)
@@ -150,67 +125,6 @@ where
             Ok(resp)
         })
     }
-}
-
-// Only re-encode successful, non-chunked, application/json GET responses (outside
-// /openapi/) when the client's Accept header prefers protobuf — see the module doc
-// comment for why every branch here ultimately falls back to returning JSON unchanged.
-async fn reencode_proto_response(uri: &str, resp: Response<Body>) -> Response<Body> {
-    // Only re-encode successful (2xx) responses.
-    if !resp.status().is_success() {
-        return resp;
-    }
-
-    // Only re-encode when the response is application/json.
-    let is_json = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.starts_with("application/json"))
-        .unwrap_or(false);
-
-    if !is_json {
-        return resp;
-    }
-
-    // Watch streams use chunked transfer encoding (streaming NDJSON).
-    // Buffering a watch stream would deadlock the response — the stream
-    // never ends while the connection is open.  Pass watch responses
-    // through unchanged; the client's Accept includes "application/json"
-    // as a fallback so returning JSON is always legal.
-    let is_chunked = resp
-        .headers()
-        .get(header::TRANSFER_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(|te| te.eq_ignore_ascii_case("chunked"))
-        .unwrap_or(false);
-    if is_chunked {
-        tracing::debug!(uri = %uri, "skip proto re-encode: chunked watch stream");
-        return resp;
-    }
-
-    // Collect the body bytes. Limit to 32 MiB — any larger response is
-    // pathological for our API surface.
-    let (parts, body) = resp.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            // Can't collect body — pass through a 500.
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .unwrap();
-        }
-    };
-
-    // Every response reaches here unchanged regardless of its `kind` — proto
-    // re-encoding was abandoned for all types (see module doc comment above:
-    // client-go's typed proto decoders don't reliably honour the
-    // contentType=application/json field inside a proto Unknown envelope, so
-    // re-encoding produces "proto: illegal wireType N" for discovery, Node,
-    // NodeList, and others). There is nothing left to inspect the body for, so
-    // it is never parsed as JSON here.
-    Response::from_parts(parts, Body::from(body_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -815,9 +729,9 @@ mod tests {
 
     /// Watch streams (Transfer-Encoding: chunked) must NOT be buffered or re-encoded as proto.
     ///
-    /// The content_type layer must detect chunked responses and pass them through.
-    /// Buffering a watch stream deadlocks the response — the stream never ends while
-    /// the connection is open, so `to_bytes` would block forever.
+    /// This middleware never buffers a response body — there is no re-encoding path left
+    /// to buffer for — so a chunked watch stream, which never ends while the connection
+    /// is open, can never be deadlocked by a `to_bytes` call here.
     ///
     /// This is the regression for the pod lifecycle smoke test failure: the kubelet's
     /// node watch (`GET /api/v1/nodes?fieldSelector=metadata.name=ci-node&watch=true`)
@@ -1152,10 +1066,8 @@ mod tests {
     /// A watch's `Body` is a long-lived stream already wired to a broadcast receiver that
     /// was subscribed before this middleware ever ran (see `SqliteStore::watch`) — by the
     /// time headers reach this layer, "the response" is an in-progress kubelet/controller
-    /// watch connection, not a finished value. Every other branch of this middleware treats
-    /// such streams as untouchable (the is_chunked check in `reencode_proto_response` skips
-    /// re-encoding for exactly this reason); the access-log header injection introduced
-    /// alongside the request_id feature must honour the same rule. If this regresses, kubelet
+    /// watch connection, not a finished value. The access-log header injection introduced
+    /// alongside the request_id feature must honour that rule. If this regresses, kubelet
     /// and controller watches pick up a header mutation on every open that pre-040855f1 never
     /// performed, which is one of the two concrete structural risks flagged by the conformance
     /// bisection that isolated the access-log commit as the sole differentiator between a
@@ -1206,40 +1118,6 @@ mod tests {
             resp.headers().get("transfer-encoding").unwrap(),
             "chunked",
             "transfer-encoding must be preserved unchanged on a watch response"
-        );
-    }
-
-    /// Regression test for mayor-g7g2m: `reencode_proto_response` must not deserialize
-    /// the response body into a `serde_json::Value` tree.
-    ///
-    /// It used to do so on every non-chunked JSON GET a protobuf-preferring client made
-    /// (i.e. essentially every kubelet request) solely to extract `kind` for a
-    /// `tracing::debug!` field — a value that never affected the returned bytes, since
-    /// the function unconditionally passes the original JSON through unchanged (proto
-    /// re-encoding was already abandoned). Measured cost: ~1.06GB / 8.25M allocation
-    /// events over one hour-long conformance run, all spent building a `Value` tree
-    /// that was thrown away after reading one field for a log line. This test scans
-    /// the function's own source for the parse call site rather than instrumenting
-    /// allocations, because the output bytes are identical whether or not the parse
-    /// runs (see other tests in this module), so a bytes-equality test alone cannot
-    /// catch a reintroduction of this dead work.
-    #[test]
-    fn reencode_response_does_not_build_a_json_value_tree() {
-        let source = include_str!("content_type.rs");
-        let fn_start = source
-            .find("async fn reencode_proto_response")
-            .expect("reencode_proto_response must still exist in this file");
-        let after_start = &source[fn_start..];
-        let fn_end = after_start
-            .find("\n}\n")
-            .expect("reencode_proto_response's closing brace must be found");
-        let fn_body = &after_start[..fn_end];
-
-        assert!(
-            !fn_body.contains("serde_json::Value") && !fn_body.contains("serde_json::from_slice"),
-            "reencode_proto_response must not parse the response body into a \
-             serde_json::Value — it always returns the body bytes unchanged, so doing \
-             so only wastes allocations (mayor-g7g2m); fn body was:\n{fn_body}"
         );
     }
 }
