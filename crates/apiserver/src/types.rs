@@ -432,6 +432,22 @@ impl std::fmt::Display for Namespace {
 // ObjectMeta — typed metadata struct
 // ---------------------------------------------------------------------------
 
+/// Typed representation of a Kubernetes `ownerReferences` entry. Read by the
+/// garbage-collector cascade-delete path to decide whether a dependent object
+/// still has a live owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerReference {
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_owner_deletion: Option<bool>,
+}
+
 /// Typed representation of Kubernetes `metadata`. Used to access metadata
 /// fields at a boundary rather than via raw string-keyed JSON indexing,
 /// which is invisible to the compiler and prone to silent typos.
@@ -473,6 +489,12 @@ pub struct ObjectMeta {
     pub labels: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(
+        rename = "ownerReferences",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_references: Option<Vec<OwnerReference>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,6 +1301,7 @@ mod object_meta_tests {
         assert!(meta.finalizers.is_none());
         assert!(meta.labels.is_none());
         assert!(meta.annotations.is_none());
+        assert!(meta.owner_references.is_none());
     }
 
     /// generateName and deletionTimestamp use Kubernetes camelCase names in the wire format.
@@ -1325,6 +1348,72 @@ mod object_meta_tests {
         assert!(json.get("finalizers").is_none());
         assert!(json.get("labels").is_none());
         assert!(json.get("annotations").is_none());
+        assert!(json.get("ownerReferences").is_none());
+    }
+
+    /// A metadata object with two ownerReferences (Job + ReplicaSet, one marked as the
+    /// controller, one carrying blockOwnerDeletion) must round-trip through ObjectMeta
+    /// byte-identically. The GC cascade-delete path only reasons about reference identity
+    /// after this round-trip; if any of the six upstream fields were silently dropped or
+    /// renamed on the way through the typed struct, a live-owner check could pass or fail
+    /// depending on which fields survived, corrupting cascade-delete decisions.
+    #[test]
+    fn object_meta_owner_references_round_trip_byte_identical() {
+        let meta = ObjectMeta {
+            owner_references: Some(vec![
+                OwnerReference {
+                    api_version: "batch/v1".to_string(),
+                    kind: "Job".to_string(),
+                    name: "my-job".to_string(),
+                    uid: "job-uid-1".to_string(),
+                    controller: Some(true),
+                    block_owner_deletion: None,
+                },
+                OwnerReference {
+                    api_version: "apps/v1".to_string(),
+                    kind: "ReplicaSet".to_string(),
+                    name: "my-rs".to_string(),
+                    uid: "rs-uid-2".to_string(),
+                    controller: None,
+                    block_owner_deletion: Some(true),
+                },
+            ]),
+            ..Default::default()
+        };
+        let first_pass = serde_json::to_vec(&serde_json::to_value(&meta).unwrap()).unwrap();
+        let restored: ObjectMeta = serde_json::from_slice(&first_pass).unwrap();
+        let second_pass = serde_json::to_vec(&serde_json::to_value(&restored).unwrap()).unwrap();
+        assert_eq!(
+            first_pass, second_pass,
+            "ownerReferences must survive a serialize/deserialize round-trip byte-for-byte — \
+             a dropped or reordered field here would corrupt the GC cascade-delete's \
+             live-owner check"
+        );
+        assert_eq!(restored.owner_references, meta.owner_references);
+    }
+
+    /// ObjectMeta must not add an `ownerReferences: null` key when the source metadata never
+    /// had one. Every object stored before this field existed lacks the key entirely; if the
+    /// round-trip through ObjectMeta introduced an explicit null, every subsequent
+    /// read-modify-write of such an object would grow an extra key, and clients that check
+    /// for key presence to detect "has owners" would start seeing false positives.
+    #[test]
+    fn object_meta_without_owner_references_wire_format_unchanged() {
+        let original = serde_json::json!({
+            "name": "my-pod",
+            "namespace": "default",
+            "uid": "abc-123"
+        });
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let meta: ObjectMeta = serde_json::from_value(original).unwrap();
+        let round_tripped_bytes =
+            serde_json::to_vec(&serde_json::to_value(&meta).unwrap()).unwrap();
+        assert_eq!(
+            round_tripped_bytes, original_bytes,
+            "ObjectMeta without ownerReferences must serialize back byte-identical; an \
+             ownerReferences:null key would silently appear on every object never touched \
+             by an owner"
+        );
     }
 }
 
