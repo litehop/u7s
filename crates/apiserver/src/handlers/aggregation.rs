@@ -36,11 +36,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use serde::Deserialize;
 use u7s_store::{ListOptions, Store};
 
 use crate::keys::group_list_prefix;
 use crate::state::AppState;
 use crate::status::Status;
+use crate::types::Condition;
 
 const APISERVICE_GROUP: &str = "apiregistration.k8s.io";
 const APISERVICE_PLURAL: &str = "apiservices";
@@ -116,23 +118,47 @@ pub async fn find_apiservice<S: Store>(
 /// this is a defense against a privileged actor harvesting *other* callers' credentials,
 /// not a low-privilege escalation.
 fn backend_base_url(apiservice: &serde_json::Value) -> Result<Option<String>, String> {
-    let Some(svc) = apiservice.get("spec").and_then(|s| s.get("service")) else {
+    let spec: ApiServiceSpec = apiservice
+        .get("spec")
+        .and_then(|s| serde_json::from_value(s.clone()).ok())
+        .unwrap_or_default();
+    let Some(svc) = spec.service else {
         return Ok(None);
     };
-    if svc.is_null() {
-        return Ok(None);
-    }
-    let Some(name) = svc.get("name").and_then(|v| v.as_str()) else {
+    let Some(name) = svc.name else {
         return Ok(None);
     };
-    let Some(namespace) = svc.get("namespace").and_then(|v| v.as_str()) else {
+    let Some(namespace) = svc.namespace else {
         return Ok(None);
     };
-    crate::handlers::generic::validate_name("spec.service.name", name).map_err(|e| e.1.message)?;
-    crate::handlers::generic::validate_name("spec.service.namespace", namespace)
+    crate::handlers::generic::validate_name("spec.service.name", &name).map_err(|e| e.1.message)?;
+    crate::handlers::generic::validate_name("spec.service.namespace", &namespace)
         .map_err(|e| e.1.message)?;
-    let port = svc.get("port").and_then(|p| p.as_i64()).unwrap_or(443);
+    let port = svc.port.unwrap_or(443);
     Ok(Some(format!("https://{name}.{namespace}.svc:{port}")))
+}
+
+/// The subset of upstream `APIServiceSpec` that `backend_base_url` reads: just
+/// `spec.service`. `spec.caBundle`/`spec.insecureSkipTLSVerify` are read
+/// elsewhere (`build_backend_client`) and `spec.group`/`spec.version` elsewhere
+/// still (`health_check_backend`, `discovery_resources_for_apiservice`) — left
+/// as `Value` there since neither is this function's concern.
+#[derive(Debug, Default, Deserialize)]
+struct ApiServiceSpec {
+    #[serde(default)]
+    service: Option<ApiServiceServiceRef>,
+}
+
+/// Upstream `ServiceReference` (`k8s.io/kube-aggregator/pkg/apis/apiregistration/v1`):
+/// `namespace`, `name`, and `port` (`int32`, defaulting to 443 when absent).
+#[derive(Debug, Deserialize)]
+struct ApiServiceServiceRef {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    port: Option<i32>,
 }
 
 /// Build a `reqwest::Client` trusting `spec.caBundle` (or accepting any certificate when
@@ -615,39 +641,41 @@ fn upsert_available_condition(
     message: &str,
     now: &str,
 ) -> bool {
-    if !apiservice["status"].is_object() {
-        apiservice["status"] = serde_json::json!({});
-    }
-    if !apiservice["status"]["conditions"].is_array() {
-        apiservice["status"]["conditions"] = serde_json::json!([]);
-    }
-    let conditions = apiservice["status"]["conditions"]
-        .as_array_mut()
-        .expect("just ensured this is an array");
+    let existing_conditions = apiservice
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(Vec::new()));
+    let mut conditions: Vec<Condition> =
+        serde_json::from_value(existing_conditions).unwrap_or_default();
 
-    if let Some(existing) = conditions.iter_mut().find(|c| c["type"] == "Available") {
-        let status_changed = existing["status"] != status_str;
-        if !status_changed && existing["message"] == message {
+    if let Some(existing) = conditions.iter_mut().find(|c| c.type_ == "Available") {
+        let status_changed = existing.status != status_str;
+        if !status_changed && existing.message.as_deref() == Some(message) {
             return false;
         }
-        existing["status"] = serde_json::json!(status_str);
-        existing["reason"] = serde_json::json!(reason);
-        existing["message"] = serde_json::json!(message);
+        existing.status = status_str.to_owned();
+        existing.reason = Some(reason.to_owned());
+        existing.message = Some(message.to_owned());
         if status_changed {
-            existing["lastTransitionTime"] = serde_json::json!(now);
+            existing.last_transition_time = Some(now.to_owned());
         }
     } else {
         conditions.insert(
             0,
-            serde_json::json!({
-                "type": "Available",
-                "status": status_str,
-                "reason": reason,
-                "message": message,
-                "lastTransitionTime": now,
-            }),
+            Condition {
+                type_: "Available".to_owned(),
+                status: status_str.to_owned(),
+                reason: Some(reason.to_owned()),
+                message: Some(message.to_owned()),
+                last_transition_time: Some(now.to_owned()),
+                observed_generation: None,
+            },
         );
     }
+
+    apiservice["status"]["conditions"] =
+        serde_json::to_value(&conditions).expect("Condition has no non-serializable fields");
     true
 }
 
@@ -806,6 +834,25 @@ mod tests {
             "spec": { "service": { "namespace": "..", "name": "svc", "port": 443 } }
         });
         assert!(backend_base_url(&apiservice).is_err());
+    }
+
+    /// Round-trip regression for the `ApiServiceSpec`/`ApiServiceServiceRef` typed views: each
+    /// of `name`/`namespace`/`port` must land in the SAME position of the resulting URL it came
+    /// from in `spec.service`. This is the exact backend-routing decision every proxied request
+    /// depends on — if the typed struct's field ever silently swaps or drops one of these (e.g.
+    /// a field renamed without updating its wire name), a proxied request would be routed to
+    /// the wrong Service (or none at all) instead of failing loudly, which in a real aggregated
+    /// deployment risks sending a caller's request/credentials to an unintended backend.
+    #[test]
+    fn backend_base_url_round_trips_service_reference_fields() {
+        let apiservice = serde_json::json!({
+            "spec": { "service": { "name": "wardle-api", "namespace": "wardle-ns", "port": 8443 } }
+        });
+        assert_eq!(
+            backend_base_url(&apiservice),
+            Ok(Some("https://wardle-api.wardle-ns.svc:8443".to_string())),
+            "name/namespace/port must decode into the identical positions in the backend URL"
+        );
     }
 
     // ---- discovery_request_headers ---------------------------------------------------
@@ -1299,6 +1346,40 @@ mod tests {
             conditions[1]["type"], "StatusUpdated",
             "unrelated condition must survive untouched"
         );
+    }
+
+    /// A status FLIP (False -> True) on an already-present `Available` condition must UPDATE
+    /// that entry in place, not append a second one. `check_and_persist_availability` persists
+    /// whatever this function leaves in `status.conditions` as the WHOLE APIService document
+    /// (see its `state.store.put`) — the same document `list_apiservice_groups` later reads to
+    /// compute `has_apiservice`, the signal `discovery.rs`'s cache-safety invariant depends on.
+    /// An always-append bug would grow that document's `conditions` unbounded with duplicate,
+    /// conflicting `Available` entries, and a caller polling `status.conditions[0]` (as the
+    /// aggregator conformance test does) could observe a stale `False` entry even after the
+    /// backend has come up.
+    #[test]
+    fn upsert_available_condition_replaces_not_appends_on_status_flip() {
+        let mut apiservice = serde_json::json!({
+            "status": { "conditions": [
+                { "type": "Available", "status": "False", "reason": "FailedDiscoveryCheck", "message": "not yet", "lastTransitionTime": "2024-01-01T00:00:00Z" }
+            ] }
+        });
+        let changed = upsert_available_condition(
+            &mut apiservice,
+            "True",
+            "Passed",
+            "all checks passed",
+            "2024-01-02T00:00:00Z",
+        );
+        assert!(changed, "a status flip must be reported as a change");
+        let conditions = apiservice["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            conditions.len(),
+            1,
+            "must have exactly one Available condition after the flip, not one per sweep call"
+        );
+        assert_eq!(conditions[0]["status"], "True");
+        assert_eq!(conditions[0]["lastTransitionTime"], "2024-01-02T00:00:00Z");
     }
 
     // ---- proxy_middleware (integration, via a real Router) ---------------------------
