@@ -557,11 +557,11 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     // KCM writes spec.finalizers; fall back to metadata.finalizers.
-    let new_finalizers =
+    let new_finalizers: Option<Vec<String>> =
         if !req["spec"]["finalizers"].is_null() && req["spec"].get("finalizers").is_some() {
-            req["spec"]["finalizers"].clone()
+            serde_json::from_value(req["spec"]["finalizers"].clone()).unwrap_or_default()
         } else {
-            req["metadata"]["finalizers"].clone()
+            serde_json::from_value(req["metadata"]["finalizers"].clone()).unwrap_or_default()
         };
 
     // Fetch the current namespace from the store.
@@ -577,11 +577,11 @@ pub(crate) async fn finalize_namespace<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     // Namespace finalizers live in spec.finalizers (not metadata.finalizers).
-    // Ensure spec exists before writing.
-    if current.body.get("spec").is_none() || current.body["spec"].is_null() {
-        current.body["spec"] = serde_json::json!({});
-    }
-    current.body["spec"]["finalizers"] = new_finalizers;
+    let mut spec: NamespaceSpec =
+        serde_json::from_value(current.body["spec"].clone()).unwrap_or_default();
+    spec.finalizers = new_finalizers;
+    current.body["spec"] = serde_json::to_value(&spec)
+        .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
 
     // Check: if deletionTimestamp is set and spec.finalizers are now empty → hard-delete.
     let current_meta: ObjectMeta =
@@ -666,7 +666,10 @@ pub(crate) async fn put_namespace_status<S: Store>(
             current.body.as_object_mut().map(|m| m.remove("status"));
         }
         v => {
-            current.body["status"] = v.clone();
+            let status: NamespaceStatus = serde_json::from_value(v.clone()).unwrap_or_default();
+            current.body["status"] = serde_json::to_value(&status).map_err(|e| {
+                Status::internal(format!("failed to serialize NamespaceStatus: {e}"))
+            })?;
         }
     }
 
@@ -3200,6 +3203,90 @@ mod tests {
         );
     }
 
+    // The finalizers subresource PUT writes spec.finalizers through NamespaceSpec and then
+    // immediately re-parses the same field into NamespaceSpec again to decide whether to
+    // hard-delete. Nothing used to force those two steps to agree on shape — a raw Value write
+    // sandwiched between two typed round-trips could drift from what the response (and the
+    // store's own copy) shows. If the write and the read ever disagreed, a client acting on the
+    // response (e.g. KCM deciding a finalizer removal took effect) and the store's actual state
+    // would desync, and the namespace could get stuck Terminating forever.
+    #[tokio::test]
+    async fn finalize_namespace_response_and_persisted_spec_never_diverge() {
+        use axum::response::IntoResponse;
+        use u7s_store::Store;
+        let state = make_state();
+
+        let key = crate::keys::cluster_object_key("namespaces", "divergence-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "divergence-ns",
+                "uid": "00000000-0000-0000-0000-000000000005",
+                "resourceVersion": "1"
+            },
+            "spec": { "finalizers": ["kubernetes", "custom.io/finalizer"] }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
+            .await
+            .expect("direct store write must succeed");
+
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "divergence-ns" },
+                "spec": { "finalizers": ["kubernetes"] }
+            })
+            .to_string(),
+        );
+
+        let resp = finalize_namespace(
+            State(state.clone()),
+            Path("divergence-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            finalize_body,
+        )
+        .await
+        .expect("finalize must succeed")
+        .into_response();
+
+        let response_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let response_body: serde_json::Value =
+            serde_json::from_slice(&response_bytes).expect("response body must be valid JSON");
+        let response_spec: NamespaceSpec =
+            serde_json::from_value(response_body["spec"].clone()).unwrap_or_default();
+
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still exist — one finalizer remains, no hard-delete yet");
+        let stored_body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
+        let stored_spec: NamespaceSpec =
+            serde_json::from_value(stored_body["spec"].clone()).unwrap_or_default();
+
+        assert_eq!(
+            response_spec.finalizers.as_deref(),
+            Some(["kubernetes".to_string()].as_slice()),
+            "the finalize response must reflect exactly the requested finalizer set, not \
+             whatever the raw pre-typed write happened to leave in place"
+        );
+        assert_eq!(
+            response_spec.finalizers, stored_spec.finalizers,
+            "the response returned from PUT /finalize and the store's persisted copy must \
+             never disagree about spec.finalizers — divergence here is exactly the class of \
+             bug that leaves a namespace stuck Terminating forever because callers and the \
+             store disagree on whether a finalizer was actually removed"
+        );
+    }
+
     // PUT /finalize with a stale resourceVersion must return 409 Conflict.
     // /finalize is a replace subresource: KCM's namespace controller reads the namespace,
     // removes a finalizer, and PUTs it back. If a concurrent write landed in between, the
@@ -3482,6 +3569,111 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-put-ns",
             "metadata must be unchanged after PUT /status"
+        );
+    }
+
+    // put_namespace_status routes the incoming status through NamespaceStatus instead of
+    // copying the raw Value. That only pays off if NamespaceStatus's flattened `rest` field
+    // actually preserves every status field the raw copy used to preserve verbatim — not just
+    // `phase`, which is the only field the struct names explicitly. Dropping any other field
+    // (e.g. a second condition) would silently erase drain-progress signals
+    // OrderedNamespaceDeletion polls for, hiding a real content-deletion failure.
+    #[tokio::test]
+    async fn put_namespace_status_typed_round_trip_preserves_all_status_fields() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-fields-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored_before = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-fields-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&stored_before.value).unwrap();
+        let rv = before["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1");
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "status-fields-ns", "resourceVersion": rv },
+                "status": {
+                    "phase": "Terminating",
+                    "conditions": [
+                        {
+                            "type": "NamespaceDeletionContentFailure",
+                            "status": "True",
+                            "reason": "ContentDeletionFailed",
+                            "message": "test-pod has a finalizer"
+                        },
+                        {
+                            "type": "NamespaceDeletionDiscoveryFailure",
+                            "status": "False",
+                            "reason": "ResourcesDiscovered",
+                            "message": "discovery succeeded"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            put_namespace_status(
+                State(state.clone()),
+                Path("status-fields-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "put_namespace_status must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-fields-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            body["status"]["phase"], "Terminating",
+            "typed status round-trip must still update phase"
+        );
+        let conditions = body["status"]["conditions"]
+            .as_array()
+            .expect("conditions must survive the typed NamespaceStatus round-trip");
+        assert_eq!(
+            conditions.len(),
+            2,
+            "both conditions must survive the typed round-trip via NamespaceStatus.rest — \
+             dropping either would hide a drain-progress signal OrderedNamespaceDeletion polls \
+             for, making a real content-deletion failure invisible to KCM"
+        );
+        assert_eq!(
+            conditions[1]["type"], "NamespaceDeletionDiscoveryFailure",
+            "condition fields beyond phase must round-trip unmodified through NamespaceStatus"
         );
     }
 
