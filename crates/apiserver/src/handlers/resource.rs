@@ -1699,20 +1699,11 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             None
         };
 
-    // Save ownerReferences before the ObjectMeta round-trip: ObjectMeta serde only
-    // knows the fields declared in the struct, so any field not in it (including
-    // ownerReferences) is silently dropped during from_value/to_value.  We restore
-    // the saved value immediately after so KCM-created Jobs (and any other object
-    // whose ownerReferences arrive via protobuf) survive the round-trip intact.
-    let saved_owner_refs = obj.body["metadata"]["ownerReferences"].clone();
     let mut ns_meta: ObjectMeta =
         serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     ns_meta.namespace = Some(ns.clone());
     obj.body["metadata"] =
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
-    if !saved_owner_refs.is_null() {
-        obj.body["metadata"]["ownerReferences"] = saved_owner_refs;
-    }
     stamp_metadata(&mut obj);
 
     // Auto-allocate clusterIP for Services that don't specify one.
