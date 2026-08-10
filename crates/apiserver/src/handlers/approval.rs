@@ -420,6 +420,80 @@ mod tests {
         );
     }
 
+    /// PUT /approval must persist every typed `CsrCondition` field exactly as
+    /// sent, and must persist them via the typed `CertificateSigningRequestStatus`/
+    /// `CsrCondition` structs, not by re-serializing an untouched raw `Value`.
+    ///
+    /// WHY this matters: approval is a security-relevant decision record — `reason`
+    /// and `lastUpdateTime` are the audit trail of who approved a CSR and when. If
+    /// the typed struct silently dropped a field (e.g. a future refactor removes
+    /// `reason` from `CsrCondition`), the condition would still "look" stored (the
+    /// `type`/`status` checks in other tests would still pass) while quietly losing
+    /// the audit fields regulators and cluster admins rely on to review approvals.
+    #[tokio::test]
+    async fn put_approval_persists_every_typed_condition_field() {
+        let state = make_state();
+        let name = "full-fields-csr";
+        seed_csr(&state.store, name, None).await;
+
+        let put_body = json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name, "resourceVersion": "1"},
+            "spec": {
+                "request": "dGVzdA==",
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            },
+            "status": {
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "AutoApproved",
+                    "message": "approved by node-csr-approver",
+                    "lastUpdateTime": "2024-01-01T00:00:00Z"
+                }]
+            }
+        });
+
+        let result = put_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /approval must succeed");
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let cond = &v["status"]["conditions"][0];
+
+        assert_eq!(cond["type"], "Approved", "condition type must be preserved");
+        assert_eq!(cond["status"], "True", "condition status must be preserved");
+        assert_eq!(
+            cond["reason"], "AutoApproved",
+            "condition reason must be preserved — it's the audit record of why a CSR was approved"
+        );
+        assert_eq!(
+            cond["message"], "approved by node-csr-approver",
+            "condition message must be preserved — it's part of the same audit record"
+        );
+        assert_eq!(
+            cond["lastUpdateTime"], "2024-01-01T00:00:00Z",
+            "condition lastUpdateTime must be preserved — it's the audit record of when a CSR was approved"
+        );
+
+        // Same security invariant as put_approval_approved_stores_conditions_not_certificate,
+        // asserted again here so a fields-only regression can't accidentally also start
+        // writing the certificate.
+        assert!(
+            v["status"]["certificate"].is_null() || v["status"].get("certificate").is_none(),
+            "/approval must never write status.certificate, regardless of which condition \
+             fields are sent — only the signer may issue a certificate"
+        );
+    }
+
     /// PUT /approval with stale resourceVersion → 409 Conflict.
     ///
     /// OCC prevents two approvers from overwriting each other's decisions.
