@@ -448,6 +448,28 @@ pub struct OwnerReference {
     pub block_owner_deletion: Option<bool>,
 }
 
+/// Typed representation of a Kubernetes `managedFields` entry (server-side apply's
+/// per-manager field ownership record). Modeled so a full `ObjectMeta` round-trip
+/// (e.g. serve-from-store, watch-event encode) does not silently drop it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFieldsEntry {
+    pub manager: String,
+    pub operation: String,
+    pub api_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields_type: Option<String>,
+    /// The SSA field-set (`FieldsV1.raw` upstream) is `map[string]interface{}` in
+    /// Go — a structurally arbitrary tree with no fixed schema, so it stays raw
+    /// JSON rather than a typed struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields_v1: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subresource: Option<String>,
+}
+
 /// Typed representation of Kubernetes `metadata`. Used to access metadata
 /// fields at a boundary rather than via raw string-keyed JSON indexing,
 /// which is invisible to the compiler and prone to silent typos.
@@ -495,6 +517,12 @@ pub struct ObjectMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub owner_references: Option<Vec<OwnerReference>>,
+    #[serde(
+        rename = "managedFields",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,6 +1330,7 @@ mod object_meta_tests {
         assert!(meta.labels.is_none());
         assert!(meta.annotations.is_none());
         assert!(meta.owner_references.is_none());
+        assert!(meta.managed_fields.is_none());
     }
 
     /// generateName and deletionTimestamp use Kubernetes camelCase names in the wire format.
@@ -1349,6 +1378,7 @@ mod object_meta_tests {
         assert!(json.get("labels").is_none());
         assert!(json.get("annotations").is_none());
         assert!(json.get("ownerReferences").is_none());
+        assert!(json.get("managedFields").is_none());
     }
 
     /// A metadata object with two ownerReferences (Job + ReplicaSet, one marked as the
@@ -1413,6 +1443,73 @@ mod object_meta_tests {
             "ObjectMeta without ownerReferences must serialize back byte-identical; an \
              ownerReferences:null key would silently appear on every object never touched \
              by an owner"
+        );
+    }
+
+    /// A metadata object with two managedFields entries (one fully populated server-side-apply
+    /// record with a fieldsV1 tree, one minimal update record with only the required manager/
+    /// operation) must round-trip through ObjectMeta byte-identically. mayor-7p767 depends on
+    /// this: tightening watch/PartialObjectMetadata handling to a full ObjectMeta round-trip is
+    /// only safe once managedFields survives it — before this field existed, any object with
+    /// server-side-apply history would silently lose its field-ownership record on that path.
+    #[test]
+    fn object_meta_managed_fields_round_trip_byte_identical() {
+        let meta = ObjectMeta {
+            managed_fields: Some(vec![
+                ManagedFieldsEntry {
+                    manager: "kubectl".to_string(),
+                    operation: "Apply".to_string(),
+                    api_version: "v1".to_string(),
+                    time: Some("2024-06-01T12:00:00Z".to_string()),
+                    fields_type: Some("FieldsV1".to_string()),
+                    fields_v1: Some(serde_json::json!({"f:metadata": {"f:labels": {}}})),
+                    subresource: Some("status".to_string()),
+                },
+                ManagedFieldsEntry {
+                    manager: "kube-controller-manager".to_string(),
+                    operation: "Update".to_string(),
+                    api_version: "v1".to_string(),
+                    time: None,
+                    fields_type: None,
+                    fields_v1: None,
+                    subresource: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        let first_pass = serde_json::to_vec(&serde_json::to_value(&meta).unwrap()).unwrap();
+        let restored: ObjectMeta = serde_json::from_slice(&first_pass).unwrap();
+        let second_pass = serde_json::to_vec(&serde_json::to_value(&restored).unwrap()).unwrap();
+        assert_eq!(
+            first_pass, second_pass,
+            "managedFields must survive a serialize/deserialize round-trip byte-for-byte — a \
+             dropped or reordered field here would corrupt server-side-apply's field-ownership \
+             record for every subsequent apply"
+        );
+        assert_eq!(restored.managed_fields, meta.managed_fields);
+    }
+
+    /// ObjectMeta must not add a `managedFields: null` key when the source metadata never had
+    /// one. Every object never touched by server-side apply lacks the key entirely; if the
+    /// round-trip through ObjectMeta introduced an explicit null, clients that check for key
+    /// presence to detect "has been server-side-applied" would start seeing false positives,
+    /// and every such read-modify-write would grow an extra key.
+    #[test]
+    fn object_meta_without_managed_fields_wire_format_unchanged() {
+        let original = serde_json::json!({
+            "name": "my-pod",
+            "namespace": "default",
+            "uid": "abc-123"
+        });
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let meta: ObjectMeta = serde_json::from_value(original).unwrap();
+        let round_tripped_bytes =
+            serde_json::to_vec(&serde_json::to_value(&meta).unwrap()).unwrap();
+        assert_eq!(
+            round_tripped_bytes, original_bytes,
+            "ObjectMeta without managedFields must serialize back byte-identical; a \
+             managedFields:null key would silently appear on every object never touched by \
+             server-side apply"
         );
     }
 }
