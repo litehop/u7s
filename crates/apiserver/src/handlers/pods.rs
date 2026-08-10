@@ -2449,6 +2449,26 @@ fn accepts_patch_content_type(ct: &str) -> bool {
         || ct.contains("application/merge-patch+json")
 }
 
+/// The two fields needed to enforce the hostNetwork/podIP status invariant below: a pod
+/// sharing the host's network namespace must report the node IP as its pod IP, not the
+/// pod-CIDR address the CNI sandbox actually assigned. Borrowed straight out of the pod
+/// `Value` rather than cloned. This invariant is narrow and stable enough to type;
+/// the generic per-kind status merge in `apply_status_patch` above it is not, since it
+/// must round-trip arbitrary future status fields untouched.
+struct HostNetworkPodIp<'a> {
+    host_network: bool,
+    host_ip: Option<&'a str>,
+}
+
+impl<'a> HostNetworkPodIp<'a> {
+    fn read(pod: &'a serde_json::Value) -> Self {
+        Self {
+            host_network: pod["spec"]["hostNetwork"].as_bool().unwrap_or(false),
+            host_ip: pod["status"]["hostIP"].as_str().filter(|s| !s.is_empty()),
+        }
+    }
+}
+
 /// Apply the `.status` and `.metadata` portions of `patch` to `stored`, returning the full
 /// updated pod. `.spec` in the patch body is ignored — the status subresource cannot modify spec.
 /// This is the Kubernetes API contract for status subresources.
@@ -2543,15 +2563,15 @@ pub(crate) fn apply_status_patch(
     // still a pod-CIDR address because the sandbox creation path doesn't special-
     // case hostNetwork.  Override podIP/podIPs here so the downward API exposes
     // the correct value (HOST_IP == POD_IP for hostNetwork pods).
-    if result["spec"]["hostNetwork"] == serde_json::json!(true) {
-        let host_ip = result["status"]["hostIP"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        if let Some(host_ip) = host_ip {
-            result["status"]["podIP"] = serde_json::json!(host_ip);
-            result["status"]["podIPs"] = serde_json::json!([{"ip": host_ip}]);
-        }
+    let host_net = HostNetworkPodIp::read(&result);
+    let podip_override = if host_net.host_network {
+        host_net.host_ip.map(str::to_owned)
+    } else {
+        None
+    };
+    if let Some(host_ip) = podip_override {
+        result["status"]["podIP"] = serde_json::json!(host_ip);
+        result["status"]["podIPs"] = serde_json::json!([{"ip": host_ip}]);
     }
 
     result
