@@ -207,13 +207,16 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 status_json["completionTime"] = crate::util::secs_to_rfc3339(secs).into();
             }
         }
-        if let Some(v) = status.active.filter(|&n| n != 0) {
+        // active/succeeded/failed/ready/terminating are upstream *int32 (proto3
+        // optional); Some(0) is a legitimate value (e.g. 0 pods currently ready)
+        // distinct from absent, so these must always be emitted when Some(_).
+        if let Some(v) = status.active {
             status_json["active"] = v.into();
         }
-        if let Some(v) = status.succeeded.filter(|&n| n != 0) {
+        if let Some(v) = status.succeeded {
             status_json["succeeded"] = v.into();
         }
-        if let Some(v) = status.failed.filter(|&n| n != 0) {
+        if let Some(v) = status.failed {
             status_json["failed"] = v.into();
         }
         if let Some(v) = status.completed_indexes.filter(|s| !s.is_empty()) {
@@ -247,13 +250,13 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             // round-trips as absent (job_controller.go:1568).
             status_json["uncountedTerminatedPods"] = serde_json::Value::Object(utp_map);
         }
-        if let Some(v) = status.ready.filter(|&n| n != 0) {
+        if let Some(v) = status.ready {
             status_json["ready"] = v.into();
         }
         if let Some(v) = status.failed_indexes.filter(|s| !s.is_empty()) {
             status_json["failedIndexes"] = v.into();
         }
-        if let Some(v) = status.terminating.filter(|&n| n != 0) {
+        if let Some(v) = status.terminating {
             status_json["terminating"] = v.into();
         }
         if status_json
@@ -830,6 +833,133 @@ mod tests {
             "status.uncountedTerminatedPods must decode as PRESENT (empty object) when the proto \
              field is Some(default), NOT be dropped — upstream KCM Job controller nil-derefs on \
              absent field (job_controller.go:1568)"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.ready when PRESENT BUT ZERO.
+    ///
+    /// Upstream JobStatus.Ready is *int32 (proto3 optional); Some(0) is a legitimate value
+    /// (0 pods currently ready) distinct from absent. Dropping it breaks successPolicy
+    /// conformance tests that assert `Expected nil to equal 0` (job.go:597).
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_status_ready() {
+        let job = batch_v1::Job {
+            status: Some(batch_v1::JobStatus {
+                ready: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["status"]["ready"], 0,
+            "status.ready must decode as PRESENT with value 0 when the proto field is Some(0), \
+             NOT be dropped — upstream KCM Job controller expects *int32 semantics; a nil (absent) \
+             field breaks successPolicy tests that assert `Expected nil to equal 0` at \
+             k8s.io/kubernetes/test/e2e/apps/job.go:597"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.active when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as status.ready: Some(0) (no pods currently active) must
+    /// not be collapsed into absent.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_status_active() {
+        let job = batch_v1::Job {
+            status: Some(batch_v1::JobStatus {
+                active: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["status"]["active"], 0,
+            "status.active must decode as PRESENT with value 0 when the proto field is Some(0), \
+             NOT be dropped — upstream KCM Job controller expects *int32 semantics; a nil (absent) \
+             field breaks successPolicy tests that assert `Expected nil to equal 0` at \
+             k8s.io/kubernetes/test/e2e/apps/job.go:597"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.succeeded when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as status.ready: Some(0) (no pods succeeded yet) must not
+    /// be collapsed into absent.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_status_succeeded() {
+        let job = batch_v1::Job {
+            status: Some(batch_v1::JobStatus {
+                succeeded: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["status"]["succeeded"], 0,
+            "status.succeeded must decode as PRESENT with value 0 when the proto field is \
+             Some(0), NOT be dropped — upstream KCM Job controller expects *int32 semantics; a \
+             nil (absent) field breaks successPolicy tests that assert `Expected nil to equal 0` \
+             at k8s.io/kubernetes/test/e2e/apps/job.go:597"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.failed when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as status.ready: Some(0) (no pods failed yet) must not be
+    /// collapsed into absent.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_status_failed() {
+        let job = batch_v1::Job {
+            status: Some(batch_v1::JobStatus {
+                failed: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["status"]["failed"], 0,
+            "status.failed must decode as PRESENT with value 0 when the proto field is Some(0), \
+             NOT be dropped — upstream KCM Job controller expects *int32 semantics; a nil (absent) \
+             field breaks successPolicy tests that assert `Expected nil to equal 0` at \
+             k8s.io/kubernetes/test/e2e/apps/job.go:597"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.terminating when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as status.ready: Some(0) (0 pods currently terminating)
+    /// must not be collapsed into absent. This is the exact field the failing successPolicy
+    /// conformance tests assert on alongside status.ready.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_status_terminating() {
+        let job = batch_v1::Job {
+            status: Some(batch_v1::JobStatus {
+                terminating: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["status"]["terminating"], 0,
+            "status.terminating must decode as PRESENT with value 0 when the proto field is \
+             Some(0), NOT be dropped — upstream KCM Job controller expects *int32 semantics; a \
+             nil (absent) field breaks successPolicy tests that assert `Expected nil to equal 0` \
+             at k8s.io/kubernetes/test/e2e/apps/job.go:597"
         );
     }
 
