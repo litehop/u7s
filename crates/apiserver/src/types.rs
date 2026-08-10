@@ -1156,6 +1156,35 @@ pub struct HpaScalingRules {
     pub rest: Value,
 }
 
+/// Upstream `metav1.Condition` — the {type, status, reason, message,
+/// lastTransitionTime, observedGeneration} shape upstream reuses byte-for-byte
+/// across many resources (APIService availability, and future condition-bearing
+/// kinds). Hand-rolled once here so each such consumer shares one struct instead
+/// of each reimplementing a near-identical one. CSR approval keeps its own
+/// `CsrCondition` rather than this type because its wire shape genuinely
+/// diverges: `lastUpdateTime` in addition to `lastTransitionTime`, and no
+/// `observedGeneration`.
+///
+/// Not yet constructed anywhere in this crate — the next resource that reports
+/// availability via a standard condition will use it directly, at which point
+/// this allow can be dropped.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
@@ -2240,6 +2269,66 @@ mod csr_types_tests {
         assert!(
             v.get("conditionType").is_none(),
             "'conditionType' must not appear — only 'type' is understood by kubectl"
+        );
+    }
+}
+
+#[cfg(test)]
+mod condition_tests {
+    use super::*;
+
+    /// `Condition` must round-trip all six upstream `metav1.Condition` fields
+    /// byte-identically. Every future consumer (e.g. APIService availability)
+    /// relies on this shape being wire-exact; a dropped or misnamed field here
+    /// would silently corrupt condition reporting for every resource that reuses
+    /// this struct, not just one call site.
+    #[test]
+    fn condition_round_trips_all_fields_byte_identical() {
+        let original = serde_json::json!({
+            "type": "Available",
+            "status": "True",
+            "reason": "AllBackendsReachable",
+            "message": "all backends healthy",
+            "lastTransitionTime": "2024-01-01T00:00:00Z",
+            "observedGeneration": 3
+        });
+
+        let cond: Condition = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(cond.type_, "Available");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("AllBackendsReachable"));
+        assert_eq!(cond.message.as_deref(), Some("all backends healthy"));
+        assert_eq!(
+            cond.last_transition_time.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(cond.observed_generation, Some(3));
+
+        let round_tripped = serde_json::to_value(&cond).unwrap();
+        assert_eq!(
+            round_tripped, original,
+            "Condition must serialize back byte-identical to the wire form it was \
+             parsed from — e.g. dropping #[serde(rename_all = \"camelCase\")] would emit \
+             `last_transition_time`/`observed_generation` instead of the camelCase wire \
+             names every client (kubectl, controllers) actually reads"
+        );
+    }
+
+    /// `Condition` fields absent on the wire must round-trip as absent, not as
+    /// explicit nulls — controllers that check for key presence (e.g. "has this
+    /// resource ever reported a reason") must not see false positives.
+    #[test]
+    fn condition_without_optional_fields_wire_format_unchanged() {
+        let original = serde_json::json!({
+            "type": "Available",
+            "status": "Unknown"
+        });
+        let cond: Condition = serde_json::from_value(original.clone()).unwrap();
+        let round_tripped = serde_json::to_value(&cond).unwrap();
+        assert_eq!(
+            round_tripped, original,
+            "Condition without reason/message/lastTransitionTime/observedGeneration \
+             must not grow explicit null keys on round-trip"
         );
     }
 }
