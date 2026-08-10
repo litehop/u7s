@@ -1,3 +1,6 @@
+use crate::types::ObjectMeta;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn wants_table(accept: &str) -> bool {
@@ -98,50 +101,88 @@ fn build_pod_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PodStatusView {
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    container_statuses: Option<Vec<ContainerStatusView>>,
+    #[serde(rename = "podIP", default)]
+    pod_ip: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ContainerStatusView {
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    restart_count: i64,
+    #[serde(default)]
+    state: Option<ContainerStateView>,
+}
+
+#[derive(Deserialize, Default)]
+struct ContainerStateView {
+    #[serde(default)]
+    waiting: Option<ContainerStateReasonView>,
+    #[serde(default)]
+    terminated: Option<ContainerStateReasonView>,
+}
+
+#[derive(Deserialize, Default)]
+struct ContainerStateReasonView {
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PodSpecView {
+    /// Only the count matters here (fallback total when containerStatuses is absent);
+    /// per-container fields are never read, so shape beyond array length is ignored.
+    #[serde(default)]
+    containers: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    node_name: Option<String>,
+}
+
 fn pod_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let creation_ts = obj["metadata"]["creationTimestamp"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let age = age_string(&creation_ts);
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let phase = obj["status"]["phase"].as_str().unwrap_or("Unknown");
+    let status: PodStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let spec: PodSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
 
-    let container_statuses = obj["status"]["containerStatuses"].as_array();
-    let spec_containers = obj["spec"]["containers"].as_array();
+    let phase = status.phase.as_deref().unwrap_or("Unknown");
 
-    let total = container_statuses
+    let total = status
+        .container_statuses
+        .as_ref()
         .map(|cs| cs.len())
-        .or_else(|| spec_containers.map(|c| c.len()))
+        .unwrap_or(spec.containers.len());
+
+    let ready_count = status
+        .container_statuses
+        .as_ref()
+        .map(|cs| cs.iter().filter(|c| c.ready).count())
         .unwrap_or(0);
 
-    let ready_count = container_statuses
-        .map(|cs| {
-            cs.iter()
-                .filter(|c| c["ready"].as_bool().unwrap_or(false))
-                .count()
-        })
+    let restarts: i64 = status
+        .container_statuses
+        .as_ref()
+        .map(|cs| cs.iter().map(|c| c.restart_count).sum())
         .unwrap_or(0);
 
-    let restarts: i64 = container_statuses
-        .map(|cs| {
-            cs.iter()
-                .map(|c| c["restartCount"].as_i64().unwrap_or(0))
-                .sum()
-        })
-        .unwrap_or(0);
+    let display_status = pod_display_status(
+        meta.deletion_timestamp.as_deref(),
+        phase,
+        status.container_statuses.as_deref(),
+    );
 
-    let status = pod_display_status(&obj, phase, container_statuses);
-
-    let pod_ip = obj["status"]["podIP"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
-    let node_name = obj["spec"]["nodeName"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
+    let pod_ip = status.pod_ip.unwrap_or_else(|| "<none>".to_string());
+    let node_name = spec.node_name.unwrap_or_else(|| "<none>".to_string());
 
     let ready_str = format!("{ready_count}/{total}");
 
@@ -151,7 +192,7 @@ fn pod_row(obj: serde_json::Value) -> serde_json::Value {
         "cells": [
             name,
             ready_str,
-            status,
+            display_status,
             restarts,
             age,
             pod_ip,
@@ -164,24 +205,23 @@ fn pod_row(obj: serde_json::Value) -> serde_json::Value {
 }
 
 fn pod_display_status(
-    obj: &serde_json::Value,
+    deletion_timestamp: Option<&str>,
     phase: &str,
-    container_statuses: Option<&Vec<serde_json::Value>>,
+    container_statuses: Option<&[ContainerStatusView]>,
 ) -> String {
-    if obj["metadata"]["deletionTimestamp"].is_string() {
+    if deletion_timestamp.is_some() {
         return "Terminating".to_string();
     }
 
     if let Some(cs) = container_statuses {
         for c in cs {
-            let waiting_reason = c["state"]["waiting"]["reason"].as_str();
-            let terminated_reason = c["state"]["terminated"]["reason"].as_str();
-            if let Some(reason) = waiting_reason {
+            let Some(state) = &c.state else { continue };
+            if let Some(reason) = state.waiting.as_ref().and_then(|w| w.reason.as_deref()) {
                 if reason != "Completed" {
                     return reason.to_string();
                 }
             }
-            if let Some(reason) = terminated_reason {
+            if let Some(reason) = state.terminated.as_ref().and_then(|t| t.reason.as_deref()) {
                 if reason != "Completed" {
                     return reason.to_string();
                 }
@@ -216,28 +256,73 @@ fn build_node_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NodeStatusView {
+    #[serde(default)]
+    conditions: Option<Vec<NodeConditionView>>,
+    #[serde(default)]
+    node_info: Option<NodeInfoView>,
+    #[serde(default)]
+    addresses: Option<Vec<NodeAddressView>>,
+}
+
+#[derive(Deserialize, Default)]
+struct NodeConditionView {
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NodeInfoView {
+    kubelet_version: Option<String>,
+    os_image: Option<String>,
+    kernel_version: Option<String>,
+    container_runtime_version: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct NodeAddressView {
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    address: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct NodeSpecView {
+    #[serde(default)]
+    unschedulable: bool,
+}
+
 fn node_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let status: NodeStatusView = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let spec: NodeSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
 
     // STATUS
-    let ready_condition = obj["status"]["conditions"]
-        .as_array()
-        .and_then(|conds| conds.iter().find(|c| c["type"].as_str() == Some("Ready")));
+    let ready_condition = status
+        .conditions
+        .as_ref()
+        .and_then(|conds| conds.iter().find(|c| c.type_.as_deref() == Some("Ready")));
     let ready_str = ready_condition
-        .and_then(|c| c["status"].as_str())
+        .and_then(|c| c.status.as_deref())
         .map(|s| if s == "True" { "Ready" } else { "NotReady" })
         .unwrap_or("NotReady");
-    let unschedulable = obj["spec"]["unschedulable"].as_bool().unwrap_or(false);
-    let status = if unschedulable {
+    let node_status = if spec.unschedulable {
         format!("{ready_str},SchedulingDisabled")
     } else {
         ready_str.to_string()
     };
 
     // ROLES
-    let roles = obj["metadata"]["labels"]
-        .as_object()
+    let roles = meta
+        .labels
+        .as_ref()
         .map(|labels| {
             let prefix = "node-role.kubernetes.io/";
             let mut roles: Vec<&str> = labels
@@ -253,47 +338,42 @@ fn node_row(obj: serde_json::Value) -> serde_json::Value {
         })
         .unwrap_or_else(|| "<none>".to_string());
 
-    let version = obj["status"]["nodeInfo"]["kubeletVersion"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
-
-    let addresses = obj["status"]["addresses"].as_array();
-    let internal_ip = addresses
+    let internal_ip = status
+        .addresses
+        .as_ref()
         .and_then(|addrs| {
             addrs
                 .iter()
-                .find(|a| a["type"].as_str() == Some("InternalIP"))
-                .and_then(|a| a["address"].as_str())
+                .find(|a| a.type_.as_deref() == Some("InternalIP"))
         })
-        .unwrap_or("<none>")
-        .to_string();
-    let external_ip = addresses
+        .and_then(|a| a.address.clone())
+        .unwrap_or_else(|| "<none>".to_string());
+    let external_ip = status
+        .addresses
+        .as_ref()
         .and_then(|addrs| {
             addrs
                 .iter()
-                .find(|a| a["type"].as_str() == Some("ExternalIP"))
-                .and_then(|a| a["address"].as_str())
+                .find(|a| a.type_.as_deref() == Some("ExternalIP"))
         })
-        .unwrap_or("<none>")
-        .to_string();
+        .and_then(|a| a.address.clone())
+        .unwrap_or_else(|| "<none>".to_string());
 
-    let os_image = obj["status"]["nodeInfo"]["osImage"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
-    let kernel_version = obj["status"]["nodeInfo"]["kernelVersion"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
-    let container_runtime = obj["status"]["nodeInfo"]["containerRuntimeVersion"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
+    let node_info = status.node_info.unwrap_or_default();
+    let version = node_info
+        .kubelet_version
+        .unwrap_or_else(|| "<none>".to_string());
+    let os_image = node_info.os_image.unwrap_or_else(|| "<none>".to_string());
+    let kernel_version = node_info
+        .kernel_version
+        .unwrap_or_else(|| "<none>".to_string());
+    let container_runtime = node_info
+        .container_runtime_version
+        .unwrap_or_else(|| "<none>".to_string());
 
     let object_ref = make_object_ref(&obj, "Node");
     serde_json::json!({
-        "cells": [name, status, roles, age, version, internal_ip, external_ip, os_image, kernel_version, container_runtime],
+        "cells": [name, node_status, roles, age, version, internal_ip, external_ip, os_image, kernel_version, container_runtime],
         "object": object_ref
     })
 }
@@ -320,35 +400,99 @@ fn build_deployment_table(objects: Vec<serde_json::Value>) -> serde_json::Value 
     })
 }
 
-fn deployment_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+/// Shared by Deployment/ReplicaSet/StatefulSet/DaemonSet: all four model
+/// `spec.template.spec.containers` (and DaemonSet additionally `.nodeSelector`)
+/// with the identical PodTemplateSpec shape.
+#[derive(Deserialize, Default, Clone)]
+struct ContainerView {
+    name: Option<String>,
+    image: Option<String>,
+}
 
-    let desired = obj["spec"]["replicas"].as_i64().unwrap_or(0);
-    let ready = obj["status"]["readyReplicas"].as_i64().unwrap_or(0);
-    let up_to_date = obj["status"]["updatedReplicas"].as_i64().unwrap_or(0);
-    let available = obj["status"]["availableReplicas"].as_i64().unwrap_or(0);
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PodTemplateSpecView {
+    #[serde(default)]
+    containers: Vec<ContainerView>,
+    #[serde(default)]
+    node_selector: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize, Default)]
+struct PodTemplateView {
+    #[serde(default)]
+    spec: PodTemplateSpecView,
+}
+
+/// CONTAINERS/IMAGES columns must preserve declaration order (not sort) so a
+/// container's name at index N still lines up with its image at index N.
+fn container_names_and_images(containers: &[ContainerView]) -> (String, String) {
+    let names = containers
+        .iter()
+        .filter_map(|c| c.name.as_deref())
+        .collect::<Vec<_>>()
+        .join(",");
+    let images = containers
+        .iter()
+        .filter_map(|c| c.image.as_deref())
+        .collect::<Vec<_>>()
+        .join(",");
+    (names, images)
+}
+
+/// Shared by Deployment/ReplicaSet/StatefulSet: all three expose `spec.replicas`
+/// and `spec.selector.matchLabels` with identical shape.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadSpecView {
+    #[serde(default)]
+    replicas: Option<i64>,
+    #[serde(default)]
+    selector: Option<LabelSelectorView>,
+    #[serde(default)]
+    template: PodTemplateView,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LabelSelectorView {
+    #[serde(default)]
+    match_labels: Option<BTreeMap<String, String>>,
+}
+
+/// Shared by Deployment/ReplicaSet/StatefulSet: the real Kubernetes API models
+/// all three kinds' status with this same `replicas`/`readyReplicas`/
+/// `updatedReplicas`/`availableReplicas` field set (each kind just uses a subset).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ReplicaStatusView {
+    #[serde(default)]
+    replicas: Option<i64>,
+    #[serde(default)]
+    ready_replicas: Option<i64>,
+    #[serde(default)]
+    updated_replicas: Option<i64>,
+    #[serde(default)]
+    available_replicas: Option<i64>,
+}
+
+fn deployment_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let spec: WorkloadSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: ReplicaStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+
+    let desired = spec.replicas.unwrap_or(0);
+    let ready = status.ready_replicas.unwrap_or(0);
+    let up_to_date = status.updated_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
     let ready_str = format!("{ready}/{desired}");
 
-    let containers = obj["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let images = obj["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["image"].as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let selector = label_map_to_string(&obj["spec"]["selector"]["matchLabels"]);
+    let (containers, images) = container_names_and_images(&spec.template.spec.containers);
+    let selector = label_map_to_string(spec.selector.and_then(|s| s.match_labels).as_ref());
 
     let object_ref = make_object_ref(&obj, "Deployment");
     serde_json::json!({
@@ -378,42 +522,88 @@ fn build_service_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
-fn service_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ServiceSpecView {
+    #[serde(rename = "type", default)]
+    type_: Option<String>,
+    #[serde(rename = "clusterIP", default)]
+    cluster_ip: Option<String>,
+    #[serde(rename = "externalIPs", default)]
+    external_ips: Option<Vec<String>>,
+    #[serde(default)]
+    ports: Option<Vec<ServicePortView>>,
+    #[serde(default)]
+    selector: Option<BTreeMap<String, String>>,
+}
 
-    let svc_type = obj["spec"]["type"].as_str().unwrap_or("<none>").to_string();
-    let cluster_ip = obj["spec"]["clusterIP"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
+#[derive(Deserialize, Default)]
+struct ServicePortView {
+    #[serde(default)]
+    port: i64,
+    protocol: Option<String>,
+    #[serde(rename = "nodePort", default)]
+    node_port: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ServiceStatusView {
+    #[serde(default)]
+    load_balancer: Option<LoadBalancerStatusView>,
+}
+
+#[derive(Deserialize, Default)]
+struct LoadBalancerStatusView {
+    #[serde(default)]
+    ingress: Option<Vec<LoadBalancerIngressView>>,
+}
+
+#[derive(Deserialize, Default)]
+struct LoadBalancerIngressView {
+    ip: Option<String>,
+    hostname: Option<String>,
+}
+
+fn service_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let spec: ServiceSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: ServiceStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+
+    let svc_type = spec.type_.unwrap_or_else(|| "<none>".to_string());
+    let cluster_ip = spec.cluster_ip.unwrap_or_else(|| "<none>".to_string());
 
     // External IP: externalIPs[0] → loadBalancer.ingress[0].ip → .hostname → <none>
-    let external_ip = obj["spec"]["externalIPs"]
-        .as_array()
+    let external_ip = spec
+        .external_ips
+        .as_ref()
         .and_then(|ips| ips.first())
-        .and_then(|v| v.as_str())
+        .cloned()
         .or_else(|| {
-            obj["status"]["loadBalancer"]["ingress"]
-                .as_array()
+            status
+                .load_balancer
+                .as_ref()
+                .and_then(|lb| lb.ingress.as_ref())
                 .and_then(|ing| ing.first())
-                .and_then(|i| i["ip"].as_str().or_else(|| i["hostname"].as_str()))
+                .and_then(|i| i.ip.clone().or_else(|| i.hostname.clone()))
         })
-        .unwrap_or("<none>")
-        .to_string();
+        .unwrap_or_else(|| "<none>".to_string());
 
     // PORT(S)
-    let ports = obj["spec"]["ports"]
-        .as_array()
+    let ports = spec
+        .ports
+        .as_ref()
         .map(|ps| {
             ps.iter()
                 .map(|p| {
-                    let port = p["port"].as_i64().unwrap_or(0);
-                    let proto = p["protocol"].as_str().unwrap_or("TCP");
-                    if let Some(np) = p["nodePort"].as_i64() {
-                        format!("{port}:{np}/{proto}")
-                    } else {
-                        format!("{port}/{proto}")
+                    let proto = p.protocol.as_deref().unwrap_or("TCP");
+                    match p.node_port {
+                        Some(np) => format!("{}:{np}/{proto}", p.port),
+                        None => format!("{}/{proto}", p.port),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -421,7 +611,7 @@ fn service_row(obj: serde_json::Value) -> serde_json::Value {
         })
         .unwrap_or_default();
 
-    let selector = label_map_to_string(&obj["spec"]["selector"]);
+    let selector = label_map_to_string(spec.selector.as_ref());
 
     let object_ref = make_object_ref(&obj, "Service");
     serde_json::json!({
@@ -453,32 +643,20 @@ fn build_replicaset_table(objects: Vec<serde_json::Value>) -> serde_json::Value 
 }
 
 fn replicaset_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let desired = obj["spec"]["replicas"].as_i64().unwrap_or(0);
-    let current = obj["status"]["replicas"].as_i64().unwrap_or(0);
-    let ready = obj["status"]["readyReplicas"].as_i64().unwrap_or(0);
+    let spec: WorkloadSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: ReplicaStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
 
-    let containers = obj["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let images = obj["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["image"].as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let selector = label_map_to_string(&obj["spec"]["selector"]["matchLabels"]);
+    let desired = spec.replicas.unwrap_or(0);
+    let current = status.replicas.unwrap_or(0);
+    let ready = status.ready_replicas.unwrap_or(0);
+
+    let (containers, images) = container_names_and_images(&spec.template.spec.containers);
+    let selector = label_map_to_string(spec.selector.and_then(|s| s.match_labels).as_ref());
 
     let object_ref = make_object_ref(&obj, "ReplicaSet");
     serde_json::json!({
@@ -507,31 +685,19 @@ fn build_statefulset_table(objects: Vec<serde_json::Value>) -> serde_json::Value
 }
 
 fn statefulset_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
 
-    let desired = obj["spec"]["replicas"].as_i64().unwrap_or(0);
-    let ready = obj["status"]["readyReplicas"].as_i64().unwrap_or(0);
+    let spec: WorkloadSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: ReplicaStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+
+    let desired = spec.replicas.unwrap_or(0);
+    let ready = status.ready_replicas.unwrap_or(0);
     let ready_str = format!("{ready}/{desired}");
 
-    let containers = obj["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["name"].as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let images = obj["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .map(|cs| {
-            cs.iter()
-                .filter_map(|c| c["image"].as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
+    let (containers, images) = container_names_and_images(&spec.template.spec.containers);
 
     let object_ref = make_object_ref(&obj, "StatefulSet");
     serde_json::json!({
@@ -562,26 +728,49 @@ fn build_daemonset_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
-fn daemonset_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DaemonSetStatusView {
+    #[serde(default)]
+    desired_number_scheduled: i64,
+    #[serde(default)]
+    current_number_scheduled: i64,
+    #[serde(default)]
+    number_ready: i64,
+    #[serde(default)]
+    updated_number_scheduled: i64,
+    #[serde(default)]
+    number_available: i64,
+}
 
-    let desired = obj["status"]["desiredNumberScheduled"]
-        .as_i64()
-        .unwrap_or(0);
-    let current = obj["status"]["currentNumberScheduled"]
-        .as_i64()
-        .unwrap_or(0);
-    let ready = obj["status"]["numberReady"].as_i64().unwrap_or(0);
-    let up_to_date = obj["status"]["updatedNumberScheduled"]
-        .as_i64()
-        .unwrap_or(0);
-    let available = obj["status"]["numberAvailable"].as_i64().unwrap_or(0);
-    let node_selector = label_map_to_string(&obj["spec"]["template"]["spec"]["nodeSelector"]);
+#[derive(Deserialize, Default)]
+struct DaemonSetSpecView {
+    #[serde(default)]
+    template: PodTemplateView,
+}
+
+fn daemonset_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let status: DaemonSetStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let spec: DaemonSetSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let node_selector = label_map_to_string(spec.template.spec.node_selector.as_ref());
 
     let object_ref = make_object_ref(&obj, "DaemonSet");
     serde_json::json!({
-        "cells": [name, desired, current, ready, up_to_date, available, node_selector, age],
+        "cells": [
+            name,
+            status.desired_number_scheduled,
+            status.current_number_scheduled,
+            status.number_ready,
+            status.updated_number_scheduled,
+            status.number_available,
+            node_selector,
+            age
+        ],
         "object": object_ref
     })
 }
@@ -603,13 +792,18 @@ fn build_namespace_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+struct NamespaceStatusView {
+    phase: Option<String>,
+}
+
 fn namespace_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
-    let status = obj["status"]["phase"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+    let status: NamespaceStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let status = status.phase.unwrap_or_else(|| "<none>".to_string());
     let object_ref = make_object_ref(&obj, "Namespace");
     serde_json::json!({
         "cells": [name, status, age],
@@ -634,11 +828,22 @@ fn build_configmap_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConfigMapDataView {
+    #[serde(default)]
+    data: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    binary_data: Option<BTreeMap<String, String>>,
+}
+
 fn configmap_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
-    let data_count = obj["data"].as_object().map(|m| m.len()).unwrap_or(0)
-        + obj["binaryData"].as_object().map(|m| m.len()).unwrap_or(0);
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+    let fields: ConfigMapDataView = serde_json::from_value(obj.clone()).unwrap_or_default();
+    let data_count = fields.data.map(|m| m.len()).unwrap_or(0)
+        + fields.binary_data.map(|m| m.len()).unwrap_or(0);
     let object_ref = make_object_ref(&obj, "ConfigMap");
     serde_json::json!({
         "cells": [name, data_count as i64, age],
@@ -664,11 +869,21 @@ fn build_secret_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+struct SecretDataView {
+    #[serde(rename = "type", default)]
+    type_: Option<String>,
+    #[serde(default)]
+    data: Option<BTreeMap<String, String>>,
+}
+
 fn secret_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
-    let secret_type = obj["type"].as_str().unwrap_or("<none>").to_string();
-    let data_count = obj["data"].as_object().map(|m| m.len()).unwrap_or(0);
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+    let fields: SecretDataView = serde_json::from_value(obj.clone()).unwrap_or_default();
+    let secret_type = fields.type_.unwrap_or_else(|| "<none>".to_string());
+    let data_count = fields.data.map(|m| m.len()).unwrap_or(0);
     let object_ref = make_object_ref(&obj, "Secret");
     serde_json::json!({
         "cells": [name, secret_type, data_count as i64, age],
@@ -693,13 +908,21 @@ fn build_serviceaccount_table(objects: Vec<serde_json::Value>) -> serde_json::Va
     })
 }
 
+#[derive(Deserialize, Default)]
+struct ServiceAccountView {
+    /// Only the count matters here; individual secret-reference fields are never read.
+    #[serde(default)]
+    secrets: Vec<serde::de::IgnoredAny>,
+}
+
 fn serviceaccount_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
-    let secrets = obj["secrets"].as_array().map(|a| a.len()).unwrap_or(0);
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+    let fields: ServiceAccountView = serde_json::from_value(obj.clone()).unwrap_or_default();
     let object_ref = make_object_ref(&obj, "ServiceAccount");
     serde_json::json!({
-        "cells": [name, secrets as i64, age],
+        "cells": [name, fields.secrets.len() as i64, age],
         "object": object_ref
     })
 }
@@ -723,13 +946,34 @@ fn build_job_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
-fn job_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct JobStatusView {
+    completion_time: Option<String>,
+    start_time: Option<String>,
+    #[serde(default)]
+    active: i64,
+    #[serde(default)]
+    succeeded: i64,
+}
 
-    let completion_time = obj["status"]["completionTime"].as_str();
-    let start_time = obj["status"]["startTime"].as_str();
-    let active = obj["status"]["active"].as_i64().unwrap_or(0);
+#[derive(Deserialize, Default)]
+struct JobSpecView {
+    completions: Option<i64>,
+}
+
+fn job_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let job_status: JobStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    let job_spec: JobSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+
+    let completion_time = job_status.completion_time.as_deref();
+    let start_time = job_status.start_time.as_deref();
+    let active = job_status.active;
 
     let status = if completion_time.is_some() {
         "Complete"
@@ -739,8 +983,8 @@ fn job_row(obj: serde_json::Value) -> serde_json::Value {
         "Failed"
     };
 
-    let succeeded = obj["status"]["succeeded"].as_i64().unwrap_or(0);
-    let total_completions = obj["spec"]["completions"].as_i64().unwrap_or(1);
+    let succeeded = job_status.succeeded;
+    let total_completions = job_spec.completions.unwrap_or(1);
     let completions = format!("{succeeded}/{total_completions}");
 
     let duration = match (start_time, completion_time) {
@@ -795,29 +1039,40 @@ fn build_cronjob_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
-fn cronjob_row(obj: serde_json::Value) -> serde_json::Value {
-    let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
-    let age = age_string(obj["metadata"]["creationTimestamp"].as_str().unwrap_or(""));
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CronJobSpecView {
+    schedule: Option<String>,
+    time_zone: Option<String>,
+    #[serde(default)]
+    suspend: bool,
+}
 
-    let schedule = obj["spec"]["schedule"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
-    let timezone = obj["spec"]["timeZone"]
-        .as_str()
-        .unwrap_or("<none>")
-        .to_string();
-    let suspend = if obj["spec"]["suspend"].as_bool().unwrap_or(false) {
-        "True"
-    } else {
-        "False"
-    };
-    let active = obj["status"]["active"]
-        .as_array()
-        .map(|a| a.len() as i64)
-        .unwrap_or(0);
-    let last_schedule = obj["status"]["lastScheduleTime"]
-        .as_str()
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CronJobStatusView {
+    /// Only the count matters here; individual active-job-reference fields are never read.
+    #[serde(default)]
+    active: Vec<serde::de::IgnoredAny>,
+    last_schedule_time: Option<String>,
+}
+
+fn cronjob_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+
+    let spec: CronJobSpecView = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    let status: CronJobStatusView =
+        serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+
+    let schedule = spec.schedule.unwrap_or_else(|| "<none>".to_string());
+    let timezone = spec.time_zone.unwrap_or_else(|| "<none>".to_string());
+    let suspend = if spec.suspend { "True" } else { "False" };
+    let active = status.active.len() as i64;
+    let last_schedule = status
+        .last_schedule_time
+        .as_deref()
         .map(age_string)
         .unwrap_or_else(|| "<none>".to_string());
 
@@ -862,20 +1117,22 @@ fn generic_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-fn label_map_to_string(val: &serde_json::Value) -> String {
-    val.as_object()
-        .map(|m| {
-            if m.is_empty() {
-                return "<none>".to_string();
-            }
-            let mut pairs: Vec<String> = m
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
-                .collect();
+/// Deserialize `obj.metadata` once per row via the shared `ObjectMeta` type instead of
+/// every kind repeating its own raw `obj["metadata"]["name"]`/`["creationTimestamp"]` walk.
+fn parse_metadata(obj: &serde_json::Value) -> ObjectMeta {
+    serde_json::from_value(obj["metadata"].clone()).unwrap_or_default()
+}
+
+fn label_map_to_string(labels: Option<&BTreeMap<String, String>>) -> String {
+    match labels {
+        None => "<none>".to_string(),
+        Some(m) if m.is_empty() => "<none>".to_string(),
+        Some(m) => {
+            let mut pairs: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
             pairs.sort();
             pairs.join(",")
-        })
-        .unwrap_or_else(|| "<none>".to_string())
+        }
+    }
 }
 
 fn make_object_ref(obj: &serde_json::Value, default_kind: &str) -> serde_json::Value {
