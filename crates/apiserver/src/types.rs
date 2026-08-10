@@ -1165,10 +1165,8 @@ pub struct HpaScalingRules {
 /// diverges: `lastUpdateTime` in addition to `lastTransitionTime`, and no
 /// `observedGeneration`.
 ///
-/// Not yet constructed anywhere in this crate — the next resource that reports
-/// availability via a standard condition will use it directly, at which point
-/// this allow can be dropped.
-#[allow(dead_code)]
+/// First consumer: `handlers/aggregation.rs`'s `upsert_available_condition`
+/// (APIService's `status.conditions[type=Available]`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Condition {
