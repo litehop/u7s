@@ -1979,6 +1979,44 @@ fn gen_secret_reference_to_json(r: core_v1::SecretReference) -> serde_json::Valu
     serde_json::Value::Object(m)
 }
 
+/// Used by `PersistentVolumeClaimSpec.dataSource` — the clone-from-PVC / restore-from-
+/// VolumeSnapshot pointer. Narrower than `ObjectReference`: dataSource always targets an
+/// object in the claim's own namespace, so it only ever carries apiGroup/kind/name.
+fn gen_typed_local_object_reference_to_json(
+    r: core_v1::TypedLocalObjectReference,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = r.api_group.filter(|s| !s.is_empty()) {
+        m.insert("apiGroup".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+        m.insert("kind".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Used by `PersistentVolumeClaimSpec.dataSourceRef` — the cross-namespace-capable successor
+/// to dataSource. Same apiGroup/kind/name as `TypedLocalObjectReference` plus `namespace`.
+fn gen_typed_object_reference_to_json(r: core_v1::TypedObjectReference) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = r.api_group.filter(|s| !s.is_empty()) {
+        m.insert("apiGroup".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+        m.insert("kind".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = r.namespace.filter(|s| !s.is_empty()) {
+        m.insert("namespace".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 // ---- Decoder A: Namespace --------------------------------------------------
 
 pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -2918,6 +2956,9 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
         if !spec.access_modes.is_empty() {
             spec_json["accessModes"] = spec.access_modes.into();
         }
+        if let Some(sel) = spec.selector {
+            spec_json["selector"] = gen_label_selector_to_json(sel);
+        }
         if let Some(v) = spec.volume_name.filter(|s| !s.is_empty()) {
             spec_json["volumeName"] = v.into();
         }
@@ -2926,6 +2967,15 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
         }
         if let Some(v) = spec.volume_mode.filter(|s| !s.is_empty()) {
             spec_json["volumeMode"] = v.into();
+        }
+        if let Some(ds) = spec.data_source {
+            spec_json["dataSource"] = gen_typed_local_object_reference_to_json(ds);
+        }
+        if let Some(dsr) = spec.data_source_ref {
+            spec_json["dataSourceRef"] = gen_typed_object_reference_to_json(dsr);
+        }
+        if let Some(v) = spec.volume_attributes_class_name.filter(|s| !s.is_empty()) {
+            spec_json["volumeAttributesClassName"] = v.into();
         }
         if let Some(res) = spec.resources {
             let mut res_json = serde_json::json!({});
@@ -6143,6 +6193,195 @@ mod tests {
             "status.conditions must survive decode — without it a caller waiting on the \
              FileSystemResizePending condition never sees the resize controller's progress"
         );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve spec.selector (PVCSpec field 4).
+    ///
+    /// Pre-provisioned-binding workflows set a label selector so the PVC only binds to a PV
+    /// carrying matching labels; dropping it on decode makes the PVC bind to any PV that
+    /// satisfies capacity/accessModes alone, silently attaching a claim to the wrong volume.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_selector() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeClaimSpec {
+                selector: Some(meta_v1::LabelSelector {
+                    match_labels: [("release".to_string(), "stable".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["spec"]["selector"]["matchLabels"]["release"], "stable",
+            "spec.selector must survive decode — without it a pre-provisioned-binding PVC \
+             loses its label constraint and can bind to any PV that merely matches capacity \
+             and accessModes, attaching the claim to the wrong volume"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve spec.dataSource (PVCSpec field 7).
+    ///
+    /// dataSource is how a user clones an existing PVC or restores a VolumeSnapshot into a new
+    /// claim; dropping it on decode makes the CSI provisioner see a claim with no data source
+    /// and provision an empty volume instead of the clone/restore the user asked for.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_data_source() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("clone-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeClaimSpec {
+                data_source: Some(core_v1::TypedLocalObjectReference {
+                    kind: Some("PersistentVolumeClaim".to_string()),
+                    name: Some("source-pvc".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["spec"]["dataSource"]["name"], "source-pvc",
+            "spec.dataSource must survive decode — clone-from-PVC breaks silently without it: \
+             the CSI provisioner sees no data source and provisions an empty volume instead of \
+             a clone of source-pvc"
+        );
+        assert_eq!(
+            result["spec"]["dataSource"]["kind"], "PersistentVolumeClaim",
+            "spec.dataSource.kind must survive decode alongside name — losing it makes the \
+             provisioner unable to tell a PVC clone request from a VolumeSnapshot restore"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve spec.dataSourceRef (PVCSpec field 8).
+    ///
+    /// dataSourceRef is the cross-namespace-capable successor to dataSource, required by
+    /// external volume populators; dropping it on decode leaves the populator controller with
+    /// nothing to reconcile, so the claim never gets populated and stays pending forever.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_data_source_ref() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("populated-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeClaimSpec {
+                data_source_ref: Some(core_v1::TypedObjectReference {
+                    api_group: Some("populator.example.com".to_string()),
+                    kind: Some("VolumePopulator".to_string()),
+                    name: Some("my-populator".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["spec"]["dataSourceRef"]["name"], "my-populator",
+            "spec.dataSourceRef must survive decode — without it an external volume populator \
+             has nothing to reconcile against and the claim never gets populated, staying \
+             Pending forever"
+        );
+        assert_eq!(
+            result["spec"]["dataSourceRef"]["apiGroup"], "populator.example.com",
+            "spec.dataSourceRef.apiGroup must survive decode — without it the populator \
+             controller cannot resolve which non-core object type to look up"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve spec.volumeAttributesClassName
+    /// (PVCSpec field 9).
+    ///
+    /// The VAC modify controller reconciles a claim's volume attributes against this field;
+    /// dropping it on decode means a user's request to apply a VolumeAttributesClass is
+    /// silently ignored and the underlying volume never gets the requested attributes.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_volume_attributes_class_name() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("vac-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeClaimSpec {
+                volume_attributes_class_name: Some("gold-tier".to_string()),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["spec"]["volumeAttributesClassName"], "gold-tier",
+            "spec.volumeAttributesClassName must survive decode — without it the VAC modify \
+             controller has nothing to reconcile and a user's request to apply gold-tier \
+             attributes to the volume is silently ignored"
+        );
+    }
+
+    /// Sentinel completeness test for `gen_persistent_volume_claim_to_json`: catches whichever
+    /// PersistentVolumeClaimSpec field gets missed next, the way the targeted tests above only
+    /// catch the four fields known to be dropped at the time they were written.
+    ///
+    /// Scoped to `.spec` (not `.status`): PersistentVolumeClaimStatus has fields this function
+    /// does not yet decode (accessModes, capacity, allocatedResources,
+    /// allocatedResourceStatuses, currentVolumeAttributesClassName, modifyVolumeStatus) — a
+    /// separate, pre-existing gap tracked as a follow-up rather than fixed here.
+    #[test]
+    fn sentinel_completeness_gen_persistent_volume_claim_to_json() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            spec: Some(core_v1::PersistentVolumeClaimSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+        let result =
+            decode_persistentvolumeclaim_proto_gen(&buf).expect("sentinel PVC must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result["spec"], "", &mut paths);
+
+        let expected = [
+            "accessModes",
+            "selector",
+            "resources",
+            "volumeName",
+            "storageClassName",
+            "volumeMode",
+            "dataSource",
+            "dataSourceRef",
+            "volumeAttributesClassName",
+        ];
+        assert_fields_present(&paths, &expected);
     }
 
     /// decode_podtemplate_proto_gen must preserve the embedded pod template's spec and
