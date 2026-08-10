@@ -454,6 +454,20 @@ if [ "$UNPACK" -eq 1 ]; then
   UNPACK_DIR="$RUN_DIR"
   mkdir -p "$UNPACK_DIR"
   tar xzf "$OUTFILE" -C "$UNPACK_DIR"
+
+  # Extract pod logs unconditionally — timed-out runs have no JUnit but their
+  # pod logs are the primary diagnostic surface.
+  POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
+  HAVE_POD_LOGS=0
+  for NODE in "${NODES[@]}"; do
+    EVAC_TARBALL="$WORKDIR/pod-logs-evacuation-${NODE}.tar.gz"
+    if [ -f "$EVAC_TARBALL" ]; then
+      mkdir -p "$POD_LOGS_DIR"
+      tar -xzf "$EVAC_TARBALL" -C "$POD_LOGS_DIR" 2>/dev/null || true
+      HAVE_POD_LOGS=1
+    fi
+  done
+
   JUNIT="$UNPACK_DIR/plugins/e2e/results/global/junit_01.xml"
   if [ -f "$JUNIT" ]; then
     # Extract totals from the testsuites element.
@@ -475,18 +489,8 @@ if [ "$UNPACK" -eq 1 ]; then
         | grep -v "BeforeSuite\|AfterSuite\|ReportBefore\|ReportAfter\|Synchronized" \
         | sed 's/^/    /'
 
-      # Print container logs from the evacuated tarballs (one per node, copied before namespace GC).
+      # Print container logs from the evacuated tarballs (extracted above, unconditionally).
       E2E_LOG="$UNPACK_DIR/plugins/e2e/results/global/e2e.log"
-      POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
-      HAVE_POD_LOGS=0
-      for NODE in "${NODES[@]}"; do
-        EVAC_TARBALL="$WORKDIR/pod-logs-evacuation-${NODE}.tar.gz"
-        if [ -f "$EVAC_TARBALL" ]; then
-          mkdir -p "$POD_LOGS_DIR"
-          tar -xzf "$EVAC_TARBALL" -C "$POD_LOGS_DIR" 2>/dev/null || true
-          HAVE_POD_LOGS=1
-        fi
-      done
       if [ -f "$E2E_LOG" ] && [ "$HAVE_POD_LOGS" -eq 1 ]; then
         echo ""
         echo "  Pod logs from failed test namespaces:"
