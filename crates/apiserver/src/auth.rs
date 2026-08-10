@@ -1011,12 +1011,25 @@ where
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
-        let path = req.uri().path().to_owned();
+        let path = req.uri().path();
 
         // Exempt paths skip auth.
-        if is_exempt(&path) {
+        if is_exempt(path) {
             return Box::pin(self.inner.call(req));
         }
+
+        // parse_path and the non-resource-URL check are pure functions of the borrowed
+        // path — run them here, on the borrow, before `req` (and the borrow) moves into
+        // the async block below. Only non-resource URLs (health checks, /openapi,
+        // /version, ...) need the raw path downstream, so only that minority pays for an
+        // owned-String clone; the common resource-URL case captures just `parsed`, which
+        // already owns its own group/version/resource/subresource/namespace/name fields.
+        let parsed = parse_path(path);
+        let non_resource_path = if parsed.resource.is_empty() && !path.starts_with("/api") {
+            Some(path.to_owned())
+        } else {
+            None
+        };
 
         // Authentication now needs to re-verify bound-object liveness against the store on
         // every request (see try_verify_sa_jwt), so the whole authn+authz+dispatch sequence
@@ -1142,18 +1155,9 @@ where
                 authenticated_user
             };
 
-            // 2. Authorize.
-            let parsed = parse_path(&path);
-
-            // Detect non-resource URL requests: paths not rooted in /api or /apis
-            // (i.e. parse_path returned an empty resource) are non-resource requests.
-            // Examples: GET /version, GET /openapi/v2, GET /openapi/v3/apis/<group>/<ver>.
-            let non_resource_url: Option<&str> =
-                if parsed.resource.is_empty() && !path.starts_with("/api") {
-                    Some(&path)
-                } else {
-                    None
-                };
+            // 2. Authorize. `parsed` and `non_resource_path` were already computed in
+            // `call`, on the borrowed path, before `req` moved into this block.
+            let non_resource_url: Option<&str> = non_resource_path.as_deref();
 
             // Non-resource URL verbs map directly from the HTTP method ("get", "post", ...).
             // get_verb's list/get/watch distinction only applies to resource requests.
@@ -3626,6 +3630,122 @@ mod tests {
             "a fieldSelector naming a DIFFERENT resource must still be denied by a \
              resourceNames-restricted Role — the fix must not turn resourceNames into a \
              no-op for LIST/WATCH requests"
+        );
+    }
+
+    /// `call`'s preamble computes `parse_path`/the non-resource-URL raw path on the
+    /// borrowed `req.uri().path()` before `req` moves into the async block, rather than
+    /// re-deriving it from an owned clone captured inside the block. This drives the same
+    /// non-resource-URL request through the full AuthLayer against two RBAC rules — one
+    /// granting exactly this path, one granting a different one — proving the exact raw
+    /// path (not stale, truncated, or the wrong request's path) is what reaches
+    /// `AuthzRequest.non_resource_url`.
+    #[tokio::test]
+    async fn call_threads_exact_raw_path_to_non_resource_url_authz() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        const PATH: &str = "/openapi/v3/apis/stable.example.com/v1";
+
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "reader-token".to_owned(),
+            UserInfo {
+                username: "reader".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+
+        // Grant nonResourceURLs on exactly PATH.
+        let idx_allowed = Arc::new(RbacIndex::new());
+        idx_allowed.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/openapi-reader",
+            &serde_json::json!({
+                "rules": [{ "verbs": ["get"], "nonResourceURLs": [PATH] }]
+            }),
+        );
+        idx_allowed.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/openapi-reader-binding",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "reader" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "openapi-reader"
+                }
+            }),
+        );
+
+        let app_allowed = Router::new()
+            .route(PATH, get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx_allowed,
+                token_map.clone(),
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+            ));
+        let req_allowed = Request::builder()
+            .method("GET")
+            .uri(PATH)
+            .header("authorization", "Bearer reader-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_allowed.oneshot(req_allowed).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an exact nonResourceURLs match on {PATH} must be granted — proves the raw \
+             path captured before `req` moves into the async block reaches RBAC unmodified"
+        );
+
+        // Grant nonResourceURLs on a DIFFERENT path — must not match PATH.
+        let idx_denied = Arc::new(RbacIndex::new());
+        idx_denied.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/openapi-reader",
+            &serde_json::json!({
+                "rules": [{
+                    "verbs": ["get"],
+                    "nonResourceURLs": ["/openapi/v3/apis/other.example.com/v1"]
+                }]
+            }),
+        );
+        idx_denied.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/openapi-reader-binding",
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "reader" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "openapi-reader"
+                }
+            }),
+        );
+
+        let app_denied = Router::new()
+            .route(PATH, get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx_denied,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+            ));
+        let req_denied = Request::builder()
+            .method("GET")
+            .uri(PATH)
+            .header("authorization", "Bearer reader-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_denied.oneshot(req_denied).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a rule granting a DIFFERENT nonResourceURL must not match {PATH} — if the \
+             preamble hoist ever captured the wrong string (stale, truncated, or the \
+             is_exempt-time borrow instead of the real path), this would wrongly allow"
         );
     }
 
