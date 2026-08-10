@@ -46,6 +46,25 @@ struct DeletionLog {
     by_revision: BTreeMap<u64, String>,
 }
 
+/// One resource type's ring buffer + deletion log, keyed by its resource-type root prefix (see
+/// `shard_key`). Before sharding, a single busy resource type (e.g. Pods, which writes orders
+/// of magnitude more often than e.g. Namespaces) could evict a quiet resource type's watch
+/// history out of one shared ring, and every watch-open/Lagged-recovery scan walked the combined
+/// occupancy of every resource type in the store instead of just its own prefix.
+struct RingShard {
+    ring: RwLock<VecDeque<Arc<InternalEvent>>>,
+    deletion_log: RwLock<DeletionLog>,
+}
+
+impl RingShard {
+    fn new() -> Self {
+        Self {
+            ring: RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)),
+            deletion_log: RwLock::new(DeletionLog::default()),
+        }
+    }
+}
+
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
     /// ALL rusqlite calls must go through spawn_blocking — rusqlite is synchronous.
@@ -54,19 +73,26 @@ pub struct SqliteStore {
     /// For Phase 1 with one vCPU, a single read connection is sufficient.
     /// For :memory: databases, this is the same connection as write_conn.
     read_conn: Arc<Mutex<Connection>>,
-    /// Broadcast channel for live events after writes.
+    /// Broadcast channel for live events after writes. Deliberately NOT sharded — every open
+    /// watch stream already filters this one channel down to its own prefix; sharding delivery
+    /// itself is a separate, larger fan-out axis tracked independently of the ring/deletion_log
+    /// sharding this type does.
     tx: broadcast::Sender<Arc<InternalEvent>>,
-    /// Ring buffer of recent events for replay.
-    /// std::sync::RwLock so push_event can write synchronously from async context.
-    ring: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
-    /// Deletion-only log that persists tombstones independently of the main ring buffer.
-    /// When the main ring compacts (evicts old events), deletion events may be lost, causing
-    /// reconnecting watchers to miss DELETED events for objects deleted before the compaction.
-    /// Keyed by store key: each key maps to its latest DELETED event. This means tombstones
-    /// are never evicted by unrelated writes — a namespace deleted early in a long conformance
-    /// run will still deliver its DELETED event even after 10 000+ subsequent writes.
-    deletion_log: Arc<RwLock<DeletionLog>>,
-    /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
+    /// Per-resource-type shards (ring buffer + deletion log), created lazily on first write for
+    /// that resource type — a typical run only ever writes a few dozen of the ~40+ core resource
+    /// types plus whatever CRDs are installed, so pre-populating every possible shard up front
+    /// would waste memory on types nobody ever writes. See `shard_key` for how a write's shard
+    /// is derived, and `RingShard`'s doc for why sharding this way matters.
+    shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    /// Lowest revision still in the ring buffer of whichever shard has compacted furthest, across
+    /// every resource type (advanced via `fetch_max` from each shard's own eviction — see
+    /// `push_event_locked`). Deliberately one process-wide value rather than per-shard: the HTTP
+    /// layer's eager pre-watch 410 check (`compaction_horizon()`) runs before it knows which
+    /// shard a watch belongs to, so a per-shard horizon would need a wider API change than this
+    /// sharding pass makes. This means a busy shard can occasionally make a quiet shard's watch
+    /// look "expired" a little earlier than strictly necessary — the same conservative direction
+    /// the old single global ring already had, never the reverse (silently serving a revision a
+    /// shard has actually already evicted as if it were still present).
     compaction_horizon: Arc<AtomicU64>,
     /// Revision of the most recently committed write. List reads are compared against
     /// this: if the read snapshot is older, the list is retried via the write connection
@@ -117,8 +143,7 @@ impl SqliteStore {
         };
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
-        let deletion_log = Arc::new(RwLock::new(DeletionLog::default()));
+        let shards = Arc::new(RwLock::new(HashMap::new()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
 
@@ -126,8 +151,7 @@ impl SqliteStore {
             write_conn,
             read_conn,
             tx,
-            ring,
-            deletion_log,
+            shards,
             compaction_horizon,
             last_written_revision,
         })
@@ -136,16 +160,34 @@ impl SqliteStore {
     /// Test-only helper: broadcast an event without going through a real write. Production
     /// code calls `push_event_locked` directly from inside the `spawn_blocking` closure that
     /// holds `write_conn`'s guard (see its doc comment); tests use this to simulate specific
-    /// broadcast orderings without needing a real concurrent write race.
+    /// broadcast orderings without needing a real concurrent write race. `ns` mirrors the
+    /// namespace a real write would have parsed from the object body (see `shard_key`) — pass
+    /// `Some(namespace)` for a namespaced test key, `None` for a cluster-scoped one.
     #[cfg(test)]
-    fn push_event(&self, event: Arc<InternalEvent>) {
+    fn push_event(&self, event: Arc<InternalEvent>, ns: Option<&str>) {
+        let shard = shard_key(&event.key, ns);
         push_event_locked(
             &self.tx,
-            &self.ring,
-            &self.deletion_log,
+            &self.shards,
+            &shard,
             &self.compaction_horizon,
             event,
         );
+    }
+
+    /// Test-only helper: look up the shard a given (key, ns) pair routes to, so tests can
+    /// inspect a shard's ring/deletion_log directly instead of hardcoding its resource-type
+    /// root string. Panics if nothing has been pushed to that shard yet.
+    #[cfg(test)]
+    fn shard_for_test(&self, key: &str, ns: Option<&str>) -> Arc<RingShard> {
+        let shard = shard_key(key, ns);
+        Arc::clone(
+            self.shards
+                .read()
+                .expect("shards poisoned")
+                .get(&shard)
+                .unwrap_or_else(|| panic!("no shard {shard} — push at least one event first")),
+        )
     }
 
     /// Return the current compaction horizon: the lowest revision no longer in the ring.
@@ -182,21 +224,28 @@ impl SqliteStore {
 /// broadcast order match revision-assignment order for every writer, closing the race.
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
-    ring: &RwLock<VecDeque<Arc<InternalEvent>>>,
-    deletion_log: &RwLock<DeletionLog>,
+    shards: &RwLock<HashMap<String, Arc<RingShard>>>,
+    shard_key: &str,
     compaction_horizon: &AtomicU64,
     event: Arc<InternalEvent>,
 ) {
+    let shard = get_or_create_shard(shards, shard_key);
+
     // Write to ring buffer synchronously using std::sync::RwLock.
     // This avoids a spawned task race between write and watch replay.
     {
-        let mut guard = ring.write().expect("ring poisoned");
+        let mut guard = shard.ring.write().expect("ring poisoned");
         guard.push_back(Arc::clone(&event));
         if guard.len() > RING_CAPACITY {
             guard.pop_front();
             // Update compaction horizon to the revision of the oldest remaining entry.
             if let Some(oldest) = guard.front() {
-                compaction_horizon.store(oldest.revision, Ordering::Relaxed);
+                // fetch_max, not store: this atomic is shared across every shard (see its field
+                // doc on `SqliteStore`), so a plain `.store()` here would let a quiet shard's
+                // low-revision eviction regress the horizon backward after some other, busier
+                // shard already advanced it past that point — silently un-expiring revisions
+                // that busier shard's ring has already discarded.
+                compaction_horizon.fetch_max(oldest.revision, Ordering::Relaxed);
                 tracing::debug!(
                     new_horizon = oldest.revision,
                     ring_len = guard.len(),
@@ -209,7 +258,9 @@ fn push_event_locked(
         // once the ring is already full. Sampled after the eviction check above so it always
         // reflects final post-eviction occupancy. Still holding the write guard — length
         // already computed, zero extra lock acquisition.
-        crate::metrics::WATCH_RING_OCCUPANCY.set(guard.len() as i64);
+        crate::metrics::WATCH_RING_OCCUPANCY
+            .with_label_values(&[shard_key])
+            .set(guard.len() as i64);
     }
     // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
     // compaction can still receive DELETED events for objects deleted before compaction.
@@ -228,7 +279,7 @@ fn push_event_locked(
     //    for keys deleted more than 2000 writes ago, which any active watcher has already
     //    processed via the broadcast channel.
     {
-        let mut guard = deletion_log.write().expect("deletion_log poisoned");
+        let mut guard = shard.deletion_log.write().expect("deletion_log poisoned");
         if event.value.is_none() {
             // Deletion: insert tombstone (indexed by revision too) then cap the map.
             guard.by_key.insert(event.key.clone(), Arc::clone(&event));
@@ -257,7 +308,9 @@ fn push_event_locked(
         // Unconditional (not just on eviction), same reasoning as WATCH_RING_OCCUPANCY above:
         // this is the only write path onto the deletion log, so this cheaply observes its true
         // length on every write, still holding the write guard.
-        crate::metrics::DELETION_LOG_LEN.set(guard.by_key.len() as i64);
+        crate::metrics::DELETION_LOG_LEN
+            .with_label_values(&[shard_key])
+            .set(guard.by_key.len() as i64);
     }
     // Best-effort broadcast of the specific event.
     let event_revision = event.revision;
@@ -281,6 +334,62 @@ fn push_event_locked(
         is_create: false,
         deleted_body: None,
     }));
+}
+
+/// Look up `shard`'s `RingShard` in `shards`, creating it on first use. Read-locks first (the
+/// common case, once every resource type in use has its shard) and only takes the write lock to
+/// insert a brand-new entry, so steady-state writes never contend with each other on this map.
+fn get_or_create_shard(
+    shards: &RwLock<HashMap<String, Arc<RingShard>>>,
+    shard: &str,
+) -> Arc<RingShard> {
+    if let Some(existing) = shards.read().expect("shards poisoned").get(shard) {
+        return Arc::clone(existing);
+    }
+    let mut guard = shards.write().expect("shards poisoned");
+    Arc::clone(
+        guard
+            .entry(shard.to_string())
+            .or_insert_with(|| Arc::new(RingShard::new())),
+    )
+}
+
+/// Derive the resource-type root prefix a write's ring/deletion_log entry belongs to (e.g.
+/// `/registry/pods/` or `/registry/apps/deployments/`) — the same string
+/// `keys::group_list_prefix(group, plural, None)` produces in the apiserver crate, since both
+/// derive from the exact same {group, plural} identity for a given key.
+///
+/// Takes `ns` (the object's namespace, already tracked in the `objects.ns` column / parsed from
+/// `metadata.namespace` for every write) rather than requiring every caller of `put`/`delete`/
+/// `create_if_namespace_active` to separately pass its {group, plural} down: a namespaced key
+/// always ends in `.../<namespace>/<name>` and a cluster-scoped key always ends in `.../<name>`
+/// regardless of how many segments precede it (core vs. non-core group), so knowing only whether
+/// the object is namespaced is enough to strip exactly the right number of trailing segments —
+/// without it, a bare 3-segment key is genuinely ambiguous (e.g. "/registry/pods/default/" could
+/// be a core resource "pods" in namespace "default", or a cluster-scoped resource "default" in
+/// group "pods"). Threading {group, plural} through instead would touch every one of the ~500
+/// call sites across the apiserver crate that write directly via a concrete `Store`, most of
+/// them test fixtures, for the same resulting shard string.
+fn shard_key(key: &str, ns: Option<&str>) -> String {
+    let segments_to_strip = if ns.is_some() { 2 } else { 1 };
+    let mut root = key;
+    for _ in 0..segments_to_strip {
+        root = root.rsplit_once('/').map_or(root, |(head, _)| head);
+    }
+    format!("{root}/")
+}
+
+/// Find the shard whose resource-type root is a prefix of `prefix` — i.e. the one shard a watch
+/// opened on `prefix` can ever match. A watch prefix is always either exactly a shard's root
+/// (cluster-scoped, or "all namespaces" of a namespaced type) or that root plus one namespace
+/// segment, so the longest matching shard key is the unambiguous, unique match; `None` means
+/// that resource type has never been written to, so there is nothing to replay.
+fn find_shard(shards: &HashMap<String, Arc<RingShard>>, prefix: &str) -> Option<Arc<RingShard>> {
+    shards
+        .iter()
+        .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
+        .max_by_key(|(shard, _)| shard.len())
+        .map(|(_, shard)| Arc::clone(shard))
 }
 
 fn open_conn(path: &str) -> Result<Connection> {
@@ -350,14 +459,17 @@ fn semantically_equal_ignoring_resource_version(new_value: &[u8], stored_value: 
 }
 
 // Full write procedure — runs inside spawn_blocking.
-// Returns (new_revision, stamped_value, is_create, is_noop).
+// Returns (new_revision, stamped_value, is_create, is_noop, ns). `ns` is the object's
+// `metadata.namespace` (used by the caller to derive its ring/deletion_log shard — see
+// `shard_key`); it is `None` in the `is_noop` case since callers skip sharding a suppressed
+// write entirely.
 fn put_sync(
     conn: &Connection,
     key: &str,
     value: Bytes,
     expected_revision: Option<u64>,
     last_written: &AtomicU64,
-) -> Result<(u64, Bytes, bool, bool)> {
+) -> Result<(u64, Bytes, bool, bool, Option<String>)> {
     // 1. Begin exclusive write transaction.
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
@@ -428,6 +540,7 @@ fn put_sync(
                 Bytes::from(existing_value.clone()),
                 false,
                 true,
+                None,
             ));
         }
     }
@@ -470,32 +583,36 @@ fn put_sync(
     // load a stale last_written_revision from the async task queue — causing the list
     // guard to miss the stale-read and return an older resourceVersion to the reflector.
     last_written.fetch_max(new_revision, Ordering::Release);
-    Ok((new_revision, stamped_value, is_create, false))
+    Ok((new_revision, stamped_value, is_create, false, ns))
 }
 
+// Returns (new_revision, last_value, ns) — `ns` (the deleted object's `metadata.namespace`,
+// read back from the `objects.ns` column rather than re-parsed from `last_value`) is used by the
+// caller to derive its ring/deletion_log shard — see `shard_key`.
 fn delete_sync(
     conn: &Connection,
     key: &str,
     expected_revision: Option<u64>,
     last_written: &AtomicU64,
-) -> Result<(u64, Bytes)> {
+) -> Result<(u64, Bytes, Option<String>)> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    let stored: Option<(u64, Vec<u8>)> = conn
+    let stored: Option<(u64, Vec<u8>, Option<String>)> = conn
         .query_row(
-            "SELECT revision, value FROM objects WHERE key = ?1",
+            "SELECT revision, value, ns FROM objects WHERE key = ?1",
             params![key],
             |r| {
                 Ok((
                     r.get::<_, i64>(0).map(|v| v as u64)?,
                     r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
                 ))
             },
         )
         .optional()?;
 
     // Optimistic concurrency check (same logic as put).
-    match stored.as_ref().map(|(rv, _)| *rv) {
+    match stored.as_ref().map(|(rv, _, _)| *rv) {
         None => {
             conn.execute_batch("ROLLBACK")?;
             return Err(StoreError::NotFound {
@@ -517,7 +634,8 @@ fn delete_sync(
         }
     }
 
-    let last_value = Bytes::from(stored.unwrap().1);
+    let (_, value_bytes, ns) = stored.unwrap();
+    let last_value = Bytes::from(value_bytes);
 
     conn.execute(
         "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
@@ -535,7 +653,7 @@ fn delete_sync(
     // immediately after COMMIT so the list guard sees it before any reader can observe
     // the new WAL state from a concurrent read connection.
     last_written.fetch_max(new_revision, Ordering::Release);
-    Ok((new_revision, last_value))
+    Ok((new_revision, last_value, ns))
 }
 
 /// Atomically check `ns_key`'s `status.phase` and, only if it is not `"Terminating"`,
@@ -545,13 +663,15 @@ fn delete_sync(
 /// `delete_namespace`'s Terminating write) can never land between this function's read of
 /// `ns_key` and its insert at `key`: the two operations either fully precede or fully follow
 /// each other, never interleave.
+// Returns (new_revision, stamped_value, ns) — `ns` is used by the caller to derive its
+// ring/deletion_log shard (see `shard_key`).
 fn create_if_namespace_active_sync(
     conn: &Connection,
     ns_key: Option<&str>,
     key: &str,
     value: Bytes,
     last_written: &AtomicU64,
-) -> std::result::Result<(u64, Bytes), CreateNamespacedError> {
+) -> std::result::Result<(u64, Bytes, Option<String>), CreateNamespacedError> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     if let Some(ns_key) = ns_key {
@@ -609,7 +729,7 @@ fn create_if_namespace_active_sync(
 
     conn.execute_batch("COMMIT")?;
     last_written.fetch_max(new_revision, Ordering::Release);
-    Ok((new_revision, stamped_value))
+    Ok((new_revision, stamped_value, ns))
 }
 
 /// Delete all objects in a namespace atomically.
@@ -1056,13 +1176,12 @@ impl Store for SqliteStore {
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
-        let ring = Arc::clone(&self.ring);
-        let deletion_log = Arc::clone(&self.deletion_log);
+        let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let start = std::time::Instant::now();
         let (revision, is_noop, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let (revision, stamped_value, is_create, is_noop) =
+            let (revision, stamped_value, is_create, is_noop, ns) =
                 put_sync(&conn, &key_str, value, expected_revision, &last_written)?;
             // Skip the broadcast entirely for no-op writes: no revision was bumped and no
             // storage mutation happened, so notifying watchers would be a phantom MODIFIED
@@ -1071,10 +1190,11 @@ impl Store for SqliteStore {
             // push_event_locked's doc comment for why this ordering matters under concurrent
             // writers.
             if !is_noop {
+                let shard = shard_key(&key_str, ns.as_deref());
                 push_event_locked(
                     &tx,
-                    &ring,
-                    &deletion_log,
+                    &shards,
+                    &shard,
                     &compaction_horizon,
                     Arc::new(InternalEvent {
                         key: key_str,
@@ -1111,13 +1231,12 @@ impl Store for SqliteStore {
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
-        let ring = Arc::clone(&self.ring);
-        let deletion_log = Arc::clone(&self.deletion_log);
+        let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let start = std::time::Instant::now();
         let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let (revision, stamped_value) = create_if_namespace_active_sync(
+            let (revision, stamped_value, ns) = create_if_namespace_active_sync(
                 &conn,
                 ns_key_owned.as_deref(),
                 &key_str,
@@ -1129,10 +1248,11 @@ impl Store for SqliteStore {
             // create is always a fresh key (create-only, gated on AlreadyExists above), so
             // is_create is unconditionally true here — unlike put's no-op suppression, there is
             // no case where this write should be silently absorbed.
+            let shard = shard_key(&key_str, ns.as_deref());
             push_event_locked(
                 &tx,
-                &ring,
-                &deletion_log,
+                &shards,
+                &shard,
                 &compaction_horizon,
                 Arc::new(InternalEvent {
                     key: key_str,
@@ -1156,20 +1276,20 @@ impl Store for SqliteStore {
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
-        let ring = Arc::clone(&self.ring);
-        let deletion_log = Arc::clone(&self.deletion_log);
+        let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let start = std::time::Instant::now();
         let (revision, last_value) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let (revision, last_value) =
+            let (revision, last_value, ns) =
                 delete_sync(&conn, &key_str, expected_revision, &last_written)?;
             // Broadcast while still holding write_conn's guard — see push_event_locked's
             // doc comment for why this ordering matters under concurrent writers.
+            let shard = shard_key(&key_str, ns.as_deref());
             push_event_locked(
                 &tx,
-                &ring,
-                &deletion_log,
+                &shards,
+                &shard,
                 &compaction_horizon,
                 Arc::new(InternalEvent {
                     key: key_str,
@@ -1220,8 +1340,7 @@ impl Store for SqliteStore {
         let ns = namespace.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
-        let ring = Arc::clone(&self.ring);
-        let deletion_log = Arc::clone(&self.deletion_log);
+        let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let keys = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -1229,12 +1348,18 @@ impl Store for SqliteStore {
             let keys: Vec<String> = deleted.iter().map(|(k, _, _)| k.clone()).collect();
             // Broadcast each tombstone while still holding write_conn's guard — see
             // push_event_locked's doc comment for why this ordering matters under
-            // concurrent writers.
+            // concurrent writers. This single namespace delete fans out across every resource
+            // type the namespace ever held (pods, secrets, deployments, ...), so — unlike
+            // put/delete/create_if_namespace_active, which each write exactly one key — there is
+            // no single shard for the whole call; each deleted object routes to its own shard
+            // individually, derived from its own key (every row here is namespaced by
+            // construction, via `WHERE ns = ?1` in `delete_namespace_sync`).
             for (key, body, revision) in deleted {
+                let shard = shard_key(&key, Some(&ns));
                 push_event_locked(
                     &tx,
-                    &ring,
-                    &deletion_log,
+                    &shards,
+                    &shard,
                     &compaction_horizon,
                     Arc::new(InternalEvent {
                         key,
@@ -1262,14 +1387,23 @@ impl Store for SqliteStore {
 
         let horizon = self.compaction_horizon.load(Ordering::Relaxed);
 
+        // A namespace-scoped `prefix` is always this resource type's root plus one namespace
+        // segment, and a cluster-scoped/all-namespaces `prefix` is exactly the root — either way
+        // `prefix` matches at most one shard. `None` means this resource type has never been
+        // written to, so there is nothing to replay.
+        let shard = find_shard(&self.shards.read().expect("shards poisoned"), prefix);
+
         // Collect ring buffer snapshot while holding read lock (std::sync::RwLock — synchronous).
-        let replayed: Vec<Arc<InternalEvent>> = {
-            let guard = self.ring.read().expect("ring poisoned");
-            guard
-                .iter()
-                .filter(|e| e.key.starts_with(prefix) && e.revision > from_revision)
-                .cloned()
-                .collect()
+        let replayed: Vec<Arc<InternalEvent>> = match &shard {
+            Some(shard) => {
+                let guard = shard.ring.read().expect("ring poisoned");
+                guard
+                    .iter()
+                    .filter(|e| e.key.starts_with(prefix) && e.revision > from_revision)
+                    .cloned()
+                    .collect()
+            }
+            None => Vec::new(),
         };
 
         tracing::debug!(
@@ -1286,9 +1420,11 @@ impl Store for SqliteStore {
         // Captured for lag recovery: allows re-subscribing and re-scanning ring buffer
         // without terminating the stream when the broadcast channel lags transiently.
         let tx_clone = self.tx.clone();
-        let ring_arc = Arc::clone(&self.ring);
-        // Captured to replay deletion tombstones that survived compaction of the main ring.
-        let deletion_log_arc = Arc::clone(&self.deletion_log);
+        // Re-resolved (via `find_shard`) on every use inside the stream below, rather than
+        // reusing the `shard` computed above, so a watch opened before this resource type's
+        // first-ever write still recovers correctly if that write (and its shard) arrives later
+        // in the stream's lifetime.
+        let shards_arc = Arc::clone(&self.shards);
 
         let stream = async_stream::stream! {
             // Yield compacted event if from_revision is before the horizon.
@@ -1299,13 +1435,19 @@ impl Store for SqliteStore {
             // watcher that waits for a DELETED event for an object deleted in the compaction window.
             if from_revision > 0 && from_revision < horizon {
                 let tombstones: Vec<Arc<InternalEvent>> = {
-                    let guard = deletion_log_arc.read().expect("deletion_log poisoned");
-                    guard
-                        .by_key
-                        .values()
-                        .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
-                        .cloned()
-                        .collect()
+                    let shards_guard = shards_arc.read().expect("shards poisoned");
+                    match find_shard(&shards_guard, &prefix_owned) {
+                        Some(shard) => {
+                            let guard = shard.deletion_log.read().expect("deletion_log poisoned");
+                            guard
+                                .by_key
+                                .values()
+                                .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
+                                .cloned()
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    }
                 };
                 for tombstone in &tombstones {
                     yield internal_to_watch(tombstone);
@@ -1427,19 +1569,25 @@ impl Store for SqliteStore {
                         // Timed separately from the `for event in &catchup { yield ... }` loop
                         // below: `yield` inside this generator suspends on the consumer's poll
                         // rate (backpressure), which would fold client-drain latency into this
-                        // measurement. This histogram exists to isolate the O(ring) scan itself
-                        // — the part that runs synchronously while holding `ring_arc`'s read
-                        // lock and blocks whichever tokio worker is polling this stream.
+                        // measurement. This histogram exists to isolate the O(shard-ring) scan
+                        // itself — the part that runs synchronously while holding the shard's
+                        // ring read lock and blocks whichever tokio worker is polling this stream.
                         let recovery_scan_started = std::time::Instant::now();
                         let catchup: Vec<Arc<InternalEvent>> = {
-                            let guard = ring_arc.read().expect("ring poisoned");
-                            guard
-                                .iter()
-                                .filter(|e| {
-                                    e.key.starts_with(&prefix_owned) && e.revision > last_replayed
-                                })
-                                .cloned()
-                                .collect()
+                            let shards_guard = shards_arc.read().expect("shards poisoned");
+                            match find_shard(&shards_guard, &prefix_owned) {
+                                Some(shard) => {
+                                    let guard = shard.ring.read().expect("ring poisoned");
+                                    guard
+                                        .iter()
+                                        .filter(|e| {
+                                            e.key.starts_with(&prefix_owned) && e.revision > last_replayed
+                                        })
+                                        .cloned()
+                                        .collect()
+                                }
+                                None => Vec::new(),
+                            }
                         };
                         crate::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
                             .with_label_values(&[crate::metrics::prefix_bucket(&prefix_owned)])
@@ -1480,16 +1628,23 @@ impl Store for SqliteStore {
                             // started is delivered before Compacted. The client relists after
                             // Compacted anyway, so a pre-Compacted duplicate DELETED is harmless.
                             let tombstones: Vec<Arc<InternalEvent>> = {
-                                let guard = deletion_log_arc.read().expect("deletion_log poisoned");
-                                guard
-                                    .by_key
-                                    .values()
-                                    .filter(|e| {
-                                        e.key.starts_with(&prefix_owned)
-                                            && e.revision > from_revision
-                                    })
-                                    .cloned()
-                                    .collect()
+                                let shards_guard = shards_arc.read().expect("shards poisoned");
+                                match find_shard(&shards_guard, &prefix_owned) {
+                                    Some(shard) => {
+                                        let guard =
+                                            shard.deletion_log.read().expect("deletion_log poisoned");
+                                        guard
+                                            .by_key
+                                            .values()
+                                            .filter(|e| {
+                                                e.key.starts_with(&prefix_owned)
+                                                    && e.revision > from_revision
+                                            })
+                                            .cloned()
+                                            .collect()
+                                    }
+                                    None => Vec::new(),
+                                }
                             };
                             for tombstone in &tombstones {
                                 last_replayed = last_replayed.max(tombstone.revision);
@@ -1614,23 +1769,29 @@ mod tests {
         // push_event for svc-a (rv=1).
         // BUG:   broadcasts event(svc-a,rv=1) + bookmark(rv=2)  [reads last_written_revision=2]
         // FIX:   broadcasts event(svc-a,rv=1) + bookmark(rv=1)  [uses event.revision]
-        store.push_event(Arc::new(InternalEvent {
-            key: "/registry/services/default/svc-a".into(),
-            revision: 1,
-            value: Some(svc_value("svc-a", 1)),
-            is_create: true,
-            deleted_body: None,
-        }));
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: "/registry/services/default/svc-a".into(),
+                revision: 1,
+                value: Some(svc_value("svc-a", 1)),
+                is_create: true,
+                deleted_body: None,
+            }),
+            Some("default"),
+        );
 
         // push_event for svc-b (rv=2) — the concurrent write.
         // Broadcasts event(svc-b,rv=2) + bookmark(rv=2).
-        store.push_event(Arc::new(InternalEvent {
-            key: "/registry/services/default/svc-b".into(),
-            revision: 2,
-            value: Some(svc_value("svc-b", 2)),
-            is_create: true,
-            deleted_body: None,
-        }));
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: "/registry/services/default/svc-b".into(),
+                revision: 2,
+                value: Some(svc_value("svc-b", 2)),
+                is_create: true,
+                deleted_body: None,
+            }),
+            Some("default"),
+        );
 
         // Collect Added events for a short window.
         // With BUG:  watcher sees event(svc-a,rv=1)→Added, bookmark(rv=2)→last_replayed=2,
@@ -1799,7 +1960,6 @@ mod tests {
     /// Without the fix: get() returns None directly → assertion fails → test fails on revert.
     #[tokio::test(flavor = "multi_thread")]
     async fn get_returns_some_when_stale_read_snapshot_misses_creation() {
-        use std::collections::VecDeque;
         use std::sync::RwLock;
         use tokio::sync::broadcast;
 
@@ -1854,8 +2014,7 @@ mod tests {
             write_conn,
             read_conn,
             tx,
-            ring: Arc::new(RwLock::new(VecDeque::new())),
-            deletion_log: Arc::new(RwLock::new(DeletionLog::default())),
+            shards: Arc::new(RwLock::new(HashMap::new())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
         };
@@ -2054,13 +2213,16 @@ mod tests {
         // trivially passing at whatever RING_CAPACITY happens to be set to.
         const PAST_OLD_CAPACITY: u64 = 5_000;
         for i in 0..PAST_OLD_CAPACITY {
-            store.push_event(Arc::new(InternalEvent {
-                key: format!("/registry/core/configmaps/default/cm-{i}"),
-                revision: i + 1,
-                value: Some(svc_value(&format!("cm-{i}"), i + 1)),
-                is_create: true,
-                deleted_body: None,
-            }));
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/configmaps/default/cm-{i}"),
+                    revision: i + 1,
+                    value: Some(svc_value(&format!("cm-{i}"), i + 1)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
         }
 
         assert_eq!(
@@ -2071,7 +2233,8 @@ mod tests {
              16-way conformance load; a nonzero horizon here means the ring is evicting far \
              too early again, reintroducing the premature-410 bug mayor-jzlon fixes"
         );
-        let guard = store.ring.read().expect("ring poisoned");
+        let shard = store.shard_for_test("/registry/core/configmaps/default/cm-0", Some("default"));
+        let guard = shard.ring.read().expect("ring poisoned");
         assert_eq!(
             guard.len(),
             PAST_OLD_CAPACITY as usize,
@@ -2099,17 +2262,22 @@ mod tests {
         // Push exactly RING_CAPACITY + 1 events so eviction fires exactly once, on the final
         // push. Revisions are assigned 1..=RING_CAPACITY+1 in insertion order.
         for i in 0..=RING_CAPACITY as u64 {
-            store.push_event(Arc::new(InternalEvent {
-                key: format!("/registry/core/configmaps/default/cm-{i}"),
-                revision: i + 1,
-                value: Some(svc_value(&format!("cm-{i}"), i + 1)),
-                is_create: true,
-                deleted_body: None,
-            }));
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/configmaps/default/cm-{i}"),
+                    revision: i + 1,
+                    value: Some(svc_value(&format!("cm-{i}"), i + 1)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
         }
 
         {
-            let guard = store.ring.read().expect("ring poisoned");
+            let shard =
+                store.shard_for_test("/registry/core/configmaps/default/cm-0", Some("default"));
+            let guard = shard.ring.read().expect("ring poisoned");
             assert_eq!(
                 guard.len(),
                 RING_CAPACITY,
@@ -2158,16 +2326,20 @@ mod tests {
 
         const OVERFLOW: u64 = 100;
         for i in 0..(RING_CAPACITY as u64 + OVERFLOW) {
-            store.push_event(Arc::new(InternalEvent {
-                key: format!("/registry/core/configmaps/default/cm-{i}"),
-                revision: i + 1,
-                value: Some(svc_value(&format!("cm-{i}"), i + 1)),
-                is_create: true,
-                deleted_body: None,
-            }));
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/configmaps/default/cm-{i}"),
+                    revision: i + 1,
+                    value: Some(svc_value(&format!("cm-{i}"), i + 1)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
         }
 
-        let guard = store.ring.read().expect("ring poisoned");
+        let shard = store.shard_for_test("/registry/core/configmaps/default/cm-0", Some("default"));
+        let guard = shard.ring.read().expect("ring poisoned");
         assert_eq!(
             guard.len(),
             RING_CAPACITY,
@@ -2209,7 +2381,8 @@ mod tests {
         store.delete(key, None).await.expect("delete must succeed");
 
         {
-            let guard = store.deletion_log.read().expect("deletion_log poisoned");
+            let shard = store.shard_for_test(key, None);
+            let guard = shard.deletion_log.read().expect("deletion_log poisoned");
             assert!(
                 guard.by_key.contains_key(key),
                 "deletion_log must contain tombstone for deleted key; test setup broken"
@@ -2223,7 +2396,8 @@ mod tests {
             .expect("recreate must succeed");
 
         {
-            let guard = store.deletion_log.read().expect("deletion_log poisoned");
+            let shard = store.shard_for_test(key, None);
+            let guard = shard.deletion_log.read().expect("deletion_log poisoned");
             assert!(
                 !guard.by_key.contains_key(key),
                 "deletion_log must NOT retain tombstone after key is re-created; retaining it \
@@ -2263,7 +2437,8 @@ mod tests {
             store.put(&key, val, None).await.expect("put must succeed");
         }
 
-        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        let shard = store.shard_for_test("/registry/core/namespaces/ns-0", None);
+        let guard = shard.deletion_log.read().expect("deletion_log poisoned");
         for i in 0..5u32 {
             let key = format!("/registry/core/namespaces/ns-{i}");
             assert!(
@@ -2306,16 +2481,20 @@ mod tests {
             } else {
                 (format!("/registry/core/namespaces/ns-{i}"), (i as u64) + 1)
             };
-            store.push_event(Arc::new(InternalEvent {
-                key,
-                revision,
-                value: None,
-                is_create: false,
-                deleted_body: None,
-            }));
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key,
+                    revision,
+                    value: None,
+                    is_create: false,
+                    deleted_body: None,
+                }),
+                None,
+            );
         }
 
-        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        let shard = store.shard_for_test(&victim_key, None);
+        let guard = shard.deletion_log.read().expect("deletion_log poisoned");
         assert_eq!(
             guard.by_key.len(),
             DELETION_LOG_CAP,
@@ -2347,24 +2526,30 @@ mod tests {
         let recreated_key = "/registry/core/namespaces/recreate-me".to_string();
 
         // 1. Tombstone "recreate-me" at the lowest possible revision (0).
-        store.push_event(Arc::new(InternalEvent {
-            key: recreated_key.clone(),
-            revision: 0,
-            value: None,
-            is_create: false,
-            deleted_body: None,
-        }));
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: recreated_key.clone(),
+                revision: 0,
+                value: None,
+                is_create: false,
+                deleted_body: None,
+            }),
+            None,
+        );
 
         // 2. Recreate it — must evict the tombstone from both by_key and by_revision.
-        store.push_event(Arc::new(InternalEvent {
-            key: recreated_key.clone(),
-            revision: 1,
-            value: Some(Bytes::from(
-                r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"recreate-me"}}"#,
-            )),
-            is_create: true,
-            deleted_body: None,
-        }));
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: recreated_key.clone(),
+                revision: 1,
+                value: Some(Bytes::from(
+                    r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"recreate-me"}}"#,
+                )),
+                is_create: true,
+                deleted_body: None,
+            }),
+            None,
+        );
 
         // 3. Push DELETION_LOG_CAP + 1 fresh tombstones, all at revisions strictly above the
         // stale revision=0 left behind by step 1 if the index were desynced. The lowest
@@ -2373,16 +2558,20 @@ mod tests {
         const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
         let true_victim = "/registry/core/namespaces/ns-0".to_string();
         for i in 0..=DELETION_LOG_CAP {
-            store.push_event(Arc::new(InternalEvent {
-                key: format!("/registry/core/namespaces/ns-{i}"),
-                revision: (i as u64) + 2,
-                value: None,
-                is_create: false,
-                deleted_body: None,
-            }));
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/namespaces/ns-{i}"),
+                    revision: (i as u64) + 2,
+                    value: None,
+                    is_create: false,
+                    deleted_body: None,
+                }),
+                None,
+            );
         }
 
-        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        let shard = store.shard_for_test(&true_victim, None);
+        let guard = shard.deletion_log.read().expect("deletion_log poisoned");
         assert_eq!(
             guard.by_key.len(),
             DELETION_LOG_CAP,
@@ -3345,6 +3534,301 @@ mod tests {
              no follow-up write — a debounce that only flushes when the next event arrives \
              would leave this watcher's bookmark, and every other watcher's informer sync RV, \
              stuck below the burst's last write forever on a cluster that goes quiet afterward"
+        );
+    }
+
+    // --- Ring/deletion_log sharding by resource-type prefix ---
+    //
+    // A watch stream's *delivered* events are identical whether the ring is sharded or not:
+    // both the old single-ring implementation and the new per-shard one filter every candidate
+    // event by `e.key.starts_with(prefix)` before ever yielding it, so a pure "does the wrong
+    // object show up in my watch stream" test cannot distinguish them — it would pass
+    // unmodified even if this whole sharding pass were reverted. What sharding actually changes
+    // is (a) which physical `RingShard` a write's event and eviction land in, and (b) how many
+    // entries a watch-open/Lagged-recovery scan has to walk to find its own prefix's events.
+    // The tests below target those two properties directly instead.
+
+    /// Two different resource types' events must land in two distinct `RingShard` instances,
+    /// each holding only its own resource type's events.
+    ///
+    /// Why it matters: the entire premise of per-resource-type retention isolation (a busy
+    /// type's writes can no longer evict a quiet type's history) depends on writes for
+    /// different resource types never sharing one physical ring. Fails on revert: unsharding
+    /// (back to one global `ring` field) removes `SqliteStore::shards`/`RingShard` entirely, so
+    /// this test would not even compile against the old design — and if instead the shard key
+    /// were computed wrong (e.g. always the same string), `Arc::ptr_eq` below would trip and
+    /// `pods_shard.ring`'s length would be 2, not 1.
+    #[tokio::test]
+    async fn writes_to_different_resource_types_land_in_different_shards() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        store
+            .put(
+                "/registry/core/pods/default/pod-a",
+                Bytes::from(
+                    r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod-a","namespace":"default"}}"#,
+                ),
+                None,
+            )
+            .await
+            .expect("put pod-a");
+        store
+            .put(
+                "/registry/core/configmaps/default/cm-a",
+                Bytes::from(
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-a","namespace":"default"}}"#,
+                ),
+                None,
+            )
+            .await
+            .expect("put cm-a");
+
+        let pods_shard = store.shard_for_test("/registry/core/pods/default/pod-a", Some("default"));
+        let configmaps_shard =
+            store.shard_for_test("/registry/core/configmaps/default/cm-a", Some("default"));
+
+        assert!(
+            !Arc::ptr_eq(&pods_shard, &configmaps_shard),
+            "Pods and ConfigMaps must resolve to two distinct RingShard instances; if both \
+             prefixes hashed to the same shard key, this whole sharding pass would collapse \
+             back into a single ring shared by every resource type"
+        );
+
+        let pods_ring = pods_shard.ring.read().expect("ring poisoned");
+        assert_eq!(
+            pods_ring.len(),
+            1,
+            "the Pods shard must contain exactly pod-a's own event; a length of 2 here would \
+             mean cm-a's event also landed in this shard — i.e. the two resource types are \
+             still sharing one physical ring"
+        );
+        assert_eq!(
+            pods_ring.front().expect("must have an entry").key,
+            "/registry/core/pods/default/pod-a"
+        );
+    }
+
+    /// A busy resource type overflowing its own `RING_CAPACITY` must NOT evict a different,
+    /// quiet resource type's events — each shard's capacity must be independent.
+    ///
+    /// Why it matters: this is the exact mechanism `RingShard`'s doc describes — before
+    /// sharding, Pods (writing far more often than e.g. Namespaces) could push a Namespace's
+    /// watch history out of a shared ring long before Namespaces itself ever came close to
+    /// `RING_CAPACITY`. Fails on revert (shared capacity): pushing `RING_CAPACITY + 1` Pod
+    /// events onto ONE shared ring that already held the Namespace event would evict that
+    /// Namespace event on the very last push (global len exceeds `RING_CAPACITY`), and the
+    /// assertion below (`quiet_ring.len() == 1`) would fail.
+    #[tokio::test]
+    async fn shard_capacity_is_independent_per_resource_type() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // One event on a quiet resource type (namespaces), pushed first.
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: "/registry/core/namespaces/quiet-ns".into(),
+                revision: 1,
+                value: Some(Bytes::from(
+                    r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"quiet-ns"}}"#,
+                )),
+                is_create: true,
+                deleted_body: None,
+            }),
+            None,
+        );
+
+        // A busy resource type (pods) alone overflows RING_CAPACITY.
+        for i in 0..=RING_CAPACITY as u64 {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/pods/default/pod-{i}"),
+                    revision: i + 2,
+                    value: Some(svc_value(&format!("pod-{i}"), i + 2)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        let quiet_shard = store.shard_for_test("/registry/core/namespaces/quiet-ns", None);
+        let quiet_ring = quiet_shard.ring.read().expect("ring poisoned");
+        assert_eq!(
+            quiet_ring.len(),
+            1,
+            "the namespaces shard must still hold its one event after the pods shard alone \
+             absorbed RING_CAPACITY+1 writes; a length of 0 here means the pods writes evicted \
+             it — i.e. the two resource types are still sharing one ring's eviction budget"
+        );
+    }
+
+    /// Opening a watch must only ever read the ONE shard matching its own prefix — never the
+    /// combined occupancy of every resource type in the store.
+    ///
+    /// Why it matters: `find_shard` resolves a watch's prefix to exactly one `Arc<RingShard>`
+    /// before the replay scan runs (see `watch()`), and every `.iter()` call in the replay/
+    /// Lagged-recovery paths only ever walks that one shard's `ring`. This test proves that
+    /// path stays correct — and stays bounded by one small shard — even while five OTHER
+    /// resource types combined hold 5x `RING_CAPACITY` events. Fails on revert (single global
+    /// ring, prefix-filtered scan): `shard_for_test` (and `RingShard`/`shards` it depends on)
+    /// would not exist, so this test would not compile; a real linear-scan revert would also
+    /// have to walk all 50,005 entries below on every watch-open, the exact O(ring-size) cost
+    /// this sharding pass exists to eliminate — this test's five busy resource types stand in
+    /// for that combined occupancy.
+    #[tokio::test]
+    async fn watch_open_replay_only_scans_its_own_shard() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Five OTHER resource types, RING_CAPACITY events each — none of them share a shard
+        // with the resource type this test actually watches.
+        const OTHER_TYPES: u64 = 5;
+        for t in 0..OTHER_TYPES {
+            for i in 0..RING_CAPACITY as u64 {
+                store.push_event(
+                    Arc::new(InternalEvent {
+                        key: format!("/registry/core/busytype{t}/default/obj-{i}"),
+                        revision: t * RING_CAPACITY as u64 + i + 1,
+                        value: Some(svc_value("obj", i + 1)),
+                        is_create: true,
+                        deleted_body: None,
+                    }),
+                    Some("default"),
+                );
+            }
+        }
+
+        // The watched resource type has only 5 events of its own.
+        const QUIET_EVENTS: u64 = 5;
+        let base_rev = OTHER_TYPES * RING_CAPACITY as u64;
+        for i in 0..QUIET_EVENTS {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/quiettype/default/obj-{i}"),
+                    revision: base_rev + i + 1,
+                    value: Some(svc_value("obj", base_rev + i + 1)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        let quiet_shard =
+            store.shard_for_test("/registry/core/quiettype/default/obj-0", Some("default"));
+        let quiet_shard_len = quiet_shard.ring.read().expect("ring poisoned").len();
+        assert_eq!(
+            quiet_shard_len, QUIET_EVENTS as usize,
+            "quiettype's own shard must hold exactly its own 5 events, decoupled from the \
+             50_000 events pushed to the other five resource types"
+        );
+
+        let stream = store
+            .watch("/registry/core/quiettype/", 0)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let mut replayed = 0u64;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while replayed < QUIET_EVENTS {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Added(_))) => replayed += 1,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            replayed,
+            QUIET_EVENTS,
+            "watch-open replay on quiettype must deliver exactly its own 5 events even though \
+             50_000 events exist for other resource types — proving the scan that produced them \
+             was bounded by quiettype's own shard ({quiet_shard_len} entries), not the store's \
+             combined occupancy ({} entries)",
+            OTHER_TYPES * RING_CAPACITY as u64 + QUIET_EVENTS
+        );
+    }
+
+    /// The shared `compaction_horizon` atomic must use `fetch_max`, not a plain `store`, when a
+    /// shard evicts — otherwise a quieter shard's later, lower-revision eviction would regress
+    /// the horizon backward after a busier shard already advanced it past that point.
+    ///
+    /// Why it matters: `compaction_horizon()` is intentionally one process-wide value shared by
+    /// every shard (see its field doc on `SqliteStore`) — the HTTP layer's eager pre-watch 410
+    /// check reads it before it knows which shard a watch belongs to. If it could regress, a
+    /// client could be told a resourceVersion is still valid ("not expired") after the shard
+    /// that actually holds it has already evicted it from its ring, so a subsequent replay would
+    /// silently skip events instead of correctly returning `WatchEvent::Compacted`.
+    ///
+    /// Fails on revert (plain `.store()`): quiettype's first-ever eviction below evicts its own
+    /// revision=1 event — far below the horizon the busy shard already set — and a plain store
+    /// would overwrite the horizon back down to that low value.
+    #[tokio::test]
+    async fn compaction_horizon_never_regresses_when_a_quieter_shard_evicts_after_a_busier_one() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // 1. A quiet resource type gets a handful of low-revision events first — well under
+        //    RING_CAPACITY, so none of them are evicted yet.
+        const QUIET_SEED: u64 = 100;
+        for i in 0..QUIET_SEED {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/quiettype/default/obj-{i}"),
+                    revision: i + 1,
+                    value: Some(svc_value("obj", i + 1)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        // 2. A busy resource type then fills past 2x RING_CAPACITY, evicting repeatedly and
+        //    advancing compaction_horizon to a revision far higher than quiettype's own
+        //    still-unevicted revision=1.
+        let mut next_rev = QUIET_SEED + 1;
+        for _ in 0..=(2 * RING_CAPACITY as u64) {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/busytype/default/obj-{next_rev}"),
+                    revision: next_rev,
+                    value: Some(svc_value("obj", next_rev)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+            next_rev += 1;
+        }
+        let horizon_after_busy_shard = store.compaction_horizon();
+        assert!(
+            horizon_after_busy_shard > QUIET_SEED,
+            "test setup: the busy shard must have advanced the horizon well past quiettype's \
+             still-unevicted revisions (1..={QUIET_SEED})"
+        );
+
+        // 3. The quiet resource type NOW overflows RING_CAPACITY for the first time, evicting
+        //    its own oldest entry (revision=1) — far below the horizon already established.
+        for _ in 0..(RING_CAPACITY as u64 - QUIET_SEED + 1) {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/quiettype/default/obj-{next_rev}"),
+                    revision: next_rev,
+                    value: Some(svc_value("obj", next_rev)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+            next_rev += 1;
+        }
+
+        assert!(
+            store.compaction_horizon() >= horizon_after_busy_shard,
+            "compaction_horizon must never regress below a value it already reached \
+             ({horizon_after_busy_shard}); quiettype's own first eviction (of its revision=1 \
+             event, far below that value) must not overwrite it — a plain `.store()` instead of \
+             `fetch_max` would let this quieter shard's low-revision eviction silently un-expire \
+             revisions the busy shard's ring has already discarded"
         );
     }
 }
