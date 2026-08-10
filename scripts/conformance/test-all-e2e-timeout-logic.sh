@@ -42,7 +42,7 @@ assert() {
 # ---------------------------------------------------------------------------
 build_sonobuoy_args() {
   local focus="$1" all_e2e="$2" timeout_secs="$3"
-  local base="run --plugin e2e --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
+  local base="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
   if [ -n "$focus" ]; then
     echo "$base --e2e-focus=$focus"
   elif [ "$all_e2e" -eq 1 ]; then
@@ -56,7 +56,7 @@ build_sonobuoy_args() {
 # no timeout flag at all, so sonobuoy's own 6h default silently applied.
 build_sonobuoy_args_old_buggy() {
   local focus="$1" all_e2e="$2"
-  local base="run --plugin e2e --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
+  local base="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
   if [ -n "$focus" ]; then
     echo "$base --e2e-focus=$focus"
   elif [ "$all_e2e" -eq 1 ]; then

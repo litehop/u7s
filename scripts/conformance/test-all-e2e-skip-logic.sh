@@ -74,7 +74,7 @@ build_filter_args() {
 
 build_sonobuoy_args() {
   local focus="$1" all_e2e="$2" unsafe_focus="${3:-0}"
-  local base="run --plugin e2e --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
+  local base="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
   if [ -n "$focus" ]; then
     local apply=1
     [ "$unsafe_focus" -eq 1 ] && apply=0
@@ -91,7 +91,7 @@ build_sonobuoy_args() {
 # they also carried [Conformance].
 build_sonobuoy_args_old_buggy() {
   local focus="$1" all_e2e="$2"
-  local base="run --plugin e2e --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
+  local base="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 --kubeconfig /tmp/sonobuoy-kubeconfig"
   if [ -n "$focus" ]; then
     echo "$base --e2e-focus=$focus"
   elif [ "$all_e2e" -eq 1 ]; then
