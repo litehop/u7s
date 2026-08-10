@@ -2017,6 +2017,26 @@ fn gen_typed_object_reference_to_json(r: core_v1::TypedObjectReference) -> serde
     serde_json::Value::Object(m)
 }
 
+/// Used by `PersistentVolumeClaimStatus.modifyVolumeStatus` — the VAC modify controller's
+/// in-progress-operation record: which VolumeAttributesClass it's reconciling toward and
+/// whether that reconciliation is Pending/InProgress/Infeasible.
+fn gen_modify_volume_status_to_json(s: core_v1::ModifyVolumeStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = s
+        .target_volume_attributes_class_name
+        .filter(|s| !s.is_empty())
+    {
+        m.insert(
+            "targetVolumeAttributesClassName".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    if let Some(v) = s.status.filter(|s| !s.is_empty()) {
+        m.insert("status".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 // ---- Decoder A: Namespace --------------------------------------------------
 
 pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -3002,6 +3022,12 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
         if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
             status_json["phase"] = serde_json::Value::String(v);
         }
+        if !status.access_modes.is_empty() {
+            status_json["accessModes"] = status.access_modes.into();
+        }
+        if !status.capacity.is_empty() {
+            status_json["capacity"] = gen_quantity_map_btree_to_json(status.capacity);
+        }
         if !status.conditions.is_empty() {
             let conditions: Vec<serde_json::Value> = status
                 .conditions
@@ -3021,6 +3047,27 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
                 })
                 .collect();
             status_json["conditions"] = serde_json::Value::Array(conditions);
+        }
+        if !status.allocated_resources.is_empty() {
+            status_json["allocatedResources"] =
+                gen_quantity_map_btree_to_json(status.allocated_resources);
+        }
+        if !status.allocated_resource_statuses.is_empty() {
+            let statuses: serde_json::Map<String, serde_json::Value> = status
+                .allocated_resource_statuses
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            status_json["allocatedResourceStatuses"] = serde_json::Value::Object(statuses);
+        }
+        if let Some(v) = status
+            .current_volume_attributes_class_name
+            .filter(|s| !s.is_empty())
+        {
+            status_json["currentVolumeAttributesClassName"] = v.into();
+        }
+        if let Some(mvs) = status.modify_volume_status {
+            status_json["modifyVolumeStatus"] = gen_modify_volume_status_to_json(mvs);
         }
         if status_json
             .as_object()
@@ -6348,18 +6395,244 @@ mod tests {
         );
     }
 
-    /// Sentinel completeness test for `gen_persistent_volume_claim_to_json`: catches whichever
-    /// PersistentVolumeClaimSpec field gets missed next, the way the targeted tests above only
-    /// catch the four fields known to be dropped at the time they were written.
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.accessModes (PVCStatus
+    /// field 2).
     ///
-    /// Scoped to `.spec` (not `.status`): PersistentVolumeClaimStatus has fields this function
-    /// does not yet decode (accessModes, capacity, allocatedResources,
-    /// allocatedResourceStatuses, currentVolumeAttributesClassName, modifyVolumeStatus) — a
-    /// separate, pre-existing gap tracked as a follow-up rather than fixed here.
+    /// accessModes here reflects what the underlying PV actually offers; without it a client
+    /// can't distinguish "my request is RWX" from "my PV happens to also allow RWX".
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_access_modes() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("bound-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                access_modes: vec!["ReadWriteMany".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["accessModes"][0], "ReadWriteMany",
+            "status.accessModes must survive decode — it reflects what the underlying PV \
+             actually offers; without it a client can't distinguish 'my request is RWX' from \
+             'my PV happens to also allow RWX'"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.capacity (PVCStatus field 3).
+    ///
+    /// capacity is the actual size of the backing volume, which can exceed the requested size;
+    /// without it clients can't see the real backing volume size vs. what they requested (e.g.
+    /// a 10Gi request may satisfy against a 100Gi PV; that's the field that surfaces the
+    /// difference).
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_capacity() {
+        fn quantity(
+            s: &str,
+        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                string: Some(s.to_string()),
+            }
+        }
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("bound-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                capacity: [("storage".to_string(), quantity("100Gi"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["capacity"]["storage"], "100Gi",
+            "status.capacity must survive decode — clients can't see the real backing volume \
+             size vs. what they requested (e.g. a 10Gi request may satisfy against a 100Gi PV; \
+             that's the field that surfaces the difference)"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.allocatedResources
+    /// (PVCStatus field 5).
+    ///
+    /// allocatedResources tracks resize-in-progress capacity separately from spec.resources;
+    /// without it, volume-expansion progress is invisible during resize — clients see the
+    /// request but not the actual allocated capacity in-flight.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_allocated_resources() {
+        fn quantity(
+            s: &str,
+        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                string: Some(s.to_string()),
+            }
+        }
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("resizing-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                allocated_resources: [("storage".to_string(), quantity("50Gi"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["allocatedResources"]["storage"], "50Gi",
+            "status.allocatedResources must survive decode — volume-expansion progress is \
+             invisible during resize; clients see the request but not the actual allocated \
+             capacity in-flight"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.allocatedResourceStatuses
+    /// (PVCStatus field 7).
+    ///
+    /// allocatedResourceStatuses is the per-resource resize state machine's status map; without
+    /// it, per-resource resize state (which resource keys are Resizing / NodeResizePending /
+    /// NodeResizeFailed) is invisible and controllers can't drive the resize state machine.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_allocated_resource_statuses() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("resizing-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                allocated_resource_statuses: [(
+                    "storage".to_string(),
+                    "NodeResizePending".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["allocatedResourceStatuses"]["storage"], "NodeResizePending",
+            "status.allocatedResourceStatuses must survive decode — per-resource resize state \
+             (which resource keys are Resizing / NodeResizePending / NodeResizeFailed) is \
+             invisible; controllers can't drive the resize state machine"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve
+    /// status.currentVolumeAttributesClassName (PVCStatus field 8).
+    ///
+    /// This is the VAC modify controller's current-state field; without it the controller has
+    /// nothing to reconcile against and the entire modify state machine breaks.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_current_volume_attributes_class_name(
+    ) {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("vac-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                current_volume_attributes_class_name: Some("silver-tier".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["currentVolumeAttributesClassName"], "silver-tier",
+            "status.currentVolumeAttributesClassName must survive decode — the VAC modify \
+             controller has no current-state field to reconcile against — the entire modify \
+             state machine breaks"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.modifyVolumeStatus
+    /// (PVCStatus field 9).
+    ///
+    /// modifyVolumeStatus carries the in-progress VAC modification state (target class plus
+    /// Pending/InProgress/Infeasible); without it, clients see 'name changed' but not
+    /// 'stuck InProgress'.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_modify_volume_status() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("vac-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                modify_volume_status: Some(core_v1::ModifyVolumeStatus {
+                    target_volume_attributes_class_name: Some("gold-tier".to_string()),
+                    status: Some("InProgress".to_string()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["modifyVolumeStatus"]["targetVolumeAttributesClassName"], "gold-tier",
+            "status.modifyVolumeStatus.targetVolumeAttributesClassName must survive decode — \
+             in-progress VAC modification state (target class + Pending/InProgress/Infeasible) \
+             is invisible; clients see 'name changed' but not 'stuck InProgress'"
+        );
+        assert_eq!(
+            result["status"]["modifyVolumeStatus"]["status"], "InProgress",
+            "status.modifyVolumeStatus.status must survive decode alongside the target class — \
+             without it a client can tell a modify was requested but not whether it's stuck \
+             InProgress or has failed as Infeasible"
+        );
+    }
+
+    /// Sentinel completeness test for `gen_persistent_volume_claim_to_json`: catches whichever
+    /// PersistentVolumeClaimSpec or PersistentVolumeClaimStatus field gets missed next, the way
+    /// the targeted tests above only catch the fields known to be dropped at the time they were
+    /// written.
     #[test]
     fn sentinel_completeness_gen_persistent_volume_claim_to_json() {
         let pvc = core_v1::PersistentVolumeClaim {
             spec: Some(core_v1::PersistentVolumeClaimSpec::sentinel()),
+            status: Some(core_v1::PersistentVolumeClaimStatus::sentinel()),
             ..Default::default()
         };
         let mut buf = Vec::new();
@@ -6369,6 +6642,7 @@ mod tests {
 
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result["spec"], "", &mut paths);
+        collect_leaf_paths(&result["status"], "", &mut paths);
 
         let expected = [
             "accessModes",
@@ -6380,6 +6654,13 @@ mod tests {
             "dataSource",
             "dataSourceRef",
             "volumeAttributesClassName",
+            "phase",
+            "capacity",
+            "conditions",
+            "allocatedResources",
+            "allocatedResourceStatuses",
+            "currentVolumeAttributesClassName",
+            "modifyVolumeStatus",
         ];
         assert_fields_present(&paths, &expected);
     }
