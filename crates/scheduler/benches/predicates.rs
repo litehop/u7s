@@ -25,6 +25,8 @@ fn realistic_pending_pod() -> PendingPod {
             extended: Default::default(),
         },
         host_ports: Vec::new(),
+        pvc_names: Vec::new(),
+        pv_node_affinities: Vec::new(),
     }
 }
 

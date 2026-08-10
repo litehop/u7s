@@ -415,6 +415,17 @@ pub struct PendingPod {
     /// `stamp_selected_node_for_pvcs`'s selected-node annotation once this
     /// pod is bound to a node.
     pub pvc_names: Vec<String>,
+    /// The resolved `spec.nodeAffinity.required` selector of every PV already
+    /// bound (Immediate-mode `spec.volumeName` set) to one of `pvc_names` —
+    /// see `fetch_bound_pv_node_affinities`. Unlike every other field here,
+    /// this is never populated by `needs_scheduling` itself (that runs
+    /// synchronously off a single watch event, but resolving a bound PVC's PV
+    /// needs its own GETs) — the caller fetches it once and fills it in right
+    /// before the first `pick_node` attempt. Empty for a pod with no bound
+    /// PVCs or whose bound PVs carry no `nodeAffinity`, which
+    /// `node_qualifies_for_pod` then treats as "nothing to restrict on",
+    /// exactly like an absent pod-level `nodeAffinity`.
+    pub pv_node_affinities: Vec<NodeSelectorSpec>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -489,6 +500,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         requests,
         host_ports,
         pvc_names,
+        pv_node_affinities: Vec::new(),
     })
 }
 
@@ -1411,7 +1423,19 @@ impl NodeTally {
 /// capacity: its labels satisfy the pod's `nodeSelector` AND (if present)
 /// required `nodeAffinity`, AND every scheduling-blocking taint on the node
 /// is tolerated, AND (if `spec.unschedulable` is set, e.g. by `kubectl
-/// cordon`) the pod carries the override toleration.
+/// cordon`) the pod carries the override toleration, AND its labels satisfy
+/// every already-bound PVC's PV `spec.nodeAffinity`.
+///
+/// That last conjunct matters for any Immediate-mode (the StorageClass
+/// default) PVC, whose PV is already bound by the time the pod is scheduled —
+/// unlike an unbound WaitForFirstConsumer PVC (see `selected_node_patches`,
+/// which is scoped to exactly that other case), there is no later
+/// provisioning step to steer onto a compatible node, so this Filter is the
+/// only place topology-aware binding (e.g. every topology-aware CSI driver)
+/// ever gets enforced. Skipping it lets the scheduler bind a pod onto a node
+/// that cannot actually mount the volume; the kubelet then retries
+/// `MountVolume.NodeAffinity check failed` forever with no recourse, since
+/// the binding already committed.
 ///
 /// Shared by `select_node_with_capacity` (direct scheduling) and
 /// `find_preemption_plan`, so preemption never evicts pods on a node the
@@ -1440,6 +1464,16 @@ fn node_qualifies_for_pod(node: &NodeItem, pod: &PendingPod) -> bool {
                     },
                 )
             }))
+        // Every bound PVC's PV nodeAffinity is ANDed in, not ORed: a pod
+        // with two bound PVCs pinned to different nodes has nowhere it can
+        // actually run, and a node satisfying only one of them still cannot
+        // mount both — mirrors upstream's VolumeBinding Filter plugin,
+        // which rejects a node the instant any one bound volume's PV
+        // nodeAffinity fails.
+        && pod
+            .pv_node_affinities
+            .iter()
+            .all(|selector| node_selector_spec_matches(&node.metadata.labels, &node.metadata.name, Some(selector)))
 }
 
 /// Return true when adding `requested` to a node's already-committed `used`
@@ -1791,7 +1825,7 @@ fn node_selector_requirement_matches(
     }
 }
 
-/// Return true when `labels`/`node_name` satisfy a required `nodeAffinity`.
+/// Return true when `labels`/`node_name` satisfy `selector`.
 ///
 /// `nodeSelectorTerms` are ORed together (any one term matching is enough);
 /// within a single term, every `matchExpressions` requirement AND every
@@ -1799,29 +1833,28 @@ fn node_selector_requirement_matches(
 /// semantics. `matchFields` is evaluated against a synthetic one-entry
 /// `{"metadata.name": node_name}` map — the only field Kubernetes ever
 /// populates `matchFields` with (it's how the DaemonSet controller pins each
-/// per-node pod). `None` (no nodeAffinity, or no
-/// `requiredDuringSchedulingIgnoredDuringExecution`, or an empty term list)
-/// matches any node — there is nothing to restrict on.
+/// per-node pod). `None`, or an empty term list, matches any node — there is
+/// nothing to restrict on.
 ///
-/// Extracted as a pure function so the predicate can be unit-tested without
-/// network access — mirrors `node_selector_matches`.
-pub fn node_affinity_matches(
+/// Shared by `node_affinity_matches` (a pod's own required `nodeAffinity`)
+/// and `node_qualifies_for_pod`'s `pv_node_affinities` conjunct (a bound
+/// PVC's PV `spec.nodeAffinity`) — both reduce to the exact same "OR of
+/// terms, AND of expressions/fields within a term" evaluation over a
+/// `NodeSelectorSpec`, just sourced from a different part of the API.
+fn node_selector_spec_matches(
     labels: &std::collections::HashMap<String, String>,
     node_name: &str,
-    affinity: Option<&NodeAffinity>,
+    selector: Option<&NodeSelectorSpec>,
 ) -> bool {
-    let Some(affinity) = affinity else {
+    let Some(selector) = selector else {
         return true;
     };
-    let Some(required) = &affinity.required_during_scheduling_ignored_during_execution else {
-        return true;
-    };
-    if required.node_selector_terms.is_empty() {
+    if selector.node_selector_terms.is_empty() {
         return true;
     }
     let field_values: std::collections::HashMap<String, String> =
         [("metadata.name".to_owned(), node_name.to_owned())].into();
-    required.node_selector_terms.iter().any(|term| {
+    selector.node_selector_terms.iter().any(|term| {
         term.match_expressions
             .iter()
             .all(|req| node_selector_requirement_matches(labels, req))
@@ -1830,6 +1863,30 @@ pub fn node_affinity_matches(
                 .iter()
                 .all(|req| node_selector_requirement_matches(&field_values, req))
     })
+}
+
+/// Return true when `labels`/`node_name` satisfy a required `nodeAffinity`.
+///
+/// `None` (no nodeAffinity, or no
+/// `requiredDuringSchedulingIgnoredDuringExecution`) matches any node — there
+/// is nothing to restrict on. See `node_selector_spec_matches` for the actual
+/// term-matching semantics.
+///
+/// Extracted as a pure function so the predicate can be unit-tested without
+/// network access — mirrors `node_selector_matches`.
+pub fn node_affinity_matches(
+    labels: &std::collections::HashMap<String, String>,
+    node_name: &str,
+    affinity: Option<&NodeAffinity>,
+) -> bool {
+    node_selector_spec_matches(
+        labels,
+        node_name,
+        affinity.and_then(|a| {
+            a.required_during_scheduling_ignored_during_execution
+                .as_ref()
+        }),
+    )
 }
 
 /// Return true when `toleration` tolerates `taint`, mirroring Kubernetes'
@@ -2684,6 +2741,92 @@ pub async fn stamp_selected_node_for_pvcs(
             }
         }
     }
+}
+
+/// Build the path for a (cluster-scoped) PersistentVolume.
+fn pv_path(name: &str) -> String {
+    format!("/api/v1/persistentvolumes/{name}")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PvObject {
+    #[serde(default)]
+    spec: PvSpecView,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PvSpecView {
+    #[serde(default)]
+    node_affinity: Option<PvNodeAffinity>,
+}
+
+/// A PV's `spec.nodeAffinity`. Unlike a pod's `nodeAffinity`, this wraps its
+/// `NodeSelector` directly under `required` — a PV's topology constraint is
+/// not a "soft during scheduling, hard during execution" preference, so there
+/// is no `requiredDuringSchedulingIgnoredDuringExecution` qualifier to peel
+/// off, matching upstream's `v1.VolumeNodeAffinity` shape.
+#[derive(Debug, Default, Deserialize)]
+struct PvNodeAffinity {
+    #[serde(default)]
+    required: Option<NodeSelectorSpec>,
+}
+
+async fn fetch_pv_node_affinity(
+    connector: &TlsConnector,
+    server: &str,
+    name: &str,
+) -> anyhow::Result<Option<NodeSelectorSpec>> {
+    let path = pv_path(name);
+    let (status, body) = http_get(connector, server, &path).await?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        bail!("GET {path} returned {status}: {body}");
+    }
+    let obj: PvObject = serde_json::from_str(&body).context("parse PersistentVolume")?;
+    Ok(obj.spec.node_affinity.and_then(|a| a.required))
+}
+
+/// Resolve the `spec.nodeAffinity.required` selector of every PV already
+/// bound (`spec.volumeName` non-empty) to one of `pvc_names` — the
+/// Immediate-mode-binding case `selected_node_patches` deliberately does not
+/// cover (see its doc comment: that function only ever stamps an UNBOUND
+/// WaitForFirstConsumer PVC). The result feeds `PendingPod::pv_node_affinities`,
+/// which `node_qualifies_for_pod` then treats as one more mandatory (ANDed)
+/// filter, mirroring upstream's VolumeBinding Filter plugin evaluating one
+/// bound volume's topology constraint at a time.
+///
+/// A PVC or PV that no longer exists (404) contributes no constraint — that
+/// PVC simply isn't backed by a real, already-provisioned volume yet. A GET
+/// actually FAILING (network error, non-2xx, unparseable body) is propagated
+/// instead of swallowed: unlike `stamp_selected_node_for_pvcs`'s best-effort
+/// annotation PATCH (whose failure only delays an unrelated controller's
+/// resync), silently treating a failed lookup as "no constraint" here would
+/// let the scheduler bind the pod onto a node that cannot actually mount the
+/// volume — exactly the bug this function exists to close.
+pub async fn fetch_bound_pv_node_affinities(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_names: &[String],
+) -> anyhow::Result<Vec<NodeSelectorSpec>> {
+    let mut affinities = Vec::new();
+    for pvc_name in pvc_names {
+        let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await?
+        else {
+            continue;
+        };
+        if info.volume_name.is_empty() {
+            continue;
+        }
+        if let Some(selector) = fetch_pv_node_affinity(connector, server, &info.volume_name).await?
+        {
+            affinities.push(selector);
+        }
+    }
+    Ok(affinities)
 }
 
 /// Bind a pod to a node via POST .../pods/:name/binding.
@@ -4844,6 +4987,109 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Bound-PVC PV nodeAffinity (Immediate-mode binding): a topology-aware CSI
+    // driver stamps spec.nodeAffinity on the PV it provisions, and by the time
+    // an Immediate-mode PVC's pod is scheduled that PVC is ALREADY bound to
+    // that PV — there is no later WaitForFirstConsumer-style provisioning step
+    // left to steer onto a compatible node (see `selected_node_patches`, which
+    // only ever handles the unbound case). Without this check the scheduler
+    // can bind the pod to a node the PV cannot actually be mounted on; the
+    // kubelet then retries `MountVolume.NodeAffinity check failed` forever
+    // with no recourse — live-reproduced against the CSI hostpath
+    // read-write-once-pod e2e test, which hung until the 622s watchdog reap.
+    // ---------------------------------------------------------------------------
+
+    fn pv_node_affinity_requiring(key: &str, value: &str) -> NodeSelectorSpec {
+        NodeSelectorSpec {
+            node_selector_terms: vec![NodeSelectorTerm {
+                match_expressions: vec![requirement(key, "In", &[value])],
+                match_fields: vec![],
+            }],
+        }
+    }
+
+    /// A node missing the label a bound PVC's PV `nodeAffinity` requires must
+    /// be rejected outright. Reverting the `pv_node_affinities` conjunct in
+    /// `node_qualifies_for_pod` flips this from `false` to `true` — proving
+    /// the predicate, not some other check, is what discriminates here.
+    #[test]
+    fn node_qualifies_for_pod_false_when_node_lacks_label_required_by_bound_pv_node_affinity() {
+        let node = make_node("lima-node-3", &[]);
+        let mut pod = empty_pending_pod();
+        pod.pv_node_affinities = vec![pv_node_affinity_requiring(
+            "topology.hostpath.csi/node",
+            "lima-node",
+        )];
+        assert!(
+            !node_qualifies_for_pod(&node, &pod),
+            "a node missing the label a bound PVC's PV nodeAffinity requires \
+             must be rejected — otherwise the scheduler binds here and the \
+             kubelet blocks forever on MountVolume.NodeAffinity check failed"
+        );
+    }
+
+    /// The exact same node/pod shapes as the false case above, except the
+    /// node now carries the required label — this must flip to `true`, or
+    /// the predicate would just be rejecting every node unconditionally
+    /// rather than actually discriminating on the label.
+    #[test]
+    fn node_qualifies_for_pod_true_when_node_has_label_required_by_bound_pv_node_affinity() {
+        let node = make_node("lima-node", &[("topology.hostpath.csi/node", "lima-node")]);
+        let mut pod = empty_pending_pod();
+        pod.pv_node_affinities = vec![pv_node_affinity_requiring(
+            "topology.hostpath.csi/node",
+            "lima-node",
+        )];
+        assert!(
+            node_qualifies_for_pod(&node, &pod),
+            "a node carrying the label a bound PVC's PV nodeAffinity requires \
+             must still qualify"
+        );
+    }
+
+    /// Mirrors the CSI hostpath "read-write-once-pod" e2e scenario end to
+    /// end: the driver's own node carries the topology label its
+    /// provisioned PV's nodeAffinity requires, a second node does not — and,
+    /// the trap that makes this fail-on-revert meaningful, the WRONG node is
+    /// the LESS loaded one, so the ordinary least-loaded tie-break would
+    /// prefer it if the pv_node_affinities conjunct did not filter it out
+    /// first.
+    #[test]
+    fn select_node_with_capacity_binds_to_node_satisfying_bound_pv_node_affinity_over_less_loaded_node(
+    ) {
+        let driver_node = make_node_with_capacity(
+            "lima-node",
+            &[("topology.hostpath.csi/node", "lima-node")],
+            "110",
+        );
+        let other_node = make_node_with_capacity("lima-node-3", &[], "110");
+        let list = NodeList {
+            items: vec![driver_node, other_node],
+        };
+        let mut pod = empty_pending_pod();
+        pod.pv_node_affinities = vec![pv_node_affinity_requiring(
+            "topology.hostpath.csi/node",
+            "lima-node",
+        )];
+        let counts: std::collections::HashMap<String, NodeUsage> = [
+            ("lima-node".to_owned(), usage_with_pod_count(5)),
+            ("lima-node-3".to_owned(), usage_with_pod_count(0)),
+        ]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &counts);
+        assert_eq!(
+            result.ok(),
+            Some("lima-node".to_owned()),
+            "must bind to the node satisfying the bound PVC's PV nodeAffinity \
+             even though the other node is less loaded — reverting the \
+             pv_node_affinities conjunct picks lima-node-3 by the ordinary \
+             least-loaded tie-break, exactly the bug that made the CSI \
+             read-write-once-pod e2e test hang for 622s on \
+             MountVolume.NodeAffinity check failed"
+        );
+    }
+
     /// needs_scheduling extracts spec.tolerations from the watch event — if this
     /// is dropped, node_taints_tolerated always sees an empty toleration list and
     /// every tainted node is treated as blocked, even for pods meant to tolerate it.
@@ -5256,6 +5502,7 @@ mod tests {
             requests: ResourceRequests::default(),
             host_ports: Vec::new(),
             pvc_names: Vec::new(),
+            pv_node_affinities: Vec::new(),
         }
     }
 
