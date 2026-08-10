@@ -172,6 +172,8 @@ pub struct AdmissionConfigCache {
     pub(crate) validating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
     /// ValidatingAdmissionPolicyBinding objects.
     pub(crate) validating_policy_bindings: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    /// MutatingAdmissionPolicyBinding objects.
+    pub(crate) mutating_policy_bindings: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
 }
 
 impl AdmissionConfigCache {
@@ -182,6 +184,7 @@ impl AdmissionConfigCache {
             mutating_policies: RwLock::new(None),
             validating_policies: RwLock::new(None),
             validating_policy_bindings: RwLock::new(None),
+            mutating_policy_bindings: RwLock::new(None),
         }
     }
 }
@@ -908,6 +911,13 @@ impl<S: Store> AppState<S> {
                     .write()
                     .unwrap() = Some(Arc::new(items));
             }
+            "mutatingadmissionpolicybindings" => {
+                *self
+                    .admission_cache
+                    .mutating_policy_bindings
+                    .write()
+                    .unwrap() = Some(Arc::new(items));
+            }
             _ => {
                 // Not an admission config type — nothing to refresh.
             }
@@ -925,6 +935,7 @@ impl<S: Store> AppState<S> {
             "mutatingadmissionpolicies",
             "validatingadmissionpolicies",
             "validatingadmissionpolicybindings",
+            "mutatingadmissionpolicybindings",
         ] {
             self.refresh_admission_config(plural).await;
         }

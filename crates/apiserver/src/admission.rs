@@ -2592,11 +2592,47 @@ pub(crate) fn apply_cel_patch(target: &mut serde_json::Value, patch: &serde_json
     }
 }
 
-/// Run all MutatingAdmissionPolicy CEL mutations for a given resource.
+/// Fetch all MutatingAdmissionPolicyBinding objects from the in-memory cache (or store if cold).
+async fn fetch_mutating_policy_bindings<S: Store>(
+    state: &AppState<S>,
+) -> Arc<Vec<serde_json::Value>> {
+    // Hot path: read from the in-memory cache when warm. See fetch_mutating_configs for why
+    // this must be an Arc::clone, not a deep clone of the Vec.
+    {
+        let guard = state
+            .admission_cache
+            .mutating_policy_bindings
+            .read()
+            .unwrap();
+        if let Some(cached) = guard.as_ref() {
+            return Arc::clone(cached);
+        }
+    }
+    // Cache cold: fall back to the store once.
+    let prefix = "/registry/admissionregistration.k8s.io/mutatingadmissionpolicybindings/";
+    let bindings = match state.store.list(prefix, ListOptions::default()).await {
+        Ok(resp) => resp
+            .items
+            .into_iter()
+            .filter_map(|item| serde_json::from_slice(&item.value).ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("admission: failed to list MutatingAdmissionPolicyBindings: {e}");
+            vec![]
+        }
+    };
+    Arc::new(bindings)
+}
+
+/// Run all MutatingAdmissionPolicy + Binding pairs for a given resource.
 ///
-/// Fetches all MutatingAdmissionPolicy objects from the store, checks matchConstraints,
-/// evaluates each mutation's CEL expression, and applies the result as an
-/// `ApplyConfiguration` (merge patch) to the object.
+/// Fetches all MutatingAdmissionPolicy and MutatingAdmissionPolicyBinding objects from the
+/// store. A policy is inert until a binding's `spec.policyName` references it — bindings scope
+/// policies into effect, per the Kubernetes MutatingAdmissionPolicy spec (mirrors
+/// `run_validating_admission_policies`, the same requirement on the validating side). For each
+/// matching binding, checks the policy's matchConstraints and the binding's matchResources
+/// (namespaceSelector + resourceRules), evaluates each mutation's CEL expression, and applies
+/// the result as an `ApplyConfiguration` (merge patch) to the object.
 ///
 /// This is the CEL-based analog to the webhook-based `run_mutating_webhooks`.
 /// It runs before the webhook chain so that webhook admission sees the already-mutated object.
@@ -2616,11 +2652,86 @@ pub async fn run_cel_mutating_policies<S: Store>(
     if policies.is_empty() {
         return object;
     }
+    let bindings = fetch_mutating_policy_bindings(state).await;
+    if bindings.is_empty() {
+        return object;
+    }
 
-    for policy in policies.iter() {
-        // Check matchConstraints.
+    // Index policies by name once so the binding loop below is O(N+M) instead of
+    // re-scanning the full policy list (O(N*M)) for every binding.
+    let policies_by_name: HashMap<&str, &serde_json::Value> = policies
+        .iter()
+        .filter_map(|p| p["metadata"]["name"].as_str().map(|name| (name, p)))
+        .collect();
+
+    for binding in bindings.iter() {
+        let policy_name = binding["spec"]["policyName"].as_str().unwrap_or("");
+        if policy_name.is_empty() {
+            continue;
+        }
+        let policy = match policies_by_name.get(policy_name) {
+            Some(p) => *p,
+            None => {
+                tracing::warn!(
+                    "admission: MutatingAdmissionPolicyBinding references unknown policy \"{policy_name}\", skipping"
+                );
+                continue;
+            }
+        };
+
+        // Check policy matchConstraints (resourceRules).
         if !matches_match_constraints(policy, ctx.group, ctx.version, ctx.resource, ctx.operation) {
             continue;
+        }
+
+        // Check binding matchResources namespaceSelector.
+        let binding_ns_selector: Option<LabelSelector> = binding["spec"]["matchResources"]
+            ["namespaceSelector"]
+            .as_object()
+            .and_then(|_| {
+                serde_json::from_value(
+                    binding["spec"]["matchResources"]["namespaceSelector"].clone(),
+                )
+                .ok()
+            });
+        if binding_ns_selector.is_some() {
+            match ctx.namespace {
+                None => {
+                    // Cluster-scoped resources are never selected by a namespaceSelector.
+                    continue;
+                }
+                Some(ns) => {
+                    let ns_labels = fetch_namespace_labels(state, ns).await;
+                    if !label_selector_matches(binding_ns_selector.as_ref(), &ns_labels) {
+                        tracing::debug!(
+                            "admission: MutatingAdmissionPolicyBinding \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
+                            binding["metadata"]["name"].as_str().unwrap_or("unknown"),
+                            ns
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Check binding matchResources resourceRules (same as matchConstraints logic).
+        let binding_rules = binding["spec"]["matchResources"]["resourceRules"].as_array();
+        if let Some(rules) = binding_rules {
+            if !rules.is_empty() {
+                let any_rule = rules.iter().any(|rule| {
+                    matches_rule(
+                        rule,
+                        ctx.group,
+                        ctx.version,
+                        ctx.resource,
+                        ctx.namespace,
+                        ctx.operation,
+                    )
+                });
+                if !any_rule {
+                    continue;
+                }
+            }
         }
 
         // Apply each mutation in order.
@@ -7024,7 +7135,11 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// A stored MutatingAdmissionPolicy with a CEL ApplyConfiguration mutation
-    /// must be evaluated on CREATE and its label added to the stored object.
+    /// must be evaluated on CREATE and its label added to the stored object, provided
+    /// a MutatingAdmissionPolicyBinding scopes the policy into effect and matches the
+    /// resource. Without the binding, the policy is INERT per Kubernetes spec (see the
+    /// MutatingAdmissionPolicy docs) — bindings, not matchConstraints alone, decide
+    /// whether a policy fires.
     ///
     /// This is the key regression test: if MutatingAdmissionPolicy evaluation is
     /// reverted (policies fetched but CEL not run), the label will be absent and
@@ -7071,6 +7186,24 @@ mod tests {
             .await
             .unwrap();
 
+        // Bind the policy into effect — without this, the policy is inert.
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicyBinding",
+            "metadata": {"name": "add-label-binding"},
+            "spec": {
+                "policyName": "add-label-policy"
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicybindings/add-label-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
         // A Deployment with no labels.
         let deployment = json!({
             "apiVersion": "apps/v1",
@@ -7103,7 +7236,8 @@ mod tests {
     }
 
     /// A MutatingAdmissionPolicy whose matchConstraints does NOT match the resource
-    /// must be skipped — the object must be returned unchanged.
+    /// must be skipped — the object must be returned unchanged, even when a binding
+    /// scopes the policy into effect.
     ///
     /// If matchConstraints is ignored, policies for one resource type would incorrectly
     /// mutate all resource types.
@@ -7149,6 +7283,24 @@ mod tests {
             .await
             .unwrap();
 
+        // Bind the policy into effect — the test asserts matchConstraints still gates it.
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicyBinding",
+            "metadata": {"name": "deployments-only-binding"},
+            "spec": {
+                "policyName": "deployments-only-policy"
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicybindings/deployments-only-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
         // Admitting a ConfigMap (not a Deployment) — policy must be skipped.
         let cm = json!({
             "apiVersion": "v1",
@@ -7176,6 +7328,328 @@ mod tests {
             returned["metadata"]["labels"]["should-not-appear"].is_null(),
             "policy must NOT be applied when resource does not match matchConstraints; \
              applying it would mutate resources the policy was not intended for"
+        );
+    }
+
+    /// A MutatingAdmissionPolicy with matching matchConstraints but NO
+    /// MutatingAdmissionPolicyBinding must not run its CEL mutation.
+    ///
+    /// Per the Kubernetes MutatingAdmissionPolicy spec, a policy is inert until a binding
+    /// scopes it into effect — matchConstraints alone only describes what the policy *could*
+    /// apply to, not that it *does*. If this invariant regresses, an unscoped policy created
+    /// as a CRUD smoke-test fixture (e.g. upstream's `MutatingAdmissionPolicy API operations`
+    /// conformance test, which never creates a binding) silently mutates unrelated resources
+    /// created concurrently by other tests.
+    #[tokio::test]
+    async fn cel_mutating_policy_without_binding_does_not_run() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Policy alone, no binding — matchConstraints matches deployments.
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicy",
+            "metadata": {"name": "unbound-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "mutations": [{
+                    "patchType": "ApplyConfiguration",
+                    "applyConfiguration": {
+                        "expression": "Object{spec: Object.spec{replicas: 100}}"
+                    }
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicies/unbound-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let deployment = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "externalsvc", "namespace": "default"},
+            "spec": {"replicas": 2}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "externalsvc",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_mutating_webhooks(&state, deployment, None, &ctx).await;
+        assert!(result.is_ok(), "pipeline must succeed with no binding");
+        let returned = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(
+            returned["spec"]["replicas"], 2,
+            "an unbound MutatingAdmissionPolicy must be INERT — replicas must stay at the \
+             original value of 2; a policy without a binding rewriting replicas to 100 is \
+             the exact conformance-breaking bug this test guards against"
+        );
+    }
+
+    /// A MutatingAdmissionPolicyBinding that references a DIFFERENT policy than the one
+    /// being evaluated must not cause that policy's CEL mutation to run.
+    ///
+    /// Bindings scope policies into effect by name — a binding for policy A existing in the
+    /// cluster must never activate policy B. If binding→policy resolution used anything
+    /// looser than an exact name match (e.g. "any binding present" instead of "a binding
+    /// naming this policy"), this test would incorrectly pass the mutation through.
+    #[tokio::test]
+    async fn cel_mutating_policy_with_binding_referencing_different_policy_does_not_run() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Policy A: the one under test — must NOT fire.
+        let policy_a = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicy",
+            "metadata": {"name": "policy-a"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "mutations": [{
+                    "patchType": "ApplyConfiguration",
+                    "applyConfiguration": {
+                        "expression": "Object{metadata: Object.metadata{labels: {\"policy-a-ran\": \"true\"}}}"
+                    }
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicies/policy-a",
+                bytes::Bytes::from(serde_json::to_vec(&policy_a).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Binding names policy B, which does not exist — policy A must stay inert.
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicyBinding",
+            "metadata": {"name": "policy-b-binding"},
+            "spec": {
+                "policyName": "policy-b"
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicybindings/policy-b-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let deployment = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "my-deploy", "namespace": "default"}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_mutating_webhooks(&state, deployment, None, &ctx).await;
+        assert!(result.is_ok(), "pipeline must succeed");
+        let returned = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert!(
+            returned["metadata"]["labels"]["policy-a-ran"].is_null(),
+            "policy-a must not run: the only binding in the cluster names policy-b, not \
+             policy-a, so policy-a is unbound and must remain inert"
+        );
+    }
+
+    /// A MutatingAdmissionPolicyBinding's `matchResources.namespaceSelector` must scope
+    /// which namespaces the policy applies in — the same resource create in a
+    /// non-selected namespace must be unaffected, while the identical create in a
+    /// selected namespace must be mutated.
+    ///
+    /// Without this scoping, a binding intended for one namespace (e.g. a canary or
+    /// tenant-scoped policy) would mutate resources cluster-wide instead.
+    #[tokio::test]
+    async fn cel_mutating_policy_with_binding_match_resources_scope_respected() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Namespace "scoped-ns" carries the label the binding selects on.
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "scoped-ns", "labels": {"map-test": "true"}}
+        });
+        store
+            .put(
+                "/registry/namespaces/scoped-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Namespace "other-ns" does not carry the label.
+        let other_ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "other-ns"}
+        });
+        store
+            .put(
+                "/registry/namespaces/other-ns",
+                bytes::Bytes::from(serde_json::to_vec(&other_ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicy",
+            "metadata": {"name": "scoped-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "mutations": [{
+                    "patchType": "ApplyConfiguration",
+                    "applyConfiguration": {
+                        "expression": "Object{metadata: Object.metadata{labels: {\"scoped\": \"true\"}}}"
+                    }
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicies/scoped-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicyBinding",
+            "metadata": {"name": "scoped-binding"},
+            "spec": {
+                "policyName": "scoped-policy",
+                "matchResources": {
+                    "namespaceSelector": {
+                        "matchLabels": {"map-test": "true"}
+                    }
+                }
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingadmissionpolicybindings/scoped-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Create in "other-ns" — namespaceSelector does not match, must be unaffected.
+        let deploy_other = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "my-deploy", "namespace": "other-ns"}
+        });
+        let ctx_other = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("other-ns"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result_other = run_mutating_webhooks(&state, deploy_other, None, &ctx_other).await;
+        assert!(result_other.is_ok(), "pipeline must succeed");
+        let returned_other = result_other.unwrap_or_else(|_| panic!("must succeed"));
+        assert!(
+            returned_other["metadata"]["labels"]["scoped"].is_null(),
+            "policy must NOT apply in 'other-ns': the binding's namespaceSelector only \
+             matches namespaces labeled map-test=true, and other-ns has no such label"
+        );
+
+        // Create in "scoped-ns" — namespaceSelector matches, mutation must apply.
+        let deploy_scoped = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "my-deploy", "namespace": "scoped-ns"}
+        });
+        let ctx_scoped = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("scoped-ns"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result_scoped = run_mutating_webhooks(&state, deploy_scoped, None, &ctx_scoped).await;
+        assert!(result_scoped.is_ok(), "pipeline must succeed");
+        let returned_scoped = result_scoped.unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(
+            returned_scoped["metadata"]["labels"]["scoped"], "true",
+            "policy must apply in 'scoped-ns': the binding's namespaceSelector matches this \
+             namespace's map-test=true label, so the binding scopes the policy into effect here"
         );
     }
 
@@ -10615,7 +11089,7 @@ mod tests {
         );
     }
 
-    /// After init_admission_cache, all 5 cache slots are warm (Some), even if empty.
+    /// After init_admission_cache, all 6 cache slots are warm (Some), even if empty.
     ///
     /// Why this matters: init_admission_cache is called at startup. If it fails to warm
     /// a slot, that slot stays cold and every admission check for that config type costs
@@ -10678,6 +11152,15 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "validating_policy_bindings slot must be warm after init_admission_cache"
+        );
+        assert!(
+            state
+                .admission_cache
+                .mutating_policy_bindings
+                .read()
+                .unwrap()
+                .is_some(),
+            "mutating_policy_bindings slot must be warm after init_admission_cache"
         );
     }
 
