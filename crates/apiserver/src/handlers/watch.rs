@@ -1,8 +1,9 @@
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
+use serde::Serialize;
 use u7s_store::{ListOptions, Store, WatchEvent};
 
-use crate::{state::AppState, status::Status};
+use crate::{state::AppState, status::Status, types::ObjectMeta};
 
 /// Serialize `{"type":"<event_type>","object":<value>}\n` into a single heap allocation.
 ///
@@ -150,14 +151,31 @@ pub fn prepare_live_event(
     ))
 }
 
+/// The `PartialObjectMetadata` envelope GC watches and PartialObjectMetadata LIST/GET responses
+/// consume. `metadata` stays an opaque `Value` — this projection never reasons about individual
+/// metadata fields (ownerReferences, finalizers, ...), only about which top-level object keys
+/// survive, so there is nothing here for a typed struct to protect beyond that: the absence of
+/// `spec`/`status` fields on this type makes it structurally impossible for either to leak into
+/// a PartialObjectMetadata response, unlike the `serde_json::json!` macro it replaces.
+#[derive(Serialize)]
+struct PartialObjectMetadataEnvelope<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    kind: &'static str,
+    metadata: &'a serde_json::Value,
+}
+
 /// Transform a full CR JSON object into a PartialObjectMetadata object.
 /// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
 pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": obj.get("metadata").cloned().unwrap_or_default()
-    })
+    let null = serde_json::Value::Null;
+    let envelope = PartialObjectMetadataEnvelope {
+        api_version: "meta.k8s.io/v1",
+        kind: "PartialObjectMetadata",
+        metadata: obj.get("metadata").unwrap_or(&null),
+    };
+    serde_json::to_value(envelope)
+        .expect("PartialObjectMetadataEnvelope always serializes to a JSON object")
 }
 
 /// Stamp resourceVersion and apiVersion/kind onto an already-parsed DELETED tombstone body
@@ -171,7 +189,24 @@ fn finish_deleted_event(
     api_version: &str,
     kind: &str,
 ) -> Bytes {
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
+    // Set metadata.resourceVersion via ObjectMeta's own field-name mapping instead of a raw
+    // string index, merging just this one field into the existing metadata object rather than
+    // deserializing the whole object into ObjectMeta and reserializing it — a full round trip
+    // would silently drop any field ObjectMeta doesn't model (ownerReferences, managedFields,
+    // ...), which is exactly the class of correctness bug this migration exists to prevent.
+    let patch = ObjectMeta {
+        resource_version: Some(revision.to_string()),
+        ..Default::default()
+    };
+    let serde_json::Value::Object(fields) =
+        serde_json::to_value(&patch).expect("ObjectMeta always serializes to a JSON object")
+    else {
+        unreachable!("ObjectMeta always serializes to a JSON object")
+    };
+    match &mut obj["metadata"] {
+        serde_json::Value::Object(metadata) => metadata.extend(fields),
+        _ => unreachable!("stored object metadata is always a JSON object"),
+    }
     stamp_type_meta_if_changed(&mut obj, api_version, kind);
     ndjson_event_value("DELETED", &obj)
 }
@@ -253,28 +288,51 @@ pub(crate) fn encode_watch_event(
             }
             // Fallback: reconstruct a minimal tombstone from the store key.
             let (name, namespace) = parse_key_name_ns(key);
-            let object = if namespace.is_empty() {
-                serde_json::json!({
-                    "apiVersion": api_version,
-                    "kind": kind,
-                    "metadata": { "name": name, "resourceVersion": revision.to_string() }
-                })
-            } else {
-                serde_json::json!({
-                    "apiVersion": api_version,
-                    "kind": kind,
-                    "metadata": {
-                        "name": name,
-                        "namespace": namespace,
-                        "resourceVersion": revision.to_string()
-                    }
-                })
-            };
+            let object = build_tombstone_object(name, namespace, *revision, api_version, kind);
             Some(ndjson_event_value("DELETED", &object))
         }
         WatchEvent::Bookmark { revision } => Some(ndjson_bookmark(api_version, kind, *revision)),
         WatchEvent::Compacted { .. } => None,
     }
+}
+
+/// A synthetic tombstone's `{apiVersion, kind, metadata}` shape — built through `ObjectMeta`
+/// instead of `serde_json::json!` so a stray key (e.g. a typo'd `spec`) can't leak into a
+/// tombstone body, and so the two call sites that synthesize a tombstone from just
+/// name/namespace/resourceVersion (no stored body available or matching) share one field-name
+/// mapping instead of each hand-rolling a namespace-branching object literal.
+#[derive(Serialize)]
+struct TombstoneEnvelope<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    kind: &'a str,
+    metadata: ObjectMeta,
+}
+
+fn build_tombstone_object(
+    name: &str,
+    namespace: &str,
+    revision: u64,
+    api_version: &str,
+    kind: &str,
+) -> serde_json::Value {
+    let namespace = if namespace.is_empty() {
+        None
+    } else {
+        Some(namespace.to_owned())
+    };
+    let metadata = ObjectMeta {
+        name: Some(name.to_owned()),
+        namespace,
+        resource_version: Some(revision.to_string()),
+        ..Default::default()
+    };
+    serde_json::to_value(TombstoneEnvelope {
+        api_version,
+        kind,
+        metadata,
+    })
+    .expect("TombstoneEnvelope always serializes to a JSON object")
 }
 
 /// Parse the last two path segments of a store key as (name, namespace).
@@ -1072,27 +1130,13 @@ async fn watch_generic_impl<S: Store>(
                                             // this key, the watcher already sent a DELETED and a
                                             // subsequent MODIFIED-without-match must be suppressed.
                                             locally_deleted.insert(obj.key.clone());
-                                            let rv = obj.revision.to_string();
-                                            let tombstone = if ns.is_empty() {
-                                                serde_json::json!({
-                                                    "apiVersion": api_version,
-                                                    "kind": kind,
-                                                    "metadata": {
-                                                        "name": name,
-                                                        "resourceVersion": rv
-                                                    }
-                                                })
-                                            } else {
-                                                serde_json::json!({
-                                                    "apiVersion": api_version,
-                                                    "kind": kind,
-                                                    "metadata": {
-                                                        "name": name,
-                                                        "namespace": ns,
-                                                        "resourceVersion": rv
-                                                    }
-                                                })
-                                            };
+                                            let tombstone = build_tombstone_object(
+                                                &name,
+                                                &ns,
+                                                obj.revision,
+                                                &api_version,
+                                                &kind,
+                                            );
                                             record_watch_event();
                                             yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
                                         }
@@ -1470,6 +1514,166 @@ mod tests {
             decoded["object"]["kind"], "Deployment",
             "DELETED event must stamp kind even when the stored body lacks it, for the same \
              reason as apiVersion above"
+        );
+    }
+
+    /// Historical-wedge regression, ADDED counterpart: mirrors
+    /// `deleted_watch_event_stamps_api_version_and_kind_when_stored_body_lacks_them` for the
+    /// live-watch ADDED path. `prepare_live_event` is what `watch_generic_impl`'s fast path
+    /// actually calls for every live ADDED/MODIFIED event; if its unconditional TypeMeta stamp
+    /// (via `finish_live_event` -> `stamp_type_meta_if_changed`) regresses to a conditional one,
+    /// client-go's watch decoder fails to decode these events too, wedging RetryWatcher exactly
+    /// like the DELETED case above.
+    #[test]
+    fn prepare_live_event_added_stamps_api_version_and_kind_when_stored_body_lacks_them() {
+        let body_without_type_meta = serde_json::json!({
+            "metadata": {
+                "name": "test-deployment",
+                "namespace": "deployment-5815",
+                "resourceVersion": "1597"
+            },
+            "spec": { "replicas": 2 }
+        });
+        let raw = serde_json::to_vec(&body_without_type_meta).expect("body serializes");
+
+        let bytes = prepare_live_event(
+            &raw,
+            "ADDED",
+            "apps",
+            "deployments",
+            "apps/v1",
+            "Deployment",
+            false,
+            "",
+            "",
+        )
+        .expect("ADDED event must produce bytes");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end())
+                .expect("chunk must be valid JSON");
+
+        assert_eq!(
+            decoded["object"]["apiVersion"], "apps/v1",
+            "ADDED event must stamp apiVersion even when the stored body lacks it; without \
+             this, client-go's watch decoder cannot determine the object's type and silently \
+             fails to decode the event, wedging watchtools.Until forever"
+        );
+        assert_eq!(
+            decoded["object"]["kind"], "Deployment",
+            "ADDED event must stamp kind even when the stored body lacks it, for the same \
+             reason as apiVersion above"
+        );
+    }
+
+    /// Mirror of the ADDED test above for MODIFIED events: same conformance requirement.
+    #[test]
+    fn prepare_live_event_modified_stamps_api_version_and_kind_when_stored_body_lacks_them() {
+        let body_without_type_meta = serde_json::json!({
+            "metadata": {
+                "name": "test-deployment",
+                "namespace": "deployment-5815",
+                "resourceVersion": "1650"
+            },
+            "spec": { "replicas": 3 }
+        });
+        let raw = serde_json::to_vec(&body_without_type_meta).expect("body serializes");
+
+        let bytes = prepare_live_event(
+            &raw,
+            "MODIFIED",
+            "apps",
+            "deployments",
+            "apps/v1",
+            "Deployment",
+            false,
+            "",
+            "",
+        )
+        .expect("MODIFIED event must produce bytes");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end())
+                .expect("chunk must be valid JSON");
+
+        assert_eq!(
+            decoded["object"]["apiVersion"], "apps/v1",
+            "MODIFIED event must stamp apiVersion even when the stored body lacks it, for the \
+             same reason as the ADDED case above"
+        );
+        assert_eq!(
+            decoded["object"]["kind"], "Deployment",
+            "MODIFIED event must stamp kind even when the stored body lacks it, for the same \
+             reason as the ADDED case above"
+        );
+    }
+
+    /// PartialObjectMetadata projection round-trip: `to_partial_object_metadata` is shared by
+    /// the GC's watches and every PartialObjectMetadata LIST/GET response (resource.rs, core.rs,
+    /// pods.rs all call this same function), so it must emit exactly {apiVersion, kind,
+    /// metadata} — nothing from spec/status. A leaked spec/status field breaks the reflector's
+    /// decode of the PartialObjectMetadata type (which has no spec/status fields to decode
+    /// into) and, per this same regression class in cr.rs's own `to_pom_strips_spec_and_sets_
+    /// correct_kind` test, has previously caused the reflector to never receive the
+    /// initial-events-end BOOKMARK, hanging GC informer startup.
+    #[test]
+    fn to_partial_object_metadata_projects_metadata_only_and_drops_spec_status() {
+        let full_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "nginx",
+                "namespace": "default",
+                "uid": "abc-123",
+                "resourceVersion": "42",
+                "labels": { "app": "nginx" },
+                "annotations": { "note": "hello" },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": "nginx-rs",
+                    "uid": "rs-uid"
+                }]
+            },
+            "spec": { "containers": [{"name": "nginx", "image": "nginx:latest"}] },
+            "status": { "phase": "Running" }
+        });
+
+        let pom = to_partial_object_metadata(&full_pod);
+
+        assert_eq!(
+            pom,
+            serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadata",
+                "metadata": {
+                    "name": "nginx",
+                    "namespace": "default",
+                    "uid": "abc-123",
+                    "resourceVersion": "42",
+                    "labels": { "app": "nginx" },
+                    "annotations": { "note": "hello" },
+                    "ownerReferences": [{
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "nginx-rs",
+                        "uid": "rs-uid"
+                    }]
+                }
+            }),
+            "PartialObjectMetadata projection must carry the metadata verbatim (including \
+             ownerReferences, which the GC needs to find dependents) and nothing else — a \
+             stray spec/status field breaks the reflector's decode of the PartialObjectMetadata \
+             type"
+        );
+        assert!(
+            pom.get("spec").is_none(),
+            "spec must be entirely absent from a PartialObjectMetadata projection, not merely \
+             null — a client checking presence via `contains_key` rather than `.is_null()` \
+             would otherwise be misled"
+        );
+        assert!(
+            pom.get("status").is_none(),
+            "status must be entirely absent from a PartialObjectMetadata projection, not \
+             merely null, for the same reason as spec above"
         );
     }
 
