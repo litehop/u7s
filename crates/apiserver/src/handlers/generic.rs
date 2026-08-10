@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use u7s_store::StoreError;
 
 use u7s_store::Store;
@@ -8,7 +8,7 @@ use crate::{
     rbac::{user_holds_all_rules, user_holds_all_rules_in_namespace, AuthzRequest},
     state::AppState,
     status::Status,
-    types::{NamespaceSpec, Object, ObjectMeta, ResourceKey},
+    types::{NamespacePhase, NamespaceSpec, Object, ObjectMeta, ResourceKey},
     util::{store_err_to_status, utc_now_rfc3339},
 };
 
@@ -546,6 +546,27 @@ pub(crate) fn decode_continue(
     Ok((key, revision))
 }
 
+/// The `metadata` envelope of a Kubernetes List response.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListMeta {
+    resource_version: String,
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    continue_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_item_count: Option<u64>,
+}
+
+/// Wire shape of every LIST response: `{kind, apiVersion, metadata, items}`.
+#[derive(Serialize)]
+struct ListResponse {
+    kind: String,
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    metadata: ListMeta,
+    items: Vec<serde_json::Value>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_list_response(
     kind: &str,
@@ -562,23 +583,21 @@ pub(crate) fn build_list_response(
     } else {
         format!("{}/{}", group, version)
     };
-    let mut metadata = serde_json::json!({ "resourceVersion": revision.to_string() });
-    if let Some(key) = continue_key {
-        // Pin the outgoing token to this same `revision` so every later page of this walk
-        // (which decodes the token to build its own response) reports an identical
-        // resourceVersion — required by chunking conformance (see decode_continue doc).
-        metadata["continue"] =
-            serde_json::Value::String(encode_continue(&key, revision, signing_key));
-    }
-    if let Some(count) = remaining_count {
-        metadata["remainingItemCount"] = serde_json::Value::Number(count.into());
-    }
-    serde_json::json!({
-        "kind": format!("{}List", kind),
-        "apiVersion": api_version,
-        "metadata": metadata,
-        "items": items
-    })
+    // Pin the outgoing token to this same `revision` so every later page of this walk
+    // (which decodes the token to build its own response) reports an identical
+    // resourceVersion — required by chunking conformance (see decode_continue doc).
+    let continue_token = continue_key.map(|key| encode_continue(&key, revision, signing_key));
+    let response = ListResponse {
+        kind: format!("{}List", kind),
+        api_version,
+        metadata: ListMeta {
+            resource_version: revision.to_string(),
+            continue_token,
+            remaining_item_count: remaining_count,
+        },
+        items,
+    };
+    serde_json::to_value(response).expect("ListResponse is always serializable")
 }
 
 /// Check finalizers for delete: if non-empty, set deletionTimestamp and return modified object.
@@ -603,7 +622,8 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
         // The upstream KCM namespace controller watches for status.phase == "Terminating"
         // to trigger finalizer removal.
         if is_namespace {
-            obj.body["status"]["phase"] = serde_json::Value::String("Terminating".to_string());
+            obj.body["status"]["phase"] = serde_json::to_value(NamespacePhase::Terminating)
+                .expect("NamespacePhase is always serializable");
         }
         Some(obj.body.clone())
     } else {
@@ -980,6 +1000,29 @@ mod tests {
     fn non_core_group_api_version_includes_group() {
         let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None, None, TEST_KEY);
         assert_eq!(body["apiVersion"], "apps/v1");
+    }
+
+    /// The full LIST envelope shape — {kind, apiVersion, metadata: {resourceVersion}, items} —
+    /// must be exactly what client-go's List decoder expects. This pins the whole document
+    /// shape (not just individual fields) so a migration to a typed struct that reorders,
+    /// renames, drops, or adds a key is caught immediately, rather than surfacing later as a
+    /// kubectl "unable to decode" error or a silently empty list.
+    #[test]
+    fn build_list_response_envelope_has_exact_shape() {
+        let items = vec![serde_json::json!({"metadata": {"name": "a"}})];
+        let body = build_list_response("Pod", "", "v1", 7, items.clone(), None, None, TEST_KEY);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "kind": "PodList",
+                "apiVersion": "v1",
+                "metadata": { "resourceVersion": "7" },
+                "items": items
+            }),
+            "the LIST envelope shape (kind/apiVersion/metadata.resourceVersion/items) must \
+             match exactly what client-go's List decoder expects — an extra, missing, or \
+             renamed key breaks every `kubectl get` and every controller's informer LIST"
+        );
     }
 
     // -- apply_json_patch (RFC 6902) --

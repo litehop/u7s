@@ -15,7 +15,7 @@ use crate::{
     keys::{cluster_object_key, group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
-    types::{DeleteOptions, Object, ObjectMeta},
+    types::{DeleteOptions, Object, ObjectMeta, OwnerReference},
     util::{content_type, extract_body, parse_resource_version},
 };
 
@@ -3244,27 +3244,27 @@ pub(crate) fn add_foreground_deletion_finalizer(obj: &mut Object) {
 async fn owner_ref_is_live<S: Store>(
     state: &crate::state::AppState<S>,
     namespace: &str,
-    owner_ref: &serde_json::Value,
+    owner_ref: &OwnerReference,
 ) -> bool {
-    let kind = owner_ref["kind"].as_str().unwrap_or("");
-    let uid = owner_ref["uid"].as_str().unwrap_or("");
-    let name = owner_ref["name"].as_str().unwrap_or("");
-    if kind.is_empty() || uid.is_empty() || name.is_empty() {
+    if owner_ref.kind.is_empty() || owner_ref.uid.is_empty() || owner_ref.name.is_empty() {
         return false;
     }
-    let api_version = owner_ref["apiVersion"].as_str().unwrap_or("");
-    let group = api_version.split_once('/').map(|(g, _)| g).unwrap_or("");
+    let group = owner_ref
+        .api_version
+        .split_once('/')
+        .map(|(g, _)| g)
+        .unwrap_or("");
 
     let plural = match state
         .resource_registry
         .iter()
-        .find(|(rk, meta)| rk.group == group && meta.kind == kind)
+        .find(|(rk, meta)| rk.group == group && meta.kind == owner_ref.kind)
     {
         Some((rk, _)) => rk.plural.clone(),
         None => return false,
     };
 
-    let key = crate::keys::group_object_key(group, &plural, Some(namespace), name);
+    let key = crate::keys::group_object_key(group, &plural, Some(namespace), &owner_ref.name);
     let stored = match state.store.get(&key).await {
         Ok(Some(obj)) => obj,
         _ => return false,
@@ -3273,7 +3273,7 @@ async fn owner_ref_is_live<S: Store>(
         Ok(v) => v,
         Err(_) => return false,
     };
-    stored["metadata"]["uid"].as_str() == Some(uid)
+    stored["metadata"]["uid"].as_str() == Some(owner_ref.uid.as_str())
 }
 
 /// Removes `owner_uid`'s entry from the dependent's ownerReferences and persists the
@@ -3322,13 +3322,20 @@ async fn strip_or_delete_dependent<S: Store>(
                 return false;
             }
         };
-        let refs = match obj["metadata"]["ownerReferences"].as_array() {
-            Some(r) if r.iter().any(|r| r["uid"].as_str() == Some(owner_uid)) => r.clone(),
+        let meta: ObjectMeta = match serde_json::from_value(obj["metadata"].clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("cascade-delete {label}: corrupt metadata: {e}");
+                return false;
+            }
+        };
+        let refs = match meta.owner_references {
+            Some(r) if r.iter().any(|r| r.uid == owner_uid) => r,
             _ => return false,
         };
 
         let mut other_live = false;
-        for other in refs.iter().filter(|r| r["uid"].as_str() != Some(owner_uid)) {
+        for other in refs.iter().filter(|r| r.uid != owner_uid) {
             if owner_ref_is_live(state, namespace, other).await {
                 other_live = true;
                 break;
@@ -3343,13 +3350,13 @@ async fn strip_or_delete_dependent<S: Store>(
             return true;
         }
 
-        let filtered: Vec<serde_json::Value> = refs
-            .into_iter()
-            .filter(|r| r["uid"].as_str() != Some(owner_uid))
-            .collect();
-        obj["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
-        let expected_rv = obj["metadata"]["resourceVersion"]
-            .as_str()
+        let filtered: Vec<OwnerReference> =
+            refs.into_iter().filter(|r| r.uid != owner_uid).collect();
+        obj["metadata"]["ownerReferences"] =
+            serde_json::to_value(&filtered).expect("OwnerReference vec is always serializable");
+        let expected_rv = meta
+            .resource_version
+            .as_deref()
             .and_then(|s| s.parse::<u64>().ok());
         let bytes = match serde_json::to_vec(&obj) {
             Ok(b) => bytes::Bytes::from(b),
@@ -18181,6 +18188,154 @@ mod tests {
              that clobbers stale LIST-time data instead of retrying against the freshly \
              re-read object would silently discard a status update the writer believes \
              succeeded, with no error surfaced to either side"
+        );
+    }
+
+    /// A dependent with a second, still-live owner must survive `strip_or_delete_dependent`
+    /// with only the deleted owner's reference removed. This is the core GC invariant: a
+    /// cascade delete from one owner must never destroy a resource another live owner still
+    /// legitimately references (see the doc comment on `strip_or_delete_dependent`).
+    #[tokio::test]
+    async fn strip_or_delete_dependent_preserves_dependent_with_live_second_owner() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns = "default";
+        let stale_owner_uid = "stale-owner-uid";
+        let live_owner_uid = "live-owner-uid";
+
+        store
+            .put(
+                "/registry/apps/deployments/default/live-owner",
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": { "name": "live-owner", "namespace": ns, "uid": live_owner_uid }
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let dependent_key = "/registry/apps/replicasets/default/my-rs";
+        store
+            .put(
+                dependent_key,
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "metadata": {
+                            "name": "my-rs",
+                            "namespace": ns,
+                            "ownerReferences": [
+                                { "apiVersion": "apps/v1", "kind": "Deployment", "name": "deleted-owner", "uid": stale_owner_uid },
+                                { "apiVersion": "apps/v1", "kind": "Deployment", "name": "live-owner", "uid": live_owner_uid }
+                            ]
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deleted =
+            strip_or_delete_dependent(&state, ns, dependent_key, stale_owner_uid, "test-rs").await;
+        assert!(
+            !deleted,
+            "the ReplicaSet has another live owner besides the deleted one, so it must \
+             survive with only the deleted owner's reference stripped"
+        );
+
+        let stored = store.get(dependent_key).await.unwrap().unwrap();
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let refs = stored_val["metadata"]["ownerReferences"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r["uid"].as_str() == Some(stale_owner_uid)),
+            "the deleted owner's reference must be stripped"
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r["uid"].as_str() == Some(live_owner_uid)),
+            "the live owner's reference must survive — dropping it would orphan the \
+             dependent from an owner that still exists"
+        );
+    }
+
+    /// A dependent whose only other ownerReferences entry points to a UID that no longer
+    /// exists in the store must be hard-deleted, not left behind with a dangling reference.
+    /// Without this, a ReplicaSet whose sole owners were both deleted would linger forever
+    /// instead of being garbage-collected.
+    #[tokio::test]
+    async fn strip_or_delete_dependent_hard_deletes_when_no_other_owner_is_live() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns = "default";
+        let stale_owner_uid = "stale-owner-uid";
+        let other_dead_uid = "other-dead-uid";
+
+        let dependent_key = "/registry/apps/replicasets/default/my-rs";
+        store
+            .put(
+                dependent_key,
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "metadata": {
+                            "name": "my-rs",
+                            "namespace": ns,
+                            "ownerReferences": [
+                                { "apiVersion": "apps/v1", "kind": "Deployment", "name": "deleted-owner", "uid": stale_owner_uid },
+                                { "apiVersion": "apps/v1", "kind": "Deployment", "name": "also-gone", "uid": other_dead_uid }
+                            ]
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deleted =
+            strip_or_delete_dependent(&state, ns, dependent_key, stale_owner_uid, "test-rs").await;
+        assert!(
+            deleted,
+            "no other owner is live, so the dependent must be hard-deleted rather than left \
+             behind with only a dangling reference to a gone owner"
+        );
+        assert!(
+            store.get(dependent_key).await.unwrap().is_none(),
+            "the dependent must actually be removed from the store"
         );
     }
 
