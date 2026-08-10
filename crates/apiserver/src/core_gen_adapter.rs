@@ -2659,7 +2659,52 @@ fn gen_node_status_to_json(status: core_v1::NodeStatus) -> serde_json::Value {
             serde_json::Value::Array(vols),
         );
     }
+    if let Some(v) = status.features.and_then(|f| f.supplemental_groups_policy) {
+        m.insert(
+            "features".to_string(),
+            serde_json::json!({ "supplementalGroupsPolicy": v }),
+        );
+    }
+    if !status.declared_features.is_empty() {
+        m.insert(
+            "declaredFeatures".to_string(),
+            serde_json::Value::Array(
+                status
+                    .declared_features
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
     serde_json::Value::Object(m)
+}
+
+fn gen_taint_to_json(t: core_v1::Taint) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "key".to_string(),
+        serde_json::Value::String(t.key.unwrap_or_default()),
+    );
+    if let Some(v) = t.value.filter(|s| !s.is_empty()) {
+        m.insert("value".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = t.effect.filter(|s| !s.is_empty()) {
+        m.insert("effect".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(ts) = t.time_added {
+        if let Some(secs) = ts.seconds.filter(|&s| s > 0) {
+            m.insert(
+                "timeAdded".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_taints_to_json(ts: Vec<core_v1::Taint>) -> serde_json::Value {
+    serde_json::Value::Array(ts.into_iter().map(gen_taint_to_json).collect())
 }
 
 pub fn decode_node_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -2688,6 +2733,12 @@ pub fn decode_node_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                         .collect(),
                 ),
             );
+        }
+        if let Some(v) = spec.unschedulable {
+            spec_map.insert("unschedulable".to_string(), serde_json::Value::Bool(v));
+        }
+        if !spec.taints.is_empty() {
+            spec_map.insert("taints".to_string(), gen_taints_to_json(spec.taints));
         }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
@@ -3118,6 +3169,9 @@ pub fn decode_endpoints_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                             if let Some(v) = a.node_name.filter(|s| !s.is_empty()) {
                                 addr["nodeName"] = serde_json::Value::String(v);
                             }
+                            if let Some(v) = a.target_ref {
+                                addr["targetRef"] = gen_object_reference_to_json(v);
+                            }
                             addr
                         })
                         .collect::<Vec<_>>()
@@ -3136,6 +3190,9 @@ pub fn decode_endpoints_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                             }
                             if let Some(v) = a.node_name.filter(|s| !s.is_empty()) {
                                 addr["nodeName"] = serde_json::Value::String(v);
+                            }
+                            if let Some(v) = a.target_ref {
+                                addr["targetRef"] = gen_object_reference_to_json(v);
                             }
                             addr
                         })
@@ -3479,6 +3536,9 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Tests -----------------------------------------------------------------
 
+/// Most tests below guard against the same protobuf decode gap class: a `decode_*_proto_gen`
+/// function that only reads a subset of its message's fields, silently dropping the rest on
+/// every protobuf-encoded write (the default content-type for client-go's typed clientsets).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6145,6 +6205,155 @@ mod tests {
         );
     }
 
+    // ---- Node.spec.unschedulable / spec.taints: protobuf decode gap class ----
+    //
+    // Same shape as the Job/CronJob spec-scalar decode gaps fixed elsewhere in this crate:
+    // decode_node_proto_gen only read podCIDR/providerID/podCIDRs off the decoded NodeSpec,
+    // silently dropping unschedulable and taints. client-go's typed clientset defaults to
+    // protobuf content-type for Node, so every Node created via the typed API lost both
+    // fields before storage.
+
+    /// spec.unschedulable=true must survive decode — the scheduler's NodeUnschedulable
+    /// filter reads this field to keep pods off cordoned/not-yet-ready nodes. If it's
+    /// dropped, `Unschedulable: true` silently becomes `None`/absent and the filter passes
+    /// every node, letting pods bind to nodes that explicitly asked not to be scheduled onto.
+    #[test]
+    fn decode_node_proto_gen_preserves_spec_unschedulable_true() {
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("cordoned-node".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::NodeSpec {
+                unschedulable: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_node_proto_gen(&buf).expect("Node must decode");
+
+        assert_eq!(
+            result["spec"]["unschedulable"],
+            serde_json::json!(true),
+            "spec.unschedulable must survive decode — without it the scheduler's \
+             NodeUnschedulable filter never sees the cordon and binds pods to a node that \
+             explicitly asked not to be scheduled onto"
+        );
+    }
+
+    /// spec.unschedulable must be omitted (not emitted as `false`) when absent from the wire,
+    /// matching upstream's `omitempty` JSON shape for this field.
+    #[test]
+    fn decode_node_proto_gen_omits_unschedulable_when_absent() {
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("schedulable-node".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::NodeSpec {
+                unschedulable: None,
+                pod_cidr: Some("10.0.0.0/24".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_node_proto_gen(&buf).expect("Node must decode");
+
+        assert!(
+            result["spec"].get("unschedulable").is_none(),
+            "spec.unschedulable must be absent (not `false`) when the field was never set on \
+             the wire — matching upstream's omitempty shape so a client that never touched \
+             schedulability can't be told it explicitly requested `false`"
+        );
+    }
+
+    /// spec.taints must survive decode — TaintToleration scheduling predicates and the
+    /// eviction controller both key off this field to know which pods must move off (or
+    /// never land on) a tainted node.
+    #[test]
+    fn decode_node_proto_gen_preserves_spec_taints() {
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("tainted-node".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::NodeSpec {
+                taints: vec![core_v1::Taint {
+                    key: Some("node.kubernetes.io/not-ready".to_string()),
+                    value: Some(String::new()),
+                    effect: Some("NoSchedule".to_string()),
+                    time_added: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_node_proto_gen(&buf).expect("Node must decode");
+
+        let taints = result["spec"]["taints"].as_array().expect(
+            "spec.taints must be present — without it a node's NoSchedule/NoExecute taints \
+             vanish on decode and pods that should be evicted or blocked from scheduling \
+             there are neither",
+        );
+        assert_eq!(taints.len(), 1, "one taint must survive decode");
+        assert_eq!(
+            taints[0]["key"], "node.kubernetes.io/not-ready",
+            "taint key must survive decode — the scheduler and toleration matching both key \
+             off this field"
+        );
+        assert_eq!(
+            taints[0]["effect"], "NoSchedule",
+            "taint effect must survive decode — without it the scheduler cannot tell \
+             NoSchedule from PreferNoSchedule from NoExecute"
+        );
+    }
+
+    /// NodeStatus.features.supplementalGroupsPolicy and NodeStatus.declaredFeatures must
+    /// survive decode alongside the spec fields above — same decoder, same silent-drop gap
+    /// found while auditing every field this function reads off the wire.
+    #[test]
+    fn decode_node_proto_gen_preserves_status_features_and_declared_features() {
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("feature-node".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::NodeStatus {
+                features: Some(core_v1::NodeFeatures {
+                    supplemental_groups_policy: Some(true),
+                }),
+                declared_features: vec!["SupplementalGroupsPolicy".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_node_proto_gen(&buf).expect("Node must decode");
+
+        assert_eq!(
+            result["status"]["features"]["supplementalGroupsPolicy"],
+            serde_json::json!(true),
+            "status.features.supplementalGroupsPolicy must survive decode — without it a \
+             client can't tell whether the node's runtime actually supports \
+             SupplementalGroupsPolicy/ContainerUser"
+        );
+        assert_eq!(
+            result["status"]["declaredFeatures"][0], "SupplementalGroupsPolicy",
+            "status.declaredFeatures must survive decode"
+        );
+    }
+
     /// Service status.loadBalancer and status.conditions must survive proto decode.
     ///
     /// `kubectl get svc` and any client waiting on external connectivity read
@@ -6797,6 +7006,46 @@ mod tests {
         assert_eq!(
             result["subsets"][0]["ports"][0]["port"], 8080,
             "subsets[].ports must survive decode — without it kube-proxy has no port to forward to"
+        );
+    }
+
+    /// decode_endpoints_proto_gen must preserve addresses[].targetRef — found while auditing
+    /// this file's decoders for the same silent-field-drop shape as Node.spec.unschedulable.
+    ///
+    /// targetRef points back at the Pod backing an address; consumers reading Endpoints
+    /// directly (rather than via EndpointSlice) use it to resolve which pod owns a given IP.
+    #[test]
+    fn decode_endpoints_proto_gen_preserves_address_target_ref() {
+        let ep = core_v1::Endpoints {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            subsets: vec![core_v1::EndpointSubset {
+                addresses: vec![core_v1::EndpointAddress {
+                    ip: Some("10.0.0.5".to_string()),
+                    target_ref: Some(core_v1::ObjectReference {
+                        kind: Some("Pod".to_string()),
+                        name: Some("pod-a".to_string()),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                not_ready_addresses: vec![],
+                ports: vec![],
+            }],
+        };
+        let mut buf = Vec::new();
+        ep.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_endpoints_proto_gen(&buf).expect("Endpoints must decode");
+
+        assert_eq!(
+            result["subsets"][0]["addresses"][0]["targetRef"]["name"], "pod-a",
+            "addresses[].targetRef must survive decode — without it a consumer reading \
+             Endpoints directly cannot tell which Pod backs a given address"
         );
     }
 
