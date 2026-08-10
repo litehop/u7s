@@ -319,13 +319,27 @@ pub async fn find_crd<S: Store>(
 /// Takes the conversion config directly (rather than `&CrContext`) so callers that only
 /// carry that config — like the watch path's `CrFieldSelectorContext` — can share this
 /// exact check instead of re-deriving it.
+///
+/// `apiVersion` lives at the object root, not under `metadata`, so it isn't covered by
+/// `types::ObjectMeta`; this gets its own tiny typed view rather than a raw Value index
+/// for the field that gates whether a real network call (the webhook) fires.
+#[derive(serde::Deserialize)]
+struct StoredApiVersion {
+    #[serde(rename = "apiVersion", default)]
+    api_version: Option<String>,
+}
+
 fn object_needs_conversion(
     obj: &serde_json::Value,
     desired_api_version: &str,
     conversion_webhook_client_config: Option<&serde_json::Value>,
 ) -> bool {
-    conversion_webhook_client_config.is_some()
-        && obj["apiVersion"].as_str() != Some(desired_api_version)
+    if conversion_webhook_client_config.is_none() {
+        return false;
+    }
+    let stored = <StoredApiVersion as serde::Deserialize>::deserialize(obj)
+        .unwrap_or(StoredApiVersion { api_version: None });
+    stored.api_version.as_deref() != Some(desired_api_version)
 }
 
 /// Derive the `state.cr_conversion_cache` key for `item` at `desired_api_version` — the
@@ -517,11 +531,6 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
     obj["kind"] = serde_json::Value::String(kind.to_string());
-    // Save ownerReferences before the ObjectMeta round-trip: ObjectMeta serde only
-    // knows declared fields, so ownerReferences is silently dropped by from_value/to_value.
-    // Restore it after so CR dependents created with ownerReferences survive intact and
-    // cascade_delete_cr_dependents can find them by ownerReference.uid.
-    let saved_owner_refs = obj["metadata"]["ownerReferences"].clone();
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
@@ -536,9 +545,6 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
         meta.creation_timestamp = Some(utc_now_rfc3339());
     }
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    if !saved_owner_refs.is_null() {
-        obj["metadata"]["ownerReferences"] = saved_owner_refs;
-    }
 }
 
 fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
@@ -5446,6 +5452,63 @@ mod tests {
             obj["metadata"]["creationTimestamp"], "2024-01-01T00:00:00Z",
             "existing creationTimestamp must be preserved"
         );
+    }
+
+    // stamp_cr_fields's ObjectMeta round-trip must preserve ownerReferences — a
+    // dependent created with an ownerReference (e.g. by a controller) must still be
+    // findable by cascade_delete_cr_dependents after create/replace stamps the envelope.
+    #[test]
+    fn stamp_cr_fields_preserves_owner_references() {
+        let mut obj = serde_json::json!({
+            "metadata": {
+                "name": "dep",
+                "ownerReferences": [{
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "name": "owner",
+                    "uid": "owner-uid",
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            }
+        });
+        stamp_cr_fields(&mut obj, "example.io", "v1", "Widget");
+        let refs = obj["metadata"]["ownerReferences"].as_array();
+        assert!(
+            refs.is_some() && !refs.unwrap().is_empty(),
+            "ownerReferences must survive stamp_cr_fields's ObjectMeta round-trip — if \
+             dropped, cascade_delete_cr_dependents can never find this object by owner uid"
+        );
+    }
+
+    // object_needs_conversion gates whether the conversion webhook — a real network call
+    // with its own timeout — fires for a stored CR. It must compare the object's OWN
+    // stored apiVersion against the requested one: an already-matching object must never
+    // be sent through the webhook (real webhooks reject a version-to-itself request as a
+    // client bug), and a drifted object must always be converted or clients requesting
+    // the new version see stale-shaped data.
+    #[test]
+    fn object_needs_conversion_dispatches_on_the_objects_own_stored_api_version() {
+        let cfg = serde_json::json!({ "url": "https://example.invalid/convert" });
+        let obj = serde_json::json!({ "apiVersion": "example.io/v1", "kind": "Widget" });
+        assert!(
+            !object_needs_conversion(&obj, "example.io/v1", Some(&cfg)),
+            "an object already stored at the requested apiVersion must not be sent \
+             through the conversion webhook"
+        );
+        assert!(
+            object_needs_conversion(&obj, "example.io/v2", Some(&cfg)),
+            "an object stored under an older apiVersion than requested must be converted"
+        );
+    }
+
+    // Without a configured conversion webhook there is nothing to dispatch to — most CRDs
+    // never declare a `conversion` block — so a mismatched apiVersion alone must not
+    // trigger a call that has nowhere to go.
+    #[test]
+    fn object_needs_conversion_returns_false_without_webhook_config() {
+        let obj = serde_json::json!({ "apiVersion": "example.io/v1" });
+        assert!(!object_needs_conversion(&obj, "example.io/v2", None));
     }
 
     // validate_cr_name must reject empty names — empty string is not a valid
@@ -12574,10 +12637,10 @@ mod tests {
     }
 
     /// Creating a CR via the API with ownerReferences in metadata must preserve those
-    /// references in storage. stamp_cr_fields rounds-trips metadata through ObjectMeta
-    /// (which lacks ownerReferences), so without an explicit save+restore the ownerRefs
-    /// are silently dropped — cascade_delete_cr_dependents then can't find dependents and
-    /// GC conformance 'should support cascading deletion of custom resources' fails.
+    /// references in storage. stamp_cr_fields rounds-trips metadata through ObjectMeta;
+    /// if ObjectMeta ever stops modeling ownerReferences, this round-trip would silently
+    /// drop them — cascade_delete_cr_dependents then can't find dependents and GC
+    /// conformance 'should support cascading deletion of custom resources' fails.
     #[tokio::test]
     async fn create_cr_via_api_preserves_owner_references() {
         let state = make_state();
@@ -12660,8 +12723,8 @@ mod tests {
         assert!(
             refs.is_some() && !refs.unwrap().is_empty(),
             "ownerReferences must be preserved through create_cr — stamp_cr_fields \
-             rounds-trips metadata through ObjectMeta which drops unknown fields; \
-             without explicit save+restore, cascade cannot find dependents and GC conformance fails"
+             rounds-trips metadata through ObjectMeta; if ownerReferences were dropped, \
+             cascade could not find dependents and GC conformance would fail"
         );
         assert_eq!(
             refs.unwrap()[0]["uid"].as_str(),
@@ -12699,10 +12762,10 @@ mod tests {
 
     /// Creating a NAMESPACED CR via the API with ownerReferences in metadata must preserve
     /// those references in storage. create_cr_namespaced round-trips metadata through
-    /// ObjectMeta a second time (to stamp namespace) BEFORE stamp_cr_fields's own
-    /// save+restore ever runs, so ownerReferences is already gone by the time stamp_cr_fields
-    /// tries to save it — cascade_delete_cr_dependents then can't find dependents and any
-    /// namespaced CR-owns-CR relationship silently loses its GC/cascade-delete link.
+    /// ObjectMeta twice (once to stamp namespace, once in stamp_cr_fields); if either
+    /// round-trip ever dropped ownerReferences, cascade_delete_cr_dependents could not find
+    /// dependents and any namespaced CR-owns-CR relationship would silently lose its
+    /// GC/cascade-delete link.
     #[tokio::test]
     async fn create_cr_namespaced_via_api_preserves_owner_references() {
         let state = make_state();
@@ -12788,9 +12851,9 @@ mod tests {
         assert!(
             refs.is_some() && !refs.unwrap().is_empty(),
             "ownerReferences must be preserved through create_cr_namespaced — the namespace-\
-             setting ObjectMeta round-trip runs before stamp_cr_fields's own save+restore, so \
-             without a fix ownerRefs are already gone by the time stamp_cr_fields tries to save \
-             them, and cascade_delete_cr_dependents can never find this dependent by uid"
+             setting ObjectMeta round-trip runs before stamp_cr_fields's own round-trip, so if \
+             either one dropped ownerReferences, cascade_delete_cr_dependents could never find \
+             this dependent by uid"
         );
         assert_eq!(
             refs.unwrap()[0]["uid"].as_str(),
