@@ -87,19 +87,23 @@ fn gen_success_policy_to_json(sp: batch_v1::SuccessPolicy) -> serde_json::Value 
 
 fn gen_job_spec_to_json(spec: batch_v1::JobSpec) -> serde_json::Value {
     let mut m = serde_json::Map::new();
-    if let Some(v) = spec.parallelism.filter(|&n| n != 0) {
+    // parallelism/completions/activeDeadlineSeconds/backoffLimit/ttlSecondsAfterFinished are
+    // upstream *int32/*int64 (proto3 optional); Some(0) is a legitimate value (e.g. "run 0 pods
+    // in parallel", "retry 0 times") distinct from absent, so these must always be emitted
+    // when Some(_).
+    if let Some(v) = spec.parallelism {
         m.insert("parallelism".to_string(), v.into());
     }
-    if let Some(v) = spec.completions.filter(|&n| n != 0) {
+    if let Some(v) = spec.completions {
         m.insert("completions".to_string(), v.into());
     }
-    if let Some(v) = spec.active_deadline_seconds.filter(|&n| n != 0) {
+    if let Some(v) = spec.active_deadline_seconds {
         m.insert("activeDeadlineSeconds".to_string(), v.into());
     }
-    if let Some(v) = spec.backoff_limit.filter(|&n| n != 0) {
+    if let Some(v) = spec.backoff_limit {
         m.insert("backoffLimit".to_string(), v.into());
     }
-    if let Some(v) = spec.ttl_seconds_after_finished.filter(|&n| n != 0) {
+    if let Some(v) = spec.ttl_seconds_after_finished {
         m.insert("ttlSecondsAfterFinished".to_string(), v.into());
     }
     if let Some(v) = spec.completion_mode.filter(|s| !s.is_empty()) {
@@ -285,7 +289,10 @@ pub fn decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         if let Some(v) = spec.schedule.filter(|s| !s.is_empty()) {
             spec_map.insert("schedule".to_string(), v.into());
         }
-        if let Some(v) = spec.starting_deadline_seconds.filter(|&n| n != 0) {
+        // startingDeadlineSeconds/successfulJobsHistoryLimit/failedJobsHistoryLimit are
+        // upstream *int64/*int32 (proto3 optional); Some(0) is a legitimate value (e.g. "keep
+        // no history") distinct from absent, so these must always be emitted when Some(_).
+        if let Some(v) = spec.starting_deadline_seconds {
             spec_map.insert("startingDeadlineSeconds".to_string(), v.into());
         }
         if let Some(v) = spec.concurrency_policy.filter(|s| !s.is_empty()) {
@@ -294,10 +301,10 @@ pub fn decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         if let Some(true) = spec.suspend {
             spec_map.insert("suspend".to_string(), true.into());
         }
-        if let Some(v) = spec.successful_jobs_history_limit.filter(|&n| n != 0) {
+        if let Some(v) = spec.successful_jobs_history_limit {
             spec_map.insert("successfulJobsHistoryLimit".to_string(), v.into());
         }
-        if let Some(v) = spec.failed_jobs_history_limit.filter(|&n| n != 0) {
+        if let Some(v) = spec.failed_jobs_history_limit {
             spec_map.insert("failedJobsHistoryLimit".to_string(), v.into());
         }
         if let Some(v) = spec.time_zone.filter(|s| !s.is_empty()) {
@@ -963,6 +970,135 @@ mod tests {
         );
     }
 
+    /// decode_job_proto_gen must preserve spec.parallelism when PRESENT BUT ZERO.
+    ///
+    /// Upstream JobSpec.Parallelism is *int32 (proto3 optional); Some(0) means "explicitly
+    /// don't run pods in parallel" (a valid Job spec). Dropping it to absent would make KCM's
+    /// Job controller fall back to its hardcoded default of 1 instead of the user's intent.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_spec_parallelism() {
+        let job = batch_v1::Job {
+            spec: Some(batch_v1::JobSpec {
+                parallelism: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["spec"]["parallelism"], 0,
+            "spec.parallelism must decode as PRESENT with value 0 when the proto field is \
+             Some(0), NOT be dropped — user-visible intent, `parallelism: 0` means 'explicitly \
+             don't run pods in parallel'. Silently dropping means KCM's controller falls back \
+             to its hardcoded default of 1 instead."
+        );
+    }
+
+    /// decode_job_proto_gen must preserve spec.completions when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as spec.parallelism: `completions: 0` is a rare but valid
+    /// value for indexed jobs and must not be collapsed into absent.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_spec_completions() {
+        let job = batch_v1::Job {
+            spec: Some(batch_v1::JobSpec {
+                completions: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["spec"]["completions"], 0,
+            "spec.completions must decode as PRESENT with value 0 when the proto field is \
+             Some(0), NOT be dropped — user-visible intent, `completions: 0` means 'zero \
+             completions required'. Silently dropping means KCM's controller treats the field \
+             as unset instead."
+        );
+    }
+
+    /// decode_job_proto_gen must preserve spec.activeDeadlineSeconds when PRESENT BUT ZERO.
+    ///
+    /// Upstream JobSpec.ActiveDeadlineSeconds is *int64 (proto3 optional); `activeDeadlineSeconds:
+    /// 0` means "the Job's pods must be terminated immediately" and must not be collapsed into
+    /// absent (which means "no deadline").
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_spec_active_deadline_seconds() {
+        let job = batch_v1::Job {
+            spec: Some(batch_v1::JobSpec {
+                active_deadline_seconds: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["spec"]["activeDeadlineSeconds"], 0,
+            "spec.activeDeadlineSeconds must decode as PRESENT with value 0 when the proto \
+             field is Some(0), NOT be dropped — user-visible intent, `activeDeadlineSeconds: 0` \
+             means 'terminate pods immediately'. Silently dropping means KCM's controller \
+             treats the Job as having no deadline instead."
+        );
+    }
+
+    /// decode_job_proto_gen must preserve spec.backoffLimit when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as spec.parallelism: `backoffLimit: 0` ("don't retry on
+    /// failure") is a very common value and must not be collapsed into absent.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_spec_backoff_limit() {
+        let job = batch_v1::Job {
+            spec: Some(batch_v1::JobSpec {
+                backoff_limit: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["spec"]["backoffLimit"], 0,
+            "spec.backoffLimit must decode as PRESENT with value 0 when the proto field is \
+             Some(0), NOT be dropped — user-visible intent, `backoffLimit: 0` means 'don't \
+             retry on failure'. Silently dropping means KCM's controller falls back to its \
+             hardcoded default of 6 instead."
+        );
+    }
+
+    /// decode_job_proto_gen must preserve spec.ttlSecondsAfterFinished when PRESENT BUT ZERO.
+    ///
+    /// Same *int32 tri-state issue as spec.parallelism: `ttlSecondsAfterFinished: 0` means
+    /// "delete immediately after completion" and must not be collapsed into absent (which
+    /// means "never automatically delete").
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_zero_spec_ttl_seconds_after_finished() {
+        let job = batch_v1::Job {
+            spec: Some(batch_v1::JobSpec {
+                ttl_seconds_after_finished: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        assert_eq!(
+            result["spec"]["ttlSecondsAfterFinished"], 0,
+            "spec.ttlSecondsAfterFinished must decode as PRESENT with value 0 when the proto \
+             field is Some(0), NOT be dropped — user-visible intent, \
+             `ttlSecondsAfterFinished: 0` means 'delete immediately after completion'. \
+             Silently dropping means KCM's controller treats the Job as never eligible for \
+             automatic deletion instead."
+        );
+    }
+
     /// decode_cronjob_proto_gen's status.active entries must preserve resourceVersion/fieldPath.
     ///
     /// ObjectReference has 7 fields; this hand-rolled mapping (not core_gen_adapter's shared
@@ -998,6 +1134,89 @@ mod tests {
         assert_eq!(
             result["status"]["active"][0]["fieldPath"], "spec.containers{main}",
             "status.active[0].fieldPath must survive decode"
+        );
+    }
+
+    /// decode_cronjob_proto_gen must preserve spec.startingDeadlineSeconds when PRESENT BUT
+    /// ZERO.
+    ///
+    /// Upstream CronJobSpec.StartingDeadlineSeconds is *int64 (proto3 optional);
+    /// `startingDeadlineSeconds: 0` means "a missed schedule is never considered started" and
+    /// must not be collapsed into absent (which means "no deadline").
+    #[test]
+    fn decode_cronjob_proto_gen_preserves_present_but_zero_spec_starting_deadline_seconds() {
+        let cj = batch_v1::CronJob {
+            spec: Some(batch_v1::CronJobSpec {
+                starting_deadline_seconds: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_cronjob_proto_gen(&buf).expect("CronJob must decode");
+        assert_eq!(
+            result["spec"]["startingDeadlineSeconds"], 0,
+            "spec.startingDeadlineSeconds must decode as PRESENT with value 0 when the proto \
+             field is Some(0), NOT be dropped — user-visible intent, \
+             `startingDeadlineSeconds: 0` means 'a missed schedule is never considered \
+             started'. Silently dropping means KCM's CronJob controller treats the field as \
+             unset instead."
+        );
+    }
+
+    /// decode_cronjob_proto_gen must preserve spec.successfulJobsHistoryLimit when PRESENT BUT
+    /// ZERO.
+    ///
+    /// Same *int32 tri-state issue as spec.startingDeadlineSeconds:
+    /// `successfulJobsHistoryLimit: 0` ("keep no history of successful runs") is common in
+    /// production and must not be collapsed into absent.
+    #[test]
+    fn decode_cronjob_proto_gen_preserves_present_but_zero_spec_successful_jobs_history_limit() {
+        let cj = batch_v1::CronJob {
+            spec: Some(batch_v1::CronJobSpec {
+                successful_jobs_history_limit: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_cronjob_proto_gen(&buf).expect("CronJob must decode");
+        assert_eq!(
+            result["spec"]["successfulJobsHistoryLimit"], 0,
+            "spec.successfulJobsHistoryLimit must decode as PRESENT with value 0 when the \
+             proto field is Some(0), NOT be dropped — user-visible intent, \
+             `successfulJobsHistoryLimit: 0` means 'keep no history of successful runs'. \
+             Silently dropping means KCM's controller falls back to its hardcoded default of \
+             3 instead."
+        );
+    }
+
+    /// decode_cronjob_proto_gen must preserve spec.failedJobsHistoryLimit when PRESENT BUT
+    /// ZERO.
+    ///
+    /// Same *int32 tri-state issue as spec.startingDeadlineSeconds:
+    /// `failedJobsHistoryLimit: 0` ("keep no history of failed runs") must not be collapsed
+    /// into absent.
+    #[test]
+    fn decode_cronjob_proto_gen_preserves_present_but_zero_spec_failed_jobs_history_limit() {
+        let cj = batch_v1::CronJob {
+            spec: Some(batch_v1::CronJobSpec {
+                failed_jobs_history_limit: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_cronjob_proto_gen(&buf).expect("CronJob must decode");
+        assert_eq!(
+            result["spec"]["failedJobsHistoryLimit"], 0,
+            "spec.failedJobsHistoryLimit must decode as PRESENT with value 0 when the proto \
+             field is Some(0), NOT be dropped — user-visible intent, \
+             `failedJobsHistoryLimit: 0` means 'keep no history of failed runs'. Silently \
+             dropping means KCM's controller falls back to its hardcoded default of 1 instead."
         );
     }
 
