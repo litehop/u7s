@@ -5,6 +5,7 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
+use serde::Deserialize;
 use u7s_store::Store;
 
 use crate::{
@@ -220,6 +221,14 @@ pub async fn patch_resource_status<S: Store>(
     Ok(Json(current.body))
 }
 
+/// Typed view of just the `kind` field, used by the CR-fallback /status handlers
+/// below to recover the real kind from the stored object when the static resource
+/// registry has no entry for this group (so `lookup` can't supply one).
+#[derive(Debug, Deserialize)]
+struct StatusEnvelope {
+    kind: String,
+}
+
 // -- namespaced --
 
 pub async fn get_namespaced_resource_status<S: Store>(
@@ -276,9 +285,8 @@ pub async fn put_namespaced_resource_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let kind = current.body["kind"]
-        .as_str()
-        .map(str::to_owned)
+    let kind = StatusEnvelope::deserialize(&current.body)
+        .map(|e| e.kind)
         .unwrap_or(kind_fallback);
 
     match &incoming.body["status"] {
@@ -340,9 +348,8 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let kind = current.body["kind"]
-        .as_str()
-        .map(str::to_owned)
+    let kind = StatusEnvelope::deserialize(&current.body)
+        .map(|e| e.kind)
         .unwrap_or(kind_fallback);
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
