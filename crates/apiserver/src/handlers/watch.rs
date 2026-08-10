@@ -156,7 +156,11 @@ pub fn prepare_live_event(
 /// metadata fields (ownerReferences, finalizers, ...), only about which top-level object keys
 /// survive, so there is nothing here for a typed struct to protect beyond that: the absence of
 /// `spec`/`status` fields on this type makes it structurally impossible for either to leak into
-/// a PartialObjectMetadata response, unlike the `serde_json::json!` macro it replaces.
+/// a PartialObjectMetadata response, unlike the `serde_json::json!` macro it replaces. It also
+/// cannot become `ObjectMeta` outright: `ObjectMeta` still doesn't model `generation` (set on
+/// every workload resource — a full round trip dropping it makes KCM's controllers see
+/// `generation: null` and stop reconciling entirely) or `deletionGracePeriodSeconds` (set by
+/// pods.rs during graceful termination).
 #[derive(Serialize)]
 struct PartialObjectMetadataEnvelope<'a> {
     #[serde(rename = "apiVersion")]
@@ -192,8 +196,10 @@ fn finish_deleted_event(
     // Set metadata.resourceVersion via ObjectMeta's own field-name mapping instead of a raw
     // string index, merging just this one field into the existing metadata object rather than
     // deserializing the whole object into ObjectMeta and reserializing it — a full round trip
-    // would silently drop any field ObjectMeta doesn't model (ownerReferences, managedFields,
-    // ...), which is exactly the class of correctness bug this migration exists to prevent.
+    // would silently drop any field ObjectMeta doesn't model. ownerReferences/managedFields are
+    // modeled now, but `generation` and `deletionGracePeriodSeconds` still aren't (see
+    // `to_partial_object_metadata`'s doc comment above), which is exactly the class of
+    // correctness bug this migration exists to prevent.
     let patch = ObjectMeta {
         resource_version: Some(revision.to_string()),
         ..Default::default()
@@ -1517,6 +1523,60 @@ mod tests {
         );
     }
 
+    /// Regression guard for a tightening that must NOT happen: `finish_deleted_event` merges
+    /// the resourceVersion patch into the existing metadata map instead of deserializing the
+    /// whole object into `ObjectMeta` and reserializing it, because `ObjectMeta` still doesn't
+    /// model `generation` or `deletionGracePeriodSeconds`. `generation` is set on every workload
+    /// resource (Deployment, StatefulSet, ...); KCM's controllers stop reconciling entirely if a
+    /// DELETED event reports `generation: null` (see defaults.rs's own comment on this exact
+    /// failure mode). This test fails if `finish_deleted_event` is ever rewritten to do a full
+    /// ObjectMeta round trip: verified by temporarily rewriting it that way and confirming the
+    /// two assertions below fail with `null` instead of `4`/`30`.
+    #[test]
+    fn deleted_watch_event_preserves_fields_objectmeta_does_not_model() {
+        let deploy_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "my-deploy",
+                "namespace": "test-ns",
+                "generation": 4,
+                "deletionGracePeriodSeconds": 30
+            },
+            "spec": { "replicas": 1 }
+        });
+        let body_bytes =
+            bytes::Bytes::from(serde_json::to_vec(&deploy_body).expect("deploy_body serializes"));
+
+        let event = WatchEvent::Deleted {
+            key: "/registry/apps/deployments/test-ns/my-deploy".into(),
+            revision: 99,
+            body: Some(body_bytes),
+        };
+
+        let chunk = encode_watch_event(&event, "apps/v1", "Deployment", false)
+            .expect("DELETED event with body must produce a chunk");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end())
+                .expect("chunk must be valid JSON");
+
+        assert_eq!(
+            decoded["object"]["metadata"]["generation"], 4,
+            "generation must survive a DELETED event unchanged — KCM's deployment controller \
+             reads it to decide whether to reconcile and stops entirely if it sees null"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["deletionGracePeriodSeconds"], 30,
+            "deletionGracePeriodSeconds must survive a DELETED event unchanged — it is set \
+             during graceful termination and read by controllers/kubelet"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "99",
+            "finish_deleted_event must still stamp the deletion revision alongside the \
+             untouched fields above"
+        );
+    }
+
     /// Historical-wedge regression, ADDED counterpart: mirrors
     /// `deleted_watch_event_stamps_api_version_and_kind_when_stored_body_lacks_them` for the
     /// live-watch ADDED path. `prepare_live_event` is what `watch_generic_impl`'s fast path
@@ -1674,6 +1734,42 @@ mod tests {
             pom.get("status").is_none(),
             "status must be entirely absent from a PartialObjectMetadata projection, not \
              merely null, for the same reason as spec above"
+        );
+    }
+
+    /// Regression guard for a tightening that must NOT happen: `PartialObjectMetadataEnvelope`'s
+    /// `metadata` field must stay `&serde_json::Value`, not become `ObjectMeta`, because
+    /// `ObjectMeta` still doesn't model `generation` or `deletionGracePeriodSeconds`. GC watches
+    /// every resource kind (including Deployments and terminating Pods) via this projection; a
+    /// full ObjectMeta round trip would silently drop both fields from the GC's view of those
+    /// objects. This test fails if `to_partial_object_metadata` is ever rewritten to deserialize
+    /// `metadata` into `ObjectMeta` and reserialize it: verified by temporarily rewriting it that
+    /// way and confirming the two assertions below fail with `null` instead of `5`/`30`.
+    #[test]
+    fn to_partial_object_metadata_preserves_fields_objectmeta_does_not_model() {
+        let full = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "my-deploy",
+                "generation": 5,
+                "deletionGracePeriodSeconds": 30
+            },
+            "spec": { "replicas": 1 }
+        });
+
+        let pom = to_partial_object_metadata(&full);
+
+        assert_eq!(
+            pom["metadata"]["generation"], 5,
+            "generation must survive the PartialObjectMetadata projection unchanged — GC's \
+             ownerReferences-following watch is the same projection KCM's generation-tracking \
+             controllers would see null from if this field were dropped"
+        );
+        assert_eq!(
+            pom["metadata"]["deletionGracePeriodSeconds"], 30,
+            "deletionGracePeriodSeconds must survive the PartialObjectMetadata projection \
+             unchanged — it is set during graceful termination and read by controllers/kubelet"
         );
     }
 
