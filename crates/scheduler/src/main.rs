@@ -25,10 +25,10 @@ use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
-    failed_scheduling_status_patch, fetch_node, find_preemption_plan, http_get,
-    is_bind_already_assigned, needs_scheduling, nominated_node_name_patch, patch_pod_status,
-    pick_node, pods_needing_resync, preemption_reservation_still_fits,
-    scheduling_gate_status_patch, scheduling_gate_status_reset,
+    failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_node,
+    find_preemption_plan, http_get, is_bind_already_assigned, needs_scheduling,
+    nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
+    preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
 };
@@ -540,6 +540,7 @@ fn handle_pod_event(
     let in_flight_clone = in_flight.clone();
     let tally_clone = tally.clone();
     tokio::spawn(async move {
+        let mut pending = pending;
         let namespace = pending.namespace.clone();
         let pod_name = pending.pod_name.clone();
         // Best-effort: clear the stale SchedulingGated reason before attempting
@@ -560,6 +561,38 @@ fn handle_pod_event(
                 error!(
                     "failed to clear stale SchedulingGated status for {namespace}/{pod_name}: {e}"
                 );
+            }
+        }
+        // Resolve every already-bound PVC's PV nodeAffinity BEFORE the first
+        // pick_node attempt below, so node_qualifies_for_pod can reject a
+        // node that cannot actually mount the volume — without this, an
+        // Immediate-mode (the StorageClass default) PVC's topology
+        // constraint is never enforced, and the kubelet blocks forever on
+        // `MountVolume.NodeAffinity check failed` once the scheduler commits
+        // a bad bind. A lookup failure here is treated exactly like
+        // pick_node's own GET /api/v1/nodes failure below: leave the pod
+        // Pending for the next watch tick rather than schedule it as if the
+        // bound PV had no topology constraint at all.
+        if !pending.pvc_names.is_empty() {
+            match fetch_bound_pv_node_affinities(
+                &connector_clone,
+                &server_clone,
+                &namespace,
+                &pending.pvc_names,
+            )
+            .await
+            {
+                Ok(affinities) => pending.pv_node_affinities = affinities,
+                Err(e) => {
+                    error!(
+                        "could not resolve bound PVC node affinity while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
+                    );
+                    in_flight_clone
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .remove(&key);
+                    return;
+                }
             }
         }
         // Ok(node_name) on a successful bind, Err on any failure to schedule
