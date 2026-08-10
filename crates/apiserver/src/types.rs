@@ -523,6 +523,19 @@ pub struct ObjectMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub managed_fields: Option<Vec<ManagedFieldsEntry>>,
+    /// Populated by defaults.rs::initialize_workload_generation for every workload
+    /// resource; null generation makes KCM's controllers skip reconciliation entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    /// Populated by handlers/pods.rs and handlers/resource.rs during graceful
+    /// termination; kubelet and controllers need it to know how long to wait before
+    /// force-removing.
+    #[serde(
+        rename = "deletionGracePeriodSeconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deletion_grace_period_seconds: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1344,8 @@ mod object_meta_tests {
         assert!(meta.annotations.is_none());
         assert!(meta.owner_references.is_none());
         assert!(meta.managed_fields.is_none());
+        assert!(meta.generation.is_none());
+        assert!(meta.deletion_grace_period_seconds.is_none());
     }
 
     /// generateName and deletionTimestamp use Kubernetes camelCase names in the wire format.
@@ -1379,6 +1394,8 @@ mod object_meta_tests {
         assert!(json.get("annotations").is_none());
         assert!(json.get("ownerReferences").is_none());
         assert!(json.get("managedFields").is_none());
+        assert!(json.get("generation").is_none());
+        assert!(json.get("deletionGracePeriodSeconds").is_none());
     }
 
     /// A metadata object with two ownerReferences (Job + ReplicaSet, one marked as the
@@ -1510,6 +1527,62 @@ mod object_meta_tests {
             "ObjectMeta without managedFields must serialize back byte-identical; a \
              managedFields:null key would silently appear on every object never touched by \
              server-side apply"
+        );
+    }
+
+    /// A metadata object with generation and deletionGracePeriodSeconds set (the state of a
+    /// workload mid-graceful-termination) must round-trip through ObjectMeta byte-identically.
+    /// mayor-7p767 depends on this: tightening watch/PartialObjectMetadata handling to a full
+    /// ObjectMeta round-trip is only safe once these fields survive it — before they existed,
+    /// KCM's controllers would see a null generation on the projected object and silently skip
+    /// reconciling it, and the kubelet would lose the grace period needed to know when to
+    /// force-remove a terminating pod.
+    #[test]
+    fn object_meta_generation_and_deletion_grace_period_round_trip_byte_identical() {
+        let meta = ObjectMeta {
+            generation: Some(7),
+            deletion_grace_period_seconds: Some(30),
+            ..Default::default()
+        };
+        let first_pass = serde_json::to_vec(&serde_json::to_value(&meta).unwrap()).unwrap();
+        let restored: ObjectMeta = serde_json::from_slice(&first_pass).unwrap();
+        let second_pass = serde_json::to_vec(&serde_json::to_value(&restored).unwrap()).unwrap();
+        assert_eq!(
+            first_pass, second_pass,
+            "generation and deletionGracePeriodSeconds must survive a serialize/deserialize \
+             round-trip byte-for-byte — a dropped field here would reproduce the exact \
+             'generation=null causes controllers to stop reconciling' bug defaults.rs warns \
+             about"
+        );
+        assert_eq!(restored.generation, meta.generation);
+        assert_eq!(
+            restored.deletion_grace_period_seconds,
+            meta.deletion_grace_period_seconds
+        );
+    }
+
+    /// ObjectMeta must not add `generation: null` or `deletionGracePeriodSeconds: null` keys
+    /// when the source metadata never had them. Every object written before these fields
+    /// existed lacks the keys entirely; if the round-trip through ObjectMeta introduced
+    /// explicit nulls, KCM's controllers reading metadata.generation would see a present-but-
+    /// null value rather than an absent field, and every such read-modify-write would grow two
+    /// extra keys.
+    #[test]
+    fn object_meta_without_generation_or_deletion_grace_period_wire_format_unchanged() {
+        let original = serde_json::json!({
+            "name": "my-pod",
+            "namespace": "default",
+            "uid": "abc-123"
+        });
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let meta: ObjectMeta = serde_json::from_value(original).unwrap();
+        let round_tripped_bytes =
+            serde_json::to_vec(&serde_json::to_value(&meta).unwrap()).unwrap();
+        assert_eq!(
+            round_tripped_bytes, original_bytes,
+            "ObjectMeta without generation/deletionGracePeriodSeconds must serialize back \
+             byte-identical; a generation:null or deletionGracePeriodSeconds:null key would \
+             silently appear on every object never touched by these fields"
         );
     }
 }
