@@ -26,6 +26,13 @@ use tokio::sync::{broadcast, Mutex};
 const RING_CAPACITY: usize = 10_000;
 const BROADCAST_CAPACITY: usize = 2048;
 
+/// How long a per-watcher stream coalesces global-bookmark broadcasts (one per write, to
+/// every open watch) before yielding a single `WatchEvent::Bookmark`. KCM's EnsureReady()
+/// only requires eventual convergence of an informer's sync RV, not a bookmark synchronous
+/// with every write, so this is safe to debounce. 150ms keeps 8x headroom under the 2s
+/// delivery deadline asserted by `write_to_different_prefix_delivers_bookmark_to_watch`.
+const GLOBAL_BOOKMARK_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Deletion-log storage: `by_key` gives O(1) lookup for evict-on-recreate and the
 /// prefix-scan replay watchers use; `by_revision` mirrors it as a revision-sorted index
 /// so the lowest-revision entry can be evicted in O(log n) via `pop_first()` instead of
@@ -1326,9 +1333,28 @@ impl Store for SqliteStore {
             // and cause a later out-of-order event on this prefix to be dedup-skipped.
             let mut bookmark_rv: u64 = from_revision;
 
+            // Debounces the global-bookmark yield below: a global bookmark is broadcast on
+            // every write in the whole store, to every open watch, so yielding one immediately
+            // per broadcast makes every watcher's allocation rate scale with cluster-wide write
+            // volume rather than its own prefix. Armed only while a bookmark update is pending
+            // (not a periodic tick) so an idle watcher never wakes for this timer, and the first
+            // pending update's deadline is never pushed out by later updates arriving inside the
+            // same window — see GLOBAL_BOOKMARK_DEBOUNCE for why the window is safe.
+            let debounce_sleep = tokio::time::sleep(GLOBAL_BOOKMARK_DEBOUNCE);
+            tokio::pin!(debounce_sleep);
+            let mut bookmark_debounce_pending = false;
+
             // Forward live broadcast events, skipping already-replayed revisions.
             loop {
-                match rx.recv().await {
+                tokio::select! {
+                    _ = &mut debounce_sleep, if bookmark_debounce_pending => {
+                        bookmark_debounce_pending = false;
+                        // Emit BOOKMARK at the highest observed RV across both specific
+                        // events and bookmarks, so clients still see advancing bookmarks.
+                        yield WatchEvent::Bookmark { revision: bookmark_rv.max(last_replayed) };
+                        continue;
+                    }
+                    recv_result = rx.recv() => match recv_result {
                     Ok(event) => {
                         // A global bookmark (key == "") is delivered to all watches
                         // regardless of prefix — it advances the informer's sync RV
@@ -1342,9 +1368,12 @@ impl Store for SqliteStore {
                         if event.key.is_empty() {
                             if event.revision > bookmark_rv {
                                 bookmark_rv = event.revision;
-                                // Emit BOOKMARK at the highest observed RV across both specific
-                                // events and bookmarks, so clients still see advancing bookmarks.
-                                yield WatchEvent::Bookmark { revision: bookmark_rv.max(last_replayed) };
+                                if !bookmark_debounce_pending {
+                                    bookmark_debounce_pending = true;
+                                    debounce_sleep
+                                        .as_mut()
+                                        .reset(tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE);
+                                }
                             }
                             continue;
                         }
@@ -1495,6 +1524,7 @@ impl Store for SqliteStore {
                             "watch() retains its own broadcast Sender clone for this stream's \
                              entire lifetime, so RecvError::Closed can never be observed here"
                         )
+                    }
                     }
                 }
             }
@@ -3210,6 +3240,111 @@ mod tests {
              statement cache with a Run count of {LIST_CALLS} (one per list_namespace_objects \
              call above); got {run_count} — this means list_namespace_objects is re-parsing \
              its SQL from scratch on every call instead of reusing a cached statement"
+        );
+    }
+
+    /// A watcher on a quiet prefix still gets a global bookmark for a burst of writes on a
+    /// completely different prefix (KCM's EnsureReady needs every informer's sync RV to
+    /// eventually catch up to any write, not just writes on that informer's own resource
+    /// type) — but the burst must cost this watcher one bookmark allocation, not one per
+    /// write. Before debouncing, every open watch stream rendered one `WatchEvent::Bookmark`
+    /// per write anywhere in the store, making allocation cost scale with cluster-wide write
+    /// volume instead of the watcher's own prefix.
+    #[tokio::test]
+    async fn burst_of_writes_on_other_prefix_coalesces_into_one_bookmark() {
+        tokio::time::pause();
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        let stream = store
+            .watch("/registry/pods/", 0)
+            .await
+            .expect("watch failed");
+        futures_util::pin_mut!(stream);
+
+        let mut last_rv = 0u64;
+        for i in 0..5 {
+            last_rv = store
+                .put(
+                    &format!("/registry/services/default/svc-{i}"),
+                    svc_value(&format!("svc-{i}"), 0),
+                    None,
+                )
+                .await
+                .expect("put must succeed");
+        }
+
+        // Collect whatever arrives up to one debounce window past the last write. Under a
+        // paused clock, tokio auto-advances virtual time to the next pending timer once
+        // nothing else is runnable, so this resolves promptly instead of sleeping for real.
+        let deadline =
+            tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE + Duration::from_millis(50);
+        let mut bookmarks: Vec<u64> = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Bookmark { revision })) => bookmarks.push(revision),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            bookmarks,
+            vec![last_rv],
+            "5 writes on an unrelated prefix inside the debounce window must coalesce into \
+             exactly one Bookmark at the last write's revision, not one per write — a per-write \
+             bookmark makes every open watch's allocation rate scale with total cluster write \
+             volume instead of its own prefix's activity"
+        );
+    }
+
+    /// The debounced global bookmark must flush purely because its own timer elapsed, not
+    /// because a later broadcast message happened to arrive and trigger a "check if it's time
+    /// yet" flush. A quiescent cluster after a single burst of writes is the common case, not
+    /// an edge case — if the flush needed a follow-up write to notice the deadline passed,
+    /// every other watcher's informer sync RV would stay stuck below that burst's revision
+    /// forever, and KCM's EnsureReady() would spin indefinitely.
+    #[tokio::test]
+    async fn debounced_bookmark_flushes_without_a_subsequent_write() {
+        tokio::time::pause();
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        let stream = store
+            .watch("/registry/pods/", 0)
+            .await
+            .expect("watch failed");
+        futures_util::pin_mut!(stream);
+
+        let written_rv = store
+            .put(
+                "/registry/services/default/svc-only",
+                svc_value("svc-only", 0),
+                None,
+            )
+            .await
+            .expect("put must succeed");
+
+        // No further writes occur anywhere in the store after this point.
+        let deadline =
+            tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE + Duration::from_millis(50);
+        let mut bookmark: Option<u64> = None;
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Bookmark { revision })) => {
+                    bookmark = Some(revision);
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            bookmark,
+            Some(written_rv),
+            "a single global bookmark update must still flush within the debounce window with \
+             no follow-up write — a debounce that only flushes when the next event arrives \
+             would leave this watcher's bookmark, and every other watcher's informer sync RV, \
+             stuck below the burst's last write forever on a cluster that goes quiet afterward"
         );
     }
 }
