@@ -241,9 +241,11 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                         .into(),
                 );
             }
-            if !utp_map.is_empty() {
-                status_json["uncountedTerminatedPods"] = serde_json::Value::Object(utp_map);
-            }
+            // Always emit the key when the proto field is Some, even if both lists are empty:
+            // upstream's Job controller treats non-nil-ness of this pointer as load-bearing
+            // state (JobTrackingWithFinalizers) and nil-derefs if a present-but-empty struct
+            // round-trips as absent (job_controller.go:1568).
+            status_json["uncountedTerminatedPods"] = serde_json::Value::Object(utp_map);
         }
         if let Some(v) = status.ready.filter(|&n| n != 0) {
             status_json["ready"] = v.into();
@@ -798,6 +800,36 @@ mod tests {
         assert_eq!(
             result["status"]["uncountedTerminatedPods"]["failed"][0], "uid-failed-1",
             "uncountedTerminatedPods.failed must survive decode"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve status.uncountedTerminatedPods when PRESENT BUT EMPTY.
+    ///
+    /// This is the normal steady state for a live Job with nothing currently pending finalizer
+    /// removal: JobTrackingWithFinalizers sets a non-nil-but-empty pointer the moment it starts
+    /// tracking a Job. Collapsing present-but-empty into absent on decode leaves upstream KCM's
+    /// Job controller reading a nil pointer on its next reconcile, which panics
+    /// (job_controller.go:1568, cleanUncountedPodsWithoutFinalizers) and crash-loops KCM to
+    /// death — taking every other controller down with it.
+    #[test]
+    fn decode_job_proto_gen_preserves_present_but_empty_uncounted_terminated_pods() {
+        let job = batch_v1::Job {
+            status: Some(batch_v1::JobStatus {
+                uncounted_terminated_pods: Some(batch_v1::UncountedTerminatedPods::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+
+        assert!(
+            result["status"]["uncountedTerminatedPods"].is_object(),
+            "status.uncountedTerminatedPods must decode as PRESENT (empty object) when the proto \
+             field is Some(default), NOT be dropped — upstream KCM Job controller nil-derefs on \
+             absent field (job_controller.go:1568)"
         );
     }
 
