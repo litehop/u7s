@@ -17,3 +17,4 @@ prometheus      = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 futures-util    = "0.3"
+tokio           = { version = "1", features = ["test-util"] }
