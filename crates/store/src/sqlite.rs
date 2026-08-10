@@ -315,8 +315,10 @@ fn push_event_locked(
     // Best-effort broadcast of the specific event.
     let event_revision = event.revision;
     let _ = tx.send(event);
-    // Broadcast a global bookmark (key="") to advance all informers' sync RVs.
-    // KCM's ConsistencyStore.EnsureReady() checks each informer's
+    // Broadcast a global bookmark, tagged with this write's own shard root (e.g.
+    // "/registry/pods/" — always trailing-slash-terminated, so it can never collide with a
+    // real object key, which always ends in a name segment instead), to advance all
+    // informers' sync RVs. KCM's ConsistencyStore.EnsureReady() checks each informer's
     // LastStoreSyncResourceVersion against the RV of writes the controller made.
     // A StatefulSet watch only sees StatefulSet events — without a global bookmark,
     // its sync RV lags pod write RVs and EnsureReady requeues indefinitely.
@@ -328,7 +330,7 @@ fn push_event_locked(
     // watchers' last_replayed to N+1 before write-B's event(rv=N+1) is broadcast —
     // causing write-B's event to be dedup-skipped and silently dropped.
     let _ = tx.send(Arc::new(InternalEvent {
-        key: String::new(),
+        key: shard_key.to_string(),
         revision: event_revision,
         value: None,
         is_create: false,
@@ -1498,8 +1500,9 @@ impl Store for SqliteStore {
                     }
                     recv_result = rx.recv() => match recv_result {
                     Ok(event) => {
-                        // A global bookmark (key == "") is delivered to all watches
-                        // regardless of prefix — it advances the informer's sync RV
+                        // A global bookmark (key holds the writer's shard root, always
+                        // trailing-slash-terminated — see push_event_locked) is delivered to
+                        // all watches regardless of prefix — it advances the informer's sync RV
                         // without carrying an object (KCM ConsistencyStore relies on this).
                         //
                         // Do NOT update last_replayed here: a global bookmark may arrive from
@@ -1507,7 +1510,18 @@ impl Store for SqliteStore {
                         // higher than a pending event on this watcher's prefix. Advancing
                         // last_replayed from a cross-prefix bookmark would cause that pending
                         // event to be dedup-skipped and silently dropped.
-                        if event.key.is_empty() {
+                        if event.key.ends_with('/') {
+                            // This watcher's own prefix is either exactly its shard's root or
+                            // that root plus one namespace segment (see `shard_key`), so
+                            // `prefix_owned.starts_with(&event.key)` is true only when this
+                            // bookmark came from the SAME shard this watcher is on. The trailing
+                            // per-matched-event bookmark just above already delivered an
+                            // equal-or-higher-revision bookmark to this watcher a moment earlier
+                            // via a different, unthrottled path — this one carries no new
+                            // information, so drop it before it can even arm the debounce timer.
+                            if prefix_owned.starts_with(event.key.as_str()) {
+                                continue;
+                            }
                             if event.revision > bookmark_rv {
                                 bookmark_rv = event.revision;
                                 if !bookmark_debounce_pending {
@@ -1853,7 +1867,7 @@ mod tests {
         // 1. Global bookmark at rv=365 (from a concurrent Endpoints write on a different prefix).
         //    This arrives BEFORE the service event at rv=364 due to scheduling jitter.
         tx.send(Arc::new(InternalEvent {
-            key: String::new(),
+            key: "/registry/endpoints/".to_string(),
             revision: 365,
             value: None,
             is_create: false,
@@ -3534,6 +3548,110 @@ mod tests {
              no follow-up write — a debounce that only flushes when the next event arrives \
              would leave this watcher's bookmark, and every other watcher's informer sync RV, \
              stuck below the burst's last write forever on a cluster that goes quiet afterward"
+        );
+    }
+
+    /// A watcher whose own prefix is on the SAME shard as a write must receive exactly one
+    /// Bookmark for that write — the trailing per-matched-event bookmark already delivers a
+    /// bookmark at this revision immediately; the global-bookmark broadcast for this same
+    /// shard carries no new information and must be suppressed before it can even enter the
+    /// debounce timer above.
+    ///
+    /// Why it matters: without the dedup, every same-shard watcher pays for a second,
+    /// identical-revision Bookmark allocation per write — doubling this watcher's allocation
+    /// rate for zero client-visible benefit (client-go only cares that the RV advances, and
+    /// it already has).
+    #[tokio::test]
+    async fn watcher_on_writing_shard_does_not_receive_redundant_global_bookmark() {
+        tokio::time::pause();
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        let stream = store
+            .watch("/registry/pods/", 0)
+            .await
+            .expect("watch failed");
+        futures_util::pin_mut!(stream);
+
+        let rv = store
+            .put(
+                "/registry/pods/default/foo",
+                Bytes::from(
+                    r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"foo","namespace":"default"}}"#,
+                ),
+                None,
+            )
+            .await
+            .expect("put must succeed");
+
+        // Collect whatever arrives up to one debounce window past the write, same idiom as
+        // the cross-shard debounce tests above.
+        let deadline =
+            tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE + Duration::from_millis(50);
+        let mut bookmarks: Vec<u64> = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Bookmark { revision })) => bookmarks.push(revision),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            bookmarks,
+            vec![rv],
+            "a same-shard watcher must see exactly one Bookmark per write, delivered by the \
+             trailing per-matched-event path; a second Bookmark at the same revision means the \
+             redundant same-shard global-bookmark was not suppressed and this watcher's \
+             allocation rate has silently doubled again"
+        );
+    }
+
+    /// A watcher on a DIFFERENT shard than the one just written to must still receive the
+    /// global bookmark for that write — the same-shard dedup above must never widen to
+    /// suppress this.
+    ///
+    /// Why it matters: KCM's ConsistencyStore.EnsureReady() requires every informer's sync RV
+    /// to converge on ANY write in the cluster, not just writes to that informer's own
+    /// resource type (e.g. a StatefulSet controller's informer must still advance after a pod
+    /// write). If this cross-shard delivery ever regressed, EnsureReady would requeue forever.
+    #[tokio::test]
+    async fn watcher_on_different_shard_still_receives_global_bookmark() {
+        tokio::time::pause();
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        let stream = store
+            .watch("/registry/pods/", 0)
+            .await
+            .expect("watch failed");
+        futures_util::pin_mut!(stream);
+
+        let rv = store
+            .put(
+                "/registry/services/default/svc-1",
+                svc_value("svc-1", 0),
+                None,
+            )
+            .await
+            .expect("put must succeed");
+
+        let deadline =
+            tokio::time::Instant::now() + GLOBAL_BOOKMARK_DEBOUNCE + Duration::from_millis(50);
+        let mut bookmarks: Vec<u64> = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Bookmark { revision })) => bookmarks.push(revision),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            bookmarks,
+            vec![rv],
+            "cross-shard watcher must still receive the global bookmark for a different \
+             shard's write; if the same-shard dedup were widened to unconditionally suppress \
+             the global bookmark, this watcher's sync RV would never converge and KCM's \
+             EnsureReady would requeue forever"
         );
     }
 
