@@ -547,6 +547,11 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
 }
 
+fn stamp_cr_envelope(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
+    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+    obj["kind"] = serde_json::Value::String(kind.to_string());
+}
+
 fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
     if name.is_empty() {
         return Err(Status::bad_request(
@@ -1387,8 +1392,7 @@ pub async fn get_cr<S: Store>(
             let mut converted_obj = converted
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
-            converted_obj["apiVersion"] = serde_json::Value::String(desired_api_version);
-            converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+            stamp_cr_envelope(&mut converted_obj, &group, &version, &ctx.kind);
             if let Some(schema) = ctx.schema.as_ref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
@@ -1414,8 +1418,7 @@ pub async fn get_cr<S: Store>(
         }
     }
 
-    obj["apiVersion"] = serde_json::Value::String(desired_api_version);
-    obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    stamp_cr_envelope(&mut obj, &group, &version, &ctx.kind);
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
@@ -2200,8 +2203,7 @@ pub async fn get_cr_namespaced<S: Store>(
             let mut converted_obj = converted
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
-            converted_obj["apiVersion"] = serde_json::Value::String(desired_api_version);
-            converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+            stamp_cr_envelope(&mut converted_obj, &group, &version, &ctx.kind);
             if let Some(schema) = ctx.schema.as_ref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
@@ -2227,8 +2229,7 @@ pub async fn get_cr_namespaced<S: Store>(
         }
     }
 
-    obj["apiVersion"] = serde_json::Value::String(desired_api_version);
-    obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    stamp_cr_envelope(&mut obj, &group, &version, &ctx.kind);
     if let Some(schema) = ctx.schema.as_ref() {
         apply_crd_schema_defaults(schema, &mut obj);
     }
