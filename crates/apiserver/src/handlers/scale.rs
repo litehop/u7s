@@ -13,7 +13,7 @@ use crate::{
     keys::group_object_key,
     state::AppState,
     status::Status,
-    types::Object,
+    types::{Object, ObjectMeta},
     util::{content_type, extract_body},
 };
 
@@ -42,7 +42,9 @@ struct ScaleSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ScaleStatus {
-    replicas: i32,
+    // Option, not i32: extract_status_replicas must tell "absent" (fall back to
+    // spec.replicas) apart from "explicitly 0" (a fully scaled-down workload).
+    replicas: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -347,11 +349,11 @@ pub fn extract_replicas(obj: &serde_json::Value) -> i64 {
 /// `spec.replicas` when the status field has not yet been written (e.g. immediately
 /// after creation before the first controller reconciliation).
 pub fn extract_status_replicas(obj: &serde_json::Value) -> i64 {
-    if let Some(n) = obj["status"]["replicas"].as_i64() {
-        n
-    } else {
+    let status: ScaleStatus = serde_json::from_value(obj["status"].clone()).unwrap_or_default();
+    match status.replicas {
+        Some(n) => n as i64,
         // Status not yet written by controller — treat as equal to spec.
-        extract_replicas(obj)
+        None => extract_replicas(obj),
     }
 }
 
@@ -403,6 +405,34 @@ async fn scale_get_impl<S: Store>(
     .into_response())
 }
 
+/// Write `new_replicas` into the stored workload's `spec.replicas`, bumping
+/// `metadata.generation` when the value actually changes.
+///
+/// Only the `replicas` key of `spec` is touched — the rest (selector, template,
+/// strategy, ...) is left exactly as stored, matching the single field
+/// `extract_replicas` reads back out. The two must never drift: HPA computes
+/// its scale-up/down decision from `extract_replicas`' view of this same
+/// object, so a write that silently touched a different key (or a different
+/// type) than the read would make HPA see a stale replica count.
+fn write_scale_replicas(
+    obj: &mut Object,
+    new_replicas: i32,
+) -> Result<(), crate::status::StatusError> {
+    let old_replicas = extract_replicas(&obj.body);
+    obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
+
+    // Increment generation when spec.replicas changes — controllers use
+    // generation/observedGeneration to detect spec drift and trigger reconciliation.
+    if new_replicas as i64 != old_replicas {
+        let mut meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        meta.generation = Some(meta.generation.unwrap_or(1) + 1);
+        obj.body["metadata"] =
+            serde_json::to_value(meta).map_err(|e| Status::internal(e.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn scale_put_impl<S: Store>(
     state: AppState<S>,
     group: &str,
@@ -417,8 +447,7 @@ async fn scale_put_impl<S: Store>(
     let new_replicas = scale
         .spec
         .replicas
-        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?
-        as i64;
+        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?;
 
     let key = group_object_key(group, resource, Some(ns), name);
     let stored = state
@@ -431,18 +460,12 @@ async fn scale_put_impl<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let old_replicas = extract_replicas(&obj.body);
-    // Capture actual pod count before changing spec so the response reflects reality.
+    // Capture actual pod count and selector before changing spec so the response
+    // reflects reality.
     let status_replicas = extract_status_replicas(&obj.body);
     let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
-    obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
 
-    // Increment generation when spec.replicas changes — controllers use
-    // generation/observedGeneration to detect spec drift and trigger reconciliation.
-    if new_replicas != old_replicas {
-        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
-        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
-    }
+    write_scale_replicas(&mut obj, new_replicas)?;
 
     let expected_rv =
         crate::util::parse_resource_version(scale.metadata.resource_version.as_deref())?;
@@ -455,7 +478,7 @@ async fn scale_put_impl<S: Store>(
     Ok(Json(build_scale(
         name,
         ns,
-        new_replicas,
+        new_replicas as i64,
         status_replicas,
         &new_rv.to_string(),
         &selector,
@@ -500,26 +523,19 @@ async fn scale_patch_impl<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let old_replicas = extract_replicas(&obj.body);
-    // Capture actual pod count before changing spec so the response reflects reality.
+    // Capture actual pod count and selector before changing spec so the response
+    // reflects reality.
     let status_replicas = extract_status_replicas(&obj.body);
     let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
 
-    // Extract replicas from patch if present; otherwise keep current value.
-    let new_replicas = if let Some(r) = patch_scale_spec.replicas {
-        let r = r as i64;
-        obj.body["spec"]["replicas"] = serde_json::json!(r);
-        r
-    } else {
-        old_replicas
+    // Extract replicas from patch if present; otherwise keep current value (no write).
+    let new_replicas = match patch_scale_spec.replicas {
+        Some(r) => {
+            write_scale_replicas(&mut obj, r)?;
+            r as i64
+        }
+        None => extract_replicas(&obj.body),
     };
-
-    // Increment generation when spec.replicas changes — controllers use
-    // generation/observedGeneration to detect spec drift and trigger reconciliation.
-    if new_replicas != old_replicas {
-        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
-        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
-    }
 
     let expected_rv =
         crate::util::parse_resource_version(patch_body["metadata"]["resourceVersion"].as_str())?;
@@ -1272,6 +1288,55 @@ mod handler_tests {
         let stored = store.get(key).await.unwrap().unwrap();
         let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(stored_obj["spec"]["replicas"], 5);
+    }
+
+    /// The field `put_scale` writes and the field `extract_replicas` reads must be
+    /// the exact same field, with the exact same value, after every write.
+    ///
+    /// `extract_replicas` is HPA's window into `spec.replicas` for every read path
+    /// (get_scale, and any future controller code sharing this helper). If the write
+    /// path in `write_scale_replicas` ever drifted from the field `extract_replicas`
+    /// parses — a renamed key, a different type — HPA would keep computing its
+    /// scale-up/down decision from a stale replica count served by `extract_replicas`,
+    /// even though the write itself succeeded and kubectl scale reported success.
+    #[tokio::test]
+    async fn put_scale_and_extract_replicas_agree_on_the_same_field() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 3).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 7 }
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let key = "/registry/apps/deployments/default/my-deploy";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            extract_replicas(&stored_obj),
+            7,
+            "extract_replicas must read back exactly what put_scale wrote (7, not the \
+             original 3) — if the two ever disagree on the field name or type, HPA's \
+             reconcile loop (which calls extract_replicas) would compute its next \
+             scale decision from a stale replica count"
+        );
     }
 
     /// PUT scale on a workload with spec.selector must also populate status.selector
