@@ -108,13 +108,17 @@ mod tests {
         u7s_store::metrics::WATCH_BROADCAST_LAGGED_TOTAL
             .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
             .inc_by(0);
-        // The two new bare gauges have no handler-side `.set()` call (unlike
+        // These two shard-labeled gauges have no handler-side `.set()` call (unlike
         // u7s_watch_broadcast_receivers, set every scrape from real store state) — they are
         // only ever set from push_event_locked's write path (see sqlite.rs), which this test
         // never exercises. Touch them directly so their `LazyLock` registers, same reasoning
         // as the Vec touches above.
-        u7s_store::metrics::WATCH_RING_OCCUPANCY.set(0);
-        u7s_store::metrics::DELETION_LOG_LEN.set(0);
+        u7s_store::metrics::WATCH_RING_OCCUPANCY
+            .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
+            .set(0);
+        u7s_store::metrics::DELETION_LOG_LEN
+            .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
+            .set(0);
         u7s_store::metrics::WATCH_LAG_RECOVERY_DURATION_SECONDS
             .with_label_values(&["/registry/metrics-endpoint-test-touch/"])
             .observe(0.0);

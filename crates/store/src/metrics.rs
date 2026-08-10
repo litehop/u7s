@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
 
 /// Total watch events dropped because a watcher fell behind the shared broadcast channel
 /// (`tokio::sync::broadcast::error::RecvError::Lagged`), by store key prefix.
@@ -69,19 +69,20 @@ pub fn prime_watch_closed_total() {
     }
 }
 
-/// Current length of the watch replay ring buffer (`SqliteStore::ring`) — the direct answer to
-/// "how full is the buffer during a run," needed before deciding whether the ring's replay/
-/// lag-recovery scans warrant sharding by resource-type prefix.
+/// Current length of each per-resource-type shard's watch replay ring buffer — the direct
+/// answer to "how full is each shard's buffer during a run," needed to see whether a busy
+/// resource type's shard is approaching `RING_CAPACITY` while a quiet one stays empty.
 ///
-/// Bare (unlabeled) gauge: the ring is one global structure today, so a per-prefix breakdown
-/// would either be fake precision (only one series would ever populate) or require re-deriving
-/// per-prefix occupancy via a full ring scan on every write — reintroducing the exact O(ring)
-/// cost on the write hot path that this metric exists to help diagnose on the watch hot path.
-/// Sharding the ring gets a real per-shard version of this for free as a side effect.
-pub static WATCH_RING_OCCUPANCY: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "u7s_watch_ring_occupancy",
-        "Current number of events held in the watch replay ring buffer.",
+/// Labeled by shard (its resource-type root prefix, e.g. `/registry/pods/`) now that the ring
+/// is sharded — previously a bare gauge, since a per-prefix breakdown of one global ring would
+/// have been fake precision (only one series would ever populate).
+pub static WATCH_RING_OCCUPANCY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "u7s_watch_ring_occupancy",
+            "Current number of events held in the watch replay ring buffer, by shard.",
+        ),
+        &["shard"],
     )
     .expect("static metric definition is valid");
     prometheus::default_registry()
@@ -90,13 +91,16 @@ pub static WATCH_RING_OCCUPANCY: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
-/// Current length of the deletion-tombstone log (`SqliteStore::deletion_log`) — same class of
+/// Current length of each per-resource-type shard's deletion-tombstone log — same class of
 /// blind spot as the ring buffer above (a capped structure whose length was previously only
 /// ever logged on its own eviction path, at `debug!` level).
-pub static DELETION_LOG_LEN: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "u7s_deletion_log_len",
-        "Current number of tombstones held in the deletion log.",
+pub static DELETION_LOG_LEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "u7s_deletion_log_len",
+            "Current number of tombstones held in the deletion log, by shard.",
+        ),
+        &["shard"],
     )
     .expect("static metric definition is valid");
     prometheus::default_registry()
@@ -213,24 +217,36 @@ mod tests {
         );
     }
 
-    /// A bare `IntGauge` only shows up in `prometheus::gather()` once something dereferences its
-    /// `LazyLock` — this test fails on revert (e.g. if `WATCH_RING_OCCUPANCY`'s `.set()` call
-    /// site in `push_event_locked` were deleted) because it asserts the *gathered* value, not
-    /// just that the static compiles and `.set()`/`.get()` round-trip in isolation. Without this
-    /// wired up, an operator scraping a freshly started process could not tell "ring occupancy
-    /// is zero" from "this metric was never registered."
+    /// An `IntGaugeVec` only shows a label's series in `prometheus::gather()` once that label
+    /// has been set at least once — this test fails on revert (e.g. if `WATCH_RING_OCCUPANCY`'s
+    /// `.set()` call site in `push_event_locked` were deleted, or if it stopped labeling by
+    /// shard) because it asserts the *gathered* value for a specific shard label, not just that
+    /// the static compiles and `.set()`/`.get()` round-trip in isolation. Without this wired up,
+    /// an operator scraping a freshly started process could not tell "this shard's ring
+    /// occupancy is zero" from "this metric was never registered for this shard."
     #[test]
     fn watch_ring_occupancy_reflects_the_value_it_was_set_to_in_gather() {
-        WATCH_RING_OCCUPANCY.set(42);
+        WATCH_RING_OCCUPANCY
+            .with_label_values(&["/registry/metrics-test-ring/"])
+            .set(42);
 
         let families = prometheus::gather();
         let family = families
             .iter()
             .find(|f| f.name() == "u7s_watch_ring_occupancy")
             .expect("u7s_watch_ring_occupancy must appear in gathered metric families once set");
-        let value = family.get_metric()[0].get_gauge().get_value();
+        let metric = family
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "shard" && l.value() == "/registry/metrics-test-ring/")
+            })
+            .expect("gathered output must carry a series for the shard label that was set");
         assert_eq!(
-            value, 42.0,
+            metric.get_gauge().get_value(),
+            42.0,
             "gathered value must match the last .set() call — a mismatch here means the \
              registered Collector is not the same instance push_event_locked is setting"
         );
@@ -240,16 +256,27 @@ mod tests {
     /// for the deletion-tombstone-log gauge.
     #[test]
     fn deletion_log_len_reflects_the_value_it_was_set_to_in_gather() {
-        DELETION_LOG_LEN.set(7);
+        DELETION_LOG_LEN
+            .with_label_values(&["/registry/metrics-test-deletion-log/"])
+            .set(7);
 
         let families = prometheus::gather();
         let family = families
             .iter()
             .find(|f| f.name() == "u7s_deletion_log_len")
             .expect("u7s_deletion_log_len must appear in gathered metric families once set");
-        let value = family.get_metric()[0].get_gauge().get_value();
+        let metric = family
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label().iter().any(|l| {
+                    l.name() == "shard" && l.value() == "/registry/metrics-test-deletion-log/"
+                })
+            })
+            .expect("gathered output must carry a series for the shard label that was set");
         assert_eq!(
-            value, 7.0,
+            metric.get_gauge().get_value(),
+            7.0,
             "gathered value must match the last .set() call — a mismatch here means the \
              registered Collector is not the same instance push_event_locked is setting"
         );
