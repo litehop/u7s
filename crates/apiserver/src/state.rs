@@ -216,6 +216,75 @@ impl ApiServiceCache {
     }
 }
 
+/// One resolved, cache-safe (`STATIC_GROUPS`-or-CRD-backed, never `APIService`-backed) API
+/// group's discovery entry, as plain owned data rather than `types::APIGroupDiscovery` — that
+/// type derives only `Debug`/`Serialize` (deliberately kept minimal since it used to be built
+/// fresh once per request), so it has no `Clone` for `DiscoveryCache` to hand out shared
+/// snapshots with. `handlers/discovery.rs` converts between this and the typed
+/// `APIGroupDiscovery` family on every cache write and read.
+#[derive(Clone)]
+pub struct CachedDiscoveryGroup {
+    pub name: String,
+    pub versions: Vec<CachedDiscoveryVersion>,
+}
+
+#[derive(Clone)]
+pub struct CachedDiscoveryVersion {
+    pub version: String,
+    pub resources: Vec<CachedDiscoveryResource>,
+}
+
+#[derive(Clone)]
+pub struct CachedDiscoveryResource {
+    pub resource: String,
+    pub kind: String,
+    pub namespaced: bool,
+    pub short_names: Vec<String>,
+    pub singular_resource: String,
+    pub subresources: Vec<CachedDiscoverySubresource>,
+    pub verbs: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct CachedDiscoverySubresource {
+    pub kind: String,
+    pub subresource: String,
+    pub verbs: Vec<String>,
+}
+
+/// In-memory cache of the aggregated-discovery document's `STATIC_GROUPS` + CRD-backed portion
+/// (`discovery.rs`'s `build_aggregated_discovery`/`core_and_crd_groups`) — never an
+/// `APIService`-backed group, because a live `APIService` backend's discovery response can
+/// legitimately depend on the caller's own forwarded `authorization` header (see
+/// `build_aggregated_discovery`'s doc), and a cache keyed without that would leak one caller's
+/// backend-authorized result to another.
+///
+/// One cache entry covers every `(include_core, discovery_version)` call-site combination:
+/// `include_core` only controls whether a separately-built, always-static core-group item is
+/// prepended, and `discovery_version` only affects the wrapping document's top-level
+/// `apiVersion` string — neither changes this data, so there is nothing to key on.
+///
+/// Cache invalidation strategy: inline, write-through — identical to `AdmissionConfigCache` /
+/// `ApiServiceCache` (see `AdmissionConfigCache`'s doc for the full rationale). Every CRD
+/// create/replace/patch/delete handler (`handlers/crd.rs`) calls
+/// `handlers::discovery::refresh_discovery_cache` immediately after the store write succeeds.
+/// `APIService` writes do *not* need to refresh this cache: an `APIService`-backed group is
+/// never part of its content, so doing so would only waste a rebuild.
+///
+/// `None` = cache cold (not yet populated); `build_aggregated_discovery` rebuilds it inline on
+/// first use, then every later request reads the warm `Arc` snapshot.
+pub struct DiscoveryCache {
+    pub groups: RwLock<Option<Arc<Vec<CachedDiscoveryGroup>>>>,
+}
+
+impl DiscoveryCache {
+    pub fn new() -> Self {
+        DiscoveryCache {
+            groups: RwLock::new(None),
+        }
+    }
+}
+
 /// A compiled CRD `openAPIV3Schema`: the `boon::Schemas` set plus the root schema's
 /// index within it (both are required to call `Schemas::validate`).
 pub struct CompiledCrSchema {
@@ -470,6 +539,9 @@ pub struct AppState<S = SqliteStore> {
     /// In-memory cache of registered `APIService` objects.
     /// See `ApiServiceCache` for the invalidation strategy.
     pub apiservice_cache: Arc<ApiServiceCache>,
+    /// Cache of the aggregated-discovery document's `STATIC_GROUPS` + CRD-backed portion.
+    /// See `DiscoveryCache` for the invalidation strategy.
+    pub discovery_cache: Arc<DiscoveryCache>,
     /// Per-namespace lock serializing ResourceQuota check-then-write critical sections.
     /// See `QuotaAdmissionLocks` for why this is required.
     pub quota_admission_locks: QuotaAdmissionLocks,
@@ -548,6 +620,7 @@ impl<S> Clone for AppState<S> {
             sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
+            discovery_cache: self.discovery_cache.clone(),
             quota_admission_locks: self.quota_admission_locks.clone(),
             cr_schema_cache: self.cr_schema_cache.clone(),
             cr_conversion_cache: self.cr_conversion_cache.clone(),
@@ -742,6 +815,7 @@ impl<S: Store> AppState<S> {
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),
+            discovery_cache: Arc::new(DiscoveryCache::new()),
             quota_admission_locks: QuotaAdmissionLocks::new(),
             cr_schema_cache: Arc::new(CrSchemaCache::new()),
             cr_conversion_cache: Arc::new(CrConversionCache::new()),
