@@ -199,6 +199,63 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                         serde_json::Value::Object(sat_map),
                     );
                 }
+                if let Some(pc) = src.pod_certificate {
+                    let mut pc_map = serde_json::Map::new();
+                    if let Some(v) = pc.signer_name.filter(|s| !s.is_empty()) {
+                        pc_map.insert("signerName".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pc.key_type.filter(|s| !s.is_empty()) {
+                        pc_map.insert("keyType".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pc.max_expiration_seconds.filter(|&v| v != 0) {
+                        pc_map.insert(
+                            "maxExpirationSeconds".to_string(),
+                            serde_json::Value::Number(v.into()),
+                        );
+                    }
+                    if let Some(v) = pc.credential_bundle_path.filter(|s| !s.is_empty()) {
+                        pc_map.insert(
+                            "credentialBundlePath".to_string(),
+                            serde_json::Value::String(v),
+                        );
+                    }
+                    if let Some(v) = pc.key_path.filter(|s| !s.is_empty()) {
+                        pc_map.insert("keyPath".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pc.certificate_chain_path.filter(|s| !s.is_empty()) {
+                        pc_map.insert(
+                            "certificateChainPath".to_string(),
+                            serde_json::Value::String(v),
+                        );
+                    }
+                    sm.insert(
+                        "podCertificate".to_string(),
+                        serde_json::Value::Object(pc_map),
+                    );
+                }
+                if let Some(ctb) = src.cluster_trust_bundle {
+                    let mut ctb_map = serde_json::Map::new();
+                    if let Some(v) = ctb.name.filter(|s| !s.is_empty()) {
+                        ctb_map.insert("name".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = ctb.signer_name.filter(|s| !s.is_empty()) {
+                        ctb_map.insert("signerName".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(sel) = ctb.label_selector {
+                        ctb_map
+                            .insert("labelSelector".to_string(), gen_label_selector_to_json(sel));
+                    }
+                    if let Some(true) = ctb.optional {
+                        ctb_map.insert("optional".to_string(), serde_json::Value::Bool(true));
+                    }
+                    if let Some(v) = ctb.path.filter(|s| !s.is_empty()) {
+                        ctb_map.insert("path".to_string(), serde_json::Value::String(v));
+                    }
+                    sm.insert(
+                        "clusterTrustBundle".to_string(),
+                        serde_json::Value::Object(ctb_map),
+                    );
+                }
                 serde_json::Value::Object(sm)
             })
             .collect();
@@ -229,6 +286,23 @@ fn gen_http_get_to_json(http_get: core_v1::HttpGetAction) -> serde_json::Value {
     }
     if let Some(s) = http_get.scheme.filter(|s| !s.is_empty()) {
         hg.insert("scheme".to_string(), serde_json::Value::String(s));
+    }
+    // httpHeaders — custom headers for auth-gated health checks (e.g. a bearer token or
+    // signed request header the target expects). Dropping them makes a probe that relies on
+    // one indistinguishable from an anonymous request, so the endpoint answers 401/403 and
+    // the probe fails even though the container is healthy.
+    if !http_get.http_headers.is_empty() {
+        let headers: Vec<serde_json::Value> = http_get
+            .http_headers
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "name": h.name.unwrap_or_default(),
+                    "value": h.value.unwrap_or_default(),
+                })
+            })
+            .collect();
+        hg.insert("httpHeaders".to_string(), serde_json::Value::Array(headers));
     }
     serde_json::Value::Object(hg)
 }
@@ -340,6 +414,12 @@ fn gen_lifecycle_to_json(lc: core_v1::Lifecycle) -> serde_json::Value {
     }
     if let Some(h) = lc.pre_stop {
         m.insert("preStop".to_string(), gen_lifecycle_handler_to_json(h));
+    }
+    // stopSignal — a container-supplied custom stop signal; without it the runtime falls back
+    // to its own default (usually SIGTERM), which can kill a process that only handles a
+    // different signal for graceful shutdown instead of terminating cleanly.
+    if let Some(v) = lc.stop_signal.filter(|s| !s.is_empty()) {
+        m.insert("stopSignal".to_string(), serde_json::Value::String(v));
     }
     serde_json::Value::Object(m)
 }
@@ -748,6 +828,25 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
                         }
                         vfm.insert("secretKeyRef".to_string(), serde_json::Value::Object(skrm));
                     }
+                    // fileKeyRef (EnvFiles alpha feature) selects an env var from a file
+                    // mounted via another volume. Dropping it makes the container start with
+                    // that variable entirely unset instead of the value the file provided.
+                    if let Some(fkr) = vf.file_key_ref {
+                        let mut fkrm = serde_json::Map::new();
+                        if let Some(v) = fkr.volume_name.filter(|s| !s.is_empty()) {
+                            fkrm.insert("volumeName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = fkr.path.filter(|s| !s.is_empty()) {
+                            fkrm.insert("path".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = fkr.key.filter(|s| !s.is_empty()) {
+                            fkrm.insert("key".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(true) = fkr.optional {
+                            fkrm.insert("optional".to_string(), serde_json::Value::Bool(true));
+                        }
+                        vfm.insert("fileKeyRef".to_string(), serde_json::Value::Object(fkrm));
+                    }
                     em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
                 }
                 serde_json::Value::Object(em)
@@ -1110,12 +1209,9 @@ fn gen_node_selector_term_to_json(term: core_v1::NodeSelectorTerm) -> serde_json
     serde_json::Value::Object(m)
 }
 
-/// Only `nodeAffinity` is decoded here — `podAffinity`/`podAntiAffinity` are dropped
-/// from the returned JSON. This mirrors crates/scheduler, which has no matching logic
-/// for pod (anti-)affinity yet, so there is no consumer for those fields today. If a
-/// pod sets only podAffinity/podAntiAffinity (no nodeAffinity), it round-trips through
-/// this decoder as `spec.affinity: {}` — a narrower, pre-existing version of the same
-/// silent-drop bug this function fixes for nodeAffinity.
+/// Only `nodeAffinity` is decoded here — `podAffinity`/`podAntiAffinity` live in
+/// `gen_pod_affinity_to_json`/`gen_pod_anti_affinity_to_json` below. crates/scheduler still does
+/// not enforce pod (anti-)affinity, but the fields do round-trip.
 fn gen_node_affinity_to_json(na: core_v1::NodeAffinity) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(req) = na.required_during_scheduling_ignored_during_execution {
@@ -1157,6 +1253,119 @@ fn gen_node_affinity_to_json(na: core_v1::NodeAffinity) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(m)
+}
+
+fn gen_pod_affinity_term_to_json(term: core_v1::PodAffinityTerm) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(sel) = term.label_selector {
+        m.insert("labelSelector".to_string(), gen_label_selector_to_json(sel));
+    }
+    if !term.namespaces.is_empty() {
+        m.insert(
+            "namespaces".to_string(),
+            serde_json::Value::Array(
+                term.namespaces
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(v) = term.topology_key.filter(|s| !s.is_empty()) {
+        m.insert("topologyKey".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(sel) = term.namespace_selector {
+        m.insert(
+            "namespaceSelector".to_string(),
+            gen_label_selector_to_json(sel),
+        );
+    }
+    if !term.match_label_keys.is_empty() {
+        m.insert(
+            "matchLabelKeys".to_string(),
+            serde_json::Value::Array(
+                term.match_label_keys
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !term.mismatch_label_keys.is_empty() {
+        m.insert(
+            "mismatchLabelKeys".to_string(),
+            serde_json::Value::Array(
+                term.mismatch_label_keys
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// `PodAffinity` and `PodAntiAffinity` are structurally identical on the wire (the same two
+/// fields, the same element types) — they only differ in which key they land under on the
+/// parent `Affinity` object, so `gen_pod_affinity_to_json`/`gen_pod_anti_affinity_to_json` both
+/// delegate here rather than duplicating the required/preferred handling twice.
+fn gen_pod_affinity_terms_pair_to_json(
+    required: Vec<core_v1::PodAffinityTerm>,
+    preferred: Vec<core_v1::WeightedPodAffinityTerm>,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !required.is_empty() {
+        m.insert(
+            "requiredDuringSchedulingIgnoredDuringExecution".to_string(),
+            serde_json::Value::Array(
+                required
+                    .into_iter()
+                    .map(gen_pod_affinity_term_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !preferred.is_empty() {
+        m.insert(
+            "preferredDuringSchedulingIgnoredDuringExecution".to_string(),
+            serde_json::Value::Array(
+                preferred
+                    .into_iter()
+                    .map(|w| {
+                        let mut wm = serde_json::Map::new();
+                        if let Some(weight) = w.weight {
+                            wm.insert(
+                                "weight".to_string(),
+                                serde_json::Value::Number(weight.into()),
+                            );
+                        }
+                        if let Some(term) = w.pod_affinity_term {
+                            wm.insert(
+                                "podAffinityTerm".to_string(),
+                                gen_pod_affinity_term_to_json(term),
+                            );
+                        }
+                        serde_json::Value::Object(wm)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_pod_affinity_to_json(pa: core_v1::PodAffinity) -> serde_json::Value {
+    gen_pod_affinity_terms_pair_to_json(
+        pa.required_during_scheduling_ignored_during_execution,
+        pa.preferred_during_scheduling_ignored_during_execution,
+    )
+}
+
+fn gen_pod_anti_affinity_to_json(paa: core_v1::PodAntiAffinity) -> serde_json::Value {
+    gen_pod_affinity_terms_pair_to_json(
+        paa.required_during_scheduling_ignored_during_execution,
+        paa.preferred_during_scheduling_ignored_during_execution,
+    )
 }
 
 fn gen_label_selector_requirement_to_json(
@@ -1242,6 +1451,17 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                         let mut ed_map = serde_json::Map::new();
                         if let Some(medium) = ed.medium.filter(|s| !s.is_empty()) {
                             ed_map.insert("medium".to_string(), serde_json::Value::String(medium));
+                        }
+                        // sizeLimit caps how much local storage (or memory, for the Memory
+                        // medium) this emptyDir may use. Dropping it silently turns a capped
+                        // volume into an uncapped one, letting a runaway writer exhaust node
+                        // disk/memory instead of being evicted at the limit the client set.
+                        if let Some(v) = ed
+                            .size_limit
+                            .and_then(|q| q.string)
+                            .filter(|s| !s.is_empty())
+                        {
+                            ed_map.insert("sizeLimit".to_string(), serde_json::Value::String(v));
                         }
                         vm.insert("emptyDir".to_string(), serde_json::Value::Object(ed_map));
                     }
@@ -1537,11 +1757,20 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     }
     // affinity.nodeAffinity — same silent-drop mechanism and same conformance coverage as
     // nodeSelector above ("... validates that NodeAffinity is respected if not matching").
-    // See gen_node_affinity_to_json for the podAffinity/podAntiAffinity caveat.
+    // podAffinity/podAntiAffinity round-trip too (crates/scheduler still doesn't enforce them).
     if let Some(affinity) = spec.affinity {
         let mut am = serde_json::Map::new();
         if let Some(na) = affinity.node_affinity {
             am.insert("nodeAffinity".to_string(), gen_node_affinity_to_json(na));
+        }
+        if let Some(pa) = affinity.pod_affinity {
+            am.insert("podAffinity".to_string(), gen_pod_affinity_to_json(pa));
+        }
+        if let Some(paa) = affinity.pod_anti_affinity {
+            am.insert(
+                "podAntiAffinity".to_string(),
+                gen_pod_anti_affinity_to_json(paa),
+            );
         }
         spec_map.insert("affinity".to_string(), serde_json::Value::Object(am));
     }
@@ -3725,6 +3954,12 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
         if let Some(v) = status.reason.filter(|s| !s.is_empty()) {
             status_map.insert("reason".to_string(), serde_json::Value::String(v));
         }
+        if let Some(secs) = status.last_phase_transition_time.and_then(|t| t.seconds) {
+            status_map.insert(
+                "lastPhaseTransitionTime".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
         if !status_map.is_empty() {
             obj["status"] = serde_json::Value::Object(status_map);
         }
@@ -3747,9 +3982,12 @@ pub fn decode_serviceaccount_proto_gen(data: &[u8]) -> Option<serde_json::Value>
             .secrets
             .into_iter()
             .filter_map(|r| {
-                r.name
-                    .filter(|s| !s.is_empty())
-                    .map(|n| serde_json::json!({ "name": n }))
+                let name = r.name.filter(|s| !s.is_empty())?;
+                let mut m = serde_json::json!({ "name": name });
+                if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
+                    m["fieldPath"] = serde_json::Value::String(v);
+                }
+                Some(m)
             })
             .collect::<Vec<_>>()
             .into();
@@ -3853,6 +4091,14 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
                     }
                     if let Some(v) = c.message.filter(|s| !s.is_empty()) {
                         cond["message"] = serde_json::Value::String(v);
+                    }
+                    if let Some(secs) = c.last_probe_time.and_then(|t| t.seconds) {
+                        cond["lastProbeTime"] =
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                    }
+                    if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds) {
+                        cond["lastTransitionTime"] =
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                     }
                     cond
                 })
@@ -4134,6 +4380,15 @@ pub fn decode_replicationcontroller_proto_gen(data: &[u8]) -> Option<serde_json:
         if let Some(tmpl) = spec.template {
             spec_map.insert("template".to_string(), gen_pod_template_spec_to_json(tmpl));
         }
+        // minReadySeconds gates how long a newly Ready pod must stay Ready before the RC
+        // counts it toward availableReplicas; without it every pod counts as available the
+        // instant it's Ready, defeating a rollout's flake-tolerance window.
+        if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {
+            spec_map.insert(
+                "minReadySeconds".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
         obj["spec"] = serde_json::Value::Object(spec_map);
     }
     if let Some(status) = rc.status {
@@ -4171,6 +4426,10 @@ pub fn decode_replicationcontroller_proto_gen(data: &[u8]) -> Option<serde_json:
                         if !msg.is_empty() {
                             cond["message"] = msg.clone().into();
                         }
+                    }
+                    if let Some(secs) = c.last_transition_time.as_ref().and_then(|t| t.seconds) {
+                        cond["lastTransitionTime"] =
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                     }
                     cond
                 })
@@ -4532,6 +4791,56 @@ mod tests {
         );
     }
 
+    /// RC's `status.conditions[].lastTransitionTime` and `spec.minReadySeconds` survive the
+    /// generated-path decode.
+    ///
+    /// Without lastTransitionTime, a client can't tell how long an RC has been stuck
+    /// ReplicaFailure vs. just having started failing. Without minReadySeconds, every pod
+    /// counts as available the instant it's Ready, defeating a rollout's flake-tolerance
+    /// window.
+    #[test]
+    fn generated_rc_preserves_condition_timestamp_and_min_ready_seconds() {
+        let rc = core_v1::ReplicationController {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-rc".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::ReplicationControllerSpec {
+                replicas: Some(3),
+                min_ready_seconds: Some(30),
+                ..Default::default()
+            }),
+            status: Some(core_v1::ReplicationControllerStatus {
+                conditions: vec![core_v1::ReplicationControllerCondition {
+                    r#type: Some("ReplicaFailure".to_string()),
+                    status: Some("True".to_string()),
+                    last_transition_time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_000),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_replicationcontroller_proto_gen(&buf)
+            .expect("RC with condition timestamp must decode successfully");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["lastTransitionTime"], "2023-11-14T22:13:20Z",
+            "status.conditions[].lastTransitionTime must survive decode — without it a client \
+             can't tell how long an RC has been stuck ReplicaFailure vs. just having started"
+        );
+        assert_eq!(
+            result["spec"]["minReadySeconds"], 30,
+            "spec.minReadySeconds must survive decode — without it every pod counts as \
+             available the instant it's Ready, defeating a rollout's flake-tolerance window"
+        );
+    }
+
     /// RC with template containers survives decode via the generated path.
     ///
     /// Without decoding the template, the RC controller creates pods with no containers
@@ -4676,6 +4985,41 @@ mod tests {
         assert_eq!(
             result["status"]["reason"], "E2E",
             "status.reason must survive proto decode"
+        );
+    }
+
+    /// decode_persistentvolume_proto_gen must preserve status.lastPhaseTransitionTime
+    /// (PersistentVolumeStatus field 4).
+    ///
+    /// This is the only signal a client has for how long a PV has sat in its current phase
+    /// (e.g. stuck Released instead of being reclaimed); without it, a controller polling PV
+    /// phase can't distinguish "just transitioned" from "stuck for hours".
+    #[test]
+    fn decode_persistentvolume_proto_gen_preserves_last_phase_transition_time() {
+        let pv = core_v1::PersistentVolume {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pv".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeStatus {
+                phase: Some("Released".to_string()),
+                last_phase_transition_time: Some(meta_v1::Time {
+                    seconds: Some(1_700_000_000),
+                    nanos: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolume_proto_gen(&buf).expect("PV with status must decode");
+
+        assert_eq!(
+            result["status"]["lastPhaseTransitionTime"], "2023-11-14T22:13:20Z",
+            "status.lastPhaseTransitionTime must survive proto decode — without it a client \
+             polling PV phase can't tell 'just transitioned' from 'stuck for hours'"
         );
     }
 
@@ -4839,6 +5183,30 @@ mod tests {
         );
     }
 
+    /// decode_persistentvolume_proto_gen must survive PersistentVolume::sentinel() producing
+    /// exactly the keys the .proto schema defines, not a hand-typed subset that could go stale
+    /// the same way PodStatus's did (mayor-y0pcm).
+    ///
+    /// This reaches zero KNOWN_GAPS only because mayor-hfoid (legacy-volume
+    /// DELIBERATE_OMISSIONS) and mayor-p0dyr (persistentVolumeSource INLINE_EMBEDS) already
+    /// landed; lastPhaseTransitionTime was PersistentVolume's last real gap.
+    #[test]
+    fn sentinel_completeness_decode_persistentvolume_proto_gen() {
+        let pv = core_v1::PersistentVolume::sentinel();
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_persistentvolume_proto_gen(&buf).expect("sentinel PV must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.PersistentVolume",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
     /// The `optional` bool on ConfigMap/Secret volume sources (and their projected
     /// variants) must survive proto decode.
     ///
@@ -4948,6 +5316,162 @@ mod tests {
         assert_eq!(
             proj_sources[1]["secret"]["optional"], true,
             "projected secret source's optional flag must survive decode"
+        );
+    }
+
+    /// A projected volume's `sources[].podCertificate` (PodCertificateProjection) must survive
+    /// proto decode.
+    ///
+    /// Before this fix, the whole `sources[]` entry was silently dropped: a pod using this
+    /// (1.34+ alpha) auto-rotating TLS credential projection would mount an empty projected
+    /// volume with no error, leaving the workload with no key/certificate at the path it
+    /// expected.
+    #[test]
+    fn generated_pod_spec_preserves_projected_pod_certificate_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("podcert-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("podcert-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        projected: Some(core_v1::ProjectedVolumeSource {
+                            sources: vec![core_v1::VolumeProjection {
+                                pod_certificate: Some(core_v1::PodCertificateProjection {
+                                    signer_name: Some("example.com/signer".to_string()),
+                                    key_type: Some("ECDSAP256".to_string()),
+                                    max_expiration_seconds: Some(86400),
+                                    credential_bundle_path: Some("bundle.pem".to_string()),
+                                    key_path: Some("key.pem".to_string()),
+                                    certificate_chain_path: Some("chain.pem".to_string()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with podCertificate must decode");
+
+        let pc = &result["spec"]["volumes"][0]["projected"]["sources"][0]["podCertificate"];
+        assert_eq!(
+            pc["signerName"], "example.com/signer",
+            "podCertificate.signerName must survive decode — before this fix the whole \
+             sources[] entry was dropped, leaving the workload with no credential at all"
+        );
+        assert_eq!(
+            pc["keyType"], "ECDSAP256",
+            "podCertificate.keyType must survive decode"
+        );
+        assert_eq!(
+            pc["maxExpirationSeconds"], 86400,
+            "podCertificate.maxExpirationSeconds must survive decode"
+        );
+        assert_eq!(
+            pc["credentialBundlePath"], "bundle.pem",
+            "podCertificate.credentialBundlePath must survive decode"
+        );
+        assert_eq!(
+            pc["keyPath"], "key.pem",
+            "podCertificate.keyPath must survive decode"
+        );
+        assert_eq!(
+            pc["certificateChainPath"], "chain.pem",
+            "podCertificate.certificateChainPath must survive decode"
+        );
+    }
+
+    /// A projected volume's `sources[].clusterTrustBundle` (ClusterTrustBundleProjection) must
+    /// survive proto decode.
+    ///
+    /// Before this fix, the whole `sources[]` entry was silently dropped: a pod that projected
+    /// a CA trust bundle by signer name/label selector would mount an empty projected volume,
+    /// so TLS verification against that bundle would fail with no indication why.
+    #[test]
+    fn generated_pod_spec_preserves_projected_cluster_trust_bundle_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ctb-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("ctb-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        projected: Some(core_v1::ProjectedVolumeSource {
+                            sources: vec![core_v1::VolumeProjection {
+                                cluster_trust_bundle: Some(core_v1::ClusterTrustBundleProjection {
+                                    signer_name: Some("example.com/signer".to_string()),
+                                    label_selector: Some(meta_v1::LabelSelector {
+                                        match_labels: [(
+                                            "release".to_string(),
+                                            "stable".to_string(),
+                                        )]
+                                        .into_iter()
+                                        .collect(),
+                                        ..Default::default()
+                                    }),
+                                    optional: Some(true),
+                                    path: Some("trust.pem".to_string()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with clusterTrustBundle must decode");
+
+        let ctb = &result["spec"]["volumes"][0]["projected"]["sources"][0]["clusterTrustBundle"];
+        assert_eq!(
+            ctb["signerName"], "example.com/signer",
+            "clusterTrustBundle.signerName must survive decode — before this fix the whole \
+             sources[] entry was dropped, so TLS verification against the bundle would fail \
+             with no indication why"
+        );
+        assert_eq!(
+            ctb["labelSelector"]["matchLabels"]["release"], "stable",
+            "clusterTrustBundle.labelSelector must survive decode"
+        );
+        assert_eq!(
+            ctb["optional"], true,
+            "clusterTrustBundle.optional must survive decode"
+        );
+        assert_eq!(
+            ctb["path"], "trust.pem",
+            "clusterTrustBundle.path must survive decode"
         );
     }
 
@@ -5515,6 +6039,111 @@ mod tests {
         assert_eq!(
             c["matchLabelKeys"][0], "pod-template-hash",
             "matchLabelKeys must survive decode"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.affinity.podAffinity/podAntiAffinity
+    /// (Affinity fields 2 and 3), not just nodeAffinity.
+    ///
+    /// This is a JSON round-trip fix only — crates/scheduler does not enforce pod
+    /// (anti-)affinity yet, so this test does not claim scheduling behavior changed. Before
+    /// this fix, a client that set only podAffinity/podAntiAffinity (no nodeAffinity) on a
+    /// protobuf-encoded pod create got back `spec.affinity: {}` on a subsequent GET — the
+    /// value it wrote was silently gone.
+    #[test]
+    fn generated_pod_spec_preserves_pod_affinity_and_anti_affinity() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("colocate-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                affinity: Some(core_v1::Affinity {
+                    pod_affinity: Some(core_v1::PodAffinity {
+                        required_during_scheduling_ignored_during_execution: vec![
+                            core_v1::PodAffinityTerm {
+                                label_selector: Some(meta_v1::LabelSelector {
+                                    match_labels: [("app".to_string(), "cache".to_string())]
+                                        .into_iter()
+                                        .collect(),
+                                    ..Default::default()
+                                }),
+                                namespaces: vec!["shared".to_string()],
+                                topology_key: Some("kubernetes.io/hostname".to_string()),
+                                namespace_selector: Some(meta_v1::LabelSelector {
+                                    match_labels: [(
+                                        "kubernetes.io/metadata.name".to_string(),
+                                        "shared".to_string(),
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                    ..Default::default()
+                                }),
+                                mismatch_label_keys: vec!["pod-template-hash".to_string()],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                    pod_anti_affinity: Some(core_v1::PodAntiAffinity {
+                        preferred_during_scheduling_ignored_during_execution: vec![
+                            core_v1::WeightedPodAffinityTerm {
+                                weight: Some(50),
+                                pod_affinity_term: Some(core_v1::PodAffinityTerm {
+                                    topology_key: Some("topology.kubernetes.io/zone".to_string()),
+                                    ..Default::default()
+                                }),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        let required = &result["spec"]["affinity"]["podAffinity"]
+            ["requiredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(
+            required["labelSelector"]["matchLabels"]["app"], "cache",
+            "podAffinity.requiredDuringSchedulingIgnoredDuringExecution[].labelSelector must \
+             survive decode — before this fix the whole podAffinity key was dropped"
+        );
+        assert_eq!(
+            required["namespaces"][0], "shared",
+            "podAffinityTerm.namespaces must survive decode"
+        );
+        assert_eq!(
+            required["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"], "shared",
+            "podAffinityTerm.namespaceSelector must survive decode"
+        );
+        assert_eq!(
+            required["mismatchLabelKeys"][0], "pod-template-hash",
+            "podAffinityTerm.mismatchLabelKeys must survive decode"
+        );
+
+        let preferred = &result["spec"]["affinity"]["podAntiAffinity"]
+            ["preferredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(
+            preferred["weight"], 50,
+            "podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[].weight must \
+             survive decode — before this fix the whole podAntiAffinity key was dropped"
+        );
+        assert_eq!(
+            preferred["podAffinityTerm"]["topologyKey"], "topology.kubernetes.io/zone",
+            "podAntiAffinity's nested podAffinityTerm must survive decode"
         );
     }
 
@@ -6763,6 +7392,212 @@ mod tests {
         );
     }
 
+    /// A probe's `httpGet.httpHeaders` must survive protobuf decode.
+    ///
+    /// Without it, a health check that relies on a custom header (e.g. an auth token the
+    /// target expects) is silently sent without that header, so the endpoint answers
+    /// 401/403 and the probe reports the container unhealthy even though it's fine.
+    #[test]
+    fn generated_container_preserves_liveness_probe_http_headers() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("probe-headers-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    liveness_probe: Some(core_v1::Probe {
+                        handler: Some(core_v1::ProbeHandler {
+                            http_get: Some(core_v1::HttpGetAction {
+                                path: Some("/healthz".to_string()),
+                                http_headers: vec![core_v1::HttpHeader {
+                                    name: Some("X-Auth-Token".to_string()),
+                                    value: Some("secret".to_string()),
+                                }],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with liveness probe must decode");
+
+        let header = &result["spec"]["containers"][0]["livenessProbe"]["httpGet"]["httpHeaders"][0];
+        assert_eq!(
+            header["name"], "X-Auth-Token",
+            "httpGet.httpHeaders must survive decode — without it an auth-gated health check \
+             silently loses its credential and the probe fails even though the container is \
+             healthy"
+        );
+        assert_eq!(
+            header["value"], "secret",
+            "httpHeaders[].value must survive decode"
+        );
+    }
+
+    /// A container's `lifecycle.stopSignal` must survive protobuf decode.
+    ///
+    /// Without it, the container runtime falls back to its own default stop signal (usually
+    /// SIGTERM) instead of the one the client requested, which can kill a process that only
+    /// handles a different signal for graceful shutdown, dropping in-flight work.
+    #[test]
+    fn generated_container_preserves_lifecycle_stop_signal() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("stopsignal-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                os: Some(core_v1::PodOs {
+                    name: Some("linux".to_string()),
+                }),
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    lifecycle: Some(core_v1::Lifecycle {
+                        stop_signal: Some("SIGUSR1".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with lifecycle.stopSignal must decode");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["lifecycle"]["stopSignal"], "SIGUSR1",
+            "lifecycle.stopSignal must survive decode — without it the runtime falls back to \
+             its default signal (usually SIGTERM), which can kill a process that only handles \
+             a different signal for graceful shutdown"
+        );
+    }
+
+    /// A volume's `emptyDir.sizeLimit` must survive protobuf decode.
+    ///
+    /// Without it, an emptyDir the client capped at a specific size round-trips as
+    /// uncapped, letting a runaway writer exhaust node disk/memory instead of being
+    /// evicted at the limit the client set.
+    #[test]
+    fn generated_pod_spec_preserves_empty_dir_size_limit() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("emptydir-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("scratch".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        empty_dir: Some(core_v1::EmptyDirVolumeSource {
+                            medium: Some("Memory".to_string()),
+                            size_limit: Some(
+                                crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                    string: Some("1Gi".to_string()),
+                                },
+                            ),
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with emptyDir must decode");
+
+        assert_eq!(
+            result["spec"]["volumes"][0]["emptyDir"]["sizeLimit"], "1Gi",
+            "emptyDir.sizeLimit must survive decode — without it a capped emptyDir round-trips \
+             as uncapped, letting a runaway writer exhaust node disk/memory instead of being \
+             evicted at the limit the client set"
+        );
+    }
+
+    /// An env var's `valueFrom.fileKeyRef` must survive protobuf decode.
+    ///
+    /// Without it, a container relying on this (alpha EnvFiles) feature starts with that
+    /// environment variable entirely unset instead of the value the referenced file provided.
+    #[test]
+    fn generated_container_preserves_env_file_key_ref() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("envfile-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    env: vec![core_v1::EnvVar {
+                        name: Some("FROM_FILE".to_string()),
+                        value_from: Some(core_v1::EnvVarSource {
+                            file_key_ref: Some(core_v1::FileKeySelector {
+                                volume_name: Some("envfile-vol".to_string()),
+                                path: Some("app.env".to_string()),
+                                key: Some("SOME_KEY".to_string()),
+                                optional: Some(true),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with fileKeyRef env var must decode");
+
+        let fkr = &result["spec"]["containers"][0]["env"][0]["valueFrom"]["fileKeyRef"];
+        assert_eq!(
+            fkr["volumeName"], "envfile-vol",
+            "valueFrom.fileKeyRef must survive decode — without it a container relying on \
+             this env-from-file feature starts with the variable entirely unset instead of \
+             the value the referenced file provided"
+        );
+        assert_eq!(
+            fkr["path"], "app.env",
+            "fileKeyRef.path must survive decode"
+        );
+        assert_eq!(fkr["key"], "SOME_KEY", "fileKeyRef.key must survive decode");
+        assert_eq!(
+            fkr["optional"], true,
+            "fileKeyRef.optional must survive decode"
+        );
+    }
+
     /// Pod-level securityContext, including sysctls, survives protobuf decode.
     ///
     /// P1 security bug: without this, pod.Spec.SecurityContext.RunAsUser/RunAsGroup are
@@ -7605,6 +8440,76 @@ mod tests {
         );
     }
 
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.conditions[].lastProbeTime and
+    /// .lastTransitionTime (PVCStatus field 4's condition timestamps).
+    ///
+    /// These are how a client tells "resize probed 5 minutes ago and still Resizing" from
+    /// "resize just started" — without them, the FileSystemResizePending/Resizing condition has
+    /// a type/status/reason but no way to tell how long the claim has been stuck there.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_condition_timestamps() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("resizing-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                conditions: vec![core_v1::PersistentVolumeClaimCondition {
+                    r#type: Some("Resizing".to_string()),
+                    status: Some("True".to_string()),
+                    last_probe_time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_000),
+                        nanos: Some(0),
+                    }),
+                    last_transition_time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_100),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["lastProbeTime"], "2023-11-14T22:13:20Z",
+            "status.conditions[].lastProbeTime must survive decode — without it a client can't \
+             tell how long ago a resize condition was last probed"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["lastTransitionTime"], "2023-11-14T22:15:00Z",
+            "status.conditions[].lastTransitionTime must survive decode — without it a client \
+             can't tell how long a claim has been stuck Resizing vs. just having started"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must survive PersistentVolumeClaim::sentinel()
+    /// producing exactly the keys the .proto schema defines, not a hand-typed subset that could
+    /// go stale the same way PodStatus's did (mayor-y0pcm).
+    #[test]
+    fn sentinel_completeness_decode_persistentvolumeclaim_proto_gen() {
+        let pvc = core_v1::PersistentVolumeClaim::sentinel();
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+        let result =
+            decode_persistentvolumeclaim_proto_gen(&buf).expect("sentinel PVC must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.PersistentVolumeClaim",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
     /// decode_persistentvolumeclaim_proto_gen must preserve status.allocatedResources
     /// (PVCStatus field 5).
     ///
@@ -7890,6 +8795,61 @@ mod tests {
             "automountServiceAccountToken=false must survive decode — dropping it re-enables \
              automatic API token mounting the caller explicitly opted out of"
         );
+    }
+
+    /// decode_serviceaccount_proto_gen must preserve secrets[].fieldPath (ObjectReference field
+    /// 7), reachable via ServiceAccount.secrets[].
+    ///
+    /// This is a schema field on ObjectReference that a client is entitled to set on any
+    /// secrets[] entry; dropping it silently would corrupt a GET-modify-PUT round trip through
+    /// a protobuf-content-type client even though this particular reference use is unusual.
+    #[test]
+    fn decode_serviceaccount_proto_gen_preserves_secrets_field_path() {
+        let sa = core_v1::ServiceAccount {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-sa".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            secrets: vec![core_v1::ObjectReference {
+                name: Some("my-sa-token".to_string()),
+                field_path: Some("data.token".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sa.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_serviceaccount_proto_gen(&buf).expect("ServiceAccount must decode");
+
+        assert_eq!(
+            result["secrets"][0]["fieldPath"], "data.token",
+            "secrets[].fieldPath must survive decode alongside name — a client that set it on \
+             a GET-modify-PUT round trip through a protobuf-content-type client would otherwise \
+             see it silently vanish"
+        );
+    }
+
+    /// decode_serviceaccount_proto_gen must survive ServiceAccount::sentinel() producing exactly
+    /// the keys the .proto schema defines, not a hand-typed subset that could go stale the same
+    /// way PodStatus's did (mayor-y0pcm).
+    #[test]
+    fn sentinel_completeness_decode_serviceaccount_proto_gen() {
+        let sa = core_v1::ServiceAccount::sentinel();
+        let mut buf = Vec::new();
+        sa.encode(&mut buf).expect("prost encode must succeed");
+        let result =
+            decode_serviceaccount_proto_gen(&buf).expect("sentinel ServiceAccount must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.ServiceAccount",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
     }
 
     /// decode_endpoints_proto_gen must preserve subsets[].addresses and subsets[].ports.

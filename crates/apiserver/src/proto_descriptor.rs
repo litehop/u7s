@@ -105,6 +105,15 @@ const INLINE_EMBEDS: &[(&str, &str)] = &[
         "persistentVolumeSource",
     ),
     (".k8s.io.api.core.v1.Volume", "volumeSource"),
+    // `Probe` Go-embeds `ProbeHandler` inline via a field literally named `handler` — the
+    // generated.proto comment has no `Deprecated:` marker at all, so this is not a
+    // DELIBERATE_OMISSIONS case (there's no deprecation to cite, and `core_gen_adapter.rs`'s
+    // `gen_probe_to_json` already inserts exec/httpGet/tcpSocket/grpc directly onto the
+    // Probe's own JSON object, matching upstream's inline serialization exactly). Without this
+    // entry the walk demanded a literal `handler` key no correct decoder can ever produce,
+    // which would have permanently blocked a zero-KNOWN_GAPS sentinel test on every decoder
+    // reaching a livenessProbe/readinessProbe/startupProbe.
+    (".k8s.io.api.core.v1.Probe", "handler"),
 ];
 
 /// Fields the decoders deliberately do not emit. Each entry is a decision, not an oversight;
@@ -752,6 +761,21 @@ mod tests {
         assert!(
             !keys.contains("volumeSource"),
             "volumeSource is a Go inline embed, not a JSON key a decoder can ever emit, got {keys:?}"
+        );
+    }
+
+    /// `Probe` embeds `ProbeHandler` inline: `exec`/`httpGet`/`tcpSocket`/`grpc` land directly
+    /// on each livenessProbe/readinessProbe/startupProbe, and `handler` never appears as a JSON
+    /// key. Unlike the other `INLINE_EMBEDS` entries this one has no accompanying
+    /// `DELIBERATE_OMISSIONS`-shaped deprecation story — `Probe.handler`'s .proto comment
+    /// carries no `Deprecated:` marker, it is simply Go's inline-embed idiom.
+    #[test]
+    fn inlines_probehandler_fields_onto_probe() {
+        let keys = expected_json_keys(".k8s.io.api.core.v1.Probe");
+        assert!(keys.contains("exec") && keys.contains("httpGet"));
+        assert!(
+            !keys.contains("handler"),
+            "handler is a Go inline embed, not a JSON key a decoder can ever emit, got {keys:?}"
         );
     }
 
