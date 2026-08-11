@@ -1272,6 +1272,24 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                             vm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
                         }
                     }
+                    // nfs — same wire shape and consumer story as
+                    // PersistentVolumeSource.nfs (decode_persistentvolume_proto_gen): a
+                    // client-go typed clientset sends protobuf by default, so a Pod created
+                    // with spec.volumes[i].nfs set would otherwise decode with the volume
+                    // source silently dropped and kubelet unable to resolve the mount.
+                    if let Some(nfs) = src.nfs {
+                        let mut nfs_map = serde_json::Map::new();
+                        if let Some(v) = nfs.server.filter(|s| !s.is_empty()) {
+                            nfs_map.insert("server".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = nfs.path.filter(|s| !s.is_empty()) {
+                            nfs_map.insert("path".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = nfs.read_only {
+                            nfs_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert("nfs".to_string(), serde_json::Value::Object(nfs_map));
+                    }
                     if let Some(pvc) = src.persistent_volume_claim {
                         if let Some(claim_name) = pvc.claim_name.filter(|s| !s.is_empty()) {
                             let mut pvc_map = serde_json::Map::new();
@@ -5061,6 +5079,63 @@ mod tests {
         assert!(
             result["spec"].get("schedulingGates").is_none(),
             "schedulingGates must be omitted (not an empty array) when the wire carried none"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.volumes[i].nfs (VolumeSource field 7).
+    ///
+    /// client-go's typed Pod client sends protobuf by default. Without this branch,
+    /// a Pod created with an NFS-backed volume (e.g. by a controller that mounts a shared
+    /// NFS export into a pod template) would decode with the volume source silently
+    /// dropped, leaving kubelet unable to resolve the mount and the container stuck
+    /// waiting on a volume that, per the stored object, was never even requested.
+    #[test]
+    fn pod_volume_nfs_survives_protobuf_decode_or_nfs_mount_silently_dropped_from_pod_spec() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("nfs-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("nfs-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        nfs: Some(core_v1::NfsVolumeSource {
+                            server: Some("nfs.example.com".to_string()),
+                            path: Some("/exports/data".to_string()),
+                            read_only: Some(true),
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with an nfs volume must decode");
+
+        let nfs = &result["spec"]["volumes"][0]["nfs"];
+        assert_eq!(
+            nfs["server"], "nfs.example.com",
+            "nfs.server must survive protobuf decode — without it kubelet has no host to mount from"
+        );
+        assert_eq!(
+            nfs["path"], "/exports/data",
+            "nfs.path must survive protobuf decode — without it kubelet has no export to mount"
+        );
+        assert_eq!(
+            nfs["readOnly"], true,
+            "nfs.readOnly must survive protobuf decode — losing it silently turns a read-only \
+             mount into a writable one"
         );
     }
 
