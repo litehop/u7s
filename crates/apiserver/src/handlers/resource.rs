@@ -10614,6 +10614,113 @@ mod tests {
         );
     }
 
+    fn proto_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/vnd.kubernetes.protobuf"),
+        );
+        h
+    }
+
+    /// publishNotReadyAddresses must survive a real protobuf-encoded Service create through
+    /// the actual handler — not just the decoder in isolation.
+    ///
+    /// client-go's typed Service clientset defaults to protobuf content-type. This is the
+    /// field a StatefulSet's headless Service relies on for peer discovery: the
+    /// Endpoints/EndpointSlice controllers read it to decide whether to publish SRV DNS
+    /// records for not-yet-ready pods. Before decode_service_proto_gen read this field, every
+    /// such Service created via the typed clientset would silently lose it, breaking peer
+    /// discovery for any StatefulSet pod still starting up.
+    #[tokio::test]
+    async fn service_create_via_protobuf_preserves_publish_not_ready_addresses() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use prost::Message;
+
+        let state = make_state();
+
+        let svc = crate::apps_gen::k8s::io::api::core::v1::Service {
+            metadata: Some(
+                crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                    name: Some("headless-peer-discovery".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+            ),
+            spec: Some(crate::apps_gen::k8s::io::api::core::v1::ServiceSpec {
+                cluster_ip: Some("None".to_string()),
+                publish_not_ready_addresses: Some(true),
+                ports: vec![crate::apps_gen::k8s::io::api::core::v1::ServicePort {
+                    port: Some(80),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut raw = Vec::new();
+        svc.encode(&mut raw).unwrap();
+
+        let envelope = crate::apps_gen::k8s::io::apimachinery::pkg::runtime::Unknown {
+            type_meta: Some(
+                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::TypeMeta {
+                    api_version: Some("v1".to_string()),
+                    kind: Some("Service".to_string()),
+                },
+            ),
+            raw: Some(raw),
+            ..Default::default()
+        };
+        let mut envelope_bytes = Vec::new();
+        envelope.encode(&mut envelope_bytes).unwrap();
+
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // k8s proto magic
+        body.extend(envelope_bytes);
+
+        let create_result = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            proto_headers(),
+            bytes::Bytes::from(body),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("protobuf-encoded Service create must succeed"))
+        .into_response();
+        assert_eq!(
+            create_result.status(),
+            axum::http::StatusCode::CREATED,
+            "protobuf-encoded Service create must return 201"
+        );
+
+        let get_result = get_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "services".into(),
+                "headless-peer-discovery".into(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Service GET must succeed"));
+
+        let body = to_bytes(get_result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["spec"]["publishNotReadyAddresses"], true,
+            "publishNotReadyAddresses must survive a protobuf-encoded create — without it, a \
+             StatefulSet headless Service's peer-discovery SRV records silently stop being \
+             published for not-yet-ready pods"
+        );
+    }
+
     // -- delete_collection_namespaced_resource releases clusterIP sentinels --
 
     /// Deleting a Service collection must release the clusterIP sentinels so those

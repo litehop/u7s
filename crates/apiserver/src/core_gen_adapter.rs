@@ -2693,6 +2693,21 @@ pub fn decode_podtemplate_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Service ----------------------------------------------------
 
+fn gen_session_affinity_config_to_json(sac: core_v1::SessionAffinityConfig) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sac
+        .client_ip
+        .and_then(|c| c.timeout_seconds)
+        .filter(|&v| v != 0)
+    {
+        m.insert(
+            "clientIP".to_string(),
+            serde_json::json!({ "timeoutSeconds": v }),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let svc = core_v1::Service::decode(data).ok()?;
     let meta = gen_object_meta_to_json(svc.metadata.unwrap_or_default());
@@ -2779,6 +2794,83 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 .collect();
             spec_map.insert("ports".to_string(), serde_json::Value::Array(ports_json));
         }
+        if !spec.cluster_i_ps.is_empty() {
+            spec_map.insert(
+                "clusterIPs".to_string(),
+                serde_json::Value::Array(
+                    spec.cluster_i_ps
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        // Deprecated upstream, but a client that sets it still expects it to round trip.
+        if let Some(v) = spec.load_balancer_ip.filter(|s| !s.is_empty()) {
+            spec_map.insert("loadBalancerIP".to_string(), serde_json::Value::String(v));
+        }
+        // A CIDR allowlist restricting which client IPs may reach the load balancer; dropping
+        // it silently turned an access-restricted LoadBalancer Service into an open one.
+        if !spec.load_balancer_source_ranges.is_empty() {
+            spec_map.insert(
+                "loadBalancerSourceRanges".to_string(),
+                serde_json::Value::Array(
+                    spec.load_balancer_source_ranges
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(v) = spec.health_check_node_port.filter(|&v| v != 0) {
+            spec_map.insert(
+                "healthCheckNodePort".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        // StatefulSet headless-Service peer discovery (SRV DNS records) depends on this: it
+        // tells Endpoints/EndpointSlice controllers to publish not-yet-ready pods as endpoints.
+        if let Some(v) = spec.publish_not_ready_addresses {
+            spec_map.insert(
+                "publishNotReadyAddresses".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(sac) = spec.session_affinity_config {
+            let sac_json = gen_session_affinity_config_to_json(sac);
+            if !sac_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                spec_map.insert("sessionAffinityConfig".to_string(), sac_json);
+            }
+        }
+        if !spec.ip_families.is_empty() {
+            spec_map.insert(
+                "ipFamilies".to_string(),
+                serde_json::Value::Array(
+                    spec.ip_families
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(v) = spec.allocate_load_balancer_node_ports {
+            spec_map.insert(
+                "allocateLoadBalancerNodePorts".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = spec.load_balancer_class.filter(|s| !s.is_empty()) {
+            spec_map.insert(
+                "loadBalancerClass".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        if let Some(v) = spec.traffic_distribution.filter(|s| !s.is_empty()) {
+            spec_map.insert(
+                "trafficDistribution".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
         }
@@ -2798,6 +2890,38 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                         }
                         if let Some(v) = i.hostname.filter(|s| !s.is_empty()) {
                             im.insert("hostname".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = i.ip_mode.filter(|s| !s.is_empty()) {
+                            im.insert("ipMode".to_string(), serde_json::Value::String(v));
+                        }
+                        if !i.ports.is_empty() {
+                            let ports: Vec<serde_json::Value> = i
+                                .ports
+                                .into_iter()
+                                .map(|p| {
+                                    let mut pm = serde_json::Map::new();
+                                    if let Some(v) = p.port.filter(|&n| n != 0) {
+                                        pm.insert(
+                                            "port".to_string(),
+                                            serde_json::Value::Number(v.into()),
+                                        );
+                                    }
+                                    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "protocol".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    if let Some(v) = p.error.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "error".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    serde_json::Value::Object(pm)
+                                })
+                                .collect();
+                            im.insert("ports".to_string(), serde_json::Value::Array(ports));
                         }
                         serde_json::Value::Object(im)
                     })
@@ -2819,6 +2943,9 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(v) = c.message.filter(|s| !s.is_empty()) {
                         cm["message"] = v.into();
+                    }
+                    if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+                        cm["observedGeneration"] = v.into();
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
@@ -8075,6 +8202,31 @@ mod tests {
 
         let expected =
             crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.NodeStatus"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for `decode_service_proto_gen`, gated against the schema itself.
+    ///
+    /// Fifteen ServiceSpec/ServiceStatus.loadBalancer.ingress fields (clusterIPs,
+    /// loadBalancerSourceRanges, publishNotReadyAddresses, sessionAffinityConfig, ipMode on
+    /// LoadBalancerIngress, ...) were absent from this decoder entirely — a hand-typed
+    /// expected list, written by the same person who wrote the emitter, would have needed to
+    /// remember all fifteen. Deriving `expected` from the compiled `FileDescriptorSet` instead
+    /// means a field this function forgets shows up here automatically.
+    #[test]
+    fn sentinel_completeness_gen_service_to_json() {
+        let svc = core_v1::Service::sentinel();
+        let mut buf = Vec::new();
+        svc.encode(&mut buf).unwrap();
+        let result = decode_service_proto_gen(&buf)
+            .expect("sentinel Service must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Service"]);
         let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
