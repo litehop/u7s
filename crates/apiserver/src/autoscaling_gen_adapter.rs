@@ -671,4 +671,51 @@ mod tests {
             "unset spec/status must be absent, not null"
         );
     }
+
+    // ---- Sentinel completeness: decode_hpa_v1_proto_gen / decode_hpa_v2_proto_gen ----
+    //
+    // Builds a HorizontalPodAutoscaler with every field set to a value no zero/empty-elision
+    // check in either decoder could mistake for "unset" (see u7s_sentinel::Sentinel), decodes it
+    // through the real decode_hpa_v{1,2}_proto_gen entry point, and asserts every field name the
+    // .proto schema defines shows up somewhere in the resulting JSON. A name that never appears
+    // means the decoder never reads that field from the decoded protobuf struct at all.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    use crate::util::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
+
+    #[test]
+    fn sentinel_completeness_decode_hpa_v1_proto_gen() {
+        let hpa = autoscaling_v1::HorizontalPodAutoscaler::sentinel();
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_hpa_v1_proto_gen(&buf).expect("sentinel HPA v1 must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscaler",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_hpa_v2_proto_gen() {
+        let hpa = autoscaling_v2::HorizontalPodAutoscaler::sentinel();
+        let mut buf = Vec::new();
+        hpa.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_hpa_v2_proto_gen(&buf).expect("sentinel HPA v2 must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscaler",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
 }
