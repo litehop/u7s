@@ -1276,9 +1276,14 @@ mod tests {
             "resourceVersion",
             "generation",
             "creationTimestamp",
-            "labels",
-            "annotations",
-            "ownerReferences",
+            // labels/annotations are maps: their own field name is never a real leaf once
+            // populated, only the sentinel-populated entry's deterministic "__sentinel__" key is
+            // (from u7s_sentinel's blanket `Sentinel for String`). ownerReferences is an array of
+            // a real struct; `uid` pins the check to it specifically rather than colliding with
+            // ObjectMeta's own (separately checked) `uid`.
+            "labels.__sentinel__",
+            "annotations.__sentinel__",
+            "ownerReferences.uid",
             "finalizers",
             "parallelism",
             "completions",
@@ -1291,10 +1296,13 @@ mod tests {
             "backoffLimitPerIndex",
             "maxFailedIndexes",
             "managedBy",
-            "selector",
+            // "selector"/"podFailurePolicy"/"successPolicy" are containers whose own field name
+            // is never itself a leaf once populated; each dotted entry below pins the check to a
+            // genuine leaf child instead.
+            "selector.matchLabels.__sentinel__",
             "manualSelector",
-            "podFailurePolicy",
-            "successPolicy",
+            "podFailurePolicy.rules.action",
+            "successPolicy.rules.succeededIndexes",
             "template",
             "startTime",
             "completionTime",
@@ -1302,7 +1310,9 @@ mod tests {
             "succeeded",
             "failed",
             "completedIndexes",
-            "uncountedTerminatedPods",
+            // "uncountedTerminatedPods" is a container too; "succeeded" here is its own repeated
+            // string field, so its path IS the leaf (arrays of scalars don't add a path segment).
+            "uncountedTerminatedPods.succeeded",
             "ready",
             "failedIndexes",
             "terminating",
@@ -1339,6 +1349,7 @@ mod tests {
         collect_leaf_paths(&decoded, "", &mut paths);
 
         // Same ObjectMeta omissions as sentinel_completeness_decode_job_proto_gen; see there.
+        // labels/annotations/ownerReferences dotted for the same reason as that test.
         let expected = [
             "name",
             "generateName",
@@ -1347,9 +1358,9 @@ mod tests {
             "resourceVersion",
             "generation",
             "creationTimestamp",
-            "labels",
-            "annotations",
-            "ownerReferences",
+            "labels.__sentinel__",
+            "annotations.__sentinel__",
+            "ownerReferences.uid",
             "finalizers",
             "schedule",
             "timeZone",
@@ -1359,7 +1370,10 @@ mod tests {
             "jobTemplate",
             "successfulJobsHistoryLimit",
             "failedJobsHistoryLimit",
-            "active",
+            // "active" is an array of ObjectReference (a real struct), so its own field name is
+            // never a leaf; resourceVersion is the one ObjectReference field with no top-level
+            // envelope/metadata namesake to accidentally cross-satisfy the check.
+            "active.resourceVersion",
             "lastScheduleTime",
             "lastSuccessfulTime",
         ];

@@ -1065,50 +1065,6 @@ mod tests {
 
     use crate::util::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
 
-    // selfLink is a legacy field the system no longer populates — permanently omitted.
-    // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
-    // pending a separate investigation into gen_object_meta_to_json's correct handling of
-    // them (this file's copy has the same omissions as every other gen_adapter's); do not
-    // guess at the fix here.
-    const OBJECT_META_EXPECTED: &[&str] = &[
-        "name",
-        "generateName",
-        "namespace",
-        "uid",
-        "resourceVersion",
-        "generation",
-        "creationTimestamp",
-        "labels",
-        "annotations",
-        "ownerReferences",
-        "finalizers",
-    ];
-
-    const LABEL_SELECTOR_EXPECTED: &[&str] = &[
-        "matchLabels",
-        "matchExpressions",
-        "key",
-        "operator",
-        "values",
-    ];
-
-    const MATCH_RESOURCES_EXPECTED: &[&str] = &[
-        "resourceRules",
-        "excludeResourceRules",
-        "resourceNames",
-        "apiGroups",
-        "apiVersions",
-        "resources",
-        "operations",
-        "scope",
-        "namespaceSelector",
-        "objectSelector",
-        "matchPolicy",
-    ];
-
-    const PARAM_REF_EXPECTED: &[&str] =
-        &["name", "namespace", "parameterNotFoundAction", "selector"];
-
     #[test]
     fn sentinel_completeness_decode_validatingwebhookconfiguration_proto_gen() {
         let vwc = ar_v1::ValidatingWebhookConfiguration {
@@ -1123,32 +1079,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result, "", &mut paths);
 
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(LABEL_SELECTOR_EXPECTED);
-        expected.extend([
-            "webhooks",
-            "clientConfig",
-            "caBundle",
-            "service",
-            "path",
-            "port",
-            "url",
-            "rules",
-            "operations",
-            "apiGroups",
-            "apiVersions",
-            "resources",
-            "scope",
-            "admissionReviewVersions",
-            "failurePolicy",
-            "matchPolicy",
-            "sideEffects",
-            "timeoutSeconds",
-            "namespaceSelector",
-            "objectSelector",
-            "matchConditions",
-            "expression",
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.admissionregistration.v1.ValidatingWebhookConfiguration",
         ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
@@ -1166,33 +1100,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result, "", &mut paths);
 
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(LABEL_SELECTOR_EXPECTED);
-        expected.extend([
-            "webhooks",
-            "clientConfig",
-            "caBundle",
-            "service",
-            "path",
-            "port",
-            "url",
-            "rules",
-            "operations",
-            "apiGroups",
-            "apiVersions",
-            "resources",
-            "scope",
-            "admissionReviewVersions",
-            "failurePolicy",
-            "matchPolicy",
-            "sideEffects",
-            "timeoutSeconds",
-            "reinvocationPolicy",
-            "namespaceSelector",
-            "objectSelector",
-            "matchConditions",
-            "expression",
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.admissionregistration.v1.MutatingWebhookConfiguration",
         ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
@@ -1211,38 +1122,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result, "", &mut paths);
 
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(LABEL_SELECTOR_EXPECTED);
-        expected.extend(MATCH_RESOURCES_EXPECTED);
-        expected.extend([
-            "spec",
-            "matchConstraints",
-            "failurePolicy",
-            // paramKind.apiVersion/kind deliberately excluded: both would be masked by the
-            // envelope's own top-level "apiVersion"/"kind" literals, so a dropped
-            // paramKind.apiVersion or paramKind.kind could never fail this check.
-            "paramKind",
-            "validations",
-            "expression",
-            "message",
-            "reason",
-            "messageExpression",
-            "auditAnnotations",
-            "key",
-            "valueExpression",
-            "matchConditions",
-            "name",
-            "variables",
-            "status",
-            "observedGeneration",
-            "typeChecking",
-            "expressionWarnings",
-            "fieldRef",
-            "warning",
-            "conditions",
-            "type",
-            "lastTransitionTime",
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicy",
         ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
@@ -1260,17 +1143,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result, "", &mut paths);
 
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(LABEL_SELECTOR_EXPECTED);
-        expected.extend(MATCH_RESOURCES_EXPECTED);
-        expected.extend(PARAM_REF_EXPECTED);
-        expected.extend([
-            "spec",
-            "policyName",
-            "paramRef",
-            "matchResources",
-            "validationActions",
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicyBinding",
         ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
@@ -1288,25 +1164,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result, "", &mut paths);
 
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(MATCH_RESOURCES_EXPECTED);
-        expected.extend([
-            "spec",
-            "matchConstraints",
-            "failurePolicy",
-            "reinvocationPolicy",
-            // paramKind.apiVersion/kind deliberately excluded — see the same note in
-            // sentinel_completeness_decode_validatingadmissionpolicy_proto_gen above.
-            "paramKind",
-            "variables",
-            "name",
-            "expression",
-            "mutations",
-            "patchType",
-            "applyConfiguration",
-            "jsonPatch",
-            "matchConditions",
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicy",
         ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
@@ -1324,11 +1185,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&result, "", &mut paths);
 
-        let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(LABEL_SELECTOR_EXPECTED);
-        expected.extend(MATCH_RESOURCES_EXPECTED);
-        expected.extend(PARAM_REF_EXPECTED);
-        expected.extend(["spec", "policyName", "paramRef", "matchResources"]);
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicyBinding",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 

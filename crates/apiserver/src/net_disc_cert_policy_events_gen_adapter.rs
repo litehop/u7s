@@ -1509,6 +1509,12 @@ mod tests {
     // pending a separate investigation into gen_object_meta_to_json's correct handling of
     // them (this file's copy has the same omissions as every other gen_adapter's); do not
     // guess at the fix here.
+    // labels/annotations are maps: their own field name is never a real leaf once populated,
+    // only their sentinel-populated entry is (the deterministic "__sentinel__" map-key literal
+    // u7s_sentinel's blanket `Sentinel for String` always produces). ownerReferences is an array
+    // of a real struct (OwnerReference), so its own field name is likewise never a leaf; `uid`
+    // pins the check to ownerReferences specifically rather than colliding with ObjectMeta's own
+    // (separately checked) `uid`.
     const OBJECT_META_EXPECTED: &[&str] = &[
         "name",
         "generateName",
@@ -1517,19 +1523,18 @@ mod tests {
         "resourceVersion",
         "generation",
         "creationTimestamp",
-        "labels",
-        "annotations",
-        "ownerReferences",
+        "labels.__sentinel__",
+        "annotations.__sentinel__",
+        "ownerReferences.uid",
         "finalizers",
     ];
 
-    const LABEL_SELECTOR_EXPECTED: &[&str] = &[
-        "matchLabels",
-        "matchExpressions",
-        "key",
-        "operator",
-        "values",
-    ];
+    // "matchLabels" is a map too, for the same reason as ObjectMeta's labels/annotations above.
+    // "matchExpressions" is an array of a real struct (LabelSelectorRequirement): its own field
+    // name is never a leaf either, so it's dropped in favor of its children (key/operator/values)
+    // below, which already prove it survived decode.
+    const LABEL_SELECTOR_EXPECTED: &[&str] =
+        &["matchLabels.__sentinel__", "key", "operator", "values"];
 
     #[test]
     fn sentinel_completeness_decode_ingress_proto_gen() {
@@ -1547,33 +1552,26 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"defaultBackend"/"service"/"resource"/"tls"/"rules"/"http"/"backend"/"status"/
+        // "loadBalancer"/"ingress"/"ports" are containers whose own field name is never itself a
+        // leaf once populated; each is dropped in favor of the genuine leaf children below
+        // (IngressBackend is a shared struct reachable via both defaultBackend and
+        // rules[].http.paths[].backend, so port.number/apiGroup proving it survived at all is
+        // sufficient — same acceptable ambiguity as everywhere else in this migration).
         expected.extend([
-            "spec",
             "ingressClassName",
-            "defaultBackend",
-            "service",
             "port",
             "number",
-            "resource",
             // apiGroup/kind on IngressBackend.resource: apiGroup is unique and tested; kind is
             // deliberately excluded — masked by the envelope's own top-level "kind": "Ingress".
             "apiGroup",
-            "tls",
             "hosts",
             "secretName",
-            "rules",
             "host",
-            "http",
-            "paths",
             "path",
             "pathType",
-            "backend",
-            "status",
-            "loadBalancer",
-            "ingress",
             "ip",
             "hostname",
-            "ports",
             "protocol",
             "error",
         ]);
@@ -1595,10 +1593,10 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"parameters" are containers whose own field name is never itself a leaf once
+        // populated; controller/apiGroup/scope below already prove they survived decode.
         expected.extend([
-            "spec",
             "controller",
-            "parameters",
             "apiGroup",
             "scope",
             // "kind"/"namespace" on IngressClassParametersReference deliberately excluded:
@@ -1729,7 +1727,9 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(["spec", "parentRef", "group", "resource"]);
+        // "spec"/"parentRef" are containers whose own field name is never itself a leaf once
+        // populated; group/resource below already prove they survived decode.
+        expected.extend(["group", "resource"]);
         assert_fields_present(&paths, &expected);
     }
 
@@ -1749,11 +1749,11 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"conditions" are containers whose own field name is never itself a leaf once
+        // populated; cidrs/reason/message/lastTransitionTime below already prove they survived.
         expected.extend([
-            "spec",
             "cidrs",
             "status",
-            "conditions",
             "type",
             "reason",
             "message",
@@ -1779,11 +1779,14 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "endpoints"/"conditions"/"targetRef"/"hints"/"ports" are containers whose own field
+        // name is never itself a leaf once populated; each is dropped in favor of a genuine leaf
+        // child instead ("forZones"/"forNodes" are containers too — ForZone/ForNode each have
+        // only a "name" field, so they get their own dotted entry rather than relying on the
+        // ambiguous bare "name" already satisfied by ObjectMeta's own).
         expected.extend([
             "addressType",
-            "endpoints",
             "addresses",
-            "conditions",
             "ready",
             "serving",
             "terminating",
@@ -1791,14 +1794,11 @@ mod tests {
             // targetRef.kind/apiVersion deliberately excluded — masked by the envelope's own
             // top-level "kind"/"apiVersion" literals. fieldPath is the one ObjectReference
             // field with no such collision, so it is the meaningful check here.
-            "targetRef",
             "fieldPath",
             "nodeName",
             "zone",
-            "hints",
-            "forZones",
-            "forNodes",
-            "ports",
+            "hints.forZones.name",
+            "hints.forNodes.name",
             "port",
             "protocol",
             "appProtocol",
@@ -1822,17 +1822,18 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"status"/"conditions" are containers whose own field name is never itself a
+        // leaf once populated; their genuine leaf children below already prove they survived
+        // decode. "extra" is a map<string, ExtraValue>, but ExtraValue (Go `[]string`) marshals
+        // as a bare JSON array — the sentinel-populated map entry itself is the leaf.
         expected.extend([
-            "spec",
             "request",
             "signerName",
             "expirationSeconds",
             "usages",
             "username",
             "groups",
-            "extra",
-            "status",
-            "conditions",
+            "extra.__sentinel__",
             "type",
             "reason",
             "message",
@@ -1860,20 +1861,21 @@ mod tests {
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
         expected.extend(LABEL_SELECTOR_EXPECTED);
+        // "spec"/"selector"/"conditions" are containers whose own field name is never itself a
+        // leaf once populated; LABEL_SELECTOR_EXPECTED/reason/message/lastTransitionTime below
+        // already prove they survived. "disruptedPods" is a map<string, Time>, so its leaf is
+        // the sentinel-populated entry's own key.
         expected.extend([
-            "spec",
             "minAvailable",
-            "selector",
             "maxUnavailable",
             "unhealthyPodEvictionPolicy",
             "status",
             "observedGeneration",
-            "disruptedPods",
+            "disruptedPods.__sentinel__",
             "disruptionsAllowed",
             "currentHealthy",
             "desiredHealthy",
             "expectedPods",
-            "conditions",
             "type",
             "reason",
             "message",
@@ -1916,9 +1918,11 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "series"/"regarding"/"related"/"deprecatedSource" are containers whose own field name
+        // is never itself a leaf once populated; each is dropped in favor of the genuine leaf
+        // children below, which already prove it survived decode.
         expected.extend([
             "eventTime",
-            "series",
             "count",
             "lastObservedTime",
             "reportingController",
@@ -1927,13 +1931,10 @@ mod tests {
             "reason",
             // regarding/related.kind/apiVersion deliberately excluded — masked by the
             // envelope's own top-level "kind"/"apiVersion" literals.
-            "regarding",
-            "related",
             "fieldPath",
             "note",
             "type",
             "deprecatedCount",
-            "deprecatedSource",
             "component",
             "host",
             "deprecatedFirstTimestamp",

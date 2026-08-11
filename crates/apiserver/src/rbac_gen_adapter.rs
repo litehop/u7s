@@ -982,6 +982,12 @@ mod tests {
     // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
     // pending a separate investigation into gen_object_meta_to_json's correct handling of
     // them; do not guess at the fix here.
+    // labels/annotations are maps: their own field name is never a real leaf once populated,
+    // only their sentinel-populated entry is (the deterministic "__sentinel__" map-key literal
+    // u7s_sentinel's blanket `Sentinel for String` always produces). ownerReferences is an array
+    // of a real struct (OwnerReference), so its own field name is likewise never a leaf; `uid`
+    // pins the check to ownerReferences specifically rather than colliding with ObjectMeta's own
+    // (separately checked) `uid`.
     const OBJECT_META_EXPECTED: &[&str] = &[
         "name",
         "generateName",
@@ -990,9 +996,9 @@ mod tests {
         "resourceVersion",
         "generation",
         "creationTimestamp",
-        "labels",
-        "annotations",
-        "ownerReferences",
+        "labels.__sentinel__",
+        "annotations.__sentinel__",
+        "ownerReferences.uid",
         "finalizers",
     ];
 
@@ -1012,15 +1018,17 @@ mod tests {
         collect_leaf_paths(&decoded, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "clusterRoleSelectors" is an array of LabelSelector; its own field name and its
+        // matchLabels (a map)/matchExpressions (an array of struct) children are all containers
+        // whose own field name is never itself a leaf once populated.
         expected.extend([
             "verbs",
             "apiGroups",
             "resources",
             "resourceNames",
             "nonResourceURLs",
-            "clusterRoleSelectors",
-            "matchLabels",
-            "matchExpressions",
+            "clusterRoleSelectors.matchLabels.__sentinel__",
+            "clusterRoleSelectors.matchExpressions.key",
         ]);
         assert_fields_present(&paths, &expected);
     }
@@ -1113,6 +1121,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&decoded, "", &mut paths);
 
+        // "requirements" is a container (array of a real struct) whose own field name is never
+        // itself a leaf once populated; key/operator/values below already prove it survived.
+        // "extra" is a map<string, ExtraValue>, but ExtraValue (Go `[]string`) marshals as a
+        // bare JSON array — the sentinel-populated map entry itself is the leaf.
         let expected = [
             "namespace",
             "verb",
@@ -1122,14 +1134,13 @@ mod tests {
             "subresource",
             "name",
             "rawSelector",
-            "requirements",
             "key",
             "operator",
             "values",
             "path",
             "user",
             "groups",
-            "extra",
+            "extra.__sentinel__",
             "uid",
         ];
         assert_fields_present(&paths, &expected);

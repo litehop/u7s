@@ -1059,6 +1059,12 @@ mod tests {
     // pending a separate investigation into gen_object_meta_to_json's correct handling of
     // them (this file's copy has the same omissions as every other gen_adapter's); do not
     // guess at the fix here.
+    // labels/annotations are maps: their own field name is never a real leaf once populated,
+    // only their sentinel-populated entry is (the deterministic "__sentinel__" map-key literal
+    // u7s_sentinel's blanket `Sentinel for String` always produces). ownerReferences is an array
+    // of a real struct (OwnerReference), so its own field name is likewise never a leaf; `uid`
+    // pins the check to ownerReferences specifically rather than colliding with ObjectMeta's own
+    // (separately checked) `uid`.
     const OBJECT_META_EXPECTED: &[&str] = &[
         "name",
         "generateName",
@@ -1067,9 +1073,9 @@ mod tests {
         "resourceVersion",
         "generation",
         "creationTimestamp",
-        "labels",
-        "annotations",
-        "ownerReferences",
+        "labels.__sentinel__",
+        "annotations.__sentinel__",
+        "ownerReferences.uid",
         "finalizers",
     ];
 
@@ -1107,7 +1113,12 @@ mod tests {
         expected.extend([
             "group",
             "scope",
-            "names",
+            // "names"/"versions"/"schema"/"subresources"/"scale"/"additionalPrinterColumns"/
+            // "selectableFields"/"conversion"/"webhook"/"clientConfig"/"service"/"conditions"/
+            // "acceptedNames" are containers whose own field name is never itself a real leaf
+            // once populated — each is dropped here in favor of the genuine leaf children below,
+            // which already fully exercise it (a decoder that dropped the whole container would
+            // drop its children too, and this list would still catch that).
             "plural",
             "singular",
             // "kind" deliberately excluded: names.kind/acceptedNames.kind would be masked by
@@ -1116,45 +1127,33 @@ mod tests {
             "listKind",
             "shortNames",
             "categories",
-            "versions",
             "name",
             "served",
             "storage",
             "deprecated",
             "deprecationWarning",
-            "schema",
             "openAPIV3Schema",
-            "subresources",
             "status",
-            "scale",
             "specReplicasPath",
             "statusReplicasPath",
             "labelSelectorPath",
-            "additionalPrinterColumns",
             "type",
             "jsonPath",
             "format",
             "description",
             "priority",
-            "selectableFields",
             "preserveUnknownFields",
-            "conversion",
             "strategy",
-            "webhook",
             "conversionReviewVersions",
-            "clientConfig",
             "caBundle",
             "url",
-            "service",
             "namespace",
             "path",
             "port",
-            "conditions",
             "reason",
             "message",
             "lastTransitionTime",
             "observedGeneration",
-            "acceptedNames",
             "storedVersions",
         ]);
         assert_fields_present(&paths, &expected);
@@ -1211,7 +1210,6 @@ mod tests {
             "id",
             "$schema",
             "pattern",
-            "default",
             "maximum",
             "exclusiveMaximum",
             "minimum",
@@ -1232,25 +1230,33 @@ mod tests {
             "x-kubernetes-map-type",
             "x-kubernetes-list-map-keys",
             "required",
-            "enum",
-            "properties",
-            "patternProperties",
-            "definitions",
-            "dependencies",
+            // Containers below (properties/patternProperties/definitions/dependencies/allOf/
+            // items/etc.) are never real JSON *leaves* once populated — a nested JsonSchemaProps
+            // is a non-empty struct, so only a dotted descendant leaf can survive strict
+            // leaf-path matching. "properties"/"patternProperties"/"definitions" bottom out to
+            // `{}` here because they self-reference JsonSchemaProps and `sentinel_guard` short-
+            // circuits the re-entrant construction, so their sentinel-populated map key
+            // ("__sentinel__", from u7s_sentinel's blanket `Sentinel for String`) is itself the
+            // deepest real leaf.
+            "default.d",
+            "enum.v",
+            "example.e",
+            "properties.__sentinel__",
+            "patternProperties.__sentinel__",
+            "definitions.__sentinel__",
+            // "schema"/"property" are JSONSchemaPropsOrStringArray's own two fields, reached
+            // through "dependencies" — both are already-passing bare suffix matches, kept as-is.
             "schema",
             "property",
-            "items",
             "additionalProperties",
             "additionalItems",
             "allOf",
             "oneOf",
             "anyOf",
             "not",
-            "externalDocs",
+            "externalDocs.description",
             "url",
-            "example",
-            "x-kubernetes-validations",
-            "rule",
+            "x-kubernetes-validations.rule",
             "message",
             "messageExpression",
             "reason",

@@ -1421,6 +1421,12 @@ mod tests {
     // pending a separate investigation into gen_object_meta_to_json's correct handling of
     // them (this file delegates to core_gen_adapter's copy, which has the same omissions); do
     // not guess at the fix here.
+    // labels/annotations are maps: their own field name is never a real leaf once populated,
+    // only their sentinel-populated entry is (the deterministic "__sentinel__" map-key literal
+    // u7s_sentinel's blanket `Sentinel for String` always produces). ownerReferences is an array
+    // of a real struct (OwnerReference), so its own field name is likewise never a leaf; `uid`
+    // pins the check to ownerReferences specifically rather than colliding with ObjectMeta's own
+    // (separately checked) `uid`.
     const OBJECT_META_EXPECTED: &[&str] = &[
         "name",
         "generateName",
@@ -1429,9 +1435,9 @@ mod tests {
         "resourceVersion",
         "generation",
         "creationTimestamp",
-        "labels",
-        "annotations",
-        "ownerReferences",
+        "labels.__sentinel__",
+        "annotations.__sentinel__",
+        "ownerReferences.uid",
         "finalizers",
     ];
 
@@ -1464,18 +1470,23 @@ mod tests {
         let mut expected = OBJECT_META_EXPECTED.to_vec();
         expected.extend([
             "replicas",
-            "selector",
+            // "selector" is a LabelSelector: never a leaf itself once populated, only its
+            // sentinel map entry is.
+            "selector.matchLabels.__sentinel__",
             "template",
-            "volumeClaimTemplates",
+            // "volumeClaimTemplates" holds full PersistentVolumeClaim objects; that struct's own
+            // completeness is covered by core_gen_adapter's PVC tests, so this only needs one
+            // leaf proving the array survives decode at all.
+            "volumeClaimTemplates.metadata.name",
             "serviceName",
             "podManagementPolicy",
-            "updateStrategy",
             "revisionHistoryLimit",
             "minReadySeconds",
-            "persistentVolumeClaimRetentionPolicy",
+            // "updateStrategy"/"persistentVolumeClaimRetentionPolicy"/"ordinals" are containers
+            // whose own field name is never itself a leaf; the leaf children below already
+            // exercise each one (a decoder that dropped the whole container drops these too).
             "whenDeleted",
             "whenScaled",
-            "ordinals",
             "start",
             "partition",
             "maxUnavailable",
@@ -1516,9 +1527,10 @@ mod tests {
         let mut expected = OBJECT_META_EXPECTED.to_vec();
         expected.extend([
             "replicas",
-            "selector",
+            "selector.matchLabels.__sentinel__",
             "template",
-            "strategy",
+            // "strategy" is a container (DeploymentStrategy: type + rollingUpdate); its leaf
+            // children below already exercise it.
             "maxUnavailable",
             "maxSurge",
             "revisionHistoryLimit",
@@ -1561,9 +1573,10 @@ mod tests {
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
         expected.extend([
-            "selector",
+            "selector.matchLabels.__sentinel__",
             "template",
-            "updateStrategy",
+            // "updateStrategy" is a container (DaemonSetUpdateStrategy: type + rollingUpdate);
+            // its leaf children below already exercise it.
             "maxUnavailable",
             "maxSurge",
             "minReadySeconds",
@@ -1607,7 +1620,7 @@ mod tests {
         expected.extend([
             "replicas",
             "minReadySeconds",
-            "selector",
+            "selector.matchLabels.__sentinel__",
             "template",
             "fullyLabeledReplicas",
             "readyReplicas",
@@ -1646,7 +1659,9 @@ mod tests {
         collect_leaf_paths(&decoded, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(["revision", "data"]);
+        // "data" is a RawExtension, inlined as the parsed JSON document — {"a": 1} here — so
+        // its own field name is never a leaf; "data.a" is the real decoded leaf.
+        expected.extend(["revision", "data.a"]);
         assert_fields_present(&paths, &expected);
     }
 

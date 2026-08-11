@@ -1612,6 +1612,12 @@ mod tests {
     // pending a separate investigation into gen_object_meta_to_json's correct handling of
     // them (this file's copy has the same omissions as every other gen_adapter's); do not
     // guess at the fix here.
+    // labels/annotations are maps: their own field name is never a real leaf once populated,
+    // only their sentinel-populated entry is (the deterministic "__sentinel__" map-key literal
+    // u7s_sentinel's blanket `Sentinel for String` always produces). ownerReferences is an array
+    // of a real struct (OwnerReference), so its own field name is likewise never a leaf; `uid`
+    // pins the check to ownerReferences specifically rather than colliding with ObjectMeta's own
+    // (separately checked) `uid`.
     const OBJECT_META_EXPECTED: &[&str] = &[
         "name",
         "generateName",
@@ -1620,19 +1626,18 @@ mod tests {
         "resourceVersion",
         "generation",
         "creationTimestamp",
-        "labels",
-        "annotations",
-        "ownerReferences",
+        "labels.__sentinel__",
+        "annotations.__sentinel__",
+        "ownerReferences.uid",
         "finalizers",
     ];
 
-    const LABEL_SELECTOR_EXPECTED: &[&str] = &[
-        "matchLabels",
-        "matchExpressions",
-        "key",
-        "operator",
-        "values",
-    ];
+    // "matchLabels" is a map too, for the same reason as ObjectMeta's labels/annotations above.
+    // "matchExpressions" is an array of a real struct (LabelSelectorRequirement): its own field
+    // name is never a leaf either, so it's dropped in favor of its children (key/operator/values)
+    // below, which already prove it survived decode.
+    const LABEL_SELECTOR_EXPECTED: &[&str] =
+        &["matchLabels.__sentinel__", "key", "operator", "values"];
 
     #[test]
     fn sentinel_completeness_decode_csinode_proto_gen() {
@@ -1649,14 +1654,9 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend([
-            "spec",
-            "drivers",
-            "nodeID",
-            "topologyKeys",
-            "allocatable",
-            "count",
-        ]);
+        // "spec"/"drivers"/"allocatable" are containers whose own field name is never itself a
+        // leaf once populated; nodeID/topologyKeys/count are their genuine leaf children.
+        expected.extend(["nodeID", "topologyKeys", "count"]);
         assert_fields_present(&paths, &expected);
     }
 
@@ -1675,14 +1675,14 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"tokenRequests" are containers whose own field name is never itself a leaf once
+        // populated; audience/expirationSeconds below are tokenRequests' genuine leaf children.
         expected.extend([
-            "spec",
             "attachRequired",
             "podInfoOnMount",
             "volumeLifecycleModes",
             "storageCapacity",
             "fsGroupPolicy",
-            "tokenRequests",
             "audience",
             "expirationSeconds",
             "requiresRepublish",
@@ -1713,12 +1713,9 @@ mod tests {
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
         expected.extend(LABEL_SELECTOR_EXPECTED);
-        expected.extend([
-            "storageClassName",
-            "nodeTopology",
-            "capacity",
-            "maximumVolumeSize",
-        ]);
+        // "nodeTopology" (a LabelSelector) is a container whose own field name is never itself a
+        // leaf once populated; LABEL_SELECTOR_EXPECTED's entries above already prove it survived.
+        expected.extend(["storageClassName", "capacity", "maximumVolumeSize"]);
         assert_fields_present(&paths, &expected);
     }
 
@@ -1744,21 +1741,19 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"source"/"status"/"attachError"/"detachError" are containers whose own field
+        // name is never itself a leaf once populated; each is dropped in favor of the genuine
+        // leaf children below, which already prove it survived decode.
         expected.extend([
-            "spec",
             "attacher",
             "nodeName",
-            "source",
             "persistentVolumeName",
             // inlineVolumeSpec deliberately excluded — see the module-level note above.
-            "status",
             "attached",
-            "attachmentMetadata",
-            "attachError",
+            "attachmentMetadata.__sentinel__",
             "message",
             "time",
             "errorCode",
-            "detachError",
         ]);
         assert_fields_present(&paths, &expected);
     }
@@ -1787,15 +1782,18 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "parameters" is a map: own field name never a leaf once populated, only a real entry
+        // is — this test builds one by hand ("type": "gp3") rather than via `Sentinel::sentinel`,
+        // so the leaf is "parameters.type", not the "__sentinel__" literal used elsewhere.
+        // "allowedTopologies"/"matchLabelExpressions" are containers whose leaf children
+        // (key/values) below already prove they survived.
         expected.extend([
             "provisioner",
-            "parameters",
+            "parameters.type",
             "reclaimPolicy",
             "mountOptions",
             "allowVolumeExpansion",
             "volumeBindingMode",
-            "allowedTopologies",
-            "matchLabelExpressions",
             "key",
             "values",
         ]);
@@ -1820,7 +1818,10 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
-        expected.extend(["driverName", "parameters"]);
+        // "parameters" is a map: own field name never a leaf once populated, only a real entry
+        // is — this test builds one by hand ("iops": "3000") rather than via `Sentinel::sentinel`,
+        // so the leaf is "parameters.iops", not the "__sentinel__" literal used elsewhere.
+        expected.extend(["driverName", "parameters.iops"]);
         assert_fields_present(&paths, &expected);
     }
 
@@ -1841,13 +1842,14 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "overhead"/"podFixed" (a map) and "scheduling"/"nodeSelector" (a map) are containers
+        // whose own field name is never itself a leaf once populated; "tolerations" is dropped
+        // too since its own leaf children (key/operator/value/effect/tolerationSeconds) below
+        // already prove it survived decode.
         expected.extend([
             "handler",
-            "overhead",
-            "podFixed",
-            "scheduling",
-            "nodeSelector",
-            "tolerations",
+            "overhead.podFixed.__sentinel__",
+            "scheduling.nodeSelector.__sentinel__",
             "key",
             "operator",
             "value",
@@ -1895,29 +1897,27 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"rules"/"resourceRules"/"nonResourceRules"/"conditions" are containers whose
+        // own field name is never itself a leaf once populated; each is dropped in favor of its
+        // genuine leaf children, which already prove it survived decode.
+        // "priorityLevelConfiguration"/"distinguisherMethod"/"subjects"' variants
+        // (user/group/serviceAccount) are containers too, but have no other already-listed
+        // child, so each gets a specific dotted leaf instead of being dropped outright.
         expected.extend([
-            "spec",
             "matchingPrecedence",
-            "priorityLevelConfiguration",
-            "distinguisherMethod",
-            "type",
-            "rules",
-            "subjects",
+            "priorityLevelConfiguration.name",
+            "distinguisherMethod.type",
             // Subject.kind deliberately excluded — masked by the envelope's own top-level
             // "kind": "FlowSchema" literal.
-            "user",
-            "group",
-            "serviceAccount",
-            "resourceRules",
+            "subjects.user.name",
+            "subjects.group.name",
+            "subjects.serviceAccount.namespace",
             "verbs",
             "apiGroups",
             "resources",
             "clusterScope",
             "namespaces",
-            "nonResourceRules",
             "nonResourceURLs",
-            "status",
-            "conditions",
             "reason",
             "message",
             "lastTransitionTime",
@@ -1941,21 +1941,19 @@ mod tests {
         collect_leaf_paths(&result, "", &mut paths);
 
         let mut expected = OBJECT_META_EXPECTED.to_vec();
+        // "spec"/"limited"/"limitResponse"/"queuing"/"exempt"/"conditions" are containers whose
+        // own field name is never itself a leaf once populated; each is dropped in favor of its
+        // genuine leaf children below, which already prove it survived decode (nominal
+        // ConcurrencyShares/lendablePercent are shared field names between "limited" and
+        // "exempt", so their presence proves both).
         expected.extend([
-            "spec",
             "type",
-            "limited",
             "nominalConcurrencyShares",
             "lendablePercent",
             "borrowingLimitPercent",
-            "limitResponse",
-            "queuing",
             "queues",
             "handSize",
             "queueLengthLimit",
-            "exempt",
-            "status",
-            "conditions",
             "reason",
             "message",
             "lastTransitionTime",
