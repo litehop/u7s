@@ -382,12 +382,68 @@ fn gen_seccomp_profile_to_json(sp: core_v1::SeccompProfile) -> serde_json::Value
     serde_json::Value::Object(m)
 }
 
+fn gen_selinux_options_to_json(o: core_v1::SeLinuxOptions) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = o.user.filter(|s| !s.is_empty()) {
+        m.insert("user".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = o.role.filter(|s| !s.is_empty()) {
+        m.insert("role".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = o.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = o.level.filter(|s| !s.is_empty()) {
+        m.insert("level".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_windows_security_context_options_to_json(
+    o: core_v1::WindowsSecurityContextOptions,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = o.gmsa_credential_spec_name.filter(|s| !s.is_empty()) {
+        m.insert(
+            "gmsaCredentialSpecName".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    if let Some(v) = o.gmsa_credential_spec.filter(|s| !s.is_empty()) {
+        m.insert(
+            "gmsaCredentialSpec".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    if let Some(v) = o.run_as_user_name.filter(|s| !s.is_empty()) {
+        m.insert("runAsUserName".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = o.host_process {
+        m.insert("hostProcess".to_string(), serde_json::Value::Bool(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_apparmor_profile_to_json(p: core_v1::AppArmorProfile) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = p.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = p.localhost_profile.filter(|s| !s.is_empty()) {
+        m.insert("localhostProfile".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Container-level SecurityContext (Container.securityContext, proto field 15).
 ///
 /// Without this, containers run as whatever UID/GID the image defaults to regardless of
 /// runAsUser/runAsGroup, allowPrivilegeEscalation=false is silently ignored (containers can
 /// escalate privileges even when the pod spec explicitly forbids it), and
 /// readOnlyRootFilesystem is dropped (containers get a writable root fs against the spec).
+/// seLinuxOptions/windowsOptions/procMount/appArmorProfile are hardening controls a client
+/// believes it applied — dropping them silently lets the container run less confined than the
+/// spec requested, with no error anywhere.
 fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(caps) = sc.capabilities {
@@ -395,6 +451,15 @@ fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Val
     }
     if let Some(v) = sc.privileged {
         m.insert("privileged".to_string(), serde_json::Value::Bool(v));
+    }
+    if let Some(o) = sc.se_linux_options {
+        m.insert("seLinuxOptions".to_string(), gen_selinux_options_to_json(o));
+    }
+    if let Some(o) = sc.windows_options {
+        m.insert(
+            "windowsOptions".to_string(),
+            gen_windows_security_context_options_to_json(o),
+        );
     }
     if let Some(v) = sc.run_as_user {
         m.insert("runAsUser".to_string(), serde_json::Value::Number(v.into()));
@@ -420,10 +485,19 @@ fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Val
             serde_json::Value::Bool(v),
         );
     }
+    if let Some(v) = sc.proc_mount.filter(|s| !s.is_empty()) {
+        m.insert("procMount".to_string(), serde_json::Value::String(v));
+    }
     if let Some(sp) = sc.seccomp_profile {
         m.insert(
             "seccompProfile".to_string(),
             gen_seccomp_profile_to_json(sp),
+        );
+    }
+    if let Some(p) = sc.app_armor_profile {
+        m.insert(
+            "appArmorProfile".to_string(),
+            gen_apparmor_profile_to_json(p),
         );
     }
     serde_json::Value::Object(m)
@@ -434,8 +508,20 @@ fn gen_security_context_to_json(sc: core_v1::SecurityContext) -> serde_json::Val
 /// Without this, pod.Spec.SecurityContext.RunAsUser/RunAsGroup are silently dropped for every
 /// protobuf-created pod, and sysctls never reach validate_pod_sysctls or the kubelet — a pod
 /// requesting `kernel.shm_rmid_forced=1` boots with the node default instead.
+/// seLinuxOptions/windowsOptions/seLinuxChangePolicy/fsGroupChangePolicy/
+/// supplementalGroupsPolicy are hardening controls a client believes it applied — dropping them
+/// silently lets containers run less confined than the spec requested, with no error anywhere.
 fn gen_pod_security_context_to_json(sc: core_v1::PodSecurityContext) -> serde_json::Value {
     let mut m = serde_json::Map::new();
+    if let Some(o) = sc.se_linux_options {
+        m.insert("seLinuxOptions".to_string(), gen_selinux_options_to_json(o));
+    }
+    if let Some(o) = sc.windows_options {
+        m.insert(
+            "windowsOptions".to_string(),
+            gen_windows_security_context_options_to_json(o),
+        );
+    }
     if let Some(v) = sc.run_as_user {
         m.insert("runAsUser".to_string(), serde_json::Value::Number(v.into()));
     }
@@ -462,6 +548,12 @@ fn gen_pod_security_context_to_json(sc: core_v1::PodSecurityContext) -> serde_js
             ),
         );
     }
+    if let Some(v) = sc.supplemental_groups_policy.filter(|s| !s.is_empty()) {
+        m.insert(
+            "supplementalGroupsPolicy".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
     if !sc.sysctls.is_empty() {
         let sysctls: Vec<serde_json::Value> = sc
             .sysctls
@@ -479,10 +571,28 @@ fn gen_pod_security_context_to_json(sc: core_v1::PodSecurityContext) -> serde_js
             .collect();
         m.insert("sysctls".to_string(), serde_json::Value::Array(sysctls));
     }
+    if let Some(v) = sc.fs_group_change_policy.filter(|s| !s.is_empty()) {
+        m.insert(
+            "fsGroupChangePolicy".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
     if let Some(sp) = sc.seccomp_profile {
         m.insert(
             "seccompProfile".to_string(),
             gen_seccomp_profile_to_json(sp),
+        );
+    }
+    if let Some(p) = sc.app_armor_profile {
+        m.insert(
+            "appArmorProfile".to_string(),
+            gen_apparmor_profile_to_json(p),
+        );
+    }
+    if let Some(v) = sc.se_linux_change_policy.filter(|s| !s.is_empty()) {
+        m.insert(
+            "seLinuxChangePolicy".to_string(),
+            serde_json::Value::String(v),
         );
     }
     serde_json::Value::Object(m)
@@ -8144,6 +8254,79 @@ mod tests {
             "stdinOnce",
             "tty",
         ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for `gen_security_context_to_json`, gated against the schema
+    /// itself.
+    ///
+    /// seLinuxOptions, windowsOptions, procMount and appArmorProfile had no handling at all in
+    /// this function: a container requesting SELinux/Windows hardening, a non-default
+    /// procMount, or an AppArmor profile via a protobuf-encoded create (client-go's default
+    /// wire format) had every one of those controls silently stripped before the object ever
+    /// reached storage, with no error anywhere — the container then runs less confined than
+    /// the client believes it configured.
+    #[test]
+    fn sentinel_completeness_gen_security_context_to_json() {
+        let pod = core_v1::Pod {
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    security_context: Some(core_v1::SecurityContext::sentinel()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+        let result = decode_pod_proto_gen(&buf)
+            .expect("sentinel container SecurityContext must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(
+            &result["spec"]["containers"][0]["securityContext"],
+            "",
+            &mut paths,
+        );
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.SecurityContext",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for `gen_pod_security_context_to_json`, gated against the schema
+    /// itself.
+    ///
+    /// seLinuxOptions, windowsOptions, seLinuxChangePolicy, fsGroupChangePolicy and
+    /// supplementalGroupsPolicy had no handling at all in this function: a pod-wide SELinux
+    /// relabeling policy, fsGroup ownership-change policy, or supplemental-groups merge policy
+    /// set via a protobuf-encoded create was silently stripped before the object ever reached
+    /// storage, with no error anywhere — every container in the pod then runs less confined
+    /// than the client believes it configured.
+    #[test]
+    fn sentinel_completeness_gen_pod_security_context_to_json() {
+        let pod = core_v1::Pod {
+            spec: Some(core_v1::PodSpec {
+                security_context: Some(core_v1::PodSecurityContext::sentinel()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+        let result = decode_pod_proto_gen(&buf)
+            .expect("sentinel PodSecurityContext must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result["spec"]["securityContext"], "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.PodSecurityContext",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
