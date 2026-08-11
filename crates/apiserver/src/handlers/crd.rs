@@ -547,6 +547,7 @@ pub async fn create_crd<S: Store>(
 
     let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
     let _ = state.store.delete(&tombstone_key, None).await;
+    crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     crd.metadata.resource_version = rv.to_string();
     Ok((StatusCode::CREATED, Json(crd)))
@@ -668,6 +669,7 @@ pub async fn replace_crd<S: Store>(
 
     let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&existing);
     evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
+    crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     crd.metadata.resource_version = rv.to_string();
     Ok(Json(crd))
@@ -717,6 +719,7 @@ pub async fn delete_crd<S: Store>(
         .map_err(|e| store_err_crd(e, &name))?;
 
     evict_cr_schema_cache(&state, &group, &versions, &resource_version);
+    crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     // A deleted CRD's versions can never be requested (or converted to) again, so every
     // cr_conversion_cache entry targeting one of them is now permanently unreachable —
@@ -850,6 +853,7 @@ pub async fn patch_crd<S: Store>(
 
         let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
         let _ = state.store.delete(&tombstone_key, None).await;
+        crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
         crd.metadata.resource_version = rv.to_string();
         return Ok((StatusCode::CREATED, Json(crd)).into_response());
@@ -924,6 +928,7 @@ pub async fn patch_crd<S: Store>(
         .map_err(|e| store_err_crd(e, &name))?;
 
     evict_cr_schema_cache(&state, &old_group, &old_versions, &old_rv);
+    crate::handlers::discovery::refresh_discovery_cache(&state).await;
 
     crd.metadata.resource_version = rv.to_string();
     Ok(Json(crd).into_response())

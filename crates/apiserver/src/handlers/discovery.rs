@@ -4,10 +4,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use std::sync::Arc;
 use u7s_store::{ListOptions, Store};
 
 use crate::handlers::crd::CustomResourceDefinition;
-use crate::state::AppState;
+use crate::state::{
+    AppState, CachedDiscoveryGroup, CachedDiscoveryResource, CachedDiscoverySubresource,
+    CachedDiscoveryVersion,
+};
 use crate::types::{
     APIGroup, APIGroupDiscovery, APIGroupDiscoveryList, APIGroupDiscoveryListMeta,
     APIGroupDiscoveryMeta, APIGroupList, APIResourceDiscovery, APISubresourceDiscovery,
@@ -162,7 +166,11 @@ pub async fn api_group_list<S: Store>(
     Json(api_group_list_inner(&state).await).into_response()
 }
 
-pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGroupList {
+/// Build the `STATIC_GROUPS` + CRD-backed group list only -- never an `APIService`-backed
+/// group. This is exactly the portion `DiscoveryCache` (state.rs) covers, split out of
+/// `api_group_list_inner` so both the cache's rebuild path and the plain `/apis` GroupList
+/// path share one implementation instead of drifting apart.
+async fn core_and_crd_groups<S: Store>(state: &AppState<S>) -> Vec<APIGroup> {
     let mut groups: Vec<APIGroup> = STATIC_GROUPS
         .iter()
         .map(|(name, version)| {
@@ -213,6 +221,12 @@ pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGr
             groups.push(make_group(group, &preferred, &served));
         }
     }
+
+    groups
+}
+
+pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGroupList {
+    let mut groups = core_and_crd_groups(state).await;
 
     // Aggregated groups (APIService-backed): a group already covered by a built-in or CRD
     // group above is skipped -- u7s never creates an APIService for either, so in practice
@@ -289,26 +303,19 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 /// `route` identifies which caller fired this build (`/api`, `/apis`, or `/discovery/v2`) —
 /// used only to label `u7s_discovery_build_total`, never to change behavior.
 ///
-/// APIService cache-safety constraint (read this before adding a cache here): `authorization`
-/// above is forwarded, unmodified, from `resolve_group_version_resources` into
-/// `aggregation::discovery_resources_for_apiservice`'s outbound request to the backend (see the
-/// `discovery_resources_for_apiservice` call inside `resolve_group_version_resources`, this
-/// file, currently at line 417) so a live `APIService` backend can enforce its own per-caller
-/// authorization on the discovery document it returns. That means two different callers can
-/// legitimately get two different discovery results for the exact same
+/// APIService cache-safety constraint: `authorization` above is forwarded, unmodified, from
+/// `resolve_group_version_resources` into `aggregation::discovery_resources_for_apiservice`'s
+/// outbound request to the backend, so a live `APIService` backend can enforce its own
+/// per-caller authorization on the discovery document it returns. That means two different
+/// callers can legitimately get two different discovery results for the exact same
 /// `(discovery_version, include_core)` inputs whenever any `APIService` is registered — a cache
 /// keyed only on those inputs would silently leak one caller's backend-authorized discovery
 /// response to a different caller.
 ///
-/// The follow-on discovery-cache implementation must respect this constraint. Four options were
-/// on the table when this was written, and none had been chosen yet:
-///   (a) cache only the core-groups portion (no caller-token forwarding there) and pass
-///       APIService-backed groups through per-request, uncached;
-///   (b) key the cache on `(caller-token-hash, ...)` so each caller gets its own entry;
-///   (c) bypass the cache entirely whenever any `APIService` is registered (`has_apiservice`
-///       below already computes exactly that signal);
-///   (d) a hybrid, explicitly proposed and explicitly approved before it ships.
-/// This function is where any cache-hit / cache-bypass branch belongs.
+/// Resolution (option (a) of the four once listed here): only the `STATIC_GROUPS` + CRD-backed
+/// portion is cached (`DiscoveryCache`, state.rs — never touches `authorization`); every
+/// `APIService`-backed group is still resolved per-request, uncached, exactly as before this
+/// cache existed.
 pub(crate) async fn build_aggregated_discovery<S: Store>(
     state: &AppState<S>,
     discovery_version: &str,
@@ -316,9 +323,8 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
     authorization: Option<&axum::http::HeaderValue>,
     route: &str,
 ) -> APIGroupDiscoveryList {
-    let has_apiservice = !super::aggregation::list_apiservice_groups(state)
-        .await
-        .is_empty();
+    let apiservice_groups = super::aggregation::list_apiservice_groups(state).await;
+    let has_apiservice = !apiservice_groups.is_empty();
     crate::metrics::DISCOVERY_BUILD_TOTAL
         .with_label_values(&[
             route,
@@ -327,13 +333,14 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         ])
         .inc();
 
-    // Collect all groups+versions (same logic as api_group_list_inner).
-    let group_list = api_group_list_inner(state).await;
+    let cached_groups = cached_core_and_crd_groups(state).await;
 
     let mut items: Vec<APIGroupDiscovery> = Vec::new();
 
     if include_core {
-        // Build the core group item (group="", apiVersion="v1").
+        // Build the core group item (group="", apiVersion="v1"). Never cached: it depends only
+        // on the static `V1_RESOURCES` table, not on any store state, so rebuilding it is O(1)
+        // and doesn't need write-through invalidation.
         let core_resources = api_resources_to_discovery_resources(&api_v1_resource_list_value());
         items.push(APIGroupDiscovery {
             metadata: APIGroupDiscoveryMeta {
@@ -347,35 +354,56 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         });
     }
 
-    // Build one item per non-core group. Every group+version is resolved as an independent
+    // STATIC_GROUPS + CRD-backed groups: reconstitute typed discovery entries from the cached,
+    // plain-data snapshot (a data clone, not a store re-list + STATIC_GROUPS rebuild).
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(cached_groups.len());
+    for group in cached_groups.iter() {
+        seen.insert(group.name.clone());
+        items.push(APIGroupDiscovery {
+            metadata: APIGroupDiscoveryMeta {
+                name: group.name.clone(),
+            },
+            versions: group
+                .versions
+                .iter()
+                .map(|v| APIVersionDiscovery {
+                    freshness: "Current",
+                    resources: v.resources.iter().map(cached_resource_to_typed).collect(),
+                    version: v.version.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    // APIService-backed groups only (a group already covered above is skipped, matching
+    // api_group_list_inner's dedup rule). Every group+version is resolved as an independent
     // future and run concurrently (futures_util::future::join_all) rather than one `.await`
     // per loop iteration: an APIService-backed group's live discovery fetch carries its own
     // ~10s connect+request timeout (aggregation::build_backend_client), so awaiting them one
     // at a time means N slow/unresponsive backends add up to N * 10s to *every* /apis and
     // /discovery/v2 response -- even for callers who never asked about that backend's group.
     // Running them concurrently bounds the added latency to the single slowest backend.
-    let group_futures = group_list.groups.iter().map(|group| async move {
-        let version_futures = group.versions.iter().map(|gv| async move {
-            let resources = resolve_group_version_resources(
-                state,
-                group.name.as_str(),
-                gv.version.as_str(),
-                authorization,
-            )
-            .await;
-            APIVersionDiscovery {
-                freshness: "Current",
-                resources,
-                version: gv.version.clone(),
+    let group_futures = apiservice_groups
+        .into_iter()
+        .filter(|(group, _preferred, _served)| !seen.contains(group))
+        .map(|(group, _preferred, served)| async move {
+            let version_futures = served.iter().map(|version| async {
+                let resources =
+                    resolve_group_version_resources(state, &group, version, authorization).await;
+                APIVersionDiscovery {
+                    freshness: "Current",
+                    resources,
+                    version: version.clone(),
+                }
+            });
+            APIGroupDiscovery {
+                metadata: APIGroupDiscoveryMeta {
+                    name: group.clone(),
+                },
+                versions: futures_util::future::join_all(version_futures).await,
             }
         });
-        APIGroupDiscovery {
-            metadata: APIGroupDiscoveryMeta {
-                name: group.name.clone(),
-            },
-            versions: futures_util::future::join_all(version_futures).await,
-        }
-    });
     items.extend(futures_util::future::join_all(group_futures).await);
 
     // Compute a simple ETag from the number of items (sufficient for conformance).
@@ -386,6 +414,113 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         items,
         kind: "APIGroupDiscoveryList",
         metadata: APIGroupDiscoveryListMeta { resource_version },
+    }
+}
+
+/// Read `DiscoveryCache`'s warm snapshot, rebuilding it first if cold. Mirrors
+/// `fetch_mutating_configs`'s read pattern (admission.rs): clone the `Arc` under a short-lived
+/// read lock so a concurrent rebuild can never hand out a torn/partial snapshot.
+async fn cached_core_and_crd_groups<S: Store>(
+    state: &AppState<S>,
+) -> Arc<Vec<CachedDiscoveryGroup>> {
+    let warm = state.discovery_cache.groups.read().unwrap().clone();
+    if let Some(groups) = warm {
+        return groups;
+    }
+    refresh_discovery_cache(state).await;
+    state
+        .discovery_cache
+        .groups
+        .read()
+        .unwrap()
+        .clone()
+        .expect("refresh_discovery_cache always populates the cache before returning")
+}
+
+/// Rebuild `DiscoveryCache` from the store and swap it in atomically.
+///
+/// Called write-through by every CRD create/replace/patch/delete handler (`handlers/crd.rs`)
+/// immediately after the store write succeeds, and lazily by `cached_core_and_crd_groups` on a
+/// cold cache (first request since startup, or a test that seeds the store directly). Does
+/// *not* need to run on `APIService` writes: `CachedDiscoveryGroup` never contains an
+/// `APIService`-backed group (see `build_aggregated_discovery`'s doc), so an `APIService`
+/// create/update/delete cannot change what this cache holds.
+pub(crate) async fn refresh_discovery_cache<S: Store>(state: &AppState<S>) {
+    let groups = core_and_crd_groups(state).await;
+    let group_futures = groups.iter().map(|group| async move {
+        let version_futures = group.versions.iter().map(|gv| async move {
+            let resources = resolve_group_version_resources(
+                state,
+                group.name.as_str(),
+                gv.version.as_str(),
+                None,
+            )
+            .await;
+            CachedDiscoveryVersion {
+                version: gv.version.clone(),
+                resources: resources.iter().map(typed_resource_to_cached).collect(),
+            }
+        });
+        CachedDiscoveryGroup {
+            name: group.name.clone(),
+            versions: futures_util::future::join_all(version_futures).await,
+        }
+    });
+    let cached = futures_util::future::join_all(group_futures).await;
+    *state.discovery_cache.groups.write().unwrap() = Some(Arc::new(cached));
+}
+
+/// Convert a resolved `APIResourceDiscovery` into `DiscoveryCache`'s plain-data representation.
+/// `APIResourceDiscovery` itself derives neither `Clone` nor `Deserialize` (types.rs keeps it
+/// Serialize-only, since it's built once per request today) -- `CachedDiscoveryResource` exists
+/// so the cache can hold an owned, `Clone`-able snapshot without adding either derive there.
+fn typed_resource_to_cached(r: &APIResourceDiscovery) -> CachedDiscoveryResource {
+    CachedDiscoveryResource {
+        resource: r.resource.clone(),
+        kind: r.response_kind.kind.clone(),
+        namespaced: r.scope == "Namespaced",
+        short_names: r.short_names.clone(),
+        singular_resource: r.singular_resource.clone(),
+        subresources: r
+            .subresources
+            .iter()
+            .map(|s| CachedDiscoverySubresource {
+                kind: s.response_kind.kind.clone(),
+                subresource: s.subresource.clone(),
+                verbs: s.verbs.clone(),
+            })
+            .collect(),
+        verbs: r.verbs.clone(),
+    }
+}
+
+/// The inverse of `typed_resource_to_cached`: reconstitute a fresh, owned `APIResourceDiscovery`
+/// from a cached snapshot on every discovery request.
+fn cached_resource_to_typed(r: &CachedDiscoveryResource) -> APIResourceDiscovery {
+    APIResourceDiscovery {
+        resource: r.resource.clone(),
+        response_kind: DiscoveryResponseKind {
+            kind: r.kind.clone(),
+        },
+        scope: if r.namespaced {
+            "Namespaced"
+        } else {
+            "Cluster"
+        },
+        short_names: r.short_names.clone(),
+        singular_resource: r.singular_resource.clone(),
+        subresources: r
+            .subresources
+            .iter()
+            .map(|s| APISubresourceDiscovery {
+                response_kind: DiscoveryResponseKind {
+                    kind: s.kind.clone(),
+                },
+                subresource: s.subresource.clone(),
+                verbs: s.verbs.clone(),
+            })
+            .collect(),
+        verbs: r.verbs.clone(),
     }
 }
 
@@ -2427,7 +2562,7 @@ mod tests {
     use tower::ServiceExt;
     use u7s_store::SqliteStore;
 
-    use crate::handlers::crd::create_crd;
+    use crate::handlers::crd::{create_crd, delete_crd};
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
@@ -5272,6 +5407,136 @@ mod tests {
              serde_json::json!/Value -- the byte-equality golden test above cannot catch this \
              regression on its own (see its doc comment), so this scans the function's own \
              source instead; fn body was:\n{fn_body}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DiscoveryCache — bytes-cache for the STATIC_GROUPS + CRD portion (mayor-a9kc1)
+    // ---------------------------------------------------------------------------
+
+    /// A cache-warm request and a cache-forced-cold request (the store's only source of
+    /// truth, with `DiscoveryCache` cleared so `cached_core_and_crd_groups` must rebuild from
+    /// scratch) must return byte-identical output for the same inputs -- the cache changes
+    /// *when* the STATIC_GROUPS/CRD resolution work happens, never *what* it produces. Also
+    /// pins down field-level correctness of the cache's own encode/decode round trip
+    /// (`typed_resource_to_cached`/`cached_resource_to_typed`): a cold rebuild and a warm read
+    /// both funnel through that round trip, so a self-consistent bug there (e.g. inverting the
+    /// `namespaced` bool) would NOT show up as a diff between the two calls below -- only an
+    /// explicit assertion on the actual field values can catch that class of bug, which is why
+    /// this test checks `scope`/`shortNames`/`verbs` directly rather than relying solely on the
+    /// two-calls comparison.
+    ///
+    /// Falsifiable: swap `namespaced: r.scope == "Namespaced"` for `!=` in
+    /// `typed_resource_to_cached` and this test's `scope` assertion below fails (while the
+    /// two-calls byte comparison alone would NOT, since both calls would agree on the same
+    /// wrong answer -- demonstrating why the explicit field assertion is required here).
+    #[tokio::test]
+    async fn discovery_cache_hit_is_byte_identical_to_a_forced_cold_rebuild() {
+        let state = make_state();
+        let body = crd_bytes(
+            "cache-check.example.com",
+            "widgets",
+            "widget",
+            "Widget",
+            "Namespaced",
+            "v1",
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create_crd must succeed");
+
+        // First call: whatever cache state create_crd's write-through refresh left behind.
+        let warm = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let warm_bytes = serde_json::to_string(&warm).unwrap();
+
+        // Force the cache cold, bypassing any invalidation path, so the next call must rebuild
+        // straight from the store -- the "uncached" side of this comparison.
+        *state.discovery_cache.groups.write().unwrap() = None;
+        let cold = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let cold_bytes = serde_json::to_string(&cold).unwrap();
+
+        assert_eq!(
+            warm_bytes, cold_bytes,
+            "a cache-warm read and a forced cold rebuild must produce byte-identical output \
+             for the same registered CRDs"
+        );
+
+        let group = cold
+            .items
+            .iter()
+            .find(|g| g.metadata.name == "cache-check.example.com")
+            .expect("the CRD's group must appear in aggregated discovery");
+        let resource = &group.versions[0].resources[0];
+        assert_eq!(resource.resource, "widgets");
+        assert_eq!(resource.response_kind.kind, "Widget");
+        assert_eq!(
+            resource.scope, "Namespaced",
+            "scope must round-trip through DiscoveryCache's plain-data encode/decode \
+             unchanged -- this is the assertion that actually fails if the cache's \
+             namespaced-bool mapping is ever inverted"
+        );
+        assert_eq!(resource.singular_resource, "widget");
+    }
+
+    /// Deleting a CRD must make its group disappear from the very next aggregated-discovery
+    /// call. `DiscoveryCache` is keyed on nothing but "warm or cold" (see its doc in
+    /// state.rs) -- a create/delete that doesn't call
+    /// `handlers::discovery::refresh_discovery_cache` leaves the deleted CRD's group
+    /// permanently visible in discovery, which would make kubectl and controllers keep
+    /// believing a resource type still exists after `kubectl delete crd` succeeds.
+    ///
+    /// Falsifiable: comment out the `refresh_discovery_cache` call in `delete_crd` and this
+    /// test fails, because the cache still holds the pre-delete snapshot.
+    #[tokio::test]
+    async fn deleting_a_crd_removes_its_group_from_discovery_on_the_next_call() {
+        let state = make_state();
+        let body = crd_bytes(
+            "invalidation-check.example.com",
+            "gadgets",
+            "gadget",
+            "Gadget",
+            "Namespaced",
+            "v1",
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create_crd must succeed");
+
+        let before = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        assert!(
+            before
+                .items
+                .iter()
+                .any(|g| g.metadata.name == "invalidation-check.example.com"),
+            "the CRD's group must be visible in discovery right after creation"
+        );
+
+        delete_crd(
+            State(state.clone()),
+            Path("gadgets.invalidation-check.example.com".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        let after = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        assert!(
+            !after
+                .items
+                .iter()
+                .any(|g| g.metadata.name == "invalidation-check.example.com"),
+            "the CRD's group must be gone from discovery immediately after delete_crd -- a \
+             stale DiscoveryCache entry would still show it here"
         );
     }
 
