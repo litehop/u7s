@@ -3,11 +3,18 @@ use std::path::PathBuf;
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let include_dir = manifest_dir.join("proto-include");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
 
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc);
+    // Emit the FileDescriptorSet alongside the generated structs so the sentinel completeness
+    // tests can derive their expected-JSON-key lists from the .proto schema itself instead of
+    // hand-maintaining them (see the test-only `proto_descriptor` module). A hand-written
+    // expected list can omit the same field the decoder omits and still pass green; a list
+    // derived from the descriptor cannot.
+    config.file_descriptor_set_path(out_dir.join("k8s_descriptors.bin"));
     // Blanket-derive Sentinel on every generated message so gen_*_to_json completeness tests
     // (see core_gen_adapter.rs's tests module) can build a fully-populated instance of any
     // message type without hand-listing its fields. Safe as a "." (root) pattern only because
