@@ -93,6 +93,228 @@ const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
         "stripped/synthesized server-side on every path, so a client-supplied value is never \
          honoured (mayor-2mi3e); revisit if full Server-Side Apply lands (mayor-u6ju)",
     ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "awsElasticBlockStore",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "azureDisk",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "azureFile",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "cephfs",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "cinder",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "fc",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "flexVolume",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "flocker",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "gcePersistentDisk",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "gitRepo",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "glusterfs",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "iscsi",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "photonPersistentDisk",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "portworxVolume",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "quobyte",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "rbd",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "scaleIO",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "storageos",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.VolumeSource",
+        "vsphereVolume",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "awsElasticBlockStore",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "azureDisk",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "azureFile",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "cephfs",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "cinder",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "fc",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "flexVolume",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "flocker",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "gcePersistentDisk",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "glusterfs",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "iscsi",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "photonPersistentDisk",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "portworxVolume",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "quobyte",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "rbd",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "scaleIO",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "storageos",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSource",
+        "vsphereVolume",
+        "legacy in-tree volume plugin, u7s policy decision to defer to CSI migration path \
+         (matches upstream deprecation direction)",
+    ),
 ];
 
 /// Real drops that are tolerated so this oracle can be adopted without turning the suite red in
