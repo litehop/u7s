@@ -560,6 +560,28 @@ async fn resolve_group_version_resources<S: Store>(
     }
 }
 
+/// True when a CRD version's `subresources` declares a non-null `status` key -- the same
+/// source of truth `find_crd` in `cr.rs` uses to decide whether the `/status` route is served,
+/// so discovery never advertises a `<plural>/status` entry the server can't actually handle.
+fn version_declares_status_subresource(subresources: Option<&serde_json::Value>) -> bool {
+    subresources
+        .and_then(|s| s.get("status"))
+        .map(|st| !st.is_null())
+        .unwrap_or(false)
+}
+
+/// True when a CRD version's `subresources` declares a non-null `scale` key -- mirrors
+/// `find_crd`'s `CrScaleConfig` gate in `cr.rs`, so discovery only advertises `<plural>/scale`
+/// when the `/scale` route is actually live for that version. Without this, client-go's
+/// `NewDiscoveryScaleKindResolver.ScaleForResource()` returns `ScaleKindNotFoundError` before
+/// ever issuing the HTTP request, even though the route itself works.
+fn version_declares_scale_subresource(subresources: Option<&serde_json::Value>) -> bool {
+    subresources
+        .and_then(|s| s.get("scale"))
+        .map(|sc| !sc.is_null())
+        .unwrap_or(false)
+}
+
 /// Look up CRD-backed resources for a group/version from the store and return discovery entries.
 async fn crd_group_resources<S: Store>(
     state: &AppState<S>,
@@ -594,6 +616,39 @@ async fn crd_group_resources<S: Store>(
             } else {
                 "Cluster"
             };
+            // Subresources are declared per-version, so read them from the matched version
+            // (the one this discovery document is for), not "any served version".
+            let subresources_decl = crd
+                .spec
+                .versions
+                .iter()
+                .find(|v| v.name == version)
+                .and_then(|v| v.subresources.as_ref());
+            let mut subresources = Vec::new();
+            if version_declares_status_subresource(subresources_decl) {
+                subresources.push(APISubresourceDiscovery {
+                    response_kind: DiscoveryResponseKind {
+                        kind: crd.spec.names.kind.clone(),
+                    },
+                    subresource: "status".to_string(),
+                    verbs: ["get", "patch", "update"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                });
+            }
+            if version_declares_scale_subresource(subresources_decl) {
+                subresources.push(APISubresourceDiscovery {
+                    response_kind: DiscoveryResponseKind {
+                        kind: "Scale".to_string(),
+                    },
+                    subresource: "scale".to_string(),
+                    verbs: ["get", "patch", "update"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                });
+            }
             APIResourceDiscovery {
                 resource: crd.spec.names.plural.clone(),
                 response_kind: DiscoveryResponseKind {
@@ -602,7 +657,7 @@ async fn crd_group_resources<S: Store>(
                 scope,
                 short_names: crd.spec.names.short_names.clone(),
                 singular_resource: crd.spec.names.singular.clone(),
-                subresources: vec![],
+                subresources,
                 verbs: [
                     "create",
                     "delete",
@@ -823,15 +878,45 @@ pub async fn api_group_resources<S: Store>(
             .filter(|crd| {
                 crd.spec.group == group && crd.spec.versions.iter().any(|v| v.name == version)
             })
-            .map(|crd| {
-                serde_json::json!({
+            .flat_map(|crd| {
+                let namespaced = crd.spec.scope == "Namespaced";
+                // Subresources are declared per-version, so read them from the matched
+                // version -- the one this discovery document is for.
+                let subresources_decl = crd
+                    .spec
+                    .versions
+                    .iter()
+                    .find(|v| v.name == version)
+                    .and_then(|v| v.subresources.as_ref());
+                let mut entries = vec![serde_json::json!({
                     "name": crd.spec.names.plural,
                     "singularName": crd.spec.names.singular,
-                    "namespaced": crd.spec.scope == "Namespaced",
+                    "namespaced": namespaced,
                     "kind": crd.spec.names.kind,
                     "shortNames": crd.spec.names.short_names,
                     "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-                })
+                })];
+                if version_declares_status_subresource(subresources_decl) {
+                    entries.push(serde_json::json!({
+                        "name": format!("{}/status", crd.spec.names.plural),
+                        "singularName": "",
+                        "namespaced": namespaced,
+                        "kind": crd.spec.names.kind,
+                        "verbs": ["get", "patch", "update"]
+                    }));
+                }
+                if version_declares_scale_subresource(subresources_decl) {
+                    entries.push(serde_json::json!({
+                        "name": format!("{}/scale", crd.spec.names.plural),
+                        "singularName": "",
+                        "namespaced": namespaced,
+                        "kind": "Scale",
+                        "group": "autoscaling",
+                        "version": "v1",
+                        "verbs": ["get", "patch", "update"]
+                    }));
+                }
+                entries
             })
             .collect();
 
@@ -2771,6 +2856,218 @@ mod tests {
         assert_eq!(resources[0]["name"], "gadgets");
         assert_eq!(resources[0]["kind"], "Gadget");
         assert_eq!(resources[0]["namespaced"], false);
+    }
+
+    // client-go's scale.Client resolves a CRD-backed resource's scale GroupVersionResource via
+    // NewDiscoveryScaleKindResolver.ScaleForResource(), which scans ServerPreferredResources()
+    // for a "<resource>/scale" entry and returns ScaleKindNotFoundError *before* ever issuing
+    // the HTTP request if that entry is absent -- even though mayor-vjnqa's /scale route works
+    // and answers real GETs. This proves classic /apis/{group}/{version} discovery advertises
+    // "<plural>/status" and "<plural>/scale" whenever the matched CRD version declares them.
+    #[tokio::test]
+    async fn crd_with_declared_subresources_appears_in_classic_discovery() {
+        let state = make_state();
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.scale.example.io" },
+                "spec": {
+                    "group": "scale.example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "subresources": {
+                            "status": {},
+                            "scale": {
+                                "specReplicasPath": ".spec.replicas",
+                                "statusReplicasPath": ".status.replicas"
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = api_group_resources(
+            State(state),
+            Path(("scale.example.io".to_string(), "v1".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["widgets", "widgets/status", "widgets/scale"],
+            "classic discovery must advertise both subresources declared on the CRD version, \
+             or client-go's ScaleKindResolver returns ScaleKindNotFoundError without ever \
+             calling the working /scale route"
+        );
+
+        let scale_entry = resources
+            .iter()
+            .find(|r| r["name"] == "widgets/scale")
+            .unwrap();
+        assert_eq!(scale_entry["kind"], "Scale");
+        assert_eq!(scale_entry["group"], "autoscaling");
+        assert_eq!(scale_entry["version"], "v1");
+        assert_eq!(
+            scale_entry["verbs"],
+            serde_json::json!(["get", "patch", "update"])
+        );
+
+        let status_entry = resources
+            .iter()
+            .find(|r| r["name"] == "widgets/status")
+            .unwrap();
+        assert_eq!(status_entry["kind"], "Widget");
+    }
+
+    // A CRD version that declares no subresources must not fabricate "/status" or "/scale"
+    // entries -- doing so would advertise routes the server doesn't actually serve, which is
+    // just as broken as omitting real ones (a client would issue a request the server 404s).
+    #[tokio::test]
+    async fn crd_without_subresources_has_no_subresource_entries_in_classic_discovery() {
+        let state = make_state();
+        let body = crd_bytes(
+            "no-subresources.example.io",
+            "gadgets",
+            "gadget",
+            "Gadget",
+            "Namespaced",
+            "v1",
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = api_group_resources(
+            State(state),
+            Path(("no-subresources.example.io".to_string(), "v1".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        assert_eq!(
+            resources.len(),
+            1,
+            "no subresources declared on the CRD -- must not fabricate /status or /scale entries"
+        );
+    }
+
+    // Same gap as classic discovery but for the aggregated v2 document (/discovery/v2), which
+    // client-go can also consult depending on the negotiated Accept header -- see
+    // crd_with_declared_subresources_appears_in_classic_discovery for why the entries matter.
+    #[tokio::test]
+    async fn crd_with_declared_subresources_appears_in_aggregated_v2_discovery() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.scalev2.example.io" },
+                "spec": {
+                    "group": "scalev2.example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "subresources": {
+                            "status": {},
+                            "scale": {
+                                "specReplicasPath": ".spec.replicas",
+                                "statusReplicasPath": ".status.replicas"
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let discovery = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let group = discovery
+            .items
+            .iter()
+            .find(|g| g.metadata.name == "scalev2.example.io")
+            .expect("CRD group must appear in aggregated discovery");
+        let version = group
+            .versions
+            .iter()
+            .find(|v| v.version == "v1")
+            .expect("v1 must appear");
+        let widgets = version
+            .resources
+            .iter()
+            .find(|r| r.resource == "widgets")
+            .expect("widgets resource must appear");
+
+        let subresource_names: Vec<&str> = widgets
+            .subresources
+            .iter()
+            .map(|s| s.subresource.as_str())
+            .collect();
+        assert_eq!(
+            subresource_names,
+            vec!["status", "scale"],
+            "aggregated v2 discovery must nest both declared subresources under the parent \
+             resource entry -- the same gap that hides them from client-go's ScaleKindResolver \
+             also applies here, since the resolver can be handed either discovery document"
+        );
+        let scale = widgets
+            .subresources
+            .iter()
+            .find(|s| s.subresource == "scale")
+            .unwrap();
+        assert_eq!(scale.response_kind.kind, "Scale");
     }
 
     // api_group_resources for an unknown group/version must return 404.
