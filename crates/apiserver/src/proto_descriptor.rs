@@ -85,6 +85,18 @@ const INLINE_EMBEDS: &[(&str, &str)] = &[
         "localObjectReference",
     ),
     (
+        ".k8s.io.api.core.v1.SecretEnvSource",
+        "localObjectReference",
+    ),
+    (
+        ".k8s.io.api.core.v1.SecretKeySelector",
+        "localObjectReference",
+    ),
+    (
+        ".k8s.io.api.core.v1.SecretProjection",
+        "localObjectReference",
+    ),
+    (
         ".k8s.io.api.core.v1.EphemeralContainer",
         "ephemeralContainerCommon",
     ),
@@ -662,6 +674,33 @@ mod tests {
             ".k8s.io.api.core.v1.ConfigMapKeySelector",
             ".k8s.io.api.core.v1.ConfigMapProjection",
             ".k8s.io.api.core.v1.ConfigMapVolumeSource",
+        ] {
+            let keys = expected_json_keys(msg);
+            assert!(
+                keys.contains("name"),
+                "{msg} embeds LocalObjectReference inline, so its `name` field must be reachable, got {keys:?}"
+            );
+            assert!(
+                !keys.contains("localObjectReference"),
+                "{msg}'s `localObjectReference` field is a Go inline embed, not a real JSON \
+                 object — expecting it as a key would make a correct decoder look incomplete, \
+                 got {keys:?}"
+            );
+        }
+    }
+
+    /// Same Go `json:",inline"` embed as the ConfigMap family, on the Secret family instead:
+    /// `SecretVolumeSource` is excluded because it uses `secretName` directly and has no
+    /// `LocalObjectReference` field at all (verified against generated.proto). Without these
+    /// three entries, `localObjectReference` kept surfacing as a missing key everywhere a
+    /// Secret-referencing field reaches Pod/PodTemplate/ReplicationController, even though no
+    /// decoder can ever emit it.
+    #[test]
+    fn inlines_localobjectreference_embeds_in_secret_sources() {
+        for msg in [
+            ".k8s.io.api.core.v1.SecretEnvSource",
+            ".k8s.io.api.core.v1.SecretKeySelector",
+            ".k8s.io.api.core.v1.SecretProjection",
         ] {
             let keys = expected_json_keys(msg);
             assert!(
