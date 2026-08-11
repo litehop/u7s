@@ -564,6 +564,12 @@ pub fn decode_proto_by_kind_and_version(
         "LocalSubjectAccessReview" => {
             crate::rbac_gen_adapter::decode_local_subject_access_review_proto_gen(raw)
         }
+        "SelfSubjectAccessReview" => {
+            crate::rbac_gen_adapter::decode_selfsubjectaccessreview_proto_gen(raw)
+        }
+        "SelfSubjectRulesReview" => {
+            crate::rbac_gen_adapter::decode_selfsubjectrulesreview_proto_gen(raw)
+        }
         "TokenReview" => crate::rbac_gen_adapter::decode_token_review_proto_gen(raw),
         "CronJob" => crate::batch_gen_adapter::decode_cronjob_proto_gen(raw),
         "Job" => crate::batch_gen_adapter::decode_job_proto_gen(raw),

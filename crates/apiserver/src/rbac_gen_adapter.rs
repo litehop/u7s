@@ -504,6 +504,44 @@ pub fn decode_local_subject_access_review_proto_gen(data: &[u8]) -> Option<serde
     }))
 }
 
+// Without a dispatch arm + decoder for SelfSubjectAccessReview/SelfSubjectRulesReview, a
+// client-go authorization/v1 typed clientset call (default protobuf content-type) hits
+// extract_body's undecodable fallback and handlers/authorization.rs's serde_json::from_slice
+// fails to parse binary protobuf as JSON — every such call gets a hard 400, not just a
+// dropped field. Argo CD calls SelfSubjectAccessReview on startup to discover its own
+// permissions, so this blocked that workflow outright.
+
+pub fn decode_selfsubjectaccessreview_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let ssar = authz_v1::SelfSubjectAccessReview::decode(data).ok()?;
+    let self_spec = ssar.spec.unwrap_or_default();
+    // SelfSubjectAccessReviewSpec carries only resourceAttributes/nonResourceAttributes (user
+    // and groups must be empty — the server fills those in from the caller's identity), so
+    // gen_sar_spec_to_json's handling of those two fields is reused via a SubjectAccessReviewSpec
+    // built from them rather than duplicating that logic.
+    let spec = gen_sar_spec_to_json(authz_v1::SubjectAccessReviewSpec {
+        resource_attributes: self_spec.resource_attributes,
+        non_resource_attributes: self_spec.non_resource_attributes,
+        ..Default::default()
+    });
+    Some(serde_json::json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SelfSubjectAccessReview",
+        "spec": spec
+    }))
+}
+
+pub fn decode_selfsubjectrulesreview_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let ssrr = authz_v1::SelfSubjectRulesReview::decode(data).ok()?;
+    let spec = ssrr.spec.unwrap_or_default();
+    Some(serde_json::json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SelfSubjectRulesReview",
+        "spec": {
+            "namespace": spec.namespace.unwrap_or_default()
+        }
+    }))
+}
+
 // ---- authentication/v1 decoders --------------------------------------------
 
 pub fn decode_token_review_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
@@ -1094,6 +1132,56 @@ mod tests {
             "extra",
             "uid",
         ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Derived from the .proto schema (rather than hand-listed) so a field added upstream to
+    /// SelfSubjectAccessReviewSpec is demanded automatically. Scoped to the Spec message, not
+    /// SubjectAccessReviewSpec, because user/groups/uid/extra are not part of this type at all
+    /// (the server fills identity in from the caller) — expecting them here would make the test
+    /// unfalsifiable for a decoder that reused gen_sar_spec_to_json incorrectly.
+    #[test]
+    fn sentinel_completeness_decode_selfsubjectaccessreview_proto_gen() {
+        let ssar = authz_v1::SelfSubjectAccessReview {
+            // metadata/status: same reasoning as SubjectAccessReview above — not a persisted
+            // resource, and status is always server-computed.
+            spec: Some(authz_v1::SelfSubjectAccessReviewSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ssar.encode(&mut buf).unwrap();
+        let decoded = decode_selfsubjectaccessreview_proto_gen(&buf)
+            .expect("sentinel SelfSubjectAccessReview must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.authorization.v1.SelfSubjectAccessReviewSpec",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_selfsubjectrulesreview_proto_gen() {
+        let ssrr = authz_v1::SelfSubjectRulesReview {
+            // metadata/status: not a persisted resource; status is always server-computed.
+            spec: Some(authz_v1::SelfSubjectRulesReviewSpec::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        ssrr.encode(&mut buf).unwrap();
+        let decoded = decode_selfsubjectrulesreview_proto_gen(&buf)
+            .expect("sentinel SelfSubjectRulesReview must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.authorization.v1.SelfSubjectRulesReviewSpec",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 
