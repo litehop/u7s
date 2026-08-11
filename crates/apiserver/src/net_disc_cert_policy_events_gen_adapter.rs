@@ -749,7 +749,15 @@ pub fn decode_endpointslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> 
         .into_iter()
         .map(|p| {
             let mut pj = serde_json::Map::new();
-            if let Some(n) = p.name.filter(|s| !s.is_empty()) {
+            // EndpointPort.name is proto3 `optional string`: Some("") is the valid, common
+            // "unnamed port" wire shape every single-port Service produces (KCM marshals
+            // `Name: &""`, a non-nil pointer to an empty string). Filtering out the empty
+            // string here — as most other fields in this file correctly do for fields where
+            // empty and absent really are equivalent — collapses that into a missing "name"
+            // key, which kube-proxy's endpointslicecache.go treats as `nil` and skips the
+            // port entirely (zero backends registered, Connection refused). Emit the key
+            // whenever the field is present, regardless of emptiness.
+            if let Some(n) = p.name {
                 pj.insert("name".to_string(), serde_json::Value::String(n));
             }
             if let Some(proto) = p.protocol.filter(|s| !s.is_empty()) {
@@ -1437,6 +1445,56 @@ mod tests {
         );
     }
 
+    /// decode_endpointslice_proto_gen must preserve a present-but-empty `ports[].name`, not
+    /// collapse it to an absent key.
+    ///
+    /// `EndpointPort.name` is proto3 `optional string`: `Some("")` is the wire shape every
+    /// single-port, unnamed-port Service produces (the most common Service shape in the whole
+    /// conformance suite) — KCM marshals `Name: &""`, a non-nil pointer to an empty string, not
+    /// a nil pointer. Kube-proxy's endpointslicecache.go distinguishes these two cases
+    /// explicitly: a missing "name" key deserializes as `nil`, which it treats as "ignore this
+    /// port" and `continue`s past, registering zero backends for it. A key present with value
+    /// "" deserializes as a valid (if unnamed) port and is kept. Collapsing the two is exactly
+    /// how a real Service went from "object looks perfect in `kubectl get -o yaml`" to
+    /// "Connection refused" with zero ipvs rules programmed.
+    #[test]
+    fn decode_endpointslice_proto_gen_preserves_present_but_empty_port_name() {
+        let es = discovery_v1::EndpointSlice {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-svc-abcde".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            address_type: Some("IPv4".to_string()),
+            ports: vec![discovery_v1::EndpointPort {
+                name: Some(String::new()),
+                port: Some(80),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        es.encode(&mut buf).unwrap();
+
+        let result = decode_endpointslice_proto_gen(&buf).expect("EndpointSlice must decode");
+
+        let port = result["ports"][0]
+            .as_object()
+            .expect("ports[0] must decode to a JSON object");
+        assert!(
+            port.contains_key("name"),
+            "ports[0] must have a \"name\" key even when the name is the empty string — an \
+             absent key and kube-proxy sees `Name == nil`, skips the port, and registers zero \
+             backends for a single-port Service's ClusterIP"
+        );
+        assert_eq!(
+            port["name"], "",
+            "the present-but-empty name's value must round-trip as \"\", not be replaced or \
+             coerced"
+        );
+    }
+
     /// decode_events_v1_event_proto_gen must preserve reason/regarding/series.
     ///
     /// This is the events.k8s.io/v1 Event type kubelet and controllers report through
@@ -1799,6 +1857,13 @@ mod tests {
             "zone",
             "hints.forZones.name",
             "hints.forNodes.name",
+            // "ports.name" (rather than the bare, ObjectMeta-collision-prone "name") pins this
+            // check to EndpointPort.name specifically — the field mayor-mb9ed's decoder bug
+            // dropped whenever it was present-but-empty. The sentinel value here is non-empty
+            // so this alone can't catch that regression (see
+            // decode_endpointslice_proto_gen_preserves_present_but_empty_port_name for that);
+            // this just proves the field is read from the decoded proto at all.
+            "ports.name",
             "port",
             "protocol",
             "appProtocol",
