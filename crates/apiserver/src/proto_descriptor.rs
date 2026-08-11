@@ -4,11 +4,18 @@
 //! Why this exists: the sentinel completeness tests (see `util::sentinel_test_util`) check a
 //! decoder's output against an `expected` array that a human typed by reading the very
 //! `gen_*_to_json` function under test. That makes the oracle a second copy of the same
-//! enumeration — if a field is forgotten in both places the test passes green, which is exactly
-//! how `deletionTimestamp`/`deletionGracePeriodSeconds`/`managedFields` stayed dropped in all
-//! twelve `gen_object_meta_to_json` copies while every one of those files had a "completeness"
-//! test. Deriving the list from the schema removes the human from the oracle: a field added
-//! upstream shows up in the expected set automatically, whether or not anyone remembers it.
+//! enumeration — if a field is forgotten in both places the test passes green. `PodStatus` is the
+//! worked example (mayor-y0pcm): `gen_pod_status_to_json` was itself written to fix an earlier
+//! drop of the whole `.status` subtree, shipped a regression test asserting `phase`/`podIP`/
+//! `conditions`, and left `containerStatuses` out of both the emitter and the expected list — so a
+//! protobuf `UpdateStatus` deleted it from the stored pod, under a green suite, for as long as the
+//! test existed. Deriving the list from the schema removes the human from the oracle: a field
+//! added upstream shows up in the expected set automatically, whether anyone remembers it or not.
+//!
+//! Scope limit worth knowing before trusting a green result: `assert_fields_present` matches a key
+//! against *any* path segment anywhere in the decoded tree, so a nested struct counts as covered
+//! the moment one of its leaves survives (mayor-66qj6). This module fixes the *list*, not the
+//! *matcher* — until 66qj6 lands, counts produced here are lower bounds on what is really missing.
 //!
 //! In this schema the proto field name *is* the JSON key — verified across all 2466 fields of the
 //! vendored protos, `json_name` never differs from `name`. Only two mechanical adjustments and a
@@ -58,32 +65,41 @@ const RENAMES: &[(&str, &str, &str)] = &[
 /// Fields the decoders deliberately do not emit. Each entry is a decision, not an oversight;
 /// anything that is merely *not yet implemented* belongs in `KNOWN_GAPS` instead so the two stay
 /// distinguishable in review.
-const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[(
-    ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
-    "selfLink",
-    "legacy field upstream no longer populates; see the .proto's own Deprecated comment",
-)];
-
-/// Real drops that are currently tolerated so this oracle can be adopted without turning the
-/// suite red in the same change. Every entry is a live bug. Removing one and watching the
-/// relevant test fail is the intended way to confirm the oracle still has teeth.
-const KNOWN_GAPS: &[(&str, &str, &str)] = &[
+///
+/// All four ObjectMeta entries are dropped by every one of the twelve `gen_object_meta_to_json`
+/// copies. That is safe only because something downstream compensates, and the compensating
+/// control is named per entry — an entry whose control is removed becomes a bug, so the note is
+/// the thing to check, not the omission itself.
+const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
+    (
+        ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+        "selfLink",
+        "legacy field upstream no longer populates; see the .proto's own Deprecated comment",
+    ),
     (
         ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
         "deletionTimestamp",
-        "dropped by all 12 gen_object_meta_to_json copies; gates graceful-deletion in controllers",
+        "restored from the stored object by replace_resource/replace_namespaced_resource and \
+         listed in handlers::status::merge_incoming_metadata's PROTECTED set (mayor-2mi3e, #888)",
     ),
     (
         ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
         "deletionGracePeriodSeconds",
-        "dropped by all 12 gen_object_meta_to_json copies",
+        "restored from the stored object alongside deletionTimestamp (mayor-2mi3e, #888)",
     ),
     (
         ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
         "managedFields",
-        "dropped by all 12 gen_object_meta_to_json copies",
+        "stripped/synthesized server-side on every path, so a client-supplied value is never \
+         honoured (mayor-2mi3e); revisit if full Server-Side Apply lands (mayor-u6ju)",
     ),
 ];
+
+/// Real drops that are tolerated so this oracle can be adopted without turning the suite red in
+/// the same change. Every entry here is a live bug with a bead. Empty today: the rollout in
+/// mayor-j430l is expected to fill it as the ~110 surveyed candidates are triaged, and each entry
+/// should leave with a fix rather than be edited to stay.
+const KNOWN_GAPS: &[(&str, &str, &str)] = &[];
 
 /// Every message in the vendored schema, indexed by fully-qualified name with a leading dot so
 /// lookups can use `FieldDescriptorProto::type_name` verbatim.
