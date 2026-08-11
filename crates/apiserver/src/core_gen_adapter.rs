@@ -3725,6 +3725,12 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
         if let Some(v) = status.reason.filter(|s| !s.is_empty()) {
             status_map.insert("reason".to_string(), serde_json::Value::String(v));
         }
+        if let Some(secs) = status.last_phase_transition_time.and_then(|t| t.seconds) {
+            status_map.insert(
+                "lastPhaseTransitionTime".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
         if !status_map.is_empty() {
             obj["status"] = serde_json::Value::Object(status_map);
         }
@@ -3747,9 +3753,12 @@ pub fn decode_serviceaccount_proto_gen(data: &[u8]) -> Option<serde_json::Value>
             .secrets
             .into_iter()
             .filter_map(|r| {
-                r.name
-                    .filter(|s| !s.is_empty())
-                    .map(|n| serde_json::json!({ "name": n }))
+                let name = r.name.filter(|s| !s.is_empty())?;
+                let mut m = serde_json::json!({ "name": name });
+                if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
+                    m["fieldPath"] = serde_json::Value::String(v);
+                }
+                Some(m)
             })
             .collect::<Vec<_>>()
             .into();
@@ -3853,6 +3862,14 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
                     }
                     if let Some(v) = c.message.filter(|s| !s.is_empty()) {
                         cond["message"] = serde_json::Value::String(v);
+                    }
+                    if let Some(secs) = c.last_probe_time.and_then(|t| t.seconds) {
+                        cond["lastProbeTime"] =
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                    }
+                    if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds) {
+                        cond["lastTransitionTime"] =
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                     }
                     cond
                 })
@@ -4679,6 +4696,41 @@ mod tests {
         );
     }
 
+    /// decode_persistentvolume_proto_gen must preserve status.lastPhaseTransitionTime
+    /// (PersistentVolumeStatus field 4).
+    ///
+    /// This is the only signal a client has for how long a PV has sat in its current phase
+    /// (e.g. stuck Released instead of being reclaimed); without it, a controller polling PV
+    /// phase can't distinguish "just transitioned" from "stuck for hours".
+    #[test]
+    fn decode_persistentvolume_proto_gen_preserves_last_phase_transition_time() {
+        let pv = core_v1::PersistentVolume {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pv".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeStatus {
+                phase: Some("Released".to_string()),
+                last_phase_transition_time: Some(meta_v1::Time {
+                    seconds: Some(1_700_000_000),
+                    nanos: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolume_proto_gen(&buf).expect("PV with status must decode");
+
+        assert_eq!(
+            result["status"]["lastPhaseTransitionTime"], "2023-11-14T22:13:20Z",
+            "status.lastPhaseTransitionTime must survive proto decode — without it a client \
+             polling PV phase can't tell 'just transitioned' from 'stuck for hours'"
+        );
+    }
+
     /// decode_persistentvolume_proto_gen must preserve spec.capacity, spec.claimRef,
     /// spec.nodeAffinity, and the spec.local volume source.
     ///
@@ -4837,6 +4889,30 @@ mod tests {
             "spec.csi.nodePublishSecretRef must survive proto decode for drivers that require \
              credentials on NodePublishVolume"
         );
+    }
+
+    /// decode_persistentvolume_proto_gen must survive PersistentVolume::sentinel() producing
+    /// exactly the keys the .proto schema defines, not a hand-typed subset that could go stale
+    /// the same way PodStatus's did (mayor-y0pcm).
+    ///
+    /// This reaches zero KNOWN_GAPS only because mayor-hfoid (legacy-volume
+    /// DELIBERATE_OMISSIONS) and mayor-p0dyr (persistentVolumeSource INLINE_EMBEDS) already
+    /// landed; lastPhaseTransitionTime was PersistentVolume's last real gap.
+    #[test]
+    fn sentinel_completeness_decode_persistentvolume_proto_gen() {
+        let pv = core_v1::PersistentVolume::sentinel();
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+        let result = decode_persistentvolume_proto_gen(&buf).expect("sentinel PV must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.PersistentVolume",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
     }
 
     /// The `optional` bool on ConfigMap/Secret volume sources (and their projected
@@ -7605,6 +7681,76 @@ mod tests {
         );
     }
 
+    /// decode_persistentvolumeclaim_proto_gen must preserve status.conditions[].lastProbeTime and
+    /// .lastTransitionTime (PVCStatus field 4's condition timestamps).
+    ///
+    /// These are how a client tells "resize probed 5 minutes ago and still Resizing" from
+    /// "resize just started" — without them, the FileSystemResizePending/Resizing condition has
+    /// a type/status/reason but no way to tell how long the claim has been stuck there.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_gen_preserves_status_condition_timestamps() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("resizing-pvc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeClaimStatus {
+                conditions: vec![core_v1::PersistentVolumeClaimCondition {
+                    r#type: Some("Resizing".to_string()),
+                    status: Some("True".to_string()),
+                    last_probe_time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_000),
+                        nanos: Some(0),
+                    }),
+                    last_transition_time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_100),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["lastProbeTime"], "2023-11-14T22:13:20Z",
+            "status.conditions[].lastProbeTime must survive decode — without it a client can't \
+             tell how long ago a resize condition was last probed"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["lastTransitionTime"], "2023-11-14T22:15:00Z",
+            "status.conditions[].lastTransitionTime must survive decode — without it a client \
+             can't tell how long a claim has been stuck Resizing vs. just having started"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto_gen must survive PersistentVolumeClaim::sentinel()
+    /// producing exactly the keys the .proto schema defines, not a hand-typed subset that could
+    /// go stale the same way PodStatus's did (mayor-y0pcm).
+    #[test]
+    fn sentinel_completeness_decode_persistentvolumeclaim_proto_gen() {
+        let pvc = core_v1::PersistentVolumeClaim::sentinel();
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+        let result =
+            decode_persistentvolumeclaim_proto_gen(&buf).expect("sentinel PVC must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.PersistentVolumeClaim",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
     /// decode_persistentvolumeclaim_proto_gen must preserve status.allocatedResources
     /// (PVCStatus field 5).
     ///
@@ -7890,6 +8036,61 @@ mod tests {
             "automountServiceAccountToken=false must survive decode — dropping it re-enables \
              automatic API token mounting the caller explicitly opted out of"
         );
+    }
+
+    /// decode_serviceaccount_proto_gen must preserve secrets[].fieldPath (ObjectReference field
+    /// 7), reachable via ServiceAccount.secrets[].
+    ///
+    /// This is a schema field on ObjectReference that a client is entitled to set on any
+    /// secrets[] entry; dropping it silently would corrupt a GET-modify-PUT round trip through
+    /// a protobuf-content-type client even though this particular reference use is unusual.
+    #[test]
+    fn decode_serviceaccount_proto_gen_preserves_secrets_field_path() {
+        let sa = core_v1::ServiceAccount {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-sa".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            secrets: vec![core_v1::ObjectReference {
+                name: Some("my-sa-token".to_string()),
+                field_path: Some("data.token".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sa.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_serviceaccount_proto_gen(&buf).expect("ServiceAccount must decode");
+
+        assert_eq!(
+            result["secrets"][0]["fieldPath"], "data.token",
+            "secrets[].fieldPath must survive decode alongside name — a client that set it on \
+             a GET-modify-PUT round trip through a protobuf-content-type client would otherwise \
+             see it silently vanish"
+        );
+    }
+
+    /// decode_serviceaccount_proto_gen must survive ServiceAccount::sentinel() producing exactly
+    /// the keys the .proto schema defines, not a hand-typed subset that could go stale the same
+    /// way PodStatus's did (mayor-y0pcm).
+    #[test]
+    fn sentinel_completeness_decode_serviceaccount_proto_gen() {
+        let sa = core_v1::ServiceAccount::sentinel();
+        let mut buf = Vec::new();
+        sa.encode(&mut buf).expect("prost encode must succeed");
+        let result =
+            decode_serviceaccount_proto_gen(&buf).expect("sentinel ServiceAccount must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.ServiceAccount",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
     }
 
     /// decode_endpoints_proto_gen must preserve subsets[].addresses and subsets[].ports.
