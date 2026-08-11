@@ -24,7 +24,7 @@ use super::generic::store_err;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ScaleMetadata {
+pub(crate) struct ScaleMetadata {
     name: Option<String>,
     namespace: Option<String>,
     #[serde(
@@ -32,12 +32,12 @@ struct ScaleMetadata {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    resource_version: Option<String>,
+    pub(crate) resource_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ScaleSpec {
-    replicas: Option<i32>,
+pub(crate) struct ScaleSpec {
+    pub(crate) replicas: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -48,15 +48,15 @@ struct ScaleStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct Scale {
+pub(crate) struct Scale {
     #[serde(rename = "apiVersion", default)]
     api_version: String,
     #[serde(default)]
     kind: String,
     #[serde(default)]
-    metadata: ScaleMetadata,
+    pub(crate) metadata: ScaleMetadata,
     #[serde(default)]
-    spec: ScaleSpec,
+    pub(crate) spec: ScaleSpec,
     #[serde(default)]
     status: ScaleStatus,
 }
@@ -172,7 +172,11 @@ fn try_decode_proto_scale_body(body: &Bytes) -> Option<Scale> {
 ///
 /// Returns `Err(StatusError)` on parse failure so the caller can propagate the
 /// 400 directly.
-fn decode_scale_body(
+///
+/// `pub(crate)`: also used by `handlers::cr`'s CRD scale subresource, which needs the
+/// same JSON/protobuf body handling client-go's scale client sends regardless of whether
+/// the target is an apps/v1 workload or a CRD.
+pub(crate) fn decode_scale_body(
     body: &Bytes,
     headers: &HeaderMap,
 ) -> Result<Scale, crate::status::StatusError> {
