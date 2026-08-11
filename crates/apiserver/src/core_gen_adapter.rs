@@ -2159,6 +2159,250 @@ pub fn decode_configmap_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Pod --------------------------------------------------------
 
+/// `ResourceRequirements` as it appears inside `PodStatus`/`ContainerStatus` (pod- and
+/// container-level resize/DRA reporting), not the incomplete inline handling used for
+/// `PodSpec`/`Container` elsewhere in this file.
+fn gen_resource_requirements_to_json(res: core_v1::ResourceRequirements) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !res.limits.is_empty() {
+        m.insert("limits".to_string(), gen_quantity_map_to_json(res.limits));
+    }
+    if !res.requests.is_empty() {
+        m.insert(
+            "requests".to_string(),
+            gen_quantity_map_to_json(res.requests),
+        );
+    }
+    if !res.claims.is_empty() {
+        let claims: Vec<serde_json::Value> = res
+            .claims
+            .into_iter()
+            .map(|c| {
+                let mut cm = serde_json::Map::new();
+                if let Some(v) = c.name.filter(|s| !s.is_empty()) {
+                    cm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = c.request.filter(|s| !s.is_empty()) {
+                    cm.insert("request".to_string(), serde_json::Value::String(v));
+                }
+                serde_json::Value::Object(cm)
+            })
+            .collect();
+        m.insert("claims".to_string(), serde_json::Value::Array(claims));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_container_state_to_json(state: core_v1::ContainerState) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(w) = state.waiting {
+        let mut wm = serde_json::Map::new();
+        if let Some(v) = w.reason.filter(|s| !s.is_empty()) {
+            wm.insert("reason".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = w.message.filter(|s| !s.is_empty()) {
+            wm.insert("message".to_string(), serde_json::Value::String(v));
+        }
+        m.insert("waiting".to_string(), serde_json::Value::Object(wm));
+    }
+    if let Some(r) = state.running {
+        let mut rm = serde_json::Map::new();
+        if let Some(secs) = r.started_at.and_then(|t| t.seconds) {
+            rm.insert(
+                "startedAt".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
+        m.insert("running".to_string(), serde_json::Value::Object(rm));
+    }
+    if let Some(t) = state.terminated {
+        let mut tm = serde_json::Map::new();
+        tm.insert(
+            "exitCode".to_string(),
+            serde_json::Value::Number(t.exit_code.unwrap_or(0).into()),
+        );
+        if let Some(v) = t.signal.filter(|&v| v != 0) {
+            tm.insert("signal".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = t.reason.filter(|s| !s.is_empty()) {
+            tm.insert("reason".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = t.message.filter(|s| !s.is_empty()) {
+            tm.insert("message".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(secs) = t.started_at.and_then(|ts| ts.seconds) {
+            tm.insert(
+                "startedAt".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
+        if let Some(secs) = t.finished_at.and_then(|ts| ts.seconds) {
+            tm.insert(
+                "finishedAt".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
+        if let Some(v) = t.container_id.filter(|s| !s.is_empty()) {
+            tm.insert("containerID".to_string(), serde_json::Value::String(v));
+        }
+        m.insert("terminated".to_string(), serde_json::Value::Object(tm));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Convert a decoded `ContainerStatus` protobuf message (an element of `PodStatus`'s
+/// `containerStatuses`/`initContainerStatuses`/`ephemeralContainerStatuses`) to JSON.
+///
+/// Missing this subtree is what makes the whole-array omission in `gen_pod_status_to_json`
+/// catastrophic rather than merely incomplete: `replace_pod_status` replaces the stored
+/// `status` subtree wholesale with the decoder's output, so a `containerStatuses` entry
+/// that never reaches JSON here means `kubectl get pods` READY/RESTARTS falls back to the
+/// spec container count and crash-loop/exec/log tooling that reads `state`/`containerID`
+/// sees nothing.
+fn gen_container_status_to_json(cs: core_v1::ContainerStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = cs.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(state) = cs.state {
+        m.insert("state".to_string(), gen_container_state_to_json(state));
+    }
+    if let Some(state) = cs.last_state {
+        m.insert("lastState".to_string(), gen_container_state_to_json(state));
+    }
+    // ready/restartCount are plain (non-pointer) fields upstream — Kubernetes always
+    // serializes them, including the zero values, so they are inserted unconditionally
+    // rather than gated on Option::is_some like the optional fields below.
+    m.insert(
+        "ready".to_string(),
+        serde_json::Value::Bool(cs.ready.unwrap_or(false)),
+    );
+    m.insert(
+        "restartCount".to_string(),
+        serde_json::Value::Number(cs.restart_count.unwrap_or(0).into()),
+    );
+    if let Some(v) = cs.image.filter(|s| !s.is_empty()) {
+        m.insert("image".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = cs.image_id.filter(|s| !s.is_empty()) {
+        m.insert("imageID".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = cs.container_id.filter(|s| !s.is_empty()) {
+        m.insert("containerID".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = cs.started {
+        m.insert("started".to_string(), serde_json::Value::Bool(v));
+    }
+    if !cs.allocated_resources.is_empty() {
+        m.insert(
+            "allocatedResources".to_string(),
+            gen_quantity_map_to_json(cs.allocated_resources),
+        );
+    }
+    if let Some(res) = cs.resources {
+        m.insert(
+            "resources".to_string(),
+            gen_resource_requirements_to_json(res),
+        );
+    }
+    if !cs.volume_mounts.is_empty() {
+        let vms: Vec<serde_json::Value> = cs
+            .volume_mounts
+            .into_iter()
+            .map(|vm| {
+                let mut vmm = serde_json::Map::new();
+                if let Some(v) = vm.name.filter(|s| !s.is_empty()) {
+                    vmm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = vm.mount_path.filter(|s| !s.is_empty()) {
+                    vmm.insert("mountPath".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = vm.read_only {
+                    vmm.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = vm.recursive_read_only.filter(|s| !s.is_empty()) {
+                    vmm.insert(
+                        "recursiveReadOnly".to_string(),
+                        serde_json::Value::String(v),
+                    );
+                }
+                if let Some(vs) = vm.volume_status {
+                    let mut vsm = serde_json::Map::new();
+                    if let Some(v) = vs.image.and_then(|i| i.image_ref).filter(|s| !s.is_empty()) {
+                        vsm.insert("image".to_string(), serde_json::json!({ "imageRef": v }));
+                    }
+                    vmm.insert("volumeStatus".to_string(), serde_json::Value::Object(vsm));
+                }
+                serde_json::Value::Object(vmm)
+            })
+            .collect();
+        m.insert("volumeMounts".to_string(), serde_json::Value::Array(vms));
+    }
+    if let Some(linux) = cs.user.and_then(|u| u.linux) {
+        let mut lm = serde_json::Map::new();
+        if let Some(v) = linux.uid {
+            lm.insert("uid".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = linux.gid {
+            lm.insert("gid".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if !linux.supplemental_groups.is_empty() {
+            lm.insert(
+                "supplementalGroups".to_string(),
+                serde_json::Value::Array(
+                    linux
+                        .supplemental_groups
+                        .into_iter()
+                        .map(|g| serde_json::Value::Number(g.into()))
+                        .collect(),
+                ),
+            );
+        }
+        m.insert("user".to_string(), serde_json::json!({ "linux": lm }));
+    }
+    if !cs.allocated_resources_status.is_empty() {
+        let statuses: Vec<serde_json::Value> = cs
+            .allocated_resources_status
+            .into_iter()
+            .map(|rs| {
+                let mut rsm = serde_json::Map::new();
+                if let Some(v) = rs.name.filter(|s| !s.is_empty()) {
+                    rsm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if !rs.resources.is_empty() {
+                    let healths: Vec<serde_json::Value> = rs
+                        .resources
+                        .into_iter()
+                        .map(|h| {
+                            let mut hm = serde_json::Map::new();
+                            if let Some(v) = h.resource_id.filter(|s| !s.is_empty()) {
+                                hm.insert("resourceID".to_string(), serde_json::Value::String(v));
+                            }
+                            if let Some(v) = h.health.filter(|s| !s.is_empty()) {
+                                hm.insert("health".to_string(), serde_json::Value::String(v));
+                            }
+                            if let Some(v) = h.message.filter(|s| !s.is_empty()) {
+                                hm.insert("message".to_string(), serde_json::Value::String(v));
+                            }
+                            serde_json::Value::Object(hm)
+                        })
+                        .collect();
+                    rsm.insert("resources".to_string(), serde_json::Value::Array(healths));
+                }
+                serde_json::Value::Object(rsm)
+            })
+            .collect();
+        m.insert(
+            "allocatedResourcesStatus".to_string(),
+            serde_json::Value::Array(statuses),
+        );
+    }
+    if let Some(v) = cs.stop_signal.filter(|s| !s.is_empty()) {
+        m.insert("stopSignal".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Convert a decoded `PodStatus` protobuf message to the JSON shape stored/served by u7s.
 ///
 /// A protobuf-encoded write to the `/status` subresource (e.g. client-go typed clients'
@@ -2167,6 +2411,12 @@ pub fn decode_configmap_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 /// so `replace_pod_status` treated the incoming status as absent and overwrote the stored
 /// status with `null` — a protobuf PUT to a pod's status subresource wiped the pod's phase,
 /// conditions and IPs instead of replacing them with the caller's values.
+///
+/// `containerStatuses`/`initContainerStatuses`/`ephemeralContainerStatuses` and the DRA
+/// resource-claim-status fields were themselves missing here in exactly the same way: since
+/// `replace_pod_status` replaces the whole stored `status` subtree with this function's
+/// output rather than merging into it, an omitted array does not just fail to update — it
+/// deletes whatever the stored pod already had.
 fn gen_pod_status_to_json(status: core_v1::PodStatus) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
@@ -2257,6 +2507,153 @@ fn gen_pod_status_to_json(status: core_v1::PodStatus) -> serde_json::Value {
     }
     if let Some(v) = status.qos_class.filter(|s| !s.is_empty()) {
         m.insert("qosClass".to_string(), serde_json::Value::String(v));
+    }
+    if !status.init_container_statuses.is_empty() {
+        m.insert(
+            "initContainerStatuses".to_string(),
+            serde_json::Value::Array(
+                status
+                    .init_container_statuses
+                    .into_iter()
+                    .map(gen_container_status_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !status.container_statuses.is_empty() {
+        m.insert(
+            "containerStatuses".to_string(),
+            serde_json::Value::Array(
+                status
+                    .container_statuses
+                    .into_iter()
+                    .map(gen_container_status_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !status.ephemeral_container_statuses.is_empty() {
+        m.insert(
+            "ephemeralContainerStatuses".to_string(),
+            serde_json::Value::Array(
+                status
+                    .ephemeral_container_statuses
+                    .into_iter()
+                    .map(gen_container_status_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(v) = status.resize.filter(|s| !s.is_empty()) {
+        m.insert("resize".to_string(), serde_json::Value::String(v));
+    }
+    if !status.resource_claim_statuses.is_empty() {
+        let claims: Vec<serde_json::Value> = status
+            .resource_claim_statuses
+            .into_iter()
+            .map(|c| {
+                let mut cm = serde_json::Map::new();
+                if let Some(v) = c.name.filter(|s| !s.is_empty()) {
+                    cm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = c.resource_claim_name.filter(|s| !s.is_empty()) {
+                    cm.insert(
+                        "resourceClaimName".to_string(),
+                        serde_json::Value::String(v),
+                    );
+                }
+                serde_json::Value::Object(cm)
+            })
+            .collect();
+        m.insert(
+            "resourceClaimStatuses".to_string(),
+            serde_json::Value::Array(claims),
+        );
+    }
+    if let Some(ext) = status.extended_resource_claim_status {
+        let mut em = serde_json::Map::new();
+        if !ext.request_mappings.is_empty() {
+            let mappings: Vec<serde_json::Value> = ext
+                .request_mappings
+                .into_iter()
+                .map(|rm| {
+                    let mut rmm = serde_json::Map::new();
+                    if let Some(v) = rm.container_name.filter(|s| !s.is_empty()) {
+                        rmm.insert("containerName".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = rm.resource_name.filter(|s| !s.is_empty()) {
+                        rmm.insert("resourceName".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = rm.request_name.filter(|s| !s.is_empty()) {
+                        rmm.insert("requestName".to_string(), serde_json::Value::String(v));
+                    }
+                    serde_json::Value::Object(rmm)
+                })
+                .collect();
+            em.insert(
+                "requestMappings".to_string(),
+                serde_json::Value::Array(mappings),
+            );
+        }
+        if let Some(v) = ext.resource_claim_name.filter(|s| !s.is_empty()) {
+            em.insert(
+                "resourceClaimName".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        m.insert(
+            "extendedResourceClaimStatus".to_string(),
+            serde_json::Value::Object(em),
+        );
+    }
+    if !status.allocated_resources.is_empty() {
+        m.insert(
+            "allocatedResources".to_string(),
+            gen_quantity_map_to_json(status.allocated_resources),
+        );
+    }
+    if let Some(res) = status.resources {
+        m.insert(
+            "resources".to_string(),
+            gen_resource_requirements_to_json(res),
+        );
+    }
+    if !status.node_allocatable_resource_claim_statuses.is_empty() {
+        let statuses: Vec<serde_json::Value> = status
+            .node_allocatable_resource_claim_statuses
+            .into_iter()
+            .map(|n| {
+                let mut nm = serde_json::Map::new();
+                if let Some(v) = n.resource_claim_name.filter(|s| !s.is_empty()) {
+                    nm.insert(
+                        "resourceClaimName".to_string(),
+                        serde_json::Value::String(v),
+                    );
+                }
+                if !n.containers.is_empty() {
+                    nm.insert(
+                        "containers".to_string(),
+                        serde_json::Value::Array(
+                            n.containers
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                if !n.resources.is_empty() {
+                    nm.insert(
+                        "resources".to_string(),
+                        gen_quantity_map_to_json(n.resources),
+                    );
+                }
+                serde_json::Value::Object(nm)
+            })
+            .collect();
+        m.insert(
+            "nodeAllocatableResourceClaimStatuses".to_string(),
+            serde_json::Value::Array(statuses),
+        );
     }
     serde_json::Value::Object(m)
 }
@@ -7402,6 +7799,37 @@ mod tests {
             "stdinOnce",
             "tty",
         ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for `gen_pod_status_to_json`, gated against the schema itself
+    /// rather than a hand-typed list.
+    ///
+    /// `gen_pod_status_to_json` was originally shipped with a hand-listed regression test
+    /// asserting only `phase`/`podIP`/`conditions` — a test that stayed green while
+    /// `containerStatuses` and five other top-level `PodStatus` fields (and everything
+    /// reachable through them) were absent from the emitter, because the same human who
+    /// wrote the emitter also wrote the list of fields it was checked against. Deriving
+    /// `expected` from the compiled `FileDescriptorSet` instead means a field this function
+    /// forgets shows up here automatically, whether or not anyone remembers to add it to a
+    /// list by hand.
+    #[test]
+    fn sentinel_completeness_gen_pod_status_to_json() {
+        let pod = core_v1::Pod {
+            status: Some(core_v1::PodStatus::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+        let result = decode_pod_proto_gen(&buf)
+            .expect("sentinel PodStatus must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result["status"], "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.PodStatus"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 }

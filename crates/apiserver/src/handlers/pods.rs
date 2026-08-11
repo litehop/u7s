@@ -11104,6 +11104,118 @@ mod handler_tests {
         assert_eq!(v["spec"]["containers"][0]["name"], "app");
     }
 
+    /// A protobuf-encoded PUT to /status must not destroy `containerStatuses`.
+    ///
+    /// `replace_pod_status` replaces the whole stored `status` subtree with whatever
+    /// `extract_body`/the proto decoder produces (`current_obj.body["status"] =
+    /// incoming["status"].clone()`), so a decoder that omits a field doesn't just fail to
+    /// update it — it deletes whatever the stored pod already had there. Before the fix,
+    /// the protobuf `PodStatus` decoder never emitted `containerStatuses` at all, so this
+    /// exact request returned 200 OK while collapsing the stored status down to
+    /// `{"phase":"Running"}`: both the caller's new containerStatuses AND the previously
+    /// stored one vanished, and `kubectl get pods` READY/RESTARTS silently fell back to
+    /// the spec container count (0/1 READY, 0 RESTARTS) for a healthy pod.
+    #[tokio::test]
+    async fn pod_status_containerstatuses_survives_protobuf_updatestatus_or_kubectl_get_pods_shows_wrong_ready_column(
+    ) {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": true,
+                        "restartCount": 5,
+                        "containerID": "containerd://old"
+                    }]
+                }
+            }),
+        )
+        .await;
+
+        // ContainerStatus{name(1)="app", restartCount(5)=6, containerID(8)="containerd://new"}
+        let mut container_status = encode_ld(1, b"app");
+        container_status.push(0x28); // field 5 (restartCount), wire type 0 (varint)
+        container_status.push(6);
+        container_status.extend_from_slice(&encode_ld(8, b"containerd://new"));
+
+        // PodStatus{containerStatuses(8) = [container_status]}
+        let pod_status = encode_ld(8, &container_status);
+
+        // ObjectMeta{name(1)="my-pod", namespace(3)="default"}
+        let mut obj_meta = encode_ld(1, b"my-pod");
+        obj_meta.extend_from_slice(&encode_ld(3, b"default"));
+
+        // Pod{metadata(1), status(3)}
+        let mut pod_proto = encode_ld(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_ld(3, &pod_status));
+
+        // Wrap in the k8s Unknown envelope client-go's typed UpdateStatus clients use.
+        let mut type_meta = encode_ld(1, b"v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"Pod"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &pod_proto));
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // magic
+        body.extend_from_slice(&unknown);
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/vnd.kubernetes.protobuf")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "this repro is about the request succeeding while silently discarding data, not \
+             about it failing"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .expect("store get must succeed")
+            .expect("pod must still exist after the status PUT");
+        let persisted: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let statuses = persisted["status"]["containerStatuses"].as_array().expect(
+            "status.containerStatuses must survive a protobuf UpdateStatus — before the fix, \
+             the protobuf PodStatus decoder never emitted this key, and replace_pod_status's \
+             whole-subtree replace turned that omission into deletion: the caller's write and \
+             the previously stored containerStatuses both vanished",
+        );
+        assert_eq!(
+            statuses.len(),
+            1,
+            "the caller's containerStatuses entry must replace the previously stored one, \
+             not disappear alongside it"
+        );
+        assert_eq!(
+            statuses[0]["restartCount"], 6,
+            "restartCount must reflect the caller's new value (6), not the stale stored \
+             value (5) or be missing — kubectl get pods' RESTARTS column reads this field"
+        );
+        assert_eq!(
+            statuses[0]["containerID"], "containerd://new",
+            "containerID must reflect the caller's new value, not the stale stored value or \
+             be missing — exec/log routing and crash-loop detection key off this field"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // patch_pod_status (PATCH /status)
     // -----------------------------------------------------------------------
