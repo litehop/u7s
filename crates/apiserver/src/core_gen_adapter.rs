@@ -287,6 +287,23 @@ fn gen_http_get_to_json(http_get: core_v1::HttpGetAction) -> serde_json::Value {
     if let Some(s) = http_get.scheme.filter(|s| !s.is_empty()) {
         hg.insert("scheme".to_string(), serde_json::Value::String(s));
     }
+    // httpHeaders — custom headers for auth-gated health checks (e.g. a bearer token or
+    // signed request header the target expects). Dropping them makes a probe that relies on
+    // one indistinguishable from an anonymous request, so the endpoint answers 401/403 and
+    // the probe fails even though the container is healthy.
+    if !http_get.http_headers.is_empty() {
+        let headers: Vec<serde_json::Value> = http_get
+            .http_headers
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "name": h.name.unwrap_or_default(),
+                    "value": h.value.unwrap_or_default(),
+                })
+            })
+            .collect();
+        hg.insert("httpHeaders".to_string(), serde_json::Value::Array(headers));
+    }
     serde_json::Value::Object(hg)
 }
 
@@ -397,6 +414,12 @@ fn gen_lifecycle_to_json(lc: core_v1::Lifecycle) -> serde_json::Value {
     }
     if let Some(h) = lc.pre_stop {
         m.insert("preStop".to_string(), gen_lifecycle_handler_to_json(h));
+    }
+    // stopSignal — a container-supplied custom stop signal; without it the runtime falls back
+    // to its own default (usually SIGTERM), which can kill a process that only handles a
+    // different signal for graceful shutdown instead of terminating cleanly.
+    if let Some(v) = lc.stop_signal.filter(|s| !s.is_empty()) {
+        m.insert("stopSignal".to_string(), serde_json::Value::String(v));
     }
     serde_json::Value::Object(m)
 }
@@ -804,6 +827,25 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
                             skrm.insert("optional".to_string(), serde_json::Value::Bool(true));
                         }
                         vfm.insert("secretKeyRef".to_string(), serde_json::Value::Object(skrm));
+                    }
+                    // fileKeyRef (EnvFiles alpha feature) selects an env var from a file
+                    // mounted via another volume. Dropping it makes the container start with
+                    // that variable entirely unset instead of the value the file provided.
+                    if let Some(fkr) = vf.file_key_ref {
+                        let mut fkrm = serde_json::Map::new();
+                        if let Some(v) = fkr.volume_name.filter(|s| !s.is_empty()) {
+                            fkrm.insert("volumeName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = fkr.path.filter(|s| !s.is_empty()) {
+                            fkrm.insert("path".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = fkr.key.filter(|s| !s.is_empty()) {
+                            fkrm.insert("key".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(true) = fkr.optional {
+                            fkrm.insert("optional".to_string(), serde_json::Value::Bool(true));
+                        }
+                        vfm.insert("fileKeyRef".to_string(), serde_json::Value::Object(fkrm));
                     }
                     em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
                 }
@@ -1409,6 +1451,17 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                         let mut ed_map = serde_json::Map::new();
                         if let Some(medium) = ed.medium.filter(|s| !s.is_empty()) {
                             ed_map.insert("medium".to_string(), serde_json::Value::String(medium));
+                        }
+                        // sizeLimit caps how much local storage (or memory, for the Memory
+                        // medium) this emptyDir may use. Dropping it silently turns a capped
+                        // volume into an uncapped one, letting a runaway writer exhaust node
+                        // disk/memory instead of being evicted at the limit the client set.
+                        if let Some(v) = ed
+                            .size_limit
+                            .and_then(|q| q.string)
+                            .filter(|s| !s.is_empty())
+                        {
+                            ed_map.insert("sizeLimit".to_string(), serde_json::Value::String(v));
                         }
                         vm.insert("emptyDir".to_string(), serde_json::Value::Object(ed_map));
                     }
@@ -4327,6 +4380,15 @@ pub fn decode_replicationcontroller_proto_gen(data: &[u8]) -> Option<serde_json:
         if let Some(tmpl) = spec.template {
             spec_map.insert("template".to_string(), gen_pod_template_spec_to_json(tmpl));
         }
+        // minReadySeconds gates how long a newly Ready pod must stay Ready before the RC
+        // counts it toward availableReplicas; without it every pod counts as available the
+        // instant it's Ready, defeating a rollout's flake-tolerance window.
+        if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {
+            spec_map.insert(
+                "minReadySeconds".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
         obj["spec"] = serde_json::Value::Object(spec_map);
     }
     if let Some(status) = rc.status {
@@ -4364,6 +4426,10 @@ pub fn decode_replicationcontroller_proto_gen(data: &[u8]) -> Option<serde_json:
                         if !msg.is_empty() {
                             cond["message"] = msg.clone().into();
                         }
+                    }
+                    if let Some(secs) = c.last_transition_time.as_ref().and_then(|t| t.seconds) {
+                        cond["lastTransitionTime"] =
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                     }
                     cond
                 })
@@ -4722,6 +4788,56 @@ mod tests {
         assert_eq!(
             result["status"]["conditions"][0]["type"], "ReplicaFailure",
             "status.conditions must survive"
+        );
+    }
+
+    /// RC's `status.conditions[].lastTransitionTime` and `spec.minReadySeconds` survive the
+    /// generated-path decode.
+    ///
+    /// Without lastTransitionTime, a client can't tell how long an RC has been stuck
+    /// ReplicaFailure vs. just having started failing. Without minReadySeconds, every pod
+    /// counts as available the instant it's Ready, defeating a rollout's flake-tolerance
+    /// window.
+    #[test]
+    fn generated_rc_preserves_condition_timestamp_and_min_ready_seconds() {
+        let rc = core_v1::ReplicationController {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-rc".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::ReplicationControllerSpec {
+                replicas: Some(3),
+                min_ready_seconds: Some(30),
+                ..Default::default()
+            }),
+            status: Some(core_v1::ReplicationControllerStatus {
+                conditions: vec![core_v1::ReplicationControllerCondition {
+                    r#type: Some("ReplicaFailure".to_string()),
+                    status: Some("True".to_string()),
+                    last_transition_time: Some(meta_v1::Time {
+                        seconds: Some(1_700_000_000),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_replicationcontroller_proto_gen(&buf)
+            .expect("RC with condition timestamp must decode successfully");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["lastTransitionTime"], "2023-11-14T22:13:20Z",
+            "status.conditions[].lastTransitionTime must survive decode — without it a client \
+             can't tell how long an RC has been stuck ReplicaFailure vs. just having started"
+        );
+        assert_eq!(
+            result["spec"]["minReadySeconds"], 30,
+            "spec.minReadySeconds must survive decode — without it every pod counts as \
+             available the instant it's Ready, defeating a rollout's flake-tolerance window"
         );
     }
 
@@ -7273,6 +7389,212 @@ mod tests {
             sc["privileged"].is_null(),
             "privileged must stay absent when unset — a spurious false looks identical to an \
              explicit non-privileged request, hiding the decode-drop bug this field is prone to"
+        );
+    }
+
+    /// A probe's `httpGet.httpHeaders` must survive protobuf decode.
+    ///
+    /// Without it, a health check that relies on a custom header (e.g. an auth token the
+    /// target expects) is silently sent without that header, so the endpoint answers
+    /// 401/403 and the probe reports the container unhealthy even though it's fine.
+    #[test]
+    fn generated_container_preserves_liveness_probe_http_headers() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("probe-headers-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    liveness_probe: Some(core_v1::Probe {
+                        handler: Some(core_v1::ProbeHandler {
+                            http_get: Some(core_v1::HttpGetAction {
+                                path: Some("/healthz".to_string()),
+                                http_headers: vec![core_v1::HttpHeader {
+                                    name: Some("X-Auth-Token".to_string()),
+                                    value: Some("secret".to_string()),
+                                }],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with liveness probe must decode");
+
+        let header = &result["spec"]["containers"][0]["livenessProbe"]["httpGet"]["httpHeaders"][0];
+        assert_eq!(
+            header["name"], "X-Auth-Token",
+            "httpGet.httpHeaders must survive decode — without it an auth-gated health check \
+             silently loses its credential and the probe fails even though the container is \
+             healthy"
+        );
+        assert_eq!(
+            header["value"], "secret",
+            "httpHeaders[].value must survive decode"
+        );
+    }
+
+    /// A container's `lifecycle.stopSignal` must survive protobuf decode.
+    ///
+    /// Without it, the container runtime falls back to its own default stop signal (usually
+    /// SIGTERM) instead of the one the client requested, which can kill a process that only
+    /// handles a different signal for graceful shutdown, dropping in-flight work.
+    #[test]
+    fn generated_container_preserves_lifecycle_stop_signal() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("stopsignal-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                os: Some(core_v1::PodOs {
+                    name: Some("linux".to_string()),
+                }),
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    lifecycle: Some(core_v1::Lifecycle {
+                        stop_signal: Some("SIGUSR1".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with lifecycle.stopSignal must decode");
+
+        assert_eq!(
+            result["spec"]["containers"][0]["lifecycle"]["stopSignal"], "SIGUSR1",
+            "lifecycle.stopSignal must survive decode — without it the runtime falls back to \
+             its default signal (usually SIGTERM), which can kill a process that only handles \
+             a different signal for graceful shutdown"
+        );
+    }
+
+    /// A volume's `emptyDir.sizeLimit` must survive protobuf decode.
+    ///
+    /// Without it, an emptyDir the client capped at a specific size round-trips as
+    /// uncapped, letting a runaway writer exhaust node disk/memory instead of being
+    /// evicted at the limit the client set.
+    #[test]
+    fn generated_pod_spec_preserves_empty_dir_size_limit() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("emptydir-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("scratch".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        empty_dir: Some(core_v1::EmptyDirVolumeSource {
+                            medium: Some("Memory".to_string()),
+                            size_limit: Some(
+                                crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                    string: Some("1Gi".to_string()),
+                                },
+                            ),
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with emptyDir must decode");
+
+        assert_eq!(
+            result["spec"]["volumes"][0]["emptyDir"]["sizeLimit"], "1Gi",
+            "emptyDir.sizeLimit must survive decode — without it a capped emptyDir round-trips \
+             as uncapped, letting a runaway writer exhaust node disk/memory instead of being \
+             evicted at the limit the client set"
+        );
+    }
+
+    /// An env var's `valueFrom.fileKeyRef` must survive protobuf decode.
+    ///
+    /// Without it, a container relying on this (alpha EnvFiles) feature starts with that
+    /// environment variable entirely unset instead of the value the referenced file provided.
+    #[test]
+    fn generated_container_preserves_env_file_key_ref() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("envfile-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    env: vec![core_v1::EnvVar {
+                        name: Some("FROM_FILE".to_string()),
+                        value_from: Some(core_v1::EnvVarSource {
+                            file_key_ref: Some(core_v1::FileKeySelector {
+                                volume_name: Some("envfile-vol".to_string()),
+                                path: Some("app.env".to_string()),
+                                key: Some("SOME_KEY".to_string()),
+                                optional: Some(true),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with fileKeyRef env var must decode");
+
+        let fkr = &result["spec"]["containers"][0]["env"][0]["valueFrom"]["fileKeyRef"];
+        assert_eq!(
+            fkr["volumeName"], "envfile-vol",
+            "valueFrom.fileKeyRef must survive decode — without it a container relying on \
+             this env-from-file feature starts with the variable entirely unset instead of \
+             the value the referenced file provided"
+        );
+        assert_eq!(
+            fkr["path"], "app.env",
+            "fileKeyRef.path must survive decode"
+        );
+        assert_eq!(fkr["key"], "SOME_KEY", "fileKeyRef.key must survive decode");
+        assert_eq!(
+            fkr["optional"], true,
+            "fileKeyRef.optional must survive decode"
         );
     }
 
