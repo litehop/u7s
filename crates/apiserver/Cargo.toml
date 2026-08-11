@@ -66,6 +66,7 @@ protoc-bin-vendored      = "3.2"
 
 [dev-dependencies]
 criterion       = "0.8"
+prost-types     = "0.14"
 
 [[bench]]
 name    = "list_filter"

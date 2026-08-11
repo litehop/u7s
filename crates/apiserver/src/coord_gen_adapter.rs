@@ -320,32 +320,16 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&decoded, "", &mut paths);
 
-        // selfLink is a legacy field the system no longer populates (see the .proto's own
-        // "Deprecated" comment) — permanently omitted, not a gap.
-        //
-        // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
-        // pending a separate investigation into gen_object_meta_to_json's correct handling of
-        // them; do not guess at the fix here.
-        let expected = [
-            "name",
-            "generateName",
-            "namespace",
-            "uid",
-            "resourceVersion",
-            "generation",
-            "creationTimestamp",
-            "labels",
-            "annotations",
-            "ownerReferences",
-            "finalizers",
-            "holderIdentity",
-            "leaseDurationSeconds",
-            "acquireTime",
-            "renewTime",
-            "leaseTransitions",
-            "strategy",
-            "preferredHolder",
-        ];
+        // Derived from the .proto schema rather than hand-listed, so a field added upstream is
+        // demanded here automatically instead of when someone remembers to type it. The
+        // deliberate omissions (selfLink) and the currently-tolerated real drops
+        // (deletionTimestamp/deletionGracePeriodSeconds/managedFields) live in one reviewed table
+        // in `proto_descriptor`, not in a comment in each of the twelve adapter test modules.
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ".k8s.io.api.coordination.v1.LeaseSpec",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 

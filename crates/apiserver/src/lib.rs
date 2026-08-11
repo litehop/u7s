@@ -24,6 +24,8 @@ mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod patch;
 mod proto;
+#[cfg(test)]
+mod proto_descriptor;
 mod quota;
 mod rbac;
 mod rbac_authz_authn_gen;
