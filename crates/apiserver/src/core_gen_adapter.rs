@@ -199,6 +199,63 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                         serde_json::Value::Object(sat_map),
                     );
                 }
+                if let Some(pc) = src.pod_certificate {
+                    let mut pc_map = serde_json::Map::new();
+                    if let Some(v) = pc.signer_name.filter(|s| !s.is_empty()) {
+                        pc_map.insert("signerName".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pc.key_type.filter(|s| !s.is_empty()) {
+                        pc_map.insert("keyType".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pc.max_expiration_seconds.filter(|&v| v != 0) {
+                        pc_map.insert(
+                            "maxExpirationSeconds".to_string(),
+                            serde_json::Value::Number(v.into()),
+                        );
+                    }
+                    if let Some(v) = pc.credential_bundle_path.filter(|s| !s.is_empty()) {
+                        pc_map.insert(
+                            "credentialBundlePath".to_string(),
+                            serde_json::Value::String(v),
+                        );
+                    }
+                    if let Some(v) = pc.key_path.filter(|s| !s.is_empty()) {
+                        pc_map.insert("keyPath".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pc.certificate_chain_path.filter(|s| !s.is_empty()) {
+                        pc_map.insert(
+                            "certificateChainPath".to_string(),
+                            serde_json::Value::String(v),
+                        );
+                    }
+                    sm.insert(
+                        "podCertificate".to_string(),
+                        serde_json::Value::Object(pc_map),
+                    );
+                }
+                if let Some(ctb) = src.cluster_trust_bundle {
+                    let mut ctb_map = serde_json::Map::new();
+                    if let Some(v) = ctb.name.filter(|s| !s.is_empty()) {
+                        ctb_map.insert("name".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = ctb.signer_name.filter(|s| !s.is_empty()) {
+                        ctb_map.insert("signerName".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(sel) = ctb.label_selector {
+                        ctb_map
+                            .insert("labelSelector".to_string(), gen_label_selector_to_json(sel));
+                    }
+                    if let Some(true) = ctb.optional {
+                        ctb_map.insert("optional".to_string(), serde_json::Value::Bool(true));
+                    }
+                    if let Some(v) = ctb.path.filter(|s| !s.is_empty()) {
+                        ctb_map.insert("path".to_string(), serde_json::Value::String(v));
+                    }
+                    sm.insert(
+                        "clusterTrustBundle".to_string(),
+                        serde_json::Value::Object(ctb_map),
+                    );
+                }
                 serde_json::Value::Object(sm)
             })
             .collect();
@@ -5143,6 +5200,162 @@ mod tests {
         assert_eq!(
             proj_sources[1]["secret"]["optional"], true,
             "projected secret source's optional flag must survive decode"
+        );
+    }
+
+    /// A projected volume's `sources[].podCertificate` (PodCertificateProjection) must survive
+    /// proto decode.
+    ///
+    /// Before this fix, the whole `sources[]` entry was silently dropped: a pod using this
+    /// (1.34+ alpha) auto-rotating TLS credential projection would mount an empty projected
+    /// volume with no error, leaving the workload with no key/certificate at the path it
+    /// expected.
+    #[test]
+    fn generated_pod_spec_preserves_projected_pod_certificate_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("podcert-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("podcert-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        projected: Some(core_v1::ProjectedVolumeSource {
+                            sources: vec![core_v1::VolumeProjection {
+                                pod_certificate: Some(core_v1::PodCertificateProjection {
+                                    signer_name: Some("example.com/signer".to_string()),
+                                    key_type: Some("ECDSAP256".to_string()),
+                                    max_expiration_seconds: Some(86400),
+                                    credential_bundle_path: Some("bundle.pem".to_string()),
+                                    key_path: Some("key.pem".to_string()),
+                                    certificate_chain_path: Some("chain.pem".to_string()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with podCertificate must decode");
+
+        let pc = &result["spec"]["volumes"][0]["projected"]["sources"][0]["podCertificate"];
+        assert_eq!(
+            pc["signerName"], "example.com/signer",
+            "podCertificate.signerName must survive decode — before this fix the whole \
+             sources[] entry was dropped, leaving the workload with no credential at all"
+        );
+        assert_eq!(
+            pc["keyType"], "ECDSAP256",
+            "podCertificate.keyType must survive decode"
+        );
+        assert_eq!(
+            pc["maxExpirationSeconds"], 86400,
+            "podCertificate.maxExpirationSeconds must survive decode"
+        );
+        assert_eq!(
+            pc["credentialBundlePath"], "bundle.pem",
+            "podCertificate.credentialBundlePath must survive decode"
+        );
+        assert_eq!(
+            pc["keyPath"], "key.pem",
+            "podCertificate.keyPath must survive decode"
+        );
+        assert_eq!(
+            pc["certificateChainPath"], "chain.pem",
+            "podCertificate.certificateChainPath must survive decode"
+        );
+    }
+
+    /// A projected volume's `sources[].clusterTrustBundle` (ClusterTrustBundleProjection) must
+    /// survive proto decode.
+    ///
+    /// Before this fix, the whole `sources[]` entry was silently dropped: a pod that projected
+    /// a CA trust bundle by signer name/label selector would mount an empty projected volume,
+    /// so TLS verification against that bundle would fail with no indication why.
+    #[test]
+    fn generated_pod_spec_preserves_projected_cluster_trust_bundle_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("ctb-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("ctb-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        projected: Some(core_v1::ProjectedVolumeSource {
+                            sources: vec![core_v1::VolumeProjection {
+                                cluster_trust_bundle: Some(core_v1::ClusterTrustBundleProjection {
+                                    signer_name: Some("example.com/signer".to_string()),
+                                    label_selector: Some(meta_v1::LabelSelector {
+                                        match_labels: [(
+                                            "release".to_string(),
+                                            "stable".to_string(),
+                                        )]
+                                        .into_iter()
+                                        .collect(),
+                                        ..Default::default()
+                                    }),
+                                    optional: Some(true),
+                                    path: Some("trust.pem".to_string()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with clusterTrustBundle must decode");
+
+        let ctb = &result["spec"]["volumes"][0]["projected"]["sources"][0]["clusterTrustBundle"];
+        assert_eq!(
+            ctb["signerName"], "example.com/signer",
+            "clusterTrustBundle.signerName must survive decode — before this fix the whole \
+             sources[] entry was dropped, so TLS verification against the bundle would fail \
+             with no indication why"
+        );
+        assert_eq!(
+            ctb["labelSelector"]["matchLabels"]["release"], "stable",
+            "clusterTrustBundle.labelSelector must survive decode"
+        );
+        assert_eq!(
+            ctb["optional"], true,
+            "clusterTrustBundle.optional must survive decode"
+        );
+        assert_eq!(
+            ctb["path"], "trust.pem",
+            "clusterTrustBundle.path must survive decode"
         );
     }
 
