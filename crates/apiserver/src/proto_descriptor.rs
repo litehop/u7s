@@ -62,6 +62,39 @@ const RENAMES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Fields that hold a Go `json:",inline"` embed: the embedded message's fields appear directly on
+/// the parent in JSON, and the proto field name used for the embed (e.g. `localObjectReference`)
+/// never appears as a JSON key at all. `walk()` must still descend into the embedded message —
+/// only the field's own name is suppressed — which is why this is a separate table from
+/// `DELIBERATE_OMISSIONS`: an omission stops the walk, an inline embed redirects it.
+const INLINE_EMBEDS: &[(&str, &str)] = &[
+    (
+        ".k8s.io.api.core.v1.ConfigMapEnvSource",
+        "localObjectReference",
+    ),
+    (
+        ".k8s.io.api.core.v1.ConfigMapKeySelector",
+        "localObjectReference",
+    ),
+    (
+        ".k8s.io.api.core.v1.ConfigMapProjection",
+        "localObjectReference",
+    ),
+    (
+        ".k8s.io.api.core.v1.ConfigMapVolumeSource",
+        "localObjectReference",
+    ),
+    (
+        ".k8s.io.api.core.v1.EphemeralContainer",
+        "ephemeralContainerCommon",
+    ),
+    (
+        ".k8s.io.api.core.v1.PersistentVolumeSpec",
+        "persistentVolumeSource",
+    ),
+    (".k8s.io.api.core.v1.Volume", "volumeSource"),
+];
+
 /// Fields the decoders deliberately do not emit. Each entry is a decision, not an oversight;
 /// anything that is merely *not yet implemented* belongs in `KNOWN_GAPS` instead so the two stay
 /// distinguishable in review.
@@ -383,6 +416,12 @@ fn is_excluded(owner: &str, field_name: &str) -> bool {
         .any(|(msg, field, _)| *msg == owner && *field == field_name)
 }
 
+fn is_inline_embed(owner: &str, field_name: &str) -> bool {
+    INLINE_EMBEDS
+        .iter()
+        .any(|(msg, field)| *msg == owner && *field == field_name)
+}
+
 /// The JSON keys a fully-populated `root` must produce, following message-typed fields
 /// transitively.
 ///
@@ -429,7 +468,11 @@ fn walk(
         // A map<K, V> is one JSON object keyed by the map's own field name; protoc's synthetic
         // `key`/`value` fields are an encoding detail and never appear as JSON keys. The value
         // type is still walked so a message-valued map contributes its fields.
-        if !is_map_entry {
+        //
+        // A Go `json:",inline"` embed is the mirror image of an exclusion: the field's own name
+        // is never a JSON key, but (unlike an exclusion) the walk must still descend, because the
+        // embedded message's fields land directly on the parent.
+        if !is_map_entry && !is_inline_embed(message_name, field.name()) {
             keys.insert(json_key(message_name, field.name(), field.json_name()));
         }
         if matches!(field.r#type(), Type::Message | Type::Group) {
@@ -492,6 +535,72 @@ mod tests {
             !keys.contains("key") && !keys.contains("value"),
             "protoc's synthetic map-entry key/value fields are an encoding detail and must not be \
              expected as JSON keys"
+        );
+    }
+
+    /// Go embeds `LocalObjectReference` inline via a field literally named `localObjectReference`
+    /// on all four of these types. Without `INLINE_EMBEDS`, the oracle would demand a
+    /// `localObjectReference` JSON key that a real ConfigMap-referencing decoder can never
+    /// produce (only `name` is ever emitted), permanently blocking a zero-`KNOWN_GAPS` sentinel
+    /// test for any decoder that reaches one of them.
+    #[test]
+    fn inlines_localobjectreference_embeds_in_configmap_sources() {
+        for msg in [
+            ".k8s.io.api.core.v1.ConfigMapEnvSource",
+            ".k8s.io.api.core.v1.ConfigMapKeySelector",
+            ".k8s.io.api.core.v1.ConfigMapProjection",
+            ".k8s.io.api.core.v1.ConfigMapVolumeSource",
+        ] {
+            let keys = expected_json_keys(msg);
+            assert!(
+                keys.contains("name"),
+                "{msg} embeds LocalObjectReference inline, so its `name` field must be reachable, got {keys:?}"
+            );
+            assert!(
+                !keys.contains("localObjectReference"),
+                "{msg}'s `localObjectReference` field is a Go inline embed, not a real JSON \
+                 object — expecting it as a key would make a correct decoder look incomplete, \
+                 got {keys:?}"
+            );
+        }
+    }
+
+    /// `EphemeralContainer` embeds `EphemeralContainerCommon` inline: `name`/`image` land
+    /// directly on each `ephemeralContainers[]` entry, and `ephemeralContainerCommon` never
+    /// appears as a JSON key.
+    #[test]
+    fn inlines_ephemeralcontainercommon_fields_onto_ephemeralcontainer() {
+        let keys = expected_json_keys(".k8s.io.api.core.v1.EphemeralContainer");
+        assert!(keys.contains("name") && keys.contains("image"));
+        assert!(
+            !keys.contains("ephemeralContainerCommon"),
+            "ephemeralContainerCommon is a Go inline embed, not a JSON key a decoder can ever \
+             emit, got {keys:?}"
+        );
+    }
+
+    /// `PersistentVolumeSpec` embeds `PersistentVolumeSource` inline: plugin fields like `nfs`
+    /// land directly under `spec`, and `persistentVolumeSource` never appears as a JSON key.
+    #[test]
+    fn inlines_persistentvolumesource_fields_onto_persistentvolumespec() {
+        let keys = expected_json_keys(".k8s.io.api.core.v1.PersistentVolumeSpec");
+        assert!(keys.contains("nfs") && keys.contains("hostPath"));
+        assert!(
+            !keys.contains("persistentVolumeSource"),
+            "persistentVolumeSource is a Go inline embed, not a JSON key a decoder can ever \
+             emit, got {keys:?}"
+        );
+    }
+
+    /// `Volume` embeds `VolumeSource` inline: plugin fields like `hostPath` land directly on each
+    /// `volumes[]` entry, and `volumeSource` never appears as a JSON key.
+    #[test]
+    fn inlines_volumesource_fields_onto_volume() {
+        let keys = expected_json_keys(".k8s.io.api.core.v1.Volume");
+        assert!(keys.contains("hostPath") && keys.contains("emptyDir"));
+        assert!(
+            !keys.contains("volumeSource"),
+            "volumeSource is a Go inline embed, not a JSON key a decoder can ever emit, got {keys:?}"
         );
     }
 
