@@ -865,6 +865,18 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::scale::put_scale)
                 .patch(handlers::scale::patch_scale),
         )
+        // Scale subresource — CRD-backed resources whose CRD declares `subresources.scale`.
+        // A literal `apps/v1` request always matches the more specific route above first
+        // (matchit prioritises literal path segments over `{group}`/`{version}` params), so
+        // this only ever serves CRDs. Without this route, an HPA targeting a CRD-backed
+        // resource gets an immediate 404 reading replicas — there is no scale route at all
+        // for CRDs otherwise.
+        .route(
+            "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}/scale",
+            get(handlers::cr::get_cr_namespaced_scale)
+                .put(handlers::cr::put_cr_namespaced_scale)
+                .patch(handlers::cr::patch_cr_namespaced_scale),
+        )
         // Generic namespaced resources — named
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}",
@@ -880,6 +892,14 @@ fn build_router(state: AppState) -> Router {
             get(handlers::cr::get_cr_status)
                 .put(handlers::cr::put_cr_status)
                 .patch(handlers::status::patch_resource_status),
+        )
+        // Cluster-scoped scale subresource — same CRD-only reasoning as the namespaced
+        // scale route above; cluster-scoped CRDs can also declare `subresources.scale`.
+        .route(
+            "/apis/{group}/{version}/{resource}/{name}/scale",
+            get(handlers::cr::get_cr_scale)
+                .put(handlers::cr::put_cr_scale)
+                .patch(handlers::cr::patch_cr_scale),
         )
         // Generic namespaced — status subresource
         .route(

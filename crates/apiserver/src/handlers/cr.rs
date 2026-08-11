@@ -182,6 +182,26 @@ pub struct CrContext {
     /// (CRD group, matched version name, CRD's own resourceVersion) — the
     /// `cr_schema_cache` key for `schema`. See `state::CrSchemaCache` for why.
     pub schema_cache_key: crate::state::CrSchemaCacheKey,
+    /// The matched version's `subresources.scale` configuration, if declared. Unlike
+    /// `has_status_subresource` (a version-independent bool — status is always just the
+    /// `.status` key), scale requires the three CRD-author-declared JSON paths, which are
+    /// specific to the requested version's schema, so this is `None` unless the matched
+    /// version itself declares `subresources.scale`.
+    pub scale: Option<CrScaleConfig>,
+}
+
+/// The three JSONPath-ish field paths (leading `.` stripped) a CRD author declares under
+/// `subresources.scale` for the `/scale` subresource. Mirrors upstream's
+/// `apiextensions/v1.CustomResourceSubresourceScale`.
+#[derive(Debug, Clone)]
+pub struct CrScaleConfig {
+    /// Where the desired replica count lives, e.g. "spec.replicas". Required by the CRD API.
+    pub spec_replicas_path: String,
+    /// Where the actual replica count lives, e.g. "status.replicas". Required by the CRD API.
+    pub status_replicas_path: String,
+    /// Where a pre-rendered label-selector string lives, e.g. "status.selector". Optional —
+    /// HPA treats a missing selector as "" rather than erroring only when this itself is unset.
+    pub label_selector_path: Option<String>,
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
@@ -253,6 +273,36 @@ pub async fn find_crd<S: Store>(
                 .map(|st| !st.is_null())
                 .unwrap_or(false)
         });
+        // Scale config is read from the matched version only (not "any version" like
+        // has_status_subresource above) because the JSON paths themselves are
+        // version-specific: two served versions of the same CRD can shape spec/status
+        // differently, so the wrong version's paths would resolve against the wrong fields.
+        let scale = matched_version
+            .subresources
+            .as_ref()
+            .and_then(|s| s.get("scale"))
+            .filter(|sc| !sc.is_null())
+            .and_then(|sc| {
+                let spec_replicas_path = sc
+                    .get("specReplicasPath")?
+                    .as_str()?
+                    .trim_start_matches('.')
+                    .to_string();
+                let status_replicas_path = sc
+                    .get("statusReplicasPath")?
+                    .as_str()?
+                    .trim_start_matches('.')
+                    .to_string();
+                let label_selector_path = sc
+                    .get("labelSelectorPath")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p.trim_start_matches('.').to_string());
+                Some(CrScaleConfig {
+                    spec_replicas_path,
+                    status_replicas_path,
+                    label_selector_path,
+                })
+            });
         // Extract conversion webhook clientConfig if strategy is Webhook.
         let conversion_webhook_client_config = crd
             .spec
@@ -274,6 +324,7 @@ pub async fn find_crd<S: Store>(
             conversion_webhook_client_config,
             selectable_fields,
             schema_cache_key,
+            scale,
         });
     }
 
@@ -3196,6 +3247,360 @@ pub async fn get_cr_status<S: Store>(
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
     Ok(Json(obj).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// CRD scale subresource
+//
+// Routes:
+//   GET/PUT/PATCH /apis/{group}/{version}/{plural}/{name}/scale               (cluster-scoped)
+//   GET/PUT/PATCH /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale (namespaced)
+//
+// Unlike the apps/v1 scale.rs handlers (hardcoded to spec.replicas/status.replicas), a CRD
+// declares its own `specReplicasPath`/`statusReplicasPath`/`labelSelectorPath` under
+// `subresources.scale` — these routes resolve those CRD-declared paths generically, which is
+// what let this fall through to 404 for every CRD before this: there was no route at all.
+// ---------------------------------------------------------------------------
+
+/// Reads an integer at a CRD-declared dot path (e.g. "spec.replicas"). Mirrors upstream's
+/// `unstructured.NestedInt64` fallback for the scale subresource (apiextensions-apiserver's
+/// `CRToScale`): any missing segment or non-numeric value along the way silently resolves to
+/// 0 rather than erroring, since statusReplicasPath in particular routinely points at a field
+/// that hasn't been written yet (e.g. status before the CR's own controller first reconciles).
+fn scale_path_get_i64(obj: &serde_json::Value, path: &str) -> i64 {
+    let mut cur = obj;
+    for seg in path.split('.') {
+        match cur.get(seg) {
+            Some(next) => cur = next,
+            None => return 0,
+        }
+    }
+    cur.as_i64().unwrap_or(0)
+}
+
+/// Reads a string at a CRD-declared dot path (labelSelectorPath), defaulting to "" when
+/// absent. HPA's `validateAndParseSelector` treats an empty selector as a hard error, so this
+/// default only matters when the CRD author never populates the field — the same failure mode
+/// apps/v1's `label_selector_to_string` already documents.
+fn scale_path_get_str<'a>(obj: &'a serde_json::Value, path: &str) -> &'a str {
+    let mut cur = obj;
+    for seg in path.split('.') {
+        match cur.get(seg) {
+            Some(next) => cur = next,
+            None => return "",
+        }
+    }
+    cur.as_str().unwrap_or("")
+}
+
+/// Writes `new_value` at a CRD-declared dot path, creating intermediate objects as needed
+/// (`serde_json::Value`'s `IndexMut` auto-vivifies a `Null` into an `Object` on indexing,
+/// matching upstream's `unstructured.SetNestedField`). Only ever called with
+/// `specReplicasPath` — `statusReplicasPath`/`labelSelectorPath` are read-only from the scale
+/// subresource's perspective; the CR's own controller owns writing those.
+fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
+    let segs: Vec<&str> = path.split('.').collect();
+    let Some((last, parents)) = segs.split_last() else {
+        return;
+    };
+    let mut cur = obj;
+    for seg in parents {
+        cur = &mut cur[*seg];
+    }
+    cur[*last] = serde_json::json!(new_value);
+}
+
+/// Identifies which stored CR a scale request targets. Grouped into one struct (rather than
+/// four positional args) purely to keep `cr_scale_put_impl`/`cr_scale_patch_impl` under
+/// clippy's `too_many_arguments` limit — mirrors `WatchConfig` elsewhere in this codebase,
+/// which groups arguments for the same reason.
+struct CrScaleTarget<'a> {
+    group: &'a str,
+    plural: &'a str,
+    ns: Option<&'a str>,
+    name: &'a str,
+}
+
+async fn cr_scale_get_impl<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    target: CrScaleTarget<'_>,
+) -> Result<Response, crate::status::StatusError> {
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(|| {
+        Status::not_found(
+            target.name,
+            &format!("scale subresource for {}", target.plural),
+        )
+    })?;
+
+    let key = cr_store_key(target.group, target.plural, target.ns, target.name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
+    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let spec_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
+    let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
+    let selector = scale_cfg
+        .label_selector_path
+        .as_deref()
+        .map(|p| scale_path_get_str(&obj, p))
+        .unwrap_or("");
+    let rv = obj["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    Ok(Json(super::scale::build_scale(
+        target.name,
+        target.ns.unwrap_or(""),
+        spec_replicas,
+        status_replicas,
+        &rv,
+        selector,
+    ))
+    .into_response())
+}
+
+async fn cr_scale_put_impl<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    target: CrScaleTarget<'_>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(|| {
+        Status::not_found(
+            target.name,
+            &format!("scale subresource for {}", target.plural),
+        )
+    })?;
+
+    let scale_body = super::scale::decode_scale_body(body, headers)?;
+    let new_replicas = scale_body
+        .spec
+        .replicas
+        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?;
+
+    let key = cr_store_key(target.group, target.plural, target.ns, target.name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
+    let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Capture actual pod count and selector before changing spec so the response reflects
+    // reality — same ordering apps/v1's scale_put_impl uses, for the same reason.
+    let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
+    let selector = scale_cfg
+        .label_selector_path
+        .as_deref()
+        .map(|p| scale_path_get_str(&obj, p).to_string())
+        .unwrap_or_default();
+
+    scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
+
+    let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    let new_rv = state
+        .store
+        .put(&key, Bytes::from(bytes), expected_rv)
+        .await
+        .map_err(|e| store_err_cr(e, target.name, &ctx.kind))?;
+
+    Ok(Json(super::scale::build_scale(
+        target.name,
+        target.ns.unwrap_or(""),
+        new_replicas as i64,
+        status_replicas,
+        &new_rv.to_string(),
+        &selector,
+    )))
+}
+
+async fn cr_scale_patch_impl<S: Store>(
+    state: &AppState<S>,
+    ctx: &CrContext,
+    target: CrScaleTarget<'_>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let scale_cfg = ctx.scale.as_ref().ok_or_else(|| {
+        Status::not_found(
+            target.name,
+            &format!("scale subresource for {}", target.plural),
+        )
+    })?;
+
+    let scale_body = super::scale::decode_scale_body(body, headers)?;
+
+    let key = cr_store_key(target.group, target.plural, target.ns, target.name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(target.name, &ctx.kind))?;
+    let mut obj: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
+    let selector = scale_cfg
+        .label_selector_path
+        .as_deref()
+        .map(|p| scale_path_get_str(&obj, p).to_string())
+        .unwrap_or_default();
+
+    // Mirrors apps/v1's scale_patch_impl: extract replicas from the patch body if present,
+    // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
+    // is a no-op write, not an error).
+    let new_replicas = match scale_body.spec.replicas {
+        Some(r) => {
+            scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, r as i64);
+            r as i64
+        }
+        None => scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
+    };
+
+    let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+    let new_rv = state
+        .store
+        .put(&key, Bytes::from(bytes), expected_rv)
+        .await
+        .map_err(|e| store_err_cr(e, target.name, &ctx.kind))?;
+
+    Ok(Json(super::scale::build_scale(
+        target.name,
+        target.ns.unwrap_or(""),
+        new_replicas,
+        status_replicas,
+        &new_rv.to_string(),
+        &selector,
+    )))
+}
+
+/// GET /apis/{group}/{version}/{plural}/{name}/scale (cluster-scoped)
+pub async fn get_cr_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let target = CrScaleTarget {
+        group: &group,
+        plural: &plural,
+        ns: None,
+        name: &name,
+    };
+    cr_scale_get_impl(&state, &ctx, target).await
+}
+
+/// PUT /apis/{group}/{version}/{plural}/{name}/scale (cluster-scoped)
+pub async fn put_cr_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let target = CrScaleTarget {
+        group: &group,
+        plural: &plural,
+        ns: None,
+        name: &name,
+    };
+    cr_scale_put_impl(&state, &ctx, target, &headers, &body).await
+}
+
+/// PATCH /apis/{group}/{version}/{plural}/{name}/scale (cluster-scoped)
+pub async fn patch_cr_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let target = CrScaleTarget {
+        group: &group,
+        plural: &plural,
+        ns: None,
+        name: &name,
+    };
+    cr_scale_patch_impl(&state, &ctx, target, &headers, &body).await
+}
+
+/// GET /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale
+pub async fn get_cr_namespaced_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if !ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let target = CrScaleTarget {
+        group: &group,
+        plural: &plural,
+        ns: Some(&ns),
+        name: &name,
+    };
+    cr_scale_get_impl(&state, &ctx, target).await
+}
+
+/// PUT /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale
+pub async fn put_cr_namespaced_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if !ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let target = CrScaleTarget {
+        group: &group,
+        plural: &plural,
+        ns: Some(&ns),
+        name: &name,
+    };
+    cr_scale_put_impl(&state, &ctx, target, &headers, &body).await
+}
+
+/// PATCH /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale
+pub async fn patch_cr_namespaced_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if !ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let target = CrScaleTarget {
+        group: &group,
+        plural: &plural,
+        ns: Some(&ns),
+        name: &name,
+    };
+    cr_scale_patch_impl(&state, &ctx, target, &headers, &body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -6337,6 +6742,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("test".into(), "v1".into(), "0".into()),
+            scale: None,
         };
         // Fresh cache per call: these tests exercise schema-correctness, not caching, and
         // every call here uses the same fixed schema_cache_key — sharing one cache across
@@ -6471,6 +6877,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
+            scale: None,
         };
         // Local to this test (not a shared/global counter) so parallel test execution in
         // the same process cannot pollute the count.
@@ -6513,6 +6920,7 @@ mod tests {
             conversion_webhook_client_config: None,
             selectable_fields: vec![],
             schema_cache_key: ("group.example.com".into(), "v1".into(), rv.into()),
+            scale: None,
         };
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });
@@ -14929,5 +15337,271 @@ mod tests {
             }
             prev = Some((size, elapsed));
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // CRD scale subresource
+    // ---------------------------------------------------------------------------
+
+    /// Builds a namespaced CRD body declaring `subresources.scale` with deliberately
+    /// non-conventional JSON paths (not "spec.replicas"/"status.replicas"). A test built
+    /// on the upstream-typical path names would still pass against a handler that hardcoded
+    /// "spec.replicas" by mistake (copy-pasted from apps/v1's scale.rs); using different
+    /// names here is what actually proves the handler reads the CRD-declared paths generically.
+    fn namespaced_crd_with_scale_subresource_bytes() -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gizmos.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "gizmos",
+                        "singular": "gizmo",
+                        "kind": "Gizmo",
+                        "listKind": "GizmoList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        {
+                            "name": "v1",
+                            "served": true,
+                            "storage": true,
+                            "subresources": {
+                                "scale": {
+                                    "specReplicasPath": ".spec.desiredReplicas",
+                                    "statusReplicasPath": ".status.actualReplicas",
+                                    "labelSelectorPath": ".status.podSelector"
+                                }
+                            }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    async fn install_namespaced_crd_with_scale_subresource(state: &AppState) {
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespaced_crd_with_scale_subresource_bytes(),
+            )
+            .await
+            .is_ok(),
+            "install namespaced CRD with scale subresource"
+        );
+    }
+
+    // GET /scale for a CRD-backed resource must succeed and resolve the CRD's own declared
+    // specReplicasPath/statusReplicasPath/labelSelectorPath — not the apps/v1-hardcoded
+    // spec.replicas/status.replicas. Before this fix, cr.rs had no scale route at all, so an
+    // HPA targeting a CRD-backed resource got an immediate 404 reading replicas
+    // ("Told to stop trying after 0.022s") instead of ever reaching this logic.
+    #[tokio::test]
+    async fn namespaced_cr_scale_get_resolves_crd_declared_paths() {
+        let state = make_state();
+        install_namespaced_crd_with_scale_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let ns = "default".to_string();
+        let plural = "gizmos".to_string();
+        let name = "my-gizmo".to_string();
+
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Gizmo",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "desiredReplicas": 5 },
+                "status": { "actualReplicas": 3, "podSelector": "app=gizmo" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = get_cr_namespaced_scale(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+        )
+        .await
+        .expect(
+            "GET /scale must succeed for a CRD declaring subresources.scale — a 404 here is \
+             exactly the HPA-controller-facing bug this fix closes",
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let scale: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            scale["spec"]["replicas"], 5,
+            "spec.replicas in the Scale object must come from the CRD-declared \
+             specReplicasPath (.spec.desiredReplicas here), not a hardcoded 'spec.replicas' \
+             — this is what makes the handler generic over arbitrary CRD field names"
+        );
+        assert_eq!(
+            scale["status"]["replicas"], 3,
+            "status.replicas must come from the CRD-declared statusReplicasPath"
+        );
+        assert_eq!(
+            scale["status"]["selector"], "app=gizmo",
+            "status.selector must come from the CRD-declared labelSelectorPath — the HPA \
+             controller treats an empty selector as a hard, unrecoverable error"
+        );
+    }
+
+    // PUT /scale is what the HPA controller actually calls to act on a scale-up/down
+    // decision. The write must land at the CRD's own specReplicasPath, not spec.replicas —
+    // a write anywhere else would silently never affect the workload the CR represents.
+    #[tokio::test]
+    async fn namespaced_cr_scale_put_writes_to_crd_declared_spec_path() {
+        let state = make_state();
+        install_namespaced_crd_with_scale_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let ns = "default".to_string();
+        let plural = "gizmos".to_string();
+        let name = "my-gizmo".to_string();
+
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Gizmo",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "desiredReplicas": 2 }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let scale_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "autoscaling/v1",
+                "kind": "Scale",
+                "spec": { "replicas": 7 }
+            })
+            .to_string(),
+        );
+
+        let put_result = put_cr_namespaced_scale(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            axum::http::HeaderMap::new(),
+            scale_body,
+        )
+        .await;
+        assert!(
+            put_result.is_ok(),
+            "PUT /scale must succeed — this is the exact call the HPA controller makes to \
+             act on its scale decision"
+        );
+
+        let resp = get_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("get must succeed");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["spec"]["desiredReplicas"], 7,
+            "PUT /scale must write the new replica count at the CRD-declared \
+             specReplicasPath (.spec.desiredReplicas) — an HPA scale-up that landed anywhere \
+             else would never actually resize the workload"
+        );
+    }
+
+    // A CRD that never declares subresources.scale must not expose a working /scale route —
+    // the same opt-in contract has_status_subresource already enforces for /status. Without
+    // this gate, every CRD (even ones the author never wired for scale) would silently start
+    // answering GET /scale with a bogus all-zero Scale object instead of 404.
+    #[tokio::test]
+    async fn namespaced_cr_scale_get_404s_when_crd_has_no_scale_subresource() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let result = get_cr_namespaced_scale(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+        )
+        .await;
+
+        let err = expect_err_status(
+            result,
+            "scale must 404 when the CRD never declared subresources.scale",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_FOUND,
+            "a CRD that never opted into subresources.scale must not expose a working \
+             /scale route"
+        );
     }
 }
