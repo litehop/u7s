@@ -2693,6 +2693,21 @@ pub fn decode_podtemplate_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Service ----------------------------------------------------
 
+fn gen_session_affinity_config_to_json(sac: core_v1::SessionAffinityConfig) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sac
+        .client_ip
+        .and_then(|c| c.timeout_seconds)
+        .filter(|&v| v != 0)
+    {
+        m.insert(
+            "clientIP".to_string(),
+            serde_json::json!({ "timeoutSeconds": v }),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let svc = core_v1::Service::decode(data).ok()?;
     let meta = gen_object_meta_to_json(svc.metadata.unwrap_or_default());
@@ -2779,6 +2794,83 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 .collect();
             spec_map.insert("ports".to_string(), serde_json::Value::Array(ports_json));
         }
+        if !spec.cluster_i_ps.is_empty() {
+            spec_map.insert(
+                "clusterIPs".to_string(),
+                serde_json::Value::Array(
+                    spec.cluster_i_ps
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        // Deprecated upstream, but a client that sets it still expects it to round trip.
+        if let Some(v) = spec.load_balancer_ip.filter(|s| !s.is_empty()) {
+            spec_map.insert("loadBalancerIP".to_string(), serde_json::Value::String(v));
+        }
+        // A CIDR allowlist restricting which client IPs may reach the load balancer; dropping
+        // it silently turned an access-restricted LoadBalancer Service into an open one.
+        if !spec.load_balancer_source_ranges.is_empty() {
+            spec_map.insert(
+                "loadBalancerSourceRanges".to_string(),
+                serde_json::Value::Array(
+                    spec.load_balancer_source_ranges
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(v) = spec.health_check_node_port.filter(|&v| v != 0) {
+            spec_map.insert(
+                "healthCheckNodePort".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        // StatefulSet headless-Service peer discovery (SRV DNS records) depends on this: it
+        // tells Endpoints/EndpointSlice controllers to publish not-yet-ready pods as endpoints.
+        if let Some(v) = spec.publish_not_ready_addresses {
+            spec_map.insert(
+                "publishNotReadyAddresses".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(sac) = spec.session_affinity_config {
+            let sac_json = gen_session_affinity_config_to_json(sac);
+            if !sac_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                spec_map.insert("sessionAffinityConfig".to_string(), sac_json);
+            }
+        }
+        if !spec.ip_families.is_empty() {
+            spec_map.insert(
+                "ipFamilies".to_string(),
+                serde_json::Value::Array(
+                    spec.ip_families
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(v) = spec.allocate_load_balancer_node_ports {
+            spec_map.insert(
+                "allocateLoadBalancerNodePorts".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = spec.load_balancer_class.filter(|s| !s.is_empty()) {
+            spec_map.insert(
+                "loadBalancerClass".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        if let Some(v) = spec.traffic_distribution.filter(|s| !s.is_empty()) {
+            spec_map.insert(
+                "trafficDistribution".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
         }
@@ -2798,6 +2890,38 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                         }
                         if let Some(v) = i.hostname.filter(|s| !s.is_empty()) {
                             im.insert("hostname".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = i.ip_mode.filter(|s| !s.is_empty()) {
+                            im.insert("ipMode".to_string(), serde_json::Value::String(v));
+                        }
+                        if !i.ports.is_empty() {
+                            let ports: Vec<serde_json::Value> = i
+                                .ports
+                                .into_iter()
+                                .map(|p| {
+                                    let mut pm = serde_json::Map::new();
+                                    if let Some(v) = p.port.filter(|&n| n != 0) {
+                                        pm.insert(
+                                            "port".to_string(),
+                                            serde_json::Value::Number(v.into()),
+                                        );
+                                    }
+                                    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "protocol".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    if let Some(v) = p.error.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "error".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    serde_json::Value::Object(pm)
+                                })
+                                .collect();
+                            im.insert("ports".to_string(), serde_json::Value::Array(ports));
                         }
                         serde_json::Value::Object(im)
                     })
@@ -2819,6 +2943,9 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(v) = c.message.filter(|s| !s.is_empty()) {
                         cm["message"] = v.into();
+                    }
+                    if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+                        cm["observedGeneration"] = v.into();
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
@@ -2896,6 +3023,73 @@ pub fn decode_secret_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 /// overwrote the stored status with `null` instead of the caller's values — wiping phase,
 /// conditions (Ready/MemoryPressure/DiskPressure/PIDPressure), addresses, capacity,
 /// allocatable and nodeInfo, on which all sig-node conformance depends.
+fn gen_node_config_source_to_json(cs: core_v1::NodeConfigSource) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(cm) = cs.config_map {
+        let mut cm_json = serde_json::Map::new();
+        if let Some(v) = cm.namespace.filter(|s| !s.is_empty()) {
+            cm_json.insert("namespace".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = cm.name.filter(|s| !s.is_empty()) {
+            cm_json.insert("name".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = cm.uid.filter(|s| !s.is_empty()) {
+            cm_json.insert("uid".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = cm.resource_version.filter(|s| !s.is_empty()) {
+            cm_json.insert("resourceVersion".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = cm.kubelet_config_key.filter(|s| !s.is_empty()) {
+            cm_json.insert("kubeletConfigKey".to_string(), serde_json::Value::String(v));
+        }
+        m.insert("configMap".to_string(), serde_json::Value::Object(cm_json));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_node_config_status_to_json(cs: core_v1::NodeConfigStatus) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = cs.assigned {
+        m.insert("assigned".to_string(), gen_node_config_source_to_json(v));
+    }
+    if let Some(v) = cs.active {
+        m.insert("active".to_string(), gen_node_config_source_to_json(v));
+    }
+    if let Some(v) = cs.last_known_good {
+        m.insert(
+            "lastKnownGood".to_string(),
+            gen_node_config_source_to_json(v),
+        );
+    }
+    if let Some(v) = cs.error.filter(|s| !s.is_empty()) {
+        m.insert("error".to_string(), serde_json::Value::String(v));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_node_runtime_handler_to_json(h: core_v1::NodeRuntimeHandler) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = h.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(f) = h.features {
+        let mut fm = serde_json::Map::new();
+        if let Some(v) = f.recursive_read_only_mounts {
+            fm.insert(
+                "recursiveReadOnlyMounts".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = f.user_namespaces {
+            fm.insert("userNamespaces".to_string(), serde_json::Value::Bool(v));
+        }
+        if !fm.is_empty() {
+            m.insert("features".to_string(), serde_json::Value::Object(fm));
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
 fn gen_node_status_to_json(status: core_v1::NodeStatus) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if !status.capacity.is_empty() {
@@ -2962,9 +3156,13 @@ fn gen_node_status_to_json(status: core_v1::NodeStatus) -> serde_json::Value {
         .and_then(|de| de.kubelet_endpoint)
         .and_then(|ke| ke.port)
     {
+        // DaemonEndpoint declares `optional int32 Port` (Go-style capitalised name in the
+        // .proto) but the Kubernetes JSON wire form is lowerCamel `port` — emitting the
+        // capitalised key here meant no decoded Node ever actually carried a usable
+        // kubeletEndpoint.port for a client reading the JSON the normal way.
         m.insert(
             "daemonEndpoints".to_string(),
-            serde_json::json!({ "kubeletEndpoint": { "Port": port } }),
+            serde_json::json!({ "kubeletEndpoint": { "port": port } }),
         );
     }
     if let Some(info) = status.node_info {
@@ -3001,6 +3199,9 @@ fn gen_node_status_to_json(status: core_v1::NodeStatus) -> serde_json::Value {
         }
         if let Some(v) = info.architecture.filter(|s| !s.is_empty()) {
             ni.insert("architecture".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = info.swap.and_then(|s| s.capacity).filter(|&c| c != 0) {
+            ni.insert("swap".to_string(), serde_json::json!({ "capacity": v }));
         }
         if !ni.is_empty() {
             m.insert("nodeInfo".to_string(), serde_json::Value::Object(ni));
@@ -3054,6 +3255,29 @@ fn gen_node_status_to_json(status: core_v1::NodeStatus) -> serde_json::Value {
         m.insert(
             "volumesAttached".to_string(),
             serde_json::Value::Array(vols),
+        );
+    }
+    // config reports the status of the (now-legacy) dynamic Kubelet config feature; a client
+    // that set spec.configSource still expects to read back whether it was actually applied.
+    if let Some(cs) = status.config {
+        let cs_json = gen_node_config_status_to_json(cs);
+        if !cs_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            m.insert("config".to_string(), cs_json);
+        }
+    }
+    // runtimeHandlers backs the RecursiveReadOnlyMounts/UserNamespaces feature-detection paths
+    // CRI-aware schedulers/admission use to decide whether a pod's requested mount/userns mode
+    // is supported on this node; dropping it makes every node look like it supports neither.
+    if !status.runtime_handlers.is_empty() {
+        m.insert(
+            "runtimeHandlers".to_string(),
+            serde_json::Value::Array(
+                status
+                    .runtime_handlers
+                    .into_iter()
+                    .map(gen_node_runtime_handler_to_json)
+                    .collect(),
+            ),
         );
     }
     if let Some(v) = status.features.and_then(|f| f.supplemental_groups_policy) {
@@ -3136,6 +3360,17 @@ pub fn decode_node_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if !spec.taints.is_empty() {
             spec_map.insert("taints".to_string(), gen_taints_to_json(spec.taints));
+        }
+        // Both deprecated upstream, but a client that sets either still expects it to round
+        // trip rather than silently vanish.
+        if let Some(v) = spec.external_id.filter(|s| !s.is_empty()) {
+            spec_map.insert("externalID".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(cs) = spec.config_source {
+            let cs_json = gen_node_config_source_to_json(cs);
+            if !cs_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                spec_map.insert("configSource".to_string(), cs_json);
+            }
         }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
@@ -6592,13 +6827,123 @@ mod tests {
              and downward-API status.hostIP consumers see no address"
         );
         assert_eq!(
-            result["status"]["daemonEndpoints"]["kubeletEndpoint"]["Port"], 10250,
-            "status.daemonEndpoints.kubeletEndpoint.Port must survive decode — the API \
-             server's own log/exec/proxy subresources dial this port to reach the kubelet"
+            result["status"]["daemonEndpoints"]["kubeletEndpoint"]["port"], 10250,
+            "status.daemonEndpoints.kubeletEndpoint.port must survive decode under its \
+             lowerCamel JSON key — the API server's own log/exec/proxy subresources dial \
+             this port to reach the kubelet, and a client reading the real Kubernetes JSON \
+             key (\"port\", not the .proto's Go-style \"Port\") would see nothing"
         );
         assert_eq!(
             result["status"]["nodeInfo"]["kubeletVersion"], "v1.36.0",
             "status.nodeInfo must survive decode — version skew checks depend on it"
+        );
+    }
+
+    /// status.config and status.runtimeHandlers survive the generated-path decode.
+    ///
+    /// runtimeHandlers backs the RecursiveReadOnlyMounts/UserNamespaces feature-detection
+    /// paths CRI-aware schedulers/admission use; before this fix, both fields were absent
+    /// from gen_node_status_to_json entirely, so every node looked like it supported neither
+    /// feature and had no dynamic-kubelet-config status, regardless of what the runtime or
+    /// kubelet actually reported.
+    #[test]
+    fn generated_node_preserves_config_status_and_runtime_handlers() {
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("node-1".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::NodeStatus {
+                config: Some(core_v1::NodeConfigStatus {
+                    assigned: Some(core_v1::NodeConfigSource {
+                        config_map: Some(core_v1::ConfigMapNodeConfigSource {
+                            name: Some("kubelet-config".to_string()),
+                            namespace: Some("kube-system".to_string()),
+                            kubelet_config_key: Some("kubelet".to_string()),
+                            ..Default::default()
+                        }),
+                    }),
+                    error: Some("failed to load checkpoint".to_string()),
+                    ..Default::default()
+                }),
+                runtime_handlers: vec![core_v1::NodeRuntimeHandler {
+                    name: Some("runc".to_string()),
+                    features: Some(core_v1::NodeRuntimeHandlerFeatures {
+                        recursive_read_only_mounts: Some(true),
+                        user_namespaces: Some(true),
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_node_proto_gen(&buf)
+            .expect("Node with config/runtimeHandlers status must decode via generated path");
+
+        assert_eq!(
+            result["status"]["config"]["assigned"]["configMap"]["name"], "kubelet-config",
+            "status.config.assigned.configMap.name must survive decode"
+        );
+        assert_eq!(
+            result["status"]["config"]["error"], "failed to load checkpoint",
+            "status.config.error must survive decode — without it a client cannot see why \
+             the assigned config failed to apply"
+        );
+        assert_eq!(
+            result["status"]["runtimeHandlers"][0]["name"], "runc",
+            "status.runtimeHandlers[].name must survive decode"
+        );
+        assert_eq!(
+            result["status"]["runtimeHandlers"][0]["features"]["recursiveReadOnlyMounts"], true,
+            "status.runtimeHandlers[].features.recursiveReadOnlyMounts must survive decode — \
+             without it every node looks like it does not support RecursiveReadOnlyMounts \
+             regardless of what the runtime actually reports"
+        );
+        assert_eq!(
+            result["status"]["runtimeHandlers"][0]["features"]["userNamespaces"], true,
+            "status.runtimeHandlers[].features.userNamespaces must survive decode"
+        );
+    }
+
+    /// spec.externalID and spec.configSource survive the generated-path decode.
+    ///
+    /// Both fields are deprecated upstream, but a client that sets either still expects it
+    /// to round-trip through a protobuf write rather than silently vanish.
+    #[test]
+    fn generated_node_preserves_spec_external_id_and_config_source() {
+        let node = core_v1::Node {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("node-1".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::NodeSpec {
+                external_id: Some("aws:///us-east-1a/i-0123456789".to_string()),
+                config_source: Some(core_v1::NodeConfigSource {
+                    config_map: Some(core_v1::ConfigMapNodeConfigSource {
+                        name: Some("kubelet-config".to_string()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_node_proto_gen(&buf)
+            .expect("Node with deprecated spec fields must decode via generated path");
+
+        assert_eq!(
+            result["spec"]["externalID"], "aws:///us-east-1a/i-0123456789",
+            "spec.externalID must survive decode"
+        );
+        assert_eq!(
+            result["spec"]["configSource"]["configMap"]["name"], "kubelet-config",
+            "spec.configSource must survive decode"
         );
     }
 
@@ -7829,6 +8174,59 @@ mod tests {
 
         let expected =
             crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.PodStatus"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for `gen_node_status_to_json`, gated against the schema itself.
+    ///
+    /// `config`/`runtimeHandlers` (and the features they gate scheduling/admission decisions
+    /// on, like RecursiveReadOnlyMounts/UserNamespaces support) were absent from this function
+    /// entirely, and `daemonEndpoints.kubeletEndpoint.port` was emitted under the .proto's
+    /// Go-style capitalised `Port` instead of the real Kubernetes JSON key — a hand-typed
+    /// expected list would have needed a human to notice both. Deriving `expected` from the
+    /// compiled `FileDescriptorSet` makes a field this function forgets show up automatically.
+    #[test]
+    fn sentinel_completeness_gen_node_status_to_json() {
+        let node = core_v1::Node {
+            status: Some(core_v1::NodeStatus::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        node.encode(&mut buf).unwrap();
+        let result = decode_node_proto_gen(&buf)
+            .expect("sentinel NodeStatus must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result["status"], "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.NodeStatus"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for `decode_service_proto_gen`, gated against the schema itself.
+    ///
+    /// Fifteen ServiceSpec/ServiceStatus.loadBalancer.ingress fields (clusterIPs,
+    /// loadBalancerSourceRanges, publishNotReadyAddresses, sessionAffinityConfig, ipMode on
+    /// LoadBalancerIngress, ...) were absent from this decoder entirely — a hand-typed
+    /// expected list, written by the same person who wrote the emitter, would have needed to
+    /// remember all fifteen. Deriving `expected` from the compiled `FileDescriptorSet` instead
+    /// means a field this function forgets shows up here automatically.
+    #[test]
+    fn sentinel_completeness_gen_service_to_json() {
+        let svc = core_v1::Service::sentinel();
+        let mut buf = Vec::new();
+        svc.encode(&mut buf).unwrap();
+        let result = decode_service_proto_gen(&buf)
+            .expect("sentinel Service must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Service"]);
         let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }

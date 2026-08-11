@@ -2042,6 +2042,162 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression: SelfSubjectAccessReview/SelfSubjectRulesReview with
+    // Content-Type: application/vnd.kubernetes.protobuf must return 201
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal k8s proto envelope for SelfSubjectAccessReview with resourceAttributes
+    /// set (verb=get, resource=pods, namespace=default).
+    fn build_ssar_proto_envelope() -> Vec<u8> {
+        // TypeMeta: field 1 = apiVersion, field 2 = kind
+        let mut type_meta = encode_ld(1, "authorization.k8s.io/v1".as_bytes());
+        type_meta.extend(encode_ld(2, "SelfSubjectAccessReview".as_bytes()));
+
+        // ResourceAttributes: field 1 = namespace, field 2 = verb, field 5 = resource
+        let mut resource_attrs = encode_ld(1, "default".as_bytes());
+        resource_attrs.extend(encode_ld(2, "get".as_bytes()));
+        resource_attrs.extend(encode_ld(5, "pods".as_bytes()));
+
+        // SelfSubjectAccessReviewSpec: field 1 = resourceAttributes
+        let spec_bytes = encode_ld(1, &resource_attrs);
+
+        // SelfSubjectAccessReview: field 2 = spec
+        let ssar_raw = encode_ld(2, &spec_bytes);
+
+        // Unknown envelope: field 1 = TypeMeta, field 2 = raw (SelfSubjectAccessReview proto)
+        let mut envelope = encode_ld(1, &type_meta);
+        envelope.extend(encode_ld(2, &ssar_raw));
+
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00];
+        body.extend(envelope);
+        body
+    }
+
+    /// Sending a protobuf-encoded SelfSubjectAccessReview body must return 201, not 400, and
+    /// the decoded resourceAttributes must actually reach the RBAC check.
+    ///
+    /// Before this fix, "SelfSubjectAccessReview" had no dispatch arm in
+    /// decode_proto_by_kind_and_version, so extract_body returned raw protobuf bytes and
+    /// this handler's serde_json::from_slice failed with 400 for every client-go typed
+    /// clientset call — Argo CD calls SelfSubjectAccessReview on startup to discover its own
+    /// permissions, so this blocked that workflow outright.
+    #[tokio::test]
+    async fn ssar_proto_body_returns_201_not_400() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(Body::from(build_ssar_proto_envelope()))
+            .unwrap();
+        req.extensions_mut().insert(user("alice", &[]));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SelfSubjectAccessReview with a protobuf body must return 201, not 400 — a missing \
+             dispatch arm previously made extract_body return undecoded bytes here"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "SelfSubjectAccessReview");
+        assert_eq!(
+            val["status"]["allowed"], true,
+            "the decoded resourceAttributes (verb=get, resource=pods) must actually reach the \
+             RBAC check, not just avoid a 400 — alice's binding authorizes exactly this"
+        );
+    }
+
+    /// Build a minimal k8s proto envelope for SelfSubjectRulesReview with namespace=default.
+    fn build_ssrr_proto_envelope() -> Vec<u8> {
+        let mut type_meta = encode_ld(1, "authorization.k8s.io/v1".as_bytes());
+        type_meta.extend(encode_ld(2, "SelfSubjectRulesReview".as_bytes()));
+
+        // SelfSubjectRulesReviewSpec: field 1 = namespace
+        let spec_bytes = encode_ld(1, "default".as_bytes());
+
+        // SelfSubjectRulesReview: field 2 = spec
+        let ssrr_raw = encode_ld(2, &spec_bytes);
+
+        let mut envelope = encode_ld(1, &type_meta);
+        envelope.extend(encode_ld(2, &ssrr_raw));
+
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00];
+        body.extend(envelope);
+        body
+    }
+
+    /// Sending a protobuf-encoded SelfSubjectRulesReview body must return 201, not 400, and the
+    /// decoded namespace must actually reach rule enumeration.
+    ///
+    /// Same root cause as SelfSubjectAccessReview above: no dispatch arm meant every protobuf
+    /// call (client-go's default content-type) hit a hard 400 instead of a result.
+    #[tokio::test]
+    async fn ssrr_proto_body_returns_201_not_400() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "verbs": ["list"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                post(self_subject_rules_review),
+            )
+            .with_state(state);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(Body::from(build_ssrr_proto_envelope()))
+            .unwrap();
+        req.extensions_mut().insert(user("alice", &[]));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SelfSubjectRulesReview with a protobuf body must return 201, not 400 — a missing \
+             dispatch arm previously made extract_body return undecoded bytes here"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "SelfSubjectRulesReview");
+        let rules = val["status"]["resourceRules"].as_array().unwrap();
+        assert_eq!(
+            rules.len(),
+            1,
+            "the decoded namespace must actually reach enumerate_rules, not just avoid a 400 \
+             — alice's one bound rule must be enumerated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Regression: Content-Type: application/json must not produce 415
     // -----------------------------------------------------------------------
 
