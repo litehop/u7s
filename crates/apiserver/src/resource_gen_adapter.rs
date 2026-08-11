@@ -1557,6 +1557,13 @@ mod tests {
 
     #[test]
     fn sentinel_completeness_decode_deviceclass_proto_gen() {
+        // parameters.raw must be a JSON *scalar*, not an object: RawExtension is opaque to the
+        // oracle (its own field name IS the leaf, since the schema can't know what shape
+        // arbitrary driver config takes), so an object payload would recurse one level deeper
+        // (".parameters.a") and never satisfy the oracle's exact ".parameters" leaf — while still
+        // needing to be valid JSON to exercise gen_json_raw_to_value's real parsing path (a
+        // blind `RawExtension::sentinel()` fills `raw` with non-JSON bytes, which is silently —
+        // and correctly — dropped, so completeness here would be untestable without this).
         let dc = resource_v1::DeviceClass {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             spec: Some(resource_v1::DeviceClassSpec {
@@ -1566,7 +1573,7 @@ mod tests {
                             driver: Some("__sentinel__".to_string()),
                             parameters: Some(
                                 crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
-                                    raw: Some(br#"{"a":1}"#.to_vec()),
+                                    raw: Some(br#"1"#.to_vec()),
                                 },
                             ),
                         }),
@@ -1592,6 +1599,13 @@ mod tests {
 
     #[test]
     fn sentinel_completeness_decode_resourceclaim_proto_gen() {
+        // Every RawExtension.raw below is a JSON *scalar*, not an object — see the comment on
+        // sentinel_completeness_decode_deviceclass_proto_gen for why. `status.allocation` also
+        // needs its own explicit override (rather than relying on `ResourceClaimStatus::sentinel()`
+        // blindly filling it): the same DeviceConfiguration/OpaqueDeviceConfiguration/
+        // RawExtension chain is reachable there too, and a blind sentinel's non-JSON raw bytes
+        // would otherwise leave `status.allocation.devices.config.deviceConfiguration.opaque.
+        // parameters` untestable for the same reason.
         let rc = resource_v1::ResourceClaim {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             spec: Some(resource_v1::ResourceClaimSpec {
@@ -1602,7 +1616,7 @@ mod tests {
                                 driver: Some("__sentinel__".to_string()),
                                 parameters: Some(
                                     crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
-                                        raw: Some(br#"{"a":1}"#.to_vec()),
+                                        raw: Some(br#"1"#.to_vec()),
                                     },
                                 ),
                             }),
@@ -1616,11 +1630,30 @@ mod tests {
                 devices: vec![resource_v1::AllocatedDeviceStatus {
                     data: Some(
                         crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
-                            raw: Some(br#"{"b":2}"#.to_vec()),
+                            raw: Some(br#"2"#.to_vec()),
                         },
                     ),
                     ..resource_v1::AllocatedDeviceStatus::sentinel()
                 }],
+                allocation: Some(resource_v1::AllocationResult {
+                    devices: Some(resource_v1::DeviceAllocationResult {
+                        config: vec![resource_v1::DeviceAllocationConfiguration {
+                            device_configuration: Some(resource_v1::DeviceConfiguration {
+                                opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                    driver: Some("__sentinel__".to_string()),
+                                    parameters: Some(
+                                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                            raw: Some(br#"3"#.to_vec()),
+                                        },
+                                    ),
+                                }),
+                            }),
+                            ..resource_v1::DeviceAllocationConfiguration::sentinel()
+                        }],
+                        ..resource_v1::DeviceAllocationResult::sentinel()
+                    }),
+                    ..resource_v1::AllocationResult::sentinel()
+                }),
                 ..resource_v1::ResourceClaimStatus::sentinel()
             }),
         };
@@ -1641,6 +1674,8 @@ mod tests {
 
     #[test]
     fn sentinel_completeness_decode_resourceclaimtemplate_proto_gen() {
+        // parameters.raw is a JSON scalar, not an object — see the comment on
+        // sentinel_completeness_decode_deviceclass_proto_gen for why.
         let rct = resource_v1::ResourceClaimTemplate {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             spec: Some(resource_v1::ResourceClaimTemplateSpec {
@@ -1652,7 +1687,7 @@ mod tests {
                                     driver: Some("__sentinel__".to_string()),
                                     parameters: Some(
                                         crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
-                                            raw: Some(br#"{"a":1}"#.to_vec()),
+                                            raw: Some(br#"1"#.to_vec()),
                                         },
                                     ),
                                 }),

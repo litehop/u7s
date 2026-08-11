@@ -371,37 +371,10 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&decoded, "", &mut paths);
 
-        // selfLink is a legacy field the system no longer populates (see the .proto's own
-        // "Deprecated" comment) — permanently omitted, not a gap.
-        //
-        // deletionTimestamp/deletionGracePeriodSeconds/managedFields are left off `expected`
-        // pending a separate investigation into gen_object_meta_to_json's correct handling of
-        // them; do not guess at the fix here.
-        let expected = [
-            "name",
-            "generateName",
-            "namespace",
-            "uid",
-            "resourceVersion",
-            "generation",
-            "creationTimestamp",
-            "labels",
-            "annotations",
-            "ownerReferences",
-            "finalizers",
-            "port",
-            "group",
-            "version",
-            "insecureSkipTLSVerify",
-            "caBundle",
-            "groupPriorityMinimum",
-            "versionPriority",
-            "type",
-            "status",
-            "lastTransitionTime",
-            "reason",
-            "message",
-        ];
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.kube_aggregator.pkg.apis.apiregistration.v1.APIService",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
     }
 }

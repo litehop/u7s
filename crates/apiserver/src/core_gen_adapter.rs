@@ -896,22 +896,16 @@ fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
         );
     }
     if let Some(res) = c.resources {
-        let mut res_map = serde_json::Map::new();
-        if !res.limits.is_empty() {
-            res_map.insert("limits".to_string(), gen_quantity_map_to_json(res.limits));
-        }
-        if !res.requests.is_empty() {
-            res_map.insert(
-                "requests".to_string(),
-                gen_quantity_map_to_json(res.requests),
-            );
-        }
+        // gen_resource_requirements_to_json also handles `claims` (DRA resource claim
+        // references) — a hand-inlined limits/requests-only copy here previously dropped it,
+        // silently resolving every `resources.claims[].name` reference to nothing.
+        let res_json = gen_resource_requirements_to_json(res);
         // Only emit "resources" when non-empty — see gen_downward_api_volume_source_to_json
         // for why materializing a wire-absent value breaks workload-template hash-collision
         // equality checks. k8s.io/api's Container.Resources is a value (not pointer) type, so
         // it is always present after protobuf decode even when the client set nothing.
-        if !res_map.is_empty() {
-            cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
+        if res_json.as_object().is_some_and(|m| !m.is_empty()) {
+            cm.insert("resources".to_string(), res_json);
         }
     }
     if let Some(p) = c.liveness_probe {
@@ -2145,17 +2139,13 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     // elsewhere in this function rather than the container-resources one. Dropping it silently
     // discards fine-grained CPU/memory sharing the client configured across all containers.
     if let Some(res) = spec.resources {
-        let mut res_map = serde_json::Map::new();
-        if !res.limits.is_empty() {
-            res_map.insert("limits".to_string(), gen_quantity_map_to_json(res.limits));
-        }
-        if !res.requests.is_empty() {
-            res_map.insert(
-                "requests".to_string(),
-                gen_quantity_map_to_json(res.requests),
-            );
-        }
-        spec_map.insert("resources".to_string(), serde_json::Value::Object(res_map));
+        // gen_resource_requirements_to_json also handles `claims` (DRA resource claim
+        // references) — a hand-inlined limits/requests-only copy here previously dropped it,
+        // silently resolving every pod-level `resources.claims[].name` reference to nothing.
+        spec_map.insert(
+            "resources".to_string(),
+            gen_resource_requirements_to_json(res),
+        );
     }
     // hostnameOverride — alpha HostnameOverride feature gate; takes precedence over
     // hostname/subdomain for what the pod perceives as its own hostname. Dropping it silently
@@ -3984,6 +3974,26 @@ pub fn decode_serviceaccount_proto_gen(data: &[u8]) -> Option<serde_json::Value>
             .filter_map(|r| {
                 let name = r.name.filter(|s| !s.is_empty())?;
                 let mut m = serde_json::json!({ "name": name });
+                // kind/namespace/uid/apiVersion/resourceVersion are real ObjectReference fields
+                // a client is entitled to set on a secrets[] entry (matching every other
+                // ObjectReference decoder in this codebase, e.g.
+                // net_disc_cert_policy_events_gen_adapter's gen_object_reference_to_json) —
+                // dropping them would silently corrupt a GET-modify-PUT round trip.
+                if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+                    m["kind"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.namespace.filter(|s| !s.is_empty()) {
+                    m["namespace"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.uid.filter(|s| !s.is_empty()) {
+                    m["uid"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
+                    m["apiVersion"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.resource_version.filter(|s| !s.is_empty()) {
+                    m["resourceVersion"] = serde_json::Value::String(v);
+                }
                 if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
                     m["fieldPath"] = serde_json::Value::String(v);
                 }
@@ -8685,23 +8695,25 @@ mod tests {
         collect_leaf_paths(&result["spec"], "", &mut paths);
         collect_leaf_paths(&result["status"], "", &mut paths);
 
+        // Every container field below (selector/resources/dataSource/etc.) is never itself a
+        // real leaf once populated; each gets a dotted entry pointing at a genuine leaf child.
         let expected = [
             "accessModes",
-            "selector",
-            "resources",
+            "selector.matchLabels.__sentinel__",
+            "resources.limits.__sentinel__",
             "volumeName",
             "storageClassName",
             "volumeMode",
-            "dataSource",
-            "dataSourceRef",
+            "dataSource.apiGroup",
+            "dataSourceRef.apiGroup",
             "volumeAttributesClassName",
             "phase",
-            "capacity",
-            "conditions",
-            "allocatedResources",
-            "allocatedResourceStatuses",
+            "capacity.__sentinel__",
+            "conditions.status",
+            "allocatedResources.__sentinel__",
+            "allocatedResourceStatuses.__sentinel__",
             "currentVolumeAttributesClassName",
-            "modifyVolumeStatus",
+            "modifyVolumeStatus.status",
         ];
         assert_fields_present(&paths, &expected);
     }
@@ -9209,8 +9221,14 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&spec_only, "", &mut paths);
 
+        // Every container field below (volumes/nodeSelector/securityContext/etc.) is never
+        // itself a real leaf once populated — only a genuine descendant leaf can survive strict
+        // leaf-path matching, so each gets a dotted entry pointing at one of its own fields
+        // instead of relying on its bare (never-a-leaf) name. PodSecurityContext's own
+        // completeness is covered separately by sentinel_completeness_gen_pod_security_context_to_json;
+        // this only needs one leaf proving it survives at all.
         let expected = [
-            "volumes",
+            "volumes.name",
             "initContainers",
             "containers",
             "ephemeralContainers",
@@ -9218,7 +9236,7 @@ mod tests {
             "terminationGracePeriodSeconds",
             "activeDeadlineSeconds",
             "dnsPolicy",
-            "nodeSelector",
+            "nodeSelector.__sentinel__",
             "serviceAccountName",
             "serviceAccount",
             "automountServiceAccountToken",
@@ -9227,31 +9245,31 @@ mod tests {
             "hostPID",
             "hostIPC",
             "shareProcessNamespace",
-            "securityContext",
-            "imagePullSecrets",
+            "securityContext.runAsUser",
+            "imagePullSecrets.name",
             "hostname",
             "subdomain",
-            "affinity",
+            "affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.weight",
             "schedulerName",
-            "tolerations",
-            "hostAliases",
+            "tolerations.key",
+            "hostAliases.ip",
             "priorityClassName",
             "priority",
-            "dnsConfig",
-            "readinessGates",
+            "dnsConfig.nameservers",
+            "readinessGates.conditionType",
             "runtimeClassName",
             "enableServiceLinks",
             "preemptionPolicy",
-            "overhead",
-            "topologySpreadConstraints",
+            "overhead.__sentinel__",
+            "topologySpreadConstraints.maxSkew",
             "setHostnameAsFQDN",
-            "os",
+            "os.name",
             "hostUsers",
-            "schedulingGates",
-            "resourceClaims",
-            "resources",
+            "schedulingGates.name",
+            "resourceClaims.name",
+            "resources.claims.name",
             "hostnameOverride",
-            "schedulingGroup",
+            "schedulingGroup.podGroupName",
         ];
         assert_fields_present(&paths, &expected);
     }
@@ -9262,29 +9280,35 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&pod["spec"]["containers"], "", &mut paths);
 
+        // Every container field below (ports/envFrom/env/resources/etc.) is never itself a real
+        // leaf once populated — this is the exact shape of bug that originally motivated this
+        // sentinel test: "volumeMounts" alone passed even though VolumeMount.mountPropagation
+        // was silently dropped, because some *other* field of the same VolumeMount (e.g.
+        // mountPath) surviving was enough. Each entry below now pins the check to a genuine leaf
+        // child; "volumeMounts.mountPropagation" specifically re-checks that original finding.
         let expected = [
             "name",
             "image",
             "command",
             "args",
             "workingDir",
-            "ports",
-            "envFrom",
-            "env",
-            "resources",
-            "resizePolicy",
+            "ports.containerPort",
+            "envFrom.prefix",
+            "env.name",
+            "resources.claims.name",
+            "resizePolicy.resourceName",
             "restartPolicy",
-            "restartPolicyRules",
-            "volumeMounts",
-            "volumeDevices",
-            "livenessProbe",
-            "readinessProbe",
-            "startupProbe",
-            "lifecycle",
+            "restartPolicyRules.action",
+            "volumeMounts.mountPropagation",
+            "volumeDevices.devicePath",
+            "livenessProbe.initialDelaySeconds",
+            "readinessProbe.initialDelaySeconds",
+            "startupProbe.initialDelaySeconds",
+            "lifecycle.postStart.sleep.seconds",
             "terminationMessagePath",
             "terminationMessagePolicy",
             "imagePullPolicy",
-            "securityContext",
+            "securityContext.privileged",
             "stdin",
             "stdinOnce",
             "tty",

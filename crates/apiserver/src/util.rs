@@ -347,16 +347,31 @@ pub(crate) mod sentinel_test_util {
         }
     }
 
-    /// True if `field` appears as a whole path segment somewhere in `leaf_paths` — i.e. it was
-    /// decoded at some level, regardless of nesting depth. Segment (not full-path) matching is
-    /// deliberate: this only cares whether a field survived decode at all, matching the
-    /// historical bug shape of a field dropped entirely from a gen_*_to_json function.
+    /// True if `field` matches a leaf path exactly, or is the trailing (dotted) suffix of one —
+    /// i.e. `field` names a real decoded *leaf*, not merely some struct's field name occurring
+    /// anywhere in the tree. This is deliberately stricter than "any path segment matches
+    /// anywhere": a bare `"mountPropagation"` used to pass the moment ANY leaf anywhere in the
+    /// tree had that segment, even a same-named field on a completely unrelated struct several
+    /// levels away — a dropped `VolumeMount.mountPropagation` was once masked by an unrelated
+    /// struct's own field of the same name surviving decode, which is exactly the class of bug
+    /// this tightening closes. Suffix matching still lets a bare field name stand in for its own
+    /// full path when it happens to be unambiguous, but a caller that needs to pin a field to a
+    /// specific nested struct (there are same-named leaves at different depths, e.g.
+    /// `NetworkPolicySpec.podSelector` vs. nested `NetworkPolicyPeer.podSelector`) must spell out
+    /// enough of the dotted path to disambiguate.
     fn has_field(leaf_paths: &BTreeSet<String>, field: &str) -> bool {
+        let suffix = format!(".{field}");
         leaf_paths
             .iter()
-            .any(|p| p.split('.').any(|seg| seg == field))
+            .any(|p| p == field || p.ends_with(&suffix))
     }
 
+    /// Convention going forward: new sentinel-completeness tests should build `expected` from
+    /// `proto_descriptor::expected_json_keys_for` (the descriptor-derived oracle) rather than
+    /// hand-typing a list — a hand-written list is a second, independent transcription of the
+    /// same `gen_*_to_json` function it is meant to check, so a field forgotten in both places
+    /// passes silently. Hand-written lists remaining in the codebase are legacy; migrate them to
+    /// the oracle opportunistically rather than adding new ones.
     pub(crate) fn assert_fields_present(leaf_paths: &BTreeSet<String>, expected: &[&str]) {
         let missing: Vec<&str> = expected
             .iter()
@@ -1489,5 +1504,53 @@ mod tests {
             "groupPriorityMinimum must survive: the aggregator uses it to order competing groups"
         );
         assert_eq!(json["spec"]["versionPriority"], 15);
+    }
+
+    // -- sentinel_test_util::assert_fields_present --
+
+    /// The matcher must distinguish "this field is a real decoded leaf" from "this name occurs
+    /// as *some* segment of *some* leaf path" — the latter is the any-segment bug that let a
+    /// dropped `VolumeMount.mountPropagation` hide behind an unrelated struct's same-named field
+    /// surviving decode. A leaf genuinely at `a.b.c` must satisfy both the full
+    /// path and a disambiguating suffix (`"b.c"`), a path that matches nothing must fail, and —
+    /// the case any-segment matching got wrong — a name that only ever occurs as an
+    /// *intermediate* segment of an unrelated leaf (`unrelated.foo.bar`, where `foo` is a
+    /// structural segment, not the field actually decoded) must NOT satisfy `expected: ["foo"]`.
+    /// Under the old any-segment matcher this last case passed; if it starts passing again, the
+    /// exact same class of decode-drop can hide behind an unrelated field again.
+    #[test]
+    fn sentinel_test_util_assert_fields_present_denies_any_segment_matching() {
+        use super::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
+
+        let value = serde_json::json!({
+            "a": { "b": { "c": "leaf-value" } },
+            "unrelated": { "foo": { "bar": "other-leaf" } }
+        });
+        let mut paths = std::collections::BTreeSet::new();
+        collect_leaf_paths(&value, "", &mut paths);
+
+        // Full dotted leaf path matches exactly.
+        assert_fields_present(&paths, &["a.b.c"]);
+        // A disambiguating suffix of a real leaf path matches too.
+        assert_fields_present(&paths, &["b.c"]);
+
+        // A path that is not a suffix of any real leaf must fail.
+        let result = std::panic::catch_unwind(|| assert_fields_present(&paths, &["x.y"]));
+        assert!(
+            result.is_err(),
+            "\"x.y\" matches no leaf path in the tree — assert_fields_present must fail, not \
+             silently pass"
+        );
+
+        // "foo" is only ever an intermediate segment of "unrelated.foo.bar" — under any-segment
+        // matching this would incorrectly pass. It must fail here: "foo" is not itself the
+        // decoded leaf, "bar" is.
+        let result = std::panic::catch_unwind(|| assert_fields_present(&paths, &["foo"]));
+        assert!(
+            result.is_err(),
+            "\"foo\" only occurs as a structural (non-leaf) segment of \"unrelated.foo.bar\" — \
+             matching it would resurrect the any-segment bug that hid a dropped \
+             VolumeMount.mountPropagation behind an unrelated field of the same name"
+        );
     }
 }

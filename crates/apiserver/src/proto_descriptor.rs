@@ -46,6 +46,14 @@ const OPAQUE_MESSAGES: &[&str] = &[
     ".k8s.io.apimachinery.pkg.runtime.RawExtension",
     ".k8s.io.apimachinery.pkg.apis.meta.v1.FieldsV1",
     ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSON",
+    // `{items: repeated string}` on the wire — protobuf's only way to put a repeated scalar in a
+    // map value — but Go's `type ExtraValue []string` marshals as a bare JSON string array, not
+    // `{"items": [...]}`. Two separate proto messages share this exact shape and Go type,
+    // confirmed against `gen_certificate_signing_request_spec_to_json`
+    // (net_disc_cert_policy_events_gen_adapter.rs) and `gen_sar_spec_to_json`
+    // (rbac_gen_adapter.rs), both of which assign `v.items` directly as the map entry's value.
+    ".k8s.io.api.certificates.v1.ExtraValue",
+    ".k8s.io.api.authorization.v1.ExtraValue",
 ];
 
 /// Fields whose JSON key is not derivable from the proto field name at all.
@@ -59,6 +67,46 @@ const RENAMES: &[(&str, &str, &str)] = &[
         ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
         "schema",
         "$schema",
+    ),
+    // JSONSchemaProps' x-kubernetes-* fields mirror the upstream OpenAPI/CRD schema's own
+    // kebab-case JSON keys (see the .proto field comments, e.g. "x-kubernetes-preserve-unknown-
+    // fields stops the API server..."), not the mechanical camelCase `json_name` protoc derives
+    // from the Go-style field name — confirmed against `gen_json_schema_props_to_json`
+    // (apiextensions_gen_adapter.rs), which emits these exact kebab-case keys.
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesPreserveUnknownFields",
+        "x-kubernetes-preserve-unknown-fields",
+    ),
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesEmbeddedResource",
+        "x-kubernetes-embedded-resource",
+    ),
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesIntOrString",
+        "x-kubernetes-int-or-string",
+    ),
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesListMapKeys",
+        "x-kubernetes-list-map-keys",
+    ),
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesListType",
+        "x-kubernetes-list-type",
+    ),
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesMapType",
+        "x-kubernetes-map-type",
+    ),
+    (
+        ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps",
+        "xKubernetesValidations",
+        "x-kubernetes-validations",
     ),
 ];
 
@@ -114,6 +162,21 @@ const INLINE_EMBEDS: &[(&str, &str)] = &[
     // which would have permanently blocked a zero-KNOWN_GAPS sentinel test on every decoder
     // reaching a livenessProbe/readinessProbe/startupProbe.
     (".k8s.io.api.core.v1.Probe", "handler"),
+    // `RuleWithOperations` Go-embeds `Rule` inline via a field literally named `rule` ("Rule is
+    // embedded, it describes other criteria of the rule, like APIGroups, APIVersions,
+    // Resources, etc." per the .proto comment); `gen_rule_with_operations_to_json`
+    // (admissionreg_gen_adapter.rs) already inserts apiGroups/apiVersions/resources/scope
+    // directly onto the RuleWithOperations object, matching upstream's inline serialization.
+    (
+        ".k8s.io.api.admissionregistration.v1.RuleWithOperations",
+        "rule",
+    ),
+    // `NamedRuleWithOperations` Go-embeds `RuleWithOperations` inline via a field literally
+    // named `ruleWithOperations`, the same pattern one level up.
+    (
+        ".k8s.io.api.admissionregistration.v1.NamedRuleWithOperations",
+        "ruleWithOperations",
+    ),
 ];
 
 /// Fields the decoders deliberately do not emit. Each entry is a decision, not an oversight;
@@ -558,15 +621,22 @@ fn is_inline_embed(owner: &str, field_name: &str) -> bool {
 /// The JSON keys a fully-populated `root` must produce, following message-typed fields
 /// transitively.
 ///
-/// Each message type is expanded at most once. That matches `u7s_sentinel::sentinel_guard`, which
-/// returns `Default::default()` when a type is re-entered while already being built — so a
-/// recursive type like `JSONSchemaProps` contributes its field names once and its self-referential
-/// branches bottom out, exactly as the sentinel instance does.
+/// A message type is expanded at most once per recursion *stack*, not once ever: that matches
+/// `u7s_sentinel::sentinel_guard`, which only short-circuits to `Default::default()` when `T` is
+/// already being built further up the SAME call stack (it pushes on entry and pops on exit, so
+/// sibling fields of the same type each get their own turn). A truly self-referential type like
+/// `JSONSchemaProps` still bottoms out (it re-enters itself on the same stack), but two sibling
+/// fields of an ordinary type — e.g. `PodSpec.containers` and `PodSpec.initContainers`, both
+/// `Container` — must each contribute their own dotted leaves (`containers.name` AND
+/// `initContainers.name`), because the sentinel populates both independently. A set keyed only by
+/// type name (visited-once-ever) would silently expand just whichever field the descriptor
+/// happens to declare first and leave the other with no leaves at all — worse than the coarse
+/// bare-name output it replaces, since that field's whole subtree would go unchecked.
 pub(crate) fn expected_json_keys(root: &str) -> BTreeSet<String> {
     let index = message_index();
     let mut keys = BTreeSet::new();
-    let mut expanded = BTreeSet::new();
-    walk(index, root, &mut keys, &mut expanded);
+    let mut stack = Vec::new();
+    walk(index, root, "", &mut keys, &mut stack);
     keys
 }
 
@@ -576,13 +646,34 @@ pub(crate) fn expected_json_keys_for(roots: &[&str]) -> BTreeSet<String> {
     roots.iter().flat_map(|r| expected_json_keys(r)).collect()
 }
 
+/// If `type_name` is protoc's synthetic message for a `map<K, V>` field, describes what the
+/// map's value contributes: `Some(None)` for a scalar value (nothing further to walk — the
+/// field's own path is the only thing worth demanding), `Some(Some(value_type))` for a
+/// message-typed value (walk `value_type` to find its leaves), or `None` if `type_name` is not a
+/// map entry at all.
+fn map_value_type<'a>(
+    index: &'a HashMap<String, DescriptorProto>,
+    type_name: &str,
+) -> Option<Option<&'a str>> {
+    let entry = index.get(type_name)?;
+    if !entry.options.as_ref().is_some_and(|o| o.map_entry()) {
+        return None;
+    }
+    let value_field = entry.field.iter().find(|f| f.name() == "value")?;
+    Some(match value_field.r#type() {
+        Type::Message | Type::Group => Some(value_field.type_name()),
+        _ => None,
+    })
+}
+
 fn walk(
     index: &HashMap<String, DescriptorProto>,
     message_name: &str,
+    parent: &str,
     keys: &mut BTreeSet<String>,
-    expanded: &mut BTreeSet<String>,
+    stack: &mut Vec<String>,
 ) {
-    if OPAQUE_MESSAGES.contains(&message_name) || !expanded.insert(message_name.to_string()) {
+    if OPAQUE_MESSAGES.contains(&message_name) || stack.iter().any(|m| m == message_name) {
         return;
     }
     let Some(message) = index.get(message_name) else {
@@ -591,6 +682,8 @@ fn walk(
 
     let is_map_entry = message.options.as_ref().is_some_and(|o| o.map_entry());
 
+    stack.push(message_name.to_string());
+
     for field in &message.field {
         // A field that is never emitted cannot contribute its children either, so an excluded
         // message-typed field stops the walk rather than demanding sub-keys that can only appear
@@ -598,20 +691,75 @@ fn walk(
         if !is_map_entry && is_excluded(message_name, field.name()) {
             continue;
         }
-        // A map<K, V> is one JSON object keyed by the map's own field name; protoc's synthetic
-        // `key`/`value` fields are an encoding detail and never appear as JSON keys. The value
-        // type is still walked so a message-valued map contributes its fields.
-        //
-        // A Go `json:",inline"` embed is the mirror image of an exclusion: the field's own name
-        // is never a JSON key, but (unlike an exclusion) the walk must still descend, because the
-        // embedded message's fields land directly on the parent.
-        if !is_map_entry && !is_inline_embed(message_name, field.name()) {
-            keys.insert(json_key(message_name, field.name(), field.json_name()));
+        // A Go `json:",inline"` embed never contributes its own JSON key, but (unlike an
+        // exclusion) the walk must still descend, at the SAME path, because the embedded
+        // message's fields land directly on the parent rather than nesting under the embed's
+        // own field name.
+        if !is_map_entry && is_inline_embed(message_name, field.name()) {
+            if matches!(field.r#type(), Type::Message | Type::Group) {
+                walk(index, field.type_name(), parent, keys, stack);
+            }
+            continue;
         }
-        if matches!(field.r#type(), Type::Message | Type::Group) {
-            walk(index, field.type_name(), keys, expanded);
+        if is_map_entry {
+            // Inside a map-entry message the synthetic `key`/`value` fields are an encoding
+            // detail; they are handled by the map-field branch below, in the PARENT's loop,
+            // before `walk` ever recurses into an entry message directly.
+            continue;
+        }
+
+        let key = json_key(message_name, field.name(), field.json_name());
+        let path = if parent.is_empty() {
+            key
+        } else {
+            format!("{parent}.{key}")
+        };
+
+        if !matches!(field.r#type(), Type::Message | Type::Group) {
+            // A genuine scalar/enum leaf: its own path IS a real decoded leaf.
+            keys.insert(path);
+            continue;
+        }
+
+        // A map<K, V> is one JSON object keyed by the map's own field name, but everything
+        // reachable *through* it sits under a data-dependent key the schema cannot know.
+        // `u7s_sentinel`'s blanket `Sentinel for String` always returns the literal
+        // `"__sentinel__"` for map keys, and every map key in this schema is a string
+        // (protobuf disallows anything else, and every Kubernetes map in the vendored API is
+        // `map[string]V`) — so a sentinel-populated map's one entry is deterministically keyed
+        // `"__sentinel__"`, and that literal stands in for the real (arbitrary) data key.
+        if let Some(value_type) = map_value_type(index, field.type_name()) {
+            let map_entry_path = format!("{path}.__sentinel__");
+            match value_type {
+                None => {
+                    keys.insert(map_entry_path);
+                }
+                Some(value_type_name) => {
+                    let before = keys.len();
+                    walk(index, value_type_name, &map_entry_path, keys, stack);
+                    if keys.len() == before {
+                        keys.insert(map_entry_path);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // A message-typed field that is itself always emitted non-empty once its own leaves
+        // are decoded (i.e. every struct-shaped field a Sentinel populates) is never itself a
+        // JSON *leaf* — only its descendants are. Demanding the field's own name here as well
+        // would be un-satisfiable by construction against real decoded JSON: only if the type
+        // contributes zero leaves of its own (excluded down to nothing, or a genuinely
+        // self-referential re-entry bottoming out) does the field's own name serve as the
+        // leaf-level stand-in for "this substructure exists."
+        let before = keys.len();
+        walk(index, field.type_name(), &path, keys, stack);
+        if keys.len() == before {
+            keys.insert(path);
         }
     }
+
+    stack.pop();
 }
 
 #[cfg(test)]
@@ -658,12 +806,20 @@ mod tests {
         );
     }
 
-    /// A map<string,string> contributes only its own field name. Without the map_entry guard the
-    /// oracle would demand literal `key`/`value` keys in every object carrying labels.
+    /// A map<string,string>'s own field name is never itself a decoded *leaf* once populated —
+    /// real JSON is `{"labels": {"<data-key>": "<data-value>"}}`, and the data key is something
+    /// only the sentinel (not the schema) knows. `walk()` stands in the deterministic
+    /// `u7s_sentinel` map key literal (`"__sentinel__"`, from its blanket `Sentinel for String`)
+    /// so the oracle demands a leaf that a real sentinel-populated decode can actually produce.
+    /// Without the map_entry guard the oracle would additionally demand literal `key`/`value`
+    /// keys in every object carrying labels.
     #[test]
     fn treats_map_fields_as_a_single_key() {
         let keys = expected_json_keys(".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta");
-        assert!(keys.contains("labels") && keys.contains("annotations"));
+        assert!(
+            keys.contains("labels.__sentinel__") && keys.contains("annotations.__sentinel__"),
+            "got {keys:?}"
+        );
         assert!(
             !keys.contains("key") && !keys.contains("value"),
             "protoc's synthetic map-entry key/value fields are an encoding detail and must not be \
@@ -740,11 +896,17 @@ mod tests {
     }
 
     /// `PersistentVolumeSpec` embeds `PersistentVolumeSource` inline: plugin fields like `nfs`
-    /// land directly under `spec`, and `persistentVolumeSource` never appears as a JSON key.
+    /// land directly under `spec`, and `persistentVolumeSource` never appears as a JSON key. `nfs`
+    /// and `hostPath` are themselves non-empty structs once populated, so — like `metadata` or
+    /// `spec` anywhere else — their OWN bare name is never a real decoded leaf; only their
+    /// dotted-path descendants (`nfs.path`, `hostPath.path`) are.
     #[test]
     fn inlines_persistentvolumesource_fields_onto_persistentvolumespec() {
         let keys = expected_json_keys(".k8s.io.api.core.v1.PersistentVolumeSpec");
-        assert!(keys.contains("nfs") && keys.contains("hostPath"));
+        assert!(
+            keys.contains("nfs.path") && keys.contains("hostPath.path"),
+            "got {keys:?}"
+        );
         assert!(
             !keys.contains("persistentVolumeSource"),
             "persistentVolumeSource is a Go inline embed, not a JSON key a decoder can ever \
@@ -753,11 +915,15 @@ mod tests {
     }
 
     /// `Volume` embeds `VolumeSource` inline: plugin fields like `hostPath` land directly on each
-    /// `volumes[]` entry, and `volumeSource` never appears as a JSON key.
+    /// `volumes[]` entry, and `volumeSource` never appears as a JSON key. Same non-leaf-container
+    /// reasoning as `PersistentVolumeSpec` above: only the dotted descendants are real leaves.
     #[test]
     fn inlines_volumesource_fields_onto_volume() {
         let keys = expected_json_keys(".k8s.io.api.core.v1.Volume");
-        assert!(keys.contains("hostPath") && keys.contains("emptyDir"));
+        assert!(
+            keys.contains("hostPath.path") && keys.contains("emptyDir.medium"),
+            "got {keys:?}"
+        );
         assert!(
             !keys.contains("volumeSource"),
             "volumeSource is a Go inline embed, not a JSON key a decoder can ever emit, got {keys:?}"
@@ -768,18 +934,27 @@ mod tests {
     /// on each livenessProbe/readinessProbe/startupProbe, and `handler` never appears as a JSON
     /// key. Unlike the other `INLINE_EMBEDS` entries this one has no accompanying
     /// `DELIBERATE_OMISSIONS`-shaped deprecation story — `Probe.handler`'s .proto comment
-    /// carries no `Deprecated:` marker, it is simply Go's inline-embed idiom.
+    /// carries no `Deprecated:` marker, it is simply Go's inline-embed idiom. `exec`/`httpGet`
+    /// are themselves non-empty structs once populated, so their dotted descendants
+    /// (`exec.command`, `httpGet.path`) are the real leaves, not their own bare names.
     #[test]
     fn inlines_probehandler_fields_onto_probe() {
         let keys = expected_json_keys(".k8s.io.api.core.v1.Probe");
-        assert!(keys.contains("exec") && keys.contains("httpGet"));
+        assert!(
+            keys.contains("exec.command") && keys.contains("httpGet.path"),
+            "got {keys:?}"
+        );
         assert!(
             !keys.contains("handler"),
             "handler is a Go inline embed, not a JSON key a decoder can ever emit, got {keys:?}"
         );
     }
 
-    /// The self-referential branches of JSONSchemaProps must not make the walk diverge.
+    /// The self-referential branches of JSONSchemaProps must not make the walk diverge. `allOf`
+    /// (`repeated JSONSchemaProps`) re-enters the same type on the same recursion stack, which
+    /// bottoms out with zero descendant keys, so `allOf`'s own bare name is kept as the
+    /// leaf-level stand-in. `properties` is a `map<string, JSONSchemaProps>`, so it additionally
+    /// gets the deterministic sentinel map-key literal.
     #[test]
     fn terminates_on_self_referential_messages() {
         let keys = expected_json_keys(
@@ -787,7 +962,7 @@ mod tests {
         );
         assert!(keys.contains("$ref") && keys.contains("$schema"));
         assert!(
-            keys.contains("allOf") && keys.contains("properties"),
+            keys.contains("allOf") && keys.contains("properties.__sentinel__"),
             "recursive fields must still be expected once, got {keys:?}"
         );
     }
@@ -818,7 +993,9 @@ mod tests {
                         let missing: Vec<&str> = expected
                             .iter()
                             .filter(|f| {
-                                !paths.iter().any(|p| p.split('.').any(|s| s == f.as_str()))
+                                !paths
+                                    .iter()
+                                    .any(|p| p == f.as_str() || p.ends_with(&format!(".{f}")))
                             })
                             .map(String::as_str)
                             .collect();
@@ -978,6 +1155,29 @@ mod tests {
         println!(
             "\nTOTAL: {total_missing} of {total_expected} schema fields never reach JSON across {} decoders",
             rows.len()
+        );
+    }
+
+    /// The oracle's keys must be full dotted leaf paths, not bare field names — a bare `name`
+    /// would satisfy `assert_fields_present` the moment ANY struct's `name` field anywhere in
+    /// the decoded tree survives (the any-segment bug this oracle exists to avoid), so a dropped
+    /// `Container.name` could hide behind `ObjectMeta.name` or any other unrelated `name`. The
+    /// walk must instead emit `spec.containers.name`, which only a genuinely-decoded
+    /// `PodSpec.containers[].name` can satisfy.
+    #[test]
+    fn walk_emits_dotted_leaf_paths_not_bare_field_names() {
+        let keys = expected_json_keys(".k8s.io.api.core.v1.Pod");
+        assert!(
+            keys.contains("spec.containers.name"),
+            "Pod's containers[].name must be expected as the dotted path spec.containers.name, \
+             got {keys:?}"
+        );
+        assert!(
+            !keys.contains("name"),
+            "a bare \"name\" key must not appear in Pod's expected set — Pod has no top-level \
+             \"name\" field of its own (only nested ones like metadata.name and \
+             spec.containers.name), so a bare \"name\" here would mean the walk regressed to \
+             any-segment-shaped output, got {keys:?}"
         );
     }
 
