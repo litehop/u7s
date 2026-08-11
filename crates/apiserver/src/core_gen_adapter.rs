@@ -1110,12 +1110,9 @@ fn gen_node_selector_term_to_json(term: core_v1::NodeSelectorTerm) -> serde_json
     serde_json::Value::Object(m)
 }
 
-/// Only `nodeAffinity` is decoded here — `podAffinity`/`podAntiAffinity` are dropped
-/// from the returned JSON. This mirrors crates/scheduler, which has no matching logic
-/// for pod (anti-)affinity yet, so there is no consumer for those fields today. If a
-/// pod sets only podAffinity/podAntiAffinity (no nodeAffinity), it round-trips through
-/// this decoder as `spec.affinity: {}` — a narrower, pre-existing version of the same
-/// silent-drop bug this function fixes for nodeAffinity.
+/// Only `nodeAffinity` is decoded here — `podAffinity`/`podAntiAffinity` live in
+/// `gen_pod_affinity_to_json`/`gen_pod_anti_affinity_to_json` below. crates/scheduler still does
+/// not enforce pod (anti-)affinity, but the fields do round-trip.
 fn gen_node_affinity_to_json(na: core_v1::NodeAffinity) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(req) = na.required_during_scheduling_ignored_during_execution {
@@ -1157,6 +1154,119 @@ fn gen_node_affinity_to_json(na: core_v1::NodeAffinity) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(m)
+}
+
+fn gen_pod_affinity_term_to_json(term: core_v1::PodAffinityTerm) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(sel) = term.label_selector {
+        m.insert("labelSelector".to_string(), gen_label_selector_to_json(sel));
+    }
+    if !term.namespaces.is_empty() {
+        m.insert(
+            "namespaces".to_string(),
+            serde_json::Value::Array(
+                term.namespaces
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(v) = term.topology_key.filter(|s| !s.is_empty()) {
+        m.insert("topologyKey".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(sel) = term.namespace_selector {
+        m.insert(
+            "namespaceSelector".to_string(),
+            gen_label_selector_to_json(sel),
+        );
+    }
+    if !term.match_label_keys.is_empty() {
+        m.insert(
+            "matchLabelKeys".to_string(),
+            serde_json::Value::Array(
+                term.match_label_keys
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !term.mismatch_label_keys.is_empty() {
+        m.insert(
+            "mismatchLabelKeys".to_string(),
+            serde_json::Value::Array(
+                term.mismatch_label_keys
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// `PodAffinity` and `PodAntiAffinity` are structurally identical on the wire (the same two
+/// fields, the same element types) — they only differ in which key they land under on the
+/// parent `Affinity` object, so `gen_pod_affinity_to_json`/`gen_pod_anti_affinity_to_json` both
+/// delegate here rather than duplicating the required/preferred handling twice.
+fn gen_pod_affinity_terms_pair_to_json(
+    required: Vec<core_v1::PodAffinityTerm>,
+    preferred: Vec<core_v1::WeightedPodAffinityTerm>,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !required.is_empty() {
+        m.insert(
+            "requiredDuringSchedulingIgnoredDuringExecution".to_string(),
+            serde_json::Value::Array(
+                required
+                    .into_iter()
+                    .map(gen_pod_affinity_term_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !preferred.is_empty() {
+        m.insert(
+            "preferredDuringSchedulingIgnoredDuringExecution".to_string(),
+            serde_json::Value::Array(
+                preferred
+                    .into_iter()
+                    .map(|w| {
+                        let mut wm = serde_json::Map::new();
+                        if let Some(weight) = w.weight {
+                            wm.insert(
+                                "weight".to_string(),
+                                serde_json::Value::Number(weight.into()),
+                            );
+                        }
+                        if let Some(term) = w.pod_affinity_term {
+                            wm.insert(
+                                "podAffinityTerm".to_string(),
+                                gen_pod_affinity_term_to_json(term),
+                            );
+                        }
+                        serde_json::Value::Object(wm)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_pod_affinity_to_json(pa: core_v1::PodAffinity) -> serde_json::Value {
+    gen_pod_affinity_terms_pair_to_json(
+        pa.required_during_scheduling_ignored_during_execution,
+        pa.preferred_during_scheduling_ignored_during_execution,
+    )
+}
+
+fn gen_pod_anti_affinity_to_json(paa: core_v1::PodAntiAffinity) -> serde_json::Value {
+    gen_pod_affinity_terms_pair_to_json(
+        paa.required_during_scheduling_ignored_during_execution,
+        paa.preferred_during_scheduling_ignored_during_execution,
+    )
 }
 
 fn gen_label_selector_requirement_to_json(
@@ -1537,11 +1647,20 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
     }
     // affinity.nodeAffinity — same silent-drop mechanism and same conformance coverage as
     // nodeSelector above ("... validates that NodeAffinity is respected if not matching").
-    // See gen_node_affinity_to_json for the podAffinity/podAntiAffinity caveat.
+    // podAffinity/podAntiAffinity round-trip too (crates/scheduler still doesn't enforce them).
     if let Some(affinity) = spec.affinity {
         let mut am = serde_json::Map::new();
         if let Some(na) = affinity.node_affinity {
             am.insert("nodeAffinity".to_string(), gen_node_affinity_to_json(na));
+        }
+        if let Some(pa) = affinity.pod_affinity {
+            am.insert("podAffinity".to_string(), gen_pod_affinity_to_json(pa));
+        }
+        if let Some(paa) = affinity.pod_anti_affinity {
+            am.insert(
+                "podAntiAffinity".to_string(),
+                gen_pod_anti_affinity_to_json(paa),
+            );
         }
         spec_map.insert("affinity".to_string(), serde_json::Value::Object(am));
     }
@@ -5591,6 +5710,111 @@ mod tests {
         assert_eq!(
             c["matchLabelKeys"][0], "pod-template-hash",
             "matchLabelKeys must survive decode"
+        );
+    }
+
+    /// decode_pod_proto_gen must preserve spec.affinity.podAffinity/podAntiAffinity
+    /// (Affinity fields 2 and 3), not just nodeAffinity.
+    ///
+    /// This is a JSON round-trip fix only — crates/scheduler does not enforce pod
+    /// (anti-)affinity yet, so this test does not claim scheduling behavior changed. Before
+    /// this fix, a client that set only podAffinity/podAntiAffinity (no nodeAffinity) on a
+    /// protobuf-encoded pod create got back `spec.affinity: {}` on a subsequent GET — the
+    /// value it wrote was silently gone.
+    #[test]
+    fn generated_pod_spec_preserves_pod_affinity_and_anti_affinity() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("colocate-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                affinity: Some(core_v1::Affinity {
+                    pod_affinity: Some(core_v1::PodAffinity {
+                        required_during_scheduling_ignored_during_execution: vec![
+                            core_v1::PodAffinityTerm {
+                                label_selector: Some(meta_v1::LabelSelector {
+                                    match_labels: [("app".to_string(), "cache".to_string())]
+                                        .into_iter()
+                                        .collect(),
+                                    ..Default::default()
+                                }),
+                                namespaces: vec!["shared".to_string()],
+                                topology_key: Some("kubernetes.io/hostname".to_string()),
+                                namespace_selector: Some(meta_v1::LabelSelector {
+                                    match_labels: [(
+                                        "kubernetes.io/metadata.name".to_string(),
+                                        "shared".to_string(),
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                    ..Default::default()
+                                }),
+                                mismatch_label_keys: vec!["pod-template-hash".to_string()],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                    pod_anti_affinity: Some(core_v1::PodAntiAffinity {
+                        preferred_during_scheduling_ignored_during_execution: vec![
+                            core_v1::WeightedPodAffinityTerm {
+                                weight: Some(50),
+                                pod_affinity_term: Some(core_v1::PodAffinityTerm {
+                                    topology_key: Some("topology.kubernetes.io/zone".to_string()),
+                                    ..Default::default()
+                                }),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod must decode");
+
+        let required = &result["spec"]["affinity"]["podAffinity"]
+            ["requiredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(
+            required["labelSelector"]["matchLabels"]["app"], "cache",
+            "podAffinity.requiredDuringSchedulingIgnoredDuringExecution[].labelSelector must \
+             survive decode — before this fix the whole podAffinity key was dropped"
+        );
+        assert_eq!(
+            required["namespaces"][0], "shared",
+            "podAffinityTerm.namespaces must survive decode"
+        );
+        assert_eq!(
+            required["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"], "shared",
+            "podAffinityTerm.namespaceSelector must survive decode"
+        );
+        assert_eq!(
+            required["mismatchLabelKeys"][0], "pod-template-hash",
+            "podAffinityTerm.mismatchLabelKeys must survive decode"
+        );
+
+        let preferred = &result["spec"]["affinity"]["podAntiAffinity"]
+            ["preferredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(
+            preferred["weight"], 50,
+            "podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[].weight must \
+             survive decode — before this fix the whole podAntiAffinity key was dropped"
+        );
+        assert_eq!(
+            preferred["podAffinityTerm"]["topologyKey"], "topology.kubernetes.io/zone",
+            "podAntiAffinity's nested podAffinityTerm must survive decode"
         );
     }
 
