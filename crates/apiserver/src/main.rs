@@ -16,7 +16,11 @@ async fn main() -> anyhow::Result<()> {
     // Defaults to "dhat-heap.json" in the process's CWD (dhat's own default)
     // unless overridden, so callers that need a stable, workdir-relative
     // location (e.g. scripts/conformance/run-all.sh --profile) can set it.
-    let mut profiler_builder = dhat::Profiler::builder();
+    // dhat's default backtrace depth (10 frames) is too shallow for this
+    // codebase's async/serde call chains: deep or recursive allocation sites
+    // collapse into a single anonymous "depth-truncated" bucket instead of
+    // being attributed to a specific callsite.
+    let mut profiler_builder = dhat::Profiler::builder().trim_backtraces(Some(50));
     if let Ok(heap_file) = std::env::var("U7S_DHAT_HEAP_FILE") {
         profiler_builder = profiler_builder.file_name(heap_file);
     }
