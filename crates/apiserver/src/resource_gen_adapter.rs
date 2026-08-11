@@ -1288,6 +1288,163 @@ mod tests {
         );
     }
 
+    /// OpaqueDeviceConfiguration.parameters is a RawExtension: the only way a DeviceClass
+    /// conveys driver-specific configuration, and opaque-by-design so the control plane can
+    /// never validate its shape itself. Losing it silently makes the driver configure every
+    /// device in the class with no parameters at all instead of failing loud.
+    #[test]
+    fn decode_deviceclass_proto_gen_round_trips_opaque_config_parameters() {
+        let dc = resource_v1::DeviceClass {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("gpu.example.com".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(resource_v1::DeviceClassSpec {
+                config: vec![resource_v1::DeviceClassConfiguration {
+                    device_configuration: Some(resource_v1::DeviceConfiguration {
+                        opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                            driver: Some("gpu.example.com".to_string()),
+                            parameters: Some(
+                                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                    raw: Some(br#"{"clockSpeed":"3.5GHz"}"#.to_vec()),
+                                },
+                            ),
+                        }),
+                    }),
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        dc.encode(&mut buf).unwrap();
+
+        let result = decode_deviceclass_proto_gen(&buf).expect("DeviceClass must decode");
+
+        assert_eq!(
+            result["spec"]["config"][0]["deviceConfiguration"]["opaque"]["parameters"]
+                ["clockSpeed"],
+            "3.5GHz",
+            "OpaqueDeviceConfiguration.parameters must survive decode as its actual JSON value \
+             — a silently dropped or null blob makes the driver configure the device class with \
+             no parameters at all, with no error to surface the loss"
+        );
+    }
+
+    /// ResourceClaim carries two independent RawExtension driver-config blobs:
+    /// spec.devices.config[].deviceConfiguration.opaque.parameters (input the claim gives the
+    /// driver) and status.devices[].data (state the driver reports back). The kubelet reads
+    /// `data` to prepare an allocated device for the pod, so losing either silently breaks
+    /// driver configuration on one end or device preparation on the other.
+    #[test]
+    fn decode_resourceclaim_proto_gen_round_trips_opaque_parameters_and_status_data() {
+        let rc = resource_v1::ResourceClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("gpu-claim".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(resource_v1::ResourceClaimSpec {
+                devices: Some(resource_v1::DeviceClaim {
+                    config: vec![resource_v1::DeviceClaimConfiguration {
+                        device_configuration: Some(resource_v1::DeviceConfiguration {
+                            opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                driver: Some("gpu.example.com".to_string()),
+                                parameters: Some(
+                                    crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                        raw: Some(br#"{"mig":"1g.10gb"}"#.to_vec()),
+                                    },
+                                ),
+                            }),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }),
+            status: Some(resource_v1::ResourceClaimStatus {
+                devices: vec![resource_v1::AllocatedDeviceStatus {
+                    driver: Some("gpu.example.com".to_string()),
+                    pool: Some("node-1".to_string()),
+                    device: Some("gpu-0".to_string()),
+                    data: Some(
+                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                            raw: Some(br#"{"uuid":"GPU-1234"}"#.to_vec()),
+                        },
+                    ),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).unwrap();
+
+        let result = decode_resourceclaim_proto_gen(&buf).expect("ResourceClaim must decode");
+
+        assert_eq!(
+            result["spec"]["devices"]["config"][0]["deviceConfiguration"]["opaque"]["parameters"]
+                ["mig"],
+            "1g.10gb",
+            "spec.devices.config[].deviceConfiguration.opaque.parameters must survive decode — \
+             it is how a claim tells the driver how to configure the device it allocates"
+        );
+        assert_eq!(
+            result["status"]["devices"][0]["data"]["uuid"], "GPU-1234",
+            "status.devices[].data must survive decode — the kubelet reads driver-reported \
+             per-device state from here to prepare the device for the pod"
+        );
+    }
+
+    /// ResourceClaimTemplate.spec.spec is copied verbatim into every ResourceClaim the control
+    /// plane generates from the template, so its embedded
+    /// OpaqueDeviceConfiguration.parameters must survive decode or every claim created from
+    /// this template inherits driver configuration with no parameters.
+    #[test]
+    fn decode_resourceclaimtemplate_proto_gen_round_trips_embedded_opaque_config_parameters() {
+        let rct = resource_v1::ResourceClaimTemplate {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("gpu-template".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(resource_v1::ResourceClaimTemplateSpec {
+                spec: Some(resource_v1::ResourceClaimSpec {
+                    devices: Some(resource_v1::DeviceClaim {
+                        config: vec![resource_v1::DeviceClaimConfiguration {
+                            device_configuration: Some(resource_v1::DeviceConfiguration {
+                                opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                    driver: Some("gpu.example.com".to_string()),
+                                    parameters: Some(
+                                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                            raw: Some(br#"{"mig":"2g.20gb"}"#.to_vec()),
+                                        },
+                                    ),
+                                }),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        rct.encode(&mut buf).unwrap();
+
+        let result = decode_resourceclaimtemplate_proto_gen(&buf)
+            .expect("ResourceClaimTemplate must decode");
+
+        assert_eq!(
+            result["spec"]["spec"]["devices"]["config"][0]["deviceConfiguration"]["opaque"]
+                ["parameters"]["mig"],
+            "2g.20gb",
+            "the embedded ResourceClaimSpec's OpaqueDeviceConfiguration.parameters must survive \
+             decode — it is copied verbatim into every ResourceClaim the control plane creates \
+             from this template"
+        );
+    }
+
     // ---- Field-omission: all-default proto must decode with no stray nulls ----
     //
     // The round-trip tests above check `result["metadata"]["namespace"].is_null()`, which is
@@ -1373,5 +1530,177 @@ mod tests {
             decoded.get("spec").is_none(),
             "an unset ResourceSliceSpec must be absent, not null"
         );
+    }
+
+    // ---- Sentinel completeness: every schema field must reach the decoded JSON ----
+    //
+    // Derived from the compiled `FileDescriptorSet` (see `proto_descriptor::expected_json_keys_for`)
+    // rather than hand-listed, so a field added upstream is demanded here automatically instead of
+    // relying on a human to notice. Before this section existed this file had zero tests of this
+    // shape at all — the ObjectMeta/PodStatus history in core_gen_adapter.rs is exactly the bug
+    // class it exists to catch: a field can be forgotten in both the decoder and a hand-typed
+    // `expected` list at once, and the hand-typed list can't tell you it's wrong.
+    //
+    // `DeviceClassSpec`/`ResourceClaimSpec`/`ResourceClaimTemplateSpec` each reach an
+    // `OpaqueDeviceConfiguration.parameters` (or `AllocatedDeviceStatus.data`) RawExtension leaf
+    // somewhere in their tree. A blind `::sentinel()` on those types would fill that RawExtension's
+    // `raw` bytes with an arbitrary non-JSON byte (see `u7s_sentinel::Sentinel`'s impl for
+    // `Vec<u8>`), which `gen_raw_extension_to_json` silently (and correctly) drops when it fails to
+    // parse as JSON — so the three tests below override just that leaf with valid JSON, matching
+    // `apps_gen_adapter`'s `ControllerRevision` precedent, to actually exercise the "survives
+    // decode" path instead of one that would pass green even if the pass-through were deleted.
+
+    use std::collections::BTreeSet;
+    use u7s_sentinel::Sentinel;
+
+    use crate::util::sentinel_test_util::{assert_fields_present, collect_leaf_paths};
+
+    #[test]
+    fn sentinel_completeness_decode_deviceclass_proto_gen() {
+        let dc = resource_v1::DeviceClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::DeviceClassSpec {
+                config: vec![resource_v1::DeviceClassConfiguration {
+                    device_configuration: Some(resource_v1::DeviceConfiguration {
+                        opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                            driver: Some("__sentinel__".to_string()),
+                            parameters: Some(
+                                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                    raw: Some(br#"{"a":1}"#.to_vec()),
+                                },
+                            ),
+                        }),
+                    }),
+                }],
+                ..resource_v1::DeviceClassSpec::sentinel()
+            }),
+        };
+        let mut buf = Vec::new();
+        dc.encode(&mut buf).unwrap();
+        let decoded = decode_deviceclass_proto_gen(&buf)
+            .expect("sentinel DeviceClass must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.resource.v1.DeviceClass",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_resourceclaim_proto_gen() {
+        let rc = resource_v1::ResourceClaim {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceClaimSpec {
+                devices: Some(resource_v1::DeviceClaim {
+                    config: vec![resource_v1::DeviceClaimConfiguration {
+                        device_configuration: Some(resource_v1::DeviceConfiguration {
+                            opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                driver: Some("__sentinel__".to_string()),
+                                parameters: Some(
+                                    crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                        raw: Some(br#"{"a":1}"#.to_vec()),
+                                    },
+                                ),
+                            }),
+                        }),
+                        ..resource_v1::DeviceClaimConfiguration::sentinel()
+                    }],
+                    ..resource_v1::DeviceClaim::sentinel()
+                }),
+            }),
+            status: Some(resource_v1::ResourceClaimStatus {
+                devices: vec![resource_v1::AllocatedDeviceStatus {
+                    data: Some(
+                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                            raw: Some(br#"{"b":2}"#.to_vec()),
+                        },
+                    ),
+                    ..resource_v1::AllocatedDeviceStatus::sentinel()
+                }],
+                ..resource_v1::ResourceClaimStatus::sentinel()
+            }),
+        };
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).unwrap();
+        let decoded = decode_resourceclaim_proto_gen(&buf)
+            .expect("sentinel ResourceClaim must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.resource.v1.ResourceClaim",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    #[test]
+    fn sentinel_completeness_decode_resourceclaimtemplate_proto_gen() {
+        let rct = resource_v1::ResourceClaimTemplate {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceClaimTemplateSpec {
+                spec: Some(resource_v1::ResourceClaimSpec {
+                    devices: Some(resource_v1::DeviceClaim {
+                        config: vec![resource_v1::DeviceClaimConfiguration {
+                            device_configuration: Some(resource_v1::DeviceConfiguration {
+                                opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                    driver: Some("__sentinel__".to_string()),
+                                    parameters: Some(
+                                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                            raw: Some(br#"{"a":1}"#.to_vec()),
+                                        },
+                                    ),
+                                }),
+                            }),
+                            ..resource_v1::DeviceClaimConfiguration::sentinel()
+                        }],
+                        ..resource_v1::DeviceClaim::sentinel()
+                    }),
+                }),
+                ..resource_v1::ResourceClaimTemplateSpec::sentinel()
+            }),
+        };
+        let mut buf = Vec::new();
+        rct.encode(&mut buf).unwrap();
+        let decoded = decode_resourceclaimtemplate_proto_gen(&buf)
+            .expect("sentinel ResourceClaimTemplate must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.resource.v1.ResourceClaimTemplate",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// ResourceSlice has no RawExtension-typed field anywhere in its tree, so unlike the three
+    /// tests above a blind `::sentinel()` is sufficient here — this is the one decoder in the
+    /// file the survey already found nothing missing in; this test is what locks that in.
+    #[test]
+    fn sentinel_completeness_decode_resourceslice_proto_gen() {
+        let rs = resource_v1::ResourceSlice {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceSliceSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        rs.encode(&mut buf).unwrap();
+        let decoded = decode_resourceslice_proto_gen(&buf)
+            .expect("sentinel ResourceSlice must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.resource.v1.ResourceSlice",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
     }
 }
