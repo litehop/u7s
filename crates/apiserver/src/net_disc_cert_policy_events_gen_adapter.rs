@@ -408,6 +408,161 @@ pub fn decode_ingressclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     Some(out)
 }
 
+// ---- Decoder A: NetworkPolicy (networking.k8s.io/v1) --------------------------
+//
+// Without a dispatch arm + decoder for this kind, a client-go networking/v1 typed clientset
+// Create()/Update() of a NetworkPolicy (default content-type protobuf) hits extract_body's
+// undecodable fallback and the generic create handler gets raw protobuf bytes it can't
+// JSON-parse — every such request fails outright instead of just dropping fields.
+
+fn gen_network_policy_port_to_json(p: networking_v1::NetworkPolicyPort) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+        m.insert("protocol".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(port) = p.port {
+        m.insert("port".to_string(), gen_int_or_string_to_json(&port));
+    }
+    if let Some(v) = p.end_port.filter(|&n| n != 0) {
+        m.insert("endPort".to_string(), serde_json::Value::Number(v.into()));
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_ip_block_to_json(b: networking_v1::IpBlock) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = b.cidr.filter(|s| !s.is_empty()) {
+        m.insert("cidr".to_string(), serde_json::Value::String(v));
+    }
+    if !b.except.is_empty() {
+        m.insert(
+            "except".to_string(),
+            serde_json::Value::Array(
+                b.except
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn gen_network_policy_peer_to_json(p: networking_v1::NetworkPolicyPeer) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(sel) = p.pod_selector {
+        m.insert("podSelector".to_string(), gen_label_selector_to_json(sel));
+    }
+    if let Some(sel) = p.namespace_selector {
+        m.insert(
+            "namespaceSelector".to_string(),
+            gen_label_selector_to_json(sel),
+        );
+    }
+    // ipBlock is mutually exclusive with the two selectors above; dropping it would silently
+    // turn an IP-CIDR-scoped rule into one that matches nothing (no selector matches either).
+    if let Some(b) = p.ip_block {
+        m.insert("ipBlock".to_string(), gen_ip_block_to_json(b));
+    }
+    serde_json::Value::Object(m)
+}
+
+pub fn decode_networkpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = networking_v1::NetworkPolicy::decode(data).ok()?;
+    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::Map::new();
+        if let Some(sel) = spec.pod_selector {
+            spec_json.insert("podSelector".to_string(), gen_label_selector_to_json(sel));
+        }
+        if !spec.ingress.is_empty() {
+            let rules: Vec<serde_json::Value> = spec
+                .ingress
+                .into_iter()
+                .map(|r| {
+                    let mut rj = serde_json::Map::new();
+                    if !r.ports.is_empty() {
+                        rj.insert(
+                            "ports".to_string(),
+                            serde_json::Value::Array(
+                                r.ports
+                                    .into_iter()
+                                    .map(gen_network_policy_port_to_json)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    if !r.from.is_empty() {
+                        rj.insert(
+                            "from".to_string(),
+                            serde_json::Value::Array(
+                                r.from
+                                    .into_iter()
+                                    .map(gen_network_policy_peer_to_json)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    serde_json::Value::Object(rj)
+                })
+                .collect();
+            spec_json.insert("ingress".to_string(), serde_json::Value::Array(rules));
+        }
+        if !spec.egress.is_empty() {
+            let rules: Vec<serde_json::Value> = spec
+                .egress
+                .into_iter()
+                .map(|r| {
+                    let mut rj = serde_json::Map::new();
+                    if !r.ports.is_empty() {
+                        rj.insert(
+                            "ports".to_string(),
+                            serde_json::Value::Array(
+                                r.ports
+                                    .into_iter()
+                                    .map(gen_network_policy_port_to_json)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    if !r.to.is_empty() {
+                        rj.insert(
+                            "to".to_string(),
+                            serde_json::Value::Array(
+                                r.to.into_iter()
+                                    .map(gen_network_policy_peer_to_json)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    serde_json::Value::Object(rj)
+                })
+                .collect();
+            spec_json.insert("egress".to_string(), serde_json::Value::Array(rules));
+        }
+        if !spec.policy_types.is_empty() {
+            spec_json.insert(
+                "policyTypes".to_string(),
+                serde_json::Value::Array(
+                    spec.policy_types
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !spec_json.is_empty() {
+            out["spec"] = serde_json::Value::Object(spec_json);
+        }
+    }
+    Some(out)
+}
+
 // ---- Decoder A: IPAddress (networking.k8s.io/v1) -----------------------------
 //
 // Without a dispatch arm + decoder for this kind, extract_body cannot decode a
@@ -1451,6 +1606,112 @@ mod tests {
             // namespace is masked by metadata.namespace already being sentinel-populated.
         ]);
         assert_fields_present(&paths, &expected);
+    }
+
+    /// Derived from the .proto schema rather than hand-listed, so a field added upstream to
+    /// NetworkPolicySpec (or its nested Ingress/Egress/Peer/Port/IPBlock messages) is demanded
+    /// here automatically instead of when someone remembers to type it — see the Lease sentinel
+    /// test in coord_gen_adapter.rs for the same pattern.
+    #[test]
+    fn sentinel_completeness_decode_networkpolicy_proto_gen() {
+        let np = networking_v1::NetworkPolicy {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::NetworkPolicySpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        np.encode(&mut buf).unwrap();
+        let result = decode_networkpolicy_proto_gen(&buf)
+            .expect("sentinel NetworkPolicy must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&result, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.networking.v1.NetworkPolicy",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// decode_proto_by_kind_and_version must dispatch NetworkPolicy proto and preserve
+    /// spec.podSelector/ingress/policyTypes.
+    ///
+    /// Before adding this decoder + its proto.rs dispatch arm, "NetworkPolicy" had no match
+    /// arm at all, so a client-go networking/v1 typed clientset Create() (default protobuf
+    /// content-type) fell through extract_body's fallback and the generic create handler
+    /// received raw protobuf bytes it can't JSON-parse, failing every such request outright.
+    #[test]
+    fn decode_networkpolicy_proto_gen_preserves_pod_selector_ingress_and_policy_types() {
+        use crate::net_disc_cert_policy_events_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
+
+        let np = networking_v1::NetworkPolicy {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("deny-all-except-web".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(networking_v1::NetworkPolicySpec {
+                pod_selector: Some(meta_v1::LabelSelector {
+                    match_labels: [("app".to_string(), "web".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }),
+                ingress: vec![networking_v1::NetworkPolicyIngressRule {
+                    ports: vec![networking_v1::NetworkPolicyPort {
+                        protocol: Some("TCP".to_string()),
+                        port: Some(IntOrString {
+                            r#type: Some(0),
+                            int_val: Some(80),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    from: vec![networking_v1::NetworkPolicyPeer {
+                        namespace_selector: Some(meta_v1::LabelSelector::default()),
+                        ..Default::default()
+                    }],
+                }],
+                policy_types: vec!["Ingress".to_string()],
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        np.encode(&mut buf).unwrap();
+
+        let result = crate::proto::decode_proto_by_kind_and_version(
+            "NetworkPolicy",
+            "networking.k8s.io/v1",
+            &buf,
+        )
+        .expect(
+            "NetworkPolicy must decode via decode_proto_by_kind_and_version — without this, \
+             client-go's typed clientset POST returns 400 instead of 201 on every create",
+        );
+
+        assert_eq!(result["kind"], "NetworkPolicy");
+        assert_eq!(
+            result["spec"]["podSelector"]["matchLabels"]["app"], "web",
+            "spec.podSelector must survive decode — without it every pod in the namespace, \
+             not just app=web, would be (mis)covered by this policy"
+        );
+        assert_eq!(
+            result["spec"]["ingress"][0]["ports"][0]["port"], 80,
+            "spec.ingress[].ports[].port must survive decode — without it the rule matches \
+             all ports instead of just 80"
+        );
+        assert_eq!(
+            result["spec"]["ingress"][0]["from"][0]["namespaceSelector"],
+            serde_json::json!({}),
+            "spec.ingress[].from[].namespaceSelector must survive decode as an (empty) \
+             selector, not be dropped — an absent selector and an empty one mean different \
+             things (no restriction from namespaceSelector vs. matches every namespace)"
+        );
+        assert_eq!(
+            result["spec"]["policyTypes"][0], "Ingress",
+            "spec.policyTypes must survive decode — without it this policy defaults to \
+             covering both Ingress and Egress, silently widening its scope"
+        );
     }
 
     #[test]

@@ -617,6 +617,9 @@ pub fn decode_proto_by_kind_and_version(
             crate::net_disc_cert_policy_events_gen_adapter::decode_ingressclass_proto_gen(raw)
         }
         "Ingress" => crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen(raw),
+        "NetworkPolicy" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_networkpolicy_proto_gen(raw)
+        }
         "EndpointSlice" => {
             crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen(raw)
         }
