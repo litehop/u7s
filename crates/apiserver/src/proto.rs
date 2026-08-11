@@ -514,37 +514,258 @@ pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
     })
 }
 
+type DecoderFn = fn(&[u8]) -> Option<serde_json::Value>;
+
+/// `kind` -> proto decoder, for the common case where a kind has exactly one wire layout
+/// regardless of `apiVersion`. Built once and reused so adding a decoder for a new kind is a
+/// one-line `m.insert(...)` here rather than a new match arm in `decode_proto_by_kind_and_version`.
+///
+/// `Event` and `HorizontalPodAutoscaler` are the only kinds whose proto layout depends on
+/// `apiVersion` (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1) — they are
+/// dispatched explicitly before falling back to this map instead of being modeled as lookup keys.
+fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
+    static DECODERS: std::sync::OnceLock<std::collections::HashMap<&'static str, DecoderFn>> =
+        std::sync::OnceLock::new();
+    DECODERS.get_or_init(|| {
+        let mut m: std::collections::HashMap<&'static str, DecoderFn> =
+            std::collections::HashMap::new();
+        m.insert(
+            "CustomResourceDefinition",
+            crate::apiextensions_gen_adapter::decode_crd_proto_gen,
+        );
+        m.insert(
+            "APIService",
+            crate::apiregistration_gen_adapter::decode_apiservice_proto_gen,
+        );
+        m.insert(
+            "Namespace",
+            crate::core_gen_adapter::decode_namespace_proto_gen,
+        );
+        m.insert(
+            "ConfigMap",
+            crate::core_gen_adapter::decode_configmap_proto_gen,
+        );
+        m.insert("Pod", crate::core_gen_adapter::decode_pod_proto_gen);
+        m.insert(
+            "PodTemplate",
+            crate::core_gen_adapter::decode_podtemplate_proto_gen,
+        );
+        m.insert("Node", crate::core_gen_adapter::decode_node_proto_gen);
+        m.insert("Service", crate::core_gen_adapter::decode_service_proto_gen);
+        m.insert("Secret", crate::core_gen_adapter::decode_secret_proto_gen);
+        m.insert(
+            "ReplicationController",
+            crate::core_gen_adapter::decode_replicationcontroller_proto_gen,
+        );
+        m.insert(
+            "PersistentVolume",
+            crate::core_gen_adapter::decode_persistentvolume_proto_gen,
+        );
+        m.insert("Lease", crate::coord_gen_adapter::decode_lease_proto_gen_a);
+        m.insert(
+            "IPAddress",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ipaddress_proto_gen,
+        );
+        m.insert(
+            "ServiceCIDR",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_servicecidr_proto_gen,
+        );
+        m.insert(
+            "CSINode",
+            crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen,
+        );
+        m.insert(
+            "CSIDriver",
+            crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen,
+        );
+        m.insert(
+            "CSIStorageCapacity",
+            crate::storage_node_flow_gen_adapter::decode_csistoragecapacity_proto_gen,
+        );
+        m.insert(
+            "ClusterRole",
+            crate::rbac_gen_adapter::decode_clusterrole_proto_gen,
+        );
+        m.insert(
+            "ClusterRoleBinding",
+            crate::rbac_gen_adapter::decode_clusterrolebinding_proto_gen,
+        );
+        m.insert("Role", crate::rbac_gen_adapter::decode_role_proto_gen);
+        m.insert(
+            "RoleBinding",
+            crate::rbac_gen_adapter::decode_rolebinding_proto_gen,
+        );
+        m.insert(
+            "SubjectAccessReview",
+            crate::rbac_gen_adapter::decode_subject_access_review_proto_gen,
+        );
+        m.insert(
+            "LocalSubjectAccessReview",
+            crate::rbac_gen_adapter::decode_local_subject_access_review_proto_gen,
+        );
+        m.insert(
+            "SelfSubjectAccessReview",
+            crate::rbac_gen_adapter::decode_selfsubjectaccessreview_proto_gen,
+        );
+        m.insert(
+            "SelfSubjectRulesReview",
+            crate::rbac_gen_adapter::decode_selfsubjectrulesreview_proto_gen,
+        );
+        m.insert(
+            "TokenReview",
+            crate::rbac_gen_adapter::decode_token_review_proto_gen,
+        );
+        m.insert(
+            "CronJob",
+            crate::batch_gen_adapter::decode_cronjob_proto_gen,
+        );
+        m.insert("Job", crate::batch_gen_adapter::decode_job_proto_gen);
+        m.insert(
+            "RuntimeClass",
+            crate::storage_node_flow_gen_adapter::decode_runtimeclass_proto_gen,
+        );
+        m.insert(
+            "VolumeAttachment",
+            crate::storage_node_flow_gen_adapter::decode_volumeattachment_proto_gen,
+        );
+        m.insert(
+            "StatefulSet",
+            crate::apps_gen_adapter::decode_statefulset_proto_gen,
+        );
+        m.insert(
+            "Deployment",
+            crate::apps_gen_adapter::decode_deployment_proto_gen,
+        );
+        m.insert(
+            "DaemonSet",
+            crate::apps_gen_adapter::decode_daemonset_proto_gen,
+        );
+        m.insert(
+            "ReplicaSet",
+            crate::apps_gen_adapter::decode_replicaset_proto_gen,
+        );
+        m.insert(
+            "ServiceAccount",
+            crate::core_gen_adapter::decode_serviceaccount_proto_gen,
+        );
+        m.insert(
+            "PersistentVolumeClaim",
+            crate::core_gen_adapter::decode_persistentvolumeclaim_proto_gen,
+        );
+        m.insert(
+            "Endpoints",
+            crate::core_gen_adapter::decode_endpoints_proto_gen,
+        );
+        m.insert(
+            "StorageClass",
+            crate::storage_node_flow_gen_adapter::decode_storageclass_proto_gen,
+        );
+        m.insert(
+            "VolumeAttributesClass",
+            crate::storage_node_flow_gen_adapter::decode_volumeattributesclass_proto_gen,
+        );
+        m.insert(
+            "ResourceQuota",
+            crate::core_gen_adapter::decode_resourcequota_proto_gen,
+        );
+        m.insert(
+            "LimitRange",
+            crate::core_gen_adapter::decode_limitrange_proto_gen,
+        );
+        m.insert(
+            "PodDisruptionBudget",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen,
+        );
+        m.insert(
+            "FlowSchema",
+            crate::storage_node_flow_gen_adapter::decode_flowschema_proto_gen,
+        );
+        m.insert(
+            "PriorityLevelConfiguration",
+            crate::storage_node_flow_gen_adapter::decode_prioritylevelconfiguration_proto_gen,
+        );
+        m.insert(
+            "ValidatingWebhookConfiguration",
+            crate::admissionreg_gen_adapter::decode_validatingwebhookconfiguration_proto_gen,
+        );
+        m.insert(
+            "MutatingWebhookConfiguration",
+            crate::admissionreg_gen_adapter::decode_mutatingwebhookconfiguration_proto_gen,
+        );
+        m.insert(
+            "MutatingAdmissionPolicy",
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicy_proto_gen,
+        );
+        m.insert(
+            "MutatingAdmissionPolicyBinding",
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicybinding_proto_gen,
+        );
+        m.insert(
+            "ValidatingAdmissionPolicy",
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicy_proto_gen,
+        );
+        m.insert(
+            "ValidatingAdmissionPolicyBinding",
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen,
+        );
+        m.insert(
+            "IngressClass",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingressclass_proto_gen,
+        );
+        m.insert(
+            "Ingress",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen,
+        );
+        m.insert(
+            "NetworkPolicy",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_networkpolicy_proto_gen,
+        );
+        m.insert(
+            "EndpointSlice",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen,
+        );
+        m.insert(
+            "CertificateSigningRequest",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen,
+        );
+        m.insert(
+            "PriorityClass",
+            crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen,
+        );
+        m.insert(
+            "ControllerRevision",
+            crate::apps_gen_adapter::decode_controllerrevision_proto_gen,
+        );
+        m.insert(
+            "DeleteOptions",
+            crate::apiextensions_gen_adapter::decode_delete_options_proto_gen,
+        );
+        m.insert(
+            "DeviceClass",
+            crate::resource_gen_adapter::decode_deviceclass_proto_gen,
+        );
+        m.insert(
+            "ResourceClaim",
+            crate::resource_gen_adapter::decode_resourceclaim_proto_gen,
+        );
+        m.insert(
+            "ResourceClaimTemplate",
+            crate::resource_gen_adapter::decode_resourceclaimtemplate_proto_gen,
+        );
+        m.insert(
+            "ResourceSlice",
+            crate::resource_gen_adapter::decode_resourceslice_proto_gen,
+        );
+        m
+    })
+}
+
 pub fn decode_proto_by_kind_and_version(
     kind: &str,
     api_version: &str,
     raw: &[u8],
 ) -> Option<serde_json::Value> {
     match kind {
-        "CustomResourceDefinition" => crate::apiextensions_gen_adapter::decode_crd_proto_gen(raw),
-        "APIService" => crate::apiregistration_gen_adapter::decode_apiservice_proto_gen(raw),
-        "Namespace" => crate::core_gen_adapter::decode_namespace_proto_gen(raw),
-        "ConfigMap" => crate::core_gen_adapter::decode_configmap_proto_gen(raw),
-        "Pod" => crate::core_gen_adapter::decode_pod_proto_gen(raw),
-        "PodTemplate" => crate::core_gen_adapter::decode_podtemplate_proto_gen(raw),
-        "Node" => crate::core_gen_adapter::decode_node_proto_gen(raw),
-        "Service" => crate::core_gen_adapter::decode_service_proto_gen(raw),
-        "Secret" => crate::core_gen_adapter::decode_secret_proto_gen(raw),
-        "ReplicationController" => {
-            crate::core_gen_adapter::decode_replicationcontroller_proto_gen(raw)
-        }
-        "PersistentVolume" => crate::core_gen_adapter::decode_persistentvolume_proto_gen(raw),
-        "Lease" => crate::coord_gen_adapter::decode_lease_proto_gen_a(raw),
-        "IPAddress" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_ipaddress_proto_gen(raw)
-        }
-        "ServiceCIDR" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_servicecidr_proto_gen(raw)
-        }
-        "CSINode" => crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen(raw),
-        "CSIDriver" => crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen(raw),
-        "CSIStorageCapacity" => {
-            crate::storage_node_flow_gen_adapter::decode_csistoragecapacity_proto_gen(raw)
-        }
         "Event" => {
             if api_version == "events.k8s.io/v1" {
                 crate::net_disc_cert_policy_events_gen_adapter::decode_events_v1_event_proto_gen(
@@ -554,89 +775,6 @@ pub fn decode_proto_by_kind_and_version(
                 crate::core_gen_adapter::decode_event_proto_gen(raw)
             }
         }
-        "ClusterRole" => crate::rbac_gen_adapter::decode_clusterrole_proto_gen(raw),
-        "ClusterRoleBinding" => crate::rbac_gen_adapter::decode_clusterrolebinding_proto_gen(raw),
-        "Role" => crate::rbac_gen_adapter::decode_role_proto_gen(raw),
-        "RoleBinding" => crate::rbac_gen_adapter::decode_rolebinding_proto_gen(raw),
-        "SubjectAccessReview" => {
-            crate::rbac_gen_adapter::decode_subject_access_review_proto_gen(raw)
-        }
-        "LocalSubjectAccessReview" => {
-            crate::rbac_gen_adapter::decode_local_subject_access_review_proto_gen(raw)
-        }
-        "SelfSubjectAccessReview" => {
-            crate::rbac_gen_adapter::decode_selfsubjectaccessreview_proto_gen(raw)
-        }
-        "SelfSubjectRulesReview" => {
-            crate::rbac_gen_adapter::decode_selfsubjectrulesreview_proto_gen(raw)
-        }
-        "TokenReview" => crate::rbac_gen_adapter::decode_token_review_proto_gen(raw),
-        "CronJob" => crate::batch_gen_adapter::decode_cronjob_proto_gen(raw),
-        "Job" => crate::batch_gen_adapter::decode_job_proto_gen(raw),
-        "RuntimeClass" => crate::storage_node_flow_gen_adapter::decode_runtimeclass_proto_gen(raw),
-        "VolumeAttachment" => {
-            crate::storage_node_flow_gen_adapter::decode_volumeattachment_proto_gen(raw)
-        }
-        "StatefulSet" => crate::apps_gen_adapter::decode_statefulset_proto_gen(raw),
-        "Deployment" => crate::apps_gen_adapter::decode_deployment_proto_gen(raw),
-        "DaemonSet" => crate::apps_gen_adapter::decode_daemonset_proto_gen(raw),
-        "ReplicaSet" => crate::apps_gen_adapter::decode_replicaset_proto_gen(raw),
-        "ServiceAccount" => crate::core_gen_adapter::decode_serviceaccount_proto_gen(raw),
-        "PersistentVolumeClaim" => {
-            crate::core_gen_adapter::decode_persistentvolumeclaim_proto_gen(raw)
-        }
-        "Endpoints" => crate::core_gen_adapter::decode_endpoints_proto_gen(raw),
-        "StorageClass" => crate::storage_node_flow_gen_adapter::decode_storageclass_proto_gen(raw),
-        "VolumeAttributesClass" => {
-            crate::storage_node_flow_gen_adapter::decode_volumeattributesclass_proto_gen(raw)
-        }
-        "ResourceQuota" => crate::core_gen_adapter::decode_resourcequota_proto_gen(raw),
-        "LimitRange" => crate::core_gen_adapter::decode_limitrange_proto_gen(raw),
-        "PodDisruptionBudget" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen(
-                raw,
-            )
-        }
-        "FlowSchema" => crate::storage_node_flow_gen_adapter::decode_flowschema_proto_gen(raw),
-        "PriorityLevelConfiguration" => {
-            crate::storage_node_flow_gen_adapter::decode_prioritylevelconfiguration_proto_gen(raw)
-        }
-        "ValidatingWebhookConfiguration" => {
-            crate::admissionreg_gen_adapter::decode_validatingwebhookconfiguration_proto_gen(raw)
-        }
-        "MutatingWebhookConfiguration" => {
-            crate::admissionreg_gen_adapter::decode_mutatingwebhookconfiguration_proto_gen(raw)
-        }
-        "MutatingAdmissionPolicy" => {
-            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicy_proto_gen(raw)
-        }
-        "MutatingAdmissionPolicyBinding" => {
-            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicybinding_proto_gen(raw)
-        }
-        "ValidatingAdmissionPolicy" => {
-            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicy_proto_gen(raw)
-        }
-        "ValidatingAdmissionPolicyBinding" => {
-            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen(raw)
-        }
-        "IngressClass" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_ingressclass_proto_gen(raw)
-        }
-        "Ingress" => crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen(raw),
-        "NetworkPolicy" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_networkpolicy_proto_gen(raw)
-        }
-        "EndpointSlice" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen(raw)
-        }
-        "CertificateSigningRequest" => {
-            crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen(raw)
-        }
-        "PriorityClass" => {
-            crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen(raw)
-        }
-        "ControllerRevision" => crate::apps_gen_adapter::decode_controllerrevision_proto_gen(raw),
-        "DeleteOptions" => crate::apiextensions_gen_adapter::decode_delete_options_proto_gen(raw),
         "HorizontalPodAutoscaler" => {
             if api_version == "autoscaling/v2" {
                 crate::autoscaling_gen_adapter::decode_hpa_v2_proto_gen(raw)
@@ -644,13 +782,7 @@ pub fn decode_proto_by_kind_and_version(
                 crate::autoscaling_gen_adapter::decode_hpa_v1_proto_gen(raw)
             }
         }
-        "DeviceClass" => crate::resource_gen_adapter::decode_deviceclass_proto_gen(raw),
-        "ResourceClaim" => crate::resource_gen_adapter::decode_resourceclaim_proto_gen(raw),
-        "ResourceClaimTemplate" => {
-            crate::resource_gen_adapter::decode_resourceclaimtemplate_proto_gen(raw)
-        }
-        "ResourceSlice" => crate::resource_gen_adapter::decode_resourceslice_proto_gen(raw),
-        _ => None,
+        _ => decoders().get(kind).and_then(|f| f(raw)),
     }
 }
 
@@ -10590,6 +10722,56 @@ mod tests {
             conditions[1]["type"], "",
             "type must be present as an empty string, not omitted, matching the \
              non-omitempty wire contract of CustomResourceDefinitionCondition"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decoders() HashMap dispatch (guards the match -> HashMap refactor)
+    // ---------------------------------------------------------------------------
+
+    /// decode_proto_by_kind_and_version must route each kind to ITS OWN decoder, not a
+    /// neighboring one copy-pasted into the wrong `m.insert()` call. The old `match` gave a
+    /// compile error for a duplicated pattern; a `HashMap<&str, DecoderFn>` gives no such
+    /// protection — a mis-wired kind (e.g. `m.insert("Service", decode_pod_proto_gen)`) compiles
+    /// fine and only surfaces as objects decoding with the wrong shape at runtime. Each decoder
+    /// hardcodes its own "kind" in the output, so cross-wiring shows up as a kind mismatch here.
+    #[test]
+    fn decode_proto_by_kind_and_version_routes_pod_service_configmap_to_their_own_decoders() {
+        let pod_proto = encode_length_delimited(1, &encode_length_delimited(1, b"routing-pod"));
+        let pod = decode_proto_by_kind_and_version("Pod", "v1", &pod_proto)
+            .expect("Pod must decode via the HashMap-dispatched decoder");
+        assert_eq!(pod["kind"], "Pod");
+        assert_eq!(pod["metadata"]["name"], "routing-pod");
+
+        let svc_proto = encode_length_delimited(1, &encode_length_delimited(1, b"routing-svc"));
+        let svc = decode_proto_by_kind_and_version("Service", "v1", &svc_proto)
+            .expect("Service must decode via the HashMap-dispatched decoder");
+        assert_eq!(svc["kind"], "Service");
+        assert_eq!(svc["metadata"]["name"], "routing-svc");
+
+        let cm_proto = encode_length_delimited(1, &encode_length_delimited(1, b"routing-cm"));
+        let cm = decode_proto_by_kind_and_version("ConfigMap", "v1", &cm_proto)
+            .expect("ConfigMap must decode via the HashMap-dispatched decoder");
+        assert_eq!(cm["kind"], "ConfigMap");
+        assert_eq!(cm["metadata"]["name"], "routing-cm");
+    }
+
+    /// The old `match kind { "Pod" => ..., "Service" => ..., ... }` gave the compiler an
+    /// "unreachable pattern" error on a duplicate arm, so two kinds could never collide silently.
+    /// A `HashMap<&str, DecoderFn>` drops that guarantee: `m.insert(k, v)` silently overwrites an
+    /// earlier entry for the same key, and a deleted `m.insert` line just returns `None` at
+    /// runtime instead of failing to build. This pins the entry count so a shadowed or dropped
+    /// kind fails a test instead of shipping — bump EXPECTED_KINDS by exactly 1 per new
+    /// single-decoder `m.insert()` added to `decoders()`.
+    #[test]
+    fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
+        const EXPECTED_KINDS: usize = 62;
+        assert_eq!(
+            decoders().len(),
+            EXPECTED_KINDS,
+            "decoders() must have exactly one entry per registered kind — a mismatch means a \
+             duplicate m.insert() call silently overwrote another kind's decoder, or an \
+             m.insert() call was accidentally deleted"
         );
     }
 }
