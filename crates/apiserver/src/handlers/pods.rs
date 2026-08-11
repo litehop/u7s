@@ -8944,6 +8944,143 @@ mod handler_tests {
         );
     }
 
+    /// The full create_pod pipeline must preserve container- and pod-level SecurityContext
+    /// hardening fields end to end when the request arrives protobuf-encoded.
+    ///
+    /// `gen_security_context_to_json`/`gen_pod_security_context_to_json` previously had no
+    /// branch at all for seLinuxOptions/windowsOptions/appArmorProfile/seLinuxChangePolicy/
+    /// fsGroupChangePolicy: a client-go protobuf create carrying these hardening controls had
+    /// them silently stripped before the object ever reached storage, and the container/pod
+    /// would run less confined than the client believed it configured — with no error
+    /// anywhere. Asserting on the object fetched back out of the store (not just the CREATE
+    /// response) rules out a whole-subtree-replace elsewhere silently discarding fields that
+    /// did survive decode, the same failure shape mayor-y0pcm found in the /status path.
+    #[tokio::test]
+    async fn create_pod_preserves_securitycontext_hardening_fields_from_protobuf_body_or_container_runs_less_confined_than_requested(
+    ) {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let mut obj_meta = encode_ld(1, b"hardened-pod");
+        obj_meta.extend_from_slice(&encode_ld(3, b"default"));
+
+        // Container.securityContext (tag 15) -> SecurityContext:
+        //   seLinuxOptions(3): user(1)/role(2)/type(3)/level(4)
+        //   windowsOptions(10): gmsaCredentialSpecName(1)/gmsaCredentialSpec(2)/
+        //     runAsUserName(3)/hostProcess(4, bool)
+        //   appArmorProfile(12): type(1)/localhostProfile(2)
+        let mut se_linux_options = encode_ld(1, b"system_u");
+        se_linux_options.extend_from_slice(&encode_ld(2, b"staff_r"));
+        se_linux_options.extend_from_slice(&encode_ld(3, b"container_t"));
+        se_linux_options.extend_from_slice(&encode_ld(4, b"s0:c1,c2"));
+
+        let mut windows_options = encode_ld(1, b"my-gmsa-spec");
+        windows_options.extend_from_slice(&encode_ld(2, b"<GMSA XML>"));
+        windows_options.extend_from_slice(&encode_ld(3, b"ContainerAdministrator"));
+        windows_options.push(0x20); // field 4 (hostProcess), wire type 0 (varint)
+        windows_options.push(1); // true
+
+        let mut app_armor_profile = encode_ld(1, b"Localhost");
+        app_armor_profile.extend_from_slice(&encode_ld(2, b"k8s-apparmor-example-deny-write"));
+
+        let mut container_security_context = encode_ld(3, &se_linux_options);
+        container_security_context.extend_from_slice(&encode_ld(10, &windows_options));
+        container_security_context.extend_from_slice(&encode_ld(12, &app_armor_profile));
+
+        let mut container = encode_ld(1, b"app");
+        container.extend_from_slice(&encode_ld(2, b"nginx"));
+        container.extend_from_slice(&encode_ld(15, &container_security_context));
+
+        // PodSpec.securityContext (tag 14) -> PodSecurityContext:
+        //   fsGroupChangePolicy(9), seLinuxChangePolicy(13)
+        let mut pod_security_context = encode_ld(9, b"OnRootMismatch");
+        pod_security_context.extend_from_slice(&encode_ld(13, b"Recursive"));
+
+        let mut pod_spec = encode_ld(2, &container);
+        pod_spec.extend_from_slice(&encode_ld(14, &pod_security_context));
+
+        let mut pod_proto = encode_ld(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_ld(2, &pod_spec));
+
+        let mut type_meta = encode_ld(1, b"v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"Pod"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &pod_proto));
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // magic
+        body.extend_from_slice(&unknown);
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/vnd.kubernetes.protobuf")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "protobuf-encoded pod create with SecurityContext hardening fields set must \
+             succeed, not be rejected"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/hardened-pod")
+            .await
+            .expect("store get must succeed")
+            .expect("pod must be persisted");
+        let persisted: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let sc = &persisted["spec"]["containers"][0]["securityContext"];
+        assert_eq!(
+            sc["seLinuxOptions"],
+            serde_json::json!({
+                "user": "system_u", "role": "staff_r", "type": "container_t", "level": "s0:c1,c2"
+            }),
+            "container securityContext.seLinuxOptions must survive a protobuf-encoded create — \
+             dropping it means the container gets a runtime-allocated random SELinux context \
+             instead of the one the client requested"
+        );
+        assert_eq!(
+            sc["windowsOptions"],
+            serde_json::json!({
+                "gmsaCredentialSpecName": "my-gmsa-spec",
+                "gmsaCredentialSpec": "<GMSA XML>",
+                "runAsUserName": "ContainerAdministrator",
+                "hostProcess": true
+            }),
+            "container securityContext.windowsOptions must survive a protobuf-encoded create — \
+             dropping hostProcess would run the container as a normal (non-HostProcess) \
+             container against the client's request"
+        );
+        assert_eq!(
+            sc["appArmorProfile"],
+            serde_json::json!({"type": "Localhost", "localhostProfile": "k8s-apparmor-example-deny-write"}),
+            "container securityContext.appArmorProfile must survive a protobuf-encoded create \
+             — dropping it means the container runs under the runtime default AppArmor \
+             profile instead of the requested localhost profile"
+        );
+
+        let psc = &persisted["spec"]["securityContext"];
+        assert_eq!(
+            psc["fsGroupChangePolicy"], "OnRootMismatch",
+            "pod securityContext.fsGroupChangePolicy must survive a protobuf-encoded create — \
+             dropping it silently falls back to the \"Always\" recursive chown/chmod behavior \
+             the client explicitly opted out of"
+        );
+        assert_eq!(
+            psc["seLinuxChangePolicy"], "Recursive",
+            "pod securityContext.seLinuxChangePolicy must survive a protobuf-encoded create — \
+             dropping it silently falls back to the default volume relabeling policy instead \
+             of the one the client requested"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // RuntimeClass overhead injection regression test
     // -----------------------------------------------------------------------
