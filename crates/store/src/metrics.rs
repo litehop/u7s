@@ -195,6 +195,55 @@ pub static WATCH_LAG_RECOVERY_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLoc
     histogram
 });
 
+/// 1..25_000 explicit buckets. Resolution is deliberately densest from tens to low thousands,
+/// which is where a `RING_CAPACITY` decision actually gets made, and the top bucket sits above
+/// any capacity we would plausibly run so the overflow bucket stays a genuine anomaly signal
+/// rather than a routine catch-all.
+fn watch_replay_depth_buckets() -> Vec<f64> {
+    vec![
+        1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+        25000.0,
+    ]
+}
+
+/// How many events each watch open had to replay from the ring to bridge
+/// `from_revision -> now` — i.e. how far behind the client actually was when it (re)connected.
+///
+/// This is the REQUIREMENT side of ring sizing, and the only one measured from real client
+/// behaviour rather than derived. `u7s_watch_ring_span_seconds` says how much history a shard
+/// holds; this says how much history anyone actually asked for. Sizing follows directly:
+/// `RING_CAPACITY >= p99.9(replay depth) x margin`.
+///
+/// CENSORING — READ BEFORE SIZING FROM THIS. The observation is bounded by what the ring can
+/// still produce. Once a shard is evicting, a client that needed more than the ring holds is
+/// recorded as whatever the ring did have (or gets `Compacted` and contributes nothing), so the
+/// upper tail silently under-reports exactly where the decision is made. The distribution is
+/// only complete at a capacity where the shard never fills — capture it there. Cross-check
+/// `u7s_watch_ring_occupancy` against `RING_CAPACITY`, and `u7s_watch_closed_total{reason=
+/// "compacted"}` against 0, before trusting a percentile from this.
+///
+/// Doubles as a watch-open latency signal: replay depth is what drives the O(shard-occupancy)
+/// scan that mayor-nlkyd measured at 61x scaling from 1k to 100k.
+///
+/// Labeled by `prefix_bucket`, not the raw watch prefix — see `prefix_bucket`'s own doc for why.
+pub static WATCH_REPLAY_DEPTH: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "u7s_watch_replay_depth",
+            "Number of ring-buffer events replayed to a watch at open, by coarse prefix bucket. \
+             Measures how far behind clients actually are when they reconnect. Upper tail is \
+             censored once the shard evicts — see the metric's source doc.",
+        )
+        .buckets(watch_replay_depth_buckets()),
+        &["prefix_bucket"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(histogram.clone()))
+        .expect("u7s_watch_replay_depth is registered exactly once per process");
+    histogram
+});
+
 /// Collapse a watch key/prefix down to its first two `/`-delimited path segments (e.g.
 /// `/registry/configmaps/default/name` -> `/registry/configmaps/`), to bound
 /// `u7s_watch_lag_recovery_duration_seconds`'s cardinality by resource-type-ish grouping instead
