@@ -91,6 +91,38 @@ pub static WATCH_RING_OCCUPANCY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+/// Wall-clock age of the OLDEST event still retained in each shard's ring buffer.
+///
+/// Occupancy (above) answers "how many events" but not "how much history," and history is the
+/// property that actually matters: the ring is read once at watch open to bridge
+/// `from_revision -> now`, so a watch survives iff the ring still covers the gap since the
+/// client last saw an event. Whether 9,670 retained events is 8 seconds or 8 minutes of cover
+/// depends entirely on that shard's write rate, and those two cases have completely different
+/// risk. Below roughly one list-and-reestablish round trip, a client relists, re-watches, gets
+/// expired again because the ring churned meanwhile, and never reaches a streaming steady
+/// state — a relist loop rather than a graceful degradation.
+///
+/// Upstream kube-apiserver sizes its equivalent buffer against exactly this quantity: it holds
+/// a 75s window (`DefaultEventFreshDuration`) and resizes the underlying capacity between 100
+/// and 102,400 entries to keep that window constant as rate varies. This gauge is the
+/// measurement that would let us do the same instead of guessing at a fixed `RING_CAPACITY`.
+pub static WATCH_RING_OLDEST_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "u7s_watch_ring_oldest_age_seconds",
+            "Age in seconds of the oldest event retained in the watch replay ring buffer, by \
+             shard. This is the watch-replay history window actually available to a \
+             reconnecting client. 0 when the shard is empty.",
+        ),
+        &["shard"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .expect("u7s_watch_ring_oldest_age_seconds is registered exactly once per process");
+    gauge
+});
+
 /// Current length of each per-resource-type shard's deletion-tombstone log — same class of
 /// blind spot as the ring buffer above (a capped structure whose length was previously only
 /// ever logged on its own eviction path, at `debug!` level).
