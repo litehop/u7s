@@ -450,7 +450,7 @@ pub(crate) async fn list_pods<S: Store>(
         "items": items
     });
 
-    Ok(Json(body).into_response())
+    Ok(crate::content_type::negotiated_response(accept, body))
 }
 
 pub(crate) async fn create_pod<S: Store>(
@@ -677,6 +677,12 @@ pub(crate) async fn get_pod<S: Store>(
         let pod: serde_json::Value =
             serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
         return Ok(Json(super::table::build_table("", "pods", vec![pod])).into_response());
+    }
+
+    if crate::content_type::wants_protobuf(accept) {
+        let pod: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(crate::content_type::negotiated_response(accept, pod));
     }
 
     Ok((
@@ -8529,6 +8535,54 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A kubectl/kubelet-style GET with `Accept: application/vnd.kubernetes.protobuf` must
+    /// receive a real protobuf-encoded Pod, not JSON silently substituted in its place: a
+    /// client that only speaks protobuf (no `application/json` in its Accept list) would
+    /// otherwise fail to parse the response at all.
+    #[tokio::test]
+    async fn get_pod_with_protobuf_accept_returns_protobuf_encoded_body() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.kubernetes.protobuf",
+            "Content-Type must advertise protobuf, not silently stay application/json"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "body must start with the k8s protobuf magic prefix"
+        );
+        let raw = crate::proto::decode_k8s_proto_envelope(&body)
+            .expect("response body must decode as a k8s protobuf envelope");
+        let decoded = crate::core_gen_adapter::decode_pod_proto_gen(&raw.raw)
+            .expect("envelope raw field must decode as a Pod protobuf message");
+        assert_eq!(decoded["metadata"]["name"], "nginx");
+        assert_eq!(decoded["spec"]["containers"][0]["image"], "nginx");
     }
 
     /// GET a pod that does not exist must return 404.

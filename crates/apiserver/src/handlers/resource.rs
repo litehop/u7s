@@ -211,7 +211,7 @@ pub(crate) async fn list_resource<S: Store>(
         resp.remaining_count,
         &state.continue_token_key,
     );
-    Ok(Json(body).into_response())
+    Ok(crate::content_type::negotiated_response(accept, body))
 }
 
 pub(crate) async fn get_resource<S: Store>(
@@ -261,7 +261,7 @@ pub(crate) async fn get_resource<S: Store>(
         return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
     }
 
-    Ok(Json(obj).into_response())
+    Ok(crate::content_type::negotiated_response(accept, obj))
 }
 
 pub(crate) async fn create_resource<S: Store>(
@@ -1572,7 +1572,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         resp.remaining_count,
         &state.continue_token_key,
     );
-    Ok(Json(body).into_response())
+    Ok(crate::content_type::negotiated_response(accept, body))
 }
 
 pub(crate) async fn get_namespaced_resource<S: Store>(
@@ -1627,7 +1627,7 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
         return Ok(Json(super::table::build_table(&group, &plural, vec![obj])).into_response());
     }
 
-    Ok(Json(obj).into_response())
+    Ok(crate::content_type::negotiated_response(accept, obj))
 }
 
 pub(crate) async fn create_namespaced_resource<S: Store>(
@@ -4988,6 +4988,79 @@ mod tests {
 
         let resp = result.unwrap_or_else(|_| panic!("get_resource must return 200"));
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// A kubelet/kube-scheduler-style GET on a cluster-scoped built-in kind (Node) with
+    /// `Accept: application/vnd.kubernetes.protobuf` must receive a real protobuf-encoded
+    /// Node, not JSON silently substituted in its place. `get_resource` is the same generic
+    /// handler that serves Node, Service, Endpoints and EndpointSlice GETs — this proves the
+    /// `negotiated_response` wiring at this call site, distinct from `pods.rs`'s own
+    /// dedicated (and separately migrated) `get_pod` call site.
+    #[tokio::test]
+    async fn get_resource_with_protobuf_accept_returns_protobuf_encoded_node() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-1" },
+            "status": { "phase": "Running" }
+        });
+        store
+            .put(
+                "/registry/nodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            "application/vnd.kubernetes.protobuf, application/json"
+                .parse()
+                .unwrap(),
+        );
+
+        let result = get_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into(), "worker-1".into())),
+            headers,
+        )
+        .await;
+
+        let resp = result.unwrap_or_else(|_| panic!("get_resource must return 200"));
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.kubernetes.protobuf",
+            "Content-Type must advertise protobuf, not silently stay application/json"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "body must start with the k8s protobuf magic prefix"
+        );
+        let envelope = crate::proto::decode_k8s_proto_envelope(&body)
+            .expect("response body must decode as a k8s protobuf envelope");
+        let decoded = crate::core_gen_adapter::decode_node_proto_gen(&envelope.raw)
+            .expect("envelope raw field must decode as a Node protobuf message");
+        assert_eq!(decoded["metadata"]["name"], "worker-1");
     }
 
     /// `kubectl get <resource> <name>` sends Accept: application/json;as=Table;... by default
