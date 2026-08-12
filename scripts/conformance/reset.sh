@@ -89,6 +89,13 @@ if [ "${#API_PIDS[@]}" -gt 0 ]; then
 fi
 pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
 
+# The run-metrics sampler (started by run-all.sh alongside the stack, see
+# sample-run-metrics.sh) is a peer of apiserver/scheduler for teardown
+# purposes too — without this, a --stack-only session's sampler survives
+# `rm -rf "$WORKDIR"` below as an orphan still appending to its now-unlinked
+# CSVs. Its own `stop` does the SIGTERM+poll reap; harmless if none is running.
+bash scripts/conformance/sample-run-metrics.sh stop --workdir "$WORKDIR" >/dev/null 2>&1 || true
+
 # konnectivity-server is started via `disown` (scripts/u7s-start.sh), so it survives
 # even after its origin worktree is deleted, still bound to this port slot and still
 # serving its old CA-signed cert. If left running, the next run's fresh CA/agent

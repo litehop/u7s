@@ -452,6 +452,23 @@ limactl shell "$VM_NAME" sudo cat /tmp/kcm.log \
   > "$HOST_LOGS_DIR/kcm.log" 2>/dev/null || true
 echo "Host logs: $HOST_LOGS_DIR"
 
+# Fold the run-metrics sampler's artifacts (started by run-all.sh, still
+# running here) into this run's own directory, same idea as host-logs above:
+# a run whose operator forgot to babysit it still gets memory data. This is
+# the "post-run" /metrics snapshot — taken here, before run-all.sh's own
+# --profile branch (if any) stops the apiserver, per mayor-zpvp2 — and a copy
+# of the RSS/ring-gauge CSVs as they stand right now (they keep growing after
+# this copy since the sampler is still running; a --profile run re-copies the
+# final state once it reaps the sampler for real).
+bash scripts/conformance/sample-run-metrics.sh snapshot --workdir "$WORKDIR" --label post-run
+MONITORING_DIR="$RUN_DIR/monitoring"
+mkdir -p "$MONITORING_DIR"
+[ -f "$WORKDIR/rss.csv" ]      && cp "$WORKDIR/rss.csv" "$MONITORING_DIR/rss.csv"
+[ -f "$WORKDIR/vm-free.csv" ]  && cp "$WORKDIR/vm-free.csv" "$MONITORING_DIR/vm-free.csv"
+[ -f "$WORKDIR/ring-age.csv" ] && cp "$WORKDIR/ring-age.csv" "$MONITORING_DIR/ring-age.csv"
+cp "$WORKDIR"/metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
+echo "Monitoring artifacts: $MONITORING_DIR"
+
 if [ "$UNPACK" -eq 1 ]; then
   UNPACK_DIR="$RUN_DIR"
   mkdir -p "$UNPACK_DIR"
