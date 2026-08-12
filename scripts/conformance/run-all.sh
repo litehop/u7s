@@ -126,6 +126,14 @@
 #             Mutually exclusive with --binary (error if both given): --profile's
 #             whole point is the --features dhat rebuild, which a pre-built
 #             --binary bypasses by definition.
+#   --sample-interval  Cadence in seconds for scripts/conformance/sample-run-metrics.sh,
+#             which starts once the node topology is final (after step 5 and any
+#             --extra-node join) and reaps at the same point run-all.sh's own
+#             lifecycle ends (mirroring wherever the apiserver itself would be
+#             stopped) — see that script for the three artifacts it produces
+#             (host+VM RSS, /metrics snapshots, ring-gauge trajectory) and why
+#             this replaced an operator-run-by-hand monitoring loop. Default: 30s,
+#             matching that loop's own cadence.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -144,6 +152,7 @@ KONNECTIVITY_SERVER_PORT=""
 EXTRA_NODE=""
 EXTRA_KUBELET_PORT=""
 PROFILE=0
+SAMPLE_INTERVAL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -165,6 +174,7 @@ while [[ $# -gt 0 ]]; do
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
     --profile) PROFILE=1; shift ;;
+    --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -265,6 +275,8 @@ _WORKDIR_ARG="--workdir $WORKDIR"
 [ -n "$EXTRA_NODE" ] && _NODE_KUBELET_PORT_ARG="--node-kubelet-port ${EXTRA_NODE}=${EXTRA_KUBELET_PORT}"
 [ "$ALL_E2E" -eq 1 ] && _ALL_E2E_ARG="--all-e2e"
 [ "$UNSAFE_FOCUS" -eq 1 ] && _UNSAFE_FOCUS_ARG="--unsafe-focus"
+_SAMPLE_INTERVAL_ARG=""
+[ -n "$SAMPLE_INTERVAL" ] && _SAMPLE_INTERVAL_ARG="--interval $SAMPLE_INTERVAL"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -329,6 +341,17 @@ if [ -n "$EXTRA_NODE" ]; then
   bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}
 fi
 
+# Start the run-metrics sampler (host+VM RSS, ring-gauge trajectory, an
+# initial /metrics snapshot) now that the final node topology is known — see
+# sample-run-metrics.sh for the three artifacts it produces and mayor-zpvp2
+# for why this replaced an operator-run-by-hand monitoring loop. Reaped
+# below: right before the apiserver is torn down under --profile, or at the
+# very end of this script otherwise (the apiserver is never stopped by a
+# plain or --stack-only run, so neither is the sampler — same lifecycle).
+banner "Start run-metrics sampler"
+# shellcheck disable=SC2086
+bash "$DIR/sample-run-metrics.sh" start ${_PORT_ARG} ${_WORKDIR_ARG} ${_VM_ARG} ${_EXTRA_NODE_ARG} ${_SAMPLE_INTERVAL_ARG}
+
 # Step 06: Run sonobuoy.
 if [ "$STACK_ONLY" -eq 1 ]; then
   banner "Step 6/6: Run sonobuoy (skipped — --stack-only)"
@@ -356,6 +379,16 @@ else
     # trapped in a process nobody signals (observed live: PID 27958 sat
     # running for 20+ minutes after a run finished, dhat heap trapped in
     # memory, until an operator noticed and killed it by hand).
+    # Snapshot /metrics and reap the sampler BEFORE the apiserver is signalled
+    # below — a snapshot taken after would just get the graceful-empty case
+    # (apiserver already down), the exact ordering mistake mayor-zpvp2 exists
+    # to prevent. 06-run-sonobuoy.sh already copied an earlier "post-run"
+    # snapshot + the rss/ring CSVs-so-far into this run's temp/e2e/ dir; this
+    # is the FINAL snapshot, taken right at the point dhat's own heap capture
+    # also considers "the run is over".
+    bash "$DIR/sample-run-metrics.sh" snapshot --workdir "$WORKDIR" --label pre-teardown
+    bash "$DIR/sample-run-metrics.sh" stop --workdir "$WORKDIR"
+
     # shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
     API_PIDS=($(lsof -ti tcp:"${PORT:-6443}" -sTCP:LISTEN 2>/dev/null || true))
     if [ "${#API_PIDS[@]}" -gt 0 ]; then
@@ -419,7 +452,36 @@ else
     else
       echo "warning: $DHAT_HEAP_FILE was not produced — apiserver may not have exited cleanly" >&2
     fi
+
+    # Re-copy the monitoring artifacts now that they cover the whole run:
+    # 06-run-sonobuoy.sh already copied a "post-run" snapshot of these into
+    # $RUN_DIR/monitoring/, but rss.csv/ring-age.csv kept growing afterward
+    # and the "pre-teardown" snapshot above (taken after that copy ran) isn't
+    # there yet either. $RUN_DIR was already resolved above for the dhat heap.
+    if [ -n "$RUN_DIR" ]; then
+      MONITORING_DIR="$RUN_DIR/monitoring"
+      mkdir -p "$MONITORING_DIR"
+      [ -f "$WORKDIR/rss.csv" ]      && cp "$WORKDIR/rss.csv" "$MONITORING_DIR/rss.csv"
+      [ -f "$WORKDIR/vm-free.csv" ]  && cp "$WORKDIR/vm-free.csv" "$MONITORING_DIR/vm-free.csv"
+      [ -f "$WORKDIR/ring-age.csv" ] && cp "$WORKDIR/ring-age.csv" "$MONITORING_DIR/ring-age.csv"
+      cp "$WORKDIR"/metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
+      echo "Monitoring artifacts: $MONITORING_DIR"
+    fi
   fi
+fi
+
+if [ "$PROFILE" -eq 0 ]; then
+  # Non-profile paths never stop the apiserver (a plain sonobuoy run and
+  # --stack-only both deliberately leave the whole stack running — see
+  # ai/prompts/vm-operations.md) so "before the teardown that stops the
+  # apiserver" is trivially satisfied by any point, including here. The
+  # sampler itself is still reaped so it doesn't outlive this invocation of
+  # run-all.sh; re-run "sample-run-metrics.sh start" by hand to keep
+  # monitoring a --stack-only session left running for manual investigation.
+  # shellcheck disable=SC2086
+  bash "$DIR/sample-run-metrics.sh" snapshot ${_WORKDIR_ARG} --label pre-teardown
+  # shellcheck disable=SC2086
+  bash "$DIR/sample-run-metrics.sh" stop ${_WORKDIR_ARG}
 fi
 
 banner "Done"
