@@ -2349,10 +2349,10 @@ mod tests {
     /// The ring buffer must cap at exactly RING_CAPACITY entries and advance
     /// compaction_horizon to the revision of the new oldest entry every time it evicts.
     ///
-    /// Why it matters: this is the invariant the mayor-jzlon 1000 -> 100_000 RING_CAPACITY
-    /// bump depends on — watch-history retention scales directly with RING_CAPACITY (100k
-    /// entries at the observed ~36 events/sec cluster-wide 16-way-conformance rate gives
-    /// ~46 minutes of retention). If a future change to `push_event_locked` let the ring grow
+    /// Why it matters: this invariant is what makes `RING_CAPACITY` mean anything at all, and it
+    /// matters more the smaller that constant gets — at 512 the ring turns over continuously
+    /// (11 shards sat at the cap for most of a conformance run), so eviction is the steady state
+    /// rather than an edge case. If a future change to `push_event_locked` let the ring grow
     /// past RING_CAPACITY unboundedly, memory would grow without bound on a long-running
     /// server; if eviction fired but `compaction_horizon` failed to advance to match, watchers
     /// requesting an already-evicted resourceVersion would silently replay from a
