@@ -350,6 +350,32 @@ pub async fn find_crd<S: Store>(
     ))
 }
 
+/// Like `find_crd`, but downgrades a tombstoned group's 410 Gone to 404 Not Found.
+///
+/// Only DELETE and deleteCollection should call this. Upstream kube-controller-manager's
+/// namespace deletion controller (`deleteCollection()` in
+/// `pkg/controller/namespace/deletion/namespaced_resources_deleter.go`) only treats
+/// 404/405 as "resource gone, skip gracefully" — any other error, including 410, is fatal
+/// and aborts the whole `deleteAllContent` pass, leaving the namespace stuck in Terminating.
+/// Upstream never needed to handle 410 here because a deleted CRD's route is unregistered
+/// from the real apiserver's mux, so the client gets a plain 404. LIST and WATCH must keep
+/// the 410 from `find_crd` untouched — that is the informer re-list path the original 410
+/// targeted (see `find_crd`'s doc comment).
+async fn find_crd_for_delete<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    version: &str,
+    plural: &str,
+) -> Result<CrContext, crate::status::StatusError> {
+    match find_crd(state, group, version, plural).await {
+        Err(err) if err.0 == StatusCode::GONE => Err(Status::not_found(
+            &format!("{group}/{version}/{plural}"),
+            "Resource",
+        )),
+        result => result,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conversion webhook dispatch decision
 // ---------------------------------------------------------------------------
@@ -1758,7 +1784,7 @@ pub async fn delete_cr<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -1873,7 +1899,7 @@ pub async fn delete_collection_cr<S: Store>(
     Extension(user): Extension<UserInfo>,
     query: super::generic::CollectionQuery,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     let prefix = cr_list_prefix(&group, &plural, None);
     let resp = state
@@ -2493,7 +2519,7 @@ pub async fn delete_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
@@ -2601,7 +2627,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
     Extension(user): Extension<UserInfo>,
     query: super::generic::CollectionQuery,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    let ctx = find_crd_for_delete(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
         return Err(Status::not_found(
@@ -11099,6 +11125,101 @@ mod tests {
              returning 410 would mislead informers about a group that was never installed"
         );
         assert_eq!(json["reason"], "NotFound");
+    }
+
+    // DeleteCollection against a tombstoned CRD group must return 404, not 410. Upstream
+    // kube-controller-manager's namespace deletion controller (deleteCollection() in
+    // namespaced_resources_deleter.go) only treats 404/405 as "resource gone, skip
+    // gracefully" — any other error, including 410, is fatal and aborts the whole
+    // deleteAllContent pass, leaving the namespace stuck in Terminating forever. If this
+    // verb-scoping is reverted (find_crd_for_delete falls back to find_crd's blanket 410),
+    // this test fails with "expected 404, got 410".
+    #[tokio::test]
+    async fn deletecollection_returns_404_not_410_so_kcm_namespaced_resources_deleter_treats_it_as_gone_gracefully(
+    ) {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        crd::delete_crd(
+            State(state.clone()),
+            axum::extract::Path("applications.argoproj.io".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        let err = expect_err_status(
+            delete_collection_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "default".to_string(),
+                    "applications".to_string(),
+                )),
+                test_user(),
+                no_watch_query(),
+            )
+            .await,
+            "deleteCollection must error after CRD deletion",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 404,
+            "deleteCollection on a tombstoned CRD group must return 404, not 410 — kcm's \
+             deleteCollection() only skips gracefully on 404/405; a 410 propagates as a fatal \
+             error and the namespace controller requeues forever instead of finishing the \
+             deleteAllContent pass"
+        );
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // LIST against a tombstoned CRD group must still return 410 Gone (unchanged by the
+    // deleteCollection verb-scoping above). This is the informer re-list path the original
+    // 410 targeted: client-go's reflector only ever issues LIST and WATCH, never DELETE, so
+    // narrowing the 410 downgrade to delete verbs must not affect LIST.
+    #[tokio::test]
+    async fn list_returns_410_so_informer_reflector_rebuilds_watch_cleanly() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        crd::delete_crd(
+            State(state.clone()),
+            axum::extract::Path("widgets.example.io".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        let err = expect_err_status(
+            list_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                no_watch_query(),
+                "test-user".to_string(),
+            )
+            .await,
+            "list_cr must error after CRD deletion",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 410,
+            "LIST on a tombstoned CRD group must keep returning 410 Gone — this is unrelated \
+             to the deleteCollection fix above; a plain 404 here would make an informer's \
+             re-list treat the type as merely transiently missing and retry indefinitely"
+        );
+        assert_eq!(json["reason"], "Gone");
     }
 
     // After a CRD is deleted, list_cr_namespaced must return 410 Gone (not 404).
