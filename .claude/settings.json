@@ -16,8 +16,7 @@
       "Bash(pkill u7s-apiserver*)",
       "Bash(scripts/conformance/run-all.sh *)",
       "mcp__lima-node__*",
-      "mcp__mcpls__*",
-      "mcp__u7s__*"
+      "mcp__mcpls__*"
     ]
   },
   "worktree": {
