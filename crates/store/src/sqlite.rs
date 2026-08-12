@@ -1539,6 +1539,16 @@ impl Store for SqliteStore {
             None => Vec::new(),
         };
 
+        // How far behind this client actually was. Recorded here rather than only logged because
+        // it is the requirement half of ring sizing — see WATCH_REPLAY_DEPTH's doc, including
+        // why the value is only trustworthy at a capacity where this shard never fills.
+        // How far behind this client actually was. Recorded here rather than only logged because
+        // it is the requirement half of ring sizing — see WATCH_REPLAY_DEPTH's doc, including
+        // why the value is only trustworthy at a capacity where this shard never fills.
+        crate::metrics::WATCH_REPLAY_DEPTH
+            .with_label_values(&[crate::metrics::prefix_bucket(prefix)])
+            .observe(replayed.len() as f64);
+
         tracing::debug!(
             prefix,
             from_revision,
@@ -4137,6 +4147,68 @@ mod tests {
             "after a full turnover every retained event was pushed at t=100, so the shard now \
              covers 0s of history — a gauge still reporting 100 would be describing events the \
              ring has already discarded, i.e. claiming replay cover that no longer exists"
+        );
+    }
+
+    /// Opening a watch must record how many events it had to replay.
+    ///
+    /// Why it matters: replay depth is the only measurement we have of what clients actually
+    /// NEED from the ring, as opposed to what the ring happens to hold. Every decision about
+    /// `RING_CAPACITY` — including shrinking it to recover memory — is made against the tail of
+    /// this distribution. If the instrumentation silently stops firing, the histogram reports an
+    /// empty series, which is indistinguishable from the genuinely-desired state of "no watch
+    /// ever needed a replay" — so a broken metric would read as a safe one, and we would size
+    /// the ring off nothing at all.
+    ///
+    /// Drives a real `watch()` open rather than poking the metric directly, because the
+    /// regression being guarded against is the `.observe()` call being dropped from the watch
+    /// path, not the metric definition disappearing.
+    ///
+    /// Fails on revert: removing the observe leaves sample_count at 0.
+    #[tokio::test]
+    async fn watch_open_records_the_number_of_events_it_replayed() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        // Unique resource-type root: the histogram lives in the process-global prometheus
+        // registry, so sharing a bucket label with another test would let them clobber each other.
+        const BUCKET: &str = "/registry/replaydepth-test/";
+        const EVENTS: u64 = 7;
+
+        for i in 0..EVENTS {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("{BUCKET}default/obj-{i}"),
+                    revision: i + 1,
+                    value: Some(svc_value("obj", i + 1)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        let handle = crate::metrics::WATCH_REPLAY_DEPTH.with_label_values(&[BUCKET]);
+        assert_eq!(
+            handle.get_sample_count(),
+            0,
+            "test setup broken: this bucket must be untouched before the watch opens"
+        );
+
+        // The observation happens inside watch() before the stream is constructed, so awaiting
+        // the open is enough — no need to poll any events out.
+        let _stream = store.watch(BUCKET, 0).await.expect("watch must succeed");
+
+        assert_eq!(
+            handle.get_sample_count(),
+            1,
+            "one watch open must record exactly one replay-depth observation — a silently \
+             uninstrumented histogram looks identical to 'nothing ever needed replaying'"
+        );
+        assert_eq!(
+            handle.get_sample_sum(),
+            EVENTS as f64,
+            "the recorded depth must be the number of events actually replayed ({EVENTS}), not \
+             the shard's occupancy or a constant — sizing RING_CAPACITY against a wrong \
+             magnitude here would under- or over-provision the ring by whatever the error is"
         );
     }
 
