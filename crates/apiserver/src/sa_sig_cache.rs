@@ -87,8 +87,6 @@ struct Entry {
     /// Monotonic instant at which this entry stops being servable. Computed once at insert
     /// time via `capped_expiry` — see that function's doc for the security invariant.
     expires_at: Instant,
-    #[allow(dead_code)]
-    inserted_at: Instant,
 }
 
 struct CacheState {
@@ -151,9 +149,8 @@ impl SigCache {
     /// Records a verified-valid signature. Only ever called after a real signature
     /// verification succeeds — there is no way to insert a negative (invalid) result, by
     /// design (see module doc, "No negative caching"). `expires_at` must be produced by
-    /// `capped_expiry`; `now` is the insert timestamp, caller-supplied for the same
-    /// testability reason as `get`.
-    pub fn insert(&self, key: [u8; 32], kid: Option<String>, expires_at: Instant, now: Instant) {
+    /// `capped_expiry`.
+    pub fn insert(&self, key: [u8; 32], kid: Option<String>, expires_at: Instant) {
         let size = {
             let mut state = self.state.write().unwrap();
             if !state.map.contains_key(&key) {
@@ -165,7 +162,6 @@ impl SigCache {
                     signature_valid: true,
                     kid,
                     expires_at,
-                    inserted_at: now,
                 },
             );
             // At most one entry over capacity per call (one key inserted per call), but loop
@@ -349,11 +345,11 @@ mod tests {
         let k2 = [2u8; 32];
         let k3 = [3u8; 32];
 
-        cache.insert(k1, None, far_future, now);
-        cache.insert(k2, None, far_future, now);
+        cache.insert(k1, None, far_future);
+        cache.insert(k2, None, far_future);
         assert_eq!(cache.len(), 2, "cache at capacity must hold both entries");
 
-        cache.insert(k3, None, far_future, now);
+        cache.insert(k3, None, far_future);
         assert_eq!(
             cache.len(),
             2,
