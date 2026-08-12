@@ -4053,7 +4053,7 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
         if let Some(dsr) = spec.data_source_ref {
             spec_json["dataSourceRef"] = gen_typed_object_reference_to_json(dsr);
         }
-        if let Some(v) = spec.volume_attributes_class_name.filter(|s| !s.is_empty()) {
+        if let Some(v) = spec.volume_attributes_class_name {
             spec_json["volumeAttributesClassName"] = v.into();
         }
         if let Some(res) = spec.resources {
@@ -9524,6 +9524,54 @@ mod tests {
             spec["storageClassName"], "",
             "the present-but-empty storageClassName's value must round-trip as \"\", not be \
              replaced or coerced"
+        );
+    }
+
+    /// gen_persistent_volume_claim_to_json must preserve a present-but-empty
+    /// `spec.volumeAttributesClassName`, not collapse it to an absent key.
+    ///
+    /// `PersistentVolumeClaimSpec.VolumeAttributesClassName` is `*string` upstream: `nil` means
+    /// "unspecified — the persistentvolume controller will apply the default VolumeAttributesClass
+    /// if one exists", while `Some("")` is the documented (types.go:616-621) immutable opt-out
+    /// state — the claim explicitly declines any VolumeAttributesClass. A PVC with
+    /// `VolumeAttributesClassName=Some("")` must serialize as `"volumeAttributesClassName":""` in
+    /// JSON — collapsing to absent would make the PVC eligible for default-VAC provisioning when
+    /// the user's intent was the immutable opt-out state documented in upstream types.go:616-621.
+    #[test]
+    fn gen_persistent_volume_claim_to_json_preserves_present_but_empty_volume_attributes_class_name(
+    ) {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-vac".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeClaimSpec {
+                volume_attributes_class_name: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        let spec = result["spec"]
+            .as_object()
+            .expect("spec must decode to a JSON object");
+        assert!(
+            spec.contains_key("volumeAttributesClassName"),
+            "spec must have a \"volumeAttributesClassName\" key even when its value is the \
+             empty string — a PVC with VolumeAttributesClassName=Some(\"\") must serialize as \
+             \"volumeAttributesClassName\":\"\" in JSON — collapsing to absent would make the \
+             PVC eligible for default-VAC provisioning when the user's intent was the immutable \
+             opt-out state documented in upstream types.go:616-621"
+        );
+        assert_eq!(
+            spec["volumeAttributesClassName"], "",
+            "the present-but-empty volumeAttributesClassName's value must round-trip as \"\", \
+             not be replaced or coerced"
         );
     }
 
