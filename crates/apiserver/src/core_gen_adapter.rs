@@ -4041,7 +4041,7 @@ pub(crate) fn gen_persistent_volume_claim_to_json(
         if let Some(v) = spec.volume_name.filter(|s| !s.is_empty()) {
             spec_json["volumeName"] = v.into();
         }
-        if let Some(v) = spec.storage_class_name.filter(|s| !s.is_empty()) {
+        if let Some(v) = spec.storage_class_name {
             spec_json["storageClassName"] = v.into();
         }
         if let Some(v) = spec.volume_mode.filter(|s| !s.is_empty()) {
@@ -9477,6 +9477,53 @@ mod tests {
             "status.modifyVolumeStatus.status must survive decode alongside the target class — \
              without it a client can tell a modify was requested but not whether it's stuck \
              InProgress or has failed as Infeasible"
+        );
+    }
+
+    /// gen_persistent_volume_claim_to_json must preserve a present-but-empty
+    /// `spec.storageClassName`, not collapse it to an absent key.
+    ///
+    /// `PersistentVolumeClaimSpec.StorageClassName` is `*string` upstream: `nil` means "eligible
+    /// for DefaultStorageClass admission — apply whatever class the cluster considers default",
+    /// while `Some("")` means the claim explicitly opted OUT of dynamic provisioning and must
+    /// bind only to a pre-existing, unclassified PV. Collapsing `Some("")` to a missing key
+    /// makes the PV binding controller and any client-go informer that re-reads the stored JSON
+    /// treat the claim as if it never set the field — i.e. default-StorageClass admission and
+    /// dynamic provisioning get applied when the user's intent was the opposite.
+    #[test]
+    fn gen_persistent_volume_claim_to_json_preserves_present_but_empty_storage_class_name() {
+        let pvc = core_v1::PersistentVolumeClaim {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("no-dynamic-provisioning".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PersistentVolumeClaimSpec {
+                storage_class_name: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto_gen(&buf).expect("PVC must decode");
+
+        let spec = result["spec"]
+            .as_object()
+            .expect("spec must decode to a JSON object");
+        assert!(
+            spec.contains_key("storageClassName"),
+            "spec must have a \"storageClassName\" key even when its value is the empty string \
+             — a PVC with StorageClassName=Some(\"\") must serialize as \
+             \"storageClassName\":\"\" in JSON; collapsing to absent would make the PVC \
+             eligible for default-StorageClass admission when the user's intent was the \
+             opposite"
+        );
+        assert_eq!(
+            spec["storageClassName"], "",
+            "the present-but-empty storageClassName's value must round-trip as \"\", not be \
+             replaced or coerced"
         );
     }
 
