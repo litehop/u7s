@@ -136,6 +136,11 @@
 #             matching that loop's own cadence.
 set -euo pipefail
 
+# Captured before the arg-parsing loop below shifts through "$@" -- needed
+# verbatim by write-build-provenance.sh so a run's meta/build.json records
+# exactly how this invocation was made, not a reconstruction of it.
+ORIGINAL_ARGV=("$@")
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
 WORKDIR="$PWD/temp/u7s"
@@ -367,6 +372,30 @@ else
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
   bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG}
+
+  # Build provenance: record what was actually tested (git SHA, dhat feature/
+  # depth, node topology, exact invocation) into this run's own meta/build.json
+  # -- so two runs are never silently compared across different configurations.
+  # 06-run-sonobuoy.sh has already created temp/e2e/<TIMESTAMP>-<slug>/ by the
+  # time it returns above, so it's the most-recently-created entry under
+  # temp/e2e/ -- same resolution the --profile teardown below uses for the
+  # dhat heap relocation, computed independently here since this must run for
+  # EVERY sonobuoy invocation, not just profiled ones.
+  # shellcheck disable=SC2012 # `ls -t` for mtime-sort has no `find` equivalent; these dirs are our own sanitized TIMESTAMP-slug names, never adversarial filenames.
+  RUN_DIR=$(ls -td "$WORKDIR"/../e2e/*/ 2>/dev/null | head -1) || true
+  RUN_DIR="${RUN_DIR%/}"
+  if [ -n "$RUN_DIR" ]; then
+    ARGV_JSON="[]"
+    if [ "${#ORIGINAL_ARGV[@]}" -gt 0 ]; then
+      ARGV_JSON=$(printf '%s\n' "${ORIGINAL_ARGV[@]}" | jq -R . | jq -s .)
+    fi
+    _PROFILE_PROV_ARG=""
+    [ "$PROFILE" -eq 1 ] && _PROFILE_PROV_ARG="--profile"
+    # shellcheck disable=SC2086
+    bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "${U7S_VM_NAME:-lima-node}" ${_EXTRA_NODE_ARG} ${_PROFILE_PROV_ARG} --argv-json "$ARGV_JSON"
+  else
+    echo "warning: could not resolve this run's temp/e2e/ output dir — build.json not written" >&2
+  fi
 
   if [ "$PROFILE" -eq 1 ]; then
     banner "Profile: stopping apiserver to flush dhat heap"
