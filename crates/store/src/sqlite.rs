@@ -7,25 +7,15 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
 
-/// Observed 16-way conformance load cycles through ~36 cluster-wide writes/sec (see
-/// ai/findings/watch-ring-redesign-scoping-2026-08-03.md). At the old value of 1000, the
-/// ring fully turns over in well under a minute, which is shorter than the gap a client can
-/// see between its LIST call and opening the follow-up watch — that gap alone was enough to
-/// trigger spurious HTTP 410 "too old resource version" failures (e.g. the [sig-apps]
-/// StatefulSet status-endpoints conformance test). mayor-jzlon bumped this to 100_000 on
-/// 2026-08-03 for that scenario, giving ~46 minutes of retention at the observed burst rate.
-///
-/// A full 60-minute conformance run measured on 2026-08-06
-/// (ai/findings/stamp-resource-version-growth-investigation-2026-08-06.md) put actual
-/// sustained load at only ~20,229 ring-pushes total (~5.6 events/sec) — the ring never
-/// evicted a single entry at the 100k cap. Reduced to 10_000 (mayor-h3zlt): still ~30
-/// minutes of retention at the observed sustained rate, far longer than any realistic
-/// LIST-to-Watch reconnect gap, at an acceptable memory cost (~10-20MB for a typical
-/// Pod/Lease-heavy mix). This ring is still global across all resource types
-/// (per-resource-type sharding is tracked separately), so a single busy resource type can
-/// still evict a quiet one's history — just with 10x more headroom before it does.
-const RING_CAPACITY: usize = 10_000;
-const BROADCAST_CAPACITY: usize = 2048;
+/// Per-shard watch replay depth, sized from `u7s_watch_replay_depth`: over a full conformance run
+/// the deepest replay any client needed was 25 events (2,359 opens, mean 0.10). Roughly 2.5s of
+/// cover at the busiest shard's ~200 ev/s burst; overrunning it costs a 410 and one client relist,
+/// not correctness.
+const RING_CAPACITY: usize = 512;
+/// Live-event fan-out shared by EVERY watch — deliberately not sharded, so each stream filters
+/// this one channel down to its own prefix and a busy resource type can lag a quiet one's watcher.
+/// Overflow yields `Lagged`, recovered from that shard's ring; such recovery is extremely rare.
+const BROADCAST_CAPACITY: usize = 1024;
 
 /// How long a per-watcher stream coalesces global-bookmark broadcasts (one per write, to
 /// every open watch) before yielding a single `WatchEvent::Bookmark`. KCM's EnsureReady()
@@ -2356,57 +2346,6 @@ mod tests {
         );
     }
 
-    /// RING_CAPACITY must retain many times more than the old 1000-entry window that
-    /// reliably triggered premature HTTP 410s under 16-way conformance load.
-    ///
-    /// Why it matters: this is the actual regression mayor-jzlon fixes. At the old
-    /// RING_CAPACITY=1000 and the observed ~36 events/sec cluster-wide write rate under
-    /// 16-way conformance, 5000 writes (5x the old capacity) would have evicted 4000 of them,
-    /// advancing compaction_horizon well past zero — exactly the premature-eviction window
-    /// that made a client's LIST-captured resourceVersion go stale by the time it opened the
-    /// follow-up watch (e.g. the [sig-apps] StatefulSet status-endpoints conformance test).
-    /// This test MUST fail if RING_CAPACITY is ever reverted toward 1000: compaction_horizon
-    /// would advance off zero and the ring would shrink to the old cap instead of holding all
-    /// 5000 events.
-    #[tokio::test]
-    async fn ring_capacity_retains_far_more_than_the_old_1000_entry_window() {
-        let store = SqliteStore::new(":memory:").expect("in-memory store");
-
-        // 5x the OLD RING_CAPACITY (1000) — deliberately not derived from the RING_CAPACITY
-        // constant itself, so this assertion is anchored to the old buggy value rather than
-        // trivially passing at whatever RING_CAPACITY happens to be set to.
-        const PAST_OLD_CAPACITY: u64 = 5_000;
-        for i in 0..PAST_OLD_CAPACITY {
-            store.push_event(
-                Arc::new(InternalEvent {
-                    key: format!("/registry/core/configmaps/default/cm-{i}"),
-                    revision: i + 1,
-                    value: Some(svc_value(&format!("cm-{i}"), i + 1)),
-                    is_create: true,
-                    deleted_body: None,
-                }),
-                Some("default"),
-            );
-        }
-
-        assert_eq!(
-            store.compaction_horizon(),
-            0,
-            "compaction_horizon must still be 0 after only 5000 writes — 5x the OLD \
-             RING_CAPACITY of 1000, which is well within a single-digit-second burst under \
-             16-way conformance load; a nonzero horizon here means the ring is evicting far \
-             too early again, reintroducing the premature-410 bug mayor-jzlon fixes"
-        );
-        let shard = store.shard_for_test("/registry/core/configmaps/default/cm-0", Some("default"));
-        let guard = shard.ring.read().expect("ring poisoned");
-        assert_eq!(
-            guard.len(),
-            PAST_OLD_CAPACITY as usize,
-            "the ring must retain all 5000 events — at the old RING_CAPACITY=1000 only the \
-             most recent 1000 would survive, silently dropping the other 4000 from watch replay"
-        );
-    }
-
     /// The ring buffer must cap at exactly RING_CAPACITY entries and advance
     /// compaction_horizon to the revision of the new oldest entry every time it evicts.
     ///
@@ -2464,26 +2403,27 @@ mod tests {
         );
     }
 
-    /// RING_CAPACITY was cut from 100_000 to 10_000 (mayor-h3zlt) after measuring the full
-    /// 60-minute 0806-1102 conformance run: only ~20,229 ring-pushes total (~5.6 events/sec
-    /// sustained), and the 100k ring never evicted a single entry — 5x more capacity than the
-    /// sustained load needs. A 10k ring still holds ~30 minutes of history at that rate, well
-    /// past any realistic LIST-to-Watch reconnect gap.
+    /// RING_CAPACITY is 512, sized directly from `u7s_watch_replay_depth` rather than from a
+    /// retention window: across a full conformance run the deepest replay any client actually
+    /// needed was 25 events (2,359 watch opens, mean 0.10), and 512 clears that by ~20x. The
+    /// run at 512 recorded zero revision-expiry 410s, zero compacted closes and zero Lagged
+    /// recoveries, at 82 MB peak apiserver RSS versus 137 MB at the former 10_000.
     ///
     /// Why it matters: `ring_buffer_caps_at_ring_capacity_and_advances_horizon_on_evict` above
     /// asserts eviction purely in terms of the `RING_CAPACITY` symbol, so it passes unchanged
-    /// no matter what value the constant holds — it cannot catch an accidental revert back
-    /// toward 100_000 (re-inflating the ring's memory footprint ~10x with zero measured
-    /// benefit). This test pins the concrete value and independently confirms eviction drops
-    /// exactly the overflow amount, oldest-first.
+    /// no matter what value the constant holds — it cannot catch a drift back up toward 10_000
+    /// or 100_000, which costs tens of MB of retained events for history nothing was ever
+    /// measured asking for. This test pins the concrete value and independently confirms
+    /// eviction drops exactly the overflow amount, oldest-first.
     #[tokio::test]
-    async fn ring_capacity_is_pinned_to_10k_and_evicts_oldest_first() {
+    async fn ring_capacity_is_pinned_to_512_and_evicts_oldest_first() {
         assert_eq!(
-            RING_CAPACITY, 10_000,
-            "RING_CAPACITY must stay at the measured-and-justified 10_000 (mayor-h3zlt); if \
-             this fails, someone changed the constant without updating this pinned assertion — \
-             confirm the new value is backed by fresh measurement, not a guess, before adjusting \
-             this test"
+            RING_CAPACITY, 512,
+            "RING_CAPACITY must stay at the measured-and-justified 512; if this fails, someone \
+             changed the constant without updating this pinned assertion. Before adjusting it, \
+             confirm the new value against a fresh u7s_watch_replay_depth capture — and note \
+             that capture is only valid at a capacity where the shard never fills, since a \
+             full ring censors the very tail being sized against"
         );
 
         let store = SqliteStore::new(":memory:").expect("in-memory store");
