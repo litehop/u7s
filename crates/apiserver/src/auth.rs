@@ -528,7 +528,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
         if let Some(k) = sig_key {
             let now = std::time::Instant::now();
             let expires_at = sa_sig_cache::capped_expiry(data.claims.exp, unix_now(), now);
-            sig_cache.insert(k, None, expires_at, now);
+            sig_cache.insert(k, None, expires_at);
         }
         data.claims
     };
