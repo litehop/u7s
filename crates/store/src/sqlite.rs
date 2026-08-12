@@ -56,9 +56,10 @@ struct RingShard {
     ring: RwLock<VecDeque<Arc<InternalEvent>>>,
     /// Push timestamps for `ring`'s entries, as whole seconds since the store's epoch, in
     /// lockstep with it: `push_secs[i]` is when `ring[i]` was pushed. Feeds
-    /// `WATCH_RING_OLDEST_AGE_SECONDS`, which reports how much history this shard actually
-    /// covers — the property that decides whether a reconnecting watch survives (see that
-    /// gauge's doc).
+    /// `WATCH_RING_SPAN_SECONDS`, which reports how much history this shard actually covers —
+    /// the property that decides whether a reconnecting watch survives (see that gauge's doc,
+    /// which also explains why it is a span between two push times and not an age relative to
+    /// now).
     ///
     /// A side deque rather than a field on `InternalEvent` or a `(event, secs)` tuple in `ring`
     /// itself, for one reason: `ring` is created with `VecDeque::with_capacity(RING_CAPACITY+1)`,
@@ -195,7 +196,7 @@ impl SqliteStore {
 
     /// Test-only helper: like `push_event`, but with the push timestamp supplied explicitly
     /// instead of read from the store's epoch, so tests can drive
-    /// `WATCH_RING_OLDEST_AGE_SECONDS` across a span of simulated seconds without sleeping.
+    /// `WATCH_RING_SPAN_SECONDS` across a span of simulated seconds without sleeping.
     #[cfg(test)]
     fn push_event_at(&self, event: Arc<InternalEvent>, ns: Option<&str>, now_secs: u32) {
         let shard = shard_key(&event.key, ns);
@@ -314,11 +315,14 @@ fn push_event_locked(
             "push_secs must stay in lockstep with ring — a drift here silently corrupts the \
              retained-history gauge that ring sizing decisions are made from"
         );
-        // How much history this shard actually covers right now. `saturating_sub` rather than a
-        // bare subtraction so a coarse-clock or monotonic-source anomaly can only ever report 0,
-        // never wrap a u32 into a nonsense multi-decade age. Empty ring reports 0: no retained
-        // events means no replay cover, which is the honest reading.
-        crate::metrics::WATCH_RING_OLDEST_AGE_SECONDS
+        // The wall-clock span this shard's retained events cover: `now_secs` is this push's own
+        // stamp, i.e. the NEWEST retained entry, so this is newest-minus-oldest and not the
+        // oldest entry's age relative to real "now". It therefore only refreshes on write — see
+        // `WATCH_RING_SPAN_SECONDS`' doc for why span is the quantity worth reporting and how to
+        // read a frozen value on an idle shard. `saturating_sub` rather than a bare subtraction
+        // so a monotonic-source anomaly can only ever report 0, never wrap a u32 into a nonsense
+        // multi-decade span.
+        crate::metrics::WATCH_RING_SPAN_SECONDS
             .with_label_values(&[shard_key])
             .set(
                 secs_guard
@@ -3939,8 +3943,8 @@ mod tests {
         );
     }
 
-    /// `WATCH_RING_OLDEST_AGE_SECONDS` must report how far back a shard's retained history
-    /// actually reaches, in seconds — not merely that the shard holds N events.
+    /// `WATCH_RING_SPAN_SECONDS` must report how far back a shard's retained history actually
+    /// reaches, in seconds — not merely that the shard holds N events.
     ///
     /// Why it matters: the ring is read exactly once, at watch open, to bridge
     /// `from_revision -> now`. A reconnecting client's watch survives iff the ring still covers
@@ -3951,22 +3955,27 @@ mod tests {
     /// shrink `RING_CAPACITY` for memory is made against this number; if it silently reported
     /// the wrong thing we would size the ring off a fiction.
     ///
+    /// Note the measured quantity is a SPAN between two push times (newest retained minus
+    /// oldest retained), not the oldest entry's age against real "now" — see the gauge's doc.
+    /// The pushes below therefore also stand in for the clock: the span after pushing at t=45
+    /// is 45 because the newest entry IS the t=45 one.
+    ///
     /// Fails on revert: if the push stamp stops being recorded the gauge stays pinned at 0 and
     /// the 30/45 assertions fail; if the subtraction is inverted it saturates to 0 likewise.
     #[tokio::test]
-    async fn ring_reports_age_of_oldest_retained_event_not_just_occupancy() {
+    async fn ring_reports_retained_history_span_not_just_occupancy() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
         // Unique resource-type root: the gauge lives in the process-global prometheus registry,
         // so sharing a shard label with another test would let them clobber each other.
-        let age = || {
-            crate::metrics::WATCH_RING_OLDEST_AGE_SECONDS
-                .with_label_values(&["/registry/agetest-basic/"])
+        let span = || {
+            crate::metrics::WATCH_RING_SPAN_SECONDS
+                .with_label_values(&["/registry/spantest-basic/"])
                 .get()
         };
         let push = |name: &str, rv: u64, at: u32| {
             store.push_event_at(
                 Arc::new(InternalEvent {
-                    key: format!("/registry/agetest-basic/default/{name}"),
+                    key: format!("/registry/spantest-basic/default/{name}"),
                     revision: rv,
                     value: Some(svc_value(name, rv)),
                     is_create: true,
@@ -3979,7 +3988,7 @@ mod tests {
 
         push("a", 1, 0);
         assert_eq!(
-            age(),
+            span(),
             0,
             "a shard holding one just-written event has no history depth yet — reporting \
              anything but 0 would overstate the replay cover available to a reconnecting watch"
@@ -3987,45 +3996,46 @@ mod tests {
 
         push("b", 2, 30);
         assert_eq!(
-            age(),
+            span(),
             30,
-            "with the oldest retained event pushed at t=0 and the clock now at t=30, this shard \
+            "with the oldest retained event pushed at t=0 and the newest at t=30, this shard \
              covers 30s of watch-replay history; occupancy (2) says nothing about that"
         );
 
         push("c", 3, 45);
         assert_eq!(
-            age(),
+            span(),
             45,
-            "age must track the OLDEST retained event (t=0), not the gap between the last two \
+            "the span must be measured from the OLDEST retained event (t=0), not the gap \
+             between the last two \
              pushes — a watch reconnecting from 40s ago is still serviceable and must not be \
              judged against the most recent write"
         );
     }
 
-    /// Once eviction discards a shard's oldest entries, the reported history age must fall to
+    /// Once eviction discards a shard's oldest entries, the reported history span must fall to
     /// match the new oldest entry.
     ///
     /// Why it matters: this is the case that decides whether the gauge can be trusted as a
     /// safety signal at all. A ring at capacity is exactly when its cover is shrinking and when
-    /// an operator most needs a true number; a gauge that keeps reporting the age of an event
-    /// already evicted would claim the deepest history precisely when the least remains.
+    /// an operator most needs a true number; a gauge still measuring from an event already
+    /// evicted would claim the deepest history precisely when the least remains.
     ///
     /// Fails on revert: dropping the `secs_guard.pop_front()` that pairs with the ring's
     /// `pop_front` desynchronises the two deques, leaving a stale t=0 stamp at the front — this
     /// asserts 0 and would instead see 100.
     #[tokio::test]
-    async fn ring_age_falls_when_eviction_discards_the_oldest_events() {
+    async fn ring_span_falls_when_eviction_discards_the_oldest_events() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
-        let age = || {
-            crate::metrics::WATCH_RING_OLDEST_AGE_SECONDS
-                .with_label_values(&["/registry/agetest-evict/"])
+        let span = || {
+            crate::metrics::WATCH_RING_SPAN_SECONDS
+                .with_label_values(&["/registry/spantest-evict/"])
                 .get()
         };
         let push = |i: u64, at: u32| {
             store.push_event_at(
                 Arc::new(InternalEvent {
-                    key: format!("/registry/agetest-evict/default/obj-{i}"),
+                    key: format!("/registry/spantest-evict/default/obj-{i}"),
                     revision: i,
                     value: Some(svc_value("obj", i)),
                     is_create: true,
@@ -4041,7 +4051,7 @@ mod tests {
             push(i + 1, 0);
         }
         assert_eq!(
-            age(),
+            span(),
             0,
             "ring filled entirely at t=0 spans no time — test setup broken"
         );
@@ -4049,7 +4059,7 @@ mod tests {
         // One more push at t=100 forces the first eviction: the oldest t=0 entry goes.
         push(RING_CAPACITY as u64 + 1, 100);
         assert_eq!(
-            age(),
+            span(),
             100,
             "one eviction leaves the remaining t=0 entries as the oldest, so cover is still 100s"
         );
@@ -4059,7 +4069,7 @@ mod tests {
             push(RING_CAPACITY as u64 + 2 + i, 100);
         }
         assert_eq!(
-            age(),
+            span(),
             0,
             "after a full turnover every retained event was pushed at t=100, so the shard now \
              covers 0s of history — a gauge still reporting 100 would be describing events the \
