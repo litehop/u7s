@@ -13,14 +13,20 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    // Defaults to "dhat-heap.json" in the process's CWD (dhat's own default)
-    // unless overridden, so callers that need a stable, workdir-relative
-    // location (e.g. scripts/conformance/run-all.sh --profile) can set it.
-    // dhat's default backtrace depth (10 frames) is too shallow for this
-    // codebase's async/serde call chains: deep or recursive allocation sites
-    // collapse into a single anonymous "depth-truncated" bucket instead of
-    // being attributed to a specific callsite.
-    let mut profiler_builder = dhat::Profiler::builder().trim_backtraces(Some(50));
+    // Backtrace depth is env-var-driven (see scripts/conformance/run-all.sh's
+    // --dhat-depth flag), defaulting to 10 -- dhat's own crate default. A
+    // deeper depth attributes allocations in this codebase's async/serde call
+    // chains more precisely (dhat's default otherwise collapses many of them
+    // into an anonymous "depth-truncated" bucket), but isn't free: at depth
+    // 50 a full-suite Conformance run measured +82% wall-clock and +318%
+    // peak apiserver RSS versus un-profiled, almost entirely profiler
+    // overhead rather than real allocation growth. Deep-stack profiling for
+    // a focused investigation is therefore an operator opt-in via the env
+    // var, not something every profiled run pays for by default.
+    let depth = u7s_apiserver::resolve_dhat_backtrace_depth(
+        std::env::var("U7S_DHAT_BACKTRACE_DEPTH").ok().as_deref(),
+    );
+    let mut profiler_builder = dhat::Profiler::builder().trim_backtraces(Some(depth));
     if let Ok(heap_file) = std::env::var("U7S_DHAT_HEAP_FILE") {
         profiler_builder = profiler_builder.file_name(heap_file);
     }

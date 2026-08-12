@@ -146,6 +146,39 @@ scripts/conformance/run-all.sh --vm <VM> --port <PORT> --kubelet-port <KUBELET_P
 
 ---
 
+## Allocation profiling — `--profile` / `--dhat-depth`
+
+`--profile` rebuilds `u7s-apiserver` with `--features dhat` before stack bring-up and
+runs the conformance workload under dhat's allocation profiler. **It is not free, and
+the cost depends on `--dhat-depth`** (the number of backtrace frames dhat keeps per
+allocation site; forwarded to the apiserver as `U7S_DHAT_BACKTRACE_DEPTH`, defaulting
+to 10 when omitted):
+
+| config            | suite time | peak apiserver RSS |
+|-------------------|-----------|---------------------|
+| no profile        | 1524 s    | 137 MB              |
+| `--profile` depth 10 (default) | 1721 s (+13%) | 198 MB |
+| `--profile --dhat-depth 50`    | 2774 s (+82%) | 573 MB |
+
+(figures from bd memory `conformance-suite-wall-clock-budget`)
+
+**A bare `--profile` (no `--focus`) runs the FULL suite under dhat and prints a
+wall-clock warning to stderr** — even at the default depth 10 it risks exceeding the
+~25 min un-profiled budget, and at depth 50 it very likely will. Reserve
+`--dhat-depth 50` (or higher) for a `--focus`-scoped investigation, not a full-suite
+run:
+
+```bash
+scripts/conformance/run-all.sh --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT> \
+  --profile --dhat-depth 50 --focus "<FOCUS>"
+```
+
+Mutually exclusive with `--binary` (the whole point of `--profile` is the
+`--features dhat` rebuild). See `run-all.sh`'s own `--profile`/`--dhat-depth` doc
+comments for the heap-file relocation and SIGTERM-flush mechanics.
+
+---
+
 ## Stack-only mode — live stack without sonobuoy
 
 Use `--stack-only` to bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler)
