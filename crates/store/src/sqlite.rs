@@ -73,6 +73,13 @@ struct RingShard {
     /// only code that touches this field at all, and it pushes/pops both deques together while
     /// holding `ring`'s write guard. Do not read or mutate it elsewhere without preserving that.
     push_secs: RwLock<VecDeque<u32>>,
+    /// This shard's own compaction floor: the revision of the oldest entry its ring still holds,
+    /// as of its most recent eviction. 0 until this shard has evicted anything, which correctly
+    /// means "nothing of this resource type has been discarded, so no revision of it is expired."
+    ///
+    /// Authoritative for expiry decisions. `SqliteStore::compaction_horizon` is a cross-shard
+    /// maximum and must NOT be used to expire a watch — see its field doc.
+    horizon: AtomicU64,
     deletion_log: RwLock<DeletionLog>,
 }
 
@@ -81,6 +88,7 @@ impl RingShard {
         Self {
             ring: RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)),
             push_secs: RwLock::new(VecDeque::new()),
+            horizon: AtomicU64::new(0),
             deletion_log: RwLock::new(DeletionLog::default()),
         }
     }
@@ -225,16 +233,54 @@ impl SqliteStore {
         )
     }
 
-    /// Return the current compaction horizon: the lowest revision no longer in the ring.
-    /// If `from_revision > 0 && from_revision < compaction_horizon()`, the revision is expired.
+    /// Return the cross-shard MAXIMUM compaction floor.
+    ///
+    /// Do NOT use this to decide whether a watch is expired — use `compaction_horizon_for`.
+    /// Because this is a max over every shard, the busiest resource type's floor dominates it,
+    /// and expiring against it would reject watches on quiet resource types whose own history is
+    /// completely intact. It survives as a coarse, whole-store summary (and as the `Store` trait's
+    /// default backing for `compaction_horizon_for`).
     pub fn compaction_horizon(&self) -> u64 {
         self.compaction_horizon.load(Ordering::Relaxed)
     }
 
-    /// Directly set the compaction horizon. Intended for tests that simulate compaction
-    /// without needing to overflow the ring buffer (which requires 1000+ writes).
-    pub fn set_compaction_horizon_for_test(&self, horizon: u64) {
-        self.compaction_horizon.store(horizon, Ordering::Relaxed);
+    /// Return the compaction floor for the one shard `prefix` can match — the revision below
+    /// which THIS resource type's watch history has actually been discarded.
+    ///
+    /// 0 when no shard matches. A shard is created on a resource type's first write, so "no
+    /// shard" means nothing of this type was ever written and therefore nothing of it was ever
+    /// evicted; reporting 0 (not expired) is correct, and the replay is simply empty.
+    ///
+    /// NOTE for whoever implements shard reclamation (mayor-88h1w): that changes this. Once a
+    /// shard can be torn down, "no shard" stops meaning "never written" and starts also meaning
+    /// "history discarded", and returning 0 here would silently serve an empty replay as though
+    /// it were complete. Reclamation must preserve the reclaimed shard's floor rather than let
+    /// this fall through to 0.
+    pub fn compaction_horizon_for(&self, prefix: &str) -> u64 {
+        find_shard(&self.shards.read().expect("shards poisoned"), prefix)
+            .map_or(0, |shard| shard.horizon.load(Ordering::Relaxed))
+    }
+
+    /// Directly set the compaction floor for the shard `prefix` routes to, creating that shard
+    /// if it does not exist yet. Intended for tests that simulate compaction without needing to
+    /// overflow the ring buffer (which requires RING_CAPACITY+1 writes).
+    ///
+    /// Takes a prefix because expiry is per-shard: setting a store-wide value would no longer
+    /// affect any watch, since `compaction_horizon_for` consults only the matching shard.
+    /// Also advances the cross-shard maximum, so a test seeding a floor sees a consistent
+    /// `compaction_horizon()` too.
+    pub fn set_compaction_horizon_for_test(&self, prefix: &str, horizon: u64) {
+        // Resolve in its own statement so the read guard is dropped before get_or_create_shard
+        // takes the write lock — std's RwLock is not reentrant, so holding both here would
+        // deadlock this thread against itself.
+        let existing = find_shard(&self.shards.read().expect("shards poisoned"), prefix);
+        let shard = match existing {
+            Some(shard) => shard,
+            None => get_or_create_shard(&self.shards, prefix),
+        };
+        shard.horizon.store(horizon, Ordering::Relaxed);
+        self.compaction_horizon
+            .fetch_max(horizon, Ordering::Relaxed);
     }
 }
 
@@ -293,6 +339,10 @@ fn push_event_locked(
                 // low-revision eviction regress the horizon backward after some other, busier
                 // shard already advanced it past that point — silently un-expiring revisions
                 // that busier shard's ring has already discarded.
+                // This shard's own floor — the value every expiry decision for this resource
+                // type is made against. fetch_max for the same reason as the global below:
+                // concurrent writers to this shard can evict out of order.
+                shard.horizon.fetch_max(oldest.revision, Ordering::Relaxed);
                 compaction_horizon.fetch_max(oldest.revision, Ordering::Relaxed);
                 tracing::debug!(
                     new_horizon = oldest.revision,
@@ -1463,13 +1513,18 @@ impl Store for SqliteStore {
         // Subscribe FIRST to avoid missing events between replay and live.
         let mut rx = self.tx.subscribe();
 
-        let horizon = self.compaction_horizon.load(Ordering::Relaxed);
-
         // A namespace-scoped `prefix` is always this resource type's root plus one namespace
         // segment, and a cluster-scoped/all-namespaces `prefix` is exactly the root — either way
         // `prefix` matches at most one shard. `None` means this resource type has never been
         // written to, so there is nothing to replay.
         let shard = find_shard(&self.shards.read().expect("shards poisoned"), prefix);
+
+        // Expire against THIS shard's floor, never the cross-shard maximum. The store-wide value
+        // is dominated by whichever resource type churns hardest, so using it here would reject a
+        // watch on a quiet type whose own ring still holds every event it ever saw.
+        let horizon = shard
+            .as_ref()
+            .map_or(0, |shard| shard.horizon.load(Ordering::Relaxed));
 
         // Collect ring buffer snapshot while holding read lock (std::sync::RwLock — synchronous).
         let replayed: Vec<Arc<InternalEvent>> = match &shard {
@@ -1494,7 +1549,6 @@ impl Store for SqliteStore {
         );
 
         let prefix_owned = prefix.to_string();
-        let compaction_horizon_arc = Arc::clone(&self.compaction_horizon);
         // Captured for lag recovery: allows re-subscribing and re-scanning ring buffer
         // without terminating the stream when the broadcast channel lags transiently.
         let tx_clone = self.tx.clone();
@@ -1693,7 +1747,16 @@ impl Store for SqliteStore {
                         // Without this, a namespace deleted during the lag+compaction window
                         // would never deliver its DELETED event: the client would reconnect after
                         // a relist, open a new Watch at the current revision, and wait forever.
-                        let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
+                        // This shard's own floor, re-resolved rather than captured: the shard may
+                        // not have existed when the watch opened. Using the cross-shard maximum
+                        // here would declare recovery failed — and force the client into a
+                        // relist — because some unrelated busy resource type evicted, even
+                        // though this prefix's ring still holds everything since last_replayed.
+                        let current_horizon = {
+                            let shards_guard = shards_arc.read().expect("shards poisoned");
+                            find_shard(&shards_guard, &prefix_owned)
+                                .map_or(0, |shard| shard.horizon.load(Ordering::Relaxed))
+                        };
                         let recovered = current_horizon <= last_replayed;
                         tracing::debug!(
                             prefix = %prefix_owned,
@@ -4075,6 +4138,142 @@ mod tests {
              covers 0s of history — a gauge still reporting 100 would be describing events the \
              ring has already discarded, i.e. claiming replay cover that no longer exists"
         );
+    }
+
+    /// A watch on a quiet resource type must survive a busy resource type's eviction.
+    ///
+    /// Why it matters: expiry used to be decided against one process-wide `compaction_horizon`
+    /// advanced by `fetch_max` from EVERY shard's eviction. Because a fast-churning shard retains
+    /// only recent events, its oldest-retained revision is the HIGHEST of any shard, so the
+    /// store-wide maximum tracked whichever resource type churned hardest and was then applied to
+    /// all of them. A watch on a quiet type whose ring still held every event it ever saw would be
+    /// told "too old resource version". The client relists and re-watches; if the busy type is
+    /// still churning the horizon has moved again by then, so it can fail to ever re-establish —
+    /// a relist loop that looks like controllers falling behind (mayor-nlkyd) while the resource
+    /// being watched is entirely intact.
+    ///
+    /// Fails on revert: restoring the global read makes the quiet watch yield
+    /// `WatchEvent::Compacted` instead of replaying, and the explicit precondition assertion
+    /// below documents exactly why (the store-wide horizon sits far above this watch's rv).
+    #[tokio::test]
+    async fn quiet_shard_watch_survives_a_busy_shard_eviction() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Quiet type: five low-revision events, far too few to ever evict.
+        const QUIET_EVENTS: u64 = 5;
+        for i in 0..QUIET_EVENTS {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/f8ziu-quiet/default/obj-{i}"),
+                    revision: 10 + i,
+                    value: Some(svc_value("obj", 10 + i)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        // Busy type: overflow its ring so it evicts and raises a high floor.
+        for i in 0..(RING_CAPACITY as u64 + 1_000) {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/f8ziu-busy/default/obj-{i}"),
+                    revision: 1_000 + i,
+                    value: Some(svc_value("obj", 1_000 + i)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        // Precondition: the store-wide maximum is now far above the quiet watch's rv. This is
+        // the value the old code expired against, and is what makes this test meaningful.
+        let global = store.compaction_horizon();
+        assert!(
+            global > 5,
+            "test setup broken: the busy shard must have evicted and pushed the store-wide \
+             horizon ({global}) above the quiet watch's from_revision (5)"
+        );
+        assert_eq!(
+            store.compaction_horizon_for("/registry/core/f8ziu-quiet/"),
+            0,
+            "the quiet shard never evicted, so its own floor must still be 0 — if this reports \
+             the busy shard's floor the per-shard resolution is not working"
+        );
+
+        let stream = store
+            .watch("/registry/core/f8ziu-quiet/", 5)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let mut replayed = 0u64;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while replayed < QUIET_EVENTS {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Compacted { requested, horizon })) => panic!(
+                    "quiet shard's watch was expired (requested rv {requested}, horizon \
+                     {horizon}) even though its own ring still holds all {QUIET_EVENTS} of its \
+                     events — the horizon was resolved store-wide instead of per-shard"
+                ),
+                Ok(Some(_)) => replayed += 1,
+                Ok(None) => panic!("stream ended before replaying the quiet shard's events"),
+                Err(_) => panic!(
+                    "timed out after replaying {replayed} of {QUIET_EVENTS} quiet-shard events"
+                ),
+            }
+        }
+    }
+
+    /// The inverse of the above: a watch below a shard's OWN floor must still be expired.
+    ///
+    /// Why it matters: the per-shard fix must not be implemented by weakening expiry generally.
+    /// Silently serving a revision whose events this shard has genuinely evicted is strictly
+    /// worse than the spurious-410 bug it replaces — the client would receive an incomplete
+    /// replay and believe it had caught up, missing writes with no error anywhere.
+    ///
+    /// Fails on revert: an implementation that always returns 0 (e.g. never wiring the shard's
+    /// floor on eviction) passes the sibling test above but fails here.
+    #[tokio::test]
+    async fn busy_shard_still_expires_a_watch_below_its_own_floor() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        for i in 0..(RING_CAPACITY as u64 + 1_000) {
+            store.push_event(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/core/f8ziu-busy2/default/obj-{i}"),
+                    revision: 1_000 + i,
+                    value: Some(svc_value("obj", 1_000 + i)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+            );
+        }
+
+        let own_floor = store.compaction_horizon_for("/registry/core/f8ziu-busy2/");
+        assert!(
+            own_floor > 1_000,
+            "test setup broken: the busy shard must have evicted and set its own floor, got \
+             {own_floor}"
+        );
+
+        let stream = store
+            .watch("/registry/core/f8ziu-busy2/", 1_001)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(WatchEvent::Compacted { .. })) => {}
+            other => panic!(
+                "a watch from rv 1001, below this shard's own floor of {own_floor}, must be \
+                 expired with Compacted — anything else silently serves an incomplete replay as \
+                 though it were the full history. Got: {other:?}"
+            ),
+        }
     }
 
     /// The shared `compaction_horizon` atomic must use `fetch_max`, not a plain `store`, when a

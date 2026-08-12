@@ -797,7 +797,10 @@ async fn watch_generic_impl<S: Store>(
     // list snapshot at the current revision, and watch_from_rv below will be set to list_rv,
     // not from_revision. The stale from_revision is irrelevant in that path.
     if from_revision > 0 && initial_items.is_none() {
-        let horizon = state.store.compaction_horizon();
+        // Per-shard, not store-wide: the store-wide horizon is a maximum across every resource
+        // type, so a busy type's eviction would expire this watch even when its own resource
+        // type's ring is fully intact.
+        let horizon = state.store.compaction_horizon_for(&prefix);
         if from_revision < horizon {
             crate::metrics::REQUEST_TOTAL
                 .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "410"])
@@ -1983,7 +1986,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        store.set_compaction_horizon_for_test(50);
+        store.set_compaction_horizon_for_test("/registry/test/", 50);
 
         let state = AppState::new(
             store,
@@ -2036,7 +2039,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        store.set_compaction_horizon_for_test(50);
+        store.set_compaction_horizon_for_test("/registry/test/", 50);
 
         let state = AppState::new(
             store,
@@ -2144,7 +2147,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        store.set_compaction_horizon_for_test(50);
+        store.set_compaction_horizon_for_test("/registry/test/", 50);
 
         let state = AppState::new(
             store,

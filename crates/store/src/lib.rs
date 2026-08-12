@@ -380,7 +380,25 @@ pub trait Store: Send + Sync + 'static {
     /// Return the current compaction horizon.
     /// Any revision below this value has been compacted out of the ring buffer.
     /// Returns 0 when no compaction has occurred.
+    ///
+    /// For an implementation that shards its ring by resource type this is a cross-shard
+    /// MAXIMUM, so do not decide watch expiry with it — use `compaction_horizon_for`.
     fn compaction_horizon(&self) -> u64;
+
+    /// Return the compaction horizon that governs watches on `prefix` specifically: the revision
+    /// below which THIS resource type's history has been discarded.
+    ///
+    /// This, not `compaction_horizon`, is what an expiry check must consult. On a sharded store
+    /// the two differ sharply: the store-wide value tracks whichever resource type churns
+    /// hardest, so expiring against it rejects watches on quiet resource types whose own ring
+    /// still holds every event they ever saw — a spurious 410 that forces the client into a
+    /// needless relist, and under sustained churn can prevent it from ever re-establishing.
+    ///
+    /// Defaults to `compaction_horizon()` so unsharded implementations (and test doubles) need
+    /// not override it — for a single global ring the two are the same value.
+    fn compaction_horizon_for(&self, _prefix: &str) -> u64 {
+        self.compaction_horizon()
+    }
 
     /// Return the global revision of the most recently committed write.
     /// Used by watch BOOKMARK heartbeats to advance informer sync RVs across
