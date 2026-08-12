@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
 
 /// Observed 16-way conformance load cycles through ~36 cluster-wide writes/sec (see
@@ -53,6 +54,25 @@ struct DeletionLog {
 /// occupancy of every resource type in the store instead of just its own prefix.
 struct RingShard {
     ring: RwLock<VecDeque<Arc<InternalEvent>>>,
+    /// Push timestamps for `ring`'s entries, as whole seconds since the store's epoch, in
+    /// lockstep with it: `push_secs[i]` is when `ring[i]` was pushed. Feeds
+    /// `WATCH_RING_SPAN_SECONDS`, which reports how much history this shard actually covers —
+    /// the property that decides whether a reconnecting watch survives (see that gauge's doc,
+    /// which also explains why it is a span between two push times and not an age relative to
+    /// now).
+    ///
+    /// A side deque rather than a field on `InternalEvent` or a `(event, secs)` tuple in `ring`
+    /// itself, for one reason: `ring` is created with `VecDeque::with_capacity(RING_CAPACITY+1)`,
+    /// so widening its element from 8 bytes (a thin `Arc`) to 16 (`Arc` + `u32` + padding) would
+    /// double every shard's pre-allocated slot array — ~+6 MB across the 73 shards a conformance
+    /// run creates, most of which stay nearly empty. This deque is deliberately NOT
+    /// pre-allocated, so it costs 4 bytes per event actually retained (~124 KB at a measured
+    /// 30,928) instead of per slot reserved.
+    ///
+    /// INVARIANT: `push_secs.len() == ring.len()`. Upheld because `push_event_locked` is the
+    /// only code that touches this field at all, and it pushes/pops both deques together while
+    /// holding `ring`'s write guard. Do not read or mutate it elsewhere without preserving that.
+    push_secs: RwLock<VecDeque<u32>>,
     deletion_log: RwLock<DeletionLog>,
 }
 
@@ -60,6 +80,7 @@ impl RingShard {
     fn new() -> Self {
         Self {
             ring: RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)),
+            push_secs: RwLock::new(VecDeque::new()),
             deletion_log: RwLock::new(DeletionLog::default()),
         }
     }
@@ -98,6 +119,10 @@ pub struct SqliteStore {
     /// this: if the read snapshot is older, the list is retried via the write connection
     /// to guarantee the returned resourceVersion never regresses after a write.
     last_written_revision: Arc<AtomicU64>,
+    /// Monotonic zero point for ring push timestamps (`RingShard::push_secs`). Stored as an
+    /// `Instant` rather than a wall-clock `SystemTime` so the derived ages stay correct across
+    /// NTP steps and DST — the gauge measures elapsed retention, not a calendar time.
+    epoch: Instant,
 }
 
 impl SqliteStore {
@@ -154,6 +179,7 @@ impl SqliteStore {
             shards,
             compaction_horizon,
             last_written_revision,
+            epoch: Instant::now(),
         })
     }
 
@@ -165,12 +191,21 @@ impl SqliteStore {
     /// `Some(namespace)` for a namespaced test key, `None` for a cluster-scoped one.
     #[cfg(test)]
     fn push_event(&self, event: Arc<InternalEvent>, ns: Option<&str>) {
+        self.push_event_at(event, ns, self.epoch.elapsed().as_secs() as u32);
+    }
+
+    /// Test-only helper: like `push_event`, but with the push timestamp supplied explicitly
+    /// instead of read from the store's epoch, so tests can drive
+    /// `WATCH_RING_SPAN_SECONDS` across a span of simulated seconds without sleeping.
+    #[cfg(test)]
+    fn push_event_at(&self, event: Arc<InternalEvent>, ns: Option<&str>, now_secs: u32) {
         let shard = shard_key(&event.key, ns);
         push_event_locked(
             &self.tx,
             &self.shards,
             &shard,
             &self.compaction_horizon,
+            now_secs,
             event,
         );
     }
@@ -227,17 +262,30 @@ fn push_event_locked(
     shards: &RwLock<HashMap<String, Arc<RingShard>>>,
     shard_key: &str,
     compaction_horizon: &AtomicU64,
+    now_secs: u32,
     event: Arc<InternalEvent>,
 ) {
     let shard = get_or_create_shard(shards, shard_key);
+
+    // `now_secs` is seconds since the store's epoch, taken by the caller (see `SqliteStore::epoch`)
+    // rather than read here, for two reasons: it is used for BOTH this event's push stamp and the
+    // age subtraction below, so taking it once means a write can never report a negative age by
+    // racing the clock forward between the two; and it keeps this function a pure function of its
+    // arguments, so `push_event_at` can drive the retained-history gauge deterministically in
+    // tests instead of sleeping.
 
     // Write to ring buffer synchronously using std::sync::RwLock.
     // This avoids a spawned task race between write and watch replay.
     {
         let mut guard = shard.ring.write().expect("ring poisoned");
+        // Held for exactly as long as `guard`, and only ever taken here — this is what keeps
+        // `push_secs` in lockstep with `ring` (see the field's INVARIANT note).
+        let mut secs_guard = shard.push_secs.write().expect("push_secs poisoned");
         guard.push_back(Arc::clone(&event));
+        secs_guard.push_back(now_secs);
         if guard.len() > RING_CAPACITY {
             guard.pop_front();
+            secs_guard.pop_front();
             // Update compaction horizon to the revision of the oldest remaining entry.
             if let Some(oldest) = guard.front() {
                 // fetch_max, not store: this atomic is shared across every shard (see its field
@@ -261,6 +309,26 @@ fn push_event_locked(
         crate::metrics::WATCH_RING_OCCUPANCY
             .with_label_values(&[shard_key])
             .set(guard.len() as i64);
+        debug_assert_eq!(
+            guard.len(),
+            secs_guard.len(),
+            "push_secs must stay in lockstep with ring — a drift here silently corrupts the \
+             retained-history gauge that ring sizing decisions are made from"
+        );
+        // The wall-clock span this shard's retained events cover: `now_secs` is this push's own
+        // stamp, i.e. the NEWEST retained entry, so this is newest-minus-oldest and not the
+        // oldest entry's age relative to real "now". It therefore only refreshes on write — see
+        // `WATCH_RING_SPAN_SECONDS`' doc for why span is the quantity worth reporting and how to
+        // read a frozen value on an idle shard. `saturating_sub` rather than a bare subtraction
+        // so a monotonic-source anomaly can only ever report 0, never wrap a u32 into a nonsense
+        // multi-decade span.
+        crate::metrics::WATCH_RING_SPAN_SECONDS
+            .with_label_values(&[shard_key])
+            .set(
+                secs_guard
+                    .front()
+                    .map_or(0, |oldest| i64::from(now_secs.saturating_sub(*oldest))),
+            );
     }
     // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
     // compaction can still receive DELETED events for objects deleted before compaction.
@@ -1180,6 +1248,7 @@ impl Store for SqliteStore {
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let epoch = self.epoch;
         let start = std::time::Instant::now();
         let (revision, is_noop, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -1198,6 +1267,7 @@ impl Store for SqliteStore {
                     &shards,
                     &shard,
                     &compaction_horizon,
+                    epoch.elapsed().as_secs() as u32,
                     Arc::new(InternalEvent {
                         key: key_str,
                         revision,
@@ -1235,6 +1305,7 @@ impl Store for SqliteStore {
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let epoch = self.epoch;
         let start = std::time::Instant::now();
         let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -1256,6 +1327,7 @@ impl Store for SqliteStore {
                 &shards,
                 &shard,
                 &compaction_horizon,
+                epoch.elapsed().as_secs() as u32,
                 Arc::new(InternalEvent {
                     key: key_str,
                     revision,
@@ -1280,6 +1352,7 @@ impl Store for SqliteStore {
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let epoch = self.epoch;
         let start = std::time::Instant::now();
         let (revision, last_value) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -1293,6 +1366,7 @@ impl Store for SqliteStore {
                 &shards,
                 &shard,
                 &compaction_horizon,
+                epoch.elapsed().as_secs() as u32,
                 Arc::new(InternalEvent {
                     key: key_str,
                     revision,
@@ -1344,6 +1418,7 @@ impl Store for SqliteStore {
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
+        let epoch = self.epoch;
         let keys = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let deleted = delete_namespace_sync(&conn, &ns, &last_written)?;
@@ -1363,6 +1438,7 @@ impl Store for SqliteStore {
                     &shards,
                     &shard,
                     &compaction_horizon,
+                    epoch.elapsed().as_secs() as u32,
                     Arc::new(InternalEvent {
                         key,
                         revision,
@@ -2031,6 +2107,7 @@ mod tests {
             shards: Arc::new(RwLock::new(HashMap::new())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
+            epoch: Instant::now(),
         };
 
         // last_written_revision is already written_rv (set by put_sync).
@@ -3863,6 +3940,140 @@ mod tests {
              was bounded by quiettype's own shard ({quiet_shard_len} entries), not the store's \
              combined occupancy ({} entries)",
             OTHER_TYPES * RING_CAPACITY as u64 + QUIET_EVENTS
+        );
+    }
+
+    /// `WATCH_RING_SPAN_SECONDS` must report how far back a shard's retained history actually
+    /// reaches, in seconds — not merely that the shard holds N events.
+    ///
+    /// Why it matters: the ring is read exactly once, at watch open, to bridge
+    /// `from_revision -> now`. A reconnecting client's watch survives iff the ring still covers
+    /// the gap since it last saw an event, so the safety margin is a DURATION. Occupancy alone
+    /// cannot distinguish 9,670 events meaning 8 seconds of cover from the same 9,670 meaning 8
+    /// minutes, and those differ by whether a client that relists and re-watches gets expired
+    /// again mid-round-trip and never reaches a streaming steady state. Any future decision to
+    /// shrink `RING_CAPACITY` for memory is made against this number; if it silently reported
+    /// the wrong thing we would size the ring off a fiction.
+    ///
+    /// Note the measured quantity is a SPAN between two push times (newest retained minus
+    /// oldest retained), not the oldest entry's age against real "now" — see the gauge's doc.
+    /// The pushes below therefore also stand in for the clock: the span after pushing at t=45
+    /// is 45 because the newest entry IS the t=45 one.
+    ///
+    /// Fails on revert: if the push stamp stops being recorded the gauge stays pinned at 0 and
+    /// the 30/45 assertions fail; if the subtraction is inverted it saturates to 0 likewise.
+    #[tokio::test]
+    async fn ring_reports_retained_history_span_not_just_occupancy() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        // Unique resource-type root: the gauge lives in the process-global prometheus registry,
+        // so sharing a shard label with another test would let them clobber each other.
+        let span = || {
+            crate::metrics::WATCH_RING_SPAN_SECONDS
+                .with_label_values(&["/registry/spantest-basic/"])
+                .get()
+        };
+        let push = |name: &str, rv: u64, at: u32| {
+            store.push_event_at(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/spantest-basic/default/{name}"),
+                    revision: rv,
+                    value: Some(svc_value(name, rv)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+                at,
+            );
+        };
+
+        push("a", 1, 0);
+        assert_eq!(
+            span(),
+            0,
+            "a shard holding one just-written event has no history depth yet — reporting \
+             anything but 0 would overstate the replay cover available to a reconnecting watch"
+        );
+
+        push("b", 2, 30);
+        assert_eq!(
+            span(),
+            30,
+            "with the oldest retained event pushed at t=0 and the newest at t=30, this shard \
+             covers 30s of watch-replay history; occupancy (2) says nothing about that"
+        );
+
+        push("c", 3, 45);
+        assert_eq!(
+            span(),
+            45,
+            "the span must be measured from the OLDEST retained event (t=0), not the gap \
+             between the last two \
+             pushes — a watch reconnecting from 40s ago is still serviceable and must not be \
+             judged against the most recent write"
+        );
+    }
+
+    /// Once eviction discards a shard's oldest entries, the reported history span must fall to
+    /// match the new oldest entry.
+    ///
+    /// Why it matters: this is the case that decides whether the gauge can be trusted as a
+    /// safety signal at all. A ring at capacity is exactly when its cover is shrinking and when
+    /// an operator most needs a true number; a gauge still measuring from an event already
+    /// evicted would claim the deepest history precisely when the least remains.
+    ///
+    /// Fails on revert: dropping the `secs_guard.pop_front()` that pairs with the ring's
+    /// `pop_front` desynchronises the two deques, leaving a stale t=0 stamp at the front — this
+    /// asserts 0 and would instead see 100.
+    #[tokio::test]
+    async fn ring_span_falls_when_eviction_discards_the_oldest_events() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let span = || {
+            crate::metrics::WATCH_RING_SPAN_SECONDS
+                .with_label_values(&["/registry/spantest-evict/"])
+                .get()
+        };
+        let push = |i: u64, at: u32| {
+            store.push_event_at(
+                Arc::new(InternalEvent {
+                    key: format!("/registry/spantest-evict/default/obj-{i}"),
+                    revision: i,
+                    value: Some(svc_value("obj", i)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+                at,
+            );
+        };
+
+        // Exactly fill the ring at t=0, so nothing has been evicted yet.
+        for i in 0..RING_CAPACITY as u64 {
+            push(i + 1, 0);
+        }
+        assert_eq!(
+            span(),
+            0,
+            "ring filled entirely at t=0 spans no time — test setup broken"
+        );
+
+        // One more push at t=100 forces the first eviction: the oldest t=0 entry goes.
+        push(RING_CAPACITY as u64 + 1, 100);
+        assert_eq!(
+            span(),
+            100,
+            "one eviction leaves the remaining t=0 entries as the oldest, so cover is still 100s"
+        );
+
+        // Overwrite the whole ring at t=100: every t=0 entry must now be gone.
+        for i in 0..RING_CAPACITY as u64 {
+            push(RING_CAPACITY as u64 + 2 + i, 100);
+        }
+        assert_eq!(
+            span(),
+            0,
+            "after a full turnover every retained event was pushed at t=100, so the shard now \
+             covers 0s of history — a gauge still reporting 100 would be describing events the \
+             ring has already discarded, i.e. claiming replay cover that no longer exists"
         );
     }
 
