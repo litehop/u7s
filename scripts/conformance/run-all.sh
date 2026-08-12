@@ -125,7 +125,17 @@
 #             must stop it manually to flush the heap (a reminder is printed).
 #             Mutually exclusive with --binary (error if both given): --profile's
 #             whole point is the --features dhat rebuild, which a pre-built
-#             --binary bypasses by definition.
+#             --binary bypasses by definition. A bare --profile (no --focus)
+#             prints a wall-clock warning to stderr — see --dhat-depth below.
+#   --dhat-depth  Sets U7S_DHAT_BACKTRACE_DEPTH in the apiserver's own child env
+#             (only meaningful together with --profile). Controls how many stack
+#             frames dhat keeps per allocation site. Defaults to 10 (dhat's own
+#             crate default) when omitted — measured +13% wall-clock on a full
+#             suite. Depth 50 attributes deep/recursive call chains more
+#             precisely but measured +82% wall-clock and +318% peak apiserver
+#             RSS on a full suite (almost entirely profiler overhead, not real
+#             allocation growth) — reserve it for a --focus-scoped investigation,
+#             not a bare full-suite run.
 #   --sample-interval  Cadence in seconds for scripts/conformance/sample-run-metrics.sh,
 #             which starts once the node topology is final (after step 5 and any
 #             --extra-node join) and reaps at the same point run-all.sh's own
@@ -135,6 +145,11 @@
 #             this replaced an operator-run-by-hand monitoring loop. Default: 30s,
 #             matching that loop's own cadence.
 set -euo pipefail
+
+# Captured before the arg-parsing loop below shifts through "$@" -- needed
+# verbatim by write-build-provenance.sh so a run's meta/build.json records
+# exactly how this invocation was made, not a reconstruction of it.
+ORIGINAL_ARGV=("$@")
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
@@ -152,6 +167,7 @@ KONNECTIVITY_SERVER_PORT=""
 EXTRA_NODE=""
 EXTRA_KUBELET_PORT=""
 PROFILE=0
+DHAT_DEPTH=""
 SAMPLE_INTERVAL=""
 
 while [[ $# -gt 0 ]]; do
@@ -174,6 +190,7 @@ while [[ $# -gt 0 ]]; do
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
     --profile) PROFILE=1; shift ;;
+    --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -224,6 +241,26 @@ fi
 if [ -z "$EXTRA_NODE" ] && [ -n "$EXTRA_KUBELET_PORT" ]; then
   echo "error: --extra-kubelet-port requires --extra-node" >&2
   exit 1
+fi
+
+# --dhat-depth is forwarded verbatim to the apiserver's U7S_DHAT_BACKTRACE_DEPTH
+# (crates/apiserver/src/main.rs parses it as a usize) -- reject it here with a
+# clear message instead of letting a typo silently fall back to the apiserver's
+# own default of 10, which would look like the flag was simply ignored.
+if [ -n "$DHAT_DEPTH" ] && ! [[ "$DHAT_DEPTH" =~ ^[0-9]+$ ]]; then
+  echo "error: --dhat-depth must be a non-negative integer, got '$DHAT_DEPTH'" >&2
+  exit 1
+fi
+
+# A bare --profile (no --focus) runs the FULL suite under dhat instrumentation.
+# Depth 10 (the default) measured +13% wall-clock on a full run; depth 50
+# measured +82% wall-clock and +318% peak apiserver RSS, almost entirely
+# profiler overhead. Either way a full-suite profiled run risks exceeding the
+# ~25 min un-profiled budget and the watchdog's namespace-reap thresholds.
+# Skipped under --stack-only, where sonobuoy (and therefore the whole-suite
+# wall-clock this warns about) never runs at all.
+if [ "$PROFILE" -eq 1 ] && [ -z "$FOCUS" ] && [ "$STACK_ONLY" -eq 0 ]; then
+  echo "warning: dhat profiling on the full suite adds ~13-82% wall-clock (depends on --dhat-depth, default 10); expect the run to exceed the ~25 min un-profiled budget. Consider --focus for a depth-50 investigation." >&2
 fi
 
 banner() {
@@ -306,9 +343,20 @@ fi
 
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.
 banner "Step 2/6: Start apiserver"
-# shellcheck source=02-start-apiserver.sh
-# shellcheck disable=SC2086
-source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG}
+if [ "$PROFILE" -eq 1 ] && [ -n "$DHAT_DEPTH" ]; then
+  # Set only in the apiserver's own child env (via a command-scoped prefix
+  # assignment, not `export`) so U7S_DHAT_BACKTRACE_DEPTH never leaks into
+  # run-all.sh's own environment or any later step (sonobuoy, the scheduler,
+  # etc.) that has no business seeing it. Absent --dhat-depth, nothing is set
+  # here at all -- main.rs's own default of 10 applies.
+  # shellcheck source=02-start-apiserver.sh
+  # shellcheck disable=SC2086
+  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG}
+else
+  # shellcheck source=02-start-apiserver.sh
+  # shellcheck disable=SC2086
+  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG}
+fi
 
 # KUBECONFIG is now set (either from the running instance or newly started).
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -367,6 +415,32 @@ else
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
   bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG}
+
+  # Build provenance: record what was actually tested (git SHA, dhat feature/
+  # depth, node topology, exact invocation) into this run's own meta/build.json
+  # -- so two runs are never silently compared across different configurations.
+  # 06-run-sonobuoy.sh has already created temp/e2e/<TIMESTAMP>-<slug>/ by the
+  # time it returns above, so it's the most-recently-created entry under
+  # temp/e2e/ -- same resolution the --profile teardown below uses for the
+  # dhat heap relocation, computed independently here since this must run for
+  # EVERY sonobuoy invocation, not just profiled ones.
+  # shellcheck disable=SC2012 # `ls -t` for mtime-sort has no `find` equivalent; these dirs are our own sanitized TIMESTAMP-slug names, never adversarial filenames.
+  RUN_DIR=$(ls -td "$WORKDIR"/../e2e/*/ 2>/dev/null | head -1) || true
+  RUN_DIR="${RUN_DIR%/}"
+  if [ -n "$RUN_DIR" ]; then
+    ARGV_JSON="[]"
+    if [ "${#ORIGINAL_ARGV[@]}" -gt 0 ]; then
+      ARGV_JSON=$(printf '%s\n' "${ORIGINAL_ARGV[@]}" | jq -R . | jq -s .)
+    fi
+    _PROFILE_PROV_ARG=""
+    [ "$PROFILE" -eq 1 ] && _PROFILE_PROV_ARG="--profile"
+    _DHAT_DEPTH_PROV_ARG=""
+    [ "$PROFILE" -eq 1 ] && [ -n "$DHAT_DEPTH" ] && _DHAT_DEPTH_PROV_ARG="--dhat-depth $DHAT_DEPTH"
+    # shellcheck disable=SC2086
+    bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "${U7S_VM_NAME:-lima-node}" ${_EXTRA_NODE_ARG} ${_PROFILE_PROV_ARG} ${_DHAT_DEPTH_PROV_ARG} --argv-json "$ARGV_JSON"
+  else
+    echo "warning: could not resolve this run's temp/e2e/ output dir — build.json not written" >&2
+  fi
 
   if [ "$PROFILE" -eq 1 ]; then
     banner "Profile: stopping apiserver to flush dhat heap"

@@ -305,6 +305,27 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// Resolves the dhat allocation-profiler backtrace depth from
+/// `U7S_DHAT_BACKTRACE_DEPTH`, defaulting to 10 (dhat's own crate default) when
+/// unset or unparsable. Depth 50 (this codebase's prior hardcoded default)
+/// measured +82% wall-clock and +318% peak apiserver RSS on a full-suite
+/// Conformance run versus un-profiled — almost entirely profiler overhead, not
+/// real allocation growth — so deep-stack profiling for a focused
+/// investigation is now an explicit operator opt-in via the env var rather
+/// than a cost every profiled run pays by default.
+pub fn resolve_dhat_backtrace_depth(raw: Option<&str>) -> usize {
+    const DEFAULT_DEPTH: usize = 10;
+    match raw {
+        Some(raw) => raw.parse::<usize>().unwrap_or_else(|_| {
+            eprintln!(
+                "warning: U7S_DHAT_BACKTRACE_DEPTH={raw:?} is not a valid depth (usize) — using default of {DEFAULT_DEPTH}"
+            );
+            DEFAULT_DEPTH
+        }),
+        None => DEFAULT_DEPTH,
+    }
+}
+
 /// Shared helpers for the Sentinel protobuf-decode completeness tests duplicated across every
 /// `*_gen_adapter.rs` module: each one builds a message with every field set to a value no
 /// zero/empty-elision check in a `gen_*_to_json`/`decode_*_proto_gen` function could mistake for
@@ -449,6 +470,35 @@ pub(crate) mod sentinel_test_util {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- resolve_dhat_backtrace_depth --
+
+    /// Unset env var must fall back to dhat's own crate default (10), not the
+    /// prior hardcoded 50 whose +82% wall-clock / +318% RSS tax on a
+    /// full-suite Conformance run motivated making this an opt-in.
+    #[test]
+    fn resolve_dhat_backtrace_depth_defaults_to_ten_when_unset() {
+        assert_eq!(resolve_dhat_backtrace_depth(None), 10);
+    }
+
+    /// An operator's explicit depth request (e.g. a focused deep-stack
+    /// investigation) must be honored exactly, not silently clamped or
+    /// re-defaulted.
+    #[test]
+    fn resolve_dhat_backtrace_depth_honors_explicit_value() {
+        assert_eq!(resolve_dhat_backtrace_depth(Some("50")), 50);
+    }
+
+    /// A garbage value (typo, stray whitespace, negative number) must
+    /// degrade to the safe default instead of panicking the apiserver at
+    /// startup — a malformed env var should never be worse than not setting
+    /// it at all.
+    #[test]
+    fn resolve_dhat_backtrace_depth_falls_back_to_default_on_garbage_input() {
+        assert_eq!(resolve_dhat_backtrace_depth(Some("not-a-number")), 10);
+        assert_eq!(resolve_dhat_backtrace_depth(Some("-5")), 10);
+        assert_eq!(resolve_dhat_backtrace_depth(Some("")), 10);
+    }
 
     // -- store_err_to_status --
 

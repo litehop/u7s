@@ -62,6 +62,7 @@ use inflight::InflightLayer;
 pub use metrics::record_request_total;
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
+pub use util::resolve_dhat_backtrace_depth;
 
 /// Maximum request body size in bytes. Applied as the outermost layer so
 /// unauthenticated requests are rejected before auth processing, preventing
