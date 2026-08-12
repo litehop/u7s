@@ -472,6 +472,30 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
     })
 }
 
+/// Encode a Kubernetes protobuf response envelope: magic prefix + `Unknown` message wrapping
+/// pre-encoded object bytes.
+///
+/// Used by `content_type::negotiated_response` for the hot-path GET/LIST types that have a
+/// real per-type encoder (see `core_gen_adapter`/`net_disc_*_adapter`'s `encode_*_proto_gen`
+/// functions). Unlike `encode_proto_response` above, `raw` here is a genuine protobuf
+/// encoding of the object, not JSON bytes reinterpreted as protobuf — the bug class that
+/// made `encode_proto_response`'s approach unshippable (see module-level history in
+/// content_type.rs) does not apply here.
+pub(crate) fn encode_k8s_envelope(kind: &str, api_version: &str, raw: Vec<u8>) -> Vec<u8> {
+    let envelope = Unknown {
+        type_meta: Some(TypeMeta {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+        }),
+        raw,
+        content_encoding: String::new(),
+        content_type: String::new(),
+    };
+    let mut out = K8S_PROTO_MAGIC.to_vec();
+    out.extend_from_slice(&envelope.encode_to_vec());
+    out
+}
+
 /// Decoded fields from a protobuf-encoded TokenRequest.
 pub struct TokenRequestFields {
     pub audiences: Vec<String>,

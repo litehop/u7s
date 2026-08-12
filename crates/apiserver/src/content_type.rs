@@ -1,19 +1,22 @@
 // content_type.rs — Tower middleware for Kubernetes protobuf content negotiation.
 //
 // Kubelet 1.36+ sends `Accept: application/vnd.kubernetes.protobuf, application/json`
-// on every request.  This middleware validates incoming requests and passes responses
-// through unchanged.
+// on every request.  The ContentTypeService middleware below validates incoming requests
+// and passes responses through unchanged — it does not touch response bodies.
 //
-// We do not have a response-side re-encoder — see git log for the rationale (feature
-// reverted 2026-05-21 by commit 51d54dec after client-go decoder crash on Unknown
-// envelope).  In short: client-go's typed proto decoders ignore the
-// contentType=application/json field inside the Unknown envelope and attempt to decode
-// Unknown.raw as a native typed proto message.  When JSON bytes happen to align to
-// invalid proto wire types ("proto: illegal wireType N"), the kubelet crashes or hangs.
+// A prior response-side re-encoder was reverted 2026-05-21 (commit 51d54dec) after a
+// client-go decoder crash: that encoder wrapped the *JSON* bytes inside a protobuf
+// `Unknown` envelope's `raw` field, relying on client-go reading `Unknown.contentType`
+// to know to re-decode `raw` as JSON — but client-go's typed proto decoders ignore that
+// field and attempt to decode `raw` as a native proto message, producing
+// "proto: illegal wireType N" when JSON bytes happen to align to invalid wire types.
 //
-// Returning JSON is always valid because the client's Accept header includes
-// "application/json" as a fallback.  client-go falls back to its JSON decoder
-// transparently.  The proto.rs module is kept for reference and tests.
+// `negotiated_response` below is not that mechanism: it dispatches to a real per-type
+// protobuf encoder (`encoders()`) that produces a genuine protobuf-encoded object in
+// `Unknown.raw`, for a deliberately small set of hot-path kinds (see `encoders()`).
+// Kinds without a registered encoder — including every kind this middleware used to
+// mis-encode — fall back to plain JSON, which is always a valid response since the
+// client's Accept header lists "application/json" too.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,8 +24,110 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::http::{header, HeaderName, HeaderValue, Request, Response};
+use axum::response::IntoResponse;
 use tower::Layer;
 use tower_service::Service;
+
+// ---------------------------------------------------------------------------
+// Response-side protobuf encoding for hot-path GET/LIST kinds
+// ---------------------------------------------------------------------------
+
+type EncoderFn = fn(&serde_json::Value) -> Vec<u8>;
+
+/// `kind` -> protobuf encoder, mirroring `proto::decoders()`'s dispatch shape but for the
+/// response direction. Deliberately scoped to the hot-path kinds named in the bead rather
+/// than the full ~65-kind decode surface — see `core_gen_adapter`/
+/// `net_disc_cert_policy_events_gen_adapter`'s `encode_*_proto_gen` doc comments for the
+/// field-coverage scope of each encoder.
+fn encoders() -> &'static std::collections::HashMap<&'static str, EncoderFn> {
+    static ENCODERS: std::sync::OnceLock<std::collections::HashMap<&'static str, EncoderFn>> =
+        std::sync::OnceLock::new();
+    ENCODERS.get_or_init(|| {
+        let mut m: std::collections::HashMap<&'static str, EncoderFn> =
+            std::collections::HashMap::new();
+        m.insert(
+            "Pod",
+            crate::core_gen_adapter::encode_pod_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "PodList",
+            crate::core_gen_adapter::encode_podlist_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "Service",
+            crate::core_gen_adapter::encode_service_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "ServiceList",
+            crate::core_gen_adapter::encode_servicelist_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "Node",
+            crate::core_gen_adapter::encode_node_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "NodeList",
+            crate::core_gen_adapter::encode_nodelist_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "Endpoints",
+            crate::core_gen_adapter::encode_endpoints_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "EndpointsList",
+            crate::core_gen_adapter::encode_endpointslist_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "Event",
+            crate::core_gen_adapter::encode_event_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "EventList",
+            crate::core_gen_adapter::encode_eventlist_proto_gen as EncoderFn,
+        );
+        m.insert(
+            "EndpointSlice",
+            crate::net_disc_cert_policy_events_gen_adapter::encode_endpointslice_proto_gen
+                as EncoderFn,
+        );
+        m.insert(
+            "EndpointSliceList",
+            crate::net_disc_cert_policy_events_gen_adapter::encode_endpointslicelist_proto_gen
+                as EncoderFn,
+        );
+        m
+    })
+}
+
+/// Whether `accept` names the Kubernetes protobuf media type.
+pub fn wants_protobuf(accept: &str) -> bool {
+    accept.contains("application/vnd.kubernetes.protobuf")
+}
+
+/// Build the response body for an already-assembled JSON object, honoring protobuf content
+/// negotiation for the hot-path kinds registered in `encoders()`.
+///
+/// Falls back to plain `axum::Json` whenever `accept` does not request protobuf, `obj` has
+/// no (or an unrecognized) `kind`, or the kind has no registered encoder — this mirrors the
+/// pre-existing behavior for every kind this function doesn't special-case, so migrating a
+/// call site to use it cannot regress a client that only ever spoke JSON.
+pub fn negotiated_response(accept: &str, obj: serde_json::Value) -> Response<Body> {
+    if wants_protobuf(accept) {
+        if let Some(kind) = obj.get("kind").and_then(|k| k.as_str()) {
+            if let Some(encoder) = encoders().get(kind) {
+                let api_version = obj.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
+                let raw = encoder(&obj);
+                let body = crate::proto::encode_k8s_envelope(kind, api_version, raw);
+                return (
+                    [(header::CONTENT_TYPE, "application/vnd.kubernetes.protobuf")],
+                    body,
+                )
+                    .into_response();
+            }
+        }
+    }
+    axum::Json(obj).into_response()
+}
 
 // ---------------------------------------------------------------------------
 // ContentTypeLayer
@@ -1119,5 +1224,95 @@ mod tests {
             "chunked",
             "transfer-encoding must be preserved unchanged on a watch response"
         );
+    }
+
+    // ---- negotiated_response / encoders() dispatch tests -------------------
+
+    /// Every hot-path kind registered in `encoders()` must produce a protobuf-encoded
+    /// response (correct Content-Type header + k8s magic-prefix bytes) when the client asks
+    /// for it. A kind missing from this list (or whose encoder panics/returns garbage) is
+    /// exactly the "silently substitutes JSON instead of honoring Accept: protobuf" spec-
+    /// compliance gap mayor-re0a5 exists to close.
+    #[tokio::test]
+    async fn negotiated_response_returns_protobuf_for_every_registered_hot_path_kind() {
+        for (kind, api_version) in [
+            ("Pod", "v1"),
+            ("PodList", "v1"),
+            ("Service", "v1"),
+            ("ServiceList", "v1"),
+            ("Node", "v1"),
+            ("NodeList", "v1"),
+            ("Endpoints", "v1"),
+            ("EndpointsList", "v1"),
+            ("Event", "v1"),
+            ("EventList", "v1"),
+            ("EndpointSlice", "discovery.k8s.io/v1"),
+            ("EndpointSliceList", "discovery.k8s.io/v1"),
+        ] {
+            let obj = serde_json::json!({ "kind": kind, "apiVersion": api_version });
+            let resp = negotiated_response("application/vnd.kubernetes.protobuf", obj);
+
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/vnd.kubernetes.protobuf",
+                "{kind}: Content-Type must be the k8s protobuf media type"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert!(
+                body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+                "{kind}: response body must start with the k8s protobuf magic prefix"
+            );
+        }
+    }
+
+    /// A kind with no registered encoder (every kind outside the bead's scoped hot-path list)
+    /// must still get a valid response: plain JSON, exactly as if the client had not asked
+    /// for protobuf at all. This is the fallback contract every one of the ~92 non-migrated
+    /// `axum::Json` call sites implicitly relies on.
+    #[tokio::test]
+    async fn negotiated_response_falls_back_to_json_for_kind_without_encoder() {
+        let obj = serde_json::json!({ "kind": "ConfigMap", "apiVersion": "v1", "data": {} });
+        let resp = negotiated_response("application/vnd.kubernetes.protobuf", obj.clone());
+
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, "application/json",
+            "a kind without a registered encoder must fall back to JSON, not error or hang"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let recovered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            recovered, obj,
+            "fallback body must be the original JSON, unchanged"
+        );
+    }
+
+    /// A client that never asked for protobuf must never receive it, even for a kind that
+    /// does have a registered encoder — Accept negotiation, not "can we", decides the format.
+    #[tokio::test]
+    async fn negotiated_response_falls_back_to_json_when_accept_does_not_request_protobuf() {
+        let obj = serde_json::json!({ "kind": "Pod", "apiVersion": "v1" });
+        let resp = negotiated_response("application/json", obj);
+
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!body.starts_with(&[0x6b, 0x38, 0x73, 0x00]));
     }
 }

@@ -1131,6 +1131,210 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// Encoder — JSON (u7s's own already-validated stored representation) -> Kubernetes
+// protobuf wire format, for the EndpointSlice hot-path GET/LIST response (see
+// content_type.rs). The input here is never untrusted wire data, so no defensive
+// wire-type/size checking is needed.
+// ---------------------------------------------------------------------------
+
+fn jstr(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn ji32(v: &serde_json::Value, key: &str) -> Option<i32> {
+    v.get(key).and_then(|x| x.as_i64()).map(|n| n as i32)
+}
+
+fn jbool(v: &serde_json::Value, key: &str) -> Option<bool> {
+    v.get(key).and_then(|x| x.as_bool())
+}
+
+fn jstrs(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
+    let meta = obj
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let owner_references = meta
+        .get("ownerReferences")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|r| meta_v1::OwnerReference {
+                    api_version: jstr(r, "apiVersion"),
+                    kind: jstr(r, "kind"),
+                    name: jstr(r, "name"),
+                    uid: jstr(r, "uid"),
+                    controller: jbool(r, "controller"),
+                    block_owner_deletion: jbool(r, "blockOwnerDeletion"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    meta_v1::ObjectMeta {
+        name: jstr(&meta, "name"),
+        generate_name: jstr(&meta, "generateName"),
+        namespace: jstr(&meta, "namespace"),
+        uid: jstr(&meta, "uid"),
+        resource_version: jstr(&meta, "resourceVersion"),
+        generation: meta.get("generation").and_then(|x| x.as_i64()),
+        labels: meta
+            .get("labels")
+            .and_then(|m| m.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        annotations: meta
+            .get("annotations")
+            .and_then(|m| m.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        owner_references,
+        finalizers: jstrs(&meta, "finalizers"),
+        ..Default::default()
+    }
+}
+
+fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
+    let meta = v
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    meta_v1::ListMeta {
+        resource_version: jstr(&meta, "resourceVersion"),
+        r#continue: jstr(&meta, "continue"),
+        ..Default::default()
+    }
+}
+
+fn json_to_object_reference_proto(
+    v: &serde_json::Value,
+) -> crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference {
+    crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference {
+        kind: jstr(v, "kind"),
+        namespace: jstr(v, "namespace"),
+        name: jstr(v, "name"),
+        uid: jstr(v, "uid"),
+        api_version: jstr(v, "apiVersion"),
+        resource_version: jstr(v, "resourceVersion"),
+        field_path: jstr(v, "fieldPath"),
+    }
+}
+
+fn json_to_endpoint_conditions_proto(v: &serde_json::Value) -> discovery_v1::EndpointConditions {
+    discovery_v1::EndpointConditions {
+        ready: jbool(v, "ready"),
+        serving: jbool(v, "serving"),
+        terminating: jbool(v, "terminating"),
+    }
+}
+
+fn json_to_endpoint_hints_proto(v: &serde_json::Value) -> discovery_v1::EndpointHints {
+    discovery_v1::EndpointHints {
+        for_zones: v
+            .get("forZones")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|z| jstr(z, "name"))
+                    .map(|name| discovery_v1::ForZone { name: Some(name) })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        for_nodes: v
+            .get("forNodes")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| jstr(n, "name"))
+                    .map(|name| discovery_v1::ForNode { name: Some(name) })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_endpoint_proto(v: &serde_json::Value) -> discovery_v1::Endpoint {
+    discovery_v1::Endpoint {
+        addresses: jstrs(v, "addresses"),
+        conditions: v.get("conditions").map(json_to_endpoint_conditions_proto),
+        hostname: jstr(v, "hostname"),
+        target_ref: v.get("targetRef").map(json_to_object_reference_proto),
+        node_name: jstr(v, "nodeName"),
+        zone: jstr(v, "zone"),
+        hints: v.get("hints").map(json_to_endpoint_hints_proto),
+        ..Default::default()
+    }
+}
+
+fn json_to_endpointslice_port_proto(v: &serde_json::Value) -> discovery_v1::EndpointPort {
+    discovery_v1::EndpointPort {
+        // EndpointPort.name is proto3 `optional string`: an empty string is a valid,
+        // meaningful "unnamed port" wire shape (see decode_endpointslice_proto_gen above) —
+        // emit the key whenever it is present in the JSON, regardless of emptiness, rather
+        // than using the `jstr` helper's "absent if empty" behavior.
+        name: v.get("name").and_then(|n| n.as_str()).map(str::to_string),
+        protocol: jstr(v, "protocol"),
+        port: ji32(v, "port"),
+        app_protocol: jstr(v, "appProtocol"),
+    }
+}
+
+fn json_to_endpointslice_proto(v: &serde_json::Value) -> discovery_v1::EndpointSlice {
+    discovery_v1::EndpointSlice {
+        metadata: Some(json_to_object_meta_proto(v)),
+        address_type: jstr(v, "addressType"),
+        endpoints: v
+            .get("endpoints")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_endpoint_proto).collect())
+            .unwrap_or_default(),
+        ports: v
+            .get("ports")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_endpointslice_port_proto).collect())
+            .unwrap_or_default(),
+    }
+}
+
+pub fn encode_endpointslice_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    json_to_endpointslice_proto(v).encode_to_vec()
+}
+
+pub fn encode_endpointslicelist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    let items = v
+        .get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_endpointslice_proto).collect())
+        .unwrap_or_default();
+    discovery_v1::EndpointSliceList {
+        metadata: Some(json_to_list_meta_proto(v)),
+        items,
+    }
+    .encode_to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2147,6 +2351,72 @@ mod tests {
             "unset eventTime/series/regarding must be absent, not null — event-aggregation \
              tooling that groups by `series != null` to detect a repeated event would otherwise \
              misclassify every single-occurrence event as part of a series"
+        );
+    }
+
+    /// EndpointSlice round-trips through the response-side protobuf encoder: kube-proxy's
+    /// EndpointSlice-based dataplane (the default since 1.19) programs backend rules straight
+    /// from addresses/ports/conditions.ready, so a silent drop here means traffic for that
+    /// backend is never routed, or a not-ready backend is routed to anyway.
+    ///
+    /// This also exercises the mb9ed fix's encode-side counterpart: `ports[].name` must be
+    /// emitted (even as `""`) whenever the JSON had the key at all, not only when non-empty —
+    /// kube-proxy's endpointslicecache.go treats an absent `name` as a different port than an
+    /// empty-string `name`.
+    #[test]
+    fn encode_endpointslice_proto_gen_round_trips_addresses_ports_and_empty_port_name() {
+        let slice = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": { "name": "web-abcde", "namespace": "default" },
+            "addressType": "IPv4",
+            "endpoints": [{
+                "addresses": ["10.244.0.5"],
+                "conditions": { "ready": true },
+                "nodeName": "worker-1"
+            }],
+            "ports": [{ "name": "", "port": 8080, "protocol": "TCP" }]
+        });
+
+        let raw = encode_endpointslice_proto_gen(&slice);
+        let decoded =
+            decode_endpointslice_proto_gen(&raw).expect("encoded EndpointSlice bytes must decode");
+
+        assert_eq!(decoded["addressType"], "IPv4");
+        assert_eq!(decoded["endpoints"][0]["addresses"][0], "10.244.0.5");
+        assert_eq!(
+            decoded["endpoints"][0]["conditions"]["ready"], true,
+            "conditions.ready must survive — kube-proxy skips not-ready backends based on it"
+        );
+        assert_eq!(
+            decoded["ports"][0]["name"], "",
+            "an explicit empty-string port name must round-trip as present-and-empty, not \
+             vanish into a missing key (see mb9ed: a missing key reads as a *different* port \
+             to kube-proxy's endpointslicecache.go than an empty-string name does)"
+        );
+    }
+
+    /// EndpointSliceList wraps each item through the same per-slice encoder.
+    #[test]
+    fn encode_endpointslicelist_proto_gen_round_trips_all_items() {
+        let list = serde_json::json!({
+            "kind": "EndpointSliceList",
+            "apiVersion": "discovery.k8s.io/v1",
+            "metadata": { "resourceVersion": "7" },
+            "items": [
+                { "metadata": { "name": "a" }, "addressType": "IPv4" },
+                { "metadata": { "name": "b" }, "addressType": "IPv4" }
+            ]
+        });
+
+        let raw = encode_endpointslicelist_proto_gen(&list);
+        let decoded = discovery_v1::EndpointSliceList::decode(raw.as_slice())
+            .expect("encoded EndpointSliceList bytes must decode");
+
+        assert_eq!(
+            decoded.items.len(),
+            2,
+            "both list items must survive the round trip"
         );
     }
 }

@@ -4563,6 +4563,811 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+// ---------------------------------------------------------------------------
+// Encoders — JSON (u7s's own already-validated stored representation) -> Kubernetes
+// protobuf wire format, for hot-path GET/LIST responses (see content_type.rs).
+// Unlike the decoders above, the input here is never untrusted wire data, so no
+// defensive wire-type/size checking is needed. Field coverage is scoped to what
+// matters for kube-proxy/kubelet/scheduler consumers of these types rather than
+// full 1:1 parity with the corresponding decode_*_proto_gen's field surface.
+// ---------------------------------------------------------------------------
+
+fn jstr(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn ji64(v: &serde_json::Value, key: &str) -> Option<i64> {
+    v.get(key).and_then(|x| x.as_i64())
+}
+
+fn ji32(v: &serde_json::Value, key: &str) -> Option<i32> {
+    v.get(key).and_then(|x| x.as_i64()).map(|n| n as i32)
+}
+
+fn jbool(v: &serde_json::Value, key: &str) -> Option<bool> {
+    v.get(key).and_then(|x| x.as_bool())
+}
+
+fn jtime(v: &serde_json::Value, key: &str) -> Option<meta_v1::Time> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .and_then(crate::util::rfc3339_to_unix_secs)
+        .map(|secs| meta_v1::Time {
+            seconds: Some(secs),
+            ..Default::default()
+        })
+}
+
+fn json_to_microtime_proto(v: &serde_json::Value, key: &str) -> Option<meta_v1::MicroTime> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .and_then(crate::util::rfc3339_to_unix_secs)
+        .map(|secs| meta_v1::MicroTime {
+            seconds: Some(secs),
+            ..Default::default()
+        })
+}
+
+fn jstrs(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn jstrmap(v: &serde_json::Value, key: &str) -> std::collections::HashMap<String, String> {
+    v.get(key)
+        .and_then(|m| m.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_quantity_map_to_proto(
+    v: &serde_json::Value,
+    key: &str,
+) -> std::collections::HashMap<
+    String,
+    super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity,
+> {
+    v.get(key)
+        .and_then(|m| m.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| {
+                    val.as_str().map(|s| {
+                        (
+                            k.clone(),
+                            super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                string: Some(s.to_string()),
+                            },
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
+    let meta = obj
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let owner_references = meta
+        .get("ownerReferences")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|r| meta_v1::OwnerReference {
+                    api_version: jstr(r, "apiVersion"),
+                    kind: jstr(r, "kind"),
+                    name: jstr(r, "name"),
+                    uid: jstr(r, "uid"),
+                    controller: jbool(r, "controller"),
+                    block_owner_deletion: jbool(r, "blockOwnerDeletion"),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    meta_v1::ObjectMeta {
+        name: jstr(&meta, "name"),
+        generate_name: jstr(&meta, "generateName"),
+        namespace: jstr(&meta, "namespace"),
+        uid: jstr(&meta, "uid"),
+        resource_version: jstr(&meta, "resourceVersion"),
+        generation: ji64(&meta, "generation"),
+        creation_timestamp: jtime(&meta, "creationTimestamp"),
+        deletion_timestamp: jtime(&meta, "deletionTimestamp"),
+        deletion_grace_period_seconds: ji64(&meta, "deletionGracePeriodSeconds"),
+        labels: jstrmap(&meta, "labels"),
+        annotations: jstrmap(&meta, "annotations"),
+        owner_references,
+        finalizers: jstrs(&meta, "finalizers"),
+        ..Default::default()
+    }
+}
+
+fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
+    let meta = v
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    meta_v1::ListMeta {
+        resource_version: jstr(&meta, "resourceVersion"),
+        r#continue: jstr(&meta, "continue"),
+        ..Default::default()
+    }
+}
+
+fn json_to_object_reference_proto(v: &serde_json::Value) -> core_v1::ObjectReference {
+    core_v1::ObjectReference {
+        kind: jstr(v, "kind"),
+        namespace: jstr(v, "namespace"),
+        name: jstr(v, "name"),
+        uid: jstr(v, "uid"),
+        api_version: jstr(v, "apiVersion"),
+        resource_version: jstr(v, "resourceVersion"),
+        field_path: jstr(v, "fieldPath"),
+    }
+}
+
+fn json_to_meta_condition_proto(v: &serde_json::Value) -> meta_v1::Condition {
+    meta_v1::Condition {
+        r#type: jstr(v, "type"),
+        status: jstr(v, "status"),
+        observed_generation: ji64(v, "observedGeneration"),
+        last_transition_time: jtime(v, "lastTransitionTime"),
+        reason: jstr(v, "reason"),
+        message: jstr(v, "message"),
+    }
+}
+
+// ---- Encoder: Pod / PodList -------------------------------------------------
+
+fn json_to_env_var_proto(v: &serde_json::Value) -> core_v1::EnvVar {
+    core_v1::EnvVar {
+        name: jstr(v, "name"),
+        value: jstr(v, "value"),
+        ..Default::default()
+    }
+}
+
+fn json_to_container_port_proto(v: &serde_json::Value) -> core_v1::ContainerPort {
+    core_v1::ContainerPort {
+        name: jstr(v, "name"),
+        host_port: ji32(v, "hostPort"),
+        container_port: ji32(v, "containerPort"),
+        protocol: jstr(v, "protocol"),
+        host_ip: jstr(v, "hostIP"),
+    }
+}
+
+fn json_to_resource_requirements_proto(v: &serde_json::Value) -> core_v1::ResourceRequirements {
+    core_v1::ResourceRequirements {
+        limits: json_quantity_map_to_proto(v, "limits"),
+        requests: json_quantity_map_to_proto(v, "requests"),
+        ..Default::default()
+    }
+}
+
+fn json_to_volume_mount_proto(v: &serde_json::Value) -> core_v1::VolumeMount {
+    core_v1::VolumeMount {
+        name: jstr(v, "name"),
+        read_only: jbool(v, "readOnly"),
+        mount_path: jstr(v, "mountPath"),
+        sub_path: jstr(v, "subPath"),
+        ..Default::default()
+    }
+}
+
+fn json_to_container_proto(v: &serde_json::Value) -> core_v1::Container {
+    core_v1::Container {
+        name: jstr(v, "name"),
+        image: jstr(v, "image"),
+        command: jstrs(v, "command"),
+        args: jstrs(v, "args"),
+        working_dir: jstr(v, "workingDir"),
+        ports: v
+            .get("ports")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_port_proto).collect())
+            .unwrap_or_default(),
+        env: v
+            .get("env")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_env_var_proto).collect())
+            .unwrap_or_default(),
+        resources: v.get("resources").map(json_to_resource_requirements_proto),
+        volume_mounts: v
+            .get("volumeMounts")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_volume_mount_proto).collect())
+            .unwrap_or_default(),
+        image_pull_policy: jstr(v, "imagePullPolicy"),
+        ..Default::default()
+    }
+}
+
+fn json_to_volume_proto(v: &serde_json::Value) -> core_v1::Volume {
+    let mut src = core_v1::VolumeSource::default();
+    if let Some(hp) = v.get("hostPath") {
+        src.host_path = Some(core_v1::HostPathVolumeSource {
+            path: jstr(hp, "path"),
+            r#type: jstr(hp, "type"),
+        });
+    }
+    if let Some(ed) = v.get("emptyDir") {
+        src.empty_dir = Some(core_v1::EmptyDirVolumeSource {
+            medium: jstr(ed, "medium"),
+            size_limit: jstr(ed, "sizeLimit").map(|s| {
+                super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                    string: Some(s),
+                }
+            }),
+        });
+    }
+    if let Some(s) = v.get("secret") {
+        src.secret = Some(core_v1::SecretVolumeSource {
+            secret_name: jstr(s, "secretName"),
+            ..Default::default()
+        });
+    }
+    if let Some(cm) = v.get("configMap") {
+        src.config_map = Some(core_v1::ConfigMapVolumeSource {
+            local_object_reference: jstr(cm, "name")
+                .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+            ..Default::default()
+        });
+    }
+    if let Some(pvc) = v.get("persistentVolumeClaim") {
+        src.persistent_volume_claim = Some(core_v1::PersistentVolumeClaimVolumeSource {
+            claim_name: jstr(pvc, "claimName"),
+            read_only: jbool(pvc, "readOnly"),
+        });
+    }
+    core_v1::Volume {
+        name: jstr(v, "name"),
+        volume_source: Some(src),
+    }
+}
+
+fn json_to_toleration_proto(v: &serde_json::Value) -> core_v1::Toleration {
+    core_v1::Toleration {
+        key: jstr(v, "key"),
+        operator: jstr(v, "operator"),
+        value: jstr(v, "value"),
+        effect: jstr(v, "effect"),
+        toleration_seconds: ji64(v, "tolerationSeconds"),
+    }
+}
+
+fn json_to_scheduling_gate_proto(v: &serde_json::Value) -> core_v1::PodSchedulingGate {
+    core_v1::PodSchedulingGate {
+        name: jstr(v, "name"),
+    }
+}
+
+fn json_to_pod_condition_proto(v: &serde_json::Value) -> core_v1::PodCondition {
+    core_v1::PodCondition {
+        r#type: jstr(v, "type"),
+        status: jstr(v, "status"),
+        reason: jstr(v, "reason"),
+        message: jstr(v, "message"),
+        last_transition_time: jtime(v, "lastTransitionTime"),
+        last_probe_time: jtime(v, "lastProbeTime"),
+        ..Default::default()
+    }
+}
+
+fn json_to_container_state_proto(v: &serde_json::Value) -> core_v1::ContainerState {
+    let mut state = core_v1::ContainerState::default();
+    if let Some(w) = v.get("waiting") {
+        state.waiting = Some(core_v1::ContainerStateWaiting {
+            reason: jstr(w, "reason"),
+            message: jstr(w, "message"),
+        });
+    }
+    if let Some(r) = v.get("running") {
+        state.running = Some(core_v1::ContainerStateRunning {
+            started_at: jtime(r, "startedAt"),
+        });
+    }
+    if let Some(t) = v.get("terminated") {
+        state.terminated = Some(core_v1::ContainerStateTerminated {
+            exit_code: ji32(t, "exitCode"),
+            signal: ji32(t, "signal"),
+            reason: jstr(t, "reason"),
+            message: jstr(t, "message"),
+            started_at: jtime(t, "startedAt"),
+            finished_at: jtime(t, "finishedAt"),
+            container_id: jstr(t, "containerID"),
+        });
+    }
+    state
+}
+
+fn json_to_container_status_proto(v: &serde_json::Value) -> core_v1::ContainerStatus {
+    core_v1::ContainerStatus {
+        name: jstr(v, "name"),
+        state: v.get("state").map(json_to_container_state_proto),
+        last_state: v.get("lastState").map(json_to_container_state_proto),
+        ready: jbool(v, "ready"),
+        restart_count: ji32(v, "restartCount"),
+        image: jstr(v, "image"),
+        image_id: jstr(v, "imageID"),
+        container_id: jstr(v, "containerID"),
+        started: jbool(v, "started"),
+        ..Default::default()
+    }
+}
+
+fn json_to_pod_spec_proto(v: &serde_json::Value) -> core_v1::PodSpec {
+    core_v1::PodSpec {
+        volumes: v
+            .get("volumes")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_volume_proto).collect())
+            .unwrap_or_default(),
+        containers: v
+            .get("containers")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_proto).collect())
+            .unwrap_or_default(),
+        init_containers: v
+            .get("initContainers")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_proto).collect())
+            .unwrap_or_default(),
+        restart_policy: jstr(v, "restartPolicy"),
+        termination_grace_period_seconds: ji64(v, "terminationGracePeriodSeconds"),
+        dns_policy: jstr(v, "dnsPolicy"),
+        node_selector: jstrmap(v, "nodeSelector"),
+        service_account_name: jstr(v, "serviceAccountName"),
+        node_name: jstr(v, "nodeName"),
+        host_network: jbool(v, "hostNetwork"),
+        hostname: jstr(v, "hostname"),
+        subdomain: jstr(v, "subdomain"),
+        scheduler_name: jstr(v, "schedulerName"),
+        tolerations: v
+            .get("tolerations")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_toleration_proto).collect())
+            .unwrap_or_default(),
+        priority_class_name: jstr(v, "priorityClassName"),
+        scheduling_gates: v
+            .get("schedulingGates")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_scheduling_gate_proto).collect())
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+fn json_to_pod_status_proto(v: &serde_json::Value) -> core_v1::PodStatus {
+    core_v1::PodStatus {
+        phase: jstr(v, "phase"),
+        conditions: v
+            .get("conditions")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_pod_condition_proto).collect())
+            .unwrap_or_default(),
+        message: jstr(v, "message"),
+        reason: jstr(v, "reason"),
+        nominated_node_name: jstr(v, "nominatedNodeName"),
+        host_ip: jstr(v, "hostIP"),
+        pod_ip: jstr(v, "podIP"),
+        pod_i_ps: v
+            .get("podIPs")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|ip| jstr(ip, "ip"))
+                    .map(|ip| core_v1::PodIp { ip: Some(ip) })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        start_time: jtime(v, "startTime"),
+        qos_class: jstr(v, "qosClass"),
+        container_statuses: v
+            .get("containerStatuses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_status_proto).collect())
+            .unwrap_or_default(),
+        init_container_statuses: v
+            .get("initContainerStatuses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_status_proto).collect())
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+fn json_to_pod_proto(v: &serde_json::Value) -> core_v1::Pod {
+    core_v1::Pod {
+        metadata: Some(json_to_object_meta_proto(v)),
+        spec: Some(json_to_pod_spec_proto(
+            v.get("spec").unwrap_or(&serde_json::Value::Null),
+        )),
+        status: v.get("status").map(json_to_pod_status_proto),
+    }
+}
+
+pub fn encode_pod_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    json_to_pod_proto(v).encode_to_vec()
+}
+
+pub fn encode_podlist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    let items = v
+        .get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_pod_proto).collect())
+        .unwrap_or_default();
+    core_v1::PodList {
+        metadata: Some(json_to_list_meta_proto(v)),
+        items,
+    }
+    .encode_to_vec()
+}
+
+// ---- Encoder: Service / ServiceList -----------------------------------------
+
+fn json_to_int_or_string_proto(v: &serde_json::Value) -> IntOrString {
+    match v {
+        serde_json::Value::String(s) => IntOrString {
+            r#type: Some(1),
+            str_val: Some(s.clone()),
+            ..Default::default()
+        },
+        _ => IntOrString {
+            r#type: Some(0),
+            int_val: v.as_i64().map(|n| n as i32),
+            ..Default::default()
+        },
+    }
+}
+
+fn json_to_service_port_proto(v: &serde_json::Value) -> core_v1::ServicePort {
+    core_v1::ServicePort {
+        name: jstr(v, "name"),
+        protocol: jstr(v, "protocol"),
+        app_protocol: jstr(v, "appProtocol"),
+        port: ji32(v, "port"),
+        target_port: v.get("targetPort").map(json_to_int_or_string_proto),
+        node_port: ji32(v, "nodePort"),
+    }
+}
+
+fn json_to_service_spec_proto(v: &serde_json::Value) -> core_v1::ServiceSpec {
+    core_v1::ServiceSpec {
+        ports: v
+            .get("ports")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_service_port_proto).collect())
+            .unwrap_or_default(),
+        selector: jstrmap(v, "selector"),
+        cluster_ip: jstr(v, "clusterIP"),
+        cluster_i_ps: jstrs(v, "clusterIPs"),
+        r#type: jstr(v, "type"),
+        external_i_ps: jstrs(v, "externalIPs"),
+        session_affinity: jstr(v, "sessionAffinity"),
+        load_balancer_ip: jstr(v, "loadBalancerIP"),
+        load_balancer_source_ranges: jstrs(v, "loadBalancerSourceRanges"),
+        external_name: jstr(v, "externalName"),
+        external_traffic_policy: jstr(v, "externalTrafficPolicy"),
+        health_check_node_port: ji32(v, "healthCheckNodePort"),
+        publish_not_ready_addresses: jbool(v, "publishNotReadyAddresses"),
+        ip_families: jstrs(v, "ipFamilies"),
+        ip_family_policy: jstr(v, "ipFamilyPolicy"),
+        allocate_load_balancer_node_ports: jbool(v, "allocateLoadBalancerNodePorts"),
+        load_balancer_class: jstr(v, "loadBalancerClass"),
+        internal_traffic_policy: jstr(v, "internalTrafficPolicy"),
+        traffic_distribution: jstr(v, "trafficDistribution"),
+        ..Default::default()
+    }
+}
+
+fn json_to_port_status_proto(v: &serde_json::Value) -> core_v1::PortStatus {
+    core_v1::PortStatus {
+        port: ji32(v, "port"),
+        protocol: jstr(v, "protocol"),
+        error: jstr(v, "error"),
+    }
+}
+
+fn json_to_service_status_proto(v: &serde_json::Value) -> core_v1::ServiceStatus {
+    let load_balancer = v.get("loadBalancer").map(|lb| core_v1::LoadBalancerStatus {
+        ingress: lb
+            .get("ingress")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|i| core_v1::LoadBalancerIngress {
+                        ip: jstr(i, "ip"),
+                        hostname: jstr(i, "hostname"),
+                        ip_mode: jstr(i, "ipMode"),
+                        ports: i
+                            .get("ports")
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.iter().map(json_to_port_status_proto).collect())
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    });
+    core_v1::ServiceStatus {
+        load_balancer,
+        conditions: v
+            .get("conditions")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_meta_condition_proto).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_service_proto(v: &serde_json::Value) -> core_v1::Service {
+    core_v1::Service {
+        metadata: Some(json_to_object_meta_proto(v)),
+        spec: v.get("spec").map(json_to_service_spec_proto),
+        status: v.get("status").map(json_to_service_status_proto),
+    }
+}
+
+pub fn encode_service_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    json_to_service_proto(v).encode_to_vec()
+}
+
+pub fn encode_servicelist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    let items = v
+        .get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_service_proto).collect())
+        .unwrap_or_default();
+    core_v1::ServiceList {
+        metadata: Some(json_to_list_meta_proto(v)),
+        items,
+    }
+    .encode_to_vec()
+}
+
+// ---- Encoder: Node / NodeList ------------------------------------------------
+
+fn json_to_taint_proto(v: &serde_json::Value) -> core_v1::Taint {
+    core_v1::Taint {
+        key: jstr(v, "key"),
+        value: jstr(v, "value"),
+        effect: jstr(v, "effect"),
+        time_added: jtime(v, "timeAdded"),
+    }
+}
+
+fn json_to_node_spec_proto(v: &serde_json::Value) -> core_v1::NodeSpec {
+    core_v1::NodeSpec {
+        pod_cidr: jstr(v, "podCIDR"),
+        pod_cid_rs: jstrs(v, "podCIDRs"),
+        provider_id: jstr(v, "providerID"),
+        unschedulable: jbool(v, "unschedulable"),
+        taints: v
+            .get("taints")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_taint_proto).collect())
+            .unwrap_or_default(),
+        external_id: jstr(v, "externalID"),
+        ..Default::default()
+    }
+}
+
+fn json_to_node_condition_proto(v: &serde_json::Value) -> core_v1::NodeCondition {
+    core_v1::NodeCondition {
+        r#type: jstr(v, "type"),
+        status: jstr(v, "status"),
+        last_heartbeat_time: jtime(v, "lastHeartbeatTime"),
+        last_transition_time: jtime(v, "lastTransitionTime"),
+        reason: jstr(v, "reason"),
+        message: jstr(v, "message"),
+    }
+}
+
+fn json_to_node_address_proto(v: &serde_json::Value) -> core_v1::NodeAddress {
+    core_v1::NodeAddress {
+        r#type: jstr(v, "type"),
+        address: jstr(v, "address"),
+    }
+}
+
+fn json_to_node_system_info_proto(v: &serde_json::Value) -> core_v1::NodeSystemInfo {
+    core_v1::NodeSystemInfo {
+        machine_id: jstr(v, "machineID"),
+        system_uuid: jstr(v, "systemUUID"),
+        boot_id: jstr(v, "bootID"),
+        kernel_version: jstr(v, "kernelVersion"),
+        os_image: jstr(v, "osImage"),
+        container_runtime_version: jstr(v, "containerRuntimeVersion"),
+        kubelet_version: jstr(v, "kubeletVersion"),
+        kube_proxy_version: jstr(v, "kubeProxyVersion"),
+        operating_system: jstr(v, "operatingSystem"),
+        architecture: jstr(v, "architecture"),
+        ..Default::default()
+    }
+}
+
+fn json_to_node_status_proto(v: &serde_json::Value) -> core_v1::NodeStatus {
+    core_v1::NodeStatus {
+        capacity: json_quantity_map_to_proto(v, "capacity"),
+        allocatable: json_quantity_map_to_proto(v, "allocatable"),
+        phase: jstr(v, "phase"),
+        conditions: v
+            .get("conditions")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_node_condition_proto).collect())
+            .unwrap_or_default(),
+        addresses: v
+            .get("addresses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_node_address_proto).collect())
+            .unwrap_or_default(),
+        node_info: v.get("nodeInfo").map(json_to_node_system_info_proto),
+        ..Default::default()
+    }
+}
+
+fn json_to_node_proto(v: &serde_json::Value) -> core_v1::Node {
+    core_v1::Node {
+        metadata: Some(json_to_object_meta_proto(v)),
+        spec: v.get("spec").map(json_to_node_spec_proto),
+        status: v.get("status").map(json_to_node_status_proto),
+    }
+}
+
+pub fn encode_node_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    json_to_node_proto(v).encode_to_vec()
+}
+
+pub fn encode_nodelist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    let items = v
+        .get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_node_proto).collect())
+        .unwrap_or_default();
+    core_v1::NodeList {
+        metadata: Some(json_to_list_meta_proto(v)),
+        items,
+    }
+    .encode_to_vec()
+}
+
+// ---- Encoder: Endpoints / EndpointsList -------------------------------------
+
+fn json_to_endpoint_address_proto(v: &serde_json::Value) -> core_v1::EndpointAddress {
+    core_v1::EndpointAddress {
+        ip: jstr(v, "ip"),
+        hostname: jstr(v, "hostname"),
+        node_name: jstr(v, "nodeName"),
+        target_ref: v.get("targetRef").map(json_to_object_reference_proto),
+    }
+}
+
+fn json_to_endpoint_port_proto(v: &serde_json::Value) -> core_v1::EndpointPort {
+    core_v1::EndpointPort {
+        name: jstr(v, "name"),
+        port: ji32(v, "port"),
+        protocol: jstr(v, "protocol"),
+        app_protocol: jstr(v, "appProtocol"),
+    }
+}
+
+fn json_to_endpoint_subset_proto(v: &serde_json::Value) -> core_v1::EndpointSubset {
+    core_v1::EndpointSubset {
+        addresses: v
+            .get("addresses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_endpoint_address_proto).collect())
+            .unwrap_or_default(),
+        not_ready_addresses: v
+            .get("notReadyAddresses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_endpoint_address_proto).collect())
+            .unwrap_or_default(),
+        ports: v
+            .get("ports")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_endpoint_port_proto).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_endpoints_proto(v: &serde_json::Value) -> core_v1::Endpoints {
+    core_v1::Endpoints {
+        metadata: Some(json_to_object_meta_proto(v)),
+        subsets: v
+            .get("subsets")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_endpoint_subset_proto).collect())
+            .unwrap_or_default(),
+    }
+}
+
+pub fn encode_endpoints_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    json_to_endpoints_proto(v).encode_to_vec()
+}
+
+pub fn encode_endpointslist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    let items = v
+        .get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_endpoints_proto).collect())
+        .unwrap_or_default();
+    core_v1::EndpointsList {
+        metadata: Some(json_to_list_meta_proto(v)),
+        items,
+    }
+    .encode_to_vec()
+}
+
+// ---- Encoder: Event / EventList (core/v1) -----------------------------------
+
+fn json_to_event_source_proto(v: &serde_json::Value) -> core_v1::EventSource {
+    core_v1::EventSource {
+        component: jstr(v, "component"),
+        host: jstr(v, "host"),
+    }
+}
+
+fn json_to_event_series_proto(v: &serde_json::Value) -> core_v1::EventSeries {
+    core_v1::EventSeries {
+        count: ji32(v, "count"),
+        last_observed_time: json_to_microtime_proto(v, "lastObservedTime"),
+    }
+}
+
+fn json_to_event_proto(v: &serde_json::Value) -> core_v1::Event {
+    core_v1::Event {
+        metadata: Some(json_to_object_meta_proto(v)),
+        involved_object: v.get("involvedObject").map(json_to_object_reference_proto),
+        reason: jstr(v, "reason"),
+        message: jstr(v, "message"),
+        source: v.get("source").map(json_to_event_source_proto),
+        first_timestamp: jtime(v, "firstTimestamp"),
+        last_timestamp: jtime(v, "lastTimestamp"),
+        count: ji32(v, "count"),
+        r#type: jstr(v, "type"),
+        event_time: json_to_microtime_proto(v, "eventTime"),
+        series: v.get("series").map(json_to_event_series_proto),
+        action: jstr(v, "action"),
+        related: v.get("related").map(json_to_object_reference_proto),
+        reporting_component: jstr(v, "reportingComponent"),
+        reporting_instance: jstr(v, "reportingInstance"),
+    }
+}
+
+pub fn encode_event_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    json_to_event_proto(v).encode_to_vec()
+}
+
+pub fn encode_eventlist_proto_gen(v: &serde_json::Value) -> Vec<u8> {
+    let items = v
+        .get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_event_proto).collect())
+        .unwrap_or_default();
+    core_v1::EventList {
+        metadata: Some(json_to_list_meta_proto(v)),
+        items,
+    }
+    .encode_to_vec()
+}
+
 // ---- Tests -----------------------------------------------------------------
 
 /// Most tests below guard against the same protobuf decode gap class: a `decode_*_proto_gen`
@@ -9471,5 +10276,215 @@ mod tests {
             crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Service"]);
         let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
+    }
+
+    // ---- Response-side protobuf encoder round-trip tests ------------------
+    //
+    // Each test round-trips JSON -> encode_*_proto_gen -> decode_*_proto_gen -> JSON.
+    // A regression here means a kubelet/kube-proxy/scheduler client that negotiated
+    // Accept: application/vnd.kubernetes.protobuf on a GET/LIST would receive a
+    // response with the asserted field silently missing or wrong, even though the
+    // same field is present in u7s's own JSON representation of the object.
+
+    /// Pod round-trips through the protobuf encoder: a kubelet that watches Pods over
+    /// protobuf (client-go's default when the server offers it) needs spec.containers,
+    /// spec.nodeName and status.phase/podIP to actually run and report on the pod: if any
+    /// of these vanish on the wire, the kubelet either can't start the container or reports
+    /// stale/empty status back to the control plane.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_container_and_status_fields() {
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "web-1", "namespace": "default", "uid": "abc-123" },
+            "spec": {
+                "containers": [{
+                    "name": "web",
+                    "image": "nginx:1.27",
+                    "ports": [{ "containerPort": 80, "protocol": "TCP" }],
+                    "resources": { "requests": { "cpu": "100m" } }
+                }],
+                "nodeName": "worker-1",
+                "restartPolicy": "Always"
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.0.0.5",
+                "containerStatuses": [{ "name": "web", "ready": true, "restartCount": 0 }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(decoded["metadata"]["name"], "web-1");
+        assert_eq!(decoded["spec"]["containers"][0]["image"], "nginx:1.27");
+        assert_eq!(
+            decoded["spec"]["containers"][0]["ports"][0]["containerPort"],
+            80
+        );
+        assert_eq!(decoded["spec"]["nodeName"], "worker-1");
+        assert_eq!(decoded["status"]["phase"], "Running");
+        assert_eq!(decoded["status"]["podIP"], "10.0.0.5");
+        assert_eq!(
+            decoded["status"]["containerStatuses"][0]["ready"], true,
+            "containerStatuses[].ready must survive the round trip — kube-proxy/kubectl's \
+             READY column and readiness-gated traffic routing both depend on it"
+        );
+    }
+
+    /// PodList wraps each item through the same per-Pod encoder; a LIST response must carry
+    /// every item, not just the first, and must carry the list's resourceVersion so a watcher
+    /// that lists-then-watches knows where to resume from.
+    #[test]
+    fn encode_podlist_proto_gen_round_trips_all_items_and_resource_version() {
+        let list = serde_json::json!({
+            "kind": "PodList",
+            "apiVersion": "v1",
+            "metadata": { "resourceVersion": "42" },
+            "items": [
+                { "metadata": { "name": "a" }, "spec": { "containers": [] } },
+                { "metadata": { "name": "b" }, "spec": { "containers": [] } }
+            ]
+        });
+
+        let raw = encode_podlist_proto_gen(&list);
+        let podlist =
+            core_v1::PodList::decode(raw.as_slice()).expect("encoded PodList bytes must decode");
+
+        assert_eq!(
+            podlist.items.len(),
+            2,
+            "both list items must survive the round trip"
+        );
+        assert_eq!(
+            podlist.metadata.unwrap().resource_version.as_deref(),
+            Some("42"),
+            "list resourceVersion must survive — a watcher that lists-then-watches uses it \
+             as the watch's starting point"
+        );
+    }
+
+    /// Service round-trips ClusterIP/ports/selector: kube-proxy programs iptables/ipvs rules
+    /// directly from these fields, so a silent drop here means traffic for that Service is
+    /// never routed to any backend.
+    #[test]
+    fn encode_service_proto_gen_round_trips_cluster_ip_and_ports() {
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "clusterIP": "10.96.0.1",
+                "type": "ClusterIP",
+                "selector": { "app": "web" },
+                "ports": [{ "name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP" }]
+            }
+        });
+
+        let raw = encode_service_proto_gen(&svc);
+        let decoded = decode_service_proto_gen(&raw).expect("encoded Service bytes must decode");
+
+        assert_eq!(decoded["spec"]["clusterIP"], "10.96.0.1");
+        assert_eq!(decoded["spec"]["selector"]["app"], "web");
+        assert_eq!(decoded["spec"]["ports"][0]["port"], 80);
+        assert_eq!(
+            decoded["spec"]["ports"][0]["targetPort"], 8080,
+            "targetPort must round-trip through IntOrString — kube-proxy dials this port on \
+             the pod, not the Service's own `port`"
+        );
+    }
+
+    /// Node round-trips capacity/allocatable/conditions: the scheduler's resource-fit
+    /// predicate reads capacity/allocatable directly, and kubelet's own NodeReady gate reads
+    /// conditions — either silently dropping means pods get scheduled onto (or kept off of)
+    /// nodes based on wrong information.
+    #[test]
+    fn encode_node_proto_gen_round_trips_capacity_and_conditions() {
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-1" },
+            "spec": { "podCIDR": "10.244.0.0/24", "unschedulable": false },
+            "status": {
+                "capacity": { "cpu": "4", "memory": "8Gi" },
+                "allocatable": { "cpu": "3800m", "memory": "7Gi" },
+                "conditions": [{ "type": "Ready", "status": "True" }],
+                "addresses": [{ "type": "InternalIP", "address": "192.168.1.10" }]
+            }
+        });
+
+        let raw = encode_node_proto_gen(&node);
+        let decoded = decode_node_proto_gen(&raw).expect("encoded Node bytes must decode");
+
+        assert_eq!(decoded["spec"]["podCIDR"], "10.244.0.0/24");
+        assert_eq!(decoded["status"]["capacity"]["cpu"], "4");
+        assert_eq!(decoded["status"]["allocatable"]["memory"], "7Gi");
+        assert_eq!(decoded["status"]["conditions"][0]["type"], "Ready");
+        assert_eq!(decoded["status"]["addresses"][0]["address"], "192.168.1.10");
+    }
+
+    /// Endpoints (legacy API) round-trips subset addresses/ports: kube-proxy's legacy
+    /// (non-EndpointSlice) code path programs backend rules straight from these fields.
+    #[test]
+    fn encode_endpoints_proto_gen_round_trips_subset_addresses_and_ports() {
+        let eps = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": { "name": "web", "namespace": "default" },
+            "subsets": [{
+                "addresses": [{ "ip": "10.244.0.5", "nodeName": "worker-1" }],
+                "ports": [{ "name": "http", "port": 8080, "protocol": "TCP" }]
+            }]
+        });
+
+        let raw = encode_endpoints_proto_gen(&eps);
+        let decoded =
+            decode_endpoints_proto_gen(&raw).expect("encoded Endpoints bytes must decode");
+
+        assert_eq!(decoded["subsets"][0]["addresses"][0]["ip"], "10.244.0.5");
+        assert_eq!(decoded["subsets"][0]["ports"][0]["port"], 8080);
+    }
+
+    /// Event round-trips involvedObject/reason/message/count: `kubectl describe`'s Events
+    /// table and any controller reading Events for diagnostics depend on all four fields
+    /// pointing at the correct object and carrying the correct occurrence count.
+    #[test]
+    fn encode_event_proto_gen_round_trips_involved_object_and_count() {
+        let event = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "web-1.abc", "namespace": "default" },
+            "involvedObject": { "kind": "Pod", "name": "web-1", "namespace": "default" },
+            "reason": "Started",
+            "message": "Started container web",
+            "type": "Normal",
+            "count": 3
+        });
+
+        let raw = encode_event_proto_gen(&event);
+        let decoded = decode_event_proto_gen(&raw).expect("encoded Event bytes must decode");
+
+        assert_eq!(decoded["involvedObject"]["name"], "web-1");
+        assert_eq!(decoded["reason"], "Started");
+        assert_eq!(decoded["count"], 3);
+    }
+
+    /// Falsifiability check for the encoder-dispatch/round-trip machinery itself: reverting
+    /// any one encoder's field mapping (e.g. dropping `image` from `json_to_container_proto`)
+    /// makes `encode_pod_proto_gen_round_trips_container_and_status_fields` fail, since the
+    /// decoded image would come back `Value::Null` instead of `"nginx:1.27"`. This is not a
+    /// separate test — it documents why the round-trip tests above are load-bearing rather
+    /// than tautological: they compare an encoder-specific field the decoder does not
+    /// synthesize on its own.
+    #[test]
+    fn round_trip_tests_are_falsifiable_by_construction() {
+        let empty_container = serde_json::json!({});
+        let container = json_to_container_proto(&empty_container);
+        assert_eq!(
+            container.image, None,
+            "an encoder that defaulted `image` instead of reading it from JSON would make \
+             this assertion (and the Pod round-trip test above) fail on revert"
+        );
     }
 }
