@@ -1,9 +1,8 @@
-/// u7s-kubeconfig — shared kubeconfig parsing and TLS client construction.
+/// u7s-kubeconfig — kubeconfig parsing and TLS client construction.
 ///
-/// Both u7s-scheduler and u7s-controller-manager need to read a kubeconfig
-/// file, extract TLS credentials, and build a tokio-rustls TlsConnector for
-/// mTLS connections to the API server. This crate holds that shared logic
-/// so each binary doesn't duplicate it.
+/// u7s-scheduler needs to read a kubeconfig file, extract TLS credentials,
+/// and build a tokio-rustls TlsConnector for mTLS connections to the API
+/// server. This crate holds that logic separately from the scheduler binary.
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -112,12 +111,10 @@ pub fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> 
 }
 
 // ---------------------------------------------------------------------------
-// HyperApiClient — shared HTTP/1.1 over TLS client
+// HyperApiClient — HTTP/1.1 over TLS client for u7s-scheduler
 //
-// Extracted from u7s-scheduler and u7s-controller-manager to eliminate
-// duplicate implementations of send_request / stream_watch_events.
-// The `bearer` field covers the controller-manager's optional auth header;
-// the scheduler passes `None`.
+// The `bearer` field supports an optional auth header; scheduler always
+// passes `None` today.
 // ---------------------------------------------------------------------------
 
 /// A minimal HTTP/1.1 mTLS API client backed by hyper.
@@ -1075,8 +1072,8 @@ mod tests {
 
     /// Verify that the bearer token field on HyperApiClient is correctly stored.
     /// The header injection itself is tested indirectly via request() and watch_stream().
-    /// A missing bearer silently breaks auth for controller-manager (which passes Some)
-    /// but not scheduler (which passes None) — so both cases must be constructable.
+    /// Covers both the Some(...) and None construction paths since a missing bearer
+    /// would silently break auth for any future bearer-token consumer.
     #[test]
     fn hyper_api_client_bearer_field_is_set() {
         let (ca_pem, cert_pem, key_pem) = make_test_certs();
@@ -1092,7 +1089,7 @@ mod tests {
             bearer: Some("my-token".to_owned()),
         };
         assert_eq!(client.bearer.as_deref(), Some("my-token"));
-        // bearer = None must also be constructable (scheduler path).
+        // bearer = None must also be constructable (scheduler's path today).
         // (We only check the field; construction is what matters for the compiler.)
         drop(client);
     }
