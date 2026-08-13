@@ -4,95 +4,9 @@ use crate::apiregistration_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as me
 use crate::apiregistration_gen::k8s::io::kube_aggregator::pkg::apis::apiregistration::v1 as apiregistration_v1;
 
 // ---- shared helpers --------------------------------------------------------
-//
-// Duplicated (not delegated to core_gen_adapter) because this module's meta_v1::ObjectMeta
-// is generated into its own private OUT_DIR include, so it is a nominally distinct Rust type
-// from core_gen_adapter's — the same reason coord_gen_adapter carries its own copy.
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
-    let mut m = serde_json::json!({ "creationTimestamp": serde_json::Value::Null });
-    if let Some(n) = meta.name.filter(|s| !s.is_empty()) {
-        m["name"] = serde_json::Value::String(n);
-    }
-    if let Some(n) = meta.generate_name.filter(|s| !s.is_empty()) {
-        m["generateName"] = serde_json::Value::String(n);
-    }
-    if let Some(n) = meta.namespace.filter(|s| !s.is_empty()) {
-        m["namespace"] = serde_json::Value::String(n);
-    }
-    if let Some(u) = meta.uid.filter(|s| !s.is_empty()) {
-        m["uid"] = serde_json::Value::String(u);
-    }
-    if let Some(rv) = meta.resource_version.filter(|s| !s.is_empty()) {
-        m["resourceVersion"] = serde_json::Value::String(rv);
-    }
-    if let Some(g) = meta.generation.filter(|&v| v != 0) {
-        m["generation"] = serde_json::Value::Number(g.into());
-    }
-    if let Some(ts) = meta.creation_timestamp {
-        if let Some(secs) = ts.seconds {
-            if secs > 0 {
-                m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-            }
-        }
-    }
-    if !meta.labels.is_empty() {
-        let labels: serde_json::Map<String, serde_json::Value> = meta
-            .labels
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["labels"] = serde_json::Value::Object(labels);
-    }
-    if !meta.annotations.is_empty() {
-        let annotations: serde_json::Map<String, serde_json::Value> = meta
-            .annotations
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["annotations"] = serde_json::Value::Object(annotations);
-    }
-    if !meta.owner_references.is_empty() {
-        let refs: Vec<serde_json::Value> = meta
-            .owner_references
-            .into_iter()
-            .map(|r| {
-                let mut entry = serde_json::json!({});
-                if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
-                    entry["apiVersion"] = serde_json::Value::String(v);
-                }
-                if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
-                    entry["kind"] = serde_json::Value::String(v);
-                }
-                if let Some(v) = r.name.filter(|s| !s.is_empty()) {
-                    entry["name"] = serde_json::Value::String(v);
-                }
-                if let Some(v) = r.uid.filter(|s| !s.is_empty()) {
-                    entry["uid"] = serde_json::Value::String(v);
-                }
-                if let Some(ctrl) = r.controller {
-                    entry["controller"] = serde_json::Value::Bool(ctrl);
-                }
-                if let Some(bod) = r.block_owner_deletion {
-                    entry["blockOwnerDeletion"] = serde_json::Value::Bool(bod);
-                }
-                entry
-            })
-            .collect();
-        if !refs.is_empty() {
-            m["ownerReferences"] = serde_json::Value::Array(refs);
-        }
-    }
-    if !meta.finalizers.is_empty() {
-        let fins: Vec<serde_json::Value> = meta
-            .finalizers
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect();
-        m["finalizers"] = serde_json::Value::Array(fins);
-    }
-    m
+    crate::core_gen_adapter::gen_object_meta_to_json(meta)
 }
 
 /// Decode a protobuf-encoded `APIService` (apiregistration.k8s.io/v1) into JSON.

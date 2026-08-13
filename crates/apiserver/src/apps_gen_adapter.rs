@@ -16,46 +16,8 @@ fn gen_persistent_volume_claim_to_json(pvc: core_v1::PersistentVolumeClaim) -> s
     crate::core_gen_adapter::gen_persistent_volume_claim_to_json(pvc)
 }
 
-fn gen_label_selector_requirement_to_json(
-    req: meta_v1::LabelSelectorRequirement,
-) -> serde_json::Value {
-    let mut m = serde_json::json!({});
-    if let Some(k) = req.key.filter(|s| !s.is_empty()) {
-        m["key"] = serde_json::Value::String(k);
-    }
-    if let Some(op) = req.operator.filter(|s| !s.is_empty()) {
-        m["operator"] = serde_json::Value::String(op);
-    }
-    if !req.values.is_empty() {
-        m["values"] = serde_json::Value::Array(
-            req.values
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-    }
-    m
-}
-
 fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value {
-    let mut m = serde_json::json!({});
-    if !sel.match_labels.is_empty() {
-        let labels: serde_json::Map<String, serde_json::Value> = sel
-            .match_labels
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["matchLabels"] = serde_json::Value::Object(labels);
-    }
-    if !sel.match_expressions.is_empty() {
-        m["matchExpressions"] = serde_json::Value::Array(
-            sel.match_expressions
-                .into_iter()
-                .map(gen_label_selector_requirement_to_json)
-                .collect(),
-        );
-    }
-    m
+    crate::core_gen_adapter::gen_label_selector_to_json(sel)
 }
 
 macro_rules! apps_condition_to_json {

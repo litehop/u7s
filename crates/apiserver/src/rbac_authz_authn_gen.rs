@@ -5,26 +5,10 @@
 
 pub mod k8s {
     pub mod io {
-        pub mod apimachinery {
-            pub mod pkg {
-                pub mod apis {
-                    pub mod meta {
-                        pub mod v1 {
-                            include!(concat!(
-                                env!("OUT_DIR"),
-                                "/k8s.io.apimachinery.pkg.apis.meta.v1.rs"
-                            ));
-                        }
-                    }
-                }
-                pub mod runtime {
-                    include!(concat!(
-                        env!("OUT_DIR"),
-                        "/k8s.io.apimachinery.pkg.runtime.rs"
-                    ));
-                }
-            }
-        }
+        // apimachinery is generated once by build.rs; apps_gen is the sole `include!` site so
+        // every wrapper's ObjectMeta/LabelSelector/etc. is one Rust type, not a nominally
+        // distinct copy per wrapper.
+        pub use crate::apps_gen::k8s::io::apimachinery;
         pub mod api {
             pub mod rbac {
                 pub mod v1 {
