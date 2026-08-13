@@ -2658,6 +2658,12 @@ mod tests {
     /// and spurious reconciliations that act on objects no longer in scope.
     ///
     /// This test would fail on revert: without the synthetic DELETED, `deleted_count` is 0.
+    ///
+    /// The watch is opened FIRST (mirroring a real informer, which is a long-lived watch
+    /// already open before any given write happens): a shard now exists only once something
+    /// watches its resource type (see `push_event_locked`'s doc), so unlike before this test can
+    /// no longer rely on the ring replaying a two-step transition that happened entirely before
+    /// any watch opened — it must observe both writes live.
     #[tokio::test]
     async fn watch_generic_modified_event_losing_selector_match_emits_synthetic_deleted() {
         use crate::state::AppState;
@@ -2665,6 +2671,37 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Watch with "app=frontend" BEFORE either write, so both are observed live: ADDED
+        // (matches) then MODIFIED (no longer matches), which the server must convert to a
+        // synthetic DELETED rather than silence.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
 
         // Create object with matching label "app=frontend".
         let obj_v1 = serde_json::json!({
@@ -2704,37 +2741,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Watch with "app=frontend". Ring buffer has ADDED (matches) then MODIFIED (no match).
-        // The MODIFIED must produce a synthetic DELETED, not silence.
-        let resp = watch_generic(
-            state,
-            WatchConfig {
-                prefix: "/registry/configmaps/default/".into(),
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                from_revision: 0,
-                initial_items: None,
-                label_selector: Some("app=frontend".into()),
-                field_selector: None,
-                allow_watch_bookmarks: false,
-                username: "test-user".into(),
-                as_partial_object_metadata: false,
-                group: "".into(),
-                plural: "".into(),
-                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
-            },
-        )
-        .await
-        .unwrap_or_else(|_| panic!("watch must succeed"));
 
         let lines = read_watch_body_with_timeout(resp).await;
 
