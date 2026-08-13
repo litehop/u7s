@@ -11,6 +11,7 @@ mod args;
 mod auth;
 mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
+mod bootstrap_apply;
 mod content_type;
 mod coord_gen;
 mod coord_gen_adapter;
@@ -520,6 +521,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     //     TcpListener::bind so we can set an explicit accept-queue backlog — see
     //     LISTEN_BACKLOG's doc comment for why the OS default isn't enough headroom.
     let listener = bind_listener(&args.listen)?;
+
+    // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound.
+    // It authenticates as system:bootstrap-installer (mayor-1pwxi) and SSA-upserts a bootstrap
+    // addon manifest bundle (e.g. CoreDNS) against this same apiserver. b"" is a placeholder —
+    // Path A [3/3] swaps in the real manifest bytes; the empty apply here proves the wiring
+    // works before any manifest content exists. Runs concurrently with request-serving below;
+    // failure is already logged and counted inside apply_yaml_bundle, so it's discarded here
+    // rather than re-logged — a missing addon is degraded-mode, never a reason to abort the
+    // apiserver itself.
+    tokio::spawn(async move {
+        let _ = bootstrap_apply::apply_yaml_bundle(&bootstrap_installer_kubeconfig_path, b"").await;
+    });
+
     serve_tls(listener, app, tls_material.server_config).await?;
     Ok(())
 }
