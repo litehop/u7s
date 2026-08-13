@@ -41,7 +41,7 @@ re-export it, then have `main.rs` call through. Workers assigned to binary
 crates must do this refactor first, then test the public functions.
 
 ```
-crates/controller-manager/
+crates/scheduler/
   src/
     lib.rs      ← extracted logic (pub fn / pub async fn)
     main.rs     ← minimal: parse args, call lib::run()
