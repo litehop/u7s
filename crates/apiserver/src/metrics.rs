@@ -239,6 +239,24 @@ pub static DISCOVERY_BUILD_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
+/// Counter of failed `bootstrap_apply::apply_yaml_bundle` calls — every bootstrap addon
+/// manifest (e.g. CoreDNS) is installed via Server-Side Apply against this apiserver's own
+/// just-bound listener at boot, and a failure there is caught and logged rather than aborting
+/// the apiserver (a missing addon is degraded-mode, not crash-worthy). This counter is the
+/// only signal an operator has that the install silently failed.
+pub static BOOTSTRAP_APPLY_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "u7s_bootstrap_apply_failures_total",
+        "Total number of failed in-process bootstrap addon YAML apply attempts (e.g. CoreDNS \
+         Server-Side Apply against this apiserver's own listener).",
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_bootstrap_apply_failures_total is registered exactly once per process");
+    counter
+});
+
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;
