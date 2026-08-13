@@ -128,7 +128,6 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("discovery.k8s.io", "v1"),
     ("events.k8s.io", "v1"),
     ("flowcontrol.apiserver.k8s.io", "v1"),
-    ("gateway.networking.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
     ("node.k8s.io", "v1"),
     ("policy", "v1"),
@@ -177,9 +176,6 @@ async fn core_and_crd_groups<S: Store>(state: &AppState<S>) -> Vec<APIGroup> {
             // autoscaling advertises both v2 (preferred) and v1.
             if *name == "autoscaling" {
                 make_group(name, version, &["v2", "v1"])
-            // gateway.networking.k8s.io advertises v1 (preferred) and v1beta1.
-            } else if *name == "gateway.networking.k8s.io" {
-                make_group(name, version, &["v1", "v1beta1"])
             } else {
                 make_group(name, version, &[version])
             }
@@ -804,8 +800,6 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
         ("events.k8s.io", "v1") => Some(events_v1_resources()),
         ("flowcontrol.apiserver.k8s.io", "v1") => Some(flowcontrol_v1_resources()),
-        ("gateway.networking.k8s.io", "v1") => Some(gateway_networking_v1_resources()),
-        ("gateway.networking.k8s.io", "v1beta1") => Some(gateway_networking_v1beta1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
@@ -1359,56 +1353,6 @@ fn networking_v1_resources() -> serde_json::Value {
                 "singularName": "servicecidr",
                 "namespaced": false,
                 "kind": "ServiceCIDR",
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            }
-        ]
-    })
-}
-
-fn gateway_networking_v1_resources() -> serde_json::Value {
-    serde_json::json!({
-        "kind": "APIResourceList",
-        "apiVersion": "v1",
-        "groupVersion": "gateway.networking.k8s.io/v1",
-        "resources": [
-            {
-                "name": "gatewayclasses",
-                "singularName": "gatewayclass",
-                "namespaced": false,
-                "kind": "GatewayClass",
-                "shortNames": ["gc"],
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            },
-            {
-                "name": "gateways",
-                "singularName": "gateway",
-                "namespaced": true,
-                "kind": "Gateway",
-                "shortNames": ["gtw"],
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            },
-            {
-                "name": "httproutes",
-                "singularName": "httproute",
-                "namespaced": true,
-                "kind": "HTTPRoute",
-                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
-            }
-        ]
-    })
-}
-
-fn gateway_networking_v1beta1_resources() -> serde_json::Value {
-    serde_json::json!({
-        "kind": "APIResourceList",
-        "apiVersion": "v1",
-        "groupVersion": "gateway.networking.k8s.io/v1beta1",
-        "resources": [
-            {
-                "name": "referencegrants",
-                "singularName": "referencegrant",
-                "namespaced": true,
-                "kind": "ReferenceGrant",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
