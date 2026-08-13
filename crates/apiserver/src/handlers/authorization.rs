@@ -77,6 +77,24 @@ struct AccessReviewStatus {
     allowed: bool,
 }
 
+/// `resourceAttributes.resource` and `.subresource` are supposed to arrive pre-split
+/// (e.g. `resource: "pods", subresource: "binding"`), but real clients — including
+/// kubectl's `auth can-i pods/binding` path in some code paths — send the combined
+/// `"pods/binding"` form in `resource` and leave `subresource` empty. The RBAC index's
+/// `resource_matches` (see rbac.rs) only recognizes the split form, since that is what
+/// the runtime authorizer always passes (it splits the URL path itself). Without this
+/// normalization, SAR silently disagreed with the runtime authorizer for every named
+/// subresource (`pods/binding`, `pods/status`, `pods/eviction`, ...): the real POST
+/// succeeds but `kubectl auth can-i` / SelfSubjectAccessReview reports `allowed: false`.
+fn split_combined_resource<'a>(resource: &'a str, subresource: &'a str) -> (&'a str, &'a str) {
+    if subresource.is_empty() {
+        if let Some((res, sub)) = resource.split_once('/') {
+            return (res, sub);
+        }
+    }
+    (resource, subresource)
+}
+
 pub async fn self_subject_access_review<S: Store>(
     State(state): State<AppState<S>>,
     Extension(user): Extension<UserInfo>,
@@ -122,14 +140,15 @@ pub async fn self_subject_access_review<S: Store>(
         } else {
             Some(attrs.name.as_str())
         };
+        let (resource, subresource) = split_combined_resource(&attrs.resource, &attrs.subresource);
 
         state.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
             groups: &user.groups,
             verb: &attrs.verb,
             api_group: &attrs.group,
-            resource: &attrs.resource,
-            subresource: &attrs.subresource,
+            resource,
+            subresource,
             namespace: ns,
             name,
             non_resource_url: None,
@@ -384,14 +403,15 @@ pub async fn subject_access_review<S: Store>(
         } else {
             Some(attrs.name.as_str())
         };
+        let (resource, subresource) = split_combined_resource(&attrs.resource, &attrs.subresource);
 
         state.rbac_index.is_allowed(&AuthzRequest {
             username: &spec.user,
             groups: &spec.groups,
             verb: &attrs.verb,
             api_group: &attrs.group,
-            resource: &attrs.resource,
-            subresource: &attrs.subresource,
+            resource,
+            subresource,
             namespace: ns,
             name,
             non_resource_url: None,
@@ -528,14 +548,15 @@ pub async fn local_subject_access_review<S: Store>(
         } else {
             Some(attrs.name.as_str())
         };
+        let (resource, subresource) = split_combined_resource(&attrs.resource, &attrs.subresource);
 
         state.rbac_index.is_allowed(&AuthzRequest {
             username: &spec.user,
             groups: &spec.groups,
             verb: &attrs.verb,
             api_group: &attrs.group,
-            resource: &attrs.resource,
-            subresource: &attrs.subresource,
+            resource,
+            subresource,
             namespace: ns,
             name,
             non_resource_url: None,
@@ -1268,6 +1289,67 @@ mod handler_tests {
              check — otherwise `kubectl auth can-i get /metrics` always reports no for \
              every user, regardless of their actual grants"
         );
+    }
+
+    /// `kubectl auth can-i create pods/binding` sends the named subresource as a single
+    /// combined `resource: "pods/binding"` string with `subresource` left empty. The
+    /// runtime authorizer (which parses the URL path itself) already splits this
+    /// correctly, so `system:kube-scheduler` can genuinely POST bindings — but before
+    /// `split_combined_resource`, SAR passed the un-split "pods/binding" straight to
+    /// `RbacIndex::is_allowed`, which never matches the `resources: ["pods/binding"]`
+    /// rule split logic. That made `kubectl auth can-i create pods/binding
+    /// --as=system:kube-scheduler` report `no` even though the scheduler could actually
+    /// bind pods — a false negative for any tool (kubectl, RBAC auditors) that trusts SAR
+    /// instead of just attempting the action. Covers pods/status and pods/eviction too,
+    /// since any named subresource hit the same bug.
+    #[tokio::test]
+    async fn ssar_allows_combined_resource_subresource_string_matching_rbac_rule() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "apiGroups": [""],
+                "resources": ["pods/binding", "pods/status", "pods/eviction"],
+                "verbs": ["create"]
+            }]),
+            "system:kube-scheduler",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        for resource in ["pods/binding", "pods/status", "pods/eviction"] {
+            let body = serde_json::json!({
+                "spec": {
+                    "resourceAttributes": {
+                        "namespace": "default",
+                        "verb": "create",
+                        "group": "",
+                        "resource": resource
+                    }
+                }
+            });
+            let req = json_req(
+                "POST",
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                body,
+                user("system:kube-scheduler", &[]),
+            );
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                val["status"]["allowed"], true,
+                "system:kube-scheduler must be allowed to create {resource} — SAR must \
+                 agree with the runtime authorizer, which already permits this action"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
