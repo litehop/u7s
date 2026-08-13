@@ -9,7 +9,7 @@
 # lifecycle so every run gets the same three artifacts with no operator
 # action:
 #
-#   rss.csv       ts,scope,pid,comm,rss_kb,footprint_kb
+#   rss.csv       ts,scope,pid,comm,rss_kb,footprint_kb,cpu_seconds_cumulative
 #                 One row per sampled process per tick. scope is "host" for
 #                 the three host processes (apiserver, scheduler,
 #                 konnectivity-server) or a VM name for the --top-n busiest
@@ -20,7 +20,25 @@
 #                 overstates real memory on macOS by ~30% (measured: 135 MB
 #                 ps RSS vs 103 MB physical footprint on a live apiserver).
 #                 Empty on Linux/VM rows, where there is no footprint tool.
+#                 cpu_seconds_cumulative is ps's own `time=` field (total CPU
+#                 time consumed since the process started) converted to a
+#                 plain number of seconds — deliberately a raw cumulative
+#                 counter, not `pcpu`/`%cpu`, whose value is that same
+#                 cumulative time divided by wall-clock process age, i.e. a
+#                 LIFETIME AVERAGE that can never show a spike or a recent
+#                 idle period once a process has run for a while (mayor-jnk90
+#                 measured this directly: it is the only reason every "CPU"
+#                 number in that findings doc was a single misleading
+#                 snapshot). A real instantaneous rate for the interval
+#                 between two ticks is (cpu_seconds_cumulative[N] -
+#                 cpu_seconds_cumulative[N-1]) / (ts[N] - ts[N-1]) — the same
+#                 math Prometheus's own process collector and PromQL's
+#                 rate(process_cpu_seconds_total[...]) use, computed by
+#                 whatever reads this CSV rather than baked in here, since a
+#                 cumulative counter can always be turned into a rate later
+#                 but a rate can never be turned back into the counter.
 #
+
 #   vm-free.csv   ts,vm,total_mb,used_mb,free_mb
 #                 `free -m` totals per VM, so VM-level memory pressure is
 #                 visible even when no single process is the culprit.
@@ -164,11 +182,31 @@ footprint_kb() {
   esac
 }
 
+# Both BSD (macOS) and GNU (Linux/procps) `ps` report cumulative CPU time via
+# the `time=` keyword as a formatted [[DD-]HH:]MM:SS[.ss] duration, not a raw
+# seconds value — there is no portable `cputimes=`-style keyword that works on
+# both (BSD ps rejects it outright). Splitting on both '-' and ':' handles
+# every field count ps can produce (MM:SS, HH:MM:SS, DD-HH:MM:SS) uniformly,
+# so this is the one parser both sample_one_host_process and sample_vm_rss
+# need, regardless of how long the sampled process has been running.
+cpu_time_to_seconds() {
+  local t="$1"
+  [ -z "$t" ] && return 0
+  awk -F'[-:]' '{
+    n = NF
+    total = $n + 0
+    if (n >= 2) total += $(n-1) * 60
+    if (n >= 3) total += $(n-2) * 3600
+    if (n >= 4) total += $(n-3) * 86400
+    printf "%.2f", total
+  }' <<< "$t"
+}
+
 sample_one_host_process() {
   local ts="$1" name="$2" pid="$3"
   [ -z "$pid" ] && return 0
-  local rss
-  rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')" || true
+  local rss cputime
+  read -r rss cputime < <(ps -o rss=,time= -p "$pid" 2>/dev/null) || true
   # Process died between resolve and sample (real race on a short-lived
   # restart) — skip this tick's row for it rather than aborting the loop.
   [ -z "$rss" ] && return 0
@@ -176,20 +214,21 @@ sample_one_host_process() {
   if [ "$DARWIN" -eq 1 ]; then
     fp="$(footprint_kb "$pid")" || fp=""
   fi
-  echo "${ts},host,${pid},${name},${rss},${fp}" >> "$RSS_CSV"
+  echo "${ts},host,${pid},${name},${rss},${fp},$(cpu_time_to_seconds "$cputime")" >> "$RSS_CSV"
 }
 
 sample_vm_rss() {
   local ts="$1" vm="$2" out
-  out="$(limactl shell "$vm" -- ps -eo pid=,rss=,comm= --sort=-rss 2>/dev/null | head -n "$TOP_N")" || return 0
+  out="$(limactl shell "$vm" -- ps -eo pid=,rss=,time=,comm= --sort=-rss 2>/dev/null | head -n "$TOP_N")" || return 0
   [ -z "$out" ] && return 0
-  local pid rss comm
+  local pid rss cputime comm
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     pid="$(echo "$line" | awk '{print $1}')"
     rss="$(echo "$line" | awk '{print $2}')"
-    comm="$(echo "$line" | awk '{print $3}')"
-    echo "${ts},${vm},${pid},${comm},${rss}," >> "$RSS_CSV"
+    cputime="$(echo "$line" | awk '{print $3}')"
+    comm="$(echo "$line" | awk '{print $4}')"
+    echo "${ts},${vm},${pid},${comm},${rss},,$(cpu_time_to_seconds "$cputime")" >> "$RSS_CSV"
   done <<< "$out"
 }
 
@@ -295,7 +334,7 @@ cmd_start() {
     fi
   fi
 
-  [ -f "$RSS_CSV" ]     || echo "ts,scope,pid,comm,rss_kb,footprint_kb" > "$RSS_CSV"
+  [ -f "$RSS_CSV" ]     || echo "ts,scope,pid,comm,rss_kb,footprint_kb,cpu_seconds_cumulative" > "$RSS_CSV"
   [ -f "$VM_FREE_CSV" ] || echo "ts,vm,total_mb,used_mb,free_mb" > "$VM_FREE_CSV"
   [ -f "$RING_CSV" ]    || echo "ts,shard,events,span_secs" > "$RING_CSV"
 
