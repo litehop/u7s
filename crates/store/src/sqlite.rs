@@ -366,6 +366,144 @@ impl SqliteStore {
     }
 }
 
+/// Push one event into ONE shard's ring buffer and deletion log (occupancy/span/deletion-log-len
+/// metrics included), evicting past `RING_CAPACITY` exactly as a real write would. Does NOT
+/// touch the broadcast channel — callers decide separately whether and how to notify live
+/// watchers.
+///
+/// Two callers, two different reasons a shard needs an event pushed into it without necessarily
+/// meaning "notify every watcher right now":
+/// - `push_event_locked`'s per-matched-shard loop (a real write) — broadcasts separately,
+///   exactly once, after this runs for every shard the write is relevant to.
+/// - `SqliteStore::watch`'s snapshot-seeding of a freshly-created shard — backfills it with the
+///   CURRENT state of everything under its prefix (as synthetic ADDED events, oldest revision
+///   first) so a resource type's first-ever watch sees pre-existing objects exactly as upstream
+///   kube-apiserver's watch cache would (always warm from an initial LIST at cacher-init, never
+///   lazily empty for a first-time watcher) — see that function's doc for why this is necessary,
+///   not optional, now that writes no longer create shards. Broadcasting these would be wrong:
+///   they are not new writes, and every OTHER already-open watch has already seen them for real.
+fn push_into_shard(
+    shard_key_label: &str,
+    shard: &RingShard,
+    compaction_horizon: &AtomicU64,
+    now_secs: u32,
+    event: &Arc<InternalEvent>,
+) {
+    // Write to ring buffer synchronously using std::sync::RwLock.
+    // This avoids a spawned task race between write and watch replay.
+    {
+        let mut guard = shard.ring.write().expect("ring poisoned");
+        // Held for exactly as long as `guard`, and only ever taken here — this is what keeps
+        // `push_secs` in lockstep with `ring` (see the field's INVARIANT note).
+        let mut secs_guard = shard.push_secs.write().expect("push_secs poisoned");
+        guard.push_back(Arc::clone(event));
+        secs_guard.push_back(now_secs);
+        if guard.len() > RING_CAPACITY {
+            guard.pop_front();
+            secs_guard.pop_front();
+            // Update compaction horizon to the revision of the oldest remaining entry.
+            if let Some(oldest) = guard.front() {
+                // fetch_max, not store: this atomic is shared across every shard (see its field
+                // doc on `SqliteStore`), so a plain `.store()` here would let a quiet shard's
+                // low-revision eviction regress the horizon backward after some other, busier
+                // shard already advanced it past that point — silently un-expiring revisions
+                // that busier shard's ring has already discarded.
+                // This shard's own floor — the value every expiry decision for this resource
+                // type is made against. fetch_max for the same reason as the global below:
+                // concurrent writers to this shard can evict out of order.
+                shard.horizon.fetch_max(oldest.revision, Ordering::Relaxed);
+                compaction_horizon.fetch_max(oldest.revision, Ordering::Relaxed);
+                tracing::debug!(
+                    new_horizon = oldest.revision,
+                    ring_len = guard.len(),
+                    "push_into_shard: ring buffer compacted"
+                );
+            }
+        }
+        // Unconditional (not just on eviction): this is the only write path onto the ring, so
+        // this is the one place that can cheaply observe true occupancy on every push, not just
+        // once the ring is already full. Sampled after the eviction check above so it always
+        // reflects final post-eviction occupancy. Still holding the write guard — length
+        // already computed, zero extra lock acquisition. Labeled by `shard_key_label` (this
+        // shard's own identity), not necessarily a write's canonical resource-type root — they
+        // can differ (see `matching_shards`'s doc), and mislabeling would corrupt the per-shard
+        // breakdown.
+        crate::metrics::WATCH_RING_OCCUPANCY
+            .with_label_values(&[shard_key_label])
+            .set(guard.len() as i64);
+        debug_assert_eq!(
+            guard.len(),
+            secs_guard.len(),
+            "push_secs must stay in lockstep with ring — a drift here silently corrupts the \
+             retained-history gauge that ring sizing decisions are made from"
+        );
+        // The wall-clock span this shard's retained events cover: `now_secs` is this push's own
+        // stamp, i.e. the NEWEST retained entry, so this is newest-minus-oldest and not the
+        // oldest entry's age relative to real "now". It therefore only refreshes on write — see
+        // `WATCH_RING_SPAN_SECONDS`' doc for why span is the quantity worth reporting and how to
+        // read a frozen value on an idle shard. `saturating_sub` rather than a bare subtraction
+        // so a monotonic-source anomaly can only ever report 0, never wrap a u32 into a nonsense
+        // multi-decade span.
+        crate::metrics::WATCH_RING_SPAN_SECONDS
+            .with_label_values(&[shard_key_label])
+            .set(
+                secs_guard
+                    .front()
+                    .map_or(0, |oldest| i64::from(now_secs.saturating_sub(*oldest))),
+            );
+    }
+    // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
+    // compaction can still receive DELETED events for objects deleted before compaction.
+    //
+    // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
+    //
+    // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
+    //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
+    //    any watcher reconnecting will see the live object in a fresh list response. Keeping
+    //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
+    //    event for the current incarnation.
+    //
+    // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
+    //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
+    //    to cover any watcher within the ring window; tombstones evicted by this path are
+    //    for keys deleted more than 2000 writes ago, which any active watcher has already
+    //    processed via the broadcast channel.
+    {
+        let mut guard = shard.deletion_log.write().expect("deletion_log poisoned");
+        if event.value.is_none() {
+            // Deletion: insert tombstone (indexed by revision too) then cap the map.
+            guard.by_key.insert(event.key.clone(), Arc::clone(event));
+            guard.by_revision.insert(event.revision, event.key.clone());
+            const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+            if guard.by_key.len() > DELETION_LOG_CAP {
+                // Evict the entry with the smallest revision. `by_revision` keeps
+                // revision -> key sorted, so this is O(log n) via pop_first() instead
+                // of an O(n) linear scan over `by_key`.
+                if let Some((_, oldest_key)) = guard.by_revision.pop_first() {
+                    guard.by_key.remove(&oldest_key);
+                    tracing::debug!(
+                        evicted_key = %oldest_key,
+                        cap = DELETION_LOG_CAP,
+                        "push_into_shard: deletion tombstone log evicted oldest entry"
+                    );
+                }
+            }
+        } else {
+            // Creation/update: evict any stale tombstone for this key, keeping the
+            // revision index in sync too.
+            if let Some(old) = guard.by_key.remove(&event.key) {
+                guard.by_revision.remove(&old.revision);
+            }
+        }
+        // Unconditional (not just on eviction), same reasoning as WATCH_RING_OCCUPANCY above:
+        // this is the only write path onto the deletion log, so this cheaply observes its true
+        // length on every write, still holding the write guard.
+        crate::metrics::DELETION_LOG_LEN
+            .with_label_values(&[shard_key_label])
+            .set(guard.by_key.len() as i64);
+    }
+}
+
 /// Push one write's event onto the ring buffer, deletion log, and broadcast channel.
 ///
 /// Callers in `put`/`delete`/`delete_namespace_resources` invoke this from INSIDE the
@@ -407,118 +545,7 @@ fn push_event_locked(
     // arguments, so `push_event_at` can drive the retained-history gauge deterministically in
     // tests instead of sleeping.
     for (matched_key, shard) in &matched {
-        // Write to ring buffer synchronously using std::sync::RwLock.
-        // This avoids a spawned task race between write and watch replay.
-        {
-            let mut guard = shard.ring.write().expect("ring poisoned");
-            // Held for exactly as long as `guard`, and only ever taken here — this is what keeps
-            // `push_secs` in lockstep with `ring` (see the field's INVARIANT note).
-            let mut secs_guard = shard.push_secs.write().expect("push_secs poisoned");
-            guard.push_back(Arc::clone(&event));
-            secs_guard.push_back(now_secs);
-            if guard.len() > RING_CAPACITY {
-                guard.pop_front();
-                secs_guard.pop_front();
-                // Update compaction horizon to the revision of the oldest remaining entry.
-                if let Some(oldest) = guard.front() {
-                    // fetch_max, not store: this atomic is shared across every shard (see its field
-                    // doc on `SqliteStore`), so a plain `.store()` here would let a quiet shard's
-                    // low-revision eviction regress the horizon backward after some other, busier
-                    // shard already advanced it past that point — silently un-expiring revisions
-                    // that busier shard's ring has already discarded.
-                    // This shard's own floor — the value every expiry decision for this resource
-                    // type is made against. fetch_max for the same reason as the global below:
-                    // concurrent writers to this shard can evict out of order.
-                    shard.horizon.fetch_max(oldest.revision, Ordering::Relaxed);
-                    compaction_horizon.fetch_max(oldest.revision, Ordering::Relaxed);
-                    tracing::debug!(
-                        new_horizon = oldest.revision,
-                        ring_len = guard.len(),
-                        "push_event_locked: ring buffer compacted"
-                    );
-                }
-            }
-            // Unconditional (not just on eviction): this is the only write path onto the ring, so
-            // this is the one place that can cheaply observe true occupancy on every push, not just
-            // once the ring is already full. Sampled after the eviction check above so it always
-            // reflects final post-eviction occupancy. Still holding the write guard — length
-            // already computed, zero extra lock acquisition. Labeled by `matched_key` (this
-            // shard's own identity), not the write's `shard_key` — they can differ (see
-            // `matching_shards`'s doc), and mislabeling would corrupt the per-shard breakdown.
-            crate::metrics::WATCH_RING_OCCUPANCY
-                .with_label_values(&[matched_key])
-                .set(guard.len() as i64);
-            debug_assert_eq!(
-                guard.len(),
-                secs_guard.len(),
-                "push_secs must stay in lockstep with ring — a drift here silently corrupts the \
-                 retained-history gauge that ring sizing decisions are made from"
-            );
-            // The wall-clock span this shard's retained events cover: `now_secs` is this push's own
-            // stamp, i.e. the NEWEST retained entry, so this is newest-minus-oldest and not the
-            // oldest entry's age relative to real "now". It therefore only refreshes on write — see
-            // `WATCH_RING_SPAN_SECONDS`' doc for why span is the quantity worth reporting and how to
-            // read a frozen value on an idle shard. `saturating_sub` rather than a bare subtraction
-            // so a monotonic-source anomaly can only ever report 0, never wrap a u32 into a nonsense
-            // multi-decade span.
-            crate::metrics::WATCH_RING_SPAN_SECONDS
-                .with_label_values(&[matched_key])
-                .set(
-                    secs_guard
-                        .front()
-                        .map_or(0, |oldest| i64::from(now_secs.saturating_sub(*oldest))),
-                );
-        }
-        // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
-        // compaction can still receive DELETED events for objects deleted before compaction.
-        //
-        // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
-        //
-        // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
-        //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
-        //    any watcher reconnecting will see the live object in a fresh list response. Keeping
-        //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
-        //    event for the current incarnation.
-        //
-        // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
-        //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
-        //    to cover any watcher within the ring window; tombstones evicted by this path are
-        //    for keys deleted more than 2000 writes ago, which any active watcher has already
-        //    processed via the broadcast channel.
-        {
-            let mut guard = shard.deletion_log.write().expect("deletion_log poisoned");
-            if event.value.is_none() {
-                // Deletion: insert tombstone (indexed by revision too) then cap the map.
-                guard.by_key.insert(event.key.clone(), Arc::clone(&event));
-                guard.by_revision.insert(event.revision, event.key.clone());
-                const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
-                if guard.by_key.len() > DELETION_LOG_CAP {
-                    // Evict the entry with the smallest revision. `by_revision` keeps
-                    // revision -> key sorted, so this is O(log n) via pop_first() instead
-                    // of an O(n) linear scan over `by_key`.
-                    if let Some((_, oldest_key)) = guard.by_revision.pop_first() {
-                        guard.by_key.remove(&oldest_key);
-                        tracing::debug!(
-                            evicted_key = %oldest_key,
-                            cap = DELETION_LOG_CAP,
-                            "push_event_locked: deletion tombstone log evicted oldest entry"
-                        );
-                    }
-                }
-            } else {
-                // Creation/update: evict any stale tombstone for this key, keeping the
-                // revision index in sync too.
-                if let Some(old) = guard.by_key.remove(&event.key) {
-                    guard.by_revision.remove(&old.revision);
-                }
-            }
-            // Unconditional (not just on eviction), same reasoning as WATCH_RING_OCCUPANCY above:
-            // this is the only write path onto the deletion log, so this cheaply observes its true
-            // length on every write, still holding the write guard.
-            crate::metrics::DELETION_LOG_LEN
-                .with_label_values(&[matched_key.as_str()])
-                .set(guard.by_key.len() as i64);
-        }
+        push_into_shard(matched_key, shard, compaction_horizon, now_secs, &event);
     }
     // Best-effort broadcast of the specific event.
     let event_revision = event.revision;
@@ -1677,16 +1704,51 @@ impl Store for SqliteStore {
         // resulting gap (a concurrent idle-GC could theoretically fire between the two) is
         // self-healing, not a correctness bug: at worst it costs a duplicate shard, never a lost
         // event, since `matching_shards` fans writes out to every shard that exists.
-        let (shard_key_owned, shard) = {
+        let (shard_key_owned, shard, created_fresh) = {
             let found = find_shard_key(&self.shards.read().expect("shards poisoned"), prefix);
             match found {
-                Some(found) => found,
+                Some((key, shard)) => (key, shard, false),
                 None => (
                     prefix.to_string(),
                     get_or_create_shard(&self.shards, prefix),
+                    true,
                 ),
             }
         };
+
+        // Backfill a freshly-created shard with the CURRENT state of everything under this
+        // watch's own prefix, as synthetic ADDED events ordered oldest-revision-first. Without
+        // this, a resource type's first-ever watch would see nothing for anything written
+        // before it opened, unlike upstream kube-apiserver — whose watch cache is always warm
+        // from an initial LIST at cacher-init, never lazily empty for a first-time watcher. This
+        // is what keeps `resource_version=0, watch=true` working for a cold-start informer (e.g.
+        // KCM's metadata informer) now that writes alone no longer keep a shard's history alive.
+        // Not broadcast (`push_into_shard` only touches THIS shard's ring/deletion_log): these
+        // are not new writes, and every other already-open watch has already seen them for real.
+        // An EXISTING, reused shard (the `false` branch) needs none of this — it has been
+        // accumulating real history since whichever earlier watch created it.
+        if created_fresh {
+            let mut items = self.list(prefix, ListOptions::default()).await?.items;
+            items.sort_by_key(|o| o.revision);
+            let seed_secs = self.epoch.elapsed().as_secs() as u32;
+            for obj in &items {
+                let event = Arc::new(InternalEvent {
+                    key: obj.key.clone(),
+                    revision: obj.revision,
+                    value: Some(obj.value.clone()),
+                    is_create: true,
+                    deleted_body: None,
+                });
+                push_into_shard(
+                    &shard_key_owned,
+                    &shard,
+                    &self.compaction_horizon,
+                    seed_secs,
+                    &event,
+                );
+            }
+        }
+
         // Registers this stream as one of `shard`'s live watchers for as long as it stays open —
         // see `ShardWatcherGuard`'s doc for why it must be held inside the generator below, not
         // here.
