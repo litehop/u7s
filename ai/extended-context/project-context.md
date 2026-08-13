@@ -9,13 +9,15 @@ metadata:
 
 A Kubernetes-compatible control plane implementation in Rust, targeting severely resource-constrained environments where k3s and k0s are too heavy.
 
-**North star milestone:** Sufficient Kubernetes API compatibility to run an Argo CD GitOps setup on the cluster.
+**North star:** see `north-star.md` — durable why-u7s-exists, decision framework, and guiding principles (operator sign-off required to change). Do not restate it here.
+
+**Current phase / status:** see `roadmap.md` — component matrix, gates, and priorities (changes often; treat any number here as dated the moment a new measurement lands).
 
 ## Target environment
 
 - **Hardware:** Minimal VPS — 1 GB RAM total, 1 shared vCPU
-- **Constraint:** All control plane components must idle under **128 MB RAM combined**
-- **Implication:** etcd is off the table. SQLite or LMDB only.
+- **Constraint:** All control plane components must idle under **128 MiB RAM combined** (u7s's own processes — apiserver, scheduler, and whichever upstream components the matrix in `roadmap.md` still runs; excludes in-cluster workload footprint)
+- **Implication:** etcd is off the table.
 
 ## Topology
 
@@ -26,35 +28,18 @@ A Kubernetes-compatible control plane implementation in Rust, targeting severely
 
 **Rust.** Chosen for minimal footprint, no GC pauses, no runtime overhead.
 
-## Kubernetes API surface (required for Argo CD milestone)
+## Design decisions
 
-- Core workload APIs: Pod, Deployment, ReplicaSet, StatefulSet
-- Config/secret APIs: ConfigMap, Secret
-- RBAC: ServiceAccount, Role, ClusterRole, RoleBinding, ClusterRoleBinding
-- CRD + custom resource support (Argo CD ships its own CRDs: Application, AppProject, etc.)
-
-## Design decisions (all settled)
-
-- **API server:** Implemented from scratch in Rust (axum). No upstream binary wrapping.
-- **State store:** SQLite WAL (rusqlite bundled). See `docs/decisions/sqlite-over-lmdb.md`.
-- **Container runtime:** CRI-O + crun. See `docs/decisions/crio-over-containerd.md`.
-- **Scheduler:** Custom Rust scheduler (`crates/scheduler`). See `roadmap.md`'s Architecture summary table and `docs/decisions/custom-bin-spread-scheduler.md`.
-- **Networking:** CNI plugin model (no built-in overlay). WebSocket-only exec/attach/portforward (no SPDY).
-- **CRD validation:** boon crate (full openAPIV3Schema). See `docs/decisions/boon-for-crd-schema-validation.md`.
-
-## Current phase
-
-Phase 3 — Conformance. Stack complete as of 2026-05-24. Ready for first sonobuoy run.
-See `roadmap.md` for full detail.
+Settled component decisions (state store, container runtime, scheduler, CRD validation, networking, TLS) live in `roadmap.md`'s Architecture summary table, each linking to its own doc under `docs/decisions/`. Not duplicated here — see that table for the current list and rationale.
 
 ## Worker preamble addendum (append to the common preamble in docs/the-mayor-method/dispatch-prompt-template.md)
 
 ```
 Domain: Kubernetes-compatible control plane in Rust.
-Target: 1 GB VPS, 1 vCPU. Control plane idle budget: <128 MB RAM total.
+Target: 1 GB VPS, 1 vCPU. Control plane idle budget: <128 MiB RAM total (u7s's own processes).
 Topology: single control plane node, multiple data plane nodes.
-API compat target: Argo CD GitOps milestone (workloads, config/secret, RBAC, CRDs).
+API compat: conform to upstream Kubernetes API surface; Argo CD is used as a correctness probe, not a milestone (see north-star.md).
 API server: implemented from scratch in Rust (no upstream kube-apiserver).
 Networking: CNI plugin model.
-State store: SQLite or LMDB (TBD).
+State store: SQLite WAL (rusqlite bundled) — see docs/decisions/sqlite-over-lmdb.md.
 ```
