@@ -4,7 +4,7 @@
 #
 # Usage:
 #   scripts/conformance/reset.sh [--vm <name>] [--workdir <path>] [--port <N>]
-#                                 [--extra-node <vm>]
+#                                 [--extra-node <vm>] [--host-only]
 #
 # After this script:
 #   - ./temp/u7s/ is gone (DB, certs, kubeconfig, PID files all wiped)
@@ -15,6 +15,19 @@
 #     before that stanza existed would otherwise be silently reused on a
 #     network with no route to the freshly-recreated primary).
 #
+# --host-only: kill this worktree's host-side processes (apiserver, scheduler,
+#   konnectivity-server) and exit immediately after — skip wiping $WORKDIR and
+#   skip all VM teardown. Intended as a worker's final teardown step, run right
+#   before `git worktree remove`: those three processes do NOT die with the
+#   worktree (apiserver/scheduler are plain backgrounded processes,
+#   konnectivity-server is started via `disown`) and otherwise squat on this
+#   VM slot's ports for the next worker to collide with (bd memory
+#   worktree-remove-does-not-kill-host-processes). --extra-node's only
+#   host-side artifact — its kubelet-port hostPort forward — is owned by that
+#   VM's own Lima hostagent, not a standalone process, so it dies with the VM
+#   and needs no extra handling here; --host-only leaving the VM alone is
+#   correct, not a gap.
+#
 # To resume a fresh run:
 #   scripts/conformance/run-all.sh
 set -euo pipefail
@@ -23,6 +36,7 @@ WORKDIR="$PWD/temp/u7s"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 PORT="${U7S_PORT:-6443}"
 EXTRA_NODE=""
+HOST_ONLY=0
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --vm) VM_NAME="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
+    --host-only) HOST_ONLY=1; shift ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -110,6 +125,12 @@ for kp in "$KONNECTIVITY_SERVER_PORT" "$KONNECTIVITY_AGENT_PORT" "$KONNECTIVITY_
     kill "${KP_PIDS[@]}" 2>/dev/null || true
   fi
 done
+
+if [ "$HOST_ONLY" -eq 1 ]; then
+  echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
+  echo "[reset] Done (host-only)."
+  exit 0
+fi
 
 # ── 2. Wipe host state ────────────────────────────────────────────────────────
 
