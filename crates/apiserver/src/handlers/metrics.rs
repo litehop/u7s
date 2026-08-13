@@ -178,4 +178,49 @@ mod tests {
             );
         }
     }
+
+    /// Without the standard Prometheus process collector, this apiserver's own CPU/RSS
+    /// trajectory is invisible to any scraper hitting `/metrics` — operators would fall back
+    /// to ad hoc `ps` snapshots (see scripts/conformance/sample-run-metrics.sh), which only
+    /// capture a lifetime-average %CPU rather than a real instantaneous rate. Prometheus's
+    /// `process_collector` module (enabled via the `prometheus` crate's `process` feature in
+    /// Cargo.toml) only compiles under `target_os = "linux"` — it reads `/proc` — and
+    /// registers itself into `prometheus::default_registry()` automatically the first time
+    /// that registry is touched, which every other metric in this module already does. This
+    /// test only runs on the actual Linux deployment target; skipped (not compiled) on a
+    /// macOS dev host, matching the crate's own platform support.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_process_collector_series_on_linux() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = metrics(State(state)).await;
+        let body = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let text = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        for metric_name in [
+            "process_cpu_seconds_total",
+            "process_resident_memory_bytes",
+            "process_virtual_memory_bytes",
+            "process_open_fds",
+            "process_start_time_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {metric_name} ")),
+                "/metrics must expose {metric_name} on Linux via the Prometheus crate's own \
+                 process collector — its absence means the `process` feature regressed (see \
+                 crates/apiserver/Cargo.toml) and this apiserver's CPU/RSS trajectory is once \
+                 again invisible to any scraper. Full output:\n{text}"
+            );
+        }
+    }
 }
