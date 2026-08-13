@@ -61,7 +61,7 @@ use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
 use state::AppState;
-use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
+use tls::{generate_tls, load_or_generate_sa_keys, write_component_kubeconfig, write_kubeconfig};
 pub use util::resolve_dhat_backtrace_depth;
 
 /// Maximum request body size in bytes. Applied as the outermost layer so
@@ -237,6 +237,37 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // 5. Write kubeconfig.
     write_kubeconfig(&args.kubeconfig, &tls_material, &args)?;
+
+    // 5a. Write dedicated kubeconfigs for KCM and the scheduler so each authenticates as
+    // its own least-privilege x509 identity (system:kube-controller-manager /
+    // system:kube-scheduler) instead of sharing the admin/system:masters kubeconfig above.
+    // seed_rbac() already seeds a ClusterRole + ClusterRoleBinding for each name; nothing
+    // authenticated as either identity before these files existed.
+    let kcm_kubeconfig_path =
+        std::path::Path::new(&args.kubeconfig).with_file_name("kcm-kubeconfig");
+    write_component_kubeconfig(
+        &kcm_kubeconfig_path.to_string_lossy(),
+        &tls_material,
+        &args,
+        &tls_material.kcm_cert_der,
+        &tls_material.kcm_key_pem,
+        "system:kube-controller-manager",
+    )?;
+    // Named "kubeconfig-scheduler", not "scheduler-kubeconfig": several out-of-scope
+    // scripts (run-all.sh, reset.sh, sample-run-metrics.sh) pkill/pgrep the scheduler
+    // process by matching the literal substring "<workdir>/kubeconfig" in its argv. This
+    // filename keeps that substring intact as a prefix so those scripts keep reaping the
+    // scheduler correctly without needing their own changes.
+    let scheduler_kubeconfig_path =
+        std::path::Path::new(&args.kubeconfig).with_file_name("kubeconfig-scheduler");
+    write_component_kubeconfig(
+        &scheduler_kubeconfig_path.to_string_lossy(),
+        &tls_material,
+        &args,
+        &tls_material.scheduler_cert_der,
+        &tls_material.scheduler_key_pem,
+        "system:kube-scheduler",
+    )?;
 
     // 6. Load optional static token map.
     let mut token_map = match &args.token_auth_file {
@@ -1171,13 +1202,39 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets/status","deployments/status","replicasets/status","statefulsets/status"], "verbs": ["get","update","patch"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            // The endpointslice controller mirrors each Service's endpoints into
+            // EndpointSlice objects; the generic read-only discovery rule below doesn't
+            // cover this because it needs write verbs too.
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","escalate","bind"] },
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","volumeattachments","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] }
+            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","volumeattachments","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
+            // namespace-controller needs these two subresources specifically (the base
+            // "namespaces" rule above doesn't cover them) to record deletion-progress
+            // conditions and clear the "kubernetes" finalizer once a namespace's contents
+            // are gone — without it, a deleted namespace hangs in Terminating forever.
+            { "apiGroups": [""], "resources": ["namespaces/status","namespaces/finalize"], "verbs": ["get","update","patch"] },
+            // The garbage-collector, resourcequota, and namespace controllers all do
+            // generic, type-agnostic discovery/cleanup across the entire API surface —
+            // they must handle arbitrary/future resource types, including CRDs, without a
+            // hardcoded list (e.g. namespace deletion has to delete every object of every
+            // type living in that namespace, whatever type that turns out to be). This is
+            // the exact union of verbs upstream's own bootstrap policy grants their
+            // per-controller ClusterRoles (system:controller:generic-garbage-collector:
+            // get/list/watch/patch/update/delete; system:controller:resourcequota-controller:
+            // get/list/watch; system:controller:namespace-controller:
+            // get/list/watch/delete/deletecollection — see the seeded-but-currently-unused
+            // copies of those three roles below). With
+            // --use-service-account-credentials=false all three controllers run as this
+            // single identity, so the grant has to live here instead. Stops short of
+            // create/escalate/bind on arbitrary types, so this is still not
+            // cluster-admin-equivalent.
+            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete","deletecollection"] }
         ]
     });
     put!(key, body, "system:kube-controller-manager", "ClusterRole");
@@ -5068,6 +5125,231 @@ mod tests {
             state.rbac_index.is_allowed(&get_status),
             "system:kube-controller-manager must be allowed to GET resourcequotas/status — \
              quota controller reads current status before updating it"
+        );
+    }
+
+    /// Regression test: with --use-service-account-credentials=false, the garbage-collector,
+    /// resourcequota, and namespace controllers all run as system:kube-controller-manager and
+    /// must be able to discover AND clean up arbitrary/future resource types (including CRDs)
+    /// they have no hardcoded knowledge of. Confirmed live, in two stages:
+    /// 1. A real KCM process against a read-only version of this rule spammed "is not allowed
+    ///    to list poddisruptionbudgets/ingresses/customresourcedefinitions/..." on every one of
+    ///    its generic-discovery informers.
+    /// 2. After adding read-only get/list/watch, a real namespace deletion (sonobuoy's own
+    ///    teardown) hung in Terminating forever: the namespace controller's content-cleanup
+    ///    step needs deletecollection across every resource type in the namespace, which
+    ///    read-only access does not grant — every teardown failed with a wall of "is not
+    ///    allowed to deletecollection <type>" for dozens of types, live-observed in kcm.log.
+    /// The verb set here is the union of what upstream's own bootstrap policy grants the three
+    /// per-controller ClusterRoles this identity is standing in for (see the seeded-but-unused
+    /// system:controller:generic-garbage-collector / resourcequota-controller /
+    /// namespace-controller roles elsewhere in this function). Also checks the boundary of
+    /// that grant: it still must not include `create` on an arbitrary type, or this would be
+    /// silently cluster-admin-equivalent and defeat the whole point of a dedicated identity.
+    #[tokio::test]
+    async fn kcm_identity_can_discover_and_cleanup_but_not_create_arbitrary_resource_types() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+
+        let patch_replicaset_status = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "patch",
+            api_group: "apps",
+            resource: "replicasets",
+            subresource: "status",
+            namespace: Some("kube-system"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&patch_replicaset_status),
+            "system:kube-controller-manager must be allowed to PATCH replicasets/status — \
+             without it every ReplicaSet sync ends in a 403 and .status.replicas is never \
+             updated, live-confirmed via kubectl auth can-i before this fix"
+        );
+
+        let create_endpointslice = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "create",
+            api_group: "discovery.k8s.io",
+            resource: "endpointslices",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&create_endpointslice),
+            "system:kube-controller-manager must be allowed to CREATE endpointslices — the \
+             read-only generic-discovery rule doesn't cover this, the endpointslice controller \
+             needs its own write grant or every Service's endpoints mirroring silently 403s, \
+             live-confirmed via kubectl auth can-i before this fix"
+        );
+
+        let list_arbitrary_type = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "list",
+            api_group: "policy",
+            resource: "poddisruptionbudgets",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&list_arbitrary_type),
+            "system:kube-controller-manager must be able to LIST resource types outside its \
+             explicit rule list (e.g. poddisruptionbudgets) — the GC/quota-monitor controllers \
+             discover the full API surface generically, they don't have a hardcoded type list"
+        );
+
+        let deletecollection_arbitrary_type = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "deletecollection",
+            api_group: "policy",
+            resource: "poddisruptionbudgets",
+            subresource: "",
+            namespace: Some("sonobuoy"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state
+                .rbac_index
+                .is_allowed(&deletecollection_arbitrary_type),
+            "system:kube-controller-manager must be allowed to DELETECOLLECTION arbitrary \
+             resource types — without it, deleting a namespace hangs in Terminating forever \
+             because the namespace controller can never finish clearing its contents, \
+             live-confirmed: a real sonobuoy namespace got stuck exactly this way before this fix"
+        );
+
+        let namespace_finalize = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "update",
+            api_group: "",
+            resource: "namespaces",
+            subresource: "finalize",
+            namespace: None,
+            name: Some("sonobuoy"),
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&namespace_finalize),
+            "system:kube-controller-manager must be allowed to UPDATE namespaces/finalize — \
+             without it a namespace whose contents are already gone still never clears its \
+             'kubernetes' finalizer and stays Terminating forever"
+        );
+
+        let create_arbitrary_type = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "create",
+            api_group: "policy",
+            resource: "poddisruptionbudgets",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&create_arbitrary_type),
+            "the generic wildcard rule must stop short of `create` on arbitrary types — if \
+             create is also allowed, this identity is silently cluster-admin-equivalent and \
+             the dedicated least-privilege identity provides no real boundary"
+        );
+    }
+
+    /// Regression test: the scheduler must be able to PATCH pods/binding and pods/status
+    /// once it authenticates as its own dedicated identity (system:kube-scheduler) instead
+    /// of sharing the admin/system:masters kubeconfig. Without pods/binding, the scheduler
+    /// can never actually place a pod on a node — every pod stays Pending forever. Also
+    /// verifies the flip side: this identity's ClusterRole is scoped, not cluster-admin, so
+    /// it must NOT be allowed to delete a Namespace — a regression here would mean the
+    /// dedicated identity is silently as powerful as system:masters, defeating the point of
+    /// giving the scheduler its own cert in the first place.
+    #[tokio::test]
+    async fn scheduler_identity_can_bind_pods_but_not_delete_namespaces() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+
+        let bind_pod = rbac::AuthzRequest {
+            username: "system:kube-scheduler",
+            groups: &groups,
+            verb: "patch",
+            api_group: "",
+            resource: "pods",
+            subresource: "binding",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&bind_pod),
+            "system:kube-scheduler must be allowed to PATCH pods/binding — without this \
+             the scheduler can never place a pod on a node and every pod stays Pending forever"
+        );
+
+        let patch_pod_status = rbac::AuthzRequest {
+            username: "system:kube-scheduler",
+            groups: &groups,
+            verb: "patch",
+            api_group: "",
+            resource: "pods",
+            subresource: "status",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&patch_pod_status),
+            "system:kube-scheduler must be allowed to PATCH pods/status — the scheduler \
+             writes scheduling-related conditions onto the pod it just bound"
+        );
+
+        let delete_namespace = rbac::AuthzRequest {
+            username: "system:kube-scheduler",
+            groups: &groups,
+            verb: "delete",
+            api_group: "",
+            resource: "namespaces",
+            subresource: "",
+            namespace: None,
+            name: Some("default"),
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&delete_namespace),
+            "system:kube-scheduler must NOT be allowed to delete a Namespace — if this \
+             identity were granted cluster-admin-equivalent access, the dedicated x509 \
+             identity would give no least-privilege benefit over the shared admin kubeconfig \
+             it replaces"
         );
     }
 

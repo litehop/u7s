@@ -257,6 +257,17 @@ pub struct TlsMaterial {
     pub kubelet_client_cert_pem: Vec<u8>,
     /// PEM-encoded kubelet client private key.
     pub kubelet_client_key_pem: Vec<u8>,
+    /// DER-encoded kube-controller-manager client certificate (CN=system:kube-controller-manager,
+    /// no O=). Written into a dedicated KCM kubeconfig so KCM authenticates as its own
+    /// least-privilege identity instead of sharing the admin/system:masters kubeconfig.
+    pub kcm_cert_der: Vec<u8>,
+    /// PEM-encoded kube-controller-manager client private key.
+    pub kcm_key_pem: Vec<u8>,
+    /// DER-encoded scheduler client certificate (CN=system:kube-scheduler, no O=). Same
+    /// rationale as `kcm_cert_der`, for the scheduler's dedicated kubeconfig.
+    pub scheduler_cert_der: Vec<u8>,
+    /// PEM-encoded scheduler client private key.
+    pub scheduler_key_pem: Vec<u8>,
     /// Bearer token embedded in the admin kubeconfig alongside the client cert.
     ///
     /// kubectl/KCM authenticate to us via the admin cert (mTLS) only, so the HTTP request
@@ -382,6 +393,26 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .push(rcgen::DnType::OrganizationName, "system:masters");
     let kubelet_client_cert = kubelet_client_params.signed_by(&kubelet_client_key, &ca_issuer)?;
 
+    // --- KCM client cert ---
+    // Real kubeadm gives kube-controller-manager a dedicated x509 identity, not a share
+    // of admin/system:masters. No O= — the seeded ClusterRoleBinding
+    // system:kube-controller-manager (see seed_rbac()) binds by username (kind: User),
+    // so group membership is irrelevant here.
+    let kcm_key = KeyPair::generate()?;
+    let mut kcm_params = CertificateParams::default();
+    kcm_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "system:kube-controller-manager");
+    let kcm_cert = kcm_params.signed_by(&kcm_key, &ca_issuer)?;
+
+    // --- Scheduler client cert ---
+    let scheduler_key = KeyPair::generate()?;
+    let mut scheduler_params = CertificateParams::default();
+    scheduler_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "system:kube-scheduler");
+    let scheduler_cert = scheduler_params.signed_by(&scheduler_key, &ca_issuer)?;
+
     // --- Build rustls ServerConfig ---
     // Present only the leaf cert in the chain. The CA cert is already in the
     // kubelet's trust store (via kubeconfig certificate-authority-data). Including
@@ -424,6 +455,8 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let admin_cert_pem = pem_encode("CERTIFICATE", &admin_cert_der);
     let kubelet_client_cert_der = kubelet_client_cert.der().to_vec();
     let kubelet_client_cert_pem = pem_encode("CERTIFICATE", &kubelet_client_cert_der);
+    let kcm_cert_der = kcm_cert.der().to_vec();
+    let scheduler_cert_der = scheduler_cert.der().to_vec();
     Ok(TlsMaterial {
         ca_cert_der,
         server_cert_der,
@@ -432,6 +465,10 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         admin_key_pem: admin_key.serialize_pem().into_bytes(),
         kubelet_client_cert_pem,
         kubelet_client_key_pem: kubelet_client_key.serialize_pem().into_bytes(),
+        kcm_cert_der,
+        kcm_key_pem: kcm_key.serialize_pem().into_bytes(),
+        scheduler_cert_der,
+        scheduler_key_pem: scheduler_key.serialize_pem().into_bytes(),
         admin_bearer_token: uuid::Uuid::new_v4().to_string(),
         server_config: Arc::new(server_config),
     })
@@ -457,26 +494,55 @@ struct Kubeconfig {
     ca_data: String,
     cert_data: String,
     key_data: String,
-    token: String,
+    /// `None` for dedicated component identities (KCM, scheduler): they authenticate via
+    /// x509 client cert only and never go through `handlers::aggregation`'s proxy, so they
+    /// have no need for the admin-bearer-token forwarding shim (see `admin_bearer_token`'s doc).
+    token: Option<String>,
+    user: String,
 }
 
 impl Kubeconfig {
     fn new(server: &str, tls: &TlsMaterial) -> Self {
+        let mut kc = Self::for_identity(
+            server,
+            tls,
+            &tls.admin_cert_der,
+            &tls.admin_key_pem,
+            "admin",
+        );
+        kc.token = Some(tls.admin_bearer_token.clone());
+        kc
+    }
+
+    /// Build a kubeconfig for a dedicated non-admin component identity (KCM, scheduler),
+    /// embedding `cert_der`/`key_pem` under `username` instead of the admin cert.
+    fn for_identity(
+        server: &str,
+        tls: &TlsMaterial,
+        cert_der: &[u8],
+        key_pem: &[u8],
+        username: &str,
+    ) -> Self {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         // kubeconfig fields expect base64(PEM), not base64(DER).
         let ca_pem = pem_encode("CERTIFICATE", &tls.ca_cert_der);
-        let cert_pem = pem_encode("CERTIFICATE", &tls.admin_cert_der);
+        let cert_pem = pem_encode("CERTIFICATE", cert_der);
         Kubeconfig {
             server: server.to_owned(),
             ca_data: b64.encode(&ca_pem),
             cert_data: b64.encode(&cert_pem),
-            key_data: b64.encode(&tls.admin_key_pem),
-            token: tls.admin_bearer_token.clone(),
+            key_data: b64.encode(key_pem),
+            token: None,
+            user: username.to_owned(),
         }
     }
 
     fn to_yaml(&self) -> String {
+        let token_line = match &self.token {
+            Some(token) => format!("\x20   token: {token}\n"),
+            None => String::new(),
+        };
         format!(
             "apiVersion: v1\n\
              kind: Config\n\
@@ -488,22 +554,30 @@ impl Kubeconfig {
              contexts:\n\
              - context:\n\
              \x20   cluster: u7s\n\
-             \x20   user: admin\n\
+             \x20   user: {user}\n\
              \x20 name: u7s\n\
              current-context: u7s\n\
              users:\n\
-             - name: admin\n\
+             - name: {user}\n\
              \x20 user:\n\
              \x20   client-certificate-data: {cert_data}\n\
              \x20   client-key-data: {key_data}\n\
-             \x20   token: {token}\n",
+             {token_line}",
             server = self.server,
             ca_data = self.ca_data,
+            user = self.user,
             cert_data = self.cert_data,
             key_data = self.key_data,
-            token = self.token,
         )
     }
+}
+
+/// Server URL embedded in every kubeconfig this module writes — see [`write_kubeconfig`]'s
+/// doc for the parallel-worker rationale.
+fn kubeconfig_server_url(args: &Args) -> &str {
+    args.advertise_address
+        .as_deref()
+        .unwrap_or("https://127.0.0.1:6443")
 }
 
 /// Write a kubeconfig to `path`.
@@ -519,16 +593,40 @@ pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, args: &Args) -> anyhow::R
     // parallel workers running on non-default loopback IPs (127.0.0.2, etc.)
     // get a kubeconfig that points at their own apiserver.
     // lima-start.sh rewrites any 127.x address to host.lima.internal when copying into the VM.
-    let server_url = args
-        .advertise_address
-        .as_deref()
-        .unwrap_or("https://127.0.0.1:6443");
-    let kc = Kubeconfig::new(server_url, tls);
+    let kc = Kubeconfig::new(kubeconfig_server_url(args), tls);
     write_private_key(
         validate_cli_path(std::path::Path::new(path))?,
         kc.to_yaml().as_bytes(),
     )?;
     tracing::info!("kubeconfig written to {path}");
+    Ok(())
+}
+
+/// Write a kubeconfig for a dedicated component identity (KCM, scheduler) rather than the
+/// shared admin identity `write_kubeconfig` writes. Real kubeadm gives each static control-plane
+/// component its own x509 client cert so cluster RBAC (e.g. the seeded
+/// `system:kube-controller-manager` / `system:kube-scheduler` ClusterRoles) actually applies,
+/// instead of every component sharing admin/system:masters and bypassing RBAC entirely.
+pub fn write_component_kubeconfig(
+    path: &str,
+    tls: &TlsMaterial,
+    args: &Args,
+    cert_der: &[u8],
+    key_pem: &[u8],
+    username: &str,
+) -> anyhow::Result<()> {
+    let kc = Kubeconfig::for_identity(
+        kubeconfig_server_url(args),
+        tls,
+        cert_der,
+        key_pem,
+        username,
+    );
+    write_private_key(
+        validate_cli_path(std::path::Path::new(path))?,
+        kc.to_yaml().as_bytes(),
+    )?;
+    tracing::info!("kubeconfig written to {path} (user={username})");
     Ok(())
 }
 
@@ -1450,6 +1548,102 @@ mod tests {
             "leaf cert's Issuer CN must match the on-disk legacy CA Subject CN exactly, \
              or X.509 issuer/subject name matching fails for anything signed after \
              this restart of a pre-fix cluster"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Regression: KCM and the scheduler must each get their own x509 identity
+    /// (CN=system:kube-controller-manager / CN=system:kube-scheduler) with no
+    /// O=system:masters — the seeded ClusterRoleBindings for those names (see
+    /// lib.rs::seed_rbac) bind by username, and O=system:masters would bypass RBAC
+    /// entirely via the cluster-admin ClusterRoleBinding on that group instead of
+    /// exercising the least-privilege ClusterRoles meant for these identities.
+    #[test]
+    fn kcm_and_scheduler_certs_carry_dedicated_identities_with_no_masters_group() {
+        let dir = test_temp_dir("component-cert-identity");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+
+        let kcm_id = crate::auth::extract_client_cert_identity(&tls.kcm_cert_der)
+            .expect("kcm_cert_der must parse as a valid x509 cert");
+        assert_eq!(
+            kcm_id.username, "system:kube-controller-manager",
+            "KCM's cert CN must be its dedicated identity, not admin — otherwise KCM \
+             still resolves through system:masters and the seeded least-privilege \
+             ClusterRole never gets exercised"
+        );
+        assert_eq!(
+            kcm_id.groups,
+            vec!["system:authenticated".to_owned()],
+            "KCM's cert must carry no O=system:masters — that group's \
+             ClusterRoleBinding grants cluster-admin, defeating the whole point \
+             of a dedicated least-privilege identity"
+        );
+
+        let scheduler_id = crate::auth::extract_client_cert_identity(&tls.scheduler_cert_der)
+            .expect("scheduler_cert_der must parse as a valid x509 cert");
+        assert_eq!(
+            scheduler_id.username, "system:kube-scheduler",
+            "scheduler's cert CN must be its dedicated identity, not admin"
+        );
+        assert_eq!(
+            scheduler_id.groups,
+            vec!["system:authenticated".to_owned()],
+            "scheduler's cert must carry no O=system:masters, for the same reason as KCM's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Regression: `write_component_kubeconfig` must embed the given component's own
+    /// cert/key under its own username, and must NOT carry the admin bearer token —
+    /// that token exists solely so kubectl/admin's cert-only requests still carry an
+    /// Authorization header for the aggregation proxy to forward (see
+    /// `TlsMaterial::admin_bearer_token`'s doc); embedding it into a component
+    /// kubeconfig would make every KCM/scheduler request also present the raw admin
+    /// token, silently reintroducing the cluster-admin escape hatch this feature
+    /// exists to close.
+    #[test]
+    fn write_component_kubeconfig_omits_admin_bearer_token_and_uses_component_identity() {
+        let dir = test_temp_dir("component-kubeconfig");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let out_path = dir.join("scheduler-kubeconfig");
+
+        write_component_kubeconfig(
+            &out_path.to_string_lossy(),
+            &tls,
+            &args,
+            &tls.scheduler_cert_der,
+            &tls.scheduler_key_pem,
+            "system:kube-scheduler",
+        )
+        .expect("write_component_kubeconfig must succeed");
+
+        let yaml = std::fs::read_to_string(&out_path).expect("kubeconfig must be written"); // lgtm[rust/path-injection]
+        assert!(
+            yaml.contains("user: system:kube-scheduler"),
+            "component kubeconfig must reference its own identity, not 'admin'; got: {yaml}"
+        );
+        assert!(
+            !yaml.contains(&tls.admin_bearer_token),
+            "component kubeconfig must never embed the admin bearer token — doing so would \
+             let a request authenticated via the scheduler's cert also carry cluster-admin \
+             credentials, defeating least-privilege; got: {yaml}"
+        );
+        assert!(
+            !yaml.contains("token:"),
+            "component kubeconfig must have no token field at all when none was minted \
+             for it; got: {yaml}"
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
