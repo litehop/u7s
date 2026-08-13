@@ -6,7 +6,6 @@ Each file should be structured like an AI Skill: front matter describing scope, 
 
 | File | Contents |
 |------|----------|
-| [project-stance.md](project-stance.md) | Project posture, constraints, merge policy, and worker preamble to inject in every dispatch |
 | [project-context.md](project-context.md) | u7s technical context: goals, target environment, settled decisions, current phase |
 | [north-star.md](north-star.md) | u7s's durable north star, decision framework, and guiding principles for component build-vs-delegate decisions — operator sign-off required to change |
 | [roadmap.md](roadmap.md) | Current state and priorities: component matrix, gates, standing initiatives — changes often, links back to north-star.md rather than restating it |

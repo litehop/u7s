@@ -47,7 +47,7 @@ A Kubernetes-compatible control plane implementation in Rust, targeting severely
 Phase 3 — Conformance. Stack complete as of 2026-05-24. Ready for first sonobuoy run.
 See `roadmap.md` for full detail.
 
-## Worker preamble addendum (append to project-stance.md preamble)
+## Worker preamble addendum (append to the common preamble in docs/the-mayor-method/dispatch-prompt-template.md)
 
 ```
 Domain: Kubernetes-compatible control plane in Rust.
