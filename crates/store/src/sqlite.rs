@@ -102,6 +102,75 @@ impl RingShard {
     }
 }
 
+/// RAII handle a `watch()` stream holds for exactly as long as it is open. Registers itself as
+/// one of `shard`'s live watchers on construction; on drop (stream ended, whether by client
+/// disconnect, error, or being polled to completion), deregisters, and if that was the LAST
+/// watcher, schedules `shard` for idle-GC after `RING_SHARD_IDLE_GRACE`.
+///
+/// Lives as a local binding inside `watch()`'s `async_stream::stream!` body, not in `watch()`'s
+/// own outer scope — a generator's live locals are dropped exactly when the generator itself is
+/// dropped, which for a `Stream` is exactly when the client's connection (or whatever is polling
+/// it) goes away. That is the one signal this whole lifecycle needs: "is anyone still reading
+/// this stream," which nothing else in `watch()`'s own body observes.
+struct ShardWatcherGuard {
+    shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    key: String,
+    shard: Arc<RingShard>,
+}
+
+impl ShardWatcherGuard {
+    fn attach(
+        shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+        key: String,
+        shard: Arc<RingShard>,
+    ) -> Self {
+        shard.watchers.fetch_add(1, Ordering::AcqRel);
+        Self { shards, key, shard }
+    }
+}
+
+impl Drop for ShardWatcherGuard {
+    fn drop(&mut self) {
+        // fetch_sub returns the PRE-decrement value, so `== 1` means we just took the count to
+        // zero — the moment a shard becomes eligible for idle-GC, not merely "some watcher left."
+        if self.shard.watchers.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let shards = Arc::clone(&self.shards);
+        let key = self.key.clone();
+        let shard = Arc::clone(&self.shard);
+        tokio::spawn(async move {
+            tokio::time::sleep(RING_SHARD_IDLE_GRACE).await;
+            // Re-check AND remove under the SAME write-lock acquisition: a watch that reconnects
+            // during the grace window re-attaches via `find_shard_key`/`get_or_create_shard`
+            // (each of which also needs `shards`' lock), so by the time this write-lock is
+            // granted, any such reconnect has already either bumped `watchers` back above zero
+            // (this check then correctly declines) or has not happened yet (in which case it
+            // will simply create a fresh shard afterward, exactly as if this one had never
+            // existed). `Arc::ptr_eq` guards against the pathological case where this exact key
+            // was removed and then recreated as a DIFFERENT shard in between — removing that new
+            // one instead would silently orphan whatever just attached to it.
+            let removed = {
+                let mut guard = shards.write().expect("shards poisoned");
+                let idle = guard.get(&key).is_some_and(|s| {
+                    Arc::ptr_eq(s, &shard) && s.watchers.load(Ordering::Acquire) == 0
+                });
+                if idle {
+                    guard.remove(&key)
+                } else {
+                    None
+                }
+            };
+            if removed.is_some() {
+                crate::metrics::WATCH_RING_SHARD_EVICTIONS_TOTAL
+                    .with_label_values(&[crate::metrics::prefix_bucket(&key)])
+                    .inc();
+                tracing::debug!(shard = %key, "watch: idle ring shard evicted after grace period");
+            }
+        });
+    }
+}
+
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
     /// ALL rusqlite calls must go through spawn_blocking — rusqlite is synchronous.
@@ -499,17 +568,18 @@ fn get_or_create_shard(
     )
 }
 
-/// Unconditionally remove and return `key`'s shard, if present. Callers decide WHEN removal is
-/// safe — this only performs it, atomically under `shards`' write lock, so a concurrent
-/// `get_or_create_shard`/`matching_shards` read can never observe a half-removed entry.
+/// Unconditionally remove and return `key`'s shard, if present, atomically under `shards`' write
+/// lock — so a concurrent `get_or_create_shard`/`matching_shards` read can never observe a
+/// half-removed entry.
 ///
-/// Two callers, two different safety arguments for "when":
-/// - The idle-GC path (`ShardWatcherGuard`'s drop) re-checks `watchers == 0` under this SAME
-///   write lock immediately before calling this, so a watch that reconnected during the grace
-///   window (see `RING_SHARD_IDLE_GRACE`) is guaranteed to have already re-incremented the count
-///   by the time that check runs, defeating the teardown.
-/// - CRD-delete's eager teardown (mayor-88h1w) has a different invariant: the resource type
-///   itself is gone, so removal is unconditionally correct regardless of `watchers`.
+/// Not called by this crate's own idle-GC (`ShardWatcherGuard`'s drop): that path needs its
+/// idle-check (`watchers == 0`) and the removal to happen under the SAME write-lock acquisition
+/// (so a reconnecting watch can't slip in between the two), which means it does its own
+/// conditional variant of this one-line removal inline rather than composing this fully
+/// unconditional helper. This exists for a caller with a genuinely different invariant: CRD-delete
+/// eager teardown (mayor-88h1w) removes a shard because its resource TYPE no longer exists, which
+/// is unconditionally correct regardless of `watchers`.
+#[allow(dead_code)] // mayor-88h1w's CRD-delete teardown is the intended caller; not wired up yet.
 pub(crate) fn tear_down_shard(
     shards: &RwLock<HashMap<String, Arc<RingShard>>>,
     key: &str,
@@ -576,6 +646,21 @@ fn find_shard(shards: &HashMap<String, Arc<RingShard>>, prefix: &str) -> Option<
         .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
         .max_by_key(|(shard, _)| shard.len())
         .map(|(_, shard)| Arc::clone(shard))
+}
+
+/// Like `find_shard`, but also returns the exact map key the match lives under — `watch()` needs
+/// this (unlike every other `find_shard` caller, which only needs the shard's contents) so its
+/// idle-GC teardown can later remove the SAME entry again, even when it differs from this watch's
+/// own `prefix` (a reused, more broadly-scoped shard created by an earlier, different watch).
+fn find_shard_key(
+    shards: &HashMap<String, Arc<RingShard>>,
+    prefix: &str,
+) -> Option<(String, Arc<RingShard>)> {
+    shards
+        .iter()
+        .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
+        .max_by_key(|(shard, _)| shard.len())
+        .map(|(shard, ring)| (shard.clone(), Arc::clone(ring)))
 }
 
 fn open_conn(path: &str) -> Result<Connection> {
@@ -1579,30 +1664,51 @@ impl Store for SqliteStore {
         // Subscribe FIRST to avoid missing events between replay and live.
         let mut rx = self.tx.subscribe();
 
-        // A namespace-scoped `prefix` is always this resource type's root plus one namespace
-        // segment, and a cluster-scoped/all-namespaces `prefix` is exactly the root — either way
-        // `prefix` matches at most one shard. `None` means this resource type has never been
-        // written to, so there is nothing to replay.
-        let shard = find_shard(&self.shards.read().expect("shards poisoned"), prefix);
+        // Create-on-first-watch: a watch is what brings a resource type's shard into being now
+        // (see `push_event_locked`'s doc — writes no longer do). `find_shard_key` first, so a
+        // watch that can reuse an EXISTING shard (created by an earlier watch, of the same or a
+        // different granularity — see `matching_shards`' doc) inherits its full retained history
+        // instead of starting from empty; only a genuinely first-ever watch on this resource type
+        // falls through to creating a fresh shard keyed to `prefix` itself.
+        //
+        // Resolved in two lock acquisitions rather than one (find, then possibly create) — same
+        // trade-off `set_compaction_horizon_for_test` already documents: std's RwLock is not
+        // reentrant, so holding the read guard into the write-lock branch would deadlock. The
+        // resulting gap (a concurrent idle-GC could theoretically fire between the two) is
+        // self-healing, not a correctness bug: at worst it costs a duplicate shard, never a lost
+        // event, since `matching_shards` fans writes out to every shard that exists.
+        let (shard_key_owned, shard) = {
+            let found = find_shard_key(&self.shards.read().expect("shards poisoned"), prefix);
+            match found {
+                Some(found) => found,
+                None => (
+                    prefix.to_string(),
+                    get_or_create_shard(&self.shards, prefix),
+                ),
+            }
+        };
+        // Registers this stream as one of `shard`'s live watchers for as long as it stays open —
+        // see `ShardWatcherGuard`'s doc for why it must be held inside the generator below, not
+        // here.
+        let watcher_guard = ShardWatcherGuard::attach(
+            Arc::clone(&self.shards),
+            shard_key_owned,
+            Arc::clone(&shard),
+        );
 
         // Expire against THIS shard's floor, never the cross-shard maximum. The store-wide value
         // is dominated by whichever resource type churns hardest, so using it here would reject a
         // watch on a quiet type whose own ring still holds every event it ever saw.
-        let horizon = shard
-            .as_ref()
-            .map_or(0, |shard| shard.horizon.load(Ordering::Relaxed));
+        let horizon = shard.horizon.load(Ordering::Relaxed);
 
         // Collect ring buffer snapshot while holding read lock (std::sync::RwLock — synchronous).
-        let replayed: Vec<Arc<InternalEvent>> = match &shard {
-            Some(shard) => {
-                let guard = shard.ring.read().expect("ring poisoned");
-                guard
-                    .iter()
-                    .filter(|e| e.key.starts_with(prefix) && e.revision > from_revision)
-                    .cloned()
-                    .collect()
-            }
-            None => Vec::new(),
+        let replayed: Vec<Arc<InternalEvent>> = {
+            let guard = shard.ring.read().expect("ring poisoned");
+            guard
+                .iter()
+                .filter(|e| e.key.starts_with(prefix) && e.revision > from_revision)
+                .cloned()
+                .collect()
         };
 
         // How far behind this client actually was. Recorded here rather than only logged because
@@ -1635,6 +1741,11 @@ impl Store for SqliteStore {
         let shards_arc = Arc::clone(&self.shards);
 
         let stream = async_stream::stream! {
+            // Moved in (not just referenced) so it lives exactly as long as this generator does
+            // — see `ShardWatcherGuard`'s doc for why that, and not `watch()`'s own outer scope,
+            // is the lifetime that must drive idle-GC eligibility.
+            let _watcher_guard = watcher_guard;
+
             // Yield compacted event if from_revision is before the horizon.
             // Before yielding Compacted, emit any deletion tombstones from the deletion_log
             // that the client missed (revision > from_revision). These are deletions that were
