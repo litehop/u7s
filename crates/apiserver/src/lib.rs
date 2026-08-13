@@ -2483,6 +2483,24 @@ async fn seed_services(
         Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
     }
 
+    // Reserve kube-dns's fixed clusterIP in the allocator's own sentinel keyspace.
+    // Without this, allocate_service_ip (hint starts at offset 2, +1 per call) has no
+    // idea offset 10 is taken and will hand it to the 9th ordinary dynamic Service,
+    // colliding with kube-dns's VIP.
+    let dns_ip_sentinel_key = format!("{}{}", state::SERVICE_IP_PREFIX, kube_dns_cluster_ip);
+    match store
+        .put(
+            &dns_ip_sentinel_key,
+            Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+            Some(0),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed kube-dns clusterIP sentinel: {e}")),
+    }
+
     // default/kubernetes Endpoints — controllers (e.g. endpoint controller, admission webhooks)
     // watch this object to locate the apiserver. Without it they log errors and may fail to start.
     let ep_key = keys::object_key("endpoints", "default", "kubernetes");
@@ -3310,6 +3328,26 @@ async fn seed_metrics_server(
         Err(e) => {
             return Err(anyhow::anyhow!(
                 "seed Service kube-system/metrics-server: {e}"
+            ))
+        }
+    }
+
+    // Reserve metrics-server's fixed clusterIP in the allocator's own sentinel
+    // keyspace — same reasoning as the kube-dns sentinel above, one offset further.
+    let metrics_ip_sentinel_key = format!("{}{}", state::SERVICE_IP_PREFIX, metrics_server_ip);
+    match store
+        .put(
+            &metrics_ip_sentinel_key,
+            Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+            Some(0),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "seed metrics-server clusterIP sentinel: {e}"
             ))
         }
     }
