@@ -1362,7 +1362,7 @@ fn gen_pod_anti_affinity_to_json(paa: core_v1::PodAntiAffinity) -> serde_json::V
     )
 }
 
-fn gen_label_selector_requirement_to_json(
+pub(crate) fn gen_label_selector_requirement_to_json(
     req: meta_v1::LabelSelectorRequirement,
 ) -> serde_json::Value {
     let mut m = serde_json::Map::new();
