@@ -518,8 +518,9 @@ reaching the WRONG VM's kubelet. Root-caused as a live port-forward collision, n
 cert issue — see `mayor-1rlwt` and `mayor-pgm5q.6`'s notes for the full misdiagnosis
 trail. Fixed by reprovisioning `lima-node-smoke` onto `10255` (stop VM, edit
 `~/.lima/lima-node-smoke/lima.yaml`'s `portForwards[0].hostPort`, restart — `limactl`
-has no in-place port-edit command, and `worker-vm.sh start` only applies `--set` flags
-on FIRST provision, not on restarting an already-existing VM). `lima-node-2` itself
+has no in-place port-edit command). The lesson stands regardless of which script
+provisions a VM: **a live VM's ports can drift from this table; verify with
+`grep -A1 guestPort ~/.lima/<vm-name>/lima.yaml` before assuming.** `lima-node-2` itself
 was left on the workaround port `10252` from an earlier dispatch (mayor-6m0np) rather
 than reverted to `10251` — no live collision exists at `10252` today, so it wasn't
 worth the ~5 min reprovision to "fix" a non-problem (Rule 2). A future mayor MAY want
@@ -536,8 +537,9 @@ workers. Different loopback IPs are NOT reliably reachable from inside Lima VMs 
 
 **Kubelet port** is the host-side port-forward for guest port 10250. Each slot must use
 a distinct kubelet port so parallel workers don't collide on log/exec/attach requests.
-Pass `--kubelet-port <N>` to `run-all.sh` and provision the VM with:
-`scripts/worker-vm.sh start <vm-name> 127.0.0.1 <kubelet-port>`
+Pass `--kubelet-port <N>` to `run-all.sh` — `run-all.sh` (via `lima-start.sh`) provisions
+the VM with the assigned `--kubelet-port` automatically on first run; no separate
+provisioning step is needed.
 
 The MCP server name mirrors the VM name: `mcp__lima-node-smoke__run_shell_command`
 for `lima-node-smoke`, etc.
@@ -601,8 +603,10 @@ not wired into `run-all.sh` today — an option when you only need "is the clust
 `--verbose` turns on `RUST_LOG=debug` (set inside the script — never export it
 inline). Omit `--binary` and the script builds the worktree itself, so no manual
 `cargo build` is needed. Workers must not hard-code `lima-node` or `6443` anywhere.
-`U7S_HOST_IP` is no longer used — workers always bind to `127.0.0.1` and use
-`--port` for isolation. The konnectivity port auto-derives from `--port` (6443→8135,
+Workers should never pass `--ip` / rely on `U7S_HOST_IP` — always bind `127.0.0.1`
+and use `--port` for isolation (the underlying flag still exists in
+`run-all.sh`/`u7s-start.sh` but is not part of the worker workflow). The
+konnectivity port auto-derives from `--port` (6443→8135,
 6444→8235, 6445→8335, …); workers no longer need to pass `--konnectivity-server-port`
 for standard slots. An explicit `--konnectivity-server-port` override remains available
 when needed.
@@ -835,8 +839,6 @@ When a worker returns from a VM/sonobuoy-touching bead:
   runner timeout unrelated to the diff), rerun the specific job with
   `gh run rerun <run-id> --failed` and wait for green. Only merge when ALL
   checks are green.
-- **Branch-delete-on-merge fails.** See Mayor Merge Protocol in
-  [`bootstrap.md`](./bootstrap.md) (the PR merge `/loop` block).
 
 ## What goes RIGHT with these patterns
 
