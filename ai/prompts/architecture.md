@@ -13,7 +13,7 @@ u7s is a Kubernetes-compatible control plane written from scratch in Rust, targe
 ### What u7s is
 
 - A Kubernetes API-compatible server (REST + watch semantics) implemented in Rust
-- A small u7s-native controller manager (ServiceAccount token provisioning, EndpointSlice/EndpointSliceMirroring, ClusterRole aggregation, Namespace lifecycle) that delegates everything else — Deployment, ReplicaSet, StatefulSet, and the rest of the reconcile loops — to the real upstream `kube-controller-manager` (see §3.3)
+- No controller manager of its own — every reconcile loop (Deployment, ReplicaSet, StatefulSet, EndpointSlice/EndpointSliceMirroring, ClusterRole aggregation, Namespace lifecycle, and the rest) runs in the real upstream `kube-controller-manager` (see §3.3)
 - No node agent of its own — pods run under the real upstream kubelet (backed by CRI-O), which u7s provisions per node rather than building its own kubelet-equivalent binary (see §3.5)
 - An embedded state store (SQLite or LMDB — see §9) behind a storage abstraction layer
 - A scheduler boundary (pluggable, design TBD) that places pods on nodes
@@ -97,30 +97,27 @@ The storage layer is an abstract Rust trait. SQLite and LMDB are the two candida
 
 ### 3.3 Controller Manager
 
-Two different things run under the "controller manager" umbrella:
-
-**u7s-native** (`crates/controller-manager`, binary `u7s-controller-manager`): a handful of
-controllers u7s reimplements directly — ServiceAccount token provisioning, the EndpointSlice
-and EndpointSliceMirroring controllers, ClusterRole aggregation (needed for Argo CD's
-aggregated `admin`/`edit`/`view` roles), and Namespace lifecycle (finalizer injection and
-resource drain on delete). `crates/controller-manager/src/main.rs` is the authoritative,
-current list — it changes independently of this document.
-
-**Real upstream `kube-controller-manager`:** everything else — Deployment, ReplicaSet,
-StatefulSet, Job, CronJob, DaemonSet, garbage collection, CSR approving/signing, disruption,
-and the rest of the ~30 controllers upstream ships. `scripts/conformance/04-start-kcm.sh`
-downloads the real binary and runs it against u7s (wrapped by
-`scripts/conformance/kcm-supervisor.sh`, a crash-restart supervisor with backoff), passing
-`--controllers='*,-...'` to enable everything except the controllers that assume a cloud
-provider or a node-lifecycle implementation u7s doesn't have (cloud-node-lifecycle,
-node-ipam, node-lifecycle, node-route, service-lb, service-cidr).
+u7s does not ship a native controller-manager crate or binary. All ~30 reconcile loops —
+Deployment, ReplicaSet, StatefulSet, Job, CronJob, DaemonSet, garbage collection, CSR
+approving/signing, disruption, EndpointSlice/EndpointSliceMirroring, ClusterRole
+aggregation, Namespace lifecycle, and the rest — run in the real upstream
+`kube-controller-manager`. `scripts/conformance/04-start-kcm.sh` downloads the real binary
+and runs it against u7s with `--controllers=*` (wrapped by
+`scripts/conformance/kcm-supervisor.sh`, a crash-restart supervisor with backoff), disabling
+only the controllers that assume a cloud provider or a node-lifecycle implementation u7s
+doesn't have (cloud-node-lifecycle, node-ipam, node-route, service-lb, service-cidr).
 
 Why delegate instead of reimplementing: running the real binary gets conformance-level
 correctness — status/condition semantics, edge cases, and cross-controller interactions —
 for dozens of controllers without u7s having to rebuild each one. `roadmap.md`'s guiding
 principle states this directly: "conform, don't reinvent — this is what lets us run REAL
-upstream components (KCM, kubelet, kube-scheduler) against u7s as conformance oracles." u7s
-only reimplements a controller natively when there's a concrete reason to run it itself.
+upstream components (KCM, kubelet, kube-scheduler) against u7s as conformance oracles."
+
+This delegation still has one gap: KCM itself currently authenticates to u7s using a
+`system:masters` admin cert shim rather than its own ServiceAccount-based kubeconfig. JWT
+minting infra already exists (§4.3), but provisioning and wiring a real SA-based kubeconfig
+for KCM specifically is deferred to Phase 4 under the "DB-05: KCM SA token provisioning"
+EPIC — the least-privilege KCM identity is not yet in place.
 
 ### 3.4 Scheduler
 
