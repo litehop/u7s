@@ -1667,7 +1667,12 @@ pub async fn replace_cr<S: Store>(
         dry_run: false,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    debug_assert_eq!(
+        existing["metadata"]["uid"], obj["metadata"]["uid"],
+        "old_object passed to run_validating_webhooks must be the same resource's pre-update \
+         state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
+    );
+    run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let meta: crate::types::ObjectMeta =
@@ -2491,7 +2496,12 @@ pub async fn replace_cr_namespaced<S: Store>(
         dry_run: false,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    debug_assert_eq!(
+        existing["metadata"]["uid"], obj["metadata"]["uid"],
+        "old_object passed to run_validating_webhooks must be the same resource's pre-update \
+         state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
+    );
+    run_validating_webhooks(&state, &obj, Some(&existing), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let meta: crate::types::ObjectMeta =
@@ -2844,6 +2854,11 @@ pub async fn patch_cr<S: Store>(
         None
     };
 
+    // obj is deserialized directly from the stored bytes above and the patch below mutates
+    // it in place, so this clone is the only pre-patch snapshot available to pass as
+    // old_object to run_validating_webhooks.
+    let old = obj.clone();
+
     match patch_type {
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
@@ -2902,7 +2917,12 @@ pub async fn patch_cr<S: Store>(
         dry_run: false,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    debug_assert_eq!(
+        old["metadata"]["uid"], obj["metadata"]["uid"],
+        "old_object passed to run_validating_webhooks must be the same resource's pre-patch \
+         state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
+    );
+    run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -3048,6 +3068,11 @@ pub async fn patch_cr_namespaced<S: Store>(
         None
     };
 
+    // obj is deserialized directly from the stored bytes above and the patch below mutates
+    // it in place, so this clone is the only pre-patch snapshot available to pass as
+    // old_object to run_validating_webhooks.
+    let old = obj.clone();
+
     match patch_type {
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
@@ -3106,7 +3131,12 @@ pub async fn patch_cr_namespaced<S: Store>(
         dry_run: false,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+    debug_assert_eq!(
+        old["metadata"]["uid"], obj["metadata"]["uid"],
+        "old_object passed to run_validating_webhooks must be the same resource's pre-patch \
+         state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
+    );
+    run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -15723,6 +15753,356 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a CRD that never opted into subresources.scale must not expose a working \
              /scale route"
+        );
+    }
+
+    // -- pre-update old_object threading tests --
+    //
+    // replace_cr, replace_cr_namespaced, patch_cr and patch_cr_namespaced all fetch the
+    // pre-update object from the store but historically dropped it before calling
+    // run_validating_webhooks, always passing None. A VAP/MAP webhook that enforces an
+    // immutability rule (e.g. "spec.destination cannot change after creation") compares
+    // request.oldObject against request.object — with oldObject always null it has nothing
+    // to diff against and silently allows every mutation. These four tests spin up a real
+    // mock webhook HTTP server and assert the captured AdmissionReview actually carries the
+    // pre-update spec as oldObject, for each of the four fixed call sites plus the DELETE
+    // path (which already had a correct, and must-stay-unchanged, old==stored shape).
+
+    /// Start an axum router on a random local TCP port and return its base URL.
+    async fn spawn_capturing_admission_server(
+        captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) -> String {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let router = Router::new().route(
+            "/admit",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured);
+                async move {
+                    *captured.lock().unwrap() = Some(body.clone());
+                    let uid = body["request"]["uid"].as_str().unwrap_or("").to_string();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": uid, "allowed": true }
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock admission server must not fail");
+        });
+        format!("http://{addr}/admit")
+    }
+
+    async fn put_validating_webhook_config(state: &AppState, name: &str, url: &str, op: &str) {
+        use u7s_store::Store;
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": { "name": name },
+            "webhooks": [{
+                "name": format!("{name}.test.example.com"),
+                "clientConfig": { "url": url },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": [op]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                &format!(
+                    "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/{name}"
+                ),
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// replace_cr_namespaced (PUT) must give a VAP/MAP webhook the pre-update spec as
+    /// oldObject, not None — otherwise an immutability rule on e.g. spec.destination can
+    /// never detect that the field actually changed and silently allows the update.
+    #[tokio::test]
+    async fn replace_cr_namespaced_threads_pre_update_spec_as_old_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "replace-old-object-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_admission_server(std::sync::Arc::clone(&captured)).await;
+        put_validating_webhook_config(&state, "replace-old-object-vwc", &url, "UPDATE").await;
+
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "other-ns" } }
+            })
+            .to_string(),
+        );
+        assert!(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((group, version, ns, plural, name)),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "namespaced replace must succeed when the validating webhook allows it"
+        );
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "replace_cr_namespaced must pass the pre-update object as old_object — a null \
+             oldObject means an immutability-enforcing webhook has nothing to compare the \
+             new spec against and silently allows any change"
+        );
+        assert_ne!(
+            review["request"]["oldObject"]["spec"], review["request"]["object"]["spec"],
+            "old_object.spec must reflect the pre-update state, not the just-replaced spec — \
+             otherwise a webhook diffing old vs new spec sees them as identical and can never \
+             detect the change it exists to police"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["spec"]["destination"]["namespace"], "default",
+            "old_object must carry the value that was actually stored before this replace"
+        );
+    }
+
+    /// patch_cr (JSON merge patch) must give a VAP/MAP webhook the pre-patch spec as
+    /// oldObject. patch_cr deserializes the stored object straight into the mutable `obj`
+    /// that the patch then mutates in place, so without a deliberate pre-patch snapshot
+    /// there is nothing left to pass once the patch has applied.
+    #[tokio::test]
+    async fn patch_cr_merge_patch_threads_pre_patch_spec_as_old_object() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "patch-old-object-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_admission_server(std::sync::Arc::clone(&captured)).await;
+        put_validating_webhook_config(&state, "patch-old-object-vwc", &url, "UPDATE").await;
+
+        let patch_body = Bytes::from(serde_json::json!({ "spec": { "color": "red" } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        assert!(
+            patch_cr(
+                State(state.clone()),
+                Path((group, version, plural, name)),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped patch must succeed when the validating webhook allows it"
+        );
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "patch_cr must pass the pre-patch object as old_object, not None"
+        );
+        assert_ne!(
+            review["request"]["oldObject"]["spec"], review["request"]["object"]["spec"],
+            "old_object.spec must be the pre-patch spec — if patch_cr snapshots obj AFTER \
+             the patch mutates it in place, old_object and object become identical and a \
+             webhook can never see what changed"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["spec"]["color"], "blue",
+            "old_object must carry the color the widget was created with, before this patch"
+        );
+    }
+
+    /// patch_cr_namespaced with a strategic-merge-patch body must give a VAP/MAP webhook
+    /// the pre-patch spec as oldObject — same defect as the JSON-merge-patch case above,
+    /// but exercised through the namespaced handler and a different patch content-type to
+    /// cover the fourth (and last) fixed call site.
+    #[tokio::test]
+    async fn patch_cr_namespaced_strategic_merge_patch_threads_pre_patch_spec_as_old_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "patch-old-object-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_admission_server(std::sync::Arc::clone(&captured)).await;
+        put_validating_webhook_config(&state, "patch-ns-old-object-vwc", &url, "UPDATE").await;
+
+        let patch_body = Bytes::from(
+            serde_json::json!({ "spec": { "destination": { "namespace": "prod" } } }).to_string(),
+        );
+        assert!(
+            patch_cr_namespaced(
+                State(state.clone()),
+                Path((group, version, ns, plural, name)),
+                test_user(),
+                strategic_merge_patch_headers(),
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "namespaced strategic-merge patch must succeed when the validating webhook allows it"
+        );
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called on UPDATE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "patch_cr_namespaced must pass the pre-patch object as old_object, not None"
+        );
+        assert_ne!(
+            review["request"]["oldObject"]["spec"], review["request"]["object"]["spec"],
+            "old_object.spec must be the pre-patch spec, not the already-patched spec"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["spec"]["destination"]["namespace"], "default",
+            "old_object must carry the namespace the Application was created with, before \
+             this strategic-merge patch"
+        );
+    }
+
+    /// The DELETE path (delete_cr_namespaced here) already passed the stored object as
+    /// old_object correctly before this fix — old == the stored object, since there is no
+    /// separate "new" on delete. This must stay unchanged: a DELETE-path VAP/MAP webhook
+    /// (e.g. one that blocks deletion of resources with a protection label) depends on
+    /// oldObject being populated exactly like this.
+    #[tokio::test]
+    async fn delete_cr_namespaced_still_passes_stored_object_as_old_object() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "delete-old-object-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let url = spawn_capturing_admission_server(std::sync::Arc::clone(&captured)).await;
+        put_validating_webhook_config(&state, "delete-old-object-vwc", &url, "DELETE").await;
+
+        assert!(
+            delete_cr_namespaced(
+                State(state.clone()),
+                Path((group, version, ns.clone(), plural, name)),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .is_ok(),
+            "delete must succeed when the validating webhook allows it"
+        );
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called on DELETE");
+        assert!(
+            !review["request"]["oldObject"].is_null(),
+            "delete_cr_namespaced must keep passing the stored object as old_object on \
+             DELETE — this bead only changes the UPDATE call sites and must not regress \
+             the DELETE contract"
+        );
+        assert_eq!(
+            review["request"]["oldObject"]["spec"]["destination"]["namespace"], "default",
+            "old_object on DELETE must be the object that was actually stored, not an \
+             empty or unrelated placeholder"
         );
     }
 }
