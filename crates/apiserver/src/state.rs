@@ -1188,7 +1188,7 @@ fn rm_cou(kind: &str, _namespaced: bool) -> ResourceMeta {
     }
 }
 
-fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
+pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     let mut m = HashMap::new();
 
     // core/v1 — cluster-scoped

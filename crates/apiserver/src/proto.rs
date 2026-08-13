@@ -10810,4 +10810,44 @@ mod tests {
              m.insert() call was accidentally deleted"
         );
     }
+
+    /// `state::build_registry()` is production code's real GVK routing table: every kind it
+    /// lists is routed for full CRUD through the generic handlers in `handlers/resource.rs`,
+    /// which call `extract_body` -> `decode_proto_by_kind_and_version` unconditionally. A kind
+    /// present in the registry but missing from `decoders()` does not fail to build, or even
+    /// fail the request outright — it silently falls through to `extract_body`'s raw-bytes
+    /// passthrough, so the gap only surfaces once a real protobuf-encoded client happens to
+    /// write that kind. This walks every registry entry and asserts a decoder exists, so a
+    /// dropped or forgotten `m.insert()` in `decoders()` fails a test instead of shipping.
+    #[test]
+    fn every_registered_resource_has_a_protobuf_decoder() {
+        // `Event` and `HorizontalPodAutoscaler` pick their wire layout from `apiVersion`, not
+        // from `kind` alone (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1),
+        // so `decode_proto_by_kind_and_version` dispatches them explicitly before consulting
+        // `decoders()` — their absence from the map is by design, not a gap.
+        const APIVERSION_DISPATCHED_KINDS: &[&str] = &["Event", "HorizontalPodAutoscaler"];
+        // Upstream sigs.k8s.io/gateway-api ships these as CRDs with no generated protobuf
+        // marshaler at all (CRD-backed resources never support protobuf encoding in real
+        // Kubernetes), so there is no upstream .proto schema to decode against — see the
+        // `decoders()` doc comment for the full reasoning.
+        const KINDS_WITHOUT_UPSTREAM_PROTOBUF_MARSHALER: &[&str] =
+            &["Gateway", "GatewayClass", "HTTPRoute", "ReferenceGrant"];
+
+        for (key, meta) in crate::state::build_registry().iter() {
+            if APIVERSION_DISPATCHED_KINDS.contains(&meta.kind.as_str())
+                || KINDS_WITHOUT_UPSTREAM_PROTOBUF_MARSHALER.contains(&meta.kind.as_str())
+            {
+                continue;
+            }
+            assert!(
+                decoders().contains_key(meta.kind.as_str()),
+                "resource_registry routes {}/{} {} for full CRUD but decoders() has no \
+                 protobuf decoder; a protobuf-encoded write to this kind falls through to \
+                 raw-bytes passthrough instead of decoding",
+                key.group,
+                key.version,
+                meta.kind,
+            );
+        }
+    }
 }
