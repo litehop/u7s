@@ -43,8 +43,13 @@ echo "=== [05] Start u7s-scheduler (on host) ==="
 
 cargo build --release -p u7s-scheduler --manifest-path "$REPO/Cargo.toml" "${TARGET_DIR_ARGS[@]+"${TARGET_DIR_ARGS[@]}"}"
 
-if [ ! -f "$WORKDIR/kubeconfig" ]; then
-  echo "error: kubeconfig not found at $WORKDIR/kubeconfig" >&2
+# scheduler-kubeconfig is u7s-apiserver's dedicated kubeconfig for the scheduler's own
+# x509 identity (CN=system:kube-scheduler) — not the shared admin/system:masters
+# kubeconfig. Named "kubeconfig-scheduler" (suffix, not prefix) so the pkill/pgrep
+# patterns below — and the ones in run-all.sh/reset.sh/sample-run-metrics.sh matching
+# the literal substring "${WORKDIR}/kubeconfig" — still match this process's argv.
+if [ ! -f "$WORKDIR/kubeconfig-scheduler" ]; then
+  echo "error: kubeconfig not found at $WORKDIR/kubeconfig-scheduler" >&2
   echo "Start u7s-apiserver first: scripts/u7s-start.sh" >&2
   exit 1
 fi
@@ -60,7 +65,7 @@ fi
 
 echo "Starting u7s-scheduler (logs: $LOG) ..."
 nohup "$BINARY" \
-  --kubeconfig "$WORKDIR/kubeconfig" \
+  --kubeconfig "$WORKDIR/kubeconfig-scheduler" \
   > "$LOG" 2>&1 &
 SCHEDULER_PID=$!
 disown "$SCHEDULER_PID"
