@@ -183,10 +183,10 @@ const INLINE_EMBEDS: &[(&str, &str)] = &[
 /// anything that is merely *not yet implemented* belongs in `KNOWN_GAPS` instead so the two stay
 /// distinguishable in review.
 ///
-/// All four ObjectMeta entries are dropped by every one of the twelve `gen_object_meta_to_json`
-/// copies. That is safe only because something downstream compensates, and the compensating
-/// control is named per entry — an entry whose control is removed becomes a bug, so the note is
-/// the thing to check, not the omission itself.
+/// All four ObjectMeta entries are dropped by the single shared `gen_object_meta_to_json`, which
+/// every adapter delegates to rather than reimplementing. That is safe only because something
+/// downstream compensates, and the compensating control is named per entry — an entry whose
+/// control is removed becomes a bug, so the note is the thing to check, not the omission itself.
 const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
     (
         ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
