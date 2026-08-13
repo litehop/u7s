@@ -4591,4 +4591,249 @@ mod tests {
              revisions the busy shard's ring has already discarded"
         );
     }
+
+    // --- Ring shard lifecycle: create-on-first-watch, idle-GC after RING_SHARD_IDLE_GRACE ---
+    //
+    // mayor-v2218: a shard now exists only because a watch is or recently was open on its
+    // resource type, not because something was written to it (see push_event_locked's and
+    // SqliteStore::watch's doc comments). The five tests below guard each half of that
+    // lifecycle plus the two races the design has to survive.
+
+    /// A watch opened against a resource type with zero prior writes must create that type's
+    /// shard immediately, not leave it absent until some future write.
+    ///
+    /// Why it matters: if watch-open stopped creating a shard, this watch would have no ring to
+    /// reconnect into — a client that briefly disconnects (a pod restart, a network blip) would
+    /// get no replay at all instead of the RING_SHARD_IDLE_GRACE window this whole lifecycle
+    /// exists to provide, silently degrading every reconnect into a full relist.
+    #[tokio::test]
+    async fn watch_open_creates_shard_when_no_writes_yet() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/widgets/";
+
+        assert!(
+            !store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "test setup: no shard should exist before anything has watched or written this type"
+        );
+
+        let _stream = store.watch(prefix, 0).await.expect("watch must succeed");
+
+        assert!(
+            store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "watching a resource type with zero prior writes must create its shard immediately \
+             — otherwise this watch has no ring to fall back on if it has to reconnect a moment \
+             later"
+        );
+    }
+
+    /// A write to a resource type nobody is watching must NOT create a shard — but must still
+    /// be fully durable via sqlite.
+    ///
+    /// Why it matters: this is the entire memory-frugality point of the redesign (mayor-v2218's
+    /// SIGNAL) — every ephemeral CRD type ever written otherwise ratchets the shard count up for
+    /// the rest of the process's life, even though nothing is or will be watching most of them.
+    /// If a write started creating shards again, that regression would be invisible from a
+    /// client's point of view (reads still work) and would only show up as unbounded memory
+    /// growth over a long-running process's lifetime.
+    #[tokio::test]
+    async fn write_without_watch_does_not_create_shard() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/widgets/default/widget-a";
+        let val = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Widget","metadata":{"name":"widget-a","namespace":"default"}}"#,
+        );
+
+        let written_rv = store.put(key, val, None).await.expect("put must succeed");
+
+        assert!(
+            store.shards.read().expect("shards poisoned").is_empty(),
+            "a write to a resource type with no open watch must not create a shard — doing so \
+             would silently reintroduce the unbounded, monotonically-growing shard count this \
+             whole lifecycle change exists to fix"
+        );
+
+        let fetched = store
+            .get(key)
+            .await
+            .expect("get must not error")
+            .expect("object must still be readable via sqlite even with no shard");
+        assert_eq!(
+            fetched.revision, written_rv,
+            "sqlite remains the source of truth regardless of ring/shard state — the revision \
+             put() returned must be exactly what a subsequent get() reads back"
+        );
+
+        let listed = store
+            .list("/registry/core/widgets/", ListOptions::default())
+            .await
+            .expect("list must not error");
+        assert_eq!(
+            listed.items.len(),
+            1,
+            "list must still see the written object via sqlite even though no shard exists to \
+             fan out a live event for it"
+        );
+    }
+
+    /// A shard with zero attached watchers must survive until RING_SHARD_IDLE_GRACE elapses,
+    /// then be torn down.
+    ///
+    /// Why it matters: tearing a shard down immediately on disconnect would defeat the whole
+    /// point of the grace period — a client that reconnects a moment later (the common case;
+    /// real client-go reconnects usually inside 5s) would find no ring to replay from and be
+    /// forced into a full relist on every transient disconnect. Not tearing it down at all would
+    /// silently reintroduce the unbounded shard growth this lifecycle exists to fix.
+    #[tokio::test]
+    async fn watch_disconnect_gc_after_grace_period() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/widgets/";
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        drop(stream);
+
+        assert!(
+            store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "the shard must survive immediately after disconnect — the grace period exists \
+             precisely so a reconnect a moment later still has a ring to replay from"
+        );
+
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE * 3).await;
+
+        assert!(
+            !store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "a shard with zero watchers for longer than RING_SHARD_IDLE_GRACE must be torn down \
+             — otherwise every resource type anything ever watched, even once and briefly, keeps \
+             its shard for the rest of the process's life, which is the exact unbounded-growth \
+             failure mode this lifecycle change exists to fix"
+        );
+    }
+
+    /// A watch that reconnects to the same prefix DURING the grace window must cancel the
+    /// pending teardown — the shard must still exist after the original grace deadline passes.
+    ///
+    /// Why it matters: this is the mechanism that makes the grace period actually useful rather
+    /// than just a fixed delay before eviction happens anyway. Without this re-check, a client
+    /// that reconnects at, say, 90s into a 120s grace window would still lose its ring at the
+    /// 120s mark even though it is actively watching again — turning every reconnect race into a
+    /// coin flip between "ring survives" and "ring evicted out from under an active watcher."
+    #[tokio::test]
+    async fn watch_reconnect_during_grace_window_cancels_gc() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/widgets/";
+
+        let first = store.watch(prefix, 0).await.expect("watch must succeed");
+        drop(first);
+
+        // Reconnect well within the grace window.
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE / 4).await;
+        let second = store
+            .watch(prefix, 0)
+            .await
+            .expect("reconnect during grace window must succeed");
+
+        // Wait past the FIRST watch's own grace deadline (measured from its own disconnect).
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE).await;
+
+        assert!(
+            store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "a watch that reconnected during the grace window must have cancelled the pending \
+             teardown — losing the shard here means idle-GC evicted it while a client was \
+             actively watching it again, not merely 'nobody watched for a while'"
+        );
+
+        drop(second);
+    }
+
+    /// A shard idle-GC teardown racing against a concurrent write to the same prefix must never
+    /// panic and must never lose the write — sqlite persistence, not ring survival, is the
+    /// correctness bar.
+    ///
+    /// Why it matters: this is the write-vs-teardown race mayor-v2218's correctness analysis
+    /// depends on being safe — teardown removes a shard under `shards`' write lock, while a
+    /// concurrent write reads `shards` to find shards to fan out to. If those two operations
+    /// were not mutually exclusive (e.g. a write read a shard reference, teardown dropped the
+    /// last OTHER reference concurrently, and the write then touched freed memory), this would
+    /// be a use-after-free; if the locking were merely sloppy rather than unsound, it could still
+    /// silently drop the shard's own copy of an event without falling back to sqlite. Hammering
+    /// real concurrent writes against repeated real teardown calls on the same shard is what
+    /// would expose either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn race_write_vs_teardown_does_not_lose_broadcast() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let prefix = "/registry/core/racers/";
+
+        // Create the shard the way a real watch would; kept open for the whole test so the
+        // stream itself never becomes a confounding variable in this race.
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        const N: usize = 200;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let writer_store = Arc::clone(&store);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = tokio::spawn(async move {
+            writer_barrier.wait().await;
+            for i in 0..N {
+                let key = format!("{prefix}racer-{i}");
+                let val = Bytes::from(format!(
+                    r#"{{"apiVersion":"v1","kind":"Racer","metadata":{{"name":"racer-{i}"}}}}"#
+                ));
+                writer_store
+                    .put(&key, val, None)
+                    .await
+                    .expect("put must succeed even if its own shard is concurrently torn down");
+            }
+        });
+
+        let teardown_shards = Arc::clone(&store.shards);
+        let teardown_barrier = Arc::clone(&barrier);
+        let teardown = tokio::spawn(async move {
+            teardown_barrier.wait().await;
+            // Simulates idle-GC's teardown firing repeatedly mid-write-burst. Unconditional (the
+            // shard's watcher count is irrelevant here) — this test exercises the write path's
+            // locking under concurrent removal, which is exactly what tear_down_shard performs
+            // for real idle-GC too, just without the surrounding idle re-check.
+            for _ in 0..N {
+                tear_down_shard(&teardown_shards, prefix);
+            }
+        });
+
+        writer.await.expect("writer task must not panic");
+        teardown.await.expect("teardown task must not panic");
+
+        // Sqlite, not the ring, is the source of truth: every write must be durably persisted
+        // regardless of whether its own shard survived the race against teardown.
+        let listed = store
+            .list(prefix, ListOptions::default())
+            .await
+            .expect("list must not error");
+        assert_eq!(
+            listed.items.len(),
+            N,
+            "every one of {N} concurrent writes must be durably persisted via sqlite even under \
+             a shard being repeatedly torn down mid-burst — losing one here means the write path \
+             lost data instead of merely losing ring/replay history"
+        );
+    }
 }
