@@ -162,6 +162,32 @@ pub static DELETION_LOG_LEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+/// Total watch ring shards torn down by idle-GC after `RING_SHARD_IDLE_GRACE` — the direct
+/// measure of the eviction pressure this lifecycle (create-on-first-watch, reclaim once every
+/// watcher disconnects) actually produces. A near-zero rate on a long-running process with many
+/// short-lived watches would say the grace period is too generous for the memory it is meant to
+/// bound; a high rate paired with watch-reconnect complaints would say it is too short.
+///
+/// Labeled by `prefix_bucket`, not the shard's raw key — a shard's own key is already
+/// resource-type-scoped (never per-object), but bucketing keeps this consistent with its
+/// siblings (`u7s_watch_lag_recovery_duration_seconds`, `u7s_watch_replay_depth`) on one
+/// dashboard without minting a namespace-scoped shard's full key as its own series.
+pub static WATCH_RING_SHARD_EVICTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "u7s_watch_ring_shard_evictions_total",
+            "Total number of watch ring shards torn down after their idle grace period, by \
+             coarse prefix bucket.",
+        ),
+        &["prefix_bucket"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(counter.clone()))
+        .expect("u7s_watch_ring_shard_evictions_total is registered exactly once per process");
+    counter
+});
+
 /// 5us..82ms exponential (factor 2, 15 buckets). Brackets the measured O(ring) scan-cost range
 /// (10.9us at 1k ring occupancy to 670.8us at 100k occupancy, per a throwaway microbenchmark)
 /// with headroom on both ends for lock-contention cases worse than an isolated benchmark.

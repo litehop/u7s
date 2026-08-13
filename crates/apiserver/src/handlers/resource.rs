@@ -11641,16 +11641,20 @@ mod tests {
     /// Symptom: after patching a ConfigMap to remove a key, the kubelet's projected volume
     /// syncer did not update the mounted file.  The root cause hypothesis was that PATCH
     /// mutations do not emit a MODIFIED watch event.  This test verifies the full chain:
-    /// create → ADDED event in ring buffer, merge-patch removing a key → MODIFIED event
-    /// in ring buffer, subscribe from rv=0 → both events replayed, MODIFIED has key absent.
+    /// subscribe from rv=0, create → live ADDED event, merge-patch removing a key → live
+    /// MODIFIED event with the key absent.
     ///
     /// If do_patch ever stops calling store.put() (which broadcasts the InternalEvent),
     /// or if store.put() stops emitting the Modified WatchEvent, this test will fail —
     /// no MODIFIED event will appear in the stream.
     ///
-    /// Test structure: events are pre-seeded into the ring buffer BEFORE opening the watch
-    /// so replay is synchronous. timeout_seconds=1 closes the stream after 1s, allowing
-    /// to_bytes to return with the collected data.
+    /// Test structure: the watch is opened FIRST (mirroring the kubelet's real projected-volume
+    /// syncer, which is a long-lived watch already open before any given patch happens), then
+    /// the create and patch land as live events on that already-open stream. A shard now exists
+    /// only once something watches its resource type (see `push_event_locked`'s doc), so unlike
+    /// before this test can no longer rely on the ring replaying pre-watch writes — it must
+    /// observe them live. timeout_seconds=1 closes the stream after 1s, allowing to_bytes to
+    /// return with the collected data.
     #[tokio::test]
     async fn configmap_patch_emits_modified_watch_event_with_deleted_key_absent() {
         use axum::body::to_bytes;
@@ -11659,72 +11663,7 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-
-        // Build a temporary state just for create+patch; consumed before watch.
-        {
-            let tmp_state = crate::state::AppState::new(
-                Arc::clone(&store),
-                None,
-                None,
-                std::collections::HashMap::new(),
-                "https://localhost:6443".into(),
-            );
-
-            // 1. Create a ConfigMap with two data keys.
-            let cm = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": { "name": "app-config", "namespace": "default" },
-                "data": {
-                    "key-to-keep": "value-a",
-                    "key-to-delete": "value-b"
-                }
-            });
-            create_namespaced_resource(
-                axum::extract::State(tmp_state.clone()),
-                axum::extract::Path((
-                    "".to_string(),
-                    "v1".to_string(),
-                    "default".to_string(),
-                    "configmaps".to_string(),
-                )),
-                axum::extract::Query(CreateQuery::default()),
-                test_user(),
-                json_headers(),
-                bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("ConfigMap create must succeed"));
-
-            // 2. Patch the ConfigMap: set key-to-delete to null (JSON merge-patch removes it).
-            let patch = serde_json::json!({"data": {"key-to-delete": null}});
-            let mut mp_headers = axum::http::HeaderMap::new();
-            mp_headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/merge-patch+json"),
-            );
-            let _ = patch_namespaced_resource(
-                axum::extract::State(tmp_state),
-                axum::extract::Path((
-                    "".to_string(),
-                    "v1".to_string(),
-                    "default".to_string(),
-                    "configmaps".to_string(),
-                    "app-config".to_string(),
-                )),
-                axum::extract::Query(PatchQuery::default()),
-                test_user(),
-                mp_headers,
-                bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("ConfigMap merge-patch must succeed"))
-            .into_response();
-            // tmp_state is dropped here; the store Arc count goes back down to 1 (only `store`).
-        }
-
-        // 3. Build watch state from the store Arc.
-        let watch_state = crate::state::AppState::new(
+        let state = crate::state::AppState::new(
             store,
             None,
             None,
@@ -11732,13 +11671,14 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // 4. Subscribe a WATCH from rv=0 so the ring buffer replays ADDED and MODIFIED.
+        // 1. Subscribe a WATCH from rv=0 BEFORE any write, so the create and patch below are
+        //    observed live.
         //    timeout_seconds=1 closes the stream after 1s so to_bytes can return with data.
         //    (Previously this relied on watch_state being the only store Arc so the broadcast
         //    channel would close when watch_generic dropped it — that shortcut was fixed by
         //    the store-keepalive fix which keeps the store alive for the stream.)
         let resp = super::watch_generic(
-            watch_state,
+            state.clone(),
             super::WatchConfig {
                 prefix: "/registry/configmaps/default/".into(),
                 api_version: "v1".into(),
@@ -11752,13 +11692,64 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "configmaps".into(),
-                timeout_seconds: Some(1), // stream closes after 1s; ring buffer events arrive before that
+                timeout_seconds: Some(1), // stream closes after 1s; live events arrive before that
             },
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
 
-        // 5. Collect the body (terminates when timeout_seconds=1 fires, or 3s guard).
+        // 2. Create a ConfigMap with two data keys — observed live by the watch above.
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "app-config", "namespace": "default" },
+            "data": {
+                "key-to-keep": "value-a",
+                "key-to-delete": "value-b"
+            }
+        });
+        create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("ConfigMap create must succeed"));
+
+        // 3. Patch the ConfigMap: set key-to-delete to null (JSON merge-patch removes it).
+        let patch = serde_json::json!({"data": {"key-to-delete": null}});
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let _ = patch_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+                "app-config".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("ConfigMap merge-patch must succeed"))
+        .into_response();
+
+        // 4. Collect the body (terminates when timeout_seconds=1 fires, or 3s guard).
         let body_bytes = tokio::time::timeout(
             tokio::time::Duration::from_secs(3),
             to_bytes(resp.into_body(), usize::MAX),
@@ -11772,7 +11763,7 @@ mod tests {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
 
-        // 6. There must be exactly one MODIFIED event in the stream.
+        // 5. There must be exactly one MODIFIED event in the stream.
         let modified_events: Vec<&serde_json::Value> =
             lines.iter().filter(|v| v["type"] == "MODIFIED").collect();
         assert_eq!(
@@ -11785,7 +11776,7 @@ mod tests {
 
         let modified_obj = &modified_events[0]["object"];
 
-        // 7. The MODIFIED event must not contain key-to-delete (it was removed by the patch).
+        // 6. The MODIFIED event must not contain key-to-delete (it was removed by the patch).
         assert!(
             modified_obj["data"].get("key-to-delete").is_none()
                 || modified_obj["data"]["key-to-delete"].is_null(),
@@ -11795,7 +11786,7 @@ mod tests {
             modified_obj["data"]
         );
 
-        // 8. The MODIFIED event must still carry key-to-keep.
+        // 7. The MODIFIED event must still carry key-to-keep.
         assert_eq!(
             modified_obj["data"]["key-to-keep"].as_str().unwrap_or(""),
             "value-a",
