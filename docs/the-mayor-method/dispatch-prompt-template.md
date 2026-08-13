@@ -312,6 +312,40 @@ this repo. When you need it:
 - Never reference callers or "used by X" — that information belongs in git history.
 - Test WHY, not WHAT. Test names and assertion messages must state why the behaviour
   matters (what breaks for a user if it regresses), not just describe what the code does.
+
+## Final step — reap your host processes (mandatory if you were assigned a VM/port)
+
+If this dispatch assigned you a VM, port, and kubelet port (Lima VM protocol
+block), your LAST action before ending the session — after quality gates pass
+and your PR is open — must be:
+
+```bash
+scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <YOUR_ASSIGNED_PORT>
+```
+
+Always pass YOUR OWN assigned `--port` — never omit it and never let it
+default to `6443`, which is the mayor's own live stack; an unscoped `--port`
+can kill IT, not just yours. If your bead used a non-standard konnectivity
+port slot (rare — standard slots auto-derive it from `--port`: 6443→8135,
+6444→8235, 6445→8335, …), also pass
+`--konnectivity-server-port <YOUR_DERIVED_KONNECTIVITY_PORT>`.
+
+Why this matters: `git worktree remove` does NOT kill the host-side
+`u7s-apiserver`, `u7s-scheduler`, or `konnectivity-server` processes your
+`run-all.sh` call started — they are plain backgrounded (or, for
+konnectivity-server, `disown`ed) processes that outlive their worktree, keep
+squatting on this VM slot's ports, and keep serving a now-stale CA-signed
+cert that breaks the NEXT dispatch to this same slot. See bd memory
+`worktree-remove-does-not-kill-host-processes` and `mayor-yfvxn` for the
+observed-orphan history this closes. `--host-only` kills exactly those three
+process kinds, scoped to your own `--workdir`/`--port`, and exits before
+touching `$WORKDIR` or the VM — safe to run even if your bead never brought
+up a live stack.
+
+If this bead had NO VM/port assignment (pure code/doc bead — you never ran
+`run-all.sh`), skip this step entirely: there is nothing of yours to reap,
+and running it with a default/omitted `--port` risks matching the mayor's
+own live stack on `6443` instead of safely doing nothing.
 ```
 
 ## Worktree path convention

@@ -97,7 +97,7 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 
 **Set up loops.** If they don't exist already, create:
 - 60m — reread this file + siblings; reassert posture to operator
-- 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs)
+- 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs, orphaned host processes — body below)
 - 30m — cluster review (3+ same-surface beads → one PR; 8–12 sweet spot)
 - 30m — merge PRs (green only; no --admin)
 - 15m — bead dispatch pass (filter out decisions/EPICs/release-coupled/v1.x/hot-zone)
@@ -107,6 +107,47 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 
 The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
+
+**Worktree hygiene loop body — orphaned host processes (mayor-yfvxn).**
+`git worktree remove` does not kill the host-side processes a worker's
+conformance run started: `u7s-apiserver` and `u7s-scheduler` are plain
+backgrounded processes, and `konnectivity-server` is started via `disown`
+(`scripts/u7s-start.sh`) — all three survive their worktree's removal, keep
+squatting on that VM slot's ports, and serve a now-stale CA-signed cert that
+makes the next dispatch to that slot fail with a cert-verification error
+instead of a clean port-bind error. `kubelet` and `kube-controller-manager`
+need NO host-side handling — they run guest-side inside the Lima VM and die
+with the VM, not on the host. Binary-path matching (`ps aux | grep
+<path-to-binary>`) does not work here: every worker's binary is built into
+the same shared `target/` path, so a binary-path grep can't tell one
+worker's process from another's — match on the worktree-specific argument
+instead (the `.../temp/u7s/kubeconfig` path for apiserver/scheduler, the
+`.../temp/u7s` workdir path for konnectivity-server).
+
+1. List live worktrees: `git worktree list --porcelain | grep ^worktree | cut -d' ' -f2-`.
+2. List candidate host processes:
+   `ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server' | grep -v grep`.
+3. For each candidate, extract the worktree path embedded in its command
+   line and cross-reference it against the live-worktree list from step 1.
+   Any process whose path is NOT in that list is an orphan — its worktree
+   is gone but the process outlived it.
+4. Auto-kill orphans (operator decision, mayor-yfvxn: auto-run, no approval
+   gate — log loudly instead). For each orphan, log one line, THEN kill it:
+   ```bash
+   # log format: [hygiene] orphan-kill: <proc_type> pid=<PID> workdir=<dead-worktree-path>
+   pkill -f "u7s-apiserver.*<dead-worktree-path>/temp/u7s/kubeconfig"
+   pkill -f "u7s-scheduler.*<dead-worktree-path>/temp/u7s/kubeconfig"
+   pkill -f "konnectivity-server.*<dead-worktree-path>/temp/u7s"
+   ```
+5. Verify: re-run step 2's `ps` grep. Any PID matching a dead-worktree path
+   that still appears is a kill failure — surface it to the operator instead
+   of silently retrying (a process that survives one kill may be zombied or
+   reparented and need manual investigation).
+
+This loop is the drift backstop, not the primary defense: workers are
+required to run `scripts/conformance/reset.sh --host-only` as their own
+final step before ending a session (see `dispatch-prompt-template.md`'s
+Common preamble), so in the normal case this loop finds nothing to kill.
 
 **Establish the stance (first session only).** Every project has a stance
 (pre-alpha, production-stable, refactor-only, greenfield, perf-critical,
