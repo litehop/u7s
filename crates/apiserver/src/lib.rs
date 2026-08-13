@@ -268,6 +268,20 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         &tls_material.scheduler_key_pem,
         "system:kube-scheduler",
     )?;
+    // No consumer yet: the in-process YAML applier that will use this identity to install
+    // bootstrap manifest bundles (e.g. CoreDNS) against this apiserver is a later bead.
+    // Written eagerly here (like kcm/scheduler above) so seed_rbac()'s ClusterRoleBinding
+    // for this identity has a matching credential once the applier lands.
+    let bootstrap_installer_kubeconfig_path =
+        std::path::Path::new(&args.kubeconfig).with_file_name("bootstrap-installer-kubeconfig");
+    write_component_kubeconfig(
+        &bootstrap_installer_kubeconfig_path.to_string_lossy(),
+        &tls_material,
+        &args,
+        &tls_material.bootstrap_installer_cert_der,
+        &tls_material.bootstrap_installer_key_pem,
+        "system:bootstrap-installer",
+    )?;
 
     // 6. Load optional static token map.
     let mut token_map = match &args.token_auth_file {
@@ -1295,6 +1309,48 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:kube-scheduler" }
     });
     put!(key, body, "system:kube-scheduler", "ClusterRoleBinding");
+
+    // -----------------------------------------------------------------------
+    // ClusterRole: system:bootstrap-installer — minimal-scope identity for the
+    // in-process YAML applier (a later bead) that server-side-applies bootstrap
+    // manifest bundles (e.g. CoreDNS's ClusterRole/ClusterRoleBinding/ServiceAccount/
+    // ConfigMap/Deployment/Service) against the just-bound apiserver. Deliberately
+    // upsert-only: no delete/deletecollection verbs anywhere in this role, since the
+    // applier never removes objects — broadening this is a separate, later change.
+    // -----------------------------------------------------------------------
+    let key = keys::group_object_key(GROUP, "clusterroles", None, "system:bootstrap-installer");
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:bootstrap-installer", "uid": "00000000-0000-0000-0000-000000000079", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["create","patch","update"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services"], "verbs": ["create","patch","update"] },
+            { "apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["create","patch","update"] }
+        ]
+    });
+    put!(key, body, "system:bootstrap-installer", "ClusterRole");
+
+    // ClusterRoleBinding: system:bootstrap-installer → user system:bootstrap-installer.
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:bootstrap-installer",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:bootstrap-installer", "uid": "00000000-0000-0000-0000-00000000007a", "creationTimestamp": TS },
+        "subjects": [{ "kind": "User", "apiGroup": "rbac.authorization.k8s.io", "name": "system:bootstrap-installer" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:bootstrap-installer" }
+    });
+    put!(
+        key,
+        body,
+        "system:bootstrap-installer",
+        "ClusterRoleBinding"
+    );
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:node-proxier — kube-proxy needs watch on services/endpoints.
@@ -5350,6 +5406,161 @@ mod tests {
              identity were granted cluster-admin-equivalent access, the dedicated x509 \
              identity would give no least-privilege benefit over the shared admin kubeconfig \
              it replaces"
+        );
+    }
+
+    /// Regression test: the bootstrap-installer identity must be able to CREATE a ConfigMap
+    /// in an arbitrary namespace — without this rule, the bootstrap-installer applier (a
+    /// later bead) cannot install CoreDNS's ConfigMap and the whole bootstrap YAML apply
+    /// fails before the cluster ever gets DNS.
+    #[tokio::test]
+    async fn bootstrap_installer_identity_can_create_configmap() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let create_configmap = rbac::AuthzRequest {
+            username: "system:bootstrap-installer",
+            groups: &groups,
+            verb: "create",
+            api_group: "",
+            resource: "configmaps",
+            subresource: "",
+            namespace: Some("kube-system"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&create_configmap),
+            "system:bootstrap-installer must be allowed to CREATE configmaps — without this \
+             rule the bootstrap-installer applier cannot install CoreDNS's ConfigMap and the \
+             bootstrap YAML apply fails before the cluster ever gets DNS"
+        );
+    }
+
+    /// Regression test: the bootstrap-installer identity must be able to PATCH an apps/v1
+    /// Deployment — server-side-apply re-runs of the applier (idempotent re-application of
+    /// the same manifest bundle) issue PATCH, not just CREATE, so without this verb every
+    /// re-apply after the first would 403 and CoreDNS could never be upgraded in place.
+    #[tokio::test]
+    async fn bootstrap_installer_identity_can_patch_deployment() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let patch_deployment = rbac::AuthzRequest {
+            username: "system:bootstrap-installer",
+            groups: &groups,
+            verb: "patch",
+            api_group: "apps",
+            resource: "deployments",
+            subresource: "",
+            namespace: Some("kube-system"),
+            name: Some("coredns"),
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&patch_deployment),
+            "system:bootstrap-installer must be allowed to PATCH apps/v1 deployments — \
+             without this, re-applying the bootstrap manifest bundle (e.g. after a version \
+             bump) 403s instead of upserting CoreDNS's Deployment"
+        );
+    }
+
+    /// Regression test: the bootstrap-installer identity must be able to CREATE a
+    /// ClusterRoleBinding — CoreDNS's manifest bundle ships its own ClusterRole and
+    /// ClusterRoleBinding for the coredns ServiceAccount, and without this rule the
+    /// applier can never grant CoreDNS the RBAC it needs to watch Services/Endpoints.
+    #[tokio::test]
+    async fn bootstrap_installer_identity_can_create_clusterrolebinding() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let create_crb = rbac::AuthzRequest {
+            username: "system:bootstrap-installer",
+            groups: &groups,
+            verb: "create",
+            api_group: "rbac.authorization.k8s.io",
+            resource: "clusterrolebindings",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&create_crb),
+            "system:bootstrap-installer must be allowed to CREATE clusterrolebindings — \
+             CoreDNS's manifest bundle ships its own ClusterRoleBinding for the coredns \
+             ServiceAccount, and without this rule the applier can never grant CoreDNS the \
+             RBAC it needs to watch Services/Endpoints"
+        );
+    }
+
+    /// Regression test / sanity check: the bootstrap-installer identity must NOT be allowed
+    /// to DELETE a Namespace. The applier is deliberately upsert-only (create/patch/update
+    /// on a fixed set of Kinds) — if a scoping mistake ever granted delete verbs, this
+    /// identity would go from "installs a manifest bundle" to "can tear down a whole
+    /// namespace", a much larger blast radius than the applier is meant to have.
+    #[tokio::test]
+    async fn bootstrap_installer_identity_cannot_delete_namespace() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let delete_namespace = rbac::AuthzRequest {
+            username: "system:bootstrap-installer",
+            groups: &groups,
+            verb: "delete",
+            api_group: "",
+            resource: "namespaces",
+            subresource: "",
+            namespace: None,
+            name: Some("kube-system"),
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&delete_namespace),
+            "system:bootstrap-installer must NOT be allowed to DELETE a Namespace — the \
+             applier is deliberately upsert-only, and a regression here would silently \
+             widen its blast radius from 'installs a manifest bundle' to 'can tear down a \
+             whole namespace'"
         );
     }
 
