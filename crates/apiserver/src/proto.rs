@@ -547,6 +547,18 @@ type DecoderFn = fn(&[u8]) -> Option<serde_json::Value>;
 /// `Event` and `HorizontalPodAutoscaler` are the only kinds whose proto layout depends on
 /// `apiVersion` (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1) — they are
 /// dispatched explicitly before falling back to this map instead of being modeled as lookup keys.
+///
+/// `GatewayClass`, `Gateway`, `HTTPRoute` (gateway.networking.k8s.io/v1), and `ReferenceGrant`
+/// (gateway.networking.k8s.io/v1beta1) are routed for full CRUD by `state::build_registry()` but
+/// have no entry here, and cannot: upstream sigs.k8s.io/gateway-api ships these types as CRDs
+/// with no generated protobuf marshaler (real Kubernetes never supports protobuf encoding for
+/// CRD-backed resources), so there is no upstream `.proto` schema to vendor via `build.rs` and
+/// nothing for a decoder to decode. Hand-authoring a schema for them ourselves would reintroduce
+/// the tag-collision/incompleteness bugs the prost-build migration eliminated. A protobuf-encoded
+/// write to one of these four kinds falls through to `extract_body`'s raw-bytes passthrough and
+/// surfaces to the caller as a decode error, matching upstream's behavior of rejecting protobuf
+/// for CRDs. `every_registered_resource_has_a_protobuf_decoder` (below) enumerates exactly these
+/// four kinds so any *other*, undocumented registry/decoder gap still fails the build.
 fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
     static DECODERS: std::sync::OnceLock<std::collections::HashMap<&'static str, DecoderFn>> =
         std::sync::OnceLock::new();
