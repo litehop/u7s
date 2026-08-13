@@ -268,6 +268,13 @@ pub struct TlsMaterial {
     pub scheduler_cert_der: Vec<u8>,
     /// PEM-encoded scheduler client private key.
     pub scheduler_key_pem: Vec<u8>,
+    /// DER-encoded bootstrap-installer client certificate (CN=system:bootstrap-installer,
+    /// no O=). Written into a dedicated kubeconfig so the in-process YAML applier that
+    /// installs bootstrap manifest bundles (e.g. CoreDNS) against the just-bound apiserver
+    /// authenticates as its own least-privilege identity, same rationale as `kcm_cert_der`.
+    pub bootstrap_installer_cert_der: Vec<u8>,
+    /// PEM-encoded bootstrap-installer client private key.
+    pub bootstrap_installer_key_pem: Vec<u8>,
     /// Bearer token embedded in the admin kubeconfig alongside the client cert.
     ///
     /// kubectl/KCM authenticate to us via the admin cert (mTLS) only, so the HTTP request
@@ -413,6 +420,19 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .push(rcgen::DnType::CommonName, "system:kube-scheduler");
     let scheduler_cert = scheduler_params.signed_by(&scheduler_key, &ca_issuer)?;
 
+    // --- Bootstrap-installer client cert ---
+    // Identity for the in-process YAML applier (a later bead) that server-side-applies
+    // bootstrap manifest bundles (e.g. CoreDNS) against the just-bound apiserver. No O= —
+    // the seeded ClusterRoleBinding system:bootstrap-installer (see seed_rbac()) binds by
+    // username, same as KCM/scheduler above.
+    let bootstrap_installer_key = KeyPair::generate()?;
+    let mut bootstrap_installer_params = CertificateParams::default();
+    bootstrap_installer_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "system:bootstrap-installer");
+    let bootstrap_installer_cert =
+        bootstrap_installer_params.signed_by(&bootstrap_installer_key, &ca_issuer)?;
+
     // --- Build rustls ServerConfig ---
     // Present only the leaf cert in the chain. The CA cert is already in the
     // kubelet's trust store (via kubeconfig certificate-authority-data). Including
@@ -457,6 +477,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let kubelet_client_cert_pem = pem_encode("CERTIFICATE", &kubelet_client_cert_der);
     let kcm_cert_der = kcm_cert.der().to_vec();
     let scheduler_cert_der = scheduler_cert.der().to_vec();
+    let bootstrap_installer_cert_der = bootstrap_installer_cert.der().to_vec();
     Ok(TlsMaterial {
         ca_cert_der,
         server_cert_der,
@@ -469,6 +490,8 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         kcm_key_pem: kcm_key.serialize_pem().into_bytes(),
         scheduler_cert_der,
         scheduler_key_pem: scheduler_key.serialize_pem().into_bytes(),
+        bootstrap_installer_cert_der,
+        bootstrap_installer_key_pem: bootstrap_installer_key.serialize_pem().into_bytes(),
         admin_bearer_token: uuid::Uuid::new_v4().to_string(),
         server_config: Arc::new(server_config),
     })
