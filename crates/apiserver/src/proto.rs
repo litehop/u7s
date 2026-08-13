@@ -547,6 +547,18 @@ type DecoderFn = fn(&[u8]) -> Option<serde_json::Value>;
 /// `Event` and `HorizontalPodAutoscaler` are the only kinds whose proto layout depends on
 /// `apiVersion` (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1) — they are
 /// dispatched explicitly before falling back to this map instead of being modeled as lookup keys.
+///
+/// `GatewayClass`, `Gateway`, `HTTPRoute` (gateway.networking.k8s.io/v1), and `ReferenceGrant`
+/// (gateway.networking.k8s.io/v1beta1) are routed for full CRUD by `state::build_registry()` but
+/// have no entry here, and cannot: upstream sigs.k8s.io/gateway-api ships these types as CRDs
+/// with no generated protobuf marshaler (real Kubernetes never supports protobuf encoding for
+/// CRD-backed resources), so there is no upstream `.proto` schema to vendor via `build.rs` and
+/// nothing for a decoder to decode. Hand-authoring a schema for them ourselves would reintroduce
+/// the tag-collision/incompleteness bugs the prost-build migration eliminated. A protobuf-encoded
+/// write to one of these four kinds falls through to `extract_body`'s raw-bytes passthrough and
+/// surfaces to the caller as a decode error, matching upstream's behavior of rejecting protobuf
+/// for CRDs. `every_registered_resource_has_a_protobuf_decoder` (below) enumerates exactly these
+/// four kinds so any *other*, undocumented registry/decoder gap still fails the build.
 fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
     static DECODERS: std::sync::OnceLock<std::collections::HashMap<&'static str, DecoderFn>> =
         std::sync::OnceLock::new();
@@ -10797,5 +10809,45 @@ mod tests {
              duplicate m.insert() call silently overwrote another kind's decoder, or an \
              m.insert() call was accidentally deleted"
         );
+    }
+
+    /// `state::build_registry()` is production code's real GVK routing table: every kind it
+    /// lists is routed for full CRUD through the generic handlers in `handlers/resource.rs`,
+    /// which call `extract_body` -> `decode_proto_by_kind_and_version` unconditionally. A kind
+    /// present in the registry but missing from `decoders()` does not fail to build, or even
+    /// fail the request outright — it silently falls through to `extract_body`'s raw-bytes
+    /// passthrough, so the gap only surfaces once a real protobuf-encoded client happens to
+    /// write that kind. This walks every registry entry and asserts a decoder exists, so a
+    /// dropped or forgotten `m.insert()` in `decoders()` fails a test instead of shipping.
+    #[test]
+    fn every_registered_resource_has_a_protobuf_decoder() {
+        // `Event` and `HorizontalPodAutoscaler` pick their wire layout from `apiVersion`, not
+        // from `kind` alone (events.k8s.io/v1 vs. core/v1; autoscaling/v2 vs. autoscaling/v1),
+        // so `decode_proto_by_kind_and_version` dispatches them explicitly before consulting
+        // `decoders()` — their absence from the map is by design, not a gap.
+        const APIVERSION_DISPATCHED_KINDS: &[&str] = &["Event", "HorizontalPodAutoscaler"];
+        // Upstream sigs.k8s.io/gateway-api ships these as CRDs with no generated protobuf
+        // marshaler at all (CRD-backed resources never support protobuf encoding in real
+        // Kubernetes), so there is no upstream .proto schema to decode against — see the
+        // `decoders()` doc comment for the full reasoning.
+        const KINDS_WITHOUT_UPSTREAM_PROTOBUF_MARSHALER: &[&str] =
+            &["Gateway", "GatewayClass", "HTTPRoute", "ReferenceGrant"];
+
+        for (key, meta) in crate::state::build_registry().iter() {
+            if APIVERSION_DISPATCHED_KINDS.contains(&meta.kind.as_str())
+                || KINDS_WITHOUT_UPSTREAM_PROTOBUF_MARSHALER.contains(&meta.kind.as_str())
+            {
+                continue;
+            }
+            assert!(
+                decoders().contains_key(meta.kind.as_str()),
+                "resource_registry routes {}/{} {} for full CRUD but decoders() has no \
+                 protobuf decoder; a protobuf-encoded write to this kind falls through to \
+                 raw-bytes passthrough instead of decoding",
+                key.group,
+                key.version,
+                meta.kind,
+            );
+        }
     }
 }
