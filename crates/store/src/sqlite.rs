@@ -2664,6 +2664,14 @@ mod tests {
         let val =
             Bytes::from(r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-a"}}"#);
 
+        // A shard (and therefore a deletion_log) now exists only once something watches this
+        // resource type (see push_event_locked's doc) — held for the whole test so the shard
+        // this test inspects below isn't idle-GC'd out from under it.
+        let _watch = store
+            .watch("/registry/core/namespaces/", 0)
+            .await
+            .expect("watch must succeed");
+
         // Create, then delete the key — tombstone enters deletion_log.
         store
             .put(key, val.clone(), None)
@@ -2708,6 +2716,14 @@ mod tests {
     #[tokio::test]
     async fn deletion_log_retains_tombstone_for_deleted_key_not_recreated() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // A shard (and therefore a deletion_log) now exists only once something watches this
+        // resource type (see push_event_locked's doc) — held for the whole test so the shard
+        // this test inspects below isn't idle-GC'd out from under it.
+        let _watch = store
+            .watch("/registry/core/namespaces/", 0)
+            .await
+            .expect("watch must succeed");
 
         // Delete several keys without re-creating them — all tombstones must survive.
         for i in 0..5u32 {
@@ -2903,6 +2919,16 @@ mod tests {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
         let namespace = "endpointslice-test";
 
+        // Subscribe BEFORE the creates: a shard (and therefore ring replay) now exists only
+        // once something watches its resource type (see push_event_locked's doc), so unlike
+        // before this test can no longer rely on replaying pre-watch writes from the ring —
+        // it must observe them live instead, exactly as a real client-go informer's
+        // LIST-then-WATCH would (the LIST call, not ring replay, is what covers objects that
+        // existed before the WATCH opened).
+        let prefix = format!("/registry/endpoints/{namespace}/");
+        let stream = store.watch(&prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
         // Create 3 objects under /registry/endpoints/<namespace>/ to simulate the endpoints
         // the EndpointSlice controller creates for services in the namespace.
         let keys = [
@@ -2918,12 +2944,7 @@ mod tests {
             store.put(key, val, None).await.expect("put must succeed");
         }
 
-        // Subscribe BEFORE the delete so we enter the live-event loop.
-        let prefix = format!("/registry/endpoints/{namespace}/");
-        let stream = store.watch(&prefix, 0).await.expect("watch must succeed");
-        futures_util::pin_mut!(stream);
-
-        // Consume the 3 Added events from replay (objects existed before the watch started at rv=0).
+        // Consume the 3 live Added events emitted by the creates above.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         let mut added_count = 0usize;
         loop {
@@ -3956,6 +3977,18 @@ mod tests {
     #[tokio::test]
     async fn writes_to_different_resource_types_land_in_different_shards() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // A shard now exists only once something watches its resource type (see
+        // push_event_locked's doc) — held for the whole test so the two shards it inspects
+        // below aren't idle-GC'd out from under it.
+        let _pods_watch = store
+            .watch("/registry/core/pods/", 0)
+            .await
+            .expect("watch must succeed");
+        let _configmaps_watch = store
+            .watch("/registry/core/configmaps/", 0)
+            .await
+            .expect("watch must succeed");
 
         store
             .put(
