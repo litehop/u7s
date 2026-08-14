@@ -114,6 +114,7 @@ impl RingShard {
 /// this stream," which nothing else in `watch()`'s own body observes.
 struct ShardWatcherGuard {
     shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
     key: String,
     shard: Arc<RingShard>,
 }
@@ -121,11 +122,17 @@ struct ShardWatcherGuard {
 impl ShardWatcherGuard {
     fn attach(
         shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+        reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
         key: String,
         shard: Arc<RingShard>,
     ) -> Self {
         shard.watchers.fetch_add(1, Ordering::AcqRel);
-        Self { shards, key, shard }
+        Self {
+            shards,
+            reclaimed_horizons,
+            key,
+            shard,
+        }
     }
 }
 
@@ -138,6 +145,7 @@ impl Drop for ShardWatcherGuard {
         }
         schedule_idle_gc(
             Arc::clone(&self.shards),
+            Arc::clone(&self.reclaimed_horizons),
             self.key.clone(),
             Arc::clone(&self.shard),
         );
@@ -154,6 +162,7 @@ impl Drop for ShardWatcherGuard {
 /// live for the rest of the process's life).
 fn schedule_idle_gc(
     shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
     key: String,
     shard: Arc<RingShard>,
 ) {
@@ -179,13 +188,52 @@ fn schedule_idle_gc(
                 None
             }
         };
-        if removed.is_some() {
+        if let Some(shard) = &removed {
+            // Preserve this shard's floor before it is dropped for good — see
+            // `reclaimed_horizons`' doc for why "no shard" alone can no longer mean "never
+            // written" once idle-GC can reclaim one that genuinely held history.
+            preserve_reclaimed_horizon(&reclaimed_horizons, &key, shard);
             crate::metrics::WATCH_RING_SHARD_EVICTIONS_TOTAL
                 .with_label_values(&[crate::metrics::prefix_bucket(&key)])
                 .inc();
             tracing::debug!(shard = %key, "watch: idle ring shard evicted after grace period");
         }
     });
+}
+
+/// Preserve `shard`'s compaction floor into `reclaimed_horizons` before its entry in `shards`
+/// is dropped for good — the discriminator `compaction_horizon_for`/`get_or_create_shard`
+/// consult once a shard can be reclaimed mid-life (see `reclaimed_horizons`' doc).
+///
+/// The floor to preserve is NOT just `shard.horizon` (the eviction floor, 0 until the ring has
+/// overflowed at least once): a shard that never evicted anything still held every event it
+/// ever saw, and that whole history becomes unreplayable the moment its ring is gone. Reading
+/// the ring's own back (its highest still-held revision) and taking the max with the eviction
+/// floor is what makes a quiet, never-evicting shard's teardown still correctly expire a stale
+/// reconnect instead of only a busy, already-evicting one's.
+///
+/// Skips the insert when the computed floor is 0 (an empty shard that never held anything, or
+/// whose ring was never even created before this happened) — such an entry would carry no
+/// information over a map-miss and would only cost this map's own bound story an entry it does
+/// not need.
+fn preserve_reclaimed_horizon(
+    reclaimed_horizons: &RwLock<HashMap<String, u64>>,
+    key: &str,
+    shard: &RingShard,
+) {
+    let ring_top = shard
+        .ring
+        .read()
+        .expect("ring poisoned")
+        .back()
+        .map_or(0, |event| event.revision);
+    let horizon = shard.horizon.load(Ordering::Relaxed).max(ring_top);
+    if horizon > 0 {
+        reclaimed_horizons
+            .write()
+            .expect("reclaimed_horizons poisoned")
+            .insert(key.to_string(), horizon);
+    }
 }
 
 pub struct SqliteStore {
@@ -210,6 +258,19 @@ pub struct SqliteStore {
     /// writes. See `shard_key` for how a write's shard is derived, and `RingShard`'s doc for why
     /// sharding this way matters.
     shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    /// Compaction floor preserved for a resource-type prefix whose shard has been torn down
+    /// (idle-GC today; CRD-delete eager teardown later). Once a shard can be reclaimed, its
+    /// absence from `shards` stops meaning "this resource type was never written" and starts
+    /// also meaning "history existed and was discarded" — see `compaction_horizon_for`'s doc.
+    /// An entry here is what tells the two apart: it survives the shard itself, keyed to the
+    /// exact map key the shard lived under.
+    ///
+    /// Bounded the same way as `shards`: one entry per distinct prefix currently torn down and
+    /// not yet reused, consumed (removed) the instant `get_or_create_shard` recreates that
+    /// prefix's shard — so reconnecting/rewriting the same resource type over and over does not
+    /// grow this map, only genuinely abandoned resource types leave a lingering (tiny, u64)
+    /// entry behind.
+    reclaimed_horizons: Arc<RwLock<HashMap<String, u64>>>,
     /// Lowest revision still in the ring buffer of whichever shard has compacted furthest, across
     /// every resource type (advanced via `fetch_max` from each shard's own eviction — see
     /// `push_event_locked`). Deliberately one process-wide value rather than per-shard: the HTTP
@@ -274,6 +335,7 @@ impl SqliteStore {
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let shards = Arc::new(RwLock::new(HashMap::new()));
+        let reclaimed_horizons = Arc::new(RwLock::new(HashMap::new()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
 
@@ -282,6 +344,7 @@ impl SqliteStore {
             read_conn,
             tx,
             shards,
+            reclaimed_horizons,
             compaction_horizon,
             last_written_revision,
             epoch: Instant::now(),
@@ -311,10 +374,11 @@ impl SqliteStore {
         // ring/deletion_log internals directly for tests that never open a real watch, so it
         // stands in for that watch here rather than making every ring-behavior test also open
         // one.
-        get_or_create_shard(&self.shards, &shard);
+        get_or_create_shard(&self.shards, &self.reclaimed_horizons, &shard);
         push_event_locked(
             &self.tx,
             &self.shards,
+            &self.reclaimed_horizons,
             &shard,
             &self.compaction_horizon,
             now_secs,
@@ -351,18 +415,22 @@ impl SqliteStore {
     /// Return the compaction floor for the one shard `prefix` can match — the revision below
     /// which THIS resource type's watch history has actually been discarded.
     ///
-    /// 0 when no shard matches. A shard is created on a resource type's first write, so "no
-    /// shard" means nothing of this type was ever written and therefore nothing of it was ever
-    /// evicted; reporting 0 (not expired) is correct, and the replay is simply empty.
-    ///
-    /// NOTE for whoever implements shard reclamation (mayor-88h1w): that changes this. Once a
-    /// shard can be torn down, "no shard" stops meaning "never written" and starts also meaning
-    /// "history discarded", and returning 0 here would silently serve an empty replay as though
-    /// it were complete. Reclamation must preserve the reclaimed shard's floor rather than let
-    /// this fall through to 0.
+    /// Falls back to `reclaimed_horizons` when no LIVE shard matches: a shard can be torn down
+    /// (idle-GC) while its resource type still has real, now-unreplayable history behind it, so
+    /// "no live shard" alone stopped meaning "never written" once reclamation shipped — see that
+    /// field's doc. Only when NEITHER a live shard NOR a reclaimed-horizon entry matches is
+    /// nothing of this type known to have ever been written, and 0 (not expired) is correct.
     pub fn compaction_horizon_for(&self, prefix: &str) -> u64 {
-        find_shard(&self.shards.read().expect("shards poisoned"), prefix)
-            .map_or(0, |shard| shard.horizon.load(Ordering::Relaxed))
+        if let Some(shard) = find_shard(&self.shards.read().expect("shards poisoned"), prefix) {
+            return shard.horizon.load(Ordering::Relaxed);
+        }
+        find_reclaimed_horizon(
+            &self
+                .reclaimed_horizons
+                .read()
+                .expect("reclaimed_horizons poisoned"),
+            prefix,
+        )
     }
 
     /// Directly set the compaction floor for the shard `prefix` routes to, creating that shard
@@ -380,7 +448,7 @@ impl SqliteStore {
         let existing = find_shard(&self.shards.read().expect("shards poisoned"), prefix);
         let shard = match existing {
             Some(shard) => shard,
-            None => get_or_create_shard(&self.shards, prefix),
+            None => get_or_create_shard(&self.shards, &self.reclaimed_horizons, prefix),
         };
         shard.horizon.store(horizon, Ordering::Relaxed);
         self.compaction_horizon
@@ -548,6 +616,7 @@ fn push_into_shard(
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
     shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    reclaimed_horizons: &Arc<RwLock<HashMap<String, u64>>>,
     shard_key: &str,
     compaction_horizon: &AtomicU64,
     now_secs: u32,
@@ -578,7 +647,7 @@ fn push_event_locked(
     // arguments, so `push_event_at` can drive the retained-history histogram deterministically in
     // tests instead of sleeping.
     if matched.is_empty() && event.value.is_none() {
-        let shard = get_or_create_shard(shards, shard_key);
+        let shard = get_or_create_shard(shards, reclaimed_horizons, shard_key);
         push_into_shard(shard_key, &shard, compaction_horizon, now_secs, &event);
     } else {
         for (matched_key, shard) in &matched {
@@ -621,8 +690,18 @@ fn push_event_locked(
 /// gets it scheduled for `schedule_idle_gc` here — a shard created by a delete may never gain a
 /// watcher at all, unlike the watch-open caller which always attaches one immediately after, so
 /// this is the one place that can correctly cover both origins with a single grace-period check.
+///
+/// A brand-new shard's `horizon` is seeded from `reclaimed_horizons`, not always 0: if this exact
+/// key was torn down earlier (idle-GC) and is only now being recreated, the discarded history
+/// behind it must not be forgotten just because a live shard object exists again — otherwise a
+/// watch that resolves this freshly (re)created shard would see `horizon == 0` and wrongly treat
+/// every from_revision as caught up. Consuming (removing) the entry here is what keeps
+/// `reclaimed_horizons` from growing forever for a resource type that keeps getting
+/// reclaimed-then-reused: once its floor is baked into the live shard's own `horizon` field, the
+/// side entry no longer carries information the live shard doesn't already have.
 fn get_or_create_shard(
     shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    reclaimed_horizons: &Arc<RwLock<HashMap<String, u64>>>,
     shard: &str,
 ) -> Arc<RingShard> {
     if let Some(existing) = shards.read().expect("shards poisoned").get(shard) {
@@ -632,16 +711,29 @@ fn get_or_create_shard(
     if let Some(existing) = guard.get(shard) {
         return Arc::clone(existing);
     }
+    let seeded_horizon = reclaimed_horizons
+        .write()
+        .expect("reclaimed_horizons poisoned")
+        .remove(shard)
+        .unwrap_or(0);
     let created = Arc::new(RingShard::new());
+    created.horizon.store(seeded_horizon, Ordering::Relaxed);
     guard.insert(shard.to_string(), Arc::clone(&created));
     drop(guard);
-    schedule_idle_gc(Arc::clone(shards), shard.to_string(), Arc::clone(&created));
+    schedule_idle_gc(
+        Arc::clone(shards),
+        Arc::clone(reclaimed_horizons),
+        shard.to_string(),
+        Arc::clone(&created),
+    );
     created
 }
 
 /// Unconditionally remove and return `key`'s shard, if present, atomically under `shards`' write
 /// lock — so a concurrent `get_or_create_shard`/`matching_shards` read can never observe a
-/// half-removed entry.
+/// half-removed entry. Preserves the removed shard's floor into `reclaimed_horizons` (see that
+/// field's doc) exactly like idle-GC's own inline removal does, before the shard itself is
+/// dropped.
 ///
 /// Not called by this crate's own idle-GC (`ShardWatcherGuard`'s drop): that path needs its
 /// idle-check (`watchers == 0`) and the removal to happen under the SAME write-lock acquisition
@@ -653,9 +745,14 @@ fn get_or_create_shard(
 #[allow(dead_code)] // mayor-88h1w's CRD-delete teardown is the intended caller; not wired up yet.
 pub(crate) fn tear_down_shard(
     shards: &RwLock<HashMap<String, Arc<RingShard>>>,
+    reclaimed_horizons: &RwLock<HashMap<String, u64>>,
     key: &str,
 ) -> Option<Arc<RingShard>> {
-    shards.write().expect("shards poisoned").remove(key)
+    let removed = shards.write().expect("shards poisoned").remove(key);
+    if let Some(shard) = &removed {
+        preserve_reclaimed_horizon(reclaimed_horizons, key, shard);
+    }
+    removed
 }
 
 /// Every existing shard relevant to a write at `key` — i.e. every shard whose own key is a
@@ -732,6 +829,18 @@ fn find_shard_key(
         .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
         .max_by_key(|(shard, _)| shard.len())
         .map(|(shard, ring)| (shard.clone(), Arc::clone(ring)))
+}
+
+/// Like `find_shard`, but over `reclaimed_horizons` instead of live shards — the fallback
+/// `compaction_horizon_for` consults when no LIVE shard matches `prefix`. Same longest-prefix
+/// selection as `find_shard`, for the same reason: a more specific, reclaimed namespace-scoped
+/// entry should win over a broader, reclaimed all-namespaces one if somehow both exist.
+fn find_reclaimed_horizon(reclaimed_horizons: &HashMap<String, u64>, prefix: &str) -> u64 {
+    reclaimed_horizons
+        .iter()
+        .filter(|(shard, _)| prefix.starts_with(shard.as_str()))
+        .max_by_key(|(shard, _)| shard.len())
+        .map_or(0, |(_, horizon)| *horizon)
 }
 
 fn open_conn(path: &str) -> Result<Connection> {
@@ -1519,6 +1628,7 @@ impl Store for SqliteStore {
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
+        let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let epoch = self.epoch;
         let start = std::time::Instant::now();
@@ -1537,6 +1647,7 @@ impl Store for SqliteStore {
                 push_event_locked(
                     &tx,
                     &shards,
+                    &reclaimed_horizons,
                     &shard,
                     &compaction_horizon,
                     epoch.elapsed().as_secs() as u32,
@@ -1576,6 +1687,7 @@ impl Store for SqliteStore {
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
+        let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let epoch = self.epoch;
         let start = std::time::Instant::now();
@@ -1597,6 +1709,7 @@ impl Store for SqliteStore {
             push_event_locked(
                 &tx,
                 &shards,
+                &reclaimed_horizons,
                 &shard,
                 &compaction_horizon,
                 epoch.elapsed().as_secs() as u32,
@@ -1623,6 +1736,7 @@ impl Store for SqliteStore {
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
+        let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let epoch = self.epoch;
         let start = std::time::Instant::now();
@@ -1636,6 +1750,7 @@ impl Store for SqliteStore {
             push_event_locked(
                 &tx,
                 &shards,
+                &reclaimed_horizons,
                 &shard,
                 &compaction_horizon,
                 epoch.elapsed().as_secs() as u32,
@@ -1689,6 +1804,7 @@ impl Store for SqliteStore {
         let last_written = Arc::clone(&self.last_written_revision);
         let tx = self.tx.clone();
         let shards = Arc::clone(&self.shards);
+        let reclaimed_horizons = Arc::clone(&self.reclaimed_horizons);
         let compaction_horizon = Arc::clone(&self.compaction_horizon);
         let epoch = self.epoch;
         let keys = tokio::task::spawn_blocking(move || {
@@ -1708,6 +1824,7 @@ impl Store for SqliteStore {
                 push_event_locked(
                     &tx,
                     &shards,
+                    &reclaimed_horizons,
                     &shard,
                     &compaction_horizon,
                     epoch.elapsed().as_secs() as u32,
@@ -1754,7 +1871,7 @@ impl Store for SqliteStore {
                 Some((key, shard)) => (key, shard, false),
                 None => (
                     prefix.to_string(),
-                    get_or_create_shard(&self.shards, prefix),
+                    get_or_create_shard(&self.shards, &self.reclaimed_horizons, prefix),
                     true,
                 ),
             }
@@ -1798,6 +1915,7 @@ impl Store for SqliteStore {
         // here.
         let watcher_guard = ShardWatcherGuard::attach(
             Arc::clone(&self.shards),
+            Arc::clone(&self.reclaimed_horizons),
             shard_key_owned,
             Arc::clone(&shard),
         );
@@ -2461,6 +2579,7 @@ mod tests {
             read_conn,
             tx,
             shards: Arc::new(RwLock::new(HashMap::new())),
+            reclaimed_horizons: Arc::new(RwLock::new(HashMap::new())),
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
             epoch: Instant::now(),
@@ -4968,6 +5087,145 @@ mod tests {
         );
     }
 
+    /// A watch that reconnects with a stale `from_revision` after idle-GC has already reclaimed
+    /// its shard must be told 410 Expired, not silently served an empty or fabricated replay.
+    ///
+    /// Why it matters: watch clients reconnecting with a stale RV after 120s idle-GC MUST
+    /// receive 410 Expired, not a silent-empty or synthetic-ADDED replay that pretends to be
+    /// gap-free history — else long-running controllers drift from apiserver truth and never
+    /// know. `set_compaction_horizon_for_test` seeds a floor the shard had ALREADY earned by
+    /// evicting real history before idle-GC ever touches it, so this exercises the ordinary
+    /// "busy resource type" path, not the edge case the sibling test below covers.
+    ///
+    /// Fails on revert: reverting `tear_down_shard`/idle-GC's removal to a plain
+    /// `HashMap::remove` (today's behavior) drops the floor along with the shard, so
+    /// `compaction_horizon_for` falls back to 0 and the internal expiry check inside `watch()`
+    /// never fires — the reconnect below would instead get a live (empty) stream.
+    #[tokio::test]
+    async fn watch_reconnect_after_idle_gc_reclaim_gets_expired_not_silent_replay() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/widgets-reclaim-busy/";
+
+        // Give this shard a real, already-evicted floor before it is ever reclaimed — simulates
+        // a resource type that churned enough to compact on its own, independent of idle-GC.
+        store.set_compaction_horizon_for_test(prefix, 50);
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        drop(stream);
+
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE * 3).await;
+
+        assert!(
+            !store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "test setup broken: idle-GC must have reclaimed the shard for the reconnect below \
+             to be a meaningful test of the reclaimed-vs-never-written distinction"
+        );
+
+        let reconnect = store.watch(prefix, 10).await.expect(
+            "reconnect itself must succeed at the transport level — the 410 arrives as \
+             a WatchEvent on the stream, not an Err from watch()",
+        );
+        futures_util::pin_mut!(reconnect);
+
+        match tokio::time::timeout(Duration::from_millis(500), reconnect.next()).await {
+            Ok(Some(WatchEvent::Compacted { .. })) => {}
+            other => panic!(
+                "watch clients reconnecting with a stale RV after 120s idle-GC MUST receive 410 \
+                 Expired, not a silent-empty or synthetic-ADDED replay that pretends to be \
+                 gap-free history — else long-running controllers drift from apiserver truth \
+                 and never know. Got: {other:?}"
+            ),
+        }
+    }
+
+    /// A shard that never evicted anything (its own `horizon` floor stays 0 for its whole life)
+    /// must still correctly expire a stale reconnect once idle-GC reclaims it — the preserved
+    /// floor must come from the highest revision the ring ever actually held, not from the
+    /// eviction-floor field alone.
+    ///
+    /// Why it matters: a quiet CRD whose entire history fit in the ring still holds real events
+    /// a reconnecting client could be behind on once the ring is gone — the reclamation floor
+    /// must reflect what was actually served, not just what was evicted. An implementation that
+    /// carries forward only `shard.horizon` (0 here, since this shard never overflowed) would
+    /// pass the sibling busy-shard test above yet still let this exact bug through.
+    ///
+    /// Fails on revert: without reading the ring's own highest-held revision at teardown, the
+    /// preserved floor is 0 for this shard, `compaction_horizon_for` reports "not expired", and
+    /// the reconnect below gets a live stream instead of Compacted.
+    #[tokio::test]
+    async fn watch_reconnect_after_idle_gc_reclaim_of_never_evicted_shard_gets_expired() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/widgets-reclaim-quiet/";
+
+        // Two events only — nowhere near RING_CAPACITY, so this shard's own `horizon` (the
+        // eviction floor) never advances past 0.
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: format!("{prefix}default/widget-a"),
+                revision: 5,
+                value: Some(svc_value("widget-a", 5)),
+                is_create: true,
+                deleted_body: None,
+            }),
+            Some("default"),
+        );
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: format!("{prefix}default/widget-b"),
+                revision: 10,
+                value: Some(svc_value("widget-b", 10)),
+                is_create: true,
+                deleted_body: None,
+            }),
+            Some("default"),
+        );
+
+        assert_eq!(
+            store.compaction_horizon_for(prefix),
+            0,
+            "test setup broken: this shard must never have evicted anything — otherwise this \
+             test is indistinguishable from the sibling busy-shard test and cannot prove the \
+             fix reads the ring's own history rather than just the eviction floor"
+        );
+
+        let stream = store.watch(prefix, 0).await.expect("watch must succeed");
+        drop(stream);
+
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE * 3).await;
+
+        assert!(
+            !store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(prefix),
+            "test setup broken: idle-GC must have reclaimed the shard for the reconnect below \
+             to be a meaningful test"
+        );
+
+        // Behind the shard's highest-ever-held revision (10) but above its (always-0) eviction
+        // floor — only a fix that reads the ring's own history at teardown expires this.
+        let reconnect = store.watch(prefix, 7).await.expect(
+            "reconnect itself must succeed at the transport level — the 410 arrives as \
+             a WatchEvent on the stream, not an Err from watch()",
+        );
+        futures_util::pin_mut!(reconnect);
+
+        match tokio::time::timeout(Duration::from_millis(500), reconnect.next()).await {
+            Ok(Some(WatchEvent::Compacted { .. })) => {}
+            other => panic!(
+                "a quiet CRD whose entire history fit in the ring still holds real events a \
+                 reconnecting client could be behind on once the ring is gone — the \
+                 reclamation floor must reflect what was actually served, not just what was \
+                 evicted. Got: {other:?}"
+            ),
+        }
+    }
+
     /// A watch that reconnects to the same prefix DURING the grace window must cancel the
     /// pending teardown — the shard must still exist after the original grace deadline passes.
     ///
@@ -5051,6 +5309,7 @@ mod tests {
         });
 
         let teardown_shards = Arc::clone(&store.shards);
+        let teardown_reclaimed_horizons = Arc::clone(&store.reclaimed_horizons);
         let teardown_barrier = Arc::clone(&barrier);
         let teardown = tokio::spawn(async move {
             teardown_barrier.wait().await;
@@ -5059,7 +5318,7 @@ mod tests {
             // locking under concurrent removal, which is exactly what tear_down_shard performs
             // for real idle-GC too, just without the surrounding idle re-check.
             for _ in 0..N {
-                tear_down_shard(&teardown_shards, prefix);
+                tear_down_shard(&teardown_shards, &teardown_reclaimed_horizons, prefix);
             }
         });
 
