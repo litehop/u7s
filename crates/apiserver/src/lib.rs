@@ -218,7 +218,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     )
     .await?;
     seed_serviceaccounts(&store).await?;
-    seed_coredns(&store).await?;
     seed_metrics_server(&store, &args.service_cluster_ip_range).await?;
     seed_servicecidrs(&store, &args.service_cluster_ip_range).await?;
 
@@ -523,15 +522,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let listener = bind_listener(&args.listen)?;
 
     // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound.
-    // It authenticates as system:bootstrap-installer (mayor-1pwxi) and SSA-upserts a bootstrap
-    // addon manifest bundle (e.g. CoreDNS) against this same apiserver. b"" is a placeholder —
-    // Path A [3/3] swaps in the real manifest bytes; the empty apply here proves the wiring
-    // works before any manifest content exists. Runs concurrently with request-serving below;
-    // failure is already logged and counted inside apply_yaml_bundle, so it's discarded here
-    // rather than re-logged — a missing addon is degraded-mode, never a reason to abort the
+    // It authenticates as system:bootstrap-installer (mayor-1pwxi) and SSA-upserts the vendored
+    // CoreDNS addon bundle against this same apiserver. Runs concurrently with request-serving
+    // below; failure is already logged and counted inside apply_yaml_bundle, so it's discarded
+    // here rather than re-logged — a missing addon is degraded-mode, never a reason to abort the
     // apiserver itself.
     tokio::spawn(async move {
-        let _ = bootstrap_apply::apply_yaml_bundle(&bootstrap_installer_kubeconfig_path, b"").await;
+        let _ = bootstrap_apply::apply_yaml_bundle(
+            &bootstrap_installer_kubeconfig_path,
+            bootstrap_apply::COREDNS_MANIFEST,
+        )
+        .await;
     });
 
     serve_tls(listener, app, tls_material.server_config).await?;
@@ -1358,6 +1359,10 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     // ConfigMap/Deployment/Service) against the just-bound apiserver. Deliberately
     // upsert-only: no delete/deletecollection verbs anywhere in this role, since the
     // applier never removes objects — broadening this is a separate, later change.
+    // "get" is included so the applier can check whether a document is already
+    // installed before PATCHing — re-PATCHing an object that already exists on every
+    // boot risks corrupting any list field whose merge key collides across entries
+    // (e.g. kube-dns's Service ports, which share port 53 across UDP and TCP).
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(GROUP, "clusterroles", None, "system:bootstrap-installer");
     let body = serde_json::json!({
@@ -1365,9 +1370,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:bootstrap-installer", "uid": "00000000-0000-0000-0000-000000000079", "creationTimestamp": TS },
         "rules": [
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services"], "verbs": ["create","patch","update"] },
-            { "apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["create","patch","update"] }
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services"], "verbs": ["get","create","patch","update"] },
+            { "apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get","create","patch","update"] }
         ]
     });
     put!(key, body, "system:bootstrap-installer", "ClusterRole");
@@ -2547,40 +2552,9 @@ async fn seed_services(
         Err(e) => return Err(anyhow::anyhow!("seed Service default/kubernetes: {e}")),
     }
 
-    // kube-system/kube-dns — DNS resolver; kubelet advertises 10.96.0.10 as
-    // the nameserver in /etc/resolv.conf inside every pod.
-    let dns_key = keys::object_key("services", "kube-system", "kube-dns");
-    let dns_body = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": "kube-dns",
-            "namespace": "kube-system",
-            "uid": "00000000-0000-0000-0000-000000000021",
-            "creationTimestamp": "2024-01-01T00:00:00Z",
-            "labels": { "k8s-app": "kube-dns", "kubernetes.io/cluster-service": "true", "kubernetes.io/name": "CoreDNS" }
-        },
-        "spec": {
-            "clusterIP": kube_dns_cluster_ip.to_string(),
-            "selector": { "k8s-app": "kube-dns" },
-            "ports": [
-                { "name": "dns", "port": 53, "targetPort": 53, "protocol": "UDP" },
-                { "name": "dns-tcp", "port": 53, "targetPort": 53, "protocol": "TCP" }
-            ],
-            "sessionAffinity": "None",
-            "type": "ClusterIP"
-        }
-    });
-    match store
-        .put(&dns_key, Bytes::from(dns_body.to_string()), Some(0))
-        .await
-    {
-        Ok(_) => tracing::info!("seeded Service: kube-system/kube-dns"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-        Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
-    }
-
-    // Reserve kube-dns's fixed clusterIP in the allocator's own sentinel keyspace.
+    // kube-system/kube-dns itself is applied later, from the vendored CoreDNS bundle (see
+    // bootstrap_apply.rs), so the whole CoreDNS install lives in one manifest. Its clusterIP
+    // is still reserved here in the allocator's own sentinel keyspace ahead of that apply.
     // Without this, allocate_service_ip (hint starts at offset 2, +1 per call) has no
     // idea offset 10 is taken and will hand it to the 9th ordinary dynamic Service,
     // colliding with kube-dns's VIP.
@@ -2942,186 +2916,6 @@ async fn seed_kube_root_ca(store: &SqliteStore, ca_cert_der: &[u8]) -> anyhow::R
     Ok(())
 }
 
-async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use u7s_store::Store;
-
-    const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
-    const TS: &str = "2024-01-01T00:00:00Z";
-
-    // kube-system/coredns ServiceAccount — the kubernetes plugin uses the projected SA token
-    // to authenticate API calls. Without it, CoreDNS fails at startup with "no such file
-    // or directory" when opening /var/run/secrets/kubernetes.io/serviceaccount/token.
-    let sa_key = keys::object_key("serviceaccounts", "kube-system", "coredns");
-    let sa_body = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": {
-            "name": "coredns",
-            "namespace": "kube-system",
-            "uid": "00000000-0000-0000-0000-000000000032",
-            "creationTimestamp": TS
-        }
-    });
-    match store
-        .put(&sa_key, Bytes::from(sa_body.to_string()), Some(0))
-        .await
-    {
-        Ok(_) => tracing::info!("seeded ServiceAccount: kube-system/coredns"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "seed ServiceAccount kube-system/coredns: {e}"
-            ))
-        }
-    }
-
-    // ClusterRole for CoreDNS — grants read access to Services, Endpoints, Namespaces,
-    // and Pods so the kubernetes plugin can resolve in-cluster DNS names.
-    let cr_key = keys::group_object_key(RBAC_GROUP, "clusterroles", None, "system:coredns");
-    let cr_body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": {
-            "name": "system:coredns",
-            "uid": "00000000-0000-0000-0000-000000000033",
-            "creationTimestamp": TS,
-            "labels": { "kubernetes.io/bootstrapping": "rbac-defaults" }
-        },
-        "rules": [
-            { "apiGroups": [""], "resources": ["endpoints", "services", "pods", "namespaces"], "verbs": ["list", "watch"] },
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["list", "watch"] }
-        ]
-    });
-    match store
-        .put(&cr_key, Bytes::from(cr_body.to_string()), None)
-        .await
-    {
-        Ok(_) => tracing::info!("seeded ClusterRole: system:coredns"),
-        Err(e) => return Err(anyhow::anyhow!("seed ClusterRole system:coredns: {e}")),
-    }
-
-    // ClusterRoleBinding — binds the system:coredns role to the coredns SA.
-    let crb_key = keys::group_object_key(RBAC_GROUP, "clusterrolebindings", None, "system:coredns");
-    let crb_body = serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRoleBinding",
-        "metadata": {
-            "name": "system:coredns",
-            "uid": "00000000-0000-0000-0000-000000000034",
-            "creationTimestamp": TS,
-            "labels": { "kubernetes.io/bootstrapping": "rbac-defaults" }
-        },
-        "roleRef": {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "ClusterRole",
-            "name": "system:coredns"
-        },
-        "subjects": [{
-            "kind": "ServiceAccount",
-            "name": "coredns",
-            "namespace": "kube-system"
-        }]
-    });
-    match store
-        .put(&crb_key, Bytes::from(crb_body.to_string()), None)
-        .await
-    {
-        Ok(_) => tracing::info!("seeded ClusterRoleBinding: system:coredns"),
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "seed ClusterRoleBinding system:coredns: {e}"
-            ))
-        }
-    }
-
-    // kube-system/coredns ConfigMap — holds the Corefile that CoreDNS reads at startup.
-    // Without the kubernetes plugin in the Corefile, CoreDNS returns NOERROR with an empty
-    // ANSWER section for service DNS names, causing webhook and in-cluster lookups to fail.
-    let cm_key = keys::object_key("configmaps", "kube-system", "coredns");
-    let corefile = ".:53 {\n    errors\n    health\n    ready\n    kubernetes cluster.local in-addr.arpa ip6.arpa {\n        pods insecure\n        fallthrough in-addr.arpa ip6.arpa\n    }\n    forward . /etc/resolv.conf\n    cache 30\n    reload\n    loadbalance\n}\n";
-    let cm_body = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": "coredns",
-            "namespace": "kube-system",
-            "uid": "00000000-0000-0000-0000-000000000031",
-            "creationTimestamp": TS
-        },
-        "data": { "Corefile": corefile }
-    });
-    match store
-        .put(&cm_key, Bytes::from(cm_body.to_string()), Some(0))
-        .await
-    {
-        Ok(_) => tracing::info!("seeded ConfigMap: kube-system/coredns"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-        Err(e) => return Err(anyhow::anyhow!("seed ConfigMap kube-system/coredns: {e}")),
-    }
-
-    // kube-system/coredns Deployment — provides in-cluster DNS resolution.
-    // kubelet injects 10.96.0.10 (kube-dns Service) into every pod's /etc/resolv.conf;
-    // without a running CoreDNS pod behind that Service, DNS lookups fail inside pods.
-    // The Corefile ConfigMap above is mounted at /etc/coredns so the kubernetes plugin
-    // is active and service A records resolve correctly.
-    let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
-    let mut body = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {
-            "name": "coredns",
-            "namespace": "kube-system",
-            "uid": "00000000-0000-0000-0000-000000000030",
-            "creationTimestamp": TS,
-            "labels": { "k8s-app": "kube-dns" }
-        },
-        "spec": {
-            "replicas": 1,
-            "selector": { "matchLabels": { "k8s-app": "kube-dns" } },
-            "template": {
-                "metadata": { "labels": { "k8s-app": "kube-dns" } },
-                "spec": {
-                    "serviceAccountName": "coredns",
-                    "dnsPolicy": "Default",
-                    "containers": [{
-                        "name": "coredns",
-                        "image": "registry.k8s.io/coredns/coredns:v1.11.1",
-                        "args": ["-conf", "/etc/coredns/Corefile"],
-                        "ports": [
-                            { "containerPort": 53, "protocol": "UDP", "name": "dns" },
-                            { "containerPort": 53, "protocol": "TCP", "name": "dns-tcp" }
-                        ],
-                        "volumeMounts": [{
-                            "name": "config-volume",
-                            "mountPath": "/etc/coredns",
-                            "readOnly": true
-                        }]
-                    }],
-                    "volumes": [{
-                        "name": "config-volume",
-                        "configMap": {
-                            "name": "coredns",
-                            "items": [{ "key": "Corefile", "path": "Corefile" }]
-                        }
-                    }]
-                }
-            }
-        }
-    });
-    crate::handlers::defaults::apply_defaults("apps", "deployments", &mut body);
-    match store
-        .put(&key, Bytes::from(body.to_string()), Some(0))
-        .await
-    {
-        Ok(_) => tracing::info!("seeded Deployment: kube-system/coredns"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-        Err(e) => return Err(anyhow::anyhow!("seed Deployment kube-system/coredns: {e}")),
-    }
-
-    Ok(())
-}
-
 /// Seed the metrics-server addon — provides the `metrics.k8s.io` Resource Metrics API that
 /// kube-controller-manager's HorizontalPodAutoscaler controller polls for CPU/memory usage.
 /// Without it, every Resource-type (CPU/memory) HPA target is permanently stuck: KCM's
@@ -3135,8 +2929,7 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
 /// the `v1beta1.metrics.k8s.io` APIService. Registered through the same generic
 /// aggregation-proxy machinery (`handlers::aggregation::proxy_middleware`) that already
 /// proxies to sample-apiserver in the aggregator conformance test — deployed exactly like a
-/// user would `kubectl apply` upstream's own manifest, just written directly into the store
-/// like `seed_coredns`.
+/// user would `kubectl apply` upstream's own manifest, just written directly into the store.
 ///
 /// Two deviations from upstream's stock manifest, both required by this lab environment:
 ///   - `--kubelet-insecure-tls`: added. Upstream's default args assume a real cluster CA
@@ -3145,7 +2938,7 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
 ///     against, so metrics-server would otherwise fail every scrape with a TLS handshake
 ///     error.
 ///   - `priorityClassName: system-cluster-critical` dropped: u7s does not seed any
-///     PriorityClass objects (CoreDNS's own seeded Deployment omits it for the same reason).
+///     PriorityClass objects (the vendored CoreDNS bundle omits it for the same reason).
 async fn seed_metrics_server(
     store: &SqliteStore,
     service_cluster_ip_range: &str,
@@ -5780,11 +5573,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_services_creates_kubernetes_and_kube_dns() {
-        // Both Services are required for in-cluster communication:
-        //   - default/kubernetes: pods reach the API server via kubernetes.default.svc.cluster.local
-        //   - kube-system/kube-dns: kubelet advertises 10.96.0.10 as the nameserver in /etc/resolv.conf
-        // Without them, any in-pod API call or DNS lookup fails.
+    async fn seed_services_creates_kubernetes_service_and_reserves_kube_dns_ip() {
+        // default/kubernetes must exist: pods reach the API server via
+        // kubernetes.default.svc.cluster.local. kube-system/kube-dns itself is applied later
+        // from the vendored CoreDNS bundle, but its clusterIP must already be reserved here so
+        // no ordinary dynamic Service can grab 10.96.0.10 first.
         let store = make_store();
         seed_namespaces(&store)
             .await
@@ -5818,40 +5611,19 @@ mod tests {
         assert_eq!(k8s_ports[0]["targetPort"].as_u64(), Some(6443));
         assert_eq!(k8s_ports[0]["protocol"].as_str(), Some("TCP"));
 
-        // Verify kube-system/kube-dns Service.
-        let dns_key = keys::object_key("services", "kube-system", "kube-dns");
-        let dns_obj = store.get(&dns_key).await.expect("get must not fail");
+        // Verify kube-dns's clusterIP sentinel is reserved, even though the kube-dns Service
+        // object itself is created later by the bootstrap YAML applier, not by seed_services.
+        let sentinel_key = format!("{}10.96.0.10", state::SERVICE_IP_PREFIX);
         assert!(
-            dns_obj.is_some(),
-            "Service kube-system/kube-dns must exist after seeding"
+            store
+                .get(&sentinel_key)
+                .await
+                .expect("get must not fail")
+                .is_some(),
+            "kube-dns's clusterIP (10.96.0.10) must be reserved in the allocator's sentinel \
+             keyspace — without it, allocate_service_ip could hand 10.96.0.10 to an ordinary \
+             dynamic Service, colliding with the CoreDNS bundle's fixed VIP once it's applied"
         );
-        let dns: serde_json::Value =
-            serde_json::from_slice(&dns_obj.unwrap().value).expect("valid json");
-        assert_eq!(dns["kind"].as_str(), Some("Service"));
-        assert_eq!(dns["metadata"]["name"].as_str(), Some("kube-dns"));
-        assert_eq!(dns["metadata"]["namespace"].as_str(), Some("kube-system"));
-        assert_eq!(dns["spec"]["clusterIP"].as_str(), Some("10.96.0.10"));
-        let dns_ports = dns["spec"]["ports"]
-            .as_array()
-            .expect("ports must be an array");
-        assert_eq!(
-            dns_ports.len(),
-            2,
-            "kube-dns Service must have two ports (UDP and TCP)"
-        );
-        let protocols: Vec<&str> = dns_ports
-            .iter()
-            .filter_map(|p| p["protocol"].as_str())
-            .collect();
-        assert!(protocols.contains(&"UDP"), "kube-dns must have a UDP port");
-        assert!(protocols.contains(&"TCP"), "kube-dns must have a TCP port");
-        for port in dns_ports {
-            assert_eq!(
-                port["port"].as_u64(),
-                Some(53),
-                "kube-dns port number must be 53"
-            );
-        }
     }
 
     /// seed_services must derive the bootstrap ClusterIPs from a non-default
@@ -5888,22 +5660,16 @@ mod tests {
              not the 10.96.0.1 hardcode — otherwise it falls outside the seeded ServiceCIDR"
         );
 
-        let dns_key = keys::object_key("services", "kube-system", "kube-dns");
-        let dns: serde_json::Value = serde_json::from_slice(
-            &store
-                .get(&dns_key)
+        let sentinel_key = format!("{}172.20.0.10", state::SERVICE_IP_PREFIX);
+        assert!(
+            store
+                .get(&sentinel_key)
                 .await
                 .expect("get must not fail")
-                .unwrap()
-                .value,
-        )
-        .expect("valid json");
-        assert_eq!(
-            dns["spec"]["clusterIP"].as_str(),
-            Some("172.20.0.10"),
-            "kube-dns Service ClusterIP must be the tenth host of the configured range, \
-             not the 10.96.0.10 hardcode — otherwise kubelet's resolv.conf nameserver \
-             points at an IP no Service actually owns"
+                .is_some(),
+            "kube-dns's clusterIP sentinel must reserve the tenth host of the configured \
+             range, not the 10.96.0.10 hardcode — otherwise a custom range's dynamic Service \
+             allocation could still collide with whatever IP the CoreDNS bundle is later given"
         );
     }
 
@@ -5929,11 +5695,14 @@ mod tests {
             k8s_obj.is_some(),
             "Service default/kubernetes must still exist"
         );
-        let dns_key = keys::object_key("services", "kube-system", "kube-dns");
-        let dns_obj = store.get(&dns_key).await.expect("get must not fail");
+        let sentinel_key = format!("{}10.96.0.10", state::SERVICE_IP_PREFIX);
         assert!(
-            dns_obj.is_some(),
-            "Service kube-system/kube-dns must still exist"
+            store
+                .get(&sentinel_key)
+                .await
+                .expect("get must not fail")
+                .is_some(),
+            "kube-dns's clusterIP sentinel must still be reserved after a second seed call"
         );
     }
 
@@ -6258,138 +6027,6 @@ mod tests {
             revision_after_first, revision_after_second,
             "second reconcile must not write to the store when Endpoints already matches \
              EndpointSlice — spurious writes generate MODIFIED watch events every 5 seconds"
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_coredns_creates_deployment_in_kube_system() {
-        // CoreDNS Deployment must exist after seeding so in-cluster DNS resolution works.
-        // Without this Deployment, pods get an empty DNS response for service names
-        // because no pod backs the kube-dns Service (10.96.0.10).
-        let store = make_store();
-        seed_coredns(&store).await.expect("seed must not fail");
-
-        let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
-        let obj = store.get(&key).await.expect("get must not fail");
-        assert!(
-            obj.is_some(),
-            "Deployment kube-system/coredns must exist after seeding"
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
-        assert_eq!(parsed["kind"].as_str(), Some("Deployment"));
-        assert_eq!(parsed["apiVersion"].as_str(), Some("apps/v1"));
-        assert_eq!(parsed["metadata"]["name"].as_str(), Some("coredns"));
-        assert_eq!(
-            parsed["metadata"]["namespace"].as_str(),
-            Some("kube-system")
-        );
-        // Selector must match kube-dns label so kubelet pod assignment reaches CoreDNS pods.
-        assert_eq!(
-            parsed["spec"]["selector"]["matchLabels"]["k8s-app"].as_str(),
-            Some("kube-dns"),
-            "selector must match k8s-app=kube-dns so the kube-dns Service selects CoreDNS pods"
-        );
-        // Container must use the expected image.
-        let containers = parsed["spec"]["template"]["spec"]["containers"]
-            .as_array()
-            .expect("containers must be an array");
-        assert_eq!(containers.len(), 1, "must have exactly one container");
-        assert_eq!(
-            containers[0]["image"].as_str(),
-            Some("registry.k8s.io/coredns/coredns:v1.11.1"),
-            "image must be pinned to a known CoreDNS version"
-        );
-        // DNS ports must be present.
-        let ports = containers[0]["ports"]
-            .as_array()
-            .expect("ports must be an array");
-        assert_eq!(ports.len(), 2, "must expose both UDP and TCP port 53");
-        let protocols: Vec<&str> = ports
-            .iter()
-            .filter_map(|p| p["protocol"].as_str())
-            .collect();
-        assert!(
-            protocols.contains(&"UDP"),
-            "CoreDNS must expose UDP port 53 for DNS queries"
-        );
-        assert!(
-            protocols.contains(&"TCP"),
-            "CoreDNS must expose TCP port 53 for large DNS responses"
-        );
-        // Volume mount must reference the Corefile ConfigMap so CoreDNS loads the kubernetes plugin.
-        let volumes = parsed["spec"]["template"]["spec"]["volumes"]
-            .as_array()
-            .expect("volumes must be an array");
-        assert!(
-            !volumes.is_empty(),
-            "Deployment must declare a volume for the Corefile — without it CoreDNS starts with \
-             the default Corefile which has no kubernetes plugin and returns empty ANSWER sections"
-        );
-        let vol = &volumes[0];
-        assert_eq!(
-            vol["configMap"]["name"].as_str(),
-            Some("coredns"),
-            "volume must reference the coredns ConfigMap"
-        );
-        let vol_mounts = containers[0]["volumeMounts"]
-            .as_array()
-            .expect("volumeMounts must be an array");
-        assert!(
-            !vol_mounts.is_empty(),
-            "CoreDNS container must mount the Corefile volume"
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_coredns_creates_configmap_with_kubernetes_plugin() {
-        // The kube-system/coredns ConfigMap must exist and contain a Corefile with the
-        // kubernetes plugin. Without this, CoreDNS resolves no service DNS names, causing
-        // webhook calls and any in-cluster service lookup to fail with "no such host".
-        let store = make_store();
-        seed_coredns(&store).await.expect("seed must not fail");
-
-        let cm_key = keys::object_key("configmaps", "kube-system", "coredns");
-        let obj = store.get(&cm_key).await.expect("get must not fail");
-        assert!(
-            obj.is_some(),
-            "ConfigMap kube-system/coredns must exist so CoreDNS can load the Corefile"
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
-        assert_eq!(parsed["kind"].as_str(), Some("ConfigMap"));
-        let corefile = parsed["data"]["Corefile"]
-            .as_str()
-            .expect("Corefile key must be present in ConfigMap data");
-        assert!(
-            corefile.contains("kubernetes cluster.local"),
-            "Corefile must include the kubernetes plugin — without it service DNS names \
-             return empty ANSWER sections and webhook calls fail with 'no such host'"
-        );
-        assert!(
-            corefile.contains("in-addr.arpa ip6.arpa"),
-            "Corefile kubernetes plugin must include reverse zones for PTR record resolution"
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_coredns_is_idempotent() {
-        // A second call must not error — startup can happen against an existing database.
-        // Without idempotency, every restart would fail after the first boot.
-        let store = make_store();
-        seed_coredns(&store)
-            .await
-            .expect("first seed must not fail");
-        seed_coredns(&store)
-            .await
-            .expect("second seed must not fail — seed must be idempotent");
-
-        // Data must still be correct after two calls.
-        let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
-        let obj = store.get(&key).await.expect("get must not fail");
-        assert!(
-            obj.is_some(),
-            "Deployment kube-system/coredns must still exist after second seed call"
         );
     }
 
