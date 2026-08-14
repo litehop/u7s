@@ -997,6 +997,16 @@ async fn fallback_handler() -> status::StatusError {
     )
 }
 
+/// The RFC3339 timestamp stamped as `creationTimestamp` on every object this apiserver seeds
+/// on its very first boot (namespaces, bootstrap RBAC, ...). Computed once per process and
+/// reused everywhere, rather than reading the clock fresh at each seed site, so objects seeded
+/// moments apart during the same boot don't report different creation times, and so a value
+/// that upstream treats as immutable can't drift across repeated seed calls within one run.
+fn boot_timestamp() -> &'static str {
+    static TS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TS.get_or_init(util::utc_now_rfc3339)
+}
+
 async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
@@ -1015,7 +1025,7 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
             "metadata": {
                 "name": name,
                 "uid": uid,
-                "creationTimestamp": "2024-01-01T00:00:00Z",
+                "creationTimestamp": boot_timestamp(),
                 "labels": { "kubernetes.io/metadata.name": name },
                 "finalizers": ["kubernetes"]
             },
@@ -1038,17 +1048,34 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     use u7s_store::Store;
 
     const GROUP: &str = "rbac.authorization.k8s.io";
-    const TS: &str = "2024-01-01T00:00:00Z";
+    // Never actually written to the store — the `put!` macro below overwrites
+    // `metadata.creationTimestamp` on every body with `boot_timestamp()` before serializing
+    // it. Kept as an obviously-fake sentinel (rather than a real-looking date) so a future
+    // regression in that override shows up as a loud, unmistakable garbage value instead of
+    // silently reintroducing the old "2024-01-01" lie.
+    const TS: &str = "TIMESTAMP-OVERWRITTEN-BY-PUT-MACRO";
 
-    // Helper closure: unconditional put for a single ClusterRole.
-    // uid_suffix must be unique across all seeded objects.
+    // Helper: create-only put for a single seeded RBAC object. Like upstream kube-apiserver,
+    // bootstrap RBAC is stamped once per cluster lifetime: on first boot this creates the
+    // object with `boot_timestamp()`; on every later boot the object already exists, so the
+    // write is rejected (AlreadyExists) and swallowed, leaving whatever an operator has since
+    // changed on it untouched. uid_suffix must be unique across all seeded objects.
     macro_rules! put {
         ($key:expr, $body:expr, $name:expr, $kind:expr) => {{
-            store
-                .put(&$key, Bytes::from($body.to_string()), None)
+            let mut body = $body;
+            body["metadata"]["creationTimestamp"] = serde_json::Value::from(boot_timestamp());
+            match store
+                .put(&$key, Bytes::from(body.to_string()), Some(0))
                 .await
-                .map_err(|e| anyhow::anyhow!("seed {} {}: {}", $kind, $name, e))?;
-            tracing::info!("seeded {}: {}", $kind, $name);
+            {
+                Ok(_) => tracing::info!("seeded {}: {}", $kind, $name),
+                Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+                    // Already exists — idempotent, and intentionally not re-applied so an
+                    // operator's edit to a seeded Role/ClusterRole/ClusterRoleBinding survives
+                    // a restart instead of being silently reverted.
+                }
+                Err(e) => return Err(anyhow::anyhow!("seed {} {}: {}", $kind, $name, e)),
+            }
         }};
     }
 
@@ -4460,6 +4487,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeded_namespace_creation_timestamp_reflects_actual_cluster_boot_not_a_hardcoded_lie()
+    {
+        // kubectl derives the AGE column from creationTimestamp. Before this fix every seeded
+        // namespace was hardcoded to "2024-01-01T00:00:00Z", so a cluster booted today reported
+        // an AGE of 2+ years — a user-visible lie about how long the cluster has existed.
+        let before_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the epoch")
+            .as_secs() as i64;
+
+        let store = make_store();
+        seed_namespaces(&store).await.expect("seed must not fail");
+
+        let key = keys::cluster_object_key("namespaces", "kube-system");
+        let obj = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("kube-system must exist after seeding");
+        let ns: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+        let ts = ns["metadata"]["creationTimestamp"]
+            .as_str()
+            .expect("creationTimestamp must be a string");
+
+        assert_ne!(
+            ts, "2024-01-01T00:00:00Z",
+            "seeded namespace must not carry the old hardcoded fake creation date"
+        );
+        // boot_timestamp() is a process-wide OnceLock: in `cargo test --workspace` this test
+        // binary runs thousands of tests in one process, and whichever test first touches
+        // boot_timestamp() (possibly minutes before this test executes) freezes it for the
+        // rest of the run. A tight few-second bound would be flaky for that reason alone, so
+        // this uses a generous one-hour window — still 2+ orders of magnitude tighter than the
+        // multi-year drift the old hardcoded "2024-01-01" constant produced, which is the
+        // actual regression this test guards against.
+        let ts_secs = util::rfc3339_to_unix_secs(ts).expect("must be a valid RFC3339 timestamp");
+        assert!(
+            (ts_secs - before_secs).abs() <= 3600,
+            "seeded namespace's creationTimestamp ({ts}) must reflect the actual process boot \
+             time, not an arbitrary or multi-year-stale value"
+        );
+    }
+
+    #[tokio::test]
     async fn seed_namespaces_is_idempotent() {
         // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
         let store = make_store();
@@ -4649,10 +4720,61 @@ mod tests {
 
     #[tokio::test]
     async fn seed_rbac_is_idempotent() {
-        // Unconditional puts must not fail on a second call — seed data can be overwritten.
+        // Create-only puts must not fail on a second call — a restart re-runs seeding even
+        // though every object already exists, and each AlreadyExists must be swallowed rather
+        // than propagated as an error.
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_reseed_does_not_clobber_an_operators_edit_to_a_bootstrap_clusterrole() {
+        // Upstream kube-apiserver stamps bootstrap RBAC once per cluster lifetime; if an
+        // operator edits a seeded ClusterRole after boot and the apiserver restarts, that
+        // edit must survive. Before this fix, seed_rbac() unconditionally upserted every
+        // object on every boot (store.put(..., None)), so a restart would silently revert
+        // any such edit back to the hardcoded seed body.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("first seed must not fail");
+
+        // Simulate an operator hand-editing the seeded cluster-admin ClusterRole after boot.
+        let key = keys::group_object_key(GROUP, "clusterroles", None, "cluster-admin");
+        let existing = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("cluster-admin must exist after first seed");
+        let mut edited: serde_json::Value =
+            serde_json::from_slice(&existing.value).expect("valid json");
+        edited["metadata"]["annotations"] = serde_json::json!({"operator-edited": "true"});
+        store
+            .put(
+                &key,
+                bytes::Bytes::from(edited.to_string()),
+                Some(existing.revision),
+            )
+            .await
+            .expect("operator edit must succeed");
+
+        // A restart re-runs seed_rbac(); it must not clobber the operator's edit.
+        seed_rbac(&store).await.expect("second seed must not fail");
+
+        let after = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("cluster-admin must still exist after reseed");
+        let after_json: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("valid json");
+        assert_eq!(
+            after_json["metadata"]["annotations"]["operator-edited"].as_str(),
+            Some("true"),
+            "reseeding a bootstrap ClusterRole on restart must not revert an operator's \
+             edit to it — upstream only stamps bootstrap RBAC once per cluster lifetime"
+        );
     }
 
     #[tokio::test]
