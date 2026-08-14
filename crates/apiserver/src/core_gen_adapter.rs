@@ -6244,6 +6244,14 @@ fn json_to_node_address_proto(v: &serde_json::Value) -> core_v1::NodeAddress {
     }
 }
 
+fn json_to_node_daemon_endpoints_proto(v: &serde_json::Value) -> core_v1::NodeDaemonEndpoints {
+    core_v1::NodeDaemonEndpoints {
+        kubelet_endpoint: v.get("kubeletEndpoint").map(|ke| core_v1::DaemonEndpoint {
+            port: ji32(ke, "port"),
+        }),
+    }
+}
+
 fn json_to_node_system_info_proto(v: &serde_json::Value) -> core_v1::NodeSystemInfo {
     core_v1::NodeSystemInfo {
         machine_id: jstr(v, "machineID"),
@@ -6276,6 +6284,9 @@ fn json_to_node_status_proto(v: &serde_json::Value) -> core_v1::NodeStatus {
             .map(|a| a.iter().map(json_to_node_address_proto).collect())
             .unwrap_or_default(),
         node_info: v.get("nodeInfo").map(json_to_node_system_info_proto),
+        daemon_endpoints: v
+            .get("daemonEndpoints")
+            .map(json_to_node_daemon_endpoints_proto),
         ..Default::default()
     }
 }
@@ -11517,13 +11528,14 @@ mod tests {
         // codebase, unaffected by this encoder), so a straight schema-oracle assertion here
         // would fail on pre-existing gaps this bead did not introduce and does not fix:
         // spec.configSource (deprecated since 1.22), status.config.* (kubelet dynamic config,
-        // same deprecated feature), status.daemonEndpoints/images/volumesAttached/volumesInUse/
+        // same deprecated feature), status.images/volumesAttached/volumesInUse/
         // runtimeHandlers/declaredFeatures/features/nodeInfo.swap. Tracked as a P3 follow-on
-        // rather than expanded here.
+        // rather than expanded here. status.daemonEndpoints is NOT excluded: a typed
+        // clientset's Get() negotiates protobuf by default for this kind, so this field must
+        // survive the round trip for kubelet-port-dependent clients (e.g. MetricsGrabber).
         let excluded = [
             "spec.configSource",
             "status.config",
-            "status.daemonEndpoints",
             "status.images",
             "status.volumesAttached",
             "status.volumesInUse",
@@ -12950,6 +12962,37 @@ mod tests {
         assert_eq!(decoded["status"]["allocatable"]["memory"], "7Gi");
         assert_eq!(decoded["status"]["conditions"][0]["type"], "Ready");
         assert_eq!(decoded["status"]["addresses"][0]["address"], "192.168.1.10");
+    }
+
+    /// A client-go typed clientset's `CoreV1().Nodes().Get()` negotiates protobuf by default
+    /// for this built-in kind, so every read of a Node's `status.daemonEndpoints.kubeletEndpoint
+    /// .port` goes through this encode path. Before this fix, `json_to_node_status_proto` never
+    /// populated `daemon_endpoints` at all, so the field decoded back as absent (Port 0) on
+    /// EVERY such Get — not just after an apiserver restart. This is the exact failure behind
+    /// `[sig-instrumentation] MetricsGrabber should grab all metrics from a Kubelet`: the test
+    /// reads this field via its typed client, sees Port=0, and aborts before ever reaching
+    /// metrics-server.
+    #[test]
+    fn encode_node_proto_gen_round_trips_daemon_endpoints() {
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-1" },
+            "status": {
+                "daemonEndpoints": { "kubeletEndpoint": { "port": 10250 } }
+            }
+        });
+
+        let raw = encode_node_proto_gen(&node);
+        let decoded = decode_node_proto_gen(&raw).expect("encoded Node bytes must decode");
+
+        assert_eq!(
+            decoded["status"]["daemonEndpoints"]["kubeletEndpoint"]["port"], 10250,
+            "kubeletEndpoint.port must survive the JSON->protobuf->JSON round trip a typed \
+             clientset's protobuf-negotiated Get() performs, otherwise every such client sees \
+             Port=0 and any port-dependent kubelet interaction (e.g. metrics scraping) breaks; \
+             got: {decoded:#?}"
+        );
     }
 
     /// Endpoints (legacy API) round-trips subset addresses/ports: kube-proxy's legacy
