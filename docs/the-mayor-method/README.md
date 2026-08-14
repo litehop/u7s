@@ -222,12 +222,13 @@ Different lenses find different issues.
 ## Standing prompts
 
 The cron prompts I register with the scheduler are defined in
-[`bootstrap.md`](./bootstrap.md). Five `/loop` blocks: bead dispatch,
-clustering review, worktree hygiene, PR merge, and dashboard.md upkeep. Each
-carries its own operating manual inline (short-circuit rules,
-phase-transition behaviour, `--admin` discipline, the Windows-worktree
-merge trap recovery sequence). Register them once with your local
-scheduler; let the cadence carry the loop.
+[`bootstrap.md`](./bootstrap.md) — a single flat pasteable prompt, not
+separate documents. It sets up six cadences (reread the posture, worktree
+hygiene, cluster review, PR merge, bead dispatch, dashboard refresh) and
+inlines one loop body directly (the worktree-hygiene sweep for orphaned
+host processes); the rest point to their canonical bodies in
+[`dispatch-prompt-template.md`](./dispatch-prompt-template.md). Register
+the prompt once with your local scheduler; let the cadence carry the loop.
 
 
 

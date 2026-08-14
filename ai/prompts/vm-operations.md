@@ -26,10 +26,8 @@ the address rewrite automatically when given `--port <PORT>`.
 `<KUBELET_PORT>` is the host-side port-forward for the kubelet's guest port 10250.
 Each worker VM forwards to a different host port so parallel log/exec/attach requests
 don't collide. Always pass `--kubelet-port <KUBELET_PORT>` to `run-all.sh` and
-`u7s-start.sh`. Provision the VM with its kubelet port before the first run:
-```bash
-scripts/worker-vm.sh start <VM> 127.0.0.1 <KUBELET_PORT>
-```
+`u7s-start.sh` — `run-all.sh` (via `lima-start.sh`) provisions the VM with this port
+automatically on first run; no separate provisioning step is needed.
 
 **Never `limactl stop <VM>` when you finish.** The mayor owns VM lifecycle across the
 whole session and reassigns your VM to the next worker once you're done — stopping it
@@ -41,7 +39,7 @@ itself running.
 **Bumping a VM's memory** (the one case where stopping it is legitimate) has two
 traps: `run-all.sh --reset` silently reverts `limactl edit --memory` because
 `--reset` reprovisions from `lima/kubelet.yaml` (4GiB default, no `--memory`
-override in `lima-start.sh`/`worker-vm.sh`); and `limactl stop`/`start` kills
+override in `lima-start.sh`); and `limactl stop`/`start` kills
 kubelet (its systemd unit is disabled in the base image) — restarting KCM alone
 won't bring it back. Safe sequence:
 ```bash
@@ -124,9 +122,13 @@ pre-built binary; for normal worktree iteration, omit it.
 
 `--focus`/bare-run/`--stack-only` above all operate within `--mode=certified-conformance`
 (the `[Conformance]`-tagged subset). `--all-e2e` widens the run to the full e2e ginkgo
-set instead (`--e2e-focus=".*"` with `--e2e-skip="\[Disruptive\]|\[Flaky\]|\[Slow\]"`),
-surfacing plain `ginkgo.It` specs (e.g. SSA field-manager tests) that certified-conformance
-never exercises. This is a periodic discovery / perf-baseline run, NOT a per-PR gate —
+set instead (`--e2e-focus=".*"` with `--e2e-skip="\[Flaky\]"`). `[Disruptive]` and
+`[Slow]` are deliberately NOT skipped — checked against upstream's release-1.36
+`test/conformance/testdata/conformance.yaml`, 2 `[Disruptive]` and 6 `[Slow]` specs are
+ALSO `[Conformance]`, so skipping them would silently drop conformance coverage that
+`--mode=certified-conformance` does exercise. Surfaces plain `ginkgo.It` specs (e.g. SSA
+field-manager tests) that certified-conformance never exercises. This is a periodic
+discovery / perf-baseline run, NOT a per-PR gate —
 **wall-clock is ~6-12h, vs certified's ~25min** (PR #966 made ginkgo's `--procs=16`
 the default, replacing a silently-serial certified-conformance path). Only run it
 when explicitly asked to.
