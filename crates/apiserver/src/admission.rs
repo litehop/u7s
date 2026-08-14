@@ -251,7 +251,7 @@ pub(crate) struct LabelSelector {
     match_expressions: Vec<LabelSelectorRequirement>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct LabelSelectorRequirement {
     key: String,
@@ -321,6 +321,32 @@ pub(crate) fn label_selector_matches(
     }
 
     true
+}
+
+/// The diagnostic context to log when a namespaceSelector skip occurs: the labels
+/// `fetch_namespace_labels` actually observed, and the selector fields they were evaluated
+/// against.
+///
+/// Exists so a recurrence of mayor-z1p1u (a namespaceSelector that inexplicably never matched a
+/// namespace label patched after namespace creation) is self-diagnosing from logs alone --
+/// without this, a skip log line cannot distinguish "labels genuinely didn't match" from "fetch
+/// returned stale/wrong/empty labels", the exact ambiguity that stalled both the original
+/// investigation and a follow-up 8-way parallel repro campaign.
+struct NamespaceSelectorSkipContext<'a> {
+    observed_labels: &'a BTreeMap<String, String>,
+    selector_match_labels: Option<&'a BTreeMap<String, String>>,
+    selector_match_expressions: Option<&'a Vec<LabelSelectorRequirement>>,
+}
+
+fn namespace_selector_skip_context<'a>(
+    selector: Option<&'a LabelSelector>,
+    observed_labels: &'a BTreeMap<String, String>,
+) -> NamespaceSelectorSkipContext<'a> {
+    NamespaceSelectorSkipContext {
+        observed_labels,
+        selector_match_labels: selector.map(|s| &s.match_labels),
+        selector_match_expressions: selector.map(|s| &s.match_expressions),
+    }
 }
 
 /// Evaluate a webhook's `matchConditions` and report whether the webhook should be invoked.
@@ -1226,7 +1252,16 @@ async fn invoke_mutating_webhook<S: Store>(
         if let Some(ns) = ctx.namespace {
             let ns_labels = fetch_namespace_labels(state, ns).await;
             if !label_selector_matches(webhook.namespace_selector.as_ref(), &ns_labels) {
+                let skip_ctx = namespace_selector_skip_context(
+                    webhook.namespace_selector.as_ref(),
+                    &ns_labels,
+                );
                 tracing::debug!(
+                    webhook_name = %webhook.name,
+                    namespace = %ns,
+                    observed_labels = ?skip_ctx.observed_labels,
+                    selector_match_labels = ?skip_ctx.selector_match_labels,
+                    selector_match_expressions = ?skip_ctx.selector_match_expressions,
                     "admission: mutating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
                     webhook.name, ns
                 );
@@ -2703,7 +2738,16 @@ pub async fn run_cel_mutating_policies<S: Store>(
                 Some(ns) => {
                     let ns_labels = fetch_namespace_labels(state, ns).await;
                     if !label_selector_matches(binding_ns_selector.as_ref(), &ns_labels) {
+                        let skip_ctx = namespace_selector_skip_context(
+                            binding_ns_selector.as_ref(),
+                            &ns_labels,
+                        );
                         tracing::debug!(
+                            binding_name = %binding["metadata"]["name"].as_str().unwrap_or("unknown"),
+                            namespace = %ns,
+                            observed_labels = ?skip_ctx.observed_labels,
+                            selector_match_labels = ?skip_ctx.selector_match_labels,
+                            selector_match_expressions = ?skip_ctx.selector_match_expressions,
                             "admission: MutatingAdmissionPolicyBinding \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
                             binding["metadata"]["name"].as_str().unwrap_or("unknown"),
                             ns
@@ -3025,7 +3069,16 @@ async fn run_validating_admission_policies<S: Store>(
                 Some(ns) => {
                     let ns_labels = fetch_namespace_labels(state, ns).await;
                     if !label_selector_matches(binding_ns_selector.as_ref(), &ns_labels) {
+                        let skip_ctx = namespace_selector_skip_context(
+                            binding_ns_selector.as_ref(),
+                            &ns_labels,
+                        );
                         tracing::debug!(
+                            binding_name = %binding["metadata"]["name"].as_str().unwrap_or("unknown"),
+                            namespace = %ns,
+                            observed_labels = ?skip_ctx.observed_labels,
+                            selector_match_labels = ?skip_ctx.selector_match_labels,
+                            selector_match_expressions = ?skip_ctx.selector_match_expressions,
                             "admission: VAP binding \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
                             binding["metadata"]["name"].as_str().unwrap_or("unknown"),
                             ns
@@ -3288,10 +3341,19 @@ pub async fn run_validating_webhooks<S: Store>(
                 if let Some(ns) = ctx.namespace {
                     let ns_labels = fetch_namespace_labels(state, ns).await;
                     if !label_selector_matches(webhook.namespace_selector.as_ref(), &ns_labels) {
+                        let skip_ctx = namespace_selector_skip_context(
+                            webhook.namespace_selector.as_ref(),
+                            &ns_labels,
+                        );
                         tracing::debug!(
-                        "admission: validating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
-                        webhook.name, ns
-                    );
+                            webhook_name = %webhook.name,
+                            namespace = %ns,
+                            observed_labels = ?skip_ctx.observed_labels,
+                            selector_match_labels = ?skip_ctx.selector_match_labels,
+                            selector_match_expressions = ?skip_ctx.selector_match_expressions,
+                            "admission: validating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
+                            webhook.name, ns
+                        );
                         continue;
                     }
                 }
@@ -5393,6 +5455,74 @@ mod tests {
         assert!(
             !label_selector_matches(Some(&dne_sel), &with_key),
             "DoesNotExist must not match when the key is present"
+        );
+    }
+
+    // -- namespace_selector_skip_context unit tests --
+
+    /// mayor-z1p1u was a one-time conformance sighting (namespaceSelector never matched a
+    /// namespace label patched after namespace creation) that could not be reproduced by a
+    /// follow-up 8-way parallel repro campaign, because the original apiserver.log had already
+    /// rotated out and only recorded the webhook name and namespace string -- not what labels
+    /// were actually observed or what the selector required. This asserts the diagnostic
+    /// context built for the skip log carries the real fetched labels (not a stale/empty
+    /// stand-in) and the real selector fields, so a recurrence is self-diagnosing from the log
+    /// line alone.
+    #[test]
+    fn namespace_selector_skip_receives_observed_labels_so_recurrence_of_z1p1u_is_self_diagnosing()
+    {
+        let sel = LabelSelector {
+            match_labels: [("env".into(), "prod".into())].into(),
+            match_expressions: vec![LabelSelectorRequirement {
+                key: "team".into(),
+                operator: "Exists".into(),
+                values: vec![],
+            }],
+        };
+        let observed_dev_labels: BTreeMap<String, String> = [("env".into(), "dev".into())].into();
+        assert!(
+            !label_selector_matches(Some(&sel), &observed_dev_labels),
+            "test setup: selector must genuinely not match these labels"
+        );
+
+        let ctx = namespace_selector_skip_context(Some(&sel), &observed_dev_labels);
+
+        assert_eq!(
+            ctx.observed_labels, &observed_dev_labels,
+            "skip context must carry the labels actually fetched (env=dev), not an empty or \
+             stale map -- otherwise a genuine mismatch is indistinguishable from a broken fetch"
+        );
+        assert_eq!(
+            ctx.selector_match_labels,
+            Some(&sel.match_labels),
+            "skip context must carry the selector's matchLabels (env=prod) so the log shows \
+             what was required, not just that something was required"
+        );
+        assert_eq!(
+            ctx.selector_match_expressions,
+            Some(&sel.match_expressions),
+            "skip context must carry the selector's matchExpressions (team Exists) so match \
+             conditions beyond matchLabels are also visible in the skip log"
+        );
+    }
+
+    /// Cluster-scoped requests have no namespaceSelector to report against (the caller never
+    /// evaluates one), so the context must surface `None` rather than fabricate an empty
+    /// selector that could be misread as "matchLabels: {}" (which matches everything).
+    #[test]
+    fn namespace_selector_skip_context_reports_absent_selector_as_none() {
+        let observed: BTreeMap<String, String> = BTreeMap::new();
+        let ctx = namespace_selector_skip_context(None, &observed);
+
+        assert_eq!(
+            ctx.selector_match_labels, None,
+            "absent selector must surface as None, not an empty map indistinguishable from \
+             match-all"
+        );
+        assert_eq!(
+            ctx.selector_match_expressions, None,
+            "absent selector must surface as None, not an empty list indistinguishable from \
+             match-all"
         );
     }
 
