@@ -5281,7 +5281,41 @@ fn json_to_container_status_proto(v: &serde_json::Value) -> core_v1::ContainerSt
         // after the kubelet successfully actuates a resize request.
         resources: v.get("resources").map(json_to_resource_requirements_proto),
         allocated_resources: json_quantity_map_to_proto(v, "allocatedResources"),
+        // volumeMounts/user: kubelet-reported status the resize conformance test's
+        // apiequality.Semantic.DeepEqual compares between a protobuf-negotiated Get and the
+        // (always-JSON) /resize subresource Get. Without these, the two never match even when
+        // the underlying stored pod is identical, so the conformance poll never converges.
+        volume_mounts: v
+            .get("volumeMounts")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_volume_mount_status_proto).collect())
+            .unwrap_or_default(),
+        user: v.get("user").map(json_to_container_user_proto),
         ..Default::default()
+    }
+}
+
+fn json_to_volume_mount_status_proto(v: &serde_json::Value) -> core_v1::VolumeMountStatus {
+    core_v1::VolumeMountStatus {
+        name: jstr(v, "name"),
+        mount_path: jstr(v, "mountPath"),
+        read_only: jbool(v, "readOnly"),
+        recursive_read_only: jstr(v, "recursiveReadOnly"),
+        ..Default::default()
+    }
+}
+
+fn json_to_container_user_proto(v: &serde_json::Value) -> core_v1::ContainerUser {
+    core_v1::ContainerUser {
+        linux: v.get("linux").map(|l| core_v1::LinuxContainerUser {
+            uid: ji64(l, "uid"),
+            gid: ji64(l, "gid"),
+            supplemental_groups: l
+                .get("supplementalGroups")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_i64()).collect())
+                .unwrap_or_default(),
+        }),
     }
 }
 
@@ -5773,6 +5807,13 @@ fn json_to_pod_status_proto(v: &serde_json::Value) -> core_v1::PodStatus {
         // WaitForPodObservedGeneration) always reads back 0 regardless of what the kubelet
         // actually wrote, so it can never observe convergence and times out.
         observed_generation: ji64(v, "observedGeneration"),
+        // resize/resources/allocatedResources (pod-level, distinct from the per-container
+        // fields above) — the in-place-resize conformance test's DeepEqual compares a
+        // protobuf-negotiated Get against the (always-JSON) /resize subresource Get; without
+        // these the two never match even when the stored pod is identical.
+        resize: jstr(v, "resize"),
+        resources: v.get("resources").map(json_to_resource_requirements_proto),
+        allocated_resources: json_quantity_map_to_proto(v, "allocatedResources"),
         ..Default::default()
     }
 }
@@ -11574,22 +11615,19 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect_leaf_paths(&redecoded["status"], "", &mut paths);
 
-        // Excluded, all alpha/feature-gated and outside mayor-13y4a's scope (Pod/Volume/
-        // Container hot-path fields) — tracked as a P3 follow-on rather than expanded here:
-        // resize/resizeStatus (InPlacePodVerticalScaling, deprecated in favor of the
-        // allocatedResources/resources this bead already covers), containerStatuses[].
-        // volumeMounts (VolumeMountStatus, 1.34+), containerStatuses[].user (ContainerUser,
-        // SupplementalGroupsPolicy), containerStatuses[].stopSignal (ContainerStopSignals),
+        // Excluded, all alpha/feature-gated and outside this test's scope — tracked as a P3
+        // follow-on rather than expanded here: resizeStatus (legacy alias, superseded by
+        // `resize`), containerStatuses[].stopSignal (ContainerStopSignals),
         // containerStatuses[].allocatedResourcesStatus (ResourceHealth, ResourceHealthStatus),
         // and the DRA claim-status fields (resourceClaimStatuses, extendedResourceClaimStatus,
-        // nodeAllocatableResourceClaimStatuses).
-        let excluded_prefixes = ["resize", "resizeStatus"];
-        let excluded_substrings = [
-            ".volumeMounts",
-            ".user",
-            ".stopSignal",
-            ".allocatedResourcesStatus",
-        ];
+        // nodeAllocatableResourceClaimStatuses), plus volumeMounts[].volumeStatus
+        // (ImageVolumeWithDigest, alpha). `resize`, containerStatuses[].volumeMounts (aside from
+        // volumeStatus) and containerStatuses[].user are now handled by json_to_pod_status_proto
+        // / json_to_container_status_proto — the in-place-resize conformance test's DeepEqual
+        // compares a protobuf-negotiated Get against the /resize subresource's JSON Get, and
+        // these fields must round-trip identically or the two never match.
+        let excluded_prefixes = ["resizeStatus"];
+        let excluded_substrings = [".stopSignal", ".allocatedResourcesStatus", ".volumeStatus"];
         let excluded_top_level = [
             "resourceClaimStatuses",
             "extendedResourceClaimStatus",
@@ -11895,6 +11933,72 @@ mod tests {
             decoded["status"]["containerStatuses"][0]["allocatedResources"]["memory"], "256Mi",
             "containerStatuses[].allocatedResources must survive — the kubelet compares this \
              against the container's requests to admit further resizes"
+        );
+    }
+
+    /// The in-place-resize conformance test ("resize pod via the replace endpoint") issues a
+    /// resize, then compares a protobuf-negotiated `Pods.Get` against a JSON `Get` on the
+    /// `/resize` subresource via `apiequality.Semantic.DeepEqual`. The `/resize` handler always
+    /// returns the stored JSON verbatim, so any field this encoder drops on the protobuf side
+    /// makes the two permanently unequal — the poll never converges and the test fails at
+    /// pod_resize.go:823 ("pod from resize subresource not equivalent to pod"), even though the
+    /// underlying stored pod is identical on both sides.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_resize_subresource_comparison_fields() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "resize-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }]
+            },
+            "status": {
+                "resize": "Proposed",
+                "resources": { "requests": { "cpu": "150m" } },
+                "allocatedResources": { "cpu": "150m" },
+                "containerStatuses": [{
+                    "name": "c",
+                    "volumeMounts": [{
+                        "name": "kube-api-access",
+                        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                        "readOnly": true,
+                        "recursiveReadOnly": "Disabled"
+                    }],
+                    "user": {
+                        "linux": { "uid": 65535, "gid": 0, "supplementalGroups": [0] }
+                    }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["status"]["resize"], "Proposed",
+            "status.resize must survive — the conformance test's kubelet-side poll observes \
+             this field transition, and dropping it makes a protobuf Get diverge from the \
+             /resize subresource's JSON Get for a pod with an in-progress resize"
+        );
+        assert_eq!(
+            decoded["status"]["resources"]["requests"]["cpu"], "150m",
+            "pod-level status.resources must survive — distinct from the per-container \
+             containerStatuses[].resources already covered above"
+        );
+        assert_eq!(
+            decoded["status"]["allocatedResources"]["cpu"], "150m",
+            "pod-level status.allocatedResources must survive — distinct from the per-container \
+             containerStatuses[].allocatedResources already covered above"
+        );
+        assert_eq!(
+            decoded["status"]["containerStatuses"][0]["volumeMounts"][0]["mountPath"],
+            "/var/run/secrets/kubernetes.io/serviceaccount",
+            "containerStatuses[].volumeMounts must survive — every pod has a projected \
+             service-account token mount, so dropping this field breaks the DeepEqual \
+             comparison for essentially every real pod, not just resized ones"
+        );
+        assert_eq!(
+            decoded["status"]["containerStatuses"][0]["user"]["linux"]["uid"], 65535,
+            "containerStatuses[].user must survive — the kubelet reports the container's \
+             actual running identity here, and every running container has one"
         );
     }
 
