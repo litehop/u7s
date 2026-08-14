@@ -139,6 +139,11 @@ fn main() {
         codegen::generate_object_reference(&descriptor_bytes),
     )
     .expect("failed to write generated ObjectReference codec");
+    std::fs::write(
+        out_dir.join("volume_source_gen.rs"),
+        codegen::generate_volume_source(&descriptor_bytes),
+    )
+    .expect("failed to write generated VolumeSource codec");
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -147,5 +152,9 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("build/codegen.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/proto_exceptions.rs").display()
     );
 }
