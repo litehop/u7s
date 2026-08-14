@@ -739,10 +739,9 @@ fn get_or_create_shard(
 /// idle-check (`watchers == 0`) and the removal to happen under the SAME write-lock acquisition
 /// (so a reconnecting watch can't slip in between the two), which means it does its own
 /// conditional variant of this one-line removal inline rather than composing this fully
-/// unconditional helper. This exists for a caller with a genuinely different invariant: CRD-delete
-/// eager teardown (mayor-88h1w) removes a shard because its resource TYPE no longer exists, which
-/// is unconditionally correct regardless of `watchers`.
-#[allow(dead_code)] // mayor-88h1w's CRD-delete teardown is the intended caller; not wired up yet.
+/// unconditional helper. This exists for a caller with a genuinely different invariant:
+/// `evict_resource_type`'s CRD-delete eager teardown removes a shard because its resource TYPE
+/// no longer exists, which is unconditionally correct regardless of `watchers`.
 pub(crate) fn tear_down_shard(
     shards: &RwLock<HashMap<String, Arc<RingShard>>>,
     reclaimed_horizons: &RwLock<HashMap<String, u64>>,
@@ -2254,6 +2253,26 @@ impl Store for SqliteStore {
 
     fn compaction_horizon(&self) -> u64 {
         self.compaction_horizon.load(Ordering::Relaxed)
+    }
+
+    fn evict_resource_type(&self, prefix: &str) {
+        // Every shard rooted at `prefix` — the reverse direction from `matching_shards` (which
+        // finds shards that are a prefix of a WRITE's key): here `prefix` is the shorter,
+        // caller-supplied resource-type root, and we want every shard key that EXTENDS it (the
+        // exact cluster-scoped root itself, plus any namespace-scoped shard for the same
+        // resource type). Collected before removing so `tear_down_shard`'s own write-lock
+        // acquisition per key never nests inside this read lock.
+        let rooted: Vec<String> = self
+            .shards
+            .read()
+            .expect("shards poisoned")
+            .keys()
+            .filter(|shard| shard.starts_with(prefix))
+            .cloned()
+            .collect();
+        for shard_key in rooted {
+            tear_down_shard(&self.shards, &self.reclaimed_horizons, &shard_key);
+        }
     }
 
     fn current_revision(&self) -> u64 {

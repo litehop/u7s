@@ -400,6 +400,21 @@ pub trait Store: Send + Sync + 'static {
         self.compaction_horizon()
     }
 
+    /// Eagerly evict every ring/deletion-log shard rooted at `prefix` — i.e. the shard keyed
+    /// exactly to `prefix` AND any more specific shard whose own key extends it (e.g. a
+    /// namespace-scoped shard alongside a cluster-scoped one for the same resource type; see
+    /// `compaction_horizon_for`'s doc and the sharded implementation's own prefix-match doc for
+    /// why both can exist side by side).
+    ///
+    /// Intended for CRD deletion: once a CRD is gone, no watch can ever legally resume against
+    /// its resource type's history again, so there is no reason to hold that history alive for
+    /// up to the idle-GC grace period after the last watcher happens to disconnect.
+    ///
+    /// Defaults to a no-op, mirroring `compaction_horizon_for`'s default-for-unsharded-stores
+    /// reasoning: an implementation (or test double) that does not shard its ring by resource
+    /// type has nothing local to this `prefix` to evict.
+    fn evict_resource_type(&self, _prefix: &str) {}
+
     /// Return the global revision of the most recently committed write.
     /// Used by watch BOOKMARK heartbeats to advance informer sync RVs across
     /// resource types (KCM ConsistencyStore checks informer RV >= last written RV).
