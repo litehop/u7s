@@ -695,6 +695,41 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group.is_empty() && (plural == "configmaps" || plural == "secrets") {
         validate_data_keys(obj, plural)?;
     }
+    if group == "networking.k8s.io" && plural == "networkpolicies" {
+        validate_network_policy_ports(obj)?;
+    }
+    Ok(())
+}
+
+/// Validates NetworkPolicy `spec.{ingress,egress}[].ports[].endPort` at admission.
+///
+/// Upstream (`pkg/apis/networking/validation/validation.go`'s
+/// `ValidateNetworkPolicyPort`) rejects `endPort` set without `port`: `endPort` names
+/// a range's upper bound, so it is meaningless without a starting `port`. Conformance
+/// test `[sig-network] Netpol API should support creating NetworkPolicy API with
+/// endport field` posts exactly this shape and expects 422. Without this check u7s
+/// silently stores an invalid NetworkPolicy that specifies no actual port restriction,
+/// masking a user's misconfiguration instead of rejecting it up front.
+fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> {
+    for direction in ["ingress", "egress"] {
+        let Some(rules) = obj["spec"][direction].as_array() else {
+            continue;
+        };
+        for (i, rule) in rules.iter().enumerate() {
+            let Some(ports) = rule["ports"].as_array() else {
+                continue;
+            };
+            for (j, port) in ports.iter().enumerate() {
+                if !port["endPort"].is_null() && port["port"].is_null() {
+                    let end_port = &port["endPort"];
+                    return Err(format!(
+                        "spec.{direction}[{i}].ports[{j}].endPort: Invalid value: {end_port}: \
+                         may not be specified when `port` is not specified"
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3807,6 +3842,89 @@ mod tests {
         assert!(
             result.unwrap_err().contains("Secret.data"),
             "error must reference Secret.data"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: NetworkPolicy endPort-without-port rejection
+    // ---------------------------------------------------------------------------
+
+    /// A NetworkPolicy ingress port with `endPort` set but `port` unset must be rejected.
+    ///
+    /// Conformance test [sig-network] Netpol API should support creating NetworkPolicy
+    /// API with endport field posts exactly this shape and expects HTTP 422 (upstream
+    /// `ValidateNetworkPolicyPort` rejects it: `endPort` names a range's upper bound and
+    /// is meaningless without a starting `port`). Without this check u7s stores the
+    /// NetworkPolicy anyway, silently accepting a rule that restricts no actual port —
+    /// this test fails on revert since validate_resource would then return Ok(()).
+    #[test]
+    fn network_policy_ingress_endport_without_port_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "ingress": [{"ports": [{"endPort": 8080}]}]
+            }
+        });
+        let result = validate_resource("networking.k8s.io", "networkpolicies", &obj);
+        assert!(
+            result.is_err(),
+            "NetworkPolicy with endPort set but port unset must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("spec.ingress[0].ports[0].endPort"),
+            "error must point at the offending ingress port: {msg}"
+        );
+    }
+
+    /// Same rejection applies to egress ports, not just ingress.
+    ///
+    /// The upstream check runs identically for both directions; a fix scoped only to
+    /// ingress would leave egress silently accepting the same invalid shape.
+    #[test]
+    fn network_policy_egress_endport_without_port_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "egress": [{"ports": [{"endPort": 9090}]}]
+            }
+        });
+        let result = validate_resource("networking.k8s.io", "networkpolicies", &obj);
+        assert!(
+            result.is_err(),
+            "NetworkPolicy egress port with endPort set but port unset must be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("spec.egress[0].ports[0].endPort"),
+            "error must point at the offending egress port"
+        );
+    }
+
+    /// A NetworkPolicy with both `port` and `endPort` set (a valid range) must pass.
+    ///
+    /// Ensures the endPort check does not regress the common, valid port-range case.
+    #[test]
+    fn network_policy_port_range_with_both_fields_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "ok", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "ingress": [{"ports": [{"port": 8000, "endPort": 9000}]}]
+            }
+        });
+        assert!(
+            validate_resource("networking.k8s.io", "networkpolicies", &obj).is_ok(),
+            "NetworkPolicy with both port and endPort set must pass validation"
         );
     }
 
