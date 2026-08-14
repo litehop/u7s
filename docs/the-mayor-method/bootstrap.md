@@ -108,19 +108,22 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
 
-**Inline sync after every task-notification (MANDATORY while workers are
-active, mayor-t79kb).** Standing cron loops do NOT fire reliably in
-stream-json transport clients (Claude Code VS Code extension, Claude
-desktop app) while a background worker is alive — anthropics/claude-code#86015
-(open). Ticks queue at priority `later` and drain only on the next
-externally-driven operator turn. Symptom: dashboard drift, CLEAN PRs
-sitting unmerged, no hygiene sweeps, no bead-dispatch passes — exactly
-the coverage the loops above exist to provide, silently disabled during
-exactly the sessions with the most worker traffic.
+**Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
+Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
+`claude` from the shell) and the compensating pattern below is NOT required
+there — rely on the loops registered above. The pattern IS required in
+stream-json transport clients (Claude Code VS Code extension, Claude desktop
+app), where the cron feature does NOT fire while a background worker is alive
+— anthropics/claude-code#86015 (open). In those clients ticks queue at priority
+`later` and drain only on the next externally-driven operator turn, so
+dashboard drift, CLEAN PRs sitting unmerged, and missed hygiene sweeps result —
+exactly during sessions with the most worker traffic.
 
-Compensating pattern: after EVERY task-notification received while 1+
-workers are still active, inline the following before either dispatching
-the next worker or ending the turn:
+Compensating pattern (REQUIRED in VS Code extension / desktop app; skip on the
+CLI, though cheap enough as belt-and-suspenders if uncertain which transport
+this session is on): after EVERY task-notification received while 1+ workers
+are still active, inline the following before either dispatching the next
+worker or ending the turn:
 1. `gh pr list --state open --json number,title,mergeStateStatus` — merge
    any CLEAN PR with `gh pr merge <N> --merge`.
 2. Refresh `ai/dashboard.md` with a fresh `date -u` timestamp.
@@ -128,11 +131,9 @@ the next worker or ending the turn:
 4. Verify the returning worker's worktree is cleaned up and its bead is
    closed (close it if the worker didn't).
 
-Cost: ~5-10 additional tool calls per notification. Tolerable overhead,
-and reliable regardless of the underlying transport bug. Loops are still
-worth registering above — they fire during quiet windows (session start,
-after all workers finish) as a backstop — but they cannot be the ONLY
-sync mechanism while workers are active. See bd memory
+Cost when the pattern applies: ~5-10 additional tool calls per notification.
+If you don't know which transport you're on, run the pattern anyway — cheap
+on the CLI, load-bearing in the extension. See bd memory
 `claude-code-cron-loops-blocked-by-background-workers-in-stream-json-transport`.
 
 **Worktree hygiene loop body — orphaned host processes (mayor-yfvxn).**
