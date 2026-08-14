@@ -91,57 +91,70 @@ pub static WATCH_RING_OCCUPANCY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
-/// Wall-clock SPAN covered by the events a shard's ring currently retains: the newest retained
-/// event's push time minus the oldest's.
+/// 1..1024s exponential (factor 2, 11 buckets). Chosen from measurement, not guesswork: a
+/// `RING_CAPACITY=512` production run polled every 30s reported span min=2s, p10=13s,
+/// median=83s, max=511s — a 250x range — so these buckets bracket that with headroom on both
+/// ends. Deliberately starts at 1s rather than 0s: every bucket boundary is an inclusive `<=`
+/// upper bound, so a span of exactly 0 (see the metric's own doc) still falls inside the first
+/// (`le="1"`) bucket rather than needing its own boundary.
+fn watch_ring_span_seconds_buckets() -> Vec<f64> {
+    prometheus::exponential_buckets(1.0, 2.0, 11).expect("static bucket definition is valid")
+}
+
+/// Wall-clock SPAN covered by the events a shard's ring retains at each push: that push's newest
+/// retained event's push time minus the oldest's, observed into a histogram rather than held as
+/// a single "current" gauge value.
 ///
 /// READ THIS BEFORE INTERPRETING THE NUMBER. This is deliberately NOT "how long ago was the
-/// oldest event," and the difference bites exactly when a reader is not expecting it. The value
-/// is recomputed only when this shard is WRITTEN (it is set from inside `push_event_locked`),
-/// so both ends of the subtraction are push times. Consequences:
+/// oldest event." Both ends of the subtraction are push times, so while a shard is being
+/// actively written, newest ~= now, and the span is also, in effect, the age of the oldest
+/// retained event. A shard holding one event, or several pushed within the same second, observes
+/// 0. That means "spans no measurable time," not "empty" — cross-check `u7s_watch_ring_occupancy`.
 ///
-/// - While a shard is being actively written, newest ≈ now, so the span is also, in effect, the
-///   age of the oldest retained event. This is the case for hot shards, which is where sizing
-///   decisions get made, so in practice the two readings agree where it matters.
-/// - Once a shard goes quiet the value FREEZES at whatever it was on the last push. A shard last
-///   written an hour ago whose ring spans 30s keeps reporting 30, not 3630. Do not read a small
-///   value on an idle shard as "history was just lost."
-/// - A shard holding one event, or several pushed within the same second, reports 0. That means
-///   "spans no measurable time," not "empty" — cross-check `u7s_watch_ring_occupancy`.
+/// THIS IS A HISTOGRAM, NOT A GAUGE, BECAUSE THE DECISION-RELEVANT STATISTIC IS THE MINIMUM, AND
+/// A POLLED GAUGE CANNOT SEE IT. An earlier gauge version of this metric was `.set()` on every
+/// push and read by external Prometheus polling; measurement showed the true worst case lives in
+/// windows as narrow as one push (~2s at RING_CAPACITY=512's write rate) between long stretches
+/// where a hot shard's span sits far higher, so a 30s-cadence poller caught it on 3 of 51 samples
+/// and, at RING_CAPACITY=1500, likely never caught it at all — reporting a reassuringly high
+/// "minimum" that was actually an order of magnitude off, in the dangerous direction, for a
+/// metric whose entire purpose is sizing `RING_CAPACITY` safely. Observing every push into a
+/// histogram instead means the narrow low window is recorded permanently in the low buckets
+/// regardless of when, or whether, anything ever polls — nothing for a sampler to miss. This
+/// also gives percentiles (`histogram_quantile`) beyond the single number a gauge could ever
+/// hold, for the same one-set-per-push instrumentation cost.
 ///
 /// Span, not age-relative-to-now, is the quantity worth having: the ring is read exactly once,
 /// at watch open, to bridge `from_revision -> now`, so what a reconnecting client needs is that
-/// the ring still reaches back past where it left off. A quiet shard's ring being "stale" costs
-/// nothing, because nothing happened for the client to have missed. What does cost is a hot
-/// shard whose span has shrunk below one list-and-reestablish round trip: the client relists,
+/// the ring still reaches back past where it left off. What costs correctness is a hot shard
+/// whose span has shrunk below one list-and-reestablish round trip: the client relists,
 /// re-watches, is expired again because the ring churned meanwhile, and never reaches a
-/// streaming steady state — a relist loop rather than a graceful degradation.
-///
-/// Occupancy alone cannot see any of this. Whether 9,670 retained events is 8 seconds or 8
-/// minutes of cover depends entirely on that shard's write rate.
+/// streaming steady state — a relist loop rather than a graceful degradation. Occupancy alone
+/// cannot see any of this: whether 9,670 retained events is 8 seconds or 8 minutes of cover
+/// depends entirely on that shard's write rate.
 ///
 /// Upstream kube-apiserver sizes its equivalent buffer against exactly this quantity: it holds
 /// a 75s window (`DefaultEventFreshDuration`) and resizes the underlying capacity between 100
-/// and 102,400 entries to keep that window constant as rate varies. This gauge is the
+/// and 102,400 entries to keep that window constant as rate varies. This histogram is the
 /// measurement that would let us do the same instead of guessing at a fixed `RING_CAPACITY`.
-pub static WATCH_RING_SPAN_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
+pub static WATCH_RING_SPAN_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
             "u7s_watch_ring_span_seconds",
-            "Wall-clock span in seconds covered by the events currently retained in the watch \
-             replay ring buffer, by shard: newest retained event's push time minus the oldest's. \
-             This is the depth of watch-replay history available to a reconnecting client. NOT \
-             the age of the oldest event relative to now — it is refreshed only when the shard \
-             is written, so a shard that has stopped receiving writes keeps reporting the span \
-             as of its last push. 0 means the retained events span no measurable time (one \
-             event, or all pushed within the same second), not that the shard is empty.",
-        ),
+            "Wall-clock span in seconds covered by the events retained in the watch replay ring \
+             buffer at each push, by shard: newest retained event's push time minus the oldest's, \
+             observed on every push. NOT the age of the oldest event relative to now. The low \
+             buckets are the decision-relevant reading — they capture the worst-case (minimum) \
+             replay cover this shard has ever produced, which a polled gauge cannot reliably see.",
+        )
+        .buckets(watch_ring_span_seconds_buckets()),
         &["shard"],
     )
     .expect("static metric definition is valid");
     prometheus::default_registry()
-        .register(Box::new(gauge.clone()))
+        .register(Box::new(histogram.clone()))
         .expect("u7s_watch_ring_span_seconds is registered exactly once per process");
-    gauge
+    histogram
 });
 
 /// Current length of each per-resource-type shard's deletion-tombstone log — same class of
