@@ -33,7 +33,7 @@ Decision legend: **KEEP** (decision made, no revisit expected) · **MEASURED**
 | **API server** | NATIVE | Yes | KEEP | Smallest of u7s's own components. Ring-resize + fat LTO landed; protobuf response encoder for hot-path LIST; decode-correctness fixes ongoing. Current figures change with nearly every perf PR — see `ai/findings/` and `dashboard.md`, not restated here. |
 | **Scheduler** | NATIVE | Yes | KEEP | Bin-spread scheduler, custom preemption, DB-04 resolved. Confirmed small relative to the rest of the stack. |
 | **Store** | NATIVE (part of apiserver) | Yes | KEEP | SQLite WAL + sharded watch fan-out + per-shard compaction horizon. |
-| **KCM (kube-controller-manager)** | UPSTREAM | Yes | MEASURED | Runs with `--controllers='*,-cloud-*'`. Confirmed the **second-largest** component in the stack by a wide margin. Native reimplementation attempted then deleted (`mayor-20325`); SA-token provisioning tracked separately as EPIC `mayor-axi12` (deferred). Same evidence-gated process applies to the full component, not just the SA-token sub-issue — an upstream config-tuning audit comes before any rewrite cost-benefit estimate. |
+| **KCM (kube-controller-manager)** | UPSTREAM | Yes | MEASURED | Runs with `--controllers='*,-cloud-*'`. Confirmed the **second-largest** component in the stack by a wide margin. Native reimplementation attempted then deleted (`mayor-20325`). Least-privilege auth gap (was tracked as EPIC `mayor-axi12`) resolved 2026-08-13: dedicated x509 identities replace the `system:masters` admin-cert shim for both KCM (`mayor-c6rml`) and the scheduler (`mayor-c0b1u`, same gap found via the axi12 audit). Same evidence-gated process applies to the full component — an upstream config-tuning audit comes before any rewrite cost-benefit estimate. |
 | **Kubelet** | UPSTREAM | Yes | MEASURED | Runs on every node. Confirmed the **single largest** component by a wide margin — more than double KCM. "Gargantuan" (scope, complexity, footprint) is a real, multi-dimensional description, not a disqualifier: necessity is obvious (skipped), cost is measured, an upstream config-tuning audit is next, native rewrite is only considered after that. Packaging shape (Gate 6) may also factor in eventually. |
 | **CRI-O + crun** | UPSTREAM | Yes | KEEP | Container runtime. No plan to rewrite; measurement was for completeness only. |
 | **kube-proxy** | UPSTREAM | Yes | MEASURED | Low-level networking; native rewrite is high-effort. No presumption either way — same necessity-then-cost-then-tuning-then-rewrite evaluation as everything else, data-first. |
@@ -85,9 +85,10 @@ un-defer trigger.
   `mayor-zpvp2` sampler, producing per-process RSS for every component in the
   matrix above. See the matrix's "On the k3s/k0s comparison" note for what
   this does and doesn't establish yet.
-- Follow-ons filed from that run: no CPU trajectory data yet (`mayor-aozrt`,
-  only RSS was captured), a CoreDNS RSS anomaly (`mayor-b1gz2`), and a
-  monitoring-artifact gap in `run-all.sh` (`mayor-xzkqw`).
+- Follow-ons filed from that run, all since resolved: CPU trajectory
+  instrumentation added (`mayor-aozrt`), the CoreDNS RSS anomaly root-caused
+  and fixed (`mayor-b1gz2`), and the `run-all.sh` monitoring-artifact gap
+  fixed 2026-08-14 (`mayor-xzkqw`, PR #1158).
 - Re-measure after every non-trivial component-level perf change, and once
   the matched k3s-comparison methodology exists.
 
@@ -161,6 +162,40 @@ packaging story would not need to be re-litigated within weeks, and once
 Gate 2's component decisions are far enough along to know what's actually
 being packaged.
 
+### Gate 7 — Migration story (future consideration, NOT STARTED)
+Operator observation (2026-08-14): a fresh-install story (Gate 6) answers
+"how does a new user get a u7s cluster," not "how does an existing k3s/k0s
+user — frustrated with their current distro — move to u7s." Both matter for
+adoption; migration is the harder, later problem. Two distinct sub-problems,
+not one:
+
+- **Control-plane migration without data loss.** Moving the cluster's actual
+  API-object state (Deployments, Services, Secrets, etc.) from the old
+  control plane's backing store into u7s's SQLite store. The likely shape is
+  API-level export/import (list every resource from the old cluster, apply
+  into u7s) rather than a byte-level store migration — that avoids coupling
+  u7s to k3s's embedded-etcd or dqlite internals, at the cost of not
+  preserving resourceVersion/UID history (probably an acceptable trade for a
+  one-time cutover). PersistentVolume *data* (not the API object, the actual
+  bytes on disk) is a separate concern from API-object migration and needs
+  its own story (e.g. rsync-style volume migration) — conflating the two
+  would understate the problem.
+- **Data-plane node conversion.** Because u7s deliberately reuses real
+  upstream kubelet unmodified (see north-star.md's conformance principle),
+  this is structurally simpler than it would be for a distro with a bundled
+  node agent: kubelet is control-plane-agnostic, so converting a node is
+  closer to a normal node re-join (stop the old agent, point kubelet's
+  kubeconfig + CA trust at u7s's apiserver, restart) than a from-scratch
+  rewrite. This is a genuine structural advantage of the
+  reuse-real-components decision, not a proposal to build agent-swap
+  tooling now — worth remembering when Gate 6/7 design work actually starts.
+
+Not a bead yet — no actionable next step exists until Gate 6 (packaging)
+settles the target install/topology shape; you can't design a migration
+*into* a shape that isn't decided yet. Fires after Gate 6, opportunistically
+informed by whichever real distro (k3s most likely, given the north star's
+comparison) the first migration-seeking user is actually running.
+
 ---
 
 ## Standing initiatives (bd EPICs)
@@ -169,10 +204,10 @@ Long-running arcs tracked in bd, not tied to a single gate.
 
 | EPIC | Priority | Status | Trigger / un-defer condition |
 |---|---|---|---|
-| `mayor-axi12` | P3 | DEFERRED | Conformance or Argo CD install exposes SA-token auth gap (Gate 5) |
 | `mayor-u6ju` | P3 | DEFERRED | Gate 5's representative-workload probes (Argo CD or otherwise) demonstrate a real Server-Side Apply requirement — deliberately not pursued speculatively, given SSA's scope |
 | `mayor-8qcaw` | P4 | DEFERRED | Backlog otherwise clears OR DRA conformance failure traces to claim allocation |
-| `mayor-0bd14` | P2 | OPEN (all 10 children CLOSED) | bd-hygiene: mark EPIC closed; no work remaining |
+
+Closed since last revision: `mayor-axi12` (superseded 2026-08-13 by `mayor-c6rml`/`mayor-c0b1u`, both closed — see KCM matrix row) and `mayor-0bd14` (100% of 10 children closed, no work remaining — closed 2026-08-14).
 
 ---
 
@@ -181,9 +216,8 @@ Long-running arcs tracked in bd, not tied to a single gate.
 | Bead | Priority | Note |
 |---|---|---|
 | `mayor-rvkq` | P3 | CRD CEL validation (`x-kubernetes-validations`). A CEL evaluator already exists for `ValidatingAdmissionPolicy` — this would wire it into CR schema validation, not build one from scratch. Trigger: real workload uses CEL in a CRD schema |
-| `mayor-jtlnx` | P3 | Verify `mayor-9sd51`/PR #1134 eliminates 100% of KCM 410 fatal errors. Opportunistic on next conformance run |
+| `mayor-jtlnx` | P3 | PARTIALLY VERIFIED 2026-08-14 against two fresh full-conformance runs: `mayor-9sd51`/PR #1134's fix holds for the `deleteCollection` path (zero fatal errors in either run), but the same tombstoned-CRD condition still surfaces a non-fatal `deleteAllContent`-path error 9-11×/run. Doesn't block conformance (both runs 446/446 or 444/446), but the verb-scoping fix may need extending. See bead notes for exact log evidence |
 | `mayor-9xsn3` | P3 | DRA v1alpha3 registration. Deferred to 1.37 upstream bump (schema growing there) |
-| `mayor-t1h49` | P3 | `ai/prompts/` refresh — stale `controller-manager` references |
 
 ---
 
@@ -199,9 +233,9 @@ Long-running arcs tracked in bd, not tied to a single gate.
 | Networking | WebSocket-only exec/attach/portforward (no SPDY) | operator confirmed 2026-05-28; k8s 1.34+ dropped SPDY |
 | TLS | aws-lc-rs (P-256 ECDSA) — known arm64/Lima compat issue; workaround: use CI | memory: `local-lima-arm64-environment` |
 
-(This table duplicates `project-context.md`'s "Design decisions" section —
-known, tracked as part of `mayor-sks59`'s broader cleanup, not resolved
-here.)
+(`project-context.md`'s "Design decisions" section previously duplicated
+this table; `mayor-sks59` resolved that 2026-08-13 — it now links here
+instead of restating the list.)
 
 ---
 
