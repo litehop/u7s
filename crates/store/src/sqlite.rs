@@ -136,39 +136,56 @@ impl Drop for ShardWatcherGuard {
         if self.shard.watchers.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        let shards = Arc::clone(&self.shards);
-        let key = self.key.clone();
-        let shard = Arc::clone(&self.shard);
-        tokio::spawn(async move {
-            tokio::time::sleep(RING_SHARD_IDLE_GRACE).await;
-            // Re-check AND remove under the SAME write-lock acquisition: a watch that reconnects
-            // during the grace window re-attaches via `find_shard_key`/`get_or_create_shard`
-            // (each of which also needs `shards`' lock), so by the time this write-lock is
-            // granted, any such reconnect has already either bumped `watchers` back above zero
-            // (this check then correctly declines) or has not happened yet (in which case it
-            // will simply create a fresh shard afterward, exactly as if this one had never
-            // existed). `Arc::ptr_eq` guards against the pathological case where this exact key
-            // was removed and then recreated as a DIFFERENT shard in between — removing that new
-            // one instead would silently orphan whatever just attached to it.
-            let removed = {
-                let mut guard = shards.write().expect("shards poisoned");
-                let idle = guard.get(&key).is_some_and(|s| {
-                    Arc::ptr_eq(s, &shard) && s.watchers.load(Ordering::Acquire) == 0
-                });
-                if idle {
-                    guard.remove(&key)
-                } else {
-                    None
-                }
-            };
-            if removed.is_some() {
-                crate::metrics::WATCH_RING_SHARD_EVICTIONS_TOTAL
-                    .with_label_values(&[crate::metrics::prefix_bucket(&key)])
-                    .inc();
-                tracing::debug!(shard = %key, "watch: idle ring shard evicted after grace period");
-            }
-        });
+        schedule_idle_gc(
+            Arc::clone(&self.shards),
+            self.key.clone(),
+            Arc::clone(&self.shard),
+        );
     }
+}
+
+/// Schedule `shard` for removal from `shards` after `RING_SHARD_IDLE_GRACE`, if it still has
+/// zero attached watchers when the grace period elapses. Shared by the two events that can make
+/// a shard's continued existence unjustified: `ShardWatcherGuard::drop` (a watch closed, taking
+/// `watchers` from one to zero) and `get_or_create_shard` (a write just created the shard and no
+/// watch has EVER attached to it — see that function's doc for why a write can create a shard
+/// now, and why "zero watchers since creation" needs the exact same grace-then-reap treatment as
+/// "zero watchers as of just now," or a written-but-never-watched resource type's shard would
+/// live for the rest of the process's life).
+fn schedule_idle_gc(
+    shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
+    key: String,
+    shard: Arc<RingShard>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE).await;
+        // Re-check AND remove under the SAME write-lock acquisition: a watch that reconnects
+        // during the grace window re-attaches via `find_shard_key`/`get_or_create_shard`
+        // (each of which also needs `shards`' lock), so by the time this write-lock is
+        // granted, any such reconnect has already either bumped `watchers` back above zero
+        // (this check then correctly declines) or has not happened yet (in which case it
+        // will simply create a fresh shard afterward, exactly as if this one had never
+        // existed). `Arc::ptr_eq` guards against the pathological case where this exact key
+        // was removed and then recreated as a DIFFERENT shard in between — removing that new
+        // one instead would silently orphan whatever just attached to it.
+        let removed = {
+            let mut guard = shards.write().expect("shards poisoned");
+            let idle = guard
+                .get(&key)
+                .is_some_and(|s| Arc::ptr_eq(s, &shard) && s.watchers.load(Ordering::Acquire) == 0);
+            if idle {
+                guard.remove(&key)
+            } else {
+                None
+            }
+        };
+        if removed.is_some() {
+            crate::metrics::WATCH_RING_SHARD_EVICTIONS_TOTAL
+                .with_label_values(&[crate::metrics::prefix_bucket(&key)])
+                .inc();
+            tracing::debug!(shard = %key, "watch: idle ring shard evicted after grace period");
+        }
+    });
 }
 
 pub struct SqliteStore {
@@ -184,11 +201,14 @@ pub struct SqliteStore {
     /// itself is a separate, larger fan-out axis tracked independently of the ring/deletion_log
     /// sharding this type does.
     tx: broadcast::Sender<Arc<InternalEvent>>,
-    /// Per-resource-type shards (ring buffer + deletion log), created lazily on first write for
-    /// that resource type — a typical run only ever writes a few dozen of the ~40+ core resource
-    /// types plus whatever CRDs are installed, so pre-populating every possible shard up front
-    /// would waste memory on types nobody ever writes. See `shard_key` for how a write's shard
-    /// is derived, and `RingShard`'s doc for why sharding this way matters.
+    /// Per-resource-type shards (ring buffer + deletion log), created lazily — normally by the
+    /// first `watch()` on a resource type, or by a write if that write is a delete nobody's
+    /// shard has recorded yet (see `push_event_locked`'s doc for why deletes are special) — and
+    /// idle-GC'd after `RING_SHARD_IDLE_GRACE` if no watcher ever attaches. A typical run only
+    /// ever writes a few dozen of the ~40+ core resource types plus whatever CRDs are installed,
+    /// so pre-populating every possible shard up front would waste memory on types nobody ever
+    /// writes. See `shard_key` for how a write's shard is derived, and `RingShard`'s doc for why
+    /// sharding this way matters.
     shards: Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
     /// Lowest revision still in the ring buffer of whichever shard has compacted furthest, across
     /// every resource type (advanced via `fetch_max` from each shard's own eviction — see
@@ -285,10 +305,12 @@ impl SqliteStore {
     #[cfg(test)]
     fn push_event_at(&self, event: Arc<InternalEvent>, ns: Option<&str>, now_secs: u32) {
         let shard = shard_key(&event.key, ns);
-        // Pre-create the shard exactly as a real watch would (`push_event_locked` itself no
-        // longer creates one — see its doc). This helper exists to drive ring/deletion_log
-        // internals directly for tests that never open a real watch, so it stands in for that
-        // watch here rather than making every ring-behavior test also open one.
+        // Pre-create the shard exactly as a real watch would (`push_event_locked` only creates
+        // one itself for a delete with no existing match — see its doc; a create/update with no
+        // shard is still dropped on the floor by design). This helper exists to drive
+        // ring/deletion_log internals directly for tests that never open a real watch, so it
+        // stands in for that watch here rather than making every ring-behavior test also open
+        // one.
         get_or_create_shard(&self.shards, &shard);
         push_event_locked(
             &self.tx,
@@ -525,17 +547,28 @@ fn push_into_shard(
 /// broadcast order match revision-assignment order for every writer, closing the race.
 fn push_event_locked(
     tx: &broadcast::Sender<Arc<InternalEvent>>,
-    shards: &RwLock<HashMap<String, Arc<RingShard>>>,
+    shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
     shard_key: &str,
     compaction_horizon: &AtomicU64,
     now_secs: u32,
     event: Arc<InternalEvent>,
 ) {
     // Every EXISTING shard this write is relevant to (zero, one, or occasionally more than one —
-    // see `matching_shards`'s doc). Deliberately NOT `get_or_create_shard`: shards are created
-    // only by `watch()` now, never by a write (see that function's doc and `RingShard`'s field
-    // doc on `SqliteStore::shards`) — a write to a resource type nobody has ever watched simply
-    // has nothing to fan out to, and persists via the caller's sqlite write regardless.
+    // see `matching_shards`'s doc). Normally NOT `get_or_create_shard`: shards are created by
+    // `watch()` (see that function's doc and `RingShard`'s field doc on `SqliteStore::shards`) —
+    // a create/update to a resource type nobody has ever watched simply has nothing to fan out
+    // to, and persists via the caller's sqlite write regardless; a LATER first watch's
+    // `list()`-based backfill will see the object exactly as it is now, so nothing is lost.
+    //
+    // A DELETE is the one exception: `list()`-based backfill only reflects objects that still
+    // exist, so it can never reconstruct a delete for an object that is already gone by the time
+    // a watch first opens. If no shard exists yet to remember this delete, it is gone forever —
+    // this is exactly the "list/watch/create/delete" pattern upstream's CRD e2e fixtures use to
+    // prime a watch cache (create, delete, then watch from the create's own revision expecting
+    // the delete): with zero watchers attached the whole time, `matching_shards` below would
+    // otherwise find nothing, and the delete would silently vanish. So a delete with no matching
+    // shard creates one (idle-GC'd exactly like any other if nobody ever attaches a watcher —
+    // see `get_or_create_shard`'s doc) instead of being dropped.
     let matched = matching_shards(&shards.read().expect("shards poisoned"), &event.key);
 
     // `now_secs` is seconds since the store's epoch, taken by the caller (see `SqliteStore::epoch`)
@@ -544,8 +577,13 @@ fn push_event_locked(
     // racing the clock forward between the two; and it keeps this function a pure function of its
     // arguments, so `push_event_at` can drive the retained-history gauge deterministically in
     // tests instead of sleeping.
-    for (matched_key, shard) in &matched {
-        push_into_shard(matched_key, shard, compaction_horizon, now_secs, &event);
+    if matched.is_empty() && event.value.is_none() {
+        let shard = get_or_create_shard(shards, shard_key);
+        push_into_shard(shard_key, &shard, compaction_horizon, now_secs, &event);
+    } else {
+        for (matched_key, shard) in &matched {
+            push_into_shard(matched_key, shard, compaction_horizon, now_secs, &event);
+        }
     }
     // Best-effort broadcast of the specific event.
     let event_revision = event.revision;
@@ -577,22 +615,28 @@ fn push_event_locked(
 /// common case, once every resource type in use has its shard) and only takes the write lock to
 /// insert a brand-new entry, so steady-state writes never contend with each other on this map.
 ///
-/// Only called from the watch-open path (`SqliteStore::watch`) — writes must NOT create shards
-/// (see `push_event_locked`'s doc: a shard now exists only because some watch is or was
-/// interested in it, not because something was written).
+/// Called from the watch-open path (`SqliteStore::watch`) AND from `push_event_locked` for a
+/// delete that no existing shard is watching yet (see that function's doc for why deletes are
+/// the one write that cannot skip shard creation). Whichever caller actually creates the entry
+/// gets it scheduled for `schedule_idle_gc` here — a shard created by a delete may never gain a
+/// watcher at all, unlike the watch-open caller which always attaches one immediately after, so
+/// this is the one place that can correctly cover both origins with a single grace-period check.
 fn get_or_create_shard(
-    shards: &RwLock<HashMap<String, Arc<RingShard>>>,
+    shards: &Arc<RwLock<HashMap<String, Arc<RingShard>>>>,
     shard: &str,
 ) -> Arc<RingShard> {
     if let Some(existing) = shards.read().expect("shards poisoned").get(shard) {
         return Arc::clone(existing);
     }
     let mut guard = shards.write().expect("shards poisoned");
-    Arc::clone(
-        guard
-            .entry(shard.to_string())
-            .or_insert_with(|| Arc::new(RingShard::new())),
-    )
+    if let Some(existing) = guard.get(shard) {
+        return Arc::clone(existing);
+    }
+    let created = Arc::new(RingShard::new());
+    guard.insert(shard.to_string(), Arc::clone(&created));
+    drop(guard);
+    schedule_idle_gc(Arc::clone(shards), shard.to_string(), Arc::clone(&created));
+    created
 }
 
 /// Unconditionally remove and return `key`'s shard, if present, atomically under `shards`' write
@@ -4897,5 +4941,76 @@ mod tests {
              a shard being repeatedly torn down mid-burst — losing one here means the write path \
              lost data instead of merely losing ring/replay history"
         );
+    }
+
+    /// A create-then-delete on a resource type nobody has ever watched, followed LATER by a
+    /// watch that asks for history starting at the create's own revision, must still observe
+    /// the delete — exactly the "list/watch/create/delete" priming sequence upstream's CRD e2e
+    /// fixtures use (`isWatchCachePrimed`) to warm a fresh watch cache before relying on it.
+    ///
+    /// Why it matters: create-on-first-watch's backfill (`SqliteStore::watch`'s `created_fresh`
+    /// branch) reconstructs a brand-new shard's history from `list()`'s CURRENT state, which by
+    /// definition cannot include an object that has already been deleted. If neither the create
+    /// nor the delete ever touched a shard (because nobody was watching yet), the delete is
+    /// unrecoverable — a watch opened afterward asking for it waits forever. This is the exact
+    /// "gave up waiting for watch event" failure blocking CustomResourceDefinition Watch and
+    /// every FieldValidation/AggregatedDiscovery test that creates a CRD through the shared
+    /// `CreateNewV1CustomResourceDefinition` fixture.
+    #[tokio::test]
+    async fn delete_before_any_watch_is_still_observed_by_a_later_historical_watch() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/mygroup.example.com/widgets/";
+        let key = "/registry/mygroup.example.com/widgets/default/setup-instance";
+        let val = Bytes::from(
+            r#"{"apiVersion":"mygroup.example.com/v1","kind":"Widget","metadata":{"name":"setup-instance","namespace":"default"}}"#,
+        );
+
+        assert!(
+            store.shards.read().expect("shards poisoned").is_empty(),
+            "test setup: nothing has watched or written this resource type yet"
+        );
+
+        let created_rv = store
+            .put(key, val, None)
+            .await
+            .expect("create must succeed");
+        let (deleted_rv, _) = store
+            .delete(key, Some(created_rv))
+            .await
+            .expect("delete must succeed");
+        assert!(
+            deleted_rv > created_rv,
+            "delete must bump the revision past the create it is deleting"
+        );
+
+        // Opened only NOW — strictly after both the create and the delete completed, with zero
+        // watchers ever attached in between. Requests history starting at the create's own
+        // revision, exactly like a client that already observed the create and now wants
+        // everything since.
+        let stream = store
+            .watch(prefix, created_rv)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        let event = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect(
+                "a watch requesting history from the create's own revision must observe the \
+                 delete that happened before it ever opened — timing out here means the delete \
+                 was silently lost because no shard existed to record it",
+            )
+            .expect("stream must not end");
+        match event {
+            WatchEvent::Deleted {
+                key: deleted_key, ..
+            } => {
+                assert_eq!(
+                    deleted_key, key,
+                    "the observed delete must be for the object that was actually deleted"
+                );
+            }
+            other => panic!("expected a Deleted event, got {other:?}"),
+        }
     }
 }
