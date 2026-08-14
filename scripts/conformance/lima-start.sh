@@ -40,6 +40,7 @@
 set -euo pipefail
 
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
+KUBE_NETWORK_POLICIES_YAML="$(dirname "$0")/manifests/kube-network-policies.yaml"
 # shellcheck source=scripts/conformance/_lib.sh
 source "$(dirname "$0")/_lib.sh"
 
@@ -829,6 +830,33 @@ fi
 echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
+
+# kube-network-policies enforces NetworkPolicy ingress+egress via NFQUEUE+nftables+NRI
+# on top of CRI-O's stock bridge CNI (no CNI swap needed) — CRI-O's bridge plugin has
+# no policy engine of its own, so without this DaemonSet, NetworkPolicy objects are
+# accepted+stored by the apiserver but never enforced. Cluster-scoped, so re-applying
+# from a 2nd node's lima-start.sh run is a harmless idempotent no-op.
+echo "Applying kube-network-policies DaemonSet..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$KUBE_NETWORK_POLICIES_YAML"
+
+echo "Waiting for kube-network-policies DaemonSet to be Ready (up to 60s)..."
+NETPOL_READY=0
+for i in $(seq 1 60); do
+  DESIRED=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get ds kube-network-policies -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)
+  READY=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get ds kube-network-policies -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || true)
+  if [ -n "$DESIRED" ] && [ "$DESIRED" != "0" ] && [ "$DESIRED" = "$READY" ]; then
+    NETPOL_READY=1
+    break
+  fi
+  sleep 1
+done
+if [ "$NETPOL_READY" -eq 0 ]; then
+  echo "ERROR: kube-network-policies DaemonSet did not reach Ready within 60s (desired=${DESIRED:-?}, ready=${READY:-?})" >&2
+  echo "--- kube-network-policies pod status ---" >&2
+  kubectl --kubeconfig="$KUBECONFIG_PATH" get pods -n kube-system -l app=kube-network-policies -o wide >&2
+  exit 1
+fi
+echo "kube-network-policies DaemonSet Ready (${READY}/${DESIRED})."
 
 # Inter-node pod routes: nothing else programs a path to a peer's pod subnet — no
 # CNI/BGP here, by design (static routes over the shared user-v2 network). Re-run
