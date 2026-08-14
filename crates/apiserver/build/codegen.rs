@@ -233,21 +233,16 @@ const VOLUME: &str = ".k8s.io.api.core.v1.Volume";
 const QUANTITY: &str = ".k8s.io.apimachinery.pkg.api.resource.Quantity";
 
 /// VolumeSource fields with zero implementation today, matched against the hand-rolled
-/// `json_to_volume_proto`/`gen_pod_spec_to_json` this codegen replaces before it was deleted —
-/// not merely "listed in DELIBERATE_OMISSIONS", which is checked as a *necessary* precondition
-/// below (an assert, not the source of this list) rather than a sufficient one.
-///
-/// Fifteen other `VolumeSource` entries in that table (iscsi/glusterfs/rbd/gitRepo/cinder/
-/// cephfs/flexVolume/flocker/azureFile/vsphereVolume/quobyte/azureDisk/portworxVolume/scaleIO/
-/// storageos) describe a "no plan to implement" policy the hand-rolled code had already reversed
-/// by the time this bead started: `encode_pod_proto_gen_round_trips_rare_deprecated_volume_sources`
-/// / `decode_pod_proto_gen_round_trips_rare_deprecated_volume_sources` (core_gen_adapter.rs)
-/// pin exactly those 15 as supported, round-tripping through real protobuf bytes. Treating
-/// DELIBERATE_OMISSIONS as the sole source of what to skip here would silently delete 15
-/// already-shipped, already-tested volume types and fail both regression tests — this table is
-/// the actual, current omission set; the stale 15 entries are a pre-existing table/code
-/// divergence this codegen preserves as-is (content changes to the table are out of scope for
-/// this bead) rather than "fixes" by matching code to a table nobody has re-confirmed lately.
+/// `json_to_volume_proto`/`gen_pod_spec_to_json` this codegen replaces before it was deleted.
+/// `generate_volume_source`'s per-field loop below asserts this list and
+/// `proto_exceptions.rs`'s DELIBERATE_OMISSIONS name exactly the same VolumeSource fields — the
+/// other ~15 in-tree volume plugins DELIBERATE_OMISSIONS used to also list (iscsi/glusterfs/rbd/
+/// gitRepo/cinder/cephfs/flexVolume/flocker/azureFile/vsphereVolume/quobyte/azureDisk/
+/// portworxVolume/scaleIO/storageos) are pinned as supported by
+/// `encode_pod_proto_gen_round_trips_rare_deprecated_volume_sources` /
+/// `decode_pod_proto_gen_round_trips_rare_deprecated_volume_sources` (core_gen_adapter.rs),
+/// round-tripping through real protobuf bytes, so they were pruned from DELIBERATE_OMISSIONS
+/// rather than kept as a table/code divergence.
 const EXCLUDED_FIELDS: &[&str] = &[
     "awsElasticBlockStore",
     "gcePersistentDisk",
@@ -724,13 +719,18 @@ pub fn generate_volume_source(descriptor_bytes: &[u8]) -> String {
     for field in &message.field {
         let name = field.name();
 
-        if EXCLUDED_FIELDS.contains(&name) {
-            assert!(
-                is_excluded(VOLUME_SOURCE, name),
-                "{name} is in codegen's local EXCLUDED_FIELDS but not in \
-                 proto_exceptions.rs's DELIBERATE_OMISSIONS — every field this codegen skips \
-                 must be a sanctioned omission, not an arbitrary one"
-            );
+        let in_excluded_fields = EXCLUDED_FIELDS.contains(&name);
+        let in_deliberate_omissions = is_excluded(VOLUME_SOURCE, name);
+        assert_eq!(
+            in_excluded_fields, in_deliberate_omissions,
+            "{name}: codegen's local EXCLUDED_FIELDS ({in_excluded_fields}) and \
+             proto_exceptions.rs's DELIBERATE_OMISSIONS ({in_deliberate_omissions}) disagree \
+             for VolumeSource — the two lists must name exactly the same fields now that \
+             DELIBERATE_OMISSIONS has no stale entries left, so any future drift in either \
+             direction is caught at build time instead of silently misdescribing what's \
+             implemented"
+        );
+        if in_excluded_fields {
             continue;
         }
 
