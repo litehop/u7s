@@ -901,6 +901,39 @@ mod tests {
             "CoreDNS image must stay pinned to the version u7s has actually validated, not \
              silently drift to whatever kubeadm's upstream manifest ships next"
         );
+        let container_ports = deployment_body["spec"]["template"]["spec"]["containers"][0]["ports"]
+            .as_array()
+            .expect("container ports must be an array");
+        assert!(
+            container_ports
+                .iter()
+                .any(|p| p["containerPort"] == 9153 && p["name"] == "metrics"),
+            "CoreDNS container must expose containerPort 9153 (named \"metrics\") — without it \
+             the prometheus plugin's listener is unreachable even though it's bound inside the \
+             pod (mayor-wclvi), got {container_ports:?}"
+        );
+
+        let configmap_key = crate::keys::object_key("configmaps", "kube-system", "coredns");
+        let configmap_body: serde_json::Value = serde_json::from_slice(
+            &server
+                .store
+                .get(&configmap_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        let corefile = configmap_body["data"]["Corefile"]
+            .as_str()
+            .expect("Corefile must be a string");
+        assert!(
+            corefile.contains("prometheus 0.0.0.0:9153"),
+            "Corefile must load the prometheus plugin on :9153 — this is the only DNS-side \
+             observability signal (query rate, cache hit/miss, plugin errors) available to \
+             correlate against future CoreDNS RSS spikes (mayor-b1gz2); losing this line \
+             silently regresses that diagnosis path. Corefile was:\n{corefile}"
+        );
 
         let service_key = crate::keys::object_key("services", "kube-system", "kube-dns");
         let service_body: serde_json::Value =
