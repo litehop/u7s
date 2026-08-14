@@ -16,6 +16,11 @@ use base64::Engine;
 /// field-manager convention.
 const FIELD_MANAGER: &str = "bootstrap-installer";
 
+/// The vendored CoreDNS addon bundle (ServiceAccount, ClusterRole, ClusterRoleBinding,
+/// ConfigMap, Deployment, Service) `run()`'s post-bind hook applies via [`apply_yaml_bundle`].
+/// See `manifests/coredns.yaml` for provenance and the departures from upstream.
+pub const COREDNS_MANIFEST: &[u8] = include_bytes!("../manifests/coredns.yaml");
+
 /// Total time budget for retrying transient errors on a single document. The only realistic
 /// cause of a transient error here is this apiserver's own listener having just bound but not
 /// yet begun accepting — 30s is generous headroom for that one-time startup race.
@@ -30,9 +35,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Server-side-apply every YAML document in `yaml_bytes` against the apiserver identified by
 /// the kubeconfig at `kubeconfig_path`, authenticating as `system:bootstrap-installer`.
 ///
-/// Empty (or whitespace-only) input is a deliberate no-op: `run()`'s post-bind hook calls this
-/// with a placeholder `b""` today, before any real manifest exists, to prove the wiring works
-/// end to end. Path A [3/3] swaps that placeholder for real CoreDNS YAML.
+/// Empty (or whitespace-only) input is a deliberate no-op — kept so callers (and tests) can
+/// exercise the wiring without a real manifest bundle.
 ///
 /// A failure here is logged and counted (`u7s_bootstrap_apply_failures_total`) but never
 /// propagated into a process abort — a missing bootstrap addon is degraded-mode, not
@@ -58,10 +62,66 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
         std::str::from_utf8(yaml_bytes).context("bootstrap manifest bundle is not valid UTF-8")?;
     for doc in split_yaml_documents(text) {
         let meta = extract_doc_meta(&doc)?;
+        let base_url = resource_url(&creds.server, &meta)?;
+        // Every apiserver boot after the very first re-applies this same bundle onto objects
+        // that already exist (this is what apply_yaml_bundle_is_idempotent below relies on) --
+        // do_patch's strategic-merge engine only supports a single-field merge key per list
+        // (matching upstream's own `patchMergeKey`), which corrupts kube-dns's Service ports
+        // (both entries share `port: 53`, differing only by protocol) into two copies of
+        // whichever entry the merge processes last. Skipping a document that's already
+        // satisfied avoids ever re-running that merge on steady state.
+        let desired = crate::handlers::json_patch::ssa_body_to_json(doc.as_bytes())
+            .map_err(|e| anyhow::anyhow!("bootstrap manifest document {}: {e:?}", meta.kind))?;
+        if already_applied_remote(&client, &base_url, &desired).await {
+            continue;
+        }
         let url = ssa_url(&creds.server, &meta)?;
         apply_document(&client, &url, doc.as_bytes()).await?;
     }
     Ok(())
+}
+
+/// True if `live` already contains everything `desired` specifies, recursively — i.e.
+/// server-side-applying `desired` on top of `live` would be a pure no-op. Objects compare by
+/// subset (every key `desired` sets must match in `live`; `live` may carry extra server-added
+/// fields like `metadata.uid` or `spec.clusterIPs`); arrays compare pairwise in order, matching
+/// how this applier's own bundle never carries `$patch:delete`/`$setElementOrder` directives
+/// and never reorders a document's own arrays between one boot and the next.
+fn already_applied(desired: &serde_json::Value, live: &serde_json::Value) -> bool {
+    match (desired, live) {
+        (serde_json::Value::Object(d), serde_json::Value::Object(l)) => d
+            .iter()
+            .all(|(k, v)| l.get(k).is_some_and(|lv| already_applied(v, lv))),
+        (serde_json::Value::Array(d), serde_json::Value::Array(l)) => {
+            d.len() == l.len() && d.iter().zip(l).all(|(dv, lv)| already_applied(dv, lv))
+        }
+        _ => desired == live,
+    }
+}
+
+/// GET `url` and report whether the live object already satisfies `desired` (see
+/// [`already_applied`]). Any failure to determine that (404, connection error, non-JSON body)
+/// is treated as "not yet applied" so the caller falls through to the normal PATCH path, which
+/// already handles those cases (create-on-404, retry-on-transient-error) — this check is purely
+/// an optimization/corruption-avoidance short-circuit, never a new failure mode of its own.
+async fn already_applied_remote(
+    client: &reqwest::Client,
+    url: &str,
+    desired: &serde_json::Value,
+) -> bool {
+    let Ok(resp) = client.get(url).send().await else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(body) = resp.bytes().await else {
+        return false;
+    };
+    let Ok(live) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return false;
+    };
+    already_applied(desired, &live)
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +208,9 @@ fn kind_to_resource(kind: &str) -> anyhow::Result<(&'static str, bool)> {
     })
 }
 
-fn ssa_url(server: &str, meta: &DocMeta) -> anyhow::Result<String> {
+/// Build the bare (no query string) URL for the object `meta` describes — usable directly for
+/// a GET, or as the base for [`ssa_url`]'s `?fieldManager=` PATCH URL.
+fn resource_url(server: &str, meta: &DocMeta) -> anyhow::Result<String> {
     let (resource, namespaced) = kind_to_resource(&meta.kind)?;
     let group_path = match meta.api_version.split_once('/') {
         Some((group, version)) => format!("/apis/{group}/{version}"),
@@ -161,8 +223,13 @@ fn ssa_url(server: &str, meta: &DocMeta) -> anyhow::Result<String> {
     } else {
         format!("{group_path}/{resource}/{name}")
     };
+    Ok(format!("{server}{resource_path}"))
+}
+
+fn ssa_url(server: &str, meta: &DocMeta) -> anyhow::Result<String> {
     Ok(format!(
-        "{server}{resource_path}?fieldManager={FIELD_MANAGER}"
+        "{}?fieldManager={FIELD_MANAGER}",
+        resource_url(server, meta)?
     ))
 }
 
@@ -546,7 +613,9 @@ mod tests {
     async fn metric_increments_on_failure() {
         let (cert_pem, key_pem) = dummy_pem_cert_and_key();
         let dir = test_temp_dir("metric");
-        let addr = spawn_mock_http_server(vec![500]).await;
+        // Two 500s: the first is the already-applied pre-check GET (also failing, so it falls
+        // through to the real apply attempt), the second is the actual PATCH.
+        let addr = spawn_mock_http_server(vec![500, 500]).await;
         let kubeconfig_path = dir.join("kubeconfig");
         write_test_kubeconfig(
             &kubeconfig_path,
@@ -729,6 +798,181 @@ mod tests {
         assert_eq!(
             body["data"]["foo"], "bar",
             "re-applying the same manifest must leave data unchanged, not corrupt or drop it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // coredns_manifest_installs_every_kind — the actual bytes run() applies at boot, through
+    // the real applier against a live apiserver. This is the regression backstop for Path A
+    // [3/3]: if `run()`'s wiring ever reverts to applying an empty bundle, or the vendored YAML
+    // bitrots into something the fixed kind_to_resource table can't apply, this fails instead
+    // of silently leaving every future boot without CoreDNS.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coredns_manifest_installs_every_kind_at_its_expected_key() {
+        let server = start_test_apiserver().await;
+
+        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+            .await
+            .expect(
+                "the vendored CoreDNS bundle must apply cleanly against a live apiserver with \
+                 the system:bootstrap-installer RBAC role in place — a failure here means \
+                 every u7s boot silently ships without in-cluster DNS",
+            );
+
+        for (key, kind) in [
+            (
+                crate::keys::object_key("serviceaccounts", "kube-system", "coredns"),
+                "ServiceAccount",
+            ),
+            (
+                crate::keys::group_object_key(
+                    "rbac.authorization.k8s.io",
+                    "clusterroles",
+                    None,
+                    "system:coredns",
+                ),
+                "ClusterRole",
+            ),
+            (
+                crate::keys::group_object_key(
+                    "rbac.authorization.k8s.io",
+                    "clusterrolebindings",
+                    None,
+                    "system:coredns",
+                ),
+                "ClusterRoleBinding",
+            ),
+            (
+                crate::keys::object_key("configmaps", "kube-system", "coredns"),
+                "ConfigMap",
+            ),
+            (
+                crate::keys::group_object_key(
+                    "apps",
+                    "deployments",
+                    Some("kube-system"),
+                    "coredns",
+                ),
+                "Deployment",
+            ),
+            (
+                crate::keys::object_key("services", "kube-system", "kube-dns"),
+                "Service",
+            ),
+        ] {
+            let obj = server
+                .store
+                .get(&key)
+                .await
+                .expect("store get must not fail")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{kind} at key {key} must exist after applying the CoreDNS bundle — \
+                         a missing Kind here means kind_to_resource and this manifest have \
+                         drifted apart"
+                    )
+                });
+            let body: serde_json::Value =
+                serde_json::from_slice(&obj.value).expect("stored object must be valid JSON");
+            assert_eq!(
+                body["kind"].as_str(),
+                Some(kind),
+                "object at {key} must be a {kind}"
+            );
+        }
+
+        let deployment_key =
+            crate::keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
+        let deployment_body: serde_json::Value = serde_json::from_slice(
+            &server
+                .store
+                .get(&deployment_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        assert_eq!(
+            deployment_body["spec"]["template"]["spec"]["containers"][0]["image"].as_str(),
+            Some("registry.k8s.io/coredns/coredns:v1.11.1"),
+            "CoreDNS image must stay pinned to the version u7s has actually validated, not \
+             silently drift to whatever kubeadm's upstream manifest ships next"
+        );
+
+        let service_key = crate::keys::object_key("services", "kube-system", "kube-dns");
+        let service_body: serde_json::Value =
+            serde_json::from_slice(&server.store.get(&service_key).await.unwrap().unwrap().value)
+                .unwrap();
+        assert_eq!(
+            service_body["spec"]["clusterIP"].as_str(),
+            Some("10.96.0.10"),
+            "kube-dns's ClusterIP must stay 10.96.0.10 — kubelet hardcodes this into every \
+             pod's /etc/resolv.conf regardless of what the Service's own manifest says"
+        );
+        let service_ports = service_body["spec"]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert_eq!(
+            service_ports.len(),
+            2,
+            "kube-dns must expose exactly two ports (UDP and TCP), got {service_ports:?}"
+        );
+    }
+
+    /// Re-applying the CoreDNS bundle after it's already installed — the steady-state case on
+    /// every apiserver restart after the very first, since `run()` calls `apply_yaml_bundle`
+    /// unconditionally on every boot — must not corrupt kube-dns's Service ports. `do_patch`'s
+    /// strategic-merge engine only supports a single-field merge key per list (`port`, matching
+    /// upstream's own `patchMergeKey`), so a genuine re-PATCH of a list where two entries share
+    /// `port: 53` (UDP and TCP) collapses both into copies of whichever the merge processes
+    /// last. This fails if the already-applied short-circuit in `apply_yaml_bundle_inner` is
+    /// ever removed or broken.
+    #[tokio::test]
+    async fn coredns_manifest_reapply_does_not_corrupt_kube_dns_ports() {
+        let server = start_test_apiserver().await;
+
+        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+            .await
+            .expect("first apply must succeed");
+        apply_yaml_bundle(&server.kubeconfig_path, COREDNS_MANIFEST)
+            .await
+            .expect("second apply (every later boot) must also succeed");
+
+        let service_key = crate::keys::object_key("services", "kube-system", "kube-dns");
+        let service_body: serde_json::Value = serde_json::from_slice(
+            &server
+                .store
+                .get(&service_key)
+                .await
+                .expect("store get must not fail")
+                .expect("Service must still exist after a second apply")
+                .value,
+        )
+        .expect("stored object must be valid JSON");
+        let ports = service_body["spec"]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert_eq!(
+            ports.len(),
+            2,
+            "kube-dns must still have exactly two ports after a second apply, got {ports:?} — \
+             a merge-key collision on port 53 would collapse both entries into duplicates of \
+             the last one processed"
+        );
+        let protocols: Vec<&str> = ports
+            .iter()
+            .filter_map(|p| p["protocol"].as_str())
+            .collect();
+        assert!(
+            protocols.contains(&"UDP"),
+            "UDP port 53 must survive a second apply, got protocols {protocols:?}"
+        );
+        assert!(
+            protocols.contains(&"TCP"),
+            "TCP port 53 must survive a second apply, got protocols {protocols:?}"
         );
     }
 }
