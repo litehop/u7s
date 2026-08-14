@@ -349,8 +349,8 @@ scripts/conformance/reset.sh --host-only --workdir "$PWD/temp/u7s" --port <YOUR_
 ```
 
 Always pass YOUR OWN assigned `--port` — never omit it and never let it
-default to `6443`, which is the mayor's own live stack; an unscoped `--port`
-can kill IT, not just yours. If your bead used a non-standard konnectivity
+default to `6443`; an unscoped `--port` can kill whatever slot's stack is
+bound there — kill only what you own, not another worker's. If your bead used a non-standard konnectivity
 port slot (rare — standard slots auto-derive it from `--port`: 6443→8135,
 6444→8235, 6445→8335, …), also pass
 `--konnectivity-server-port <YOUR_DERIVED_KONNECTIVITY_PORT>`.
@@ -369,8 +369,8 @@ up a live stack.
 
 If this bead had NO VM/port assignment (pure code/doc bead — you never ran
 `run-all.sh`), skip this step entirely: there is nothing of yours to reap,
-and running it with a default/omitted `--port` risks matching the mayor's
-own live stack on `6443` instead of safely doing nothing.
+and running it with a default/omitted `--port` risks matching whatever's
+running on `6443` instead of safely doing nothing.
 ```
 
 ## Worktree path convention
@@ -519,11 +519,16 @@ limit: ~4 GiB RAM per VM).
 
 **Available VMs and their assigned ports:**
 
+All 6 slots are dispatch-assignable to workers by default. If the operator
+needs a slot for their own use, they will communicate it explicitly and it
+will be dispatched only after that — do NOT preemptively reserve any slot as
+"the operator's."
+
 | VM name | Host port | Kubelet port | Companion kubelet port | Konnectivity | Notes |
 |---|---|---|---|---|---|
-| `lima-node` | `6443` | `10250` | `10260` | `8135` | Mayor's VM — never assign to workers |
+| `lima-node` | `6443` | `10250` | `10260` | `8135` | assignable to workers; the operator will communicate if they need this slot |
 | slot 1 = `lima-node-2` | `6444` | `10251`* | `10261` | `8235` | *currently live on `10252` — see caveat below |
-| slot 2 = `lima-node-3` | `6445` | `10252` | `10262` | `8335` | often repurposed as the operator's 2-node companion node (paired with `lima-node`) — check `limactl list` / the dashboard before assuming it's free |
+| slot 2 = `lima-node-3` | `6445` | `10252` | `10262` | `8335` | workers may pair this slot with any other via `--extra-node <vm>` when a bead needs a 2-node topology — check `limactl list` / the dashboard before assuming it's free |
 | slot 3 = `lima-node-4` | `6446` | `10253` | `10263` | `8435` | |
 | slot 4 = `lima-node-5` | `6447` | `10254` | `10264` | `8535` | |
 | slot 5 = `lima-node-smoke` | `6448` | `10255` | `10265` | `8635` | fixed 2026-07-23 (mayor-1rlwt) — was misconfigured at `10251`, colliding with slot 1 |
