@@ -57,9 +57,14 @@ pub static WATCH_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 /// Counter of apiserver requests, broken out by verb, group, version, resource, scope and
-/// HTTP status code — matches upstream `apiserver_request_total`. Instrumented today at the
-/// watch handler only (open attempts, 410 expiry, and the per-client 429 rejection); extending
-/// this to every non-watch verb is tracked as a follow-on.
+/// HTTP status code — matches upstream `apiserver_request_total`. Instrumented at two sites:
+/// `auth::AuthService::call` records every non-exempt, non-watch request once the inner
+/// handler responds, covering every verb and status code — including handler-encoded outcomes
+/// such as a CRD-tombstone or expired-continue-token 410, not just RBAC's own 401/403. Watch
+/// is recorded separately by `handlers::watch` (200 open, 410 expired resourceVersion, 429
+/// per-client limit) because `AuthService::call` explicitly skips `verb == "watch"` to avoid
+/// double-counting a stream whose outcome the handler commits to before the wrapping
+/// middleware would otherwise observe it.
 pub static REQUEST_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(

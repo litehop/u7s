@@ -3986,6 +3986,95 @@ mod tests {
         );
     }
 
+    /// A 410 Gone from a non-watch handler (a tombstoned CRD group's LIST/GET response, or an
+    /// expired continue-token's LIST response — both real sources in production logs) must
+    /// still land in `apiserver_request_total{code="410"}`. The ring-buffer capacity is sized
+    /// against the measured 410 rate and the re-LIST load it drives; if AuthLayer's generic
+    /// post-`inner.call` recording only ever saw 200s in practice, that sizing decision would
+    /// run blind to exactly the traffic that matters, and reconciling metric vs. log 410 counts
+    /// would require a manual log grep every time. This does not need to reach into cr.rs or
+    /// generic.rs to prove it — the wiring records whatever status code the inner handler
+    /// returns, so a synthetic 410 responder exercises the exact same code path.
+    #[tokio::test]
+    async fn auth_layer_records_request_total_for_non_watch_410_responses() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        use crate::metrics::REQUEST_TOTAL;
+
+        let idx = allow_all_rbac("gone-responder-tester");
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "gone-responder-token".to_owned(),
+            UserInfo {
+                username: "gone-responder-tester".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+                extra: Default::default(),
+            },
+        );
+
+        const RESOURCE: &str = "authtotal410items";
+        async fn gone() -> StatusCode {
+            StatusCode::GONE
+        }
+        let app = Router::new()
+            .route(&format!("/api/v1/namespaces/default/{RESOURCE}"), get(gone))
+            .route(
+                &format!("/api/v1/namespaces/default/{RESOURCE}/{{name}}"),
+                get(gone),
+            )
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+            ));
+
+        // (verb, uri) — LIST mirrors a tombstoned-CRD-group or expired-continue-token
+        // response; GET mirrors a tombstoned-CRD-group read of one specific object.
+        let cases: [(&str, String); 2] = [
+            ("list", format!("/api/v1/namespaces/default/{RESOURCE}")),
+            (
+                "get",
+                format!("/api/v1/namespaces/default/{RESOURCE}/widget1"),
+            ),
+        ];
+
+        for (verb, uri) in cases {
+            let before = REQUEST_TOTAL
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "410"])
+                .get();
+
+            let req = Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", "Bearer gone-responder-token")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::GONE,
+                "precondition: the synthetic handler must actually return 410 for the \
+                 recording assertion below to be meaningful"
+            );
+
+            let after = REQUEST_TOTAL
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "410"])
+                .get();
+            assert_eq!(
+                after,
+                before + 1,
+                "a 410 response on verb={verb:?} must be counted in \
+                 apiserver_request_total{{code=\"410\"}} — otherwise the ring-capacity \
+                 sizing signal (410 rate + the re-LIST load it drives) is blind to every \
+                 410 that doesn't come from the watch handler"
+            );
+        }
+    }
+
     /// After AuthLayer denies a request outright — bad credential or RBAC denial — the
     /// operator must still see it in apiserver_request_total: a credential-stuffing attempt
     /// or an under-privileged caller retrying a forbidden call would otherwise be invisible
