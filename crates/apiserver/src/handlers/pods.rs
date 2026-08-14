@@ -2726,14 +2726,19 @@ pub(crate) async fn patch_pod_status<S: Store>(
 /// Distinguishes "key absent from the patch" (unchanged, preserve the stored value)
 /// from "key explicitly removed" for a single cpu/memory `resource` within a
 /// `requests`/`limits` `section`. `section` is `Option::None` when the whole section
-/// key is missing from the patch's `resources` object — that, an explicit `null`, and
-/// an empty `{}` all mean "remove everything in this section" (matches real k8s and
-/// the "remove cpu&memory limits" conformance case). Only when the section is present
-/// as a non-empty object does per-key semantics apply: an absent key is unchanged, an
+/// key is missing from the patch's `resources` object entirely — a real
+/// `strategicpatch.CreateTwoWayMergePatch` (as kubectl/e2e clients build) omits a
+/// section key altogether when nothing in it changed (e.g. a cpu-only resize of a
+/// container that also has memory limits never mentions `limits` at all), so this must
+/// mean "unchanged", symmetric with `merge_resize_section`'s `None` handling in
+/// `apply_resize_patch`. An explicit `null` or an empty `{}` are the two forms that
+/// actually mean "remove everything in this section" (matches real k8s and the "remove
+/// cpu&memory limits" conformance case). Only when the section is present as a
+/// non-empty object does per-key semantics apply: an absent key is unchanged, an
 /// explicit `null` for that key is a real removal.
 fn resize_section_removes_resource(section: Option<&serde_json::Value>, resource: &str) -> bool {
     match section {
-        None => true,
+        None => false,
         Some(serde_json::Value::Null) => true,
         Some(serde_json::Value::Object(map)) => {
             if map.is_empty() {
@@ -2786,15 +2791,29 @@ pub(crate) fn validate_resize_patch(
         }
     }
 
-    let incoming_containers = match incoming["spec"]["containers"].as_array() {
-        Some(a) => a.as_slice(),
-        None => return Ok(()), // no containers in patch — nothing to validate
-    };
+    let incoming_containers = incoming["spec"]["containers"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    // Sidecar (RestartPolicy: Always) init containers are resizable through the same
+    // GA feature as regular containers, and a real strategic-merge-patch client sends
+    // their resource changes under `spec.initContainers`, not `spec.containers`.
+    let incoming_init_containers = incoming["spec"]["initContainers"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    if incoming_containers.is_empty() && incoming_init_containers.is_empty() {
+        return Ok(()); // no containers or initContainers in patch — nothing to validate
+    }
 
     // Rule 1: only cpu and memory are resizable resource quantities.
     // If the patch specifies ephemeral-storage or any other resource in requests/limits,
     // reject with the k8s message "only cpu and memory resources are mutable".
-    for c in incoming_containers {
+    for (list_key, c) in incoming_containers.iter().map(|c| ("containers", c)).chain(
+        incoming_init_containers
+            .iter()
+            .map(|c| ("initContainers", c)),
+    ) {
         let incoming_resources = &c["resources"];
         if incoming_resources.is_null() {
             continue;
@@ -2805,7 +2824,7 @@ pub(crate) fn validate_resize_patch(
                     if key != "cpu" && key != "memory" {
                         let name = c["name"].as_str().unwrap_or("");
                         return Err(format!(
-                            "Pod {pod_ns}/{pod_name}: spec.containers[name={name}].\
+                            "Pod {pod_ns}/{pod_name}: spec.{list_key}[name={name}].\
                              resources.{section}.{key}: \
                              only cpu and memory resources are mutable",
                         ));
@@ -2865,24 +2884,34 @@ pub(crate) fn validate_resize_patch(
 
     // Rule 3: resize may not remove a resource quantity that is currently set.
     //
-    // A whole section (limits or requests) absent from the patch entirely, explicitly
-    // null, or present-but-empty ({}) means "remove everything in that section" — same
-    // as real k8s. But a resource KEY (cpu/memory) simply absent from an otherwise
-    // non-empty section means "unchanged": strategicpatch.CreateTwoWayMergePatch omits
-    // keys whose value didn't change, so a cpu-only patch never mentions memory at all.
-    // Only an EXPLICIT null for that key signals real removal. Conflating "key absent"
-    // with "key removed" (as a naive serde_json index into a missing key would, since
-    // both yield Value::Null) falsely rejects valid partial resizes.
+    // A whole section (limits or requests) explicitly null, or present-but-empty ({}),
+    // means "remove everything in that section" — same as real k8s. A section key
+    // absent from the patch entirely means "unchanged" (CreateTwoWayMergePatch omits a
+    // section altogether when nothing in it changed), same as a resource KEY simply
+    // absent from an otherwise non-empty section: strategicpatch.CreateTwoWayMergePatch
+    // omits keys whose value didn't change, so a cpu-only patch never mentions memory
+    // at all. Only an EXPLICIT null (at the section or key level) signals real removal.
+    // Conflating "absent" with "removed" (as a naive serde_json index into a missing
+    // key would, since both yield Value::Null) falsely rejects valid partial resizes.
     //
     // Check limits before requests so "resource limits cannot be removed" fires before
     // "resource requests cannot be removed" when both sections are missing (the
     // "Guaranteed pod - remove limits" conformance test expects this ordering).
+    let stored_init_containers = stored["spec"]["initContainers"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
     let stored_by_name: std::collections::HashMap<&str, &serde_json::Value> = stored_containers
         .iter()
+        .chain(stored_init_containers.iter())
         .filter_map(|c| c["name"].as_str().map(|n| (n, c)))
         .collect();
 
-    for c in incoming_containers {
+    for (list_key, c) in incoming_containers.iter().map(|c| ("containers", c)).chain(
+        incoming_init_containers
+            .iter()
+            .map(|c| ("initContainers", c)),
+    ) {
         let name = c["name"].as_str().unwrap_or("");
         let Some(stored_c) = stored_by_name.get(name) else {
             continue; // already caught by Rule 2
@@ -2902,7 +2931,7 @@ pub(crate) fn validate_resize_patch(
             {
                 return Err(format!(
                     "Pod {pod_ns}/{pod_name}: \
-                     spec.containers[name={name}].resources.limits.{resource}: \
+                     spec.{list_key}[name={name}].resources.limits.{resource}: \
                      resource limits cannot be removed",
                 ));
             }
@@ -2918,7 +2947,7 @@ pub(crate) fn validate_resize_patch(
             {
                 return Err(format!(
                     "Pod {pod_ns}/{pod_name}: \
-                     spec.containers[name={name}].resources.requests.{resource}: \
+                     spec.{list_key}[name={name}].resources.requests.{resource}: \
                      resource requests cannot be removed",
                 ));
             }
@@ -2938,13 +2967,21 @@ pub(crate) fn validate_resize_patch(
 /// exclusively for QoS class validation in validate_resize_patch. A whole section
 /// replacement (as done here previously) would drop the omitted key, corrupting the
 /// QoS computation for the *other* resource that the patch never intended to touch.
+///
+/// Merges both `containers` and `initContainers` — `compute_qos_class` factors init
+/// containers into the pod's QoS class, so a resize that changes an init container's
+/// resources (sidecars are resizable through this same GA feature) must be reflected
+/// here too, or Rule 4 evaluates QoS against a stale init-container state.
 fn merge_resize_for_qos(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> serde_json::Value {
     let mut result = stored.clone();
-    if let Some(incoming_containers) = incoming["spec"]["containers"].as_array() {
-        if let Some(stored_containers) = result["spec"]["containers"].as_array_mut() {
+    for list_key in ["containers", "initContainers"] {
+        let Some(incoming_containers) = incoming["spec"][list_key].as_array() else {
+            continue;
+        };
+        if let Some(stored_containers) = result["spec"][list_key].as_array_mut() {
             for stored_container in stored_containers.iter_mut() {
                 let stored_name = stored_container["name"].as_str().unwrap_or("");
                 let Some(incoming_c) = incoming_containers
@@ -3034,15 +3071,21 @@ fn merge_resize_section(
 /// memory requests/limits never mentions memory at all. Replacing `resources` wholesale
 /// with that partial patch silently deletes the untouched resource, corrupting
 /// multi-container resizes where different containers (or different dimensions of the
-/// same container) change independently. Only spec.containers[].resources is updated;
-/// all other fields are preserved. This is the pure logic extracted for testability.
+/// same container) change independently. Updates both spec.containers[].resources and
+/// spec.initContainers[].resources (sidecar init containers are resizable through the
+/// same GA feature and a real client's patch carries their changes under
+/// `initContainers`, not `containers`); all other fields are preserved. This is the
+/// pure logic extracted for testability.
 pub(crate) fn apply_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
 ) -> serde_json::Value {
     let mut result = stored.clone();
-    if let Some(incoming_containers) = incoming["spec"]["containers"].as_array() {
-        if let Some(stored_containers) = result["spec"]["containers"].as_array_mut() {
+    for list_key in ["containers", "initContainers"] {
+        let Some(incoming_containers) = incoming["spec"][list_key].as_array() else {
+            continue;
+        };
+        if let Some(stored_containers) = result["spec"][list_key].as_array_mut() {
             for stored_container in stored_containers.iter_mut() {
                 let stored_name = stored_container["name"].as_str().unwrap_or("");
                 let Some(incoming_container) = incoming_containers
@@ -14906,6 +14949,67 @@ mod resize_tests {
         assert_eq!(result["status"]["resize"], "Proposed");
     }
 
+    /// apply_resize_patch must also merge spec.initContainers[].resources, not just
+    /// spec.containers[].resources.
+    ///
+    /// Sidecar (RestartPolicy: Always) init containers are resizable through the same
+    /// GA in-place-resize feature as regular containers, and a real client's
+    /// strategic-merge-patch carries their resource changes under `initContainers`. A
+    /// resize patch that touches both an init container and a regular container in the
+    /// same pod (upstream's "guaranteed qos ... + resize initContainers" conformance
+    /// entries) previously had its initContainers half silently dropped — the init
+    /// container's resources on disk never changed even though the apiserver returned
+    /// 200 OK, so the kubelet had a stale spec to reconcile against and the conformance
+    /// test's post-resize verification failed.
+    #[test]
+    fn apply_resize_patch_updates_init_container_resources_too() {
+        let stored = serde_json::json!({
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {"requests": {"cpu": "20m", "memory": "35Mi"}, "limits": {"cpu": "20m", "memory": "35Mi"}}
+                }],
+                "containers": [{
+                    "name": "app",
+                    "resources": {"requests": {"cpu": "20m", "memory": "35Mi"}, "limits": {"cpu": "20m", "memory": "35Mi"}}
+                }]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {"requests": {"memory": "40Mi"}, "limits": {"memory": "40Mi"}}
+                }],
+                "containers": [{
+                    "name": "app",
+                    "resources": {"requests": {"memory": "40Mi"}, "limits": {"memory": "40Mi"}}
+                }]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["spec"]["initContainers"][0]["resources"]["requests"]["memory"], "40Mi",
+            "init container memory request must be updated by a resize patch — dropping it \
+             leaves the kubelet reconciling against a stale spec"
+        );
+        assert_eq!(
+            result["spec"]["initContainers"][0]["resources"]["limits"]["memory"], "40Mi",
+            "init container memory limit must be updated by a resize patch"
+        );
+        assert_eq!(
+            result["spec"]["initContainers"][0]["resources"]["requests"]["cpu"], "20m",
+            "init container's untouched cpu request must survive a memory-only resize"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["memory"], "40Mi",
+            "the regular container in the same patch must still be updated"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // validate_resize_patch — regression tests for invalid-resize rejection
     // (conformance: "apply invalid resize patch requests", pod_resize.go:389)
@@ -15113,6 +15217,97 @@ mod resize_tests {
              because the two-way-merge patch omits the unchanged cpu key — \
              got: {:?}",
             result.err()
+        );
+    }
+
+    /// Burstable pod with both requests and limits set — a two-way-merge patch that
+    /// changes only requests.cpu omits the ENTIRE `limits` section (nothing in it
+    /// changed), not just an individual key within it. Treating a whole section's
+    /// absence as "removed" (rather than "unchanged", symmetric with how
+    /// `apply_resize_patch`'s `merge_resize_section` already treats it) falsely rejects
+    /// this resize with 422 "resource limits cannot be removed" — this is exactly the
+    /// live-conformance failure upstream's "burstable pods - 1 container with all
+    /// requests & limits set ... cpu requests" resize entry hits when a real
+    /// `strategicpatch.CreateTwoWayMergePatch` omits an untouched section outright.
+    #[test]
+    fn resize_accepts_burstable_patch_omitting_unchanged_limits_section() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {
+                        "limits": {"cpu": "30m", "memory": "45Mi"},
+                        "requests": {"cpu": "20m", "memory": "35Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Only requests.cpu changes; limits is entirely absent from the patch because
+        // strategicpatch.CreateTwoWayMergePatch omits a section that didn't change at all.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {"requests": {"cpu": "25m"}}
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_ok(),
+            "a cpu-request-only resize must not be rejected as 'limits removed' just \
+             because the two-way-merge patch omits the entirely-unchanged limits section — \
+             got: {:?}",
+            result.err()
+        );
+    }
+
+    /// validate_resize_patch must apply Rule 3 (no removing a set resource quantity) to
+    /// init containers too, not just regular containers.
+    ///
+    /// Sidecar init containers are resizable through the same GA feature as regular
+    /// containers; before this check covered `spec.initContainers`, a resize patch that
+    /// removed an init container's cpu limit would be silently accepted by the
+    /// validator (only `apply_resize_patch` would actually see the drop), letting a
+    /// client strip resource guarantees from a running sidecar with no error.
+    #[test]
+    fn resize_rejects_init_container_removing_limits() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "sidecar-pod", "namespace": "default"},
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {
+                        "limits": {"cpu": "20m", "memory": "35Mi"},
+                        "requests": {"cpu": "20m", "memory": "35Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {"limits": {}, "requests": {"cpu": "20m", "memory": "35Mi"}}
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "removing an init container's limits must be rejected, same as a regular container"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("spec.initContainers[name=init].resources.limits")
+                && msg.contains("resource limits cannot be removed"),
+            "error must reference spec.initContainers (not spec.containers) and the k8s \
+             conformance substring 'resource limits cannot be removed' — got: {msg}"
         );
     }
 
