@@ -266,6 +266,31 @@ If `--quiet` output feels sparse and you want fuller detail on the first run, dr
 `--quiet` — the un-quiet output still ends with the same summary line but includes
 per-test progress. Both are single-run and authoritative.
 
+### Pinpoint conformance --focus gate (mandatory for runtime-path beads)
+
+For any bead touching a runtime path — protobuf/JSON encoders, request handlers,
+admission chain, store lifecycle, scheduler predicates, RBAC, subresource
+handlers — the dispatch brief MUST include 1-3 `sonobuoy --focus` test regexes
+the mayor believes MOST likely to be broken by the change. The worker's return
+MUST include the PASS lines from `e2e.txt` for each.
+
+Cargo tests + unit tests + sentinel-completeness tests are NECESSARY but NOT
+SUFFICIENT — they cannot exercise the client-go-negotiated wire path that real
+k8s clients (kubelet, controllers, e2e framework) use. PR #1130 shipped 26
+silent conformance failures on cargo-green because no unit test exercised the
+protobuf-negotiated GET path; PR #1157 later added sentinel-completeness tests
+as the SECOND layer, but the pinpoint `--focus` gate is the THIRD and final
+one, catching what encoder-shape tests still can't see.
+
+The mayor's brief specifies WHICH `--focus` tests. If unsure, err on the side
+of more — a `--focus` test takes 5-15 min and catches the exact class of bug
+that costs full days to root-cause when it lands on `main`. Exemptions: pure
+doc changes, script changes, dev-tooling scouts, and read-only investigations.
+
+See bd memories `worker-brief-hypothesis-may-be-wrong-encourage-independent-diagnosis`
+and `content-type-dispatch-must-key-on-apiversion-plus-kind` for concrete cases
+where this gate caught (or would have caught) silent breakage.
+
 ## Upstream source rules (mandatory)
 
 Upstream Kubernetes source (e2e test bodies, controllers, API types) is NOT in
