@@ -273,6 +273,122 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
     serde_json::Value::Object(m)
 }
 
+// The five VolumeSource plugin encoders below are called by `build/codegen.rs`'s generated
+// `gen_volume_to_json` (see `volume_source_gen.rs`, included further down this file) rather than
+// walked mechanically: each only emits its JSON key when a specific identifying sub-field
+// survives (secretName / the embedded LocalObjectReference's name / claimName / driver /
+// volumeClaimTemplate), a business rule the schema gives no signal for. Extracted verbatim from
+// the inline closures the generated dispatcher replaces — no behaviour change.
+
+fn gen_secret_volume_source_to_json(s: core_v1::SecretVolumeSource) -> Option<serde_json::Value> {
+    let optional = s.optional;
+    let secret_name = s.secret_name.filter(|s| !s.is_empty())?;
+    let mut secret_map = serde_json::Map::new();
+    secret_map.insert(
+        "secretName".to_string(),
+        serde_json::Value::String(secret_name),
+    );
+    if !s.items.is_empty() {
+        secret_map.insert("items".to_string(), gen_key_to_path_to_json(s.items));
+    }
+    // See gen_downward_api_volume_source_to_json: omit rather than default to 420 when unset.
+    if let Some(dm) = s.default_mode.filter(|&v| v != 0) {
+        secret_map.insert(
+            "defaultMode".to_string(),
+            serde_json::Value::Number(dm.into()),
+        );
+    }
+    if let Some(true) = optional {
+        secret_map.insert("optional".to_string(), serde_json::Value::Bool(true));
+    }
+    Some(serde_json::Value::Object(secret_map))
+}
+
+fn gen_config_map_volume_source_to_json(
+    cm: core_v1::ConfigMapVolumeSource,
+) -> Option<serde_json::Value> {
+    let optional = cm.optional;
+    let name = cm
+        .local_object_reference
+        .and_then(|lor| lor.name)
+        .filter(|s| !s.is_empty())?;
+    let mut cm_map = serde_json::Map::new();
+    cm_map.insert("name".to_string(), serde_json::Value::String(name));
+    if !cm.items.is_empty() {
+        cm_map.insert("items".to_string(), gen_key_to_path_to_json(cm.items));
+    }
+    // See gen_downward_api_volume_source_to_json: omit rather than default to 420 when unset.
+    if let Some(dm) = cm.default_mode.filter(|&v| v != 0) {
+        cm_map.insert(
+            "defaultMode".to_string(),
+            serde_json::Value::Number(dm.into()),
+        );
+    }
+    if let Some(true) = optional {
+        cm_map.insert("optional".to_string(), serde_json::Value::Bool(true));
+    }
+    Some(serde_json::Value::Object(cm_map))
+}
+
+fn gen_persistent_volume_claim_volume_source_to_json(
+    pvc: core_v1::PersistentVolumeClaimVolumeSource,
+) -> Option<serde_json::Value> {
+    let claim_name = pvc.claim_name.filter(|s| !s.is_empty())?;
+    let mut pvc_map = serde_json::Map::new();
+    pvc_map.insert(
+        "claimName".to_string(),
+        serde_json::Value::String(claim_name),
+    );
+    if let Some(true) = pvc.read_only {
+        pvc_map.insert("readOnly".to_string(), serde_json::Value::Bool(true));
+    }
+    Some(serde_json::Value::Object(pvc_map))
+}
+
+fn gen_ephemeral_volume_source_to_json(
+    eph: core_v1::EphemeralVolumeSource,
+) -> Option<serde_json::Value> {
+    let tmpl = eph.volume_claim_template?;
+    let claim = gen_persistent_volume_claim_to_json(core_v1::PersistentVolumeClaim {
+        metadata: tmpl.metadata,
+        spec: tmpl.spec,
+        ..Default::default()
+    });
+    Some(serde_json::json!({ "volumeClaimTemplate": claim }))
+}
+
+fn gen_csi_volume_source_to_json(csi: core_v1::CsiVolumeSource) -> Option<serde_json::Value> {
+    let driver = csi.driver.filter(|s| !s.is_empty())?;
+    let mut csi_map = serde_json::Map::new();
+    csi_map.insert("driver".to_string(), serde_json::Value::String(driver));
+    if let Some(ro) = csi.read_only {
+        csi_map.insert("readOnly".to_string(), serde_json::Value::Bool(ro));
+    }
+    if let Some(fs) = csi.fs_type.filter(|s| !s.is_empty()) {
+        csi_map.insert("fsType".to_string(), serde_json::Value::String(fs));
+    }
+    if !csi.volume_attributes.is_empty() {
+        let attrs: serde_json::Map<String, serde_json::Value> = csi
+            .volume_attributes
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        csi_map.insert(
+            "volumeAttributes".to_string(),
+            serde_json::Value::Object(attrs),
+        );
+    }
+    if let Some(lor) = csi.node_publish_secret_ref {
+        if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+            csi_map.insert(
+                "nodePublishSecretRef".to_string(),
+                serde_json::json!({ "name": name }),
+            );
+        }
+    }
+    Some(serde_json::Value::Object(csi_map))
+}
+
 fn gen_http_get_to_json(http_get: core_v1::HttpGetAction) -> serde_json::Value {
     let mut hg = serde_json::Map::new();
     if let Some(p) = http_get.path.filter(|s| !s.is_empty()) {
@@ -1422,615 +1538,8 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
 
     let mut spec_map = serde_json::Map::with_capacity(14);
     if !spec.volumes.is_empty() {
-        let volumes_json: Vec<serde_json::Value> = spec
-            .volumes
-            .into_iter()
-            .map(|v| {
-                let mut vm = serde_json::Map::new();
-                if let Some(n) = v.name.filter(|s| !s.is_empty()) {
-                    vm.insert("name".to_string(), serde_json::Value::String(n));
-                }
-                if let Some(src) = v.volume_source {
-                    if let Some(hp) = src.host_path {
-                        let mut hp_map = serde_json::Map::new();
-                        if let Some(p) = hp.path.filter(|s| !s.is_empty()) {
-                            hp_map.insert("path".to_string(), serde_json::Value::String(p));
-                        }
-                        if let Some(t) = hp.r#type.filter(|s| !s.is_empty()) {
-                            hp_map.insert("type".to_string(), serde_json::Value::String(t));
-                        }
-                        vm.insert("hostPath".to_string(), serde_json::Value::Object(hp_map));
-                    }
-                    if let Some(ed) = src.empty_dir {
-                        let mut ed_map = serde_json::Map::new();
-                        if let Some(medium) = ed.medium.filter(|s| !s.is_empty()) {
-                            ed_map.insert("medium".to_string(), serde_json::Value::String(medium));
-                        }
-                        // sizeLimit caps how much local storage (or memory, for the Memory
-                        // medium) this emptyDir may use. Dropping it silently turns a capped
-                        // volume into an uncapped one, letting a runaway writer exhaust node
-                        // disk/memory instead of being evicted at the limit the client set.
-                        if let Some(v) = ed
-                            .size_limit
-                            .and_then(|q| q.string)
-                            .filter(|s| !s.is_empty())
-                        {
-                            ed_map.insert("sizeLimit".to_string(), serde_json::Value::String(v));
-                        }
-                        vm.insert("emptyDir".to_string(), serde_json::Value::Object(ed_map));
-                    }
-                    if let Some(s) = src.secret {
-                        let optional = s.optional;
-                        if let Some(secret_name) = s.secret_name.filter(|s| !s.is_empty()) {
-                            let mut secret_map = serde_json::Map::new();
-                            secret_map.insert(
-                                "secretName".to_string(),
-                                serde_json::Value::String(secret_name),
-                            );
-                            if !s.items.is_empty() {
-                                secret_map
-                                    .insert("items".to_string(), gen_key_to_path_to_json(s.items));
-                            }
-                            // See gen_downward_api_volume_source_to_json: omit rather than
-                            // default to 420 when unset.
-                            if let Some(dm) = s.default_mode.filter(|&v| v != 0) {
-                                secret_map.insert(
-                                    "defaultMode".to_string(),
-                                    serde_json::Value::Number(dm.into()),
-                                );
-                            }
-                            if let Some(true) = optional {
-                                secret_map
-                                    .insert("optional".to_string(), serde_json::Value::Bool(true));
-                            }
-                            vm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
-                        }
-                    }
-                    // nfs — same wire shape and consumer story as
-                    // PersistentVolumeSource.nfs (decode_persistentvolume_proto_gen): a
-                    // client-go typed clientset sends protobuf by default, so a Pod created
-                    // with spec.volumes[i].nfs set would otherwise decode with the volume
-                    // source silently dropped and kubelet unable to resolve the mount.
-                    if let Some(nfs) = src.nfs {
-                        let mut nfs_map = serde_json::Map::new();
-                        if let Some(v) = nfs.server.filter(|s| !s.is_empty()) {
-                            nfs_map.insert("server".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = nfs.path.filter(|s| !s.is_empty()) {
-                            nfs_map.insert("path".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = nfs.read_only {
-                            nfs_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert("nfs".to_string(), serde_json::Value::Object(nfs_map));
-                    }
-                    if let Some(pvc) = src.persistent_volume_claim {
-                        if let Some(claim_name) = pvc.claim_name.filter(|s| !s.is_empty()) {
-                            let mut pvc_map = serde_json::Map::new();
-                            pvc_map.insert(
-                                "claimName".to_string(),
-                                serde_json::Value::String(claim_name),
-                            );
-                            if let Some(true) = pvc.read_only {
-                                pvc_map
-                                    .insert("readOnly".to_string(), serde_json::Value::Bool(true));
-                            }
-                            vm.insert(
-                                "persistentVolumeClaim".to_string(),
-                                serde_json::Value::Object(pvc_map),
-                            );
-                        }
-                    }
-                    if let Some(da) = src.downward_api {
-                        vm.insert(
-                            "downwardAPI".to_string(),
-                            gen_downward_api_volume_source_to_json(da.items, da.default_mode),
-                        );
-                    }
-                    if let Some(cm) = src.config_map {
-                        let optional = cm.optional;
-                        if let Some(lor) = cm.local_object_reference {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                let mut cm_map = serde_json::Map::new();
-                                cm_map.insert("name".to_string(), serde_json::Value::String(name));
-                                if !cm.items.is_empty() {
-                                    cm_map.insert(
-                                        "items".to_string(),
-                                        gen_key_to_path_to_json(cm.items),
-                                    );
-                                }
-                                // See gen_downward_api_volume_source_to_json: omit rather
-                                // than default to 420 when unset.
-                                if let Some(dm) = cm.default_mode.filter(|&v| v != 0) {
-                                    cm_map.insert(
-                                        "defaultMode".to_string(),
-                                        serde_json::Value::Number(dm.into()),
-                                    );
-                                }
-                                if let Some(true) = optional {
-                                    cm_map.insert(
-                                        "optional".to_string(),
-                                        serde_json::Value::Bool(true),
-                                    );
-                                }
-                                vm.insert(
-                                    "configMap".to_string(),
-                                    serde_json::Value::Object(cm_map),
-                                );
-                            }
-                        }
-                    }
-                    if let Some(proj) = src.projected {
-                        vm.insert(
-                            "projected".to_string(),
-                            gen_projected_volume_source_to_json(proj),
-                        );
-                    }
-                    if let Some(img) = src.image {
-                        let mut img_map = serde_json::Map::new();
-                        if let Some(r) = img.reference.filter(|s| !s.is_empty()) {
-                            img_map.insert("reference".to_string(), serde_json::Value::String(r));
-                        }
-                        if let Some(pp) = img.pull_policy.filter(|s| !s.is_empty()) {
-                            img_map.insert("pullPolicy".to_string(), serde_json::Value::String(pp));
-                        }
-                        vm.insert("image".to_string(), serde_json::Value::Object(img_map));
-                    }
-                    // ephemeral (GenericEphemeralVolume) — client-go clientsets (including
-                    // kube-controller-manager's, which the e2e test framework uses to create
-                    // pods) send protobuf by default. Without this branch, the derived PVC
-                    // template is silently dropped on decode, so the stored Pod never has
-                    // spec.volumes[].ephemeral set, KCM's ephemeral-volume-controller (whose
-                    // enqueuePod gate is `vol.Ephemeral != nil`) never enqueues the pod, and
-                    // the auto-generated PVC is never created — the pod is stuck
-                    // ContainerCreating forever waiting on a PVC that will never exist.
-                    if let Some(eph) = src.ephemeral {
-                        if let Some(tmpl) = eph.volume_claim_template {
-                            let claim = gen_persistent_volume_claim_to_json(
-                                core_v1::PersistentVolumeClaim {
-                                    metadata: tmpl.metadata,
-                                    spec: tmpl.spec,
-                                    ..Default::default()
-                                },
-                            );
-                            vm.insert(
-                                "ephemeral".to_string(),
-                                serde_json::json!({ "volumeClaimTemplate": claim }),
-                            );
-                        }
-                    }
-                    // csi (inline CSI volume, e.g. the CSI Ephemeral-volume conformance
-                    // tests) — client-go clientsets send protobuf by default; without this
-                    // branch the inline CSI volume source is silently dropped on decode, so
-                    // the stored Pod has no volume source at all and the kubelet's volume
-                    // plugin manager can never resolve the mount the container is waiting on.
-                    if let Some(csi) = src.csi {
-                        if let Some(driver) = csi.driver.filter(|s| !s.is_empty()) {
-                            let mut csi_map = serde_json::Map::new();
-                            csi_map.insert("driver".to_string(), serde_json::Value::String(driver));
-                            if let Some(ro) = csi.read_only {
-                                csi_map.insert("readOnly".to_string(), serde_json::Value::Bool(ro));
-                            }
-                            if let Some(fs) = csi.fs_type.filter(|s| !s.is_empty()) {
-                                csi_map.insert("fsType".to_string(), serde_json::Value::String(fs));
-                            }
-                            if !csi.volume_attributes.is_empty() {
-                                let attrs: serde_json::Map<String, serde_json::Value> = csi
-                                    .volume_attributes
-                                    .into_iter()
-                                    .map(|(k, v)| (k, serde_json::Value::String(v)))
-                                    .collect();
-                                csi_map.insert(
-                                    "volumeAttributes".to_string(),
-                                    serde_json::Value::Object(attrs),
-                                );
-                            }
-                            if let Some(lor) = csi.node_publish_secret_ref {
-                                if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                    csi_map.insert(
-                                        "nodePublishSecretRef".to_string(),
-                                        serde_json::json!({ "name": name }),
-                                    );
-                                }
-                            }
-                            vm.insert("csi".to_string(), serde_json::Value::Object(csi_map));
-                        }
-                    }
-                    // Remaining rare/deprecated in-tree VolumeSource variants: a
-                    // protobuf-negotiating client (kubelet, controllers) writing a Pod with one
-                    // of these must not have its volume source silently dropped on decode.
-                    if let Some(iscsi) = src.iscsi {
-                        let mut iscsi_map = serde_json::Map::new();
-                        if let Some(v) = iscsi.target_portal.filter(|s| !s.is_empty()) {
-                            iscsi_map
-                                .insert("targetPortal".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = iscsi.iqn.filter(|s| !s.is_empty()) {
-                            iscsi_map.insert("iqn".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = iscsi.lun {
-                            iscsi_map
-                                .insert("lun".to_string(), serde_json::Value::Number(v.into()));
-                        }
-                        if let Some(v) = iscsi.iscsi_interface.filter(|s| !s.is_empty()) {
-                            iscsi_map
-                                .insert("iscsiInterface".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = iscsi.fs_type.filter(|s| !s.is_empty()) {
-                            iscsi_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = iscsi.read_only {
-                            iscsi_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if !iscsi.portals.is_empty() {
-                            iscsi_map.insert(
-                                "portals".to_string(),
-                                serde_json::Value::Array(
-                                    iscsi
-                                        .portals
-                                        .into_iter()
-                                        .map(serde_json::Value::String)
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        if let Some(v) = iscsi.chap_auth_discovery {
-                            iscsi_map.insert(
-                                "chapAuthDiscovery".to_string(),
-                                serde_json::Value::Bool(v),
-                            );
-                        }
-                        if let Some(v) = iscsi.chap_auth_session {
-                            iscsi_map
-                                .insert("chapAuthSession".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if let Some(lor) = iscsi.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                iscsi_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        if let Some(v) = iscsi.initiator_name.filter(|s| !s.is_empty()) {
-                            iscsi_map
-                                .insert("initiatorName".to_string(), serde_json::Value::String(v));
-                        }
-                        vm.insert("iscsi".to_string(), serde_json::Value::Object(iscsi_map));
-                    }
-                    if let Some(g) = src.glusterfs {
-                        let mut g_map = serde_json::Map::new();
-                        if let Some(v) = g.endpoints.filter(|s| !s.is_empty()) {
-                            g_map.insert("endpoints".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = g.path.filter(|s| !s.is_empty()) {
-                            g_map.insert("path".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = g.read_only {
-                            g_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert("glusterfs".to_string(), serde_json::Value::Object(g_map));
-                    }
-                    if let Some(rbd) = src.rbd {
-                        let mut rbd_map = serde_json::Map::new();
-                        if !rbd.monitors.is_empty() {
-                            rbd_map.insert(
-                                "monitors".to_string(),
-                                serde_json::Value::Array(
-                                    rbd.monitors
-                                        .into_iter()
-                                        .map(serde_json::Value::String)
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        if let Some(v) = rbd.image.filter(|s| !s.is_empty()) {
-                            rbd_map.insert("image".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = rbd.fs_type.filter(|s| !s.is_empty()) {
-                            rbd_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = rbd.pool.filter(|s| !s.is_empty()) {
-                            rbd_map.insert("pool".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = rbd.user.filter(|s| !s.is_empty()) {
-                            rbd_map.insert("user".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = rbd.keyring.filter(|s| !s.is_empty()) {
-                            rbd_map.insert("keyring".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(lor) = rbd.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                rbd_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        if let Some(v) = rbd.read_only {
-                            rbd_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert("rbd".to_string(), serde_json::Value::Object(rbd_map));
-                    }
-                    if let Some(gr) = src.git_repo {
-                        let mut gr_map = serde_json::Map::new();
-                        if let Some(v) = gr.repository.filter(|s| !s.is_empty()) {
-                            gr_map.insert("repository".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = gr.revision.filter(|s| !s.is_empty()) {
-                            gr_map.insert("revision".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = gr.directory.filter(|s| !s.is_empty()) {
-                            gr_map.insert("directory".to_string(), serde_json::Value::String(v));
-                        }
-                        vm.insert("gitRepo".to_string(), serde_json::Value::Object(gr_map));
-                    }
-                    if let Some(c) = src.cinder {
-                        let mut c_map = serde_json::Map::new();
-                        if let Some(v) = c.volume_id.filter(|s| !s.is_empty()) {
-                            c_map.insert("volumeID".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = c.fs_type.filter(|s| !s.is_empty()) {
-                            c_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = c.read_only {
-                            c_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if let Some(lor) = c.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                c_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        vm.insert("cinder".to_string(), serde_json::Value::Object(c_map));
-                    }
-                    if let Some(c) = src.cephfs {
-                        let mut c_map = serde_json::Map::new();
-                        if !c.monitors.is_empty() {
-                            c_map.insert(
-                                "monitors".to_string(),
-                                serde_json::Value::Array(
-                                    c.monitors
-                                        .into_iter()
-                                        .map(serde_json::Value::String)
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        if let Some(v) = c.path.filter(|s| !s.is_empty()) {
-                            c_map.insert("path".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = c.user.filter(|s| !s.is_empty()) {
-                            c_map.insert("user".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = c.secret_file.filter(|s| !s.is_empty()) {
-                            c_map.insert("secretFile".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(lor) = c.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                c_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        if let Some(v) = c.read_only {
-                            c_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert("cephfs".to_string(), serde_json::Value::Object(c_map));
-                    }
-                    if let Some(fv) = src.flex_volume {
-                        let mut fv_map = serde_json::Map::new();
-                        if let Some(v) = fv.driver.filter(|s| !s.is_empty()) {
-                            fv_map.insert("driver".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = fv.fs_type.filter(|s| !s.is_empty()) {
-                            fv_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(lor) = fv.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                fv_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        if let Some(v) = fv.read_only {
-                            fv_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if !fv.options.is_empty() {
-                            let opts: serde_json::Map<String, serde_json::Value> = fv
-                                .options
-                                .into_iter()
-                                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                                .collect();
-                            fv_map.insert("options".to_string(), serde_json::Value::Object(opts));
-                        }
-                        vm.insert("flexVolume".to_string(), serde_json::Value::Object(fv_map));
-                    }
-                    if let Some(f) = src.flocker {
-                        let mut f_map = serde_json::Map::new();
-                        if let Some(v) = f.dataset_name.filter(|s| !s.is_empty()) {
-                            f_map.insert("datasetName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = f.dataset_uuid.filter(|s| !s.is_empty()) {
-                            f_map.insert("datasetUUID".to_string(), serde_json::Value::String(v));
-                        }
-                        vm.insert("flocker".to_string(), serde_json::Value::Object(f_map));
-                    }
-                    if let Some(af) = src.azure_file {
-                        let mut af_map = serde_json::Map::new();
-                        if let Some(v) = af.secret_name.filter(|s| !s.is_empty()) {
-                            af_map.insert("secretName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = af.share_name.filter(|s| !s.is_empty()) {
-                            af_map.insert("shareName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = af.read_only {
-                            af_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert("azureFile".to_string(), serde_json::Value::Object(af_map));
-                    }
-                    if let Some(vs) = src.vsphere_volume {
-                        let mut vs_map = serde_json::Map::new();
-                        if let Some(v) = vs.volume_path.filter(|s| !s.is_empty()) {
-                            vs_map.insert("volumePath".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = vs.fs_type.filter(|s| !s.is_empty()) {
-                            vs_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = vs.storage_policy_name.filter(|s| !s.is_empty()) {
-                            vs_map.insert(
-                                "storagePolicyName".to_string(),
-                                serde_json::Value::String(v),
-                            );
-                        }
-                        if let Some(v) = vs.storage_policy_id.filter(|s| !s.is_empty()) {
-                            vs_map.insert(
-                                "storagePolicyID".to_string(),
-                                serde_json::Value::String(v),
-                            );
-                        }
-                        vm.insert(
-                            "vsphereVolume".to_string(),
-                            serde_json::Value::Object(vs_map),
-                        );
-                    }
-                    if let Some(q) = src.quobyte {
-                        let mut q_map = serde_json::Map::new();
-                        if let Some(v) = q.registry.filter(|s| !s.is_empty()) {
-                            q_map.insert("registry".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = q.volume.filter(|s| !s.is_empty()) {
-                            q_map.insert("volume".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = q.read_only {
-                            q_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if let Some(v) = q.user.filter(|s| !s.is_empty()) {
-                            q_map.insert("user".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = q.group.filter(|s| !s.is_empty()) {
-                            q_map.insert("group".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = q.tenant.filter(|s| !s.is_empty()) {
-                            q_map.insert("tenant".to_string(), serde_json::Value::String(v));
-                        }
-                        vm.insert("quobyte".to_string(), serde_json::Value::Object(q_map));
-                    }
-                    if let Some(ad) = src.azure_disk {
-                        let mut ad_map = serde_json::Map::new();
-                        if let Some(v) = ad.disk_name.filter(|s| !s.is_empty()) {
-                            ad_map.insert("diskName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = ad.disk_uri.filter(|s| !s.is_empty()) {
-                            ad_map.insert("diskURI".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = ad.caching_mode.filter(|s| !s.is_empty()) {
-                            ad_map.insert("cachingMode".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = ad.fs_type.filter(|s| !s.is_empty()) {
-                            ad_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = ad.read_only {
-                            ad_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if let Some(v) = ad.kind.filter(|s| !s.is_empty()) {
-                            ad_map.insert("kind".to_string(), serde_json::Value::String(v));
-                        }
-                        vm.insert("azureDisk".to_string(), serde_json::Value::Object(ad_map));
-                    }
-                    if let Some(pw) = src.portworx_volume {
-                        let mut pw_map = serde_json::Map::new();
-                        if let Some(v) = pw.volume_id.filter(|s| !s.is_empty()) {
-                            pw_map.insert("volumeID".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = pw.fs_type.filter(|s| !s.is_empty()) {
-                            pw_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = pw.read_only {
-                            pw_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert(
-                            "portworxVolume".to_string(),
-                            serde_json::Value::Object(pw_map),
-                        );
-                    }
-                    if let Some(s) = src.scale_io {
-                        let mut s_map = serde_json::Map::new();
-                        if let Some(v) = s.gateway.filter(|s| !s.is_empty()) {
-                            s_map.insert("gateway".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.system.filter(|s| !s.is_empty()) {
-                            s_map.insert("system".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(lor) = s.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                s_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        if let Some(v) = s.ssl_enabled {
-                            s_map.insert("sslEnabled".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if let Some(v) = s.protection_domain.filter(|s| !s.is_empty()) {
-                            s_map.insert(
-                                "protectionDomain".to_string(),
-                                serde_json::Value::String(v),
-                            );
-                        }
-                        if let Some(v) = s.storage_pool.filter(|s| !s.is_empty()) {
-                            s_map.insert("storagePool".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.storage_mode.filter(|s| !s.is_empty()) {
-                            s_map.insert("storageMode".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.volume_name.filter(|s| !s.is_empty()) {
-                            s_map.insert("volumeName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.fs_type.filter(|s| !s.is_empty()) {
-                            s_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.read_only {
-                            s_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        vm.insert("scaleIO".to_string(), serde_json::Value::Object(s_map));
-                    }
-                    if let Some(s) = src.storageos {
-                        let mut s_map = serde_json::Map::new();
-                        if let Some(v) = s.volume_name.filter(|s| !s.is_empty()) {
-                            s_map.insert("volumeName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.volume_namespace.filter(|s| !s.is_empty()) {
-                            s_map.insert(
-                                "volumeNamespace".to_string(),
-                                serde_json::Value::String(v),
-                            );
-                        }
-                        if let Some(v) = s.fs_type.filter(|s| !s.is_empty()) {
-                            s_map.insert("fsType".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = s.read_only {
-                            s_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                        }
-                        if let Some(lor) = s.secret_ref {
-                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
-                                s_map.insert(
-                                    "secretRef".to_string(),
-                                    serde_json::json!({ "name": name }),
-                                );
-                            }
-                        }
-                        vm.insert("storageos".to_string(), serde_json::Value::Object(s_map));
-                    }
-                }
-                serde_json::Value::Object(vm)
-            })
-            .collect();
+        let volumes_json: Vec<serde_json::Value> =
+            spec.volumes.into_iter().map(gen_volume_to_json).collect();
         spec_map.insert(
             "volumes".to_string(),
             serde_json::Value::Array(volumes_json),
@@ -2681,6 +2190,14 @@ fn gen_quantity_map_btree_to_json(
 // down, near the other `json_to_*_proto` encoders) are generated by `build/codegen.rs` from the
 // `.k8s.io.api.core.v1.ObjectReference` descriptor rather than hand-written.
 include!(concat!(env!("OUT_DIR"), "/object_reference_gen.rs"));
+
+// `gen_volume_to_json`/`json_to_volume_proto` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.core.v1.VolumeSource` descriptor (VolumeSource is INLINE_EMBEDS'd onto `Volume`,
+// so both functions operate on the whole `Volume` JSON object rather than a nested
+// "volumeSource" key). They call the hand-written `gen_*_volume_source_to_json`/
+// `json_to_*_volume_source_proto` functions above/below for the handful of fields that need
+// more than a mechanical per-field walk (see build/codegen.rs's DELEGATED_FIELDS doc).
+include!(concat!(env!("OUT_DIR"), "/volume_source_gen.rs"));
 
 /// Used by `decode_persistentvolume_proto_gen`'s `spec.csi.*SecretRef` fields — unlike
 /// `ObjectReference`, a `SecretReference` only ever carries name/namespace (no kind/uid/
@@ -5561,233 +5078,58 @@ fn json_to_persistent_volume_claim_spec_proto(
     }
 }
 
-fn json_to_volume_proto(v: &serde_json::Value) -> core_v1::Volume {
-    let mut src = core_v1::VolumeSource::default();
-    if let Some(hp) = v.get("hostPath") {
-        src.host_path = Some(core_v1::HostPathVolumeSource {
-            path: jstr(hp, "path"),
-            r#type: jstr(hp, "type"),
-        });
+// The five VolumeSource plugin decoders below are called by `build/codegen.rs`'s generated
+// `json_to_volume_proto` (see volume_source_gen.rs, included further down this file) rather than
+// walked mechanically, for the same reasons as their encode-side counterparts above. Extracted
+// verbatim from the inline branches the generated function replaces — no behaviour change.
+
+fn json_to_secret_volume_source_proto(v: &serde_json::Value) -> core_v1::SecretVolumeSource {
+    core_v1::SecretVolumeSource {
+        secret_name: jstr(v, "secretName"),
+        ..Default::default()
     }
-    if let Some(ed) = v.get("emptyDir") {
-        src.empty_dir = Some(core_v1::EmptyDirVolumeSource {
-            medium: jstr(ed, "medium"),
-            size_limit: jstr(ed, "sizeLimit").map(|s| {
-                super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-                    string: Some(s),
-                }
-            }),
-        });
+}
+
+fn json_to_config_map_volume_source_proto(v: &serde_json::Value) -> core_v1::ConfigMapVolumeSource {
+    core_v1::ConfigMapVolumeSource {
+        local_object_reference: jstr(v, "name")
+            .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+        ..Default::default()
     }
-    if let Some(s) = v.get("secret") {
-        src.secret = Some(core_v1::SecretVolumeSource {
-            secret_name: jstr(s, "secretName"),
-            ..Default::default()
-        });
+}
+
+fn json_to_persistent_volume_claim_volume_source_proto(
+    v: &serde_json::Value,
+) -> core_v1::PersistentVolumeClaimVolumeSource {
+    core_v1::PersistentVolumeClaimVolumeSource {
+        claim_name: jstr(v, "claimName"),
+        read_only: jbool(v, "readOnly"),
     }
-    if let Some(cm) = v.get("configMap") {
-        src.config_map = Some(core_v1::ConfigMapVolumeSource {
-            local_object_reference: jstr(cm, "name")
-                .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
-            ..Default::default()
-        });
-    }
-    if let Some(pvc) = v.get("persistentVolumeClaim") {
-        src.persistent_volume_claim = Some(core_v1::PersistentVolumeClaimVolumeSource {
-            claim_name: jstr(pvc, "claimName"),
-            read_only: jbool(pvc, "readOnly"),
-        });
-    }
-    if let Some(da) = v.get("downwardAPI") {
-        src.downward_api = Some(json_to_downward_api_volume_source_proto(da));
-    }
-    if let Some(proj) = v.get("projected") {
-        src.projected = Some(json_to_projected_volume_source_proto(proj));
-    }
-    // The remaining VolumeSource variants below are all decode-side-complete (nfs/ephemeral/csi
-    // via decode_pod_proto_gen; the rest have a live proto struct with no encode-side JSON
-    // mapping at all) but were previously dropped here, so any client mounting one of these
-    // volume types and reading the pod back over protobuf would see the volume's source
-    // silently vanish.
-    if let Some(nfs) = v.get("nfs") {
-        src.nfs = Some(core_v1::NfsVolumeSource {
-            server: jstr(nfs, "server"),
-            path: jstr(nfs, "path"),
-            read_only: jbool(nfs, "readOnly"),
-        });
-    }
-    if let Some(iscsi) = v.get("iscsi") {
-        src.iscsi = Some(core_v1::IscsiVolumeSource {
-            target_portal: jstr(iscsi, "targetPortal"),
-            iqn: jstr(iscsi, "iqn"),
-            lun: ji32(iscsi, "lun"),
-            iscsi_interface: jstr(iscsi, "iscsiInterface"),
-            fs_type: jstr(iscsi, "fsType"),
-            read_only: jbool(iscsi, "readOnly"),
-            portals: jstrs(iscsi, "portals"),
-            chap_auth_discovery: jbool(iscsi, "chapAuthDiscovery"),
-            chap_auth_session: jbool(iscsi, "chapAuthSession"),
-            secret_ref: iscsi
-                .get("secretRef")
-                .map(json_to_local_object_reference_proto),
-            initiator_name: jstr(iscsi, "initiatorName"),
-        });
-    }
-    if let Some(g) = v.get("glusterfs") {
-        src.glusterfs = Some(core_v1::GlusterfsVolumeSource {
-            endpoints: jstr(g, "endpoints"),
-            path: jstr(g, "path"),
-            read_only: jbool(g, "readOnly"),
-        });
-    }
-    if let Some(rbd) = v.get("rbd") {
-        src.rbd = Some(core_v1::RbdVolumeSource {
-            monitors: jstrs(rbd, "monitors"),
-            image: jstr(rbd, "image"),
-            fs_type: jstr(rbd, "fsType"),
-            pool: jstr(rbd, "pool"),
-            user: jstr(rbd, "user"),
-            keyring: jstr(rbd, "keyring"),
-            secret_ref: rbd
-                .get("secretRef")
-                .map(json_to_local_object_reference_proto),
-            read_only: jbool(rbd, "readOnly"),
-        });
-    }
-    if let Some(gr) = v.get("gitRepo") {
-        src.git_repo = Some(core_v1::GitRepoVolumeSource {
-            repository: jstr(gr, "repository"),
-            revision: jstr(gr, "revision"),
-            directory: jstr(gr, "directory"),
-        });
-    }
-    if let Some(c) = v.get("cinder") {
-        src.cinder = Some(core_v1::CinderVolumeSource {
-            volume_id: jstr(c, "volumeID"),
-            fs_type: jstr(c, "fsType"),
-            read_only: jbool(c, "readOnly"),
-            secret_ref: c.get("secretRef").map(json_to_local_object_reference_proto),
-        });
-    }
-    if let Some(c) = v.get("cephfs") {
-        src.cephfs = Some(core_v1::CephFsVolumeSource {
-            monitors: jstrs(c, "monitors"),
-            path: jstr(c, "path"),
-            user: jstr(c, "user"),
-            secret_file: jstr(c, "secretFile"),
-            secret_ref: c.get("secretRef").map(json_to_local_object_reference_proto),
-            read_only: jbool(c, "readOnly"),
-        });
-    }
-    if let Some(fv) = v.get("flexVolume") {
-        src.flex_volume = Some(core_v1::FlexVolumeSource {
-            driver: jstr(fv, "driver"),
-            fs_type: jstr(fv, "fsType"),
-            secret_ref: fv
-                .get("secretRef")
-                .map(json_to_local_object_reference_proto),
-            read_only: jbool(fv, "readOnly"),
-            options: jstrmap(fv, "options"),
-        });
-    }
-    if let Some(f) = v.get("flocker") {
-        src.flocker = Some(core_v1::FlockerVolumeSource {
-            dataset_name: jstr(f, "datasetName"),
-            dataset_uuid: jstr(f, "datasetUUID"),
-        });
-    }
-    if let Some(af) = v.get("azureFile") {
-        src.azure_file = Some(core_v1::AzureFileVolumeSource {
-            secret_name: jstr(af, "secretName"),
-            share_name: jstr(af, "shareName"),
-            read_only: jbool(af, "readOnly"),
-        });
-    }
-    if let Some(vs) = v.get("vsphereVolume") {
-        src.vsphere_volume = Some(core_v1::VsphereVirtualDiskVolumeSource {
-            volume_path: jstr(vs, "volumePath"),
-            fs_type: jstr(vs, "fsType"),
-            storage_policy_name: jstr(vs, "storagePolicyName"),
-            storage_policy_id: jstr(vs, "storagePolicyID"),
-        });
-    }
-    if let Some(q) = v.get("quobyte") {
-        src.quobyte = Some(core_v1::QuobyteVolumeSource {
-            registry: jstr(q, "registry"),
-            volume: jstr(q, "volume"),
-            read_only: jbool(q, "readOnly"),
-            user: jstr(q, "user"),
-            group: jstr(q, "group"),
-            tenant: jstr(q, "tenant"),
-        });
-    }
-    if let Some(ad) = v.get("azureDisk") {
-        src.azure_disk = Some(core_v1::AzureDiskVolumeSource {
-            disk_name: jstr(ad, "diskName"),
-            disk_uri: jstr(ad, "diskURI"),
-            caching_mode: jstr(ad, "cachingMode"),
-            fs_type: jstr(ad, "fsType"),
-            read_only: jbool(ad, "readOnly"),
-            kind: jstr(ad, "kind"),
-        });
-    }
-    if let Some(pw) = v.get("portworxVolume") {
-        src.portworx_volume = Some(core_v1::PortworxVolumeSource {
-            volume_id: jstr(pw, "volumeID"),
-            fs_type: jstr(pw, "fsType"),
-            read_only: jbool(pw, "readOnly"),
-        });
-    }
-    if let Some(s) = v.get("scaleIO") {
-        src.scale_io = Some(core_v1::ScaleIoVolumeSource {
-            gateway: jstr(s, "gateway"),
-            system: jstr(s, "system"),
-            secret_ref: s.get("secretRef").map(json_to_local_object_reference_proto),
-            ssl_enabled: jbool(s, "sslEnabled"),
-            protection_domain: jstr(s, "protectionDomain"),
-            storage_pool: jstr(s, "storagePool"),
-            storage_mode: jstr(s, "storageMode"),
-            volume_name: jstr(s, "volumeName"),
-            fs_type: jstr(s, "fsType"),
-            read_only: jbool(s, "readOnly"),
-        });
-    }
-    if let Some(s) = v.get("storageos") {
-        src.storageos = Some(core_v1::StorageOsVolumeSource {
-            volume_name: jstr(s, "volumeName"),
-            volume_namespace: jstr(s, "volumeNamespace"),
-            fs_type: jstr(s, "fsType"),
-            read_only: jbool(s, "readOnly"),
-            secret_ref: s.get("secretRef").map(json_to_local_object_reference_proto),
-        });
-    }
-    if let Some(csi) = v.get("csi") {
-        src.csi = Some(core_v1::CsiVolumeSource {
-            driver: jstr(csi, "driver"),
-            read_only: jbool(csi, "readOnly"),
-            fs_type: jstr(csi, "fsType"),
-            volume_attributes: jstrmap(csi, "volumeAttributes"),
-            node_publish_secret_ref: csi
-                .get("nodePublishSecretRef")
-                .map(json_to_local_object_reference_proto),
-        });
-    }
-    if let Some(tmpl) = v
-        .get("ephemeral")
-        .and_then(|eph| eph.get("volumeClaimTemplate"))
-    {
-        src.ephemeral = Some(core_v1::EphemeralVolumeSource {
-            volume_claim_template: Some(core_v1::PersistentVolumeClaimTemplate {
-                metadata: Some(json_to_object_meta_proto(tmpl)),
-                spec: tmpl
-                    .get("spec")
-                    .map(json_to_persistent_volume_claim_spec_proto),
-            }),
-        });
-    }
-    core_v1::Volume {
-        name: jstr(v, "name"),
-        volume_source: Some(src),
+}
+
+fn json_to_ephemeral_volume_source_proto(
+    v: &serde_json::Value,
+) -> Option<core_v1::EphemeralVolumeSource> {
+    let tmpl = v.get("volumeClaimTemplate")?;
+    Some(core_v1::EphemeralVolumeSource {
+        volume_claim_template: Some(core_v1::PersistentVolumeClaimTemplate {
+            metadata: Some(json_to_object_meta_proto(tmpl)),
+            spec: tmpl
+                .get("spec")
+                .map(json_to_persistent_volume_claim_spec_proto),
+        }),
+    })
+}
+
+fn json_to_csi_volume_source_proto(v: &serde_json::Value) -> core_v1::CsiVolumeSource {
+    core_v1::CsiVolumeSource {
+        driver: jstr(v, "driver"),
+        read_only: jbool(v, "readOnly"),
+        fs_type: jstr(v, "fsType"),
+        volume_attributes: jstrmap(v, "volumeAttributes"),
+        node_publish_secret_ref: v
+            .get("nodePublishSecretRef")
+            .map(json_to_local_object_reference_proto),
     }
 }
 

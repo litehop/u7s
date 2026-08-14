@@ -65,6 +65,7 @@ prost-build              = "0.14"
 protoc-bin-vendored      = "3.2"
 prost                    = "0.14"
 prost-types              = "0.14"
+heck                     = "0.5"
 
 [dev-dependencies]
 criterion       = "0.8"
