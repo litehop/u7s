@@ -794,390 +794,207 @@ fn gen_pod_security_context_to_json(sc: core_v1::PodSecurityContext) -> serde_js
     serde_json::Value::Object(m)
 }
 
-fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
-    let mut cm = serde_json::Map::with_capacity(18);
-    if let Some(v) = c.name.filter(|s| !s.is_empty()) {
-        cm.insert("name".to_string(), serde_json::Value::String(v));
+/// Container.ports item encoder. Extracted so `build/codegen.rs`'s generated
+/// `gen_container_to_json` can delegate the one field (`containerPort`/`hostPort` treat 0 as
+/// unset, a business rule the schema gives no signal for) it can't derive mechanically.
+fn gen_container_port_to_json(p: core_v1::ContainerPort) -> serde_json::Value {
+    let mut pm = serde_json::Map::new();
+    if let Some(v) = p.name.filter(|s| !s.is_empty()) {
+        pm.insert("name".to_string(), serde_json::Value::String(v));
     }
-    if let Some(v) = c.image.filter(|s| !s.is_empty()) {
-        cm.insert("image".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = c.working_dir.filter(|s| !s.is_empty()) {
-        cm.insert("workingDir".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = c.image_pull_policy.filter(|s| !s.is_empty()) {
-        cm.insert("imagePullPolicy".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = c.termination_message_path.filter(|s| !s.is_empty()) {
-        cm.insert(
-            "terminationMessagePath".to_string(),
-            serde_json::Value::String(v),
+    if let Some(v) = p.container_port.filter(|&n| n != 0) {
+        pm.insert(
+            "containerPort".to_string(),
+            serde_json::Value::Number(v.into()),
         );
     }
-    if let Some(v) = c.termination_message_policy.filter(|s| !s.is_empty()) {
-        cm.insert(
-            "terminationMessagePolicy".to_string(),
-            serde_json::Value::String(v),
-        );
+    if let Some(v) = p.host_port.filter(|&n| n != 0) {
+        pm.insert("hostPort".to_string(), serde_json::Value::Number(v.into()));
     }
-    if !c.command.is_empty() {
-        cm.insert(
-            "command".to_string(),
-            serde_json::Value::Array(
-                c.command
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
+    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+        pm.insert("protocol".to_string(), serde_json::Value::String(v));
     }
-    if !c.args.is_empty() {
-        cm.insert(
-            "args".to_string(),
-            serde_json::Value::Array(c.args.into_iter().map(serde_json::Value::String).collect()),
-        );
+    if let Some(v) = p.host_ip.filter(|s| !s.is_empty()) {
+        pm.insert("hostIP".to_string(), serde_json::Value::String(v));
     }
-    if !c.ports.is_empty() {
-        let ports_json: Vec<serde_json::Value> = c
-            .ports
-            .into_iter()
-            .map(|p| {
-                let mut pm = serde_json::Map::new();
-                if let Some(v) = p.name.filter(|s| !s.is_empty()) {
-                    pm.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = p.container_port.filter(|&n| n != 0) {
-                    pm.insert(
-                        "containerPort".to_string(),
-                        serde_json::Value::Number(v.into()),
-                    );
-                }
-                if let Some(v) = p.host_port.filter(|&n| n != 0) {
-                    pm.insert("hostPort".to_string(), serde_json::Value::Number(v.into()));
-                }
-                if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
-                    pm.insert("protocol".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = p.host_ip.filter(|s| !s.is_empty()) {
-                    pm.insert("hostIP".to_string(), serde_json::Value::String(v));
-                }
-                serde_json::Value::Object(pm)
-            })
-            .collect();
-        cm.insert("ports".to_string(), serde_json::Value::Array(ports_json));
-    }
-    if !c.env.is_empty() {
-        let env_json: Vec<serde_json::Value> = c
-            .env
-            .into_iter()
-            .map(|ev| {
-                let mut em = serde_json::Map::new();
-                if let Some(v) = ev.name.filter(|s| !s.is_empty()) {
-                    em.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = ev.value.filter(|s| !s.is_empty()) {
-                    em.insert("value".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(vf) = ev.value_from {
-                    let mut vfm = serde_json::Map::new();
-                    if let Some(fr) = vf.field_ref {
-                        let mut frm = serde_json::Map::new();
-                        if let Some(v) = fr.api_version.filter(|s| !s.is_empty()) {
-                            frm.insert("apiVersion".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = fr.field_path.filter(|s| !s.is_empty()) {
-                            frm.insert("fieldPath".to_string(), serde_json::Value::String(v));
-                        }
-                        vfm.insert("fieldRef".to_string(), serde_json::Value::Object(frm));
-                    }
-                    if let Some(rfr) = vf.resource_field_ref {
-                        let mut rfrm = serde_json::Map::new();
-                        if let Some(v) = rfr.container_name.filter(|s| !s.is_empty()) {
-                            rfrm.insert("containerName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = rfr.resource.filter(|s| !s.is_empty()) {
-                            rfrm.insert("resource".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(divisor_str) = rfr.divisor.and_then(|q| q.string) {
-                            if !divisor_str.is_empty() {
-                                rfrm.insert(
-                                    "divisor".to_string(),
-                                    serde_json::Value::String(divisor_str),
-                                );
-                            }
-                        }
-                        vfm.insert(
-                            "resourceFieldRef".to_string(),
-                            serde_json::Value::Object(rfrm),
-                        );
-                    }
-                    if let Some(cmkr) = vf.config_map_key_ref {
-                        let mut cmkrm = serde_json::Map::new();
-                        if let Some(lor) = cmkr.local_object_reference {
-                            if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
-                                cmkrm.insert("name".to_string(), serde_json::Value::String(v));
-                            }
-                        }
-                        if let Some(v) = cmkr.key.filter(|s| !s.is_empty()) {
-                            cmkrm.insert("key".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(true) = cmkr.optional {
-                            cmkrm.insert("optional".to_string(), serde_json::Value::Bool(true));
-                        }
-                        vfm.insert(
-                            "configMapKeyRef".to_string(),
-                            serde_json::Value::Object(cmkrm),
-                        );
-                    }
-                    if let Some(skr) = vf.secret_key_ref {
-                        let mut skrm = serde_json::Map::new();
-                        if let Some(lor) = skr.local_object_reference {
-                            if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
-                                skrm.insert("name".to_string(), serde_json::Value::String(v));
-                            }
-                        }
-                        if let Some(v) = skr.key.filter(|s| !s.is_empty()) {
-                            skrm.insert("key".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(true) = skr.optional {
-                            skrm.insert("optional".to_string(), serde_json::Value::Bool(true));
-                        }
-                        vfm.insert("secretKeyRef".to_string(), serde_json::Value::Object(skrm));
-                    }
-                    // fileKeyRef (EnvFiles alpha feature) selects an env var from a file
-                    // mounted via another volume. Dropping it makes the container start with
-                    // that variable entirely unset instead of the value the file provided.
-                    if let Some(fkr) = vf.file_key_ref {
-                        let mut fkrm = serde_json::Map::new();
-                        if let Some(v) = fkr.volume_name.filter(|s| !s.is_empty()) {
-                            fkrm.insert("volumeName".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = fkr.path.filter(|s| !s.is_empty()) {
-                            fkrm.insert("path".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = fkr.key.filter(|s| !s.is_empty()) {
-                            fkrm.insert("key".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(true) = fkr.optional {
-                            fkrm.insert("optional".to_string(), serde_json::Value::Bool(true));
-                        }
-                        vfm.insert("fileKeyRef".to_string(), serde_json::Value::Object(fkrm));
-                    }
-                    em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
-                }
-                serde_json::Value::Object(em)
-            })
-            .collect();
-        cm.insert("env".to_string(), serde_json::Value::Array(env_json));
-    }
-    if !c.env_from.is_empty() {
-        let env_from_json: Vec<serde_json::Value> = c
-            .env_from
-            .into_iter()
-            .map(|ef| {
-                let mut efm = serde_json::Map::new();
-                if let Some(v) = ef.prefix.filter(|s| !s.is_empty()) {
-                    efm.insert("prefix".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(cmr) = ef.config_map_ref {
-                    let mut cmrm = serde_json::Map::new();
-                    if let Some(lor) = cmr.local_object_reference {
-                        if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
-                            cmrm.insert("name".to_string(), serde_json::Value::String(v));
-                        }
-                    }
-                    if let Some(true) = cmr.optional {
-                        cmrm.insert("optional".to_string(), serde_json::Value::Bool(true));
-                    }
-                    efm.insert("configMapRef".to_string(), serde_json::Value::Object(cmrm));
-                }
-                if let Some(sr) = ef.secret_ref {
-                    let mut srm = serde_json::Map::new();
-                    if let Some(lor) = sr.local_object_reference {
-                        if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
-                            srm.insert("name".to_string(), serde_json::Value::String(v));
-                        }
-                    }
-                    if let Some(true) = sr.optional {
-                        srm.insert("optional".to_string(), serde_json::Value::Bool(true));
-                    }
-                    efm.insert("secretRef".to_string(), serde_json::Value::Object(srm));
-                }
-                serde_json::Value::Object(efm)
-            })
-            .collect();
-        cm.insert(
-            "envFrom".to_string(),
-            serde_json::Value::Array(env_from_json),
-        );
-    }
-    if let Some(res) = c.resources {
-        // gen_resource_requirements_to_json also handles `claims` (DRA resource claim
-        // references) — a hand-inlined limits/requests-only copy here previously dropped it,
-        // silently resolving every `resources.claims[].name` reference to nothing.
-        let res_json = gen_resource_requirements_to_json(res);
-        // Only emit "resources" when non-empty — see gen_downward_api_volume_source_to_json
-        // for why materializing a wire-absent value breaks workload-template hash-collision
-        // equality checks. k8s.io/api's Container.Resources is a value (not pointer) type, so
-        // it is always present after protobuf decode even when the client set nothing.
-        if res_json.as_object().is_some_and(|m| !m.is_empty()) {
-            cm.insert("resources".to_string(), res_json);
-        }
-    }
-    if let Some(p) = c.liveness_probe {
-        cm.insert("livenessProbe".to_string(), gen_probe_to_json(p));
-    }
-    if let Some(p) = c.readiness_probe {
-        cm.insert("readinessProbe".to_string(), gen_probe_to_json(p));
-    }
-    if let Some(p) = c.startup_probe {
-        cm.insert("startupProbe".to_string(), gen_probe_to_json(p));
-    }
-    if let Some(lc) = c.lifecycle {
-        cm.insert("lifecycle".to_string(), gen_lifecycle_to_json(lc));
-    }
-    if let Some(sc) = c.security_context {
-        cm.insert(
-            "securityContext".to_string(),
-            gen_security_context_to_json(sc),
-        );
-    }
-    // stdin/stdinOnce/tty — allocate an interactive stdin/TTY for the container; dropping
-    // these silently turns a pod created for `kubectl run -it`/attach-style interactive use
-    // into a non-interactive one, since the kubelet never learns the client asked for a
-    // stdin/TTY pipe in the first place.
-    if let Some(v) = c.stdin {
-        cm.insert("stdin".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = c.stdin_once {
-        cm.insert("stdinOnce".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = c.tty {
-        cm.insert("tty".to_string(), serde_json::Value::Bool(v));
-    }
-    if !c.resize_policy.is_empty() {
-        let rp_json: Vec<serde_json::Value> = c
-            .resize_policy
-            .into_iter()
-            .map(|rp| {
-                let mut rpm = serde_json::Map::new();
-                if let Some(v) = rp.resource_name.filter(|s| !s.is_empty()) {
-                    rpm.insert("resourceName".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = rp.restart_policy.filter(|s| !s.is_empty()) {
-                    rpm.insert("restartPolicy".to_string(), serde_json::Value::String(v));
-                }
-                serde_json::Value::Object(rpm)
-            })
-            .collect();
-        cm.insert(
-            "resizePolicy".to_string(),
-            serde_json::Value::Array(rp_json),
-        );
-    }
-    if let Some(rp) = c.restart_policy.filter(|s| !s.is_empty()) {
-        cm.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
-    }
-    // restartPolicyRules — sidecar-style per-exit-code restart overrides; dropping this
-    // silently reverts a container to its plain restartPolicy, so an exit code the client
-    // explicitly carved out an exception for (e.g. "don't restart on exit code 0") is instead
-    // handled by the container's blanket policy.
-    if !c.restart_policy_rules.is_empty() {
-        let rules: Vec<serde_json::Value> = c
-            .restart_policy_rules
-            .into_iter()
-            .map(|r| {
-                let mut m = serde_json::Map::new();
-                if let Some(v) = r.action.filter(|s| !s.is_empty()) {
-                    m.insert("action".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(ec) = r.exit_codes {
-                    let mut ecm = serde_json::Map::new();
-                    if let Some(v) = ec.operator.filter(|s| !s.is_empty()) {
-                        ecm.insert("operator".to_string(), serde_json::Value::String(v));
-                    }
-                    if !ec.values.is_empty() {
-                        ecm.insert(
-                            "values".to_string(),
-                            serde_json::Value::Array(
-                                ec.values
-                                    .into_iter()
-                                    .map(|n| serde_json::Value::Number(n.into()))
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    m.insert("exitCodes".to_string(), serde_json::Value::Object(ecm));
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        cm.insert(
-            "restartPolicyRules".to_string(),
-            serde_json::Value::Array(rules),
-        );
-    }
-    if !c.volume_mounts.is_empty() {
-        let mounts: Vec<serde_json::Value> = c
-            .volume_mounts
-            .into_iter()
-            .map(|vm| {
-                let mut m = serde_json::Map::new();
-                if let Some(v) = vm.name.filter(|s| !s.is_empty()) {
-                    m.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vm.mount_path.filter(|s| !s.is_empty()) {
-                    m.insert("mountPath".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(true) = vm.read_only {
-                    m.insert("readOnly".to_string(), serde_json::Value::Bool(true));
-                }
-                if let Some(v) = vm.sub_path.filter(|s| !s.is_empty()) {
-                    m.insert("subPath".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vm.sub_path_expr.filter(|s| !s.is_empty()) {
-                    m.insert("subPathExpr".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vm.mount_propagation.filter(|s| !s.is_empty()) {
-                    m.insert("mountPropagation".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vm.recursive_read_only.filter(|s| !s.is_empty()) {
-                    m.insert(
-                        "recursiveReadOnly".to_string(),
-                        serde_json::Value::String(v),
-                    );
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
-    }
-    // volumeDevices — raw block device mounts (as opposed to filesystem volumeMounts);
-    // dropping this silently starts the container without a block device the client
-    // explicitly asked to have mapped in, breaking workloads (e.g. databases) that require
-    // raw block access instead of a filesystem mount.
-    if !c.volume_devices.is_empty() {
-        let devices: Vec<serde_json::Value> = c
-            .volume_devices
-            .into_iter()
-            .map(|vd| {
-                let mut m = serde_json::Map::new();
-                if let Some(v) = vd.name.filter(|s| !s.is_empty()) {
-                    m.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vd.device_path.filter(|s| !s.is_empty()) {
-                    m.insert("devicePath".to_string(), serde_json::Value::String(v));
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        cm.insert(
-            "volumeDevices".to_string(),
-            serde_json::Value::Array(devices),
-        );
-    }
-    serde_json::Value::Object(cm)
+    serde_json::Value::Object(pm)
 }
+
+/// EnvVar.valueFrom's union of reference kinds has no schema-derivable mapping (each variant
+/// needs its own field-by-field JSON shape), so `build/codegen.rs`'s generated
+/// `gen_container_to_json` delegates the whole `env` field here.
+fn gen_env_var_to_json(ev: core_v1::EnvVar) -> serde_json::Value {
+    let mut em = serde_json::Map::new();
+    if let Some(v) = ev.name.filter(|s| !s.is_empty()) {
+        em.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = ev.value.filter(|s| !s.is_empty()) {
+        em.insert("value".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(vf) = ev.value_from {
+        let mut vfm = serde_json::Map::new();
+        if let Some(fr) = vf.field_ref {
+            let mut frm = serde_json::Map::new();
+            if let Some(v) = fr.api_version.filter(|s| !s.is_empty()) {
+                frm.insert("apiVersion".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = fr.field_path.filter(|s| !s.is_empty()) {
+                frm.insert("fieldPath".to_string(), serde_json::Value::String(v));
+            }
+            vfm.insert("fieldRef".to_string(), serde_json::Value::Object(frm));
+        }
+        if let Some(rfr) = vf.resource_field_ref {
+            let mut rfrm = serde_json::Map::new();
+            if let Some(v) = rfr.container_name.filter(|s| !s.is_empty()) {
+                rfrm.insert("containerName".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = rfr.resource.filter(|s| !s.is_empty()) {
+                rfrm.insert("resource".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(divisor_str) = rfr.divisor.and_then(|q| q.string) {
+                if !divisor_str.is_empty() {
+                    rfrm.insert(
+                        "divisor".to_string(),
+                        serde_json::Value::String(divisor_str),
+                    );
+                }
+            }
+            vfm.insert(
+                "resourceFieldRef".to_string(),
+                serde_json::Value::Object(rfrm),
+            );
+        }
+        if let Some(cmkr) = vf.config_map_key_ref {
+            let mut cmkrm = serde_json::Map::new();
+            if let Some(lor) = cmkr.local_object_reference {
+                if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
+                    cmkrm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+            }
+            if let Some(v) = cmkr.key.filter(|s| !s.is_empty()) {
+                cmkrm.insert("key".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(true) = cmkr.optional {
+                cmkrm.insert("optional".to_string(), serde_json::Value::Bool(true));
+            }
+            vfm.insert(
+                "configMapKeyRef".to_string(),
+                serde_json::Value::Object(cmkrm),
+            );
+        }
+        if let Some(skr) = vf.secret_key_ref {
+            let mut skrm = serde_json::Map::new();
+            if let Some(lor) = skr.local_object_reference {
+                if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
+                    skrm.insert("name".to_string(), serde_json::Value::String(v));
+                }
+            }
+            if let Some(v) = skr.key.filter(|s| !s.is_empty()) {
+                skrm.insert("key".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(true) = skr.optional {
+                skrm.insert("optional".to_string(), serde_json::Value::Bool(true));
+            }
+            vfm.insert("secretKeyRef".to_string(), serde_json::Value::Object(skrm));
+        }
+        // fileKeyRef (EnvFiles alpha feature) selects an env var from a file
+        // mounted via another volume. Dropping it makes the container start with
+        // that variable entirely unset instead of the value the file provided.
+        if let Some(fkr) = vf.file_key_ref {
+            let mut fkrm = serde_json::Map::new();
+            if let Some(v) = fkr.volume_name.filter(|s| !s.is_empty()) {
+                fkrm.insert("volumeName".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = fkr.path.filter(|s| !s.is_empty()) {
+                fkrm.insert("path".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = fkr.key.filter(|s| !s.is_empty()) {
+                fkrm.insert("key".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(true) = fkr.optional {
+                fkrm.insert("optional".to_string(), serde_json::Value::Bool(true));
+            }
+            vfm.insert("fileKeyRef".to_string(), serde_json::Value::Object(fkrm));
+        }
+        em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
+    }
+    serde_json::Value::Object(em)
+}
+
+/// `build/codegen.rs`'s generated `gen_container_to_json` delegates the `envFrom` field here for
+/// the same reason as `gen_env_var_to_json`: `ConfigMapEnvSource`/`SecretEnvSource` are
+/// `INLINE_EMBEDS` (`LocalObjectReference`), not a mechanically-walkable nested message.
+fn gen_env_from_source_to_json(ef: core_v1::EnvFromSource) -> serde_json::Value {
+    let mut efm = serde_json::Map::new();
+    if let Some(v) = ef.prefix.filter(|s| !s.is_empty()) {
+        efm.insert("prefix".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(cmr) = ef.config_map_ref {
+        let mut cmrm = serde_json::Map::new();
+        if let Some(lor) = cmr.local_object_reference {
+            if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
+                cmrm.insert("name".to_string(), serde_json::Value::String(v));
+            }
+        }
+        if let Some(true) = cmr.optional {
+            cmrm.insert("optional".to_string(), serde_json::Value::Bool(true));
+        }
+        efm.insert("configMapRef".to_string(), serde_json::Value::Object(cmrm));
+    }
+    if let Some(sr) = ef.secret_ref {
+        let mut srm = serde_json::Map::new();
+        if let Some(lor) = sr.local_object_reference {
+            if let Some(v) = lor.name.filter(|s| !s.is_empty()) {
+                srm.insert("name".to_string(), serde_json::Value::String(v));
+            }
+        }
+        if let Some(true) = sr.optional {
+            srm.insert("optional".to_string(), serde_json::Value::Bool(true));
+        }
+        efm.insert("secretRef".to_string(), serde_json::Value::Object(srm));
+    }
+    serde_json::Value::Object(efm)
+}
+
+/// Container.volumeMounts item encoder. Extracted so `build/codegen.rs`'s generated
+/// `gen_container_to_json` can delegate the one field (`readOnly` only ever emits `true` — see
+/// `gen_pod_spec_to_json`'s `hostNetwork` for why a plain-value bool field needs this) it can't
+/// derive mechanically.
+fn gen_volume_mount_to_json(vm: core_v1::VolumeMount) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = vm.name.filter(|s| !s.is_empty()) {
+        m.insert("name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = vm.mount_path.filter(|s| !s.is_empty()) {
+        m.insert("mountPath".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(true) = vm.read_only {
+        m.insert("readOnly".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(v) = vm.sub_path.filter(|s| !s.is_empty()) {
+        m.insert("subPath".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = vm.sub_path_expr.filter(|s| !s.is_empty()) {
+        m.insert("subPathExpr".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = vm.mount_propagation.filter(|s| !s.is_empty()) {
+        m.insert("mountPropagation".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = vm.recursive_read_only.filter(|s| !s.is_empty()) {
+        m.insert(
+            "recursiveReadOnly".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+// `gen_container_to_json`/`json_to_container_proto` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.core.v1.Container` descriptor. They call the hand-written encoders above/decoders
+// below for the handful of fields (env/envFrom/ports/volumeMounts/resources/probes/lifecycle/
+// securityContext) whose JSON shape isn't a mechanical per-field walk — see
+// `build/codegen.rs::container_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/container_gen.rs"));
 
 /// EphemeralContainer (PodSpec.ephemeralContainers, proto field 34) — decoded so that
 /// UpdateEphemeralContainers (which client-go sends as protobuf) round-trips the debug
@@ -1529,549 +1346,13 @@ pub(crate) fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_j
     serde_json::Value::Object(m)
 }
 
-pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value {
-    let containers: Vec<serde_json::Value> = spec
-        .containers
-        .into_iter()
-        .map(gen_container_to_json)
-        .collect();
-
-    let mut spec_map = serde_json::Map::with_capacity(14);
-    if !spec.volumes.is_empty() {
-        let volumes_json: Vec<serde_json::Value> =
-            spec.volumes.into_iter().map(gen_volume_to_json).collect();
-        spec_map.insert(
-            "volumes".to_string(),
-            serde_json::Value::Array(volumes_json),
-        );
-    }
-    spec_map.insert(
-        "containers".to_string(),
-        serde_json::Value::Array(containers),
-    );
-    if let Some(rp) = spec.restart_policy.filter(|s| !s.is_empty()) {
-        spec_map.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
-    }
-    // dnsPolicy — without this, an explicit "None" (required to make dnsConfig authoritative
-    // instead of merged/appended) is silently dropped, create-defaulting stamps "ClusterFirst"
-    // instead, and the kubelet ignores dnsConfig.nameservers because ClusterFirst's own
-    // resolv.conf generation takes precedence — live-verified: "should support configurable
-    // pod DNS nameservers" fails this way even though dnsConfig itself decodes correctly.
-    if let Some(dp) = spec.dns_policy.filter(|s| !s.is_empty()) {
-        spec_map.insert("dnsPolicy".to_string(), serde_json::Value::String(dp));
-    }
-    if let Some(ads) = spec.active_deadline_seconds {
-        if ads > 0 {
-            spec_map.insert(
-                "activeDeadlineSeconds".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(ads)),
-            );
-        }
-    }
-    // terminationGracePeriodSeconds — a Go *int64 pointer field upstream. Unlike
-    // activeDeadlineSeconds, 0 is a legitimate "kill immediately" value a client can set on
-    // purpose, not noise, so it must be emitted whenever the wire carried any value at all.
-    // Dropping it makes KCM's Deployment controller see nil here vs its own cached &N, which
-    // EqualIgnoreHash treats as unequal — triggering an unbounded ReplicaSet collision storm.
-    if let Some(tgps) = spec.termination_grace_period_seconds {
-        spec_map.insert(
-            "terminationGracePeriodSeconds".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(tgps)),
-        );
-    }
-    if let Some(san) = spec.service_account_name.filter(|s| !s.is_empty()) {
-        spec_map.insert(
-            "serviceAccountName".to_string(),
-            serde_json::Value::String(san),
-        );
-    }
-    // serviceAccount — deprecated alias for serviceAccountName, still accepted on the wire.
-    // Dropping it silently discards the ServiceAccount choice of a legacy client that only
-    // ever sets this field rather than serviceAccountName.
-    if let Some(sa) = spec.service_account.filter(|s| !s.is_empty()) {
-        spec_map.insert("serviceAccount".to_string(), serde_json::Value::String(sa));
-    }
-    if let Some(nn) = spec.node_name.filter(|s| !s.is_empty()) {
-        spec_map.insert("nodeName".to_string(), serde_json::Value::String(nn));
-    }
-    if let Some(hn) = spec.hostname.filter(|s| !s.is_empty()) {
-        spec_map.insert("hostname".to_string(), serde_json::Value::String(hn));
-    }
-    if let Some(sd) = spec.subdomain.filter(|s| !s.is_empty()) {
-        spec_map.insert("subdomain".to_string(), serde_json::Value::String(sd));
-    }
-    if !spec.init_containers.is_empty() {
-        let init_containers: Vec<serde_json::Value> = spec
-            .init_containers
-            .into_iter()
-            .map(gen_container_to_json)
-            .collect();
-        spec_map.insert(
-            "initContainers".to_string(),
-            serde_json::Value::Array(init_containers),
-        );
-    }
-    if let Some(esl) = spec.enable_service_links {
-        spec_map.insert(
-            "enableServiceLinks".to_string(),
-            serde_json::Value::Bool(esl),
-        );
-    }
-    if let Some(rcn) = spec.runtime_class_name.filter(|s| !s.is_empty()) {
-        spec_map.insert(
-            "runtimeClassName".to_string(),
-            serde_json::Value::String(rcn),
-        );
-    }
-    // overhead — spec-level RuntimeClass pod overhead as sent directly by the client, distinct
-    // from the value apply_runtime_class_overhead injects from the RuntimeClass object at
-    // admission time (see proto.rs/pods.rs). Dropping it here erases whatever the client
-    // itself computed and sent before admission ever runs.
-    if !spec.overhead.is_empty() {
-        spec_map.insert(
-            "overhead".to_string(),
-            gen_quantity_map_to_json(spec.overhead),
-        );
-    }
-    // nodeSelector — gates which nodes the scheduler's NodeSelector predicate will bind
-    // this pod to. Without it, a pod that explicitly restricted itself to nodes with a
-    // specific label is silently treated as unrestricted and bound to any node — this
-    // exact gap is what "[sig-scheduling] SchedulerPredicates validates that NodeSelector
-    // is respected if not matching" caught: client-go clientsets (used by e2e test
-    // binaries, kube-scheduler, kube-controller-manager) send Pod creates as protobuf by
-    // default, unlike kubectl which sends JSON, so this decoder — not the scheduler — was
-    // dropping the field.
-    if !spec.node_selector.is_empty() {
-        let ns: serde_json::Map<String, serde_json::Value> = spec
-            .node_selector
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        spec_map.insert("nodeSelector".to_string(), serde_json::Value::Object(ns));
-    }
-    // affinity.nodeAffinity — same silent-drop mechanism and same conformance coverage as
-    // nodeSelector above ("... validates that NodeAffinity is respected if not matching").
-    // podAffinity/podAntiAffinity round-trip too (crates/scheduler still doesn't enforce them).
-    if let Some(affinity) = spec.affinity {
-        let mut am = serde_json::Map::new();
-        if let Some(na) = affinity.node_affinity {
-            am.insert("nodeAffinity".to_string(), gen_node_affinity_to_json(na));
-        }
-        if let Some(pa) = affinity.pod_affinity {
-            am.insert("podAffinity".to_string(), gen_pod_affinity_to_json(pa));
-        }
-        if let Some(paa) = affinity.pod_anti_affinity {
-            am.insert(
-                "podAntiAffinity".to_string(),
-                gen_pod_anti_affinity_to_json(paa),
-            );
-        }
-        spec_map.insert("affinity".to_string(), serde_json::Value::Object(am));
-    }
-    // schedulerName — selects which scheduler binds this pod; dropping it makes a pod that
-    // asked for a custom scheduler (e.g. a batch/GPU scheduler) fall back to being picked up
-    // by the default scheduler instead, silently changing where/how it gets bound.
-    if let Some(sn) = spec.scheduler_name.filter(|s| !s.is_empty()) {
-        spec_map.insert("schedulerName".to_string(), serde_json::Value::String(sn));
-    }
-    // tolerations — required for taint-based eviction and scheduling constraints.
-    // Without this field, pods that tolerate taints are treated as if they have no
-    // tolerations, causing the scheduler to reject them on tainted nodes.
-    if !spec.tolerations.is_empty() {
-        let tols: Vec<serde_json::Value> = spec
-            .tolerations
-            .into_iter()
-            .map(|t| {
-                let mut m = serde_json::Map::new();
-                if let Some(k) = t.key.filter(|s| !s.is_empty()) {
-                    m.insert("key".to_string(), serde_json::Value::String(k));
-                }
-                if let Some(op) = t.operator.filter(|s| !s.is_empty()) {
-                    m.insert("operator".to_string(), serde_json::Value::String(op));
-                }
-                if let Some(v) = t.value.filter(|s| !s.is_empty()) {
-                    m.insert("value".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(eff) = t.effect.filter(|s| !s.is_empty()) {
-                    m.insert("effect".to_string(), serde_json::Value::String(eff));
-                }
-                if let Some(ts) = t.toleration_seconds {
-                    m.insert(
-                        "tolerationSeconds".to_string(),
-                        serde_json::Value::Number(ts.into()),
-                    );
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        spec_map.insert("tolerations".to_string(), serde_json::Value::Array(tols));
-    }
-    // schedulingGates — client-go/kube-controller-manager's typed Pod client (used by e.g.
-    // the ReplicaSet controller to create pods from a template) sends protobuf by default,
-    // not JSON. Without this field, a gated pod created via a controller (as opposed to a
-    // raw `kubectl apply`/JSON POST) silently loses its schedulingGates on decode, so
-    // needs_scheduling never sees them non-empty and schedules the pod immediately —
-    // failing "validates Pods with non-empty schedulingGates are blocked on scheduling".
-    if !spec.scheduling_gates.is_empty() {
-        let gates: Vec<serde_json::Value> = spec
-            .scheduling_gates
-            .into_iter()
-            .filter_map(|g| g.name.filter(|s| !s.is_empty()))
-            .map(|name| serde_json::json!({ "name": name }))
-            .collect();
-        spec_map.insert(
-            "schedulingGates".to_string(),
-            serde_json::Value::Array(gates),
-        );
-    }
-    // topologySpreadConstraints — scheduler-enforced pod spreading across topology domains
-    // (e.g. zone/hostname); dropping this makes the scheduler treat a pod that asked to be
-    // spread across zones/nodes as unconstrained, letting it land in a single zone/node and
-    // defeating the availability guarantee the workload owner configured.
-    if !spec.topology_spread_constraints.is_empty() {
-        let constraints: Vec<serde_json::Value> = spec
-            .topology_spread_constraints
-            .into_iter()
-            .map(|c| {
-                let mut m = serde_json::Map::new();
-                if let Some(ms) = c.max_skew {
-                    m.insert("maxSkew".to_string(), serde_json::Value::Number(ms.into()));
-                }
-                if let Some(tk) = c.topology_key.filter(|s| !s.is_empty()) {
-                    m.insert("topologyKey".to_string(), serde_json::Value::String(tk));
-                }
-                if let Some(wu) = c.when_unsatisfiable.filter(|s| !s.is_empty()) {
-                    m.insert(
-                        "whenUnsatisfiable".to_string(),
-                        serde_json::Value::String(wu),
-                    );
-                }
-                if let Some(ls) = c.label_selector {
-                    m.insert("labelSelector".to_string(), gen_label_selector_to_json(ls));
-                }
-                if let Some(md) = c.min_domains {
-                    m.insert(
-                        "minDomains".to_string(),
-                        serde_json::Value::Number(md.into()),
-                    );
-                }
-                if let Some(nap) = c.node_affinity_policy.filter(|s| !s.is_empty()) {
-                    m.insert(
-                        "nodeAffinityPolicy".to_string(),
-                        serde_json::Value::String(nap),
-                    );
-                }
-                if let Some(ntp) = c.node_taints_policy.filter(|s| !s.is_empty()) {
-                    m.insert(
-                        "nodeTaintsPolicy".to_string(),
-                        serde_json::Value::String(ntp),
-                    );
-                }
-                if !c.match_label_keys.is_empty() {
-                    m.insert(
-                        "matchLabelKeys".to_string(),
-                        serde_json::Value::Array(
-                            c.match_label_keys
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        ),
-                    );
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        spec_map.insert(
-            "topologySpreadConstraints".to_string(),
-            serde_json::Value::Array(constraints),
-        );
-    }
-    // priorityClassName — used by PriorityAdmission to look up the integer priority value.
-    // Without this field, pods are treated as having no priority class, which can result in
-    // them being preempted by lower-priority pods that happen to have a class set.
-    if let Some(pcn) = spec.priority_class_name.filter(|s| !s.is_empty()) {
-        spec_map.insert(
-            "priorityClassName".to_string(),
-            serde_json::Value::String(pcn),
-        );
-    }
-    // priority — the integer priority value resolved by the scheduler from priorityClassName.
-    // Like terminationGracePeriodSeconds, 0 is a legitimate explicit value (lowest possible
-    // priority) a client can set on purpose, not noise, so it must be emitted whenever the
-    // wire carried any value at all. Without this field, the scheduler cannot perform
-    // preemption ordering correctly.
-    if let Some(p) = spec.priority {
-        spec_map.insert("priority".to_string(), serde_json::Value::Number(p.into()));
-    }
-    // preemptionPolicy — governs whether this pod may preempt lower-priority pods; dropping
-    // an explicit "Never" silently reverts to the cluster default (PreemptLowerPriority),
-    // letting the pod preempt others despite the client explicitly opting out.
-    if let Some(pp) = spec.preemption_policy.filter(|s| !s.is_empty()) {
-        spec_map.insert(
-            "preemptionPolicy".to_string(),
-            serde_json::Value::String(pp),
-        );
-    }
-    // hostNetwork — the kubelet reads this to decide whether to share the host network
-    // namespace; dropping it makes KubeletManagedEtcHosts and hostPort-on-hostNetwork
-    // behavior silently wrong for every protobuf-created pod.
-    //
-    // Unlike automountServiceAccountToken/enableServiceLinks (genuine *bool upstream,
-    // tri-state), HostNetwork is a plain bool in k8s.io/api/core/v1/types.go ("Default to
-    // false" in the proto doc, vs. no such default for the tri-state fields). gogoproto's
-    // marshaler for a non-pointer field can't check "was this set", so it unconditionally
-    // writes the field on the wire — every protobuf client (KCM, kubelet, scheduler)
-    // decodes to Some(false) whether or not hostNetwork was ever touched, while JSON's
-    // omitempty drops the zero value. So Some(false) is indistinguishable from unset here;
-    // only Some(true) reflects real intent. Same class as priority/activeDeadlineSeconds
-    // above. Live-verified: KCM's protobuf-encoded ReplicaSet POST decoded
-    // spec.template.spec to "hostNetwork": false even though the source Deployment's
-    // JSON-decoded template had no hostNetwork key at all.
-    if let Some(true) = spec.host_network {
-        spec_map.insert("hostNetwork".to_string(), serde_json::Value::Bool(true));
-    }
-    // hostPID/hostIPC/shareProcessNamespace — namespace-sharing toggles the kubelet reads to
-    // set up container isolation. Dropping hostPID/hostIPC silently re-isolates a pod that
-    // asked to see the host's process/IPC namespace, breaking debugging/monitoring pods that
-    // depend on it; dropping shareProcessNamespace silently re-isolates sibling containers
-    // from each other, breaking sidecar patterns that signal or trace another container's
-    // PID 1.
-    if let Some(v) = spec.host_pid {
-        spec_map.insert("hostPID".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = spec.host_ipc {
-        spec_map.insert("hostIPC".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = spec.share_process_namespace {
-        spec_map.insert(
-            "shareProcessNamespace".to_string(),
-            serde_json::Value::Bool(v),
-        );
-    }
-    // automountServiceAccountToken — pod-level override of the ServiceAccount default;
-    // dropping it means a pod that explicitly opted out of token automount gets one anyway.
-    if let Some(v) = spec.automount_service_account_token {
-        spec_map.insert(
-            "automountServiceAccountToken".to_string(),
-            serde_json::Value::Bool(v),
-        );
-    }
-    // imagePullSecrets — credentials the kubelet uses to authenticate private-registry image
-    // pulls for every container in the pod; dropping this makes the kubelet attempt an
-    // unauthenticated pull and ImagePullBackOff the pod even though the client supplied
-    // working credentials.
-    if !spec.image_pull_secrets.is_empty() {
-        let refs: Vec<serde_json::Value> = spec
-            .image_pull_secrets
-            .into_iter()
-            .filter_map(|r| r.name.filter(|s| !s.is_empty()))
-            .map(|name| serde_json::json!({ "name": name }))
-            .collect();
-        spec_map.insert(
-            "imagePullSecrets".to_string(),
-            serde_json::Value::Array(refs),
-        );
-    }
-    // hostAliases — injected into the pod's /etc/hosts by the kubelet; dropping this means
-    // the extra host entries a pod asked for silently never appear.
-    if !spec.host_aliases.is_empty() {
-        let aliases: Vec<serde_json::Value> = spec
-            .host_aliases
-            .into_iter()
-            .map(|ha| {
-                let mut m = serde_json::Map::new();
-                if let Some(ip) = ha.ip.filter(|s| !s.is_empty()) {
-                    m.insert("ip".to_string(), serde_json::Value::String(ip));
-                }
-                if !ha.hostnames.is_empty() {
-                    m.insert(
-                        "hostnames".to_string(),
-                        serde_json::Value::Array(
-                            ha.hostnames
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        ),
-                    );
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        spec_map.insert("hostAliases".to_string(), serde_json::Value::Array(aliases));
-    }
-    // dnsConfig — merged with dnsPolicy by the kubelet to build the pod's resolv.conf;
-    // dropping this silently discards user-specified nameservers/search/options.
-    if let Some(dc) = spec.dns_config {
-        let mut m = serde_json::Map::new();
-        if !dc.nameservers.is_empty() {
-            m.insert(
-                "nameservers".to_string(),
-                serde_json::Value::Array(
-                    dc.nameservers
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if !dc.searches.is_empty() {
-            m.insert(
-                "searches".to_string(),
-                serde_json::Value::Array(
-                    dc.searches
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if !dc.options.is_empty() {
-            let opts: Vec<serde_json::Value> = dc
-                .options
-                .into_iter()
-                .map(|o| {
-                    let mut om = serde_json::Map::new();
-                    if let Some(n) = o.name.filter(|s| !s.is_empty()) {
-                        om.insert("name".to_string(), serde_json::Value::String(n));
-                    }
-                    if let Some(v) = o.value.filter(|s| !s.is_empty()) {
-                        om.insert("value".to_string(), serde_json::Value::String(v));
-                    }
-                    serde_json::Value::Object(om)
-                })
-                .collect();
-            m.insert("options".to_string(), serde_json::Value::Array(opts));
-        }
-        spec_map.insert("dnsConfig".to_string(), serde_json::Value::Object(m));
-    }
-    // readinessGates — extra pod conditions (beyond container readiness) that must be True
-    // for the pod to count as Ready; dropping this makes the pod report Ready as soon as its
-    // containers are, ignoring a gate a workload controller (e.g. for injected sidecars)
-    // depends on.
-    if !spec.readiness_gates.is_empty() {
-        let gates: Vec<serde_json::Value> = spec
-            .readiness_gates
-            .into_iter()
-            .filter_map(|g| g.condition_type.filter(|s| !s.is_empty()))
-            .map(|ct| serde_json::json!({ "conditionType": ct }))
-            .collect();
-        spec_map.insert(
-            "readinessGates".to_string(),
-            serde_json::Value::Array(gates),
-        );
-    }
-    // ephemeralContainers — needed so UpdateEphemeralContainers (protobuf by default in
-    // client-go) round-trips the debug container through apply_ephemeral_containers_patch.
-    if !spec.ephemeral_containers.is_empty() {
-        let ecs: Vec<serde_json::Value> = spec
-            .ephemeral_containers
-            .into_iter()
-            .map(gen_ephemeral_container_to_json)
-            .collect();
-        spec_map.insert(
-            "ephemeralContainers".to_string(),
-            serde_json::Value::Array(ecs),
-        );
-    }
-    // securityContext — pod-level RunAsUser/RunAsGroup/fsGroup/sysctls; dropping this is a
-    // P1 data-loss bug (containers run as whatever the image defaults to, sysctls never
-    // reach the kubelet or validate_pod_sysctls).
-    if let Some(sc) = spec.security_context {
-        spec_map.insert(
-            "securityContext".to_string(),
-            gen_pod_security_context_to_json(sc),
-        );
-    }
-    // os — declares the pod's target OS (linux/windows), which gates which securityContext
-    // and host-namespace fields validation allows; dropping it makes OS-conditional
-    // validation silently permissive for the OS the client actually declared.
-    if let Some(name) = spec.os.and_then(|os| os.name).filter(|s| !s.is_empty()) {
-        spec_map.insert("os".to_string(), serde_json::json!({ "name": name }));
-    }
-    // resourceClaims — DRA claims a container may reference by name; dropping this means a
-    // container's resources.claims[].name resolves to nothing, so the pod starts without
-    // ever reserving the device/resource the client asked for.
-    if !spec.resource_claims.is_empty() {
-        let claims: Vec<serde_json::Value> = spec
-            .resource_claims
-            .into_iter()
-            .map(|rc| {
-                let mut m = serde_json::Map::new();
-                if let Some(n) = rc.name.filter(|s| !s.is_empty()) {
-                    m.insert("name".to_string(), serde_json::Value::String(n));
-                }
-                if let Some(rcn) = rc.resource_claim_name.filter(|s| !s.is_empty()) {
-                    m.insert(
-                        "resourceClaimName".to_string(),
-                        serde_json::Value::String(rcn),
-                    );
-                }
-                if let Some(rctn) = rc.resource_claim_template_name.filter(|s| !s.is_empty()) {
-                    m.insert(
-                        "resourceClaimTemplateName".to_string(),
-                        serde_json::Value::String(rctn),
-                    );
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        spec_map.insert(
-            "resourceClaims".to_string(),
-            serde_json::Value::Array(claims),
-        );
-    }
-    // setHostnameAsFQDN/hostUsers — genuine *bool fields upstream (unlike hostNetwork's plain
-    // bool), so gogoproto only writes them when the client's pointer is non-nil; Some(_) here
-    // reliably means "the client set this", true or false. Dropping setHostnameAsFQDN=true
-    // silently reverts the kernel hostname to the leaf name instead of the FQDN the client
-    // asked for; dropping hostUsers=false silently puts the pod back in the host user
-    // namespace, undoing a client's explicit userns-isolation opt-in for breakout mitigation.
-    if let Some(v) = spec.set_hostname_as_fqdn {
-        spec_map.insert("setHostnameAsFQDN".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = spec.host_users {
-        spec_map.insert("hostUsers".to_string(), serde_json::Value::Bool(v));
-    }
-    // resources — pod-level ResourceRequirements (alpha PodLevelResources feature gate). Unlike
-    // Container.Resources (a Go value type that upstream always writes on the wire, handled via
-    // omit-when-empty above), PodSpec.Resources is a genuine `*ResourceRequirements` pointer, so
-    // Some(_) reliably reflects client intent — mirrors the affinity/dnsConfig treatment
-    // elsewhere in this function rather than the container-resources one. Dropping it silently
-    // discards fine-grained CPU/memory sharing the client configured across all containers.
-    if let Some(res) = spec.resources {
-        // gen_resource_requirements_to_json also handles `claims` (DRA resource claim
-        // references) — a hand-inlined limits/requests-only copy here previously dropped it,
-        // silently resolving every pod-level `resources.claims[].name` reference to nothing.
-        spec_map.insert(
-            "resources".to_string(),
-            gen_resource_requirements_to_json(res),
-        );
-    }
-    // hostnameOverride — alpha HostnameOverride feature gate; takes precedence over
-    // hostname/subdomain for what the pod perceives as its own hostname. Dropping it silently
-    // falls back to the leaf/FQDN hostname the client explicitly asked to override.
-    if let Some(ho) = spec.hostname_override.filter(|s| !s.is_empty()) {
-        spec_map.insert(
-            "hostnameOverride".to_string(),
-            serde_json::Value::String(ho),
-        );
-    }
-    // schedulingGroup — alpha GenericWorkload feature gate identifying the gang-scheduling
-    // group a pod belongs to. Dropping it silently strips PodGroupName from a
-    // protobuf-encoded pod create/update, leaving the scheduler no way to apply workload-aware
-    // (gang) scheduling semantics the client explicitly asked for.
-    if let Some(pgn) = spec
-        .scheduling_group
-        .and_then(|sg| sg.pod_group_name)
-        .filter(|s| !s.is_empty())
-    {
-        spec_map.insert(
-            "schedulingGroup".to_string(),
-            serde_json::json!({ "podGroupName": pgn }),
-        );
-    }
-    serde_json::Value::Object(spec_map)
-}
+// `gen_pod_spec_to_json`/`json_to_pod_spec_proto` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.core.v1.PodSpec` descriptor. They call the hand-written/generated encoders and
+// decoders above/below for the fields (volumes, containers/initContainers, ephemeralContainers,
+// affinity, securityContext, resources, activeDeadlineSeconds, hostNetwork, imagePullSecrets,
+// readinessGates/schedulingGates, os, schedulingGroup) whose JSON shape isn't a mechanical
+// per-field walk — see `build/codegen.rs::pod_spec_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/pod_spec_gen.rs"));
 
 pub(crate) fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     let mut m = serde_json::json!({ "creationTimestamp": serde_json::Value::Null });
@@ -2484,413 +1765,99 @@ fn gen_container_state_to_json(state: core_v1::ContainerState) -> serde_json::Va
     serde_json::Value::Object(m)
 }
 
-/// Convert a decoded `ContainerStatus` protobuf message (an element of `PodStatus`'s
-/// `containerStatuses`/`initContainerStatuses`/`ephemeralContainerStatuses`) to JSON.
-///
-/// Missing this subtree is what makes the whole-array omission in `gen_pod_status_to_json`
-/// catastrophic rather than merely incomplete: `replace_pod_status` replaces the stored
-/// `status` subtree wholesale with the decoder's output, so a `containerStatuses` entry
-/// that never reaches JSON here means `kubectl get pods` READY/RESTARTS falls back to the
-/// spec container count and crash-loop/exec/log tooling that reads `state`/`containerID`
-/// sees nothing.
-fn gen_container_status_to_json(cs: core_v1::ContainerStatus) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = cs.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), serde_json::Value::String(v));
+/// ContainerStatus.user's Linux identity sub-object has no schema-derivable mapping distinct
+/// from a mechanical walk of `ContainerUser`/`LinuxContainerUser` themselves (upstream flattens
+/// nothing here) — it's delegated purely because the field is only ever emitted when
+/// `linux` is present, dropping the `user` key entirely otherwise, which
+/// `build/codegen.rs`'s generated `gen_container_status_to_json` expresses via this `Option`
+/// return rather than a mechanical nested-message walk.
+fn gen_container_user_to_json(user: core_v1::ContainerUser) -> Option<serde_json::Value> {
+    let linux = user.linux?;
+    let mut lm = serde_json::Map::new();
+    if let Some(v) = linux.uid {
+        lm.insert("uid".to_string(), serde_json::Value::Number(v.into()));
     }
-    if let Some(state) = cs.state {
-        m.insert("state".to_string(), gen_container_state_to_json(state));
+    if let Some(v) = linux.gid {
+        lm.insert("gid".to_string(), serde_json::Value::Number(v.into()));
     }
-    if let Some(state) = cs.last_state {
-        m.insert("lastState".to_string(), gen_container_state_to_json(state));
-    }
-    // ready/restartCount are plain (non-pointer) fields upstream — Kubernetes always
-    // serializes them, including the zero values, so they are inserted unconditionally
-    // rather than gated on Option::is_some like the optional fields below.
-    m.insert(
-        "ready".to_string(),
-        serde_json::Value::Bool(cs.ready.unwrap_or(false)),
-    );
-    m.insert(
-        "restartCount".to_string(),
-        serde_json::Value::Number(cs.restart_count.unwrap_or(0).into()),
-    );
-    if let Some(v) = cs.image.filter(|s| !s.is_empty()) {
-        m.insert("image".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = cs.image_id.filter(|s| !s.is_empty()) {
-        m.insert("imageID".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = cs.container_id.filter(|s| !s.is_empty()) {
-        m.insert("containerID".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = cs.started {
-        m.insert("started".to_string(), serde_json::Value::Bool(v));
-    }
-    if !cs.allocated_resources.is_empty() {
-        m.insert(
-            "allocatedResources".to_string(),
-            gen_quantity_map_to_json(cs.allocated_resources),
+    if !linux.supplemental_groups.is_empty() {
+        lm.insert(
+            "supplementalGroups".to_string(),
+            serde_json::Value::Array(
+                linux
+                    .supplemental_groups
+                    .into_iter()
+                    .map(|g| serde_json::Value::Number(g.into()))
+                    .collect(),
+            ),
         );
     }
-    if let Some(res) = cs.resources {
-        m.insert(
-            "resources".to_string(),
-            gen_resource_requirements_to_json(res),
-        );
-    }
-    if !cs.volume_mounts.is_empty() {
-        let vms: Vec<serde_json::Value> = cs
-            .volume_mounts
-            .into_iter()
-            .map(|vm| {
-                let mut vmm = serde_json::Map::new();
-                if let Some(v) = vm.name.filter(|s| !s.is_empty()) {
-                    vmm.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vm.mount_path.filter(|s| !s.is_empty()) {
-                    vmm.insert("mountPath".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = vm.read_only {
-                    vmm.insert("readOnly".to_string(), serde_json::Value::Bool(v));
-                }
-                if let Some(v) = vm.recursive_read_only.filter(|s| !s.is_empty()) {
-                    vmm.insert(
-                        "recursiveReadOnly".to_string(),
-                        serde_json::Value::String(v),
-                    );
-                }
-                if let Some(vs) = vm.volume_status {
-                    let mut vsm = serde_json::Map::new();
-                    if let Some(v) = vs.image.and_then(|i| i.image_ref).filter(|s| !s.is_empty()) {
-                        vsm.insert("image".to_string(), serde_json::json!({ "imageRef": v }));
-                    }
-                    vmm.insert("volumeStatus".to_string(), serde_json::Value::Object(vsm));
-                }
-                serde_json::Value::Object(vmm)
-            })
-            .collect();
-        m.insert("volumeMounts".to_string(), serde_json::Value::Array(vms));
-    }
-    if let Some(linux) = cs.user.and_then(|u| u.linux) {
-        let mut lm = serde_json::Map::new();
-        if let Some(v) = linux.uid {
-            lm.insert("uid".to_string(), serde_json::Value::Number(v.into()));
-        }
-        if let Some(v) = linux.gid {
-            lm.insert("gid".to_string(), serde_json::Value::Number(v.into()));
-        }
-        if !linux.supplemental_groups.is_empty() {
-            lm.insert(
-                "supplementalGroups".to_string(),
-                serde_json::Value::Array(
-                    linux
-                        .supplemental_groups
-                        .into_iter()
-                        .map(|g| serde_json::Value::Number(g.into()))
-                        .collect(),
-                ),
-            );
-        }
-        m.insert("user".to_string(), serde_json::json!({ "linux": lm }));
-    }
-    if !cs.allocated_resources_status.is_empty() {
-        let statuses: Vec<serde_json::Value> = cs
-            .allocated_resources_status
-            .into_iter()
-            .map(|rs| {
-                let mut rsm = serde_json::Map::new();
-                if let Some(v) = rs.name.filter(|s| !s.is_empty()) {
-                    rsm.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if !rs.resources.is_empty() {
-                    let healths: Vec<serde_json::Value> = rs
-                        .resources
-                        .into_iter()
-                        .map(|h| {
-                            let mut hm = serde_json::Map::new();
-                            if let Some(v) = h.resource_id.filter(|s| !s.is_empty()) {
-                                hm.insert("resourceID".to_string(), serde_json::Value::String(v));
-                            }
-                            if let Some(v) = h.health.filter(|s| !s.is_empty()) {
-                                hm.insert("health".to_string(), serde_json::Value::String(v));
-                            }
-                            if let Some(v) = h.message.filter(|s| !s.is_empty()) {
-                                hm.insert("message".to_string(), serde_json::Value::String(v));
-                            }
-                            serde_json::Value::Object(hm)
-                        })
-                        .collect();
-                    rsm.insert("resources".to_string(), serde_json::Value::Array(healths));
-                }
-                serde_json::Value::Object(rsm)
-            })
-            .collect();
-        m.insert(
-            "allocatedResourcesStatus".to_string(),
-            serde_json::Value::Array(statuses),
-        );
-    }
-    if let Some(v) = cs.stop_signal.filter(|s| !s.is_empty()) {
-        m.insert("stopSignal".to_string(), serde_json::Value::String(v));
-    }
-    serde_json::Value::Object(m)
+    Some(serde_json::json!({ "linux": lm }))
 }
 
-/// Convert a decoded `PodStatus` protobuf message to the JSON shape stored/served by u7s.
-///
-/// A protobuf-encoded write to the `/status` subresource (e.g. client-go typed clients'
-/// `UpdateStatus`, which defaults to protobuf content-type) carries the full `PodStatus`
-/// on the wire. Without this, `decode_pod_proto_gen` silently dropped `.status` entirely,
-/// so `replace_pod_status` treated the incoming status as absent and overwrote the stored
-/// status with `null` — a protobuf PUT to a pod's status subresource wiped the pod's phase,
-/// conditions and IPs instead of replacing them with the caller's values.
-///
-/// `containerStatuses`/`initContainerStatuses`/`ephemeralContainerStatuses` and the DRA
-/// resource-claim-status fields were themselves missing here in exactly the same way: since
-/// `replace_pod_status` replaces the whole stored `status` subtree with this function's
-/// output rather than merging into it, an omitted array does not just fail to update — it
-/// deletes whatever the stored pod already had.
-fn gen_pod_status_to_json(status: core_v1::PodStatus) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
-        m.insert("phase".to_string(), serde_json::Value::String(v));
+// `gen_container_status_to_json`/`json_to_container_status_proto` are generated by
+// `build/codegen.rs` from the `.k8s.io.api.core.v1.ContainerStatus` descriptor. They call the
+// hand-written/generated encoders and decoders above/below for the fields (state/lastState,
+// ready/restartCount's plain-value unconditional emission, resources, user) whose JSON shape
+// isn't a mechanical per-field walk — see `build/codegen.rs::container_status_delegated_field`.
+//
+// Missing this subtree (as `gen_pod_status_to_json`'s hand-rolled predecessor once did) is what
+// makes a whole-array omission catastrophic rather than merely incomplete: `replace_pod_status`
+// replaces the stored `status` subtree wholesale with the decoder's output, so a
+// `containerStatuses` entry that never reaches JSON here means `kubectl get pods`
+// READY/RESTARTS falls back to the spec container count and crash-loop/exec/log tooling that
+// reads `state`/`containerID` sees nothing.
+include!(concat!(env!("OUT_DIR"), "/container_status_gen.rs"));
+
+/// PodCondition's `type`/`status` are unconditionally emitted (even empty) rather than gated on
+/// `Option::is_some` like every other field here — matching upstream's non-`omitempty` JSON tags
+/// for those two fields specifically — which is why this stays a hand-written delegate rather
+/// than a mechanical per-field walk (the schema gives no signal for "always emit this one, but
+/// not that one"). `lastTransitionTime`/`lastProbeTime` are `metav1.Time` (RFC3339 string, not
+/// the `{seconds, nanos}` wire shape), the same opaque-scalar handling `emit_field_encode` already
+/// gives `Quantity`.
+fn gen_pod_condition_to_json(c: core_v1::PodCondition) -> serde_json::Value {
+    let mut cond = serde_json::json!({
+        "type": c.r#type.unwrap_or_default(),
+        "status": c.status.unwrap_or_default(),
+    });
+    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+        cond["reason"] = serde_json::Value::String(v);
     }
-    if let Some(v) = status.observed_generation.filter(|&v| v != 0) {
-        m.insert("observedGeneration".to_string(), v.into());
+    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+        cond["message"] = serde_json::Value::String(v);
     }
-    if !status.conditions.is_empty() {
-        let conditions: Vec<serde_json::Value> = status
-            .conditions
-            .into_iter()
-            .map(|c| {
-                let mut cond = serde_json::json!({
-                    "type": c.r#type.unwrap_or_default(),
-                    "status": c.status.unwrap_or_default(),
-                });
-                if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
-                    cond["reason"] = serde_json::Value::String(v);
-                }
-                if let Some(v) = c.message.filter(|s| !s.is_empty()) {
-                    cond["message"] = serde_json::Value::String(v);
-                }
-                if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds) {
-                    cond["lastTransitionTime"] =
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                }
-                if let Some(secs) = c.last_probe_time.and_then(|t| t.seconds) {
-                    cond["lastProbeTime"] =
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                }
-                if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
-                    cond["observedGeneration"] = v.into();
-                }
-                cond
-            })
-            .collect();
-        m.insert(
-            "conditions".to_string(),
-            serde_json::Value::Array(conditions),
-        );
+    if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds) {
+        cond["lastTransitionTime"] = serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
     }
-    if let Some(v) = status.message.filter(|s| !s.is_empty()) {
-        m.insert("message".to_string(), serde_json::Value::String(v));
+    if let Some(secs) = c.last_probe_time.and_then(|t| t.seconds) {
+        cond["lastProbeTime"] = serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
     }
-    if let Some(v) = status.reason.filter(|s| !s.is_empty()) {
-        m.insert("reason".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+        cond["observedGeneration"] = v.into();
     }
-    if let Some(v) = status.nominated_node_name.filter(|s| !s.is_empty()) {
-        m.insert(
-            "nominatedNodeName".to_string(),
-            serde_json::Value::String(v),
-        );
-    }
-    if let Some(v) = status.host_ip.filter(|s| !s.is_empty()) {
-        m.insert("hostIP".to_string(), serde_json::Value::String(v));
-    }
-    if !status.host_i_ps.is_empty() {
-        let ips: Vec<serde_json::Value> = status
-            .host_i_ps
-            .into_iter()
-            .filter_map(|h| h.ip.filter(|s| !s.is_empty()))
-            .map(|ip| serde_json::json!({ "ip": ip }))
-            .collect();
-        if !ips.is_empty() {
-            m.insert("hostIPs".to_string(), serde_json::Value::Array(ips));
-        }
-    }
-    if let Some(v) = status.pod_ip.filter(|s| !s.is_empty()) {
-        m.insert("podIP".to_string(), serde_json::Value::String(v));
-    }
-    if !status.pod_i_ps.is_empty() {
-        let ips: Vec<serde_json::Value> = status
-            .pod_i_ps
-            .into_iter()
-            .filter_map(|p| p.ip.filter(|s| !s.is_empty()))
-            .map(|ip| serde_json::json!({ "ip": ip }))
-            .collect();
-        if !ips.is_empty() {
-            m.insert("podIPs".to_string(), serde_json::Value::Array(ips));
-        }
-    }
-    if let Some(secs) = status.start_time.and_then(|t| t.seconds) {
-        m.insert(
-            "startTime".to_string(),
-            serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
-        );
-    }
-    if let Some(v) = status.qos_class.filter(|s| !s.is_empty()) {
-        m.insert("qosClass".to_string(), serde_json::Value::String(v));
-    }
-    if !status.init_container_statuses.is_empty() {
-        m.insert(
-            "initContainerStatuses".to_string(),
-            serde_json::Value::Array(
-                status
-                    .init_container_statuses
-                    .into_iter()
-                    .map(gen_container_status_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if !status.container_statuses.is_empty() {
-        m.insert(
-            "containerStatuses".to_string(),
-            serde_json::Value::Array(
-                status
-                    .container_statuses
-                    .into_iter()
-                    .map(gen_container_status_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if !status.ephemeral_container_statuses.is_empty() {
-        m.insert(
-            "ephemeralContainerStatuses".to_string(),
-            serde_json::Value::Array(
-                status
-                    .ephemeral_container_statuses
-                    .into_iter()
-                    .map(gen_container_status_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(v) = status.resize.filter(|s| !s.is_empty()) {
-        m.insert("resize".to_string(), serde_json::Value::String(v));
-    }
-    if !status.resource_claim_statuses.is_empty() {
-        let claims: Vec<serde_json::Value> = status
-            .resource_claim_statuses
-            .into_iter()
-            .map(|c| {
-                let mut cm = serde_json::Map::new();
-                if let Some(v) = c.name.filter(|s| !s.is_empty()) {
-                    cm.insert("name".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = c.resource_claim_name.filter(|s| !s.is_empty()) {
-                    cm.insert(
-                        "resourceClaimName".to_string(),
-                        serde_json::Value::String(v),
-                    );
-                }
-                serde_json::Value::Object(cm)
-            })
-            .collect();
-        m.insert(
-            "resourceClaimStatuses".to_string(),
-            serde_json::Value::Array(claims),
-        );
-    }
-    if let Some(ext) = status.extended_resource_claim_status {
-        let mut em = serde_json::Map::new();
-        if !ext.request_mappings.is_empty() {
-            let mappings: Vec<serde_json::Value> = ext
-                .request_mappings
-                .into_iter()
-                .map(|rm| {
-                    let mut rmm = serde_json::Map::new();
-                    if let Some(v) = rm.container_name.filter(|s| !s.is_empty()) {
-                        rmm.insert("containerName".to_string(), serde_json::Value::String(v));
-                    }
-                    if let Some(v) = rm.resource_name.filter(|s| !s.is_empty()) {
-                        rmm.insert("resourceName".to_string(), serde_json::Value::String(v));
-                    }
-                    if let Some(v) = rm.request_name.filter(|s| !s.is_empty()) {
-                        rmm.insert("requestName".to_string(), serde_json::Value::String(v));
-                    }
-                    serde_json::Value::Object(rmm)
-                })
-                .collect();
-            em.insert(
-                "requestMappings".to_string(),
-                serde_json::Value::Array(mappings),
-            );
-        }
-        if let Some(v) = ext.resource_claim_name.filter(|s| !s.is_empty()) {
-            em.insert(
-                "resourceClaimName".to_string(),
-                serde_json::Value::String(v),
-            );
-        }
-        m.insert(
-            "extendedResourceClaimStatus".to_string(),
-            serde_json::Value::Object(em),
-        );
-    }
-    if !status.allocated_resources.is_empty() {
-        m.insert(
-            "allocatedResources".to_string(),
-            gen_quantity_map_to_json(status.allocated_resources),
-        );
-    }
-    if let Some(res) = status.resources {
-        m.insert(
-            "resources".to_string(),
-            gen_resource_requirements_to_json(res),
-        );
-    }
-    if !status.node_allocatable_resource_claim_statuses.is_empty() {
-        let statuses: Vec<serde_json::Value> = status
-            .node_allocatable_resource_claim_statuses
-            .into_iter()
-            .map(|n| {
-                let mut nm = serde_json::Map::new();
-                if let Some(v) = n.resource_claim_name.filter(|s| !s.is_empty()) {
-                    nm.insert(
-                        "resourceClaimName".to_string(),
-                        serde_json::Value::String(v),
-                    );
-                }
-                if !n.containers.is_empty() {
-                    nm.insert(
-                        "containers".to_string(),
-                        serde_json::Value::Array(
-                            n.containers
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        ),
-                    );
-                }
-                if !n.resources.is_empty() {
-                    nm.insert(
-                        "resources".to_string(),
-                        gen_quantity_map_to_json(n.resources),
-                    );
-                }
-                serde_json::Value::Object(nm)
-            })
-            .collect();
-        m.insert(
-            "nodeAllocatableResourceClaimStatuses".to_string(),
-            serde_json::Value::Array(statuses),
-        );
-    }
-    serde_json::Value::Object(m)
+    cond
 }
+
+// `gen_pod_status_to_json`/`json_to_pod_status_proto` are generated by `build/codegen.rs` from
+// the `.k8s.io.api.core.v1.PodStatus` descriptor. They call the hand-written/generated encoders
+// and decoders above/below for the fields (observedGeneration's non-zero guard, conditions,
+// hostIPs/podIPs, startTime, container/init/ephemeral statuses, resources) whose JSON shape
+// isn't a mechanical per-field walk — see `build/codegen.rs::pod_status_delegated_field`.
+//
+// A protobuf-encoded write to the `/status` subresource (e.g. client-go typed clients'
+// `UpdateStatus`, which defaults to protobuf content-type) carries the full `PodStatus`
+// on the wire. Before this was schema-driven, `decode_pod_proto_gen` silently dropped `.status`
+// entirely, so `replace_pod_status` treated the incoming status as absent and overwrote the
+// stored status with `null` — a protobuf PUT to a pod's status subresource wiped the pod's
+// phase, conditions and IPs instead of replacing them with the caller's values.
+//
+// `containerStatuses`/`initContainerStatuses`/`ephemeralContainerStatuses` and the DRA
+// resource-claim-status fields were themselves missing in exactly the same way: since
+// `replace_pod_status` replaces the whole stored `status` subtree with this function's output
+// rather than merging into it, an omitted array does not just fail to update — it deletes
+// whatever the stored pod already had.
+include!(concat!(env!("OUT_DIR"), "/pod_status_gen.rs"));
 
 pub fn decode_pod_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let pod = core_v1::Pod::decode(data).ok()?;
@@ -4863,55 +3830,6 @@ fn json_to_container_resize_policy_proto(v: &serde_json::Value) -> core_v1::Cont
     }
 }
 
-fn json_to_container_proto(v: &serde_json::Value) -> core_v1::Container {
-    core_v1::Container {
-        name: jstr(v, "name"),
-        image: jstr(v, "image"),
-        command: jstrs(v, "command"),
-        args: jstrs(v, "args"),
-        working_dir: jstr(v, "workingDir"),
-        ports: v
-            .get("ports")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_container_port_proto).collect())
-            .unwrap_or_default(),
-        env_from: v
-            .get("envFrom")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_env_from_source_proto).collect())
-            .unwrap_or_default(),
-        env: v
-            .get("env")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_env_var_proto).collect())
-            .unwrap_or_default(),
-        resources: v.get("resources").map(json_to_resource_requirements_proto),
-        resize_policy: v
-            .get("resizePolicy")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .map(json_to_container_resize_policy_proto)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        volume_mounts: v
-            .get("volumeMounts")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_volume_mount_proto).collect())
-            .unwrap_or_default(),
-        liveness_probe: v.get("livenessProbe").map(json_to_probe_proto),
-        readiness_probe: v.get("readinessProbe").map(json_to_probe_proto),
-        startup_probe: v.get("startupProbe").map(json_to_probe_proto),
-        lifecycle: v.get("lifecycle").map(json_to_lifecycle_proto),
-        termination_message_path: jstr(v, "terminationMessagePath"),
-        termination_message_policy: jstr(v, "terminationMessagePolicy"),
-        image_pull_policy: jstr(v, "imagePullPolicy"),
-        security_context: v.get("securityContext").map(json_to_security_context_proto),
-        ..Default::default()
-    }
-}
-
 fn json_to_key_to_path_proto(v: &serde_json::Value) -> core_v1::KeyToPath {
     core_v1::KeyToPath {
         key: jstr(v, "key"),
@@ -5133,16 +4051,6 @@ fn json_to_csi_volume_source_proto(v: &serde_json::Value) -> core_v1::CsiVolumeS
     }
 }
 
-fn json_to_toleration_proto(v: &serde_json::Value) -> core_v1::Toleration {
-    core_v1::Toleration {
-        key: jstr(v, "key"),
-        operator: jstr(v, "operator"),
-        value: jstr(v, "value"),
-        effect: jstr(v, "effect"),
-        toleration_seconds: ji64(v, "tolerationSeconds"),
-    }
-}
-
 fn json_to_scheduling_gate_proto(v: &serde_json::Value) -> core_v1::PodSchedulingGate {
     core_v1::PodSchedulingGate {
         name: jstr(v, "name"),
@@ -5192,46 +4100,6 @@ fn json_to_container_state_proto(v: &serde_json::Value) -> core_v1::ContainerSta
     state
 }
 
-fn json_to_container_status_proto(v: &serde_json::Value) -> core_v1::ContainerStatus {
-    core_v1::ContainerStatus {
-        name: jstr(v, "name"),
-        state: v.get("state").map(json_to_container_state_proto),
-        last_state: v.get("lastState").map(json_to_container_state_proto),
-        ready: jbool(v, "ready"),
-        restart_count: ji32(v, "restartCount"),
-        image: jstr(v, "image"),
-        image_id: jstr(v, "imageID"),
-        container_id: jstr(v, "containerID"),
-        started: jbool(v, "started"),
-        // resources/allocatedResources are the in-place-resize actuals: without them, every
-        // protobuf-encoded ContainerStatus looks like the container was never resized, even
-        // after the kubelet successfully actuates a resize request.
-        resources: v.get("resources").map(json_to_resource_requirements_proto),
-        allocated_resources: json_quantity_map_to_proto(v, "allocatedResources"),
-        // volumeMounts/user: kubelet-reported status the resize conformance test's
-        // apiequality.Semantic.DeepEqual compares between a protobuf-negotiated Get and the
-        // (always-JSON) /resize subresource Get. Without these, the two never match even when
-        // the underlying stored pod is identical, so the conformance poll never converges.
-        volume_mounts: v
-            .get("volumeMounts")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_volume_mount_status_proto).collect())
-            .unwrap_or_default(),
-        user: v.get("user").map(json_to_container_user_proto),
-        ..Default::default()
-    }
-}
-
-fn json_to_volume_mount_status_proto(v: &serde_json::Value) -> core_v1::VolumeMountStatus {
-    core_v1::VolumeMountStatus {
-        name: jstr(v, "name"),
-        mount_path: jstr(v, "mountPath"),
-        read_only: jbool(v, "readOnly"),
-        recursive_read_only: jstr(v, "recursiveReadOnly"),
-        ..Default::default()
-    }
-}
-
 fn json_to_container_user_proto(v: &serde_json::Value) -> core_v1::ContainerUser {
     core_v1::ContainerUser {
         linux: v.get("linux").map(|l| core_v1::LinuxContainerUser {
@@ -5249,25 +4117,6 @@ fn json_to_container_user_proto(v: &serde_json::Value) -> core_v1::ContainerUser
 fn json_to_local_object_reference_proto(v: &serde_json::Value) -> core_v1::LocalObjectReference {
     core_v1::LocalObjectReference {
         name: jstr(v, "name"),
-    }
-}
-
-fn json_to_pod_dns_config_option_proto(v: &serde_json::Value) -> core_v1::PodDnsConfigOption {
-    core_v1::PodDnsConfigOption {
-        name: jstr(v, "name"),
-        value: jstr(v, "value"),
-    }
-}
-
-fn json_to_pod_dns_config_proto(v: &serde_json::Value) -> core_v1::PodDnsConfig {
-    core_v1::PodDnsConfig {
-        nameservers: jstrs(v, "nameservers"),
-        searches: jstrs(v, "searches"),
-        options: v
-            .get("options")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_pod_dns_config_option_proto).collect())
-            .unwrap_or_default(),
     }
 }
 
@@ -5530,218 +4379,6 @@ fn json_to_ephemeral_container_proto(v: &serde_json::Value) -> core_v1::Ephemera
     core_v1::EphemeralContainer {
         ephemeral_container_common: Some(json_to_ephemeral_container_common_proto(v)),
         target_container_name: jstr(v, "targetContainerName"),
-    }
-}
-
-fn json_to_host_alias_proto(v: &serde_json::Value) -> core_v1::HostAlias {
-    core_v1::HostAlias {
-        ip: jstr(v, "ip"),
-        hostnames: jstrs(v, "hostnames"),
-    }
-}
-
-fn json_to_topology_spread_constraint_proto(
-    v: &serde_json::Value,
-) -> core_v1::TopologySpreadConstraint {
-    core_v1::TopologySpreadConstraint {
-        max_skew: ji32(v, "maxSkew"),
-        topology_key: jstr(v, "topologyKey"),
-        when_unsatisfiable: jstr(v, "whenUnsatisfiable"),
-        label_selector: v.get("labelSelector").map(json_to_label_selector_proto),
-        min_domains: ji32(v, "minDomains"),
-        node_affinity_policy: jstr(v, "nodeAffinityPolicy"),
-        node_taints_policy: jstr(v, "nodeTaintsPolicy"),
-        match_label_keys: jstrs(v, "matchLabelKeys"),
-    }
-}
-
-fn json_to_pod_spec_proto(v: &serde_json::Value) -> core_v1::PodSpec {
-    core_v1::PodSpec {
-        volumes: v
-            .get("volumes")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_volume_proto).collect())
-            .unwrap_or_default(),
-        containers: v
-            .get("containers")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_container_proto).collect())
-            .unwrap_or_default(),
-        init_containers: v
-            .get("initContainers")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_container_proto).collect())
-            .unwrap_or_default(),
-        ephemeral_containers: v
-            .get("ephemeralContainers")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_ephemeral_container_proto).collect())
-            .unwrap_or_default(),
-        restart_policy: jstr(v, "restartPolicy"),
-        termination_grace_period_seconds: ji64(v, "terminationGracePeriodSeconds"),
-        // activeDeadlineSeconds — without it, a pod that should be actively failed after N
-        // seconds of activity (e.g. a Job's per-pod deadline) never gets killed by the
-        // kubelet, which only sees this field over protobuf watches.
-        active_deadline_seconds: ji64(v, "activeDeadlineSeconds"),
-        dns_policy: jstr(v, "dnsPolicy"),
-        node_selector: jstrmap(v, "nodeSelector"),
-        service_account_name: jstr(v, "serviceAccountName"),
-        // serviceAccount is the deprecated alias for serviceAccountName; still accepted on the
-        // wire by legacy clients, so dropping it silently discards their ServiceAccount choice.
-        service_account: jstr(v, "serviceAccount"),
-        host_network: jbool(v, "hostNetwork"),
-        host_pid: jbool(v, "hostPID"),
-        host_ipc: jbool(v, "hostIPC"),
-        // shareProcessNamespace — dropping it silently re-isolates sibling containers from
-        // each other, breaking sidecar patterns that signal or trace another container's PID 1.
-        share_process_namespace: jbool(v, "shareProcessNamespace"),
-        security_context: v
-            .get("securityContext")
-            .map(json_to_pod_security_context_proto),
-        image_pull_secrets: v
-            .get("imagePullSecrets")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_local_object_reference_proto).collect())
-            .unwrap_or_default(),
-        hostname: jstr(v, "hostname"),
-        subdomain: jstr(v, "subdomain"),
-        affinity: v.get("affinity").map(json_to_affinity_proto),
-        scheduler_name: jstr(v, "schedulerName"),
-        tolerations: v
-            .get("tolerations")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_toleration_proto).collect())
-            .unwrap_or_default(),
-        // hostAliases — injected into the pod's /etc/hosts by the kubelet; dropping this means
-        // the extra host entries a pod asked for silently never appear.
-        host_aliases: v
-            .get("hostAliases")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_host_alias_proto).collect())
-            .unwrap_or_default(),
-        priority_class_name: jstr(v, "priorityClassName"),
-        // priority — the integer priority value resolved from priorityClassName; without it
-        // the scheduler cannot perform preemption ordering correctly.
-        priority: ji32(v, "priority"),
-        node_name: jstr(v, "nodeName"),
-        dns_config: v.get("dnsConfig").map(json_to_pod_dns_config_proto),
-        readiness_gates: v
-            .get("readinessGates")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_pod_readiness_gate_proto).collect())
-            .unwrap_or_default(),
-        // runtimeClassName/overhead — without these, a RuntimeClass-scheduled pod loses both
-        // which runtime handler to use and the resource overhead the scheduler must reserve
-        // for it, causing scheduling to under-account for the sandbox's real footprint.
-        runtime_class_name: jstr(v, "runtimeClassName"),
-        // enableServiceLinks — a genuine *bool upstream (tri-state), read directly by the
-        // kubelet's makeEnvironmentVariables: a nil value there is a hard error
-        // ("nil pod.spec.enableServiceLinks encountered, cannot construct envvars"), not a
-        // silent default, so a protobuf-negotiating client's read-modify-write update loop
-        // (GET this field absent -> PUT it back absent) permanently bricks the pod's env
-        // var construction on the very next kubelet sync.
-        enable_service_links: jbool(v, "enableServiceLinks"),
-        // preemptionPolicy — dropping an explicit "Never" silently reverts to the cluster
-        // default (PreemptLowerPriority), letting the pod preempt others despite the client
-        // explicitly opting out.
-        preemption_policy: jstr(v, "preemptionPolicy"),
-        overhead: json_quantity_map_to_proto(v, "overhead"),
-        topology_spread_constraints: v
-            .get("topologySpreadConstraints")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .map(json_to_topology_spread_constraint_proto)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        // setHostnameAsFQDN/os — genuine *bool/optional-message fields; dropping
-        // setHostnameAsFQDN=true silently reverts the kernel hostname to the leaf name instead
-        // of the FQDN the client asked for, and dropping os makes OS-conditional validation
-        // silently permissive for the OS the client actually declared.
-        set_hostname_as_fqdn: jbool(v, "setHostnameAsFQDN"),
-        os: jstr(v.get("os").unwrap_or(&serde_json::Value::Null), "name")
-            .map(|name| core_v1::PodOs { name: Some(name) }),
-        // automountServiceAccountToken — pod-level override of the ServiceAccount default;
-        // dropping it means a pod that explicitly opted out of token automount gets one anyway.
-        automount_service_account_token: jbool(v, "automountServiceAccountToken"),
-        scheduling_gates: v
-            .get("schedulingGates")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_scheduling_gate_proto).collect())
-            .unwrap_or_default(),
-        ..Default::default()
-    }
-}
-
-fn json_to_pod_status_proto(v: &serde_json::Value) -> core_v1::PodStatus {
-    core_v1::PodStatus {
-        phase: jstr(v, "phase"),
-        conditions: v
-            .get("conditions")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_pod_condition_proto).collect())
-            .unwrap_or_default(),
-        message: jstr(v, "message"),
-        reason: jstr(v, "reason"),
-        nominated_node_name: jstr(v, "nominatedNodeName"),
-        host_ip: jstr(v, "hostIP"),
-        // hostIPs — dual-stack host address list; without it a dual-stack-aware client reading
-        // this field back over protobuf sees only a single-stack pod regardless of what the
-        // kubelet actually reported.
-        host_i_ps: v
-            .get("hostIPs")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|ip| jstr(ip, "ip"))
-                    .map(|ip| core_v1::HostIp { ip: Some(ip) })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        pod_ip: jstr(v, "podIP"),
-        pod_i_ps: v
-            .get("podIPs")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|ip| jstr(ip, "ip"))
-                    .map(|ip| core_v1::PodIp { ip: Some(ip) })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        start_time: jtime(v, "startTime"),
-        qos_class: jstr(v, "qosClass"),
-        container_statuses: v
-            .get("containerStatuses")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_container_status_proto).collect())
-            .unwrap_or_default(),
-        init_container_statuses: v
-            .get("initContainerStatuses")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_container_status_proto).collect())
-            .unwrap_or_default(),
-        // ephemeralContainerStatuses — without it, a client polling for a `kubectl debug`
-        // container's exit code over protobuf (client-go's default) never sees it terminate.
-        ephemeral_container_statuses: v
-            .get("ephemeralContainerStatuses")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_container_status_proto).collect())
-            .unwrap_or_default(),
-        // observedGeneration — the kubelet's own report of which generation it has processed.
-        // Without it, a protobuf-negotiating client polling for convergence (e.g. e2e's
-        // WaitForPodObservedGeneration) always reads back 0 regardless of what the kubelet
-        // actually wrote, so it can never observe convergence and times out.
-        observed_generation: ji64(v, "observedGeneration"),
-        // resize/resources/allocatedResources (pod-level, distinct from the per-container
-        // fields above) — the in-place-resize conformance test's DeepEqual compares a
-        // protobuf-negotiated Get against the (always-JSON) /resize subresource Get; without
-        // these the two never match even when the stored pod is identical.
-        resize: jstr(v, "resize"),
-        resources: v.get("resources").map(json_to_resource_requirements_proto),
-        allocated_resources: json_quantity_map_to_proto(v, "allocatedResources"),
-        ..Default::default()
     }
 }
 
@@ -11703,6 +10340,76 @@ mod tests {
             decoded["status"]["containerStatuses"][0]["ready"], true,
             "containerStatuses[].ready must survive the round trip — kube-proxy/kubectl's \
              READY column and readiness-gated traffic routing both depend on it"
+        );
+    }
+
+    /// `Container.stdin`/`stdinOnce`/`tty`/`restartPolicy`/`restartPolicyRules`/`volumeDevices`
+    /// used to be silently dropped by `json_to_container_proto` on the JSON->proto direction
+    /// (the hand-rolled decoder built a `Container` literal covering only ~18 of Container's 25
+    /// fields and fell back to `..Default::default()` for the rest) even though the proto->JSON
+    /// direction (`gen_container_to_json`) already emitted them — so a client that read a pod
+    /// back over protobuf (e.g. a controller's typed clientset) would see these fields, but a
+    /// protobuf-negotiating client's *write* of the same fields (e.g. `kubectl replace
+    /// --raw`-style flows via a protobuf-speaking proxy) silently lost them. `build/codegen.rs`'s
+    /// schema-driven walker derives both directions from the same field enumeration, so this
+    /// asymmetry cannot recur field-by-field the way it did by hand. `restartPolicyRules[].
+    /// exitCodes.values` additionally exercises the new `repeated int32` mechanical shape nested
+    /// two levels deep — the first field in this migration needing it.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_container_lifecycle_and_restart_fields() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "interactive-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "img",
+                    "stdin": true,
+                    "stdinOnce": true,
+                    "tty": true,
+                    "restartPolicy": "Always",
+                    "restartPolicyRules": [{
+                        "action": "Restart",
+                        "exitCodes": { "operator": "In", "values": [42, 137] }
+                    }],
+                    "volumeDevices": [{ "name": "block0", "devicePath": "/dev/xvda" }]
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+        let c = &decoded["spec"]["containers"][0];
+
+        assert_eq!(
+            c["stdin"], true,
+            "stdin must survive the round trip — a pod created for `kubectl run -it`-style \
+             interactive use silently becomes non-interactive without it"
+        );
+        assert_eq!(
+            c["stdinOnce"], true,
+            "stdinOnce must survive the round trip"
+        );
+        assert_eq!(c["tty"], true, "tty must survive the round trip");
+        assert_eq!(
+            c["restartPolicy"], "Always",
+            "container-level restartPolicy must survive the round trip — it overrides the \
+             pod-level policy for sidecar-style init containers"
+        );
+        assert_eq!(
+            c["restartPolicyRules"][0]["action"], "Restart",
+            "restartPolicyRules must survive the round trip — without it an exit-code-specific \
+             restart exception silently falls back to the container's blanket restartPolicy"
+        );
+        assert_eq!(
+            c["restartPolicyRules"][0]["exitCodes"]["values"],
+            serde_json::json!([42, 137]),
+            "exitCodes.values (repeated int32, nested two levels inside restartPolicyRules) must \
+             survive the round trip byte-for-byte, not just as an empty/truncated array"
+        );
+        assert_eq!(
+            c["volumeDevices"][0]["devicePath"], "/dev/xvda",
+            "volumeDevices must survive the round trip — without it a container asking for a \
+             raw block device mapping silently starts without one"
         );
     }
 

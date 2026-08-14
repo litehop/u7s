@@ -144,6 +144,26 @@ fn main() {
         codegen::generate_volume_source(&descriptor_bytes),
     )
     .expect("failed to write generated VolumeSource codec");
+    std::fs::write(
+        out_dir.join("container_gen.rs"),
+        codegen::generate_container(&descriptor_bytes),
+    )
+    .expect("failed to write generated Container codec");
+    std::fs::write(
+        out_dir.join("container_status_gen.rs"),
+        codegen::generate_container_status(&descriptor_bytes),
+    )
+    .expect("failed to write generated ContainerStatus codec");
+    std::fs::write(
+        out_dir.join("pod_spec_gen.rs"),
+        codegen::generate_pod_spec(&descriptor_bytes),
+    )
+    .expect("failed to write generated PodSpec codec");
+    std::fs::write(
+        out_dir.join("pod_status_gen.rs"),
+        codegen::generate_pod_status(&descriptor_bytes),
+    )
+    .expect("failed to write generated PodStatus codec");
 
     println!(
         "cargo:rerun-if-changed={}",
