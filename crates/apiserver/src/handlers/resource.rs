@@ -686,52 +686,92 @@ pub(crate) async fn delete_resource<S: Store>(
 
     let key = group_object_key(&group, &plural, None, &name);
 
-    // Fetch current to check finalizers.
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+    // Retry loop: a plain DELETE with no resourceVersion precondition must never surface a
+    // concurrency conflict to the client. Real controllers race the client's own DELETE (e.g.
+    // KCM's pvc-protection-controller stamping the kubernetes.io/pvc-protection finalizer just
+    // after create) — if one of those writes lands between our read and our soft-delete write,
+    // re-read the fresh object and redo the delete decision rather than returning a 409 the
+    // client never asked to guard against. Mirrors delete_pod's retry-on-RevisionMismatch loop,
+    // added for the same race class (see mayor-jhna0).
+    loop {
+        // Fetch current to check finalizers.
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
 
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let mut obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
-    // Run before the soft/hard-delete branch below so a Fail-policy webhook can deny the
-    // delete outright, matching the CREATE/UPDATE admission points above.
-    let admission_ctx = AdmissionContext {
-        group: &group,
-        version: &version,
-        resource: &plural,
-        name: &name,
-        namespace: None,
-        operation: "DELETE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-        })),
-        dry_run: false,
-    };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+        // Admission webhook pipeline (validating only — mutating webhooks do not apply to
+        // DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
+        // branch below, so a Fail-policy webhook can deny whichever delete decision this
+        // attempt makes.
+        let admission_ctx = AdmissionContext {
+            group: &group,
+            version: &version,
+            resource: &plural,
+            name: &name,
+            namespace: None,
+            operation: "DELETE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
+            dry_run: false,
+        };
+        run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
-    let owner_uid = obj.body["metadata"]["uid"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+        let owner_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
-    // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
-    // below) instead of stripping children ourselves. See add_orphan_finalizer for why.
-    if delete_opts.is_orphan() && !owner_uid.is_empty() {
-        add_orphan_finalizer(&mut obj);
-    }
+        // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
+        // below) instead of stripping children ourselves. See add_orphan_finalizer for why.
+        if delete_opts.is_orphan() && !owner_uid.is_empty() {
+            add_orphan_finalizer(&mut obj);
+        }
 
-    if let Some(soft) = apply_delete_policy(&mut obj) {
-        // Soft-delete: persist modified object, return it.
-        // Evict from RBAC index immediately — permissions must not outlast the deletion
-        // request even while finalizers are draining. Hard-delete path below also removes,
-        // so this is safe to call twice (remove_object is idempotent).
+        if let Some(soft) = apply_delete_policy(&mut obj) {
+            // Soft-delete: persist modified object, return it.
+            let expected_rv = parse_resource_version(obj.resource_version())?;
+            let new_rv = match state.store.put(&key, obj.to_bytes(), expected_rv).await {
+                Ok(rv) => rv,
+                Err(StoreError::RevisionMismatch { .. }) => {
+                    // A concurrent write advanced the stored revision between our read and
+                    // write. Re-read the fresh object and redo the delete decision.
+                    continue;
+                }
+                Err(e) => return Err(store_err(e, &name, &meta.kind)),
+            };
+            // Evict from RBAC index immediately — permissions must not outlast the deletion
+            // request even while finalizers are draining. Hard-delete path below also removes,
+            // so this is safe to call twice (remove_object is idempotent).
+            if group == RBAC_GROUP {
+                let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+                state.rbac_index.remove_object(&rbac_key);
+            }
+            if group == ADMISSION_GROUP {
+                state.refresh_admission_config(&plural).await;
+            }
+            if group == APISERVICE_GROUP {
+                state.refresh_apiservice_cache().await;
+            }
+            let mut resp_body = Object { body: soft };
+            resp_body.set_resource_version(new_rv);
+            return Ok(Json(resp_body.body).into_response());
+        }
+
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+
         if group == RBAC_GROUP {
             let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
             state.rbac_index.remove_object(&rbac_key);
@@ -742,40 +782,14 @@ pub(crate) async fn delete_resource<S: Store>(
         if group == APISERVICE_GROUP {
             state.refresh_apiservice_cache().await;
         }
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
-            .store
-            .put(&key, obj.to_bytes(), expected_rv)
-            .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut resp_body = Object { body: soft };
-        resp_body.set_resource_version(new_rv);
-        return Ok(Json(resp_body.body).into_response());
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        }))
+        .into_response());
     }
-
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-        state.rbac_index.remove_object(&rbac_key);
-    }
-    if group == ADMISSION_GROUP {
-        state.refresh_admission_config(&plural).await;
-    }
-    if group == APISERVICE_GROUP {
-        state.refresh_apiservice_cache().await;
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    }))
-    .into_response())
 }
 
 /// True when an update (PATCH or PUT) has itself completed the finalizer drain:
@@ -2396,40 +2410,6 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
 
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
-    // Run before the soft/hard-delete branch below so a Fail-policy webhook can deny the
-    // delete outright, matching the CREATE/UPDATE admission points above.
-    let admission_ctx = AdmissionContext {
-        group: &group,
-        version: &version,
-        resource: &plural,
-        name: &name,
-        namespace: Some(&ns),
-        operation: "DELETE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-        })),
-        dry_run: false,
-    };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
-
-    let owner_uid = obj.body["metadata"]["uid"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
     // Compute the effective orphan flag for this delete.
     //
     // Explicit Orphan (propagationPolicy=Orphan or orphanDependents=true) → orphan.
@@ -2447,45 +2427,105 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         || (group.is_empty()
             && plural == "replicationcontrollers"
             && !delete_opts.is_explicit_cascade());
-
-    // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
-    // below) instead of stripping children ourselves. See add_orphan_finalizer for why.
-    if effective_orphan && !owner_uid.is_empty() {
-        add_orphan_finalizer(&mut obj);
-    }
-
-    // Foreground: signal via the `foregroundDeletion` finalizer (added BEFORE the soft/
-    // hard-delete decision below) instead of hard-deleting the owner immediately and
-    // racing our own best-effort delete_pods_owned_by cascade further down. See
-    // add_foreground_deletion_finalizer for why.
     let foreground_requested = delete_opts.propagation_policy.as_deref() == Some("Foreground");
-    if foreground_requested && !owner_uid.is_empty() {
-        add_foreground_deletion_finalizer(&mut obj);
-    }
 
-    if let Some(soft) = apply_delete_policy(&mut obj) {
-        // Evict from RBAC index immediately on soft-delete — same rationale as
-        // delete_resource: permissions must not outlast the deletion request.
-        if group == RBAC_GROUP {
-            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
+    // Retry loop: a plain DELETE with no resourceVersion precondition must never surface a
+    // concurrency conflict to the client. Real controllers race the client's own DELETE (e.g.
+    // KCM's pvc-protection-controller stamping the kubernetes.io/pvc-protection finalizer just
+    // after create) — if one of those writes lands between our read and our soft-delete write,
+    // re-read the fresh object and redo the delete decision rather than returning a 409 the
+    // client never asked to guard against. Mirrors delete_pod's retry-on-RevisionMismatch loop,
+    // added for the same race class (see mayor-jhna0).
+    let owner_uid;
+    let cluster_ip;
+    loop {
+        let stored = state
             .store
-            .put(&key, obj.to_bytes(), expected_rv)
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+        let mut obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        // Admission webhook pipeline (validating only — mutating webhooks do not apply to
+        // DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
+        // branch below, so a Fail-policy webhook can deny whichever delete decision this
+        // attempt makes.
+        let admission_ctx = AdmissionContext {
+            group: &group,
+            version: &version,
+            resource: &plural,
+            name: &name,
+            namespace: Some(&ns),
+            operation: "DELETE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
+            dry_run: false,
+        };
+        run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+
+        let this_owner_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // Orphan: signal via the `orphan` finalizer (added BEFORE the soft/hard-delete decision
+        // below) instead of stripping children ourselves. See add_orphan_finalizer for why.
+        if effective_orphan && !this_owner_uid.is_empty() {
+            add_orphan_finalizer(&mut obj);
+        }
+
+        // Foreground: signal via the `foregroundDeletion` finalizer (added BEFORE the soft/
+        // hard-delete decision below) instead of hard-deleting the owner immediately and
+        // racing our own best-effort delete_pods_owned_by cascade further down. See
+        // add_foreground_deletion_finalizer for why.
+        if foreground_requested && !this_owner_uid.is_empty() {
+            add_foreground_deletion_finalizer(&mut obj);
+        }
+
+        if let Some(soft) = apply_delete_policy(&mut obj) {
+            let expected_rv = parse_resource_version(obj.resource_version())?;
+            let new_rv = match state.store.put(&key, obj.to_bytes(), expected_rv).await {
+                Ok(rv) => rv,
+                Err(StoreError::RevisionMismatch { .. }) => {
+                    // A concurrent write advanced the stored revision between our read and
+                    // write. Re-read the fresh object and redo the delete decision.
+                    continue;
+                }
+                Err(e) => return Err(store_err(e, &name, &meta.kind)),
+            };
+            // Evict from RBAC index immediately on soft-delete — same rationale as
+            // delete_resource: permissions must not outlast the deletion request.
+            if group == RBAC_GROUP {
+                let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+                state.rbac_index.remove_object(&rbac_key);
+            }
+            let mut resp_body = Object { body: soft };
+            resp_body.set_resource_version(new_rv);
+            return Ok(Json(resp_body.body).into_response());
+        }
+
+        state
+            .store
+            .delete(&key, None)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut resp_body = Object { body: soft };
-        resp_body.set_resource_version(new_rv);
-        return Ok(Json(resp_body.body).into_response());
-    }
 
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        // Capture what post-loop cascade side effects need from the freshly-read `obj`
+        // before it drops at the end of this iteration — `obj` itself is loop-scoped
+        // since every retry re-reads it fresh.
+        owner_uid = this_owner_uid;
+        cluster_ip = obj.body["spec"]["clusterIP"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        break;
+    }
 
     if group == RBAC_GROUP {
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
@@ -2494,10 +2534,6 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
 
     // Release the clusterIP sentinel so the IP can be re-allocated.
     if group.is_empty() && plural == "services" {
-        let cluster_ip = obj.body["spec"]["clusterIP"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
         state.release_service_ip(&cluster_ip).await;
     }
 
@@ -18089,7 +18125,8 @@ mod tests {
     // (simulating a different concurrent writer, e.g. a status controller) instead
     // of the caller's own value, then reports RevisionMismatch.
     //
-    // Used by strip_or_delete_dependent's concurrent-write regression test only.
+    // Used by strip_or_delete_dependent's and delete_resource's concurrent-write
+    // regression tests.
     // ---------------------------------------------------------------------------
 
     struct ConcurrentWriterStore {
@@ -18350,6 +18387,117 @@ mod tests {
              that clobbers stale LIST-time data instead of retrying against the freshly \
              re-read object would silently discard a status update the writer believes \
              succeeded, with no error surfaced to either side"
+        );
+    }
+
+    /// A plain `kubectl delete pvc` (no resourceVersion precondition — matches
+    /// `metav1.DeleteOptions{}`, exactly what client-go's typed Delete sends) must never
+    /// surface a 409 caused by u7s's OWN internal read-then-CAS-write racing a concurrent
+    /// writer. Real KCM's `pvc-protection-controller` stamps `kubernetes.io/pvc-protection`
+    /// onto a PVC moments after creation — if that write lands between
+    /// `delete_namespaced_resource`'s internal read and its internal soft-delete `put`, the
+    /// delete must retry against the fresh object rather than reject the client's DELETE with
+    /// a concurrency error it never asked to guard against (mayor-jhna0: this exact race
+    /// failed the sig-storage PV/PVC lifecycle conformance test — a client-observable 409 for
+    /// a request the client-go DELETE call gave the server zero precondition information for).
+    #[tokio::test]
+    async fn delete_namespaced_resource_retries_past_concurrent_finalizer_write_instead_of_409ing()
+    {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let pvc_key = "/registry/persistentvolumeclaims/default/pvc-repro";
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "pvc-repro",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["kubernetes.io/pvc-protection"]
+            },
+            "spec": {},
+            "status": {"phase": "Pending"}
+        });
+        inner
+            .put(
+                pvc_key,
+                bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // What a second concurrent writer (e.g. a labeling client, or KCM reprocessing with a
+        // stale informer cache) lands as between delete_namespaced_resource's read and its
+        // first soft-delete write attempt — same finalizer, plus a label the DELETE's retry
+        // must not clobber.
+        let concurrent_write = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "pvc-repro",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["kubernetes.io/pvc-protection"],
+                "labels": {"raced": "true"}
+            },
+            "spec": {},
+            "status": {"phase": "Pending"}
+        });
+        let racing_store = Arc::new(ConcurrentWriterStore::new(
+            Arc::clone(&inner),
+            bytes::Bytes::from(serde_json::to_vec(&concurrent_write).unwrap()),
+        ));
+        racing_store.arm();
+
+        let state = crate::state::AppState::new(
+            racing_store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "pvc-repro".into(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a plain DELETE (no resourceVersion precondition) must retry past a concurrent \
+             pvc-protection finalizer write and succeed rather than surfacing the server's own \
+             internal CAS conflict as a 409 the client never asked to guard against — got {:?}",
+            result.err().map(|e| e.0)
+        );
+
+        let stored = inner.get(pvc_key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored_body["metadata"]["deletionTimestamp"].is_string(),
+            "the retried delete must still stamp deletionTimestamp so garbage collection \
+             actually proceeds — a retry that only avoided the 409 without completing the \
+             soft-delete write would leave the PVC live forever with the client believing \
+             DELETE succeeded"
+        );
+        assert_eq!(
+            stored_body["metadata"]["labels"]["raced"], "true",
+            "the concurrent writer's label must survive the retried delete — a delete that \
+             retries by clobbering stale LIST-time data instead of re-reading the freshly \
+             written object would silently discard that writer's change"
         );
     }
 
