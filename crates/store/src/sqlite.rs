@@ -2256,6 +2256,16 @@ impl Store for SqliteStore {
         self.compaction_horizon.load(Ordering::Relaxed)
     }
 
+    // Without this override, a generic `S: Store` caller (e.g. handlers/watch.rs's
+    // `watch_generic_impl<S: Store>`) resolves `compaction_horizon_for` to the trait default
+    // above (cross-shard max) — Rust generic dispatch never falls back to a concrete type's
+    // inherent methods, so the identically-named inherent method at `SqliteStore::compaction_horizon_for`
+    // is invisible from inside a function bounded only by `S: Store`. Delegating here makes the
+    // two call shapes agree.
+    fn compaction_horizon_for(&self, prefix: &str) -> u64 {
+        SqliteStore::compaction_horizon_for(self, prefix)
+    }
+
     fn current_revision(&self) -> u64 {
         self.last_written_revision.load(Ordering::Acquire)
     }
@@ -5409,5 +5419,87 @@ mod tests {
             }
             other => panic!("expected a Deleted event, got {other:?}"),
         }
+    }
+
+    /// A caller that only knows `S: Store` (exactly how `handlers/watch.rs`'s
+    /// `watch_generic_impl<S: Store>` reaches the store) must see the same per-shard value a
+    /// caller holding a concrete `SqliteStore` sees — never the trait's cross-shard-max default.
+    fn compaction_horizon_for_via_store_bound<S: Store>(store: &S, prefix: &str) -> u64 {
+        store.compaction_horizon_for(prefix)
+    }
+
+    /// Fails on revert: if `impl Store for SqliteStore` does not override `compaction_horizon_for`,
+    /// a generic `S: Store` bound resolves the call to the trait's default method (cross-shard
+    /// max) instead of `SqliteStore`'s inherent per-shard method — Rust generic dispatch has no
+    /// visibility into a type's inherent impls once code is compiled against only a trait bound,
+    /// so this is invisible to every OTHER test in this file, which all call through a concrete
+    /// `SqliteStore` value and therefore resolve to the inherent method regardless of whether the
+    /// override exists.
+    ///
+    /// Why it matters: the eager pre-stream 410 check in `handlers/watch.rs` is generic-bounded
+    /// on `S: Store`; if `impl Store for SqliteStore` silently inherits the cross-shard-max
+    /// default, a fresh watch on shard X gets its `from_revision` compared against the max
+    /// horizon across ALL shards, spuriously firing 410 Gone whenever any other resource type has
+    /// advanced its horizon — reintroducing the exact per-shard-vs-cross-shard ambiguity the
+    /// `compaction_horizon_for` inherent method exists to resolve.
+    #[tokio::test]
+    async fn compaction_horizon_for_via_generic_store_bound_matches_per_shard_not_cross_shard_max()
+    {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let busy_prefix = "/registry/core/ghp6f-busy/";
+        let quiet_prefix = "/registry/core/ghp6f-quiet/";
+
+        // Busy shard: a real, high floor that would leak into the quiet shard's answer if the
+        // generic-bound call resolved to the cross-shard-max default instead of the per-shard
+        // inherent method.
+        store.set_compaction_horizon_for_test(busy_prefix, 500);
+
+        // Quiet shard: never evicted anything, then reclaimed by idle-GC — its per-shard floor
+        // comes from `reclaimed_horizons`, a second code path the fix must also cover, not just
+        // the still-live-shard path `busy_prefix` exercises above.
+        store.push_event(
+            Arc::new(InternalEvent {
+                key: format!("{quiet_prefix}default/widget-a"),
+                revision: 7,
+                value: Some(svc_value("widget-a", 7)),
+                is_create: true,
+                deleted_body: None,
+            }),
+            Some("default"),
+        );
+        let stream = store
+            .watch(quiet_prefix, 0)
+            .await
+            .expect("watch must succeed");
+        drop(stream);
+        tokio::time::sleep(RING_SHARD_IDLE_GRACE * 3).await;
+        assert!(
+            !store
+                .shards
+                .read()
+                .expect("shards poisoned")
+                .contains_key(quiet_prefix),
+            "test setup broken: idle-GC must have reclaimed the quiet shard for this test to \
+             exercise the reclaimed-horizon fallback, not the still-live-shard path"
+        );
+
+        let via_concrete = store.compaction_horizon_for(quiet_prefix);
+        assert_eq!(
+            via_concrete, 7,
+            "test setup broken: the quiet shard's own floor must be its highest-ever-held \
+             revision (7), not the busy shard's (500) — otherwise this test cannot distinguish \
+             per-shard from cross-shard-max"
+        );
+
+        let via_bound = compaction_horizon_for_via_store_bound(&store, quiet_prefix);
+        assert_eq!(
+            via_bound, via_concrete,
+            "a generic `S: Store` caller (handlers/watch.rs's watch_generic_impl) must see the \
+             SAME per-shard floor a concrete-type caller sees; if `impl Store for SqliteStore` \
+             does not override `compaction_horizon_for`, this call falls through to the trait's \
+             cross-shard-max default and returns 500 (the busy shard's floor) instead of 7 (this \
+             shard's own floor), spuriously 410-ing a watch reconnect that is nowhere near \
+             expired"
+        );
     }
 }
