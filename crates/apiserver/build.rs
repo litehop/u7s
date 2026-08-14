@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+#[path = "build/codegen.rs"]
+mod codegen;
+
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let include_dir = manifest_dir.join("proto-include");
@@ -129,8 +132,20 @@ fn main() {
         )
         .expect("prost-build failed");
 
+    let descriptor_bytes =
+        std::fs::read(out_dir.join("k8s_descriptors.bin")).expect("descriptor set just written");
+    std::fs::write(
+        out_dir.join("object_reference_gen.rs"),
+        codegen::generate_object_reference(&descriptor_bytes),
+    )
+    .expect("failed to write generated ObjectReference codec");
+
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("proto-include").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("build/codegen.rs").display()
     );
 }

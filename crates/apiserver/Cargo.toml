@@ -63,6 +63,8 @@ dhat = ["dep:dhat"]
 [build-dependencies]
 prost-build              = "0.14"
 protoc-bin-vendored      = "3.2"
+prost                    = "0.14"
+prost-types              = "0.14"
 
 [dev-dependencies]
 criterion       = "0.8"
