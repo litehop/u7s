@@ -1636,6 +1636,397 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                             vm.insert("csi".to_string(), serde_json::Value::Object(csi_map));
                         }
                     }
+                    // Remaining rare/deprecated in-tree VolumeSource variants: a
+                    // protobuf-negotiating client (kubelet, controllers) writing a Pod with one
+                    // of these must not have its volume source silently dropped on decode.
+                    if let Some(iscsi) = src.iscsi {
+                        let mut iscsi_map = serde_json::Map::new();
+                        if let Some(v) = iscsi.target_portal.filter(|s| !s.is_empty()) {
+                            iscsi_map
+                                .insert("targetPortal".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = iscsi.iqn.filter(|s| !s.is_empty()) {
+                            iscsi_map.insert("iqn".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = iscsi.lun {
+                            iscsi_map
+                                .insert("lun".to_string(), serde_json::Value::Number(v.into()));
+                        }
+                        if let Some(v) = iscsi.iscsi_interface.filter(|s| !s.is_empty()) {
+                            iscsi_map
+                                .insert("iscsiInterface".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = iscsi.fs_type.filter(|s| !s.is_empty()) {
+                            iscsi_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = iscsi.read_only {
+                            iscsi_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if !iscsi.portals.is_empty() {
+                            iscsi_map.insert(
+                                "portals".to_string(),
+                                serde_json::Value::Array(
+                                    iscsi
+                                        .portals
+                                        .into_iter()
+                                        .map(serde_json::Value::String)
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        if let Some(v) = iscsi.chap_auth_discovery {
+                            iscsi_map.insert(
+                                "chapAuthDiscovery".to_string(),
+                                serde_json::Value::Bool(v),
+                            );
+                        }
+                        if let Some(v) = iscsi.chap_auth_session {
+                            iscsi_map
+                                .insert("chapAuthSession".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(lor) = iscsi.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                iscsi_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        if let Some(v) = iscsi.initiator_name.filter(|s| !s.is_empty()) {
+                            iscsi_map
+                                .insert("initiatorName".to_string(), serde_json::Value::String(v));
+                        }
+                        vm.insert("iscsi".to_string(), serde_json::Value::Object(iscsi_map));
+                    }
+                    if let Some(g) = src.glusterfs {
+                        let mut g_map = serde_json::Map::new();
+                        if let Some(v) = g.endpoints.filter(|s| !s.is_empty()) {
+                            g_map.insert("endpoints".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = g.path.filter(|s| !s.is_empty()) {
+                            g_map.insert("path".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = g.read_only {
+                            g_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert("glusterfs".to_string(), serde_json::Value::Object(g_map));
+                    }
+                    if let Some(rbd) = src.rbd {
+                        let mut rbd_map = serde_json::Map::new();
+                        if !rbd.monitors.is_empty() {
+                            rbd_map.insert(
+                                "monitors".to_string(),
+                                serde_json::Value::Array(
+                                    rbd.monitors
+                                        .into_iter()
+                                        .map(serde_json::Value::String)
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        if let Some(v) = rbd.image.filter(|s| !s.is_empty()) {
+                            rbd_map.insert("image".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = rbd.fs_type.filter(|s| !s.is_empty()) {
+                            rbd_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = rbd.pool.filter(|s| !s.is_empty()) {
+                            rbd_map.insert("pool".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = rbd.user.filter(|s| !s.is_empty()) {
+                            rbd_map.insert("user".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = rbd.keyring.filter(|s| !s.is_empty()) {
+                            rbd_map.insert("keyring".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(lor) = rbd.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                rbd_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        if let Some(v) = rbd.read_only {
+                            rbd_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert("rbd".to_string(), serde_json::Value::Object(rbd_map));
+                    }
+                    if let Some(gr) = src.git_repo {
+                        let mut gr_map = serde_json::Map::new();
+                        if let Some(v) = gr.repository.filter(|s| !s.is_empty()) {
+                            gr_map.insert("repository".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = gr.revision.filter(|s| !s.is_empty()) {
+                            gr_map.insert("revision".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = gr.directory.filter(|s| !s.is_empty()) {
+                            gr_map.insert("directory".to_string(), serde_json::Value::String(v));
+                        }
+                        vm.insert("gitRepo".to_string(), serde_json::Value::Object(gr_map));
+                    }
+                    if let Some(c) = src.cinder {
+                        let mut c_map = serde_json::Map::new();
+                        if let Some(v) = c.volume_id.filter(|s| !s.is_empty()) {
+                            c_map.insert("volumeID".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = c.fs_type.filter(|s| !s.is_empty()) {
+                            c_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = c.read_only {
+                            c_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(lor) = c.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                c_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        vm.insert("cinder".to_string(), serde_json::Value::Object(c_map));
+                    }
+                    if let Some(c) = src.cephfs {
+                        let mut c_map = serde_json::Map::new();
+                        if !c.monitors.is_empty() {
+                            c_map.insert(
+                                "monitors".to_string(),
+                                serde_json::Value::Array(
+                                    c.monitors
+                                        .into_iter()
+                                        .map(serde_json::Value::String)
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        if let Some(v) = c.path.filter(|s| !s.is_empty()) {
+                            c_map.insert("path".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = c.user.filter(|s| !s.is_empty()) {
+                            c_map.insert("user".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = c.secret_file.filter(|s| !s.is_empty()) {
+                            c_map.insert("secretFile".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(lor) = c.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                c_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        if let Some(v) = c.read_only {
+                            c_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert("cephfs".to_string(), serde_json::Value::Object(c_map));
+                    }
+                    if let Some(fv) = src.flex_volume {
+                        let mut fv_map = serde_json::Map::new();
+                        if let Some(v) = fv.driver.filter(|s| !s.is_empty()) {
+                            fv_map.insert("driver".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = fv.fs_type.filter(|s| !s.is_empty()) {
+                            fv_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(lor) = fv.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                fv_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        if let Some(v) = fv.read_only {
+                            fv_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if !fv.options.is_empty() {
+                            let opts: serde_json::Map<String, serde_json::Value> = fv
+                                .options
+                                .into_iter()
+                                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                .collect();
+                            fv_map.insert("options".to_string(), serde_json::Value::Object(opts));
+                        }
+                        vm.insert("flexVolume".to_string(), serde_json::Value::Object(fv_map));
+                    }
+                    if let Some(f) = src.flocker {
+                        let mut f_map = serde_json::Map::new();
+                        if let Some(v) = f.dataset_name.filter(|s| !s.is_empty()) {
+                            f_map.insert("datasetName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = f.dataset_uuid.filter(|s| !s.is_empty()) {
+                            f_map.insert("datasetUUID".to_string(), serde_json::Value::String(v));
+                        }
+                        vm.insert("flocker".to_string(), serde_json::Value::Object(f_map));
+                    }
+                    if let Some(af) = src.azure_file {
+                        let mut af_map = serde_json::Map::new();
+                        if let Some(v) = af.secret_name.filter(|s| !s.is_empty()) {
+                            af_map.insert("secretName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = af.share_name.filter(|s| !s.is_empty()) {
+                            af_map.insert("shareName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = af.read_only {
+                            af_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert("azureFile".to_string(), serde_json::Value::Object(af_map));
+                    }
+                    if let Some(vs) = src.vsphere_volume {
+                        let mut vs_map = serde_json::Map::new();
+                        if let Some(v) = vs.volume_path.filter(|s| !s.is_empty()) {
+                            vs_map.insert("volumePath".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = vs.fs_type.filter(|s| !s.is_empty()) {
+                            vs_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = vs.storage_policy_name.filter(|s| !s.is_empty()) {
+                            vs_map.insert(
+                                "storagePolicyName".to_string(),
+                                serde_json::Value::String(v),
+                            );
+                        }
+                        if let Some(v) = vs.storage_policy_id.filter(|s| !s.is_empty()) {
+                            vs_map.insert(
+                                "storagePolicyID".to_string(),
+                                serde_json::Value::String(v),
+                            );
+                        }
+                        vm.insert(
+                            "vsphereVolume".to_string(),
+                            serde_json::Value::Object(vs_map),
+                        );
+                    }
+                    if let Some(q) = src.quobyte {
+                        let mut q_map = serde_json::Map::new();
+                        if let Some(v) = q.registry.filter(|s| !s.is_empty()) {
+                            q_map.insert("registry".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = q.volume.filter(|s| !s.is_empty()) {
+                            q_map.insert("volume".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = q.read_only {
+                            q_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(v) = q.user.filter(|s| !s.is_empty()) {
+                            q_map.insert("user".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = q.group.filter(|s| !s.is_empty()) {
+                            q_map.insert("group".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = q.tenant.filter(|s| !s.is_empty()) {
+                            q_map.insert("tenant".to_string(), serde_json::Value::String(v));
+                        }
+                        vm.insert("quobyte".to_string(), serde_json::Value::Object(q_map));
+                    }
+                    if let Some(ad) = src.azure_disk {
+                        let mut ad_map = serde_json::Map::new();
+                        if let Some(v) = ad.disk_name.filter(|s| !s.is_empty()) {
+                            ad_map.insert("diskName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = ad.disk_uri.filter(|s| !s.is_empty()) {
+                            ad_map.insert("diskURI".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = ad.caching_mode.filter(|s| !s.is_empty()) {
+                            ad_map.insert("cachingMode".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = ad.fs_type.filter(|s| !s.is_empty()) {
+                            ad_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = ad.read_only {
+                            ad_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(v) = ad.kind.filter(|s| !s.is_empty()) {
+                            ad_map.insert("kind".to_string(), serde_json::Value::String(v));
+                        }
+                        vm.insert("azureDisk".to_string(), serde_json::Value::Object(ad_map));
+                    }
+                    if let Some(pw) = src.portworx_volume {
+                        let mut pw_map = serde_json::Map::new();
+                        if let Some(v) = pw.volume_id.filter(|s| !s.is_empty()) {
+                            pw_map.insert("volumeID".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = pw.fs_type.filter(|s| !s.is_empty()) {
+                            pw_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = pw.read_only {
+                            pw_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert(
+                            "portworxVolume".to_string(),
+                            serde_json::Value::Object(pw_map),
+                        );
+                    }
+                    if let Some(s) = src.scale_io {
+                        let mut s_map = serde_json::Map::new();
+                        if let Some(v) = s.gateway.filter(|s| !s.is_empty()) {
+                            s_map.insert("gateway".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.system.filter(|s| !s.is_empty()) {
+                            s_map.insert("system".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(lor) = s.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                s_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        if let Some(v) = s.ssl_enabled {
+                            s_map.insert("sslEnabled".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(v) = s.protection_domain.filter(|s| !s.is_empty()) {
+                            s_map.insert(
+                                "protectionDomain".to_string(),
+                                serde_json::Value::String(v),
+                            );
+                        }
+                        if let Some(v) = s.storage_pool.filter(|s| !s.is_empty()) {
+                            s_map.insert("storagePool".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.storage_mode.filter(|s| !s.is_empty()) {
+                            s_map.insert("storageMode".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.volume_name.filter(|s| !s.is_empty()) {
+                            s_map.insert("volumeName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.fs_type.filter(|s| !s.is_empty()) {
+                            s_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.read_only {
+                            s_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        vm.insert("scaleIO".to_string(), serde_json::Value::Object(s_map));
+                    }
+                    if let Some(s) = src.storageos {
+                        let mut s_map = serde_json::Map::new();
+                        if let Some(v) = s.volume_name.filter(|s| !s.is_empty()) {
+                            s_map.insert("volumeName".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.volume_namespace.filter(|s| !s.is_empty()) {
+                            s_map.insert(
+                                "volumeNamespace".to_string(),
+                                serde_json::Value::String(v),
+                            );
+                        }
+                        if let Some(v) = s.fs_type.filter(|s| !s.is_empty()) {
+                            s_map.insert("fsType".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = s.read_only {
+                            s_map.insert("readOnly".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(lor) = s.secret_ref {
+                            if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
+                                s_map.insert(
+                                    "secretRef".to_string(),
+                                    serde_json::json!({ "name": name }),
+                                );
+                            }
+                        }
+                        vm.insert("storageos".to_string(), serde_json::Value::Object(s_map));
+                    }
                 }
                 serde_json::Value::Object(vm)
             })
@@ -12622,6 +13013,215 @@ mod tests {
                 .as_deref(),
             Some("storageos-secret"),
             "storageos.secretRef must survive protobuf encoding"
+        );
+    }
+
+    /// Mirrors `encode_pod_proto_gen_round_trips_rare_deprecated_volume_sources` but drives it
+    /// through the full `encode_pod_proto_gen` -> `decode_pod_proto_gen` round trip that a
+    /// protobuf-negotiating client (kubelet, controllers) actually gets when it PUTs/POSTs a
+    /// Pod: the apiserver decodes the wire bytes back into stored JSON. Before this fix, each
+    /// of these 15 rare/deprecated volume types would decode to a Volume with no source at
+    /// all, so a client writing e.g. an iscsi-backed Pod over protobuf would have it silently
+    /// vanish from the stored object and the kubelet could never resolve the mount.
+    #[test]
+    fn decode_pod_proto_gen_round_trips_rare_deprecated_volume_sources() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "rare-volumes-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "volumes": [
+                    { "name": "v-iscsi", "iscsi": {
+                        "targetPortal": "10.0.0.1:3260", "iqn": "iqn.2000-01.com.example:vol",
+                        "lun": 1, "iscsiInterface": "default", "fsType": "ext4",
+                        "readOnly": true, "portals": ["10.0.0.2:3260"],
+                        "chapAuthDiscovery": true, "chapAuthSession": true,
+                        "secretRef": { "name": "iscsi-secret" }, "initiatorName": "iqn.initiator"
+                    }},
+                    { "name": "v-glusterfs", "glusterfs": {
+                        "endpoints": "glusterfs-cluster", "path": "myvol", "readOnly": true
+                    }},
+                    { "name": "v-rbd", "rbd": {
+                        "monitors": ["10.0.0.1:6789"], "image": "foo", "fsType": "ext4",
+                        "pool": "rbd", "user": "admin", "keyring": "/etc/ceph/keyring",
+                        "secretRef": { "name": "rbd-secret" }, "readOnly": true
+                    }},
+                    { "name": "v-gitrepo", "gitRepo": {
+                        "repository": "https://example.com/repo.git", "revision": "abc123",
+                        "directory": "src"
+                    }},
+                    { "name": "v-cinder", "cinder": {
+                        "volumeID": "vol-1", "fsType": "ext4", "readOnly": true,
+                        "secretRef": { "name": "cinder-secret" }
+                    }},
+                    { "name": "v-cephfs", "cephfs": {
+                        "monitors": ["10.0.0.1:6789"], "path": "/", "user": "admin",
+                        "secretFile": "/etc/ceph/user.secret",
+                        "secretRef": { "name": "cephfs-secret" }, "readOnly": true
+                    }},
+                    { "name": "v-flex", "flexVolume": {
+                        "driver": "example/flex", "fsType": "ext4",
+                        "secretRef": { "name": "flex-secret" }, "readOnly": true,
+                        "options": { "foo": "bar" }
+                    }},
+                    { "name": "v-flocker", "flocker": {
+                        "datasetName": "my-dataset", "datasetUUID": "uuid-1"
+                    }},
+                    { "name": "v-azurefile", "azureFile": {
+                        "secretName": "azure-secret", "shareName": "share1", "readOnly": true
+                    }},
+                    { "name": "v-vsphere", "vsphereVolume": {
+                        "volumePath": "[datastore1] volumes/myDisk", "fsType": "ext4",
+                        "storagePolicyName": "gold", "storagePolicyID": "policy-1"
+                    }},
+                    { "name": "v-quobyte", "quobyte": {
+                        "registry": "quobyte-registry:7861", "volume": "myvol",
+                        "readOnly": true, "user": "root", "group": "wheel", "tenant": "tenant-1"
+                    }},
+                    { "name": "v-azuredisk", "azureDisk": {
+                        "diskName": "mydisk", "diskURI": "https://example.blob/mydisk.vhd",
+                        "cachingMode": "ReadWrite", "fsType": "ext4", "readOnly": true,
+                        "kind": "Managed"
+                    }},
+                    { "name": "v-portworx", "portworxVolume": {
+                        "volumeID": "vol-1", "fsType": "ext4", "readOnly": true
+                    }},
+                    { "name": "v-scaleio", "scaleIO": {
+                        "gateway": "https://scaleio", "system": "scaleio-sys",
+                        "secretRef": { "name": "scaleio-secret" }, "sslEnabled": true,
+                        "protectionDomain": "pd1", "storagePool": "pool1",
+                        "storageMode": "ThickProvisioned", "volumeName": "vol-1",
+                        "fsType": "xfs", "readOnly": true
+                    }},
+                    { "name": "v-storageos", "storageos": {
+                        "volumeName": "vol-1", "volumeNamespace": "ns1", "fsType": "ext4",
+                        "readOnly": true, "secretRef": { "name": "storageos-secret" }
+                    }}
+                ]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+        let volumes = &decoded["spec"]["volumes"];
+
+        assert_eq!(
+            volumes[0]["iscsi"]["targetPortal"], "10.0.0.1:3260",
+            "kubelet writes an iscsi volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[0]["iscsi"]["lun"], 1,
+            "iscsi.lun must survive decode"
+        );
+        assert_eq!(
+            volumes[0]["iscsi"]["portals"][0], "10.0.0.2:3260",
+            "iscsi.portals must survive decode"
+        );
+        assert_eq!(
+            volumes[0]["iscsi"]["secretRef"]["name"], "iscsi-secret",
+            "iscsi.secretRef must survive decode"
+        );
+        assert_eq!(
+            volumes[0]["iscsi"]["initiatorName"], "iqn.initiator",
+            "iscsi.initiatorName must survive decode"
+        );
+        assert_eq!(
+            volumes[1]["glusterfs"]["endpoints"], "glusterfs-cluster",
+            "kubelet writes a glusterfs volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[2]["rbd"]["secretRef"]["name"], "rbd-secret",
+            "kubelet writes an rbd volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[2]["rbd"]["monitors"][0], "10.0.0.1:6789",
+            "rbd.monitors must survive decode"
+        );
+        assert_eq!(
+            volumes[3]["gitRepo"]["repository"], "https://example.com/repo.git",
+            "kubelet writes a gitRepo volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[4]["cinder"]["volumeID"], "vol-1",
+            "kubelet writes a cinder volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[4]["cinder"]["secretRef"]["name"], "cinder-secret",
+            "cinder.secretRef must survive decode"
+        );
+        assert_eq!(
+            volumes[5]["cephfs"]["secretRef"]["name"], "cephfs-secret",
+            "kubelet writes a cephfs volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[5]["cephfs"]["secretFile"], "/etc/ceph/user.secret",
+            "cephfs.secretFile must survive decode"
+        );
+        assert_eq!(
+            volumes[6]["flexVolume"]["options"]["foo"], "bar",
+            "kubelet writes a flexVolume via protobuf; if this regresses, the volume vanishes \
+             from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[6]["flexVolume"]["secretRef"]["name"], "flex-secret",
+            "flexVolume.secretRef must survive decode"
+        );
+        assert_eq!(
+            volumes[7]["flocker"]["datasetUUID"], "uuid-1",
+            "kubelet writes a flocker volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[8]["azureFile"]["shareName"], "share1",
+            "kubelet writes an azureFile volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[9]["vsphereVolume"]["storagePolicyID"], "policy-1",
+            "kubelet writes a vsphereVolume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[10]["quobyte"]["tenant"], "tenant-1",
+            "kubelet writes a quobyte volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[11]["azureDisk"]["diskURI"], "https://example.blob/mydisk.vhd",
+            "kubelet writes an azureDisk volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[11]["azureDisk"]["kind"], "Managed",
+            "azureDisk.kind must survive decode"
+        );
+        assert_eq!(
+            volumes[12]["portworxVolume"]["volumeID"], "vol-1",
+            "kubelet writes a portworxVolume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[13]["scaleIO"]["secretRef"]["name"], "scaleio-secret",
+            "kubelet writes a scaleIO volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[13]["scaleIO"]["storageMode"], "ThickProvisioned",
+            "scaleIO.storageMode must survive decode"
+        );
+        assert_eq!(
+            volumes[14]["storageos"]["secretRef"]["name"], "storageos-secret",
+            "kubelet writes a storageos volume via protobuf; if this regresses, the volume \
+             vanishes from the apiserver's stored JSON and the pod can't mount"
+        );
+        assert_eq!(
+            volumes[14]["storageos"]["volumeNamespace"], "ns1",
+            "storageos.volumeNamespace must survive decode"
         );
     }
 
