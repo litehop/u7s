@@ -4735,11 +4735,44 @@ fn json_to_meta_condition_proto(v: &serde_json::Value) -> meta_v1::Condition {
 
 // ---- Encoder: Pod / PodList -------------------------------------------------
 
+/// EnvVar.valueFrom. Without this, `$(FOO)` container-command/subPathExpr expansion and the
+/// kubelet's own env var construction both silently see an env var with neither `value` nor
+/// `valueFrom` set — the kubelet then hard-fails with "missing value for <name>" instead of
+/// resolving the field/resource/configMap/secret reference the client actually configured.
+fn json_to_env_var_source_proto(v: &serde_json::Value) -> core_v1::EnvVarSource {
+    core_v1::EnvVarSource {
+        field_ref: v.get("fieldRef").map(json_to_object_field_selector_proto),
+        resource_field_ref: v
+            .get("resourceFieldRef")
+            .map(json_to_resource_field_selector_proto),
+        config_map_key_ref: v
+            .get("configMapKeyRef")
+            .map(|cmkr| core_v1::ConfigMapKeySelector {
+                local_object_reference: jstr(cmkr, "name")
+                    .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+                key: jstr(cmkr, "key"),
+                optional: jbool(cmkr, "optional"),
+            }),
+        secret_key_ref: v.get("secretKeyRef").map(|skr| core_v1::SecretKeySelector {
+            local_object_reference: jstr(skr, "name")
+                .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+            key: jstr(skr, "key"),
+            optional: jbool(skr, "optional"),
+        }),
+        file_key_ref: v.get("fileKeyRef").map(|fkr| core_v1::FileKeySelector {
+            volume_name: jstr(fkr, "volumeName"),
+            path: jstr(fkr, "path"),
+            key: jstr(fkr, "key"),
+            optional: jbool(fkr, "optional"),
+        }),
+    }
+}
+
 fn json_to_env_var_proto(v: &serde_json::Value) -> core_v1::EnvVar {
     core_v1::EnvVar {
         name: jstr(v, "name"),
         value: jstr(v, "value"),
-        ..Default::default()
+        value_from: v.get("valueFrom").map(json_to_env_var_source_proto),
     }
 }
 
@@ -4757,7 +4790,21 @@ fn json_to_resource_requirements_proto(v: &serde_json::Value) -> core_v1::Resour
     core_v1::ResourceRequirements {
         limits: json_quantity_map_to_proto(v, "limits"),
         requests: json_quantity_map_to_proto(v, "requests"),
-        ..Default::default()
+        // claims — DRA resource-claim references by name; dropping this makes a container's
+        // resources.claims[].name resolve to nothing, so the pod starts without ever reserving
+        // the device/resource the client asked for.
+        claims: v
+            .get("claims")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|c| core_v1::ResourceClaim {
+                        name: jstr(c, "name"),
+                        request: jstr(c, "request"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -4767,7 +4814,177 @@ fn json_to_volume_mount_proto(v: &serde_json::Value) -> core_v1::VolumeMount {
         read_only: jbool(v, "readOnly"),
         mount_path: jstr(v, "mountPath"),
         sub_path: jstr(v, "subPath"),
+        sub_path_expr: jstr(v, "subPathExpr"),
         ..Default::default()
+    }
+}
+
+fn json_to_seccomp_profile_proto(v: &serde_json::Value) -> core_v1::SeccompProfile {
+    core_v1::SeccompProfile {
+        r#type: jstr(v, "type"),
+        localhost_profile: jstr(v, "localhostProfile"),
+    }
+}
+
+fn json_to_apparmor_profile_proto(v: &serde_json::Value) -> core_v1::AppArmorProfile {
+    core_v1::AppArmorProfile {
+        r#type: jstr(v, "type"),
+        localhost_profile: jstr(v, "localhostProfile"),
+    }
+}
+
+fn json_to_selinux_options_proto(v: &serde_json::Value) -> core_v1::SeLinuxOptions {
+    core_v1::SeLinuxOptions {
+        user: jstr(v, "user"),
+        role: jstr(v, "role"),
+        r#type: jstr(v, "type"),
+        level: jstr(v, "level"),
+    }
+}
+
+fn json_to_windows_security_context_options_proto(
+    v: &serde_json::Value,
+) -> core_v1::WindowsSecurityContextOptions {
+    core_v1::WindowsSecurityContextOptions {
+        gmsa_credential_spec_name: jstr(v, "gmsaCredentialSpecName"),
+        gmsa_credential_spec: jstr(v, "gmsaCredentialSpec"),
+        run_as_user_name: jstr(v, "runAsUserName"),
+        host_process: jbool(v, "hostProcess"),
+    }
+}
+
+fn json_to_capabilities_proto(v: &serde_json::Value) -> core_v1::Capabilities {
+    core_v1::Capabilities {
+        add: jstrs(v, "add"),
+        drop: jstrs(v, "drop"),
+    }
+}
+
+/// Container-level SecurityContext (Container.securityContext, proto field 15).
+///
+/// Without this, every protobuf-encoded response silently drops runAsUser/runAsGroup,
+/// privileged, capabilities, allowPrivilegeEscalation and readOnlyRootFilesystem: a kubelet
+/// watching over protobuf would run the container less confined than the pod spec requested,
+/// with no error reported anywhere.
+fn json_to_security_context_proto(v: &serde_json::Value) -> core_v1::SecurityContext {
+    core_v1::SecurityContext {
+        capabilities: v.get("capabilities").map(json_to_capabilities_proto),
+        privileged: jbool(v, "privileged"),
+        se_linux_options: v.get("seLinuxOptions").map(json_to_selinux_options_proto),
+        windows_options: v
+            .get("windowsOptions")
+            .map(json_to_windows_security_context_options_proto),
+        run_as_user: v.get("runAsUser").and_then(|x| x.as_i64()),
+        run_as_group: v.get("runAsGroup").and_then(|x| x.as_i64()),
+        run_as_non_root: jbool(v, "runAsNonRoot"),
+        read_only_root_filesystem: jbool(v, "readOnlyRootFilesystem"),
+        allow_privilege_escalation: jbool(v, "allowPrivilegeEscalation"),
+        proc_mount: jstr(v, "procMount"),
+        seccomp_profile: v.get("seccompProfile").map(json_to_seccomp_profile_proto),
+        app_armor_profile: v.get("appArmorProfile").map(json_to_apparmor_profile_proto),
+    }
+}
+
+fn json_to_env_from_source_proto(v: &serde_json::Value) -> core_v1::EnvFromSource {
+    core_v1::EnvFromSource {
+        prefix: jstr(v, "prefix"),
+        config_map_ref: v
+            .get("configMapRef")
+            .map(|cmr| core_v1::ConfigMapEnvSource {
+                local_object_reference: jstr(cmr, "name")
+                    .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+                optional: jbool(cmr, "optional"),
+            }),
+        secret_ref: v.get("secretRef").map(|sr| core_v1::SecretEnvSource {
+            local_object_reference: jstr(sr, "name")
+                .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+            optional: jbool(sr, "optional"),
+        }),
+    }
+}
+
+fn json_to_http_get_action_proto(v: &serde_json::Value) -> core_v1::HttpGetAction {
+    core_v1::HttpGetAction {
+        path: jstr(v, "path"),
+        port: v.get("port").map(json_to_int_or_string_proto),
+        host: jstr(v, "host"),
+        scheme: jstr(v, "scheme"),
+        http_headers: v
+            .get("httpHeaders")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|h| core_v1::HttpHeader {
+                        name: jstr(h, "name"),
+                        value: jstr(h, "value"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_tcp_socket_action_proto(v: &serde_json::Value) -> core_v1::TcpSocketAction {
+    core_v1::TcpSocketAction {
+        port: v.get("port").map(json_to_int_or_string_proto),
+        host: jstr(v, "host"),
+    }
+}
+
+fn json_to_probe_handler_proto(v: &serde_json::Value) -> core_v1::ProbeHandler {
+    core_v1::ProbeHandler {
+        exec: v.get("exec").map(|e| core_v1::ExecAction {
+            command: jstrs(e, "command"),
+        }),
+        http_get: v.get("httpGet").map(json_to_http_get_action_proto),
+        tcp_socket: v.get("tcpSocket").map(json_to_tcp_socket_action_proto),
+        grpc: v.get("grpc").map(|g| core_v1::GrpcAction {
+            port: ji32(g, "port"),
+            service: jstr(g, "service"),
+        }),
+    }
+}
+
+/// Probe (Container.livenessProbe/readinessProbe/startupProbe). Without this, every
+/// protobuf-encoded pod loses its health checks: kubelet always sees "no probe configured"
+/// and treats the container as immediately healthy/ready regardless of the spec.
+fn json_to_probe_proto(v: &serde_json::Value) -> core_v1::Probe {
+    core_v1::Probe {
+        handler: Some(json_to_probe_handler_proto(v)),
+        initial_delay_seconds: ji32(v, "initialDelaySeconds"),
+        timeout_seconds: ji32(v, "timeoutSeconds"),
+        period_seconds: ji32(v, "periodSeconds"),
+        success_threshold: ji32(v, "successThreshold"),
+        failure_threshold: ji32(v, "failureThreshold"),
+        termination_grace_period_seconds: ji64(v, "terminationGracePeriodSeconds"),
+    }
+}
+
+fn json_to_lifecycle_handler_proto(v: &serde_json::Value) -> core_v1::LifecycleHandler {
+    core_v1::LifecycleHandler {
+        exec: v.get("exec").map(|e| core_v1::ExecAction {
+            command: jstrs(e, "command"),
+        }),
+        http_get: v.get("httpGet").map(json_to_http_get_action_proto),
+        tcp_socket: v.get("tcpSocket").map(json_to_tcp_socket_action_proto),
+        sleep: v.get("sleep").map(|s| core_v1::SleepAction {
+            seconds: ji64(s, "seconds"),
+        }),
+    }
+}
+
+fn json_to_lifecycle_proto(v: &serde_json::Value) -> core_v1::Lifecycle {
+    core_v1::Lifecycle {
+        post_start: v.get("postStart").map(json_to_lifecycle_handler_proto),
+        pre_stop: v.get("preStop").map(json_to_lifecycle_handler_proto),
+        stop_signal: jstr(v, "stopSignal"),
+    }
+}
+
+fn json_to_container_resize_policy_proto(v: &serde_json::Value) -> core_v1::ContainerResizePolicy {
+    core_v1::ContainerResizePolicy {
+        resource_name: jstr(v, "resourceName"),
+        restart_policy: jstr(v, "restartPolicy"),
     }
 }
 
@@ -4783,19 +5000,160 @@ fn json_to_container_proto(v: &serde_json::Value) -> core_v1::Container {
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(json_to_container_port_proto).collect())
             .unwrap_or_default(),
+        env_from: v
+            .get("envFrom")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_env_from_source_proto).collect())
+            .unwrap_or_default(),
         env: v
             .get("env")
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(json_to_env_var_proto).collect())
             .unwrap_or_default(),
         resources: v.get("resources").map(json_to_resource_requirements_proto),
+        resize_policy: v
+            .get("resizePolicy")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(json_to_container_resize_policy_proto)
+                    .collect()
+            })
+            .unwrap_or_default(),
         volume_mounts: v
             .get("volumeMounts")
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(json_to_volume_mount_proto).collect())
             .unwrap_or_default(),
+        liveness_probe: v.get("livenessProbe").map(json_to_probe_proto),
+        readiness_probe: v.get("readinessProbe").map(json_to_probe_proto),
+        startup_probe: v.get("startupProbe").map(json_to_probe_proto),
+        lifecycle: v.get("lifecycle").map(json_to_lifecycle_proto),
+        termination_message_path: jstr(v, "terminationMessagePath"),
+        termination_message_policy: jstr(v, "terminationMessagePolicy"),
         image_pull_policy: jstr(v, "imagePullPolicy"),
+        security_context: v.get("securityContext").map(json_to_security_context_proto),
         ..Default::default()
+    }
+}
+
+fn json_to_key_to_path_proto(v: &serde_json::Value) -> core_v1::KeyToPath {
+    core_v1::KeyToPath {
+        key: jstr(v, "key"),
+        path: jstr(v, "path"),
+        mode: ji32(v, "mode"),
+    }
+}
+
+fn json_to_object_field_selector_proto(v: &serde_json::Value) -> core_v1::ObjectFieldSelector {
+    core_v1::ObjectFieldSelector {
+        api_version: jstr(v, "apiVersion"),
+        field_path: jstr(v, "fieldPath"),
+    }
+}
+
+fn json_to_resource_field_selector_proto(v: &serde_json::Value) -> core_v1::ResourceFieldSelector {
+    core_v1::ResourceFieldSelector {
+        container_name: jstr(v, "containerName"),
+        resource: jstr(v, "resource"),
+        divisor: jstr(v, "divisor").map(|s| {
+            super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity { string: Some(s) }
+        }),
+    }
+}
+
+fn json_to_downward_api_volume_file_proto(v: &serde_json::Value) -> core_v1::DownwardApiVolumeFile {
+    core_v1::DownwardApiVolumeFile {
+        path: jstr(v, "path"),
+        field_ref: v.get("fieldRef").map(json_to_object_field_selector_proto),
+        resource_field_ref: v
+            .get("resourceFieldRef")
+            .map(json_to_resource_field_selector_proto),
+        mode: ji32(v, "mode"),
+    }
+}
+
+fn json_to_downward_api_items_proto(v: &serde_json::Value) -> Vec<core_v1::DownwardApiVolumeFile> {
+    v.get("items")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .map(json_to_downward_api_volume_file_proto)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// downwardAPI volume source. Without this, a pod requesting labels/annotations mounted as
+/// files gets a Volume with no volume_source at all over protobuf, and the real kubelet
+/// refuses to mount it: "FailedMount ... no defaultMode used, not even the default value".
+///
+/// Unlike configMap/secret/projected volumes, a top-level DownwardAPIVolumeSource never gets
+/// a later defaulting pass in handlers/pods.rs::apply_pod_spec_defaults (see the matching
+/// comment on the decode-side gen_downward_api_volume_source_to_json) — this encoder is the
+/// only place that stamps defaultMode when the stored JSON never had one, and the kubelet
+/// refuses to mount the volume at all without one, even on the write path.
+fn json_to_downward_api_volume_source_proto(
+    v: &serde_json::Value,
+) -> core_v1::DownwardApiVolumeSource {
+    core_v1::DownwardApiVolumeSource {
+        items: json_to_downward_api_items_proto(v),
+        default_mode: Some(match ji32(v, "defaultMode") {
+            Some(m) if m != 0 => m,
+            _ => 420,
+        }),
+    }
+}
+
+fn json_to_volume_projection_proto(v: &serde_json::Value) -> core_v1::VolumeProjection {
+    core_v1::VolumeProjection {
+        secret: v.get("secret").map(|s| core_v1::SecretProjection {
+            local_object_reference: jstr(s, "name")
+                .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+            items: s
+                .get("items")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().map(json_to_key_to_path_proto).collect())
+                .unwrap_or_default(),
+            optional: jbool(s, "optional"),
+        }),
+        downward_api: v
+            .get("downwardAPI")
+            .map(|d| core_v1::DownwardApiProjection {
+                items: json_to_downward_api_items_proto(d),
+            }),
+        config_map: v.get("configMap").map(|cm| core_v1::ConfigMapProjection {
+            local_object_reference: jstr(cm, "name")
+                .map(|name| core_v1::LocalObjectReference { name: Some(name) }),
+            items: cm
+                .get("items")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().map(json_to_key_to_path_proto).collect())
+                .unwrap_or_default(),
+            optional: jbool(cm, "optional"),
+        }),
+        service_account_token: v.get("serviceAccountToken").map(|sat| {
+            core_v1::ServiceAccountTokenProjection {
+                audience: jstr(sat, "audience"),
+                expiration_seconds: ji64(sat, "expirationSeconds"),
+                path: jstr(sat, "path"),
+            }
+        }),
+        ..Default::default()
+    }
+}
+
+/// projected volume source (sources[]: downwardAPI/configMap/secret/serviceAccountToken).
+/// Without this, a projected volume decodes to an empty source over protobuf and the kubelet
+/// mounts nothing, the same failure mode as a missing downwardAPI volume.
+fn json_to_projected_volume_source_proto(v: &serde_json::Value) -> core_v1::ProjectedVolumeSource {
+    core_v1::ProjectedVolumeSource {
+        sources: v
+            .get("sources")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_volume_projection_proto).collect())
+            .unwrap_or_default(),
+        default_mode: ji32(v, "defaultMode"),
     }
 }
 
@@ -4836,6 +5194,12 @@ fn json_to_volume_proto(v: &serde_json::Value) -> core_v1::Volume {
             read_only: jbool(pvc, "readOnly"),
         });
     }
+    if let Some(da) = v.get("downwardAPI") {
+        src.downward_api = Some(json_to_downward_api_volume_source_proto(da));
+    }
+    if let Some(proj) = v.get("projected") {
+        src.projected = Some(json_to_projected_volume_source_proto(proj));
+    }
     core_v1::Volume {
         name: jstr(v, "name"),
         volume_source: Some(src),
@@ -4866,7 +5230,11 @@ fn json_to_pod_condition_proto(v: &serde_json::Value) -> core_v1::PodCondition {
         message: jstr(v, "message"),
         last_transition_time: jtime(v, "lastTransitionTime"),
         last_probe_time: jtime(v, "lastProbeTime"),
-        ..Default::default()
+        // observedGeneration — WaitForPodConditionObservedGeneration polls this per-condition
+        // field over protobuf; without it a client can never observe a specific condition's
+        // (e.g. PodReadyToStartContainers) convergence and times out the same way a missing
+        // status-level observedGeneration does.
+        observed_generation: ji64(v, "observedGeneration"),
     }
 }
 
@@ -4908,7 +5276,321 @@ fn json_to_container_status_proto(v: &serde_json::Value) -> core_v1::ContainerSt
         image_id: jstr(v, "imageID"),
         container_id: jstr(v, "containerID"),
         started: jbool(v, "started"),
+        // resources/allocatedResources are the in-place-resize actuals: without them, every
+        // protobuf-encoded ContainerStatus looks like the container was never resized, even
+        // after the kubelet successfully actuates a resize request.
+        resources: v.get("resources").map(json_to_resource_requirements_proto),
+        allocated_resources: json_quantity_map_to_proto(v, "allocatedResources"),
         ..Default::default()
+    }
+}
+
+fn json_to_local_object_reference_proto(v: &serde_json::Value) -> core_v1::LocalObjectReference {
+    core_v1::LocalObjectReference {
+        name: jstr(v, "name"),
+    }
+}
+
+fn json_to_pod_dns_config_option_proto(v: &serde_json::Value) -> core_v1::PodDnsConfigOption {
+    core_v1::PodDnsConfigOption {
+        name: jstr(v, "name"),
+        value: jstr(v, "value"),
+    }
+}
+
+fn json_to_pod_dns_config_proto(v: &serde_json::Value) -> core_v1::PodDnsConfig {
+    core_v1::PodDnsConfig {
+        nameservers: jstrs(v, "nameservers"),
+        searches: jstrs(v, "searches"),
+        options: v
+            .get("options")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_pod_dns_config_option_proto).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_pod_readiness_gate_proto(v: &serde_json::Value) -> core_v1::PodReadinessGate {
+    core_v1::PodReadinessGate {
+        condition_type: jstr(v, "conditionType"),
+    }
+}
+
+/// Pod-level SecurityContext (PodSpec.securityContext, proto field 14).
+///
+/// Without this, runAsUser/runAsGroup/fsGroup/supplementalGroups/seccompProfile set at the
+/// pod level never reach a protobuf-watching kubelet, which then runs every container in the
+/// pod under the image's default identity instead of the one the spec requested.
+fn json_to_pod_security_context_proto(v: &serde_json::Value) -> core_v1::PodSecurityContext {
+    core_v1::PodSecurityContext {
+        se_linux_options: v.get("seLinuxOptions").map(json_to_selinux_options_proto),
+        windows_options: v
+            .get("windowsOptions")
+            .map(json_to_windows_security_context_options_proto),
+        run_as_user: v.get("runAsUser").and_then(|x| x.as_i64()),
+        run_as_group: v.get("runAsGroup").and_then(|x| x.as_i64()),
+        run_as_non_root: jbool(v, "runAsNonRoot"),
+        fs_group: v.get("fsGroup").and_then(|x| x.as_i64()),
+        supplemental_groups: v
+            .get("supplementalGroups")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|n| n.as_i64()).collect())
+            .unwrap_or_default(),
+        supplemental_groups_policy: jstr(v, "supplementalGroupsPolicy"),
+        sysctls: v
+            .get("sysctls")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|s| core_v1::Sysctl {
+                        name: jstr(s, "name"),
+                        value: jstr(s, "value"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        fs_group_change_policy: jstr(v, "fsGroupChangePolicy"),
+        seccomp_profile: v.get("seccompProfile").map(json_to_seccomp_profile_proto),
+        app_armor_profile: v.get("appArmorProfile").map(json_to_apparmor_profile_proto),
+        se_linux_change_policy: jstr(v, "seLinuxChangePolicy"),
+    }
+}
+
+fn json_to_label_selector_requirement_proto(
+    v: &serde_json::Value,
+) -> meta_v1::LabelSelectorRequirement {
+    meta_v1::LabelSelectorRequirement {
+        key: jstr(v, "key"),
+        operator: jstr(v, "operator"),
+        values: jstrs(v, "values"),
+    }
+}
+
+fn json_to_label_selector_proto(v: &serde_json::Value) -> meta_v1::LabelSelector {
+    meta_v1::LabelSelector {
+        match_labels: jstrmap(v, "matchLabels"),
+        match_expressions: v
+            .get("matchExpressions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(json_to_label_selector_requirement_proto)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_node_selector_requirement_proto(
+    v: &serde_json::Value,
+) -> core_v1::NodeSelectorRequirement {
+    core_v1::NodeSelectorRequirement {
+        key: jstr(v, "key"),
+        operator: jstr(v, "operator"),
+        values: jstrs(v, "values"),
+    }
+}
+
+fn json_to_node_selector_term_proto(v: &serde_json::Value) -> core_v1::NodeSelectorTerm {
+    core_v1::NodeSelectorTerm {
+        match_expressions: v
+            .get("matchExpressions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(json_to_node_selector_requirement_proto)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        match_fields: v
+            .get("matchFields")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(json_to_node_selector_requirement_proto)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_node_affinity_proto(v: &serde_json::Value) -> core_v1::NodeAffinity {
+    core_v1::NodeAffinity {
+        required_during_scheduling_ignored_during_execution: v
+            .get("requiredDuringSchedulingIgnoredDuringExecution")
+            .map(|req| core_v1::NodeSelector {
+                node_selector_terms: req
+                    .get("nodeSelectorTerms")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().map(json_to_node_selector_term_proto).collect())
+                    .unwrap_or_default(),
+            }),
+        preferred_during_scheduling_ignored_during_execution: v
+            .get("preferredDuringSchedulingIgnoredDuringExecution")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|p| core_v1::PreferredSchedulingTerm {
+                        weight: ji32(p, "weight"),
+                        preference: p.get("preference").map(json_to_node_selector_term_proto),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn json_to_pod_affinity_term_proto(v: &serde_json::Value) -> core_v1::PodAffinityTerm {
+    core_v1::PodAffinityTerm {
+        label_selector: v.get("labelSelector").map(json_to_label_selector_proto),
+        namespaces: jstrs(v, "namespaces"),
+        topology_key: jstr(v, "topologyKey"),
+        namespace_selector: v.get("namespaceSelector").map(json_to_label_selector_proto),
+        match_label_keys: jstrs(v, "matchLabelKeys"),
+        mismatch_label_keys: jstrs(v, "mismatchLabelKeys"),
+    }
+}
+
+/// `PodAffinity` and `PodAntiAffinity` are structurally identical on the wire — see
+/// `gen_pod_affinity_terms_pair_to_json` for the decode-side counterpart of this split.
+fn json_to_pod_affinity_terms_pair_proto(
+    v: &serde_json::Value,
+) -> (
+    Vec<core_v1::PodAffinityTerm>,
+    Vec<core_v1::WeightedPodAffinityTerm>,
+) {
+    let required = v
+        .get("requiredDuringSchedulingIgnoredDuringExecution")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().map(json_to_pod_affinity_term_proto).collect())
+        .unwrap_or_default();
+    let preferred = v
+        .get("preferredDuringSchedulingIgnoredDuringExecution")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|w| core_v1::WeightedPodAffinityTerm {
+                    weight: ji32(w, "weight"),
+                    pod_affinity_term: w
+                        .get("podAffinityTerm")
+                        .map(json_to_pod_affinity_term_proto),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (required, preferred)
+}
+
+/// Pod scheduling affinity (PodSpec.affinity, proto field 18). Without this, a pod created
+/// with node/pod affinity or anti-affinity rules loses them entirely over protobuf: the
+/// scheduler (which reads pods via the same watch path) schedules as if no constraint had
+/// ever been requested.
+fn json_to_affinity_proto(v: &serde_json::Value) -> core_v1::Affinity {
+    core_v1::Affinity {
+        node_affinity: v.get("nodeAffinity").map(json_to_node_affinity_proto),
+        pod_affinity: v.get("podAffinity").map(|pa| {
+            let (required, preferred) = json_to_pod_affinity_terms_pair_proto(pa);
+            core_v1::PodAffinity {
+                required_during_scheduling_ignored_during_execution: required,
+                preferred_during_scheduling_ignored_during_execution: preferred,
+            }
+        }),
+        pod_anti_affinity: v.get("podAntiAffinity").map(|paa| {
+            let (required, preferred) = json_to_pod_affinity_terms_pair_proto(paa);
+            core_v1::PodAntiAffinity {
+                required_during_scheduling_ignored_during_execution: required,
+                preferred_during_scheduling_ignored_during_execution: preferred,
+            }
+        }),
+    }
+}
+
+/// EphemeralContainerCommon has the same field shape as Container (see the prost-generated
+/// comment: "When a new field is added to Container it must be added here as well"), and on
+/// the wire an EphemeralContainer's JSON is a flattened Container object plus
+/// targetContainerName — mirrored below by `json_to_ephemeral_container_proto`.
+fn json_to_ephemeral_container_common_proto(
+    v: &serde_json::Value,
+) -> core_v1::EphemeralContainerCommon {
+    core_v1::EphemeralContainerCommon {
+        name: jstr(v, "name"),
+        image: jstr(v, "image"),
+        command: jstrs(v, "command"),
+        args: jstrs(v, "args"),
+        working_dir: jstr(v, "workingDir"),
+        ports: v
+            .get("ports")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_port_proto).collect())
+            .unwrap_or_default(),
+        env_from: v
+            .get("envFrom")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_env_from_source_proto).collect())
+            .unwrap_or_default(),
+        env: v
+            .get("env")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_env_var_proto).collect())
+            .unwrap_or_default(),
+        resources: v.get("resources").map(json_to_resource_requirements_proto),
+        resize_policy: v
+            .get("resizePolicy")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(json_to_container_resize_policy_proto)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        restart_policy: jstr(v, "restartPolicy"),
+        volume_mounts: v
+            .get("volumeMounts")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_volume_mount_proto).collect())
+            .unwrap_or_default(),
+        liveness_probe: v.get("livenessProbe").map(json_to_probe_proto),
+        readiness_probe: v.get("readinessProbe").map(json_to_probe_proto),
+        startup_probe: v.get("startupProbe").map(json_to_probe_proto),
+        lifecycle: v.get("lifecycle").map(json_to_lifecycle_proto),
+        termination_message_path: jstr(v, "terminationMessagePath"),
+        termination_message_policy: jstr(v, "terminationMessagePolicy"),
+        image_pull_policy: jstr(v, "imagePullPolicy"),
+        security_context: v.get("securityContext").map(json_to_security_context_proto),
+        ..Default::default()
+    }
+}
+
+/// EphemeralContainer (PodSpec.ephemeralContainers, proto field 34). Without this,
+/// `kubectl debug`'s added container never reaches a protobuf-watching kubelet: client-go's
+/// UpdateEphemeralContainers call negotiates protobuf by default, so the debug container is
+/// silently dropped before the kubelet ever sees it.
+fn json_to_ephemeral_container_proto(v: &serde_json::Value) -> core_v1::EphemeralContainer {
+    core_v1::EphemeralContainer {
+        ephemeral_container_common: Some(json_to_ephemeral_container_common_proto(v)),
+        target_container_name: jstr(v, "targetContainerName"),
+    }
+}
+
+fn json_to_host_alias_proto(v: &serde_json::Value) -> core_v1::HostAlias {
+    core_v1::HostAlias {
+        ip: jstr(v, "ip"),
+        hostnames: jstrs(v, "hostnames"),
+    }
+}
+
+fn json_to_topology_spread_constraint_proto(
+    v: &serde_json::Value,
+) -> core_v1::TopologySpreadConstraint {
+    core_v1::TopologySpreadConstraint {
+        max_skew: ji32(v, "maxSkew"),
+        topology_key: jstr(v, "topologyKey"),
+        when_unsatisfiable: jstr(v, "whenUnsatisfiable"),
+        label_selector: v.get("labelSelector").map(json_to_label_selector_proto),
+        min_domains: ji32(v, "minDomains"),
+        node_affinity_policy: jstr(v, "nodeAffinityPolicy"),
+        node_taints_policy: jstr(v, "nodeTaintsPolicy"),
+        match_label_keys: jstrs(v, "matchLabelKeys"),
     }
 }
 
@@ -4929,22 +5611,99 @@ fn json_to_pod_spec_proto(v: &serde_json::Value) -> core_v1::PodSpec {
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(json_to_container_proto).collect())
             .unwrap_or_default(),
+        ephemeral_containers: v
+            .get("ephemeralContainers")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_ephemeral_container_proto).collect())
+            .unwrap_or_default(),
         restart_policy: jstr(v, "restartPolicy"),
         termination_grace_period_seconds: ji64(v, "terminationGracePeriodSeconds"),
+        // activeDeadlineSeconds — without it, a pod that should be actively failed after N
+        // seconds of activity (e.g. a Job's per-pod deadline) never gets killed by the
+        // kubelet, which only sees this field over protobuf watches.
+        active_deadline_seconds: ji64(v, "activeDeadlineSeconds"),
         dns_policy: jstr(v, "dnsPolicy"),
         node_selector: jstrmap(v, "nodeSelector"),
         service_account_name: jstr(v, "serviceAccountName"),
-        node_name: jstr(v, "nodeName"),
+        // serviceAccount is the deprecated alias for serviceAccountName; still accepted on the
+        // wire by legacy clients, so dropping it silently discards their ServiceAccount choice.
+        service_account: jstr(v, "serviceAccount"),
         host_network: jbool(v, "hostNetwork"),
+        host_pid: jbool(v, "hostPID"),
+        host_ipc: jbool(v, "hostIPC"),
+        // shareProcessNamespace — dropping it silently re-isolates sibling containers from
+        // each other, breaking sidecar patterns that signal or trace another container's PID 1.
+        share_process_namespace: jbool(v, "shareProcessNamespace"),
+        security_context: v
+            .get("securityContext")
+            .map(json_to_pod_security_context_proto),
+        image_pull_secrets: v
+            .get("imagePullSecrets")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_local_object_reference_proto).collect())
+            .unwrap_or_default(),
         hostname: jstr(v, "hostname"),
         subdomain: jstr(v, "subdomain"),
+        affinity: v.get("affinity").map(json_to_affinity_proto),
         scheduler_name: jstr(v, "schedulerName"),
         tolerations: v
             .get("tolerations")
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(json_to_toleration_proto).collect())
             .unwrap_or_default(),
+        // hostAliases — injected into the pod's /etc/hosts by the kubelet; dropping this means
+        // the extra host entries a pod asked for silently never appear.
+        host_aliases: v
+            .get("hostAliases")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_host_alias_proto).collect())
+            .unwrap_or_default(),
         priority_class_name: jstr(v, "priorityClassName"),
+        // priority — the integer priority value resolved from priorityClassName; without it
+        // the scheduler cannot perform preemption ordering correctly.
+        priority: ji32(v, "priority"),
+        node_name: jstr(v, "nodeName"),
+        dns_config: v.get("dnsConfig").map(json_to_pod_dns_config_proto),
+        readiness_gates: v
+            .get("readinessGates")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_pod_readiness_gate_proto).collect())
+            .unwrap_or_default(),
+        // runtimeClassName/overhead — without these, a RuntimeClass-scheduled pod loses both
+        // which runtime handler to use and the resource overhead the scheduler must reserve
+        // for it, causing scheduling to under-account for the sandbox's real footprint.
+        runtime_class_name: jstr(v, "runtimeClassName"),
+        // enableServiceLinks — a genuine *bool upstream (tri-state), read directly by the
+        // kubelet's makeEnvironmentVariables: a nil value there is a hard error
+        // ("nil pod.spec.enableServiceLinks encountered, cannot construct envvars"), not a
+        // silent default, so a protobuf-negotiating client's read-modify-write update loop
+        // (GET this field absent -> PUT it back absent) permanently bricks the pod's env
+        // var construction on the very next kubelet sync.
+        enable_service_links: jbool(v, "enableServiceLinks"),
+        // preemptionPolicy — dropping an explicit "Never" silently reverts to the cluster
+        // default (PreemptLowerPriority), letting the pod preempt others despite the client
+        // explicitly opting out.
+        preemption_policy: jstr(v, "preemptionPolicy"),
+        overhead: json_quantity_map_to_proto(v, "overhead"),
+        topology_spread_constraints: v
+            .get("topologySpreadConstraints")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .map(json_to_topology_spread_constraint_proto)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // setHostnameAsFQDN/os — genuine *bool/optional-message fields; dropping
+        // setHostnameAsFQDN=true silently reverts the kernel hostname to the leaf name instead
+        // of the FQDN the client asked for, and dropping os makes OS-conditional validation
+        // silently permissive for the OS the client actually declared.
+        set_hostname_as_fqdn: jbool(v, "setHostnameAsFQDN"),
+        os: jstr(v.get("os").unwrap_or(&serde_json::Value::Null), "name")
+            .map(|name| core_v1::PodOs { name: Some(name) }),
+        // automountServiceAccountToken — pod-level override of the ServiceAccount default;
+        // dropping it means a pod that explicitly opted out of token automount gets one anyway.
+        automount_service_account_token: jbool(v, "automountServiceAccountToken"),
         scheduling_gates: v
             .get("schedulingGates")
             .and_then(|a| a.as_array())
@@ -4966,6 +5725,19 @@ fn json_to_pod_status_proto(v: &serde_json::Value) -> core_v1::PodStatus {
         reason: jstr(v, "reason"),
         nominated_node_name: jstr(v, "nominatedNodeName"),
         host_ip: jstr(v, "hostIP"),
+        // hostIPs — dual-stack host address list; without it a dual-stack-aware client reading
+        // this field back over protobuf sees only a single-stack pod regardless of what the
+        // kubelet actually reported.
+        host_i_ps: v
+            .get("hostIPs")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|ip| jstr(ip, "ip"))
+                    .map(|ip| core_v1::HostIp { ip: Some(ip) })
+                    .collect()
+            })
+            .unwrap_or_default(),
         pod_ip: jstr(v, "podIP"),
         pod_i_ps: v
             .get("podIPs")
@@ -4989,6 +5761,18 @@ fn json_to_pod_status_proto(v: &serde_json::Value) -> core_v1::PodStatus {
             .and_then(|a| a.as_array())
             .map(|a| a.iter().map(json_to_container_status_proto).collect())
             .unwrap_or_default(),
+        // ephemeralContainerStatuses — without it, a client polling for a `kubectl debug`
+        // container's exit code over protobuf (client-go's default) never sees it terminate.
+        ephemeral_container_statuses: v
+            .get("ephemeralContainerStatuses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().map(json_to_container_status_proto).collect())
+            .unwrap_or_default(),
+        // observedGeneration — the kubelet's own report of which generation it has processed.
+        // Without it, a protobuf-negotiating client polling for convergence (e.g. e2e's
+        // WaitForPodObservedGeneration) always reads back 0 regardless of what the kubelet
+        // actually wrote, so it can never observe convergence and times out.
+        observed_generation: ji64(v, "observedGeneration"),
         ..Default::default()
     }
 }
@@ -5073,7 +5857,13 @@ fn json_to_service_spec_proto(v: &serde_json::Value) -> core_v1::ServiceSpec {
         load_balancer_class: jstr(v, "loadBalancerClass"),
         internal_traffic_policy: jstr(v, "internalTrafficPolicy"),
         traffic_distribution: jstr(v, "trafficDistribution"),
-        ..Default::default()
+        session_affinity_config: v.get("sessionAffinityConfig").map(|sac| {
+            core_v1::SessionAffinityConfig {
+                client_ip: sac.get("clientIP").map(|c| core_v1::ClientIpConfig {
+                    timeout_seconds: ji32(c, "timeoutSeconds"),
+                }),
+            }
+        }),
     }
 }
 
@@ -10373,6 +11163,503 @@ mod tests {
         assert_fields_present(&paths, &expected);
     }
 
+    /// Round-trips a fully sentinel-populated Service through `encode_service_proto_gen`
+    /// (JSON -> proto), symmetric to `sentinel_completeness_gen_service_to_json` above (proto
+    /// -> JSON). A field present in the decode-side JSON but missing after re-encoding is a
+    /// field `json_to_service_spec_proto`/`json_to_service_status_proto` never reads at all.
+    #[test]
+    fn sentinel_completeness_encode_service_proto_gen() {
+        let svc = core_v1::Service::sentinel();
+        let mut buf = Vec::new();
+        svc.encode(&mut buf).unwrap();
+        let json = decode_service_proto_gen(&buf)
+            .expect("sentinel Service must decode via generated path");
+
+        let raw = encode_service_proto_gen(&json);
+        let redecoded =
+            decode_service_proto_gen(&raw).expect("encoded sentinel Service bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded, "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Service"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// `encode_servicelist_proto_gen` delegates per-item encoding to `json_to_service_proto`
+    /// (already covered field-by-field above), so this only needs to confirm the list wrapper
+    /// itself doesn't drop an item or its own `metadata.resourceVersion` — the same shape as
+    /// `encode_podlist_proto_gen_round_trips_all_items_and_resource_version` below.
+    #[test]
+    fn sentinel_completeness_encode_servicelist_proto_gen() {
+        let svc = core_v1::Service::sentinel();
+        let mut buf = Vec::new();
+        svc.encode(&mut buf).unwrap();
+        let item = decode_service_proto_gen(&buf)
+            .expect("sentinel Service must decode via generated path");
+        let list = serde_json::json!({ "metadata": { "resourceVersion": "99" }, "items": [item] });
+
+        let raw = encode_servicelist_proto_gen(&list);
+        let decoded_list =
+            core_v1::ServiceList::decode(raw.as_slice()).expect("encoded ServiceList must decode");
+        assert_eq!(
+            decoded_list.items.len(),
+            1,
+            "the sentinel item must survive the list wrapper"
+        );
+        assert_eq!(
+            decoded_list.metadata.unwrap().resource_version.as_deref(),
+            Some("99"),
+            "list resourceVersion must survive"
+        );
+
+        let mut item_buf = Vec::new();
+        decoded_list.items[0].encode(&mut item_buf).unwrap();
+        let redecoded_item =
+            decode_service_proto_gen(&item_buf).expect("re-encoded sentinel item must decode");
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded_item, "", &mut paths);
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Service"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Round-trips a fully sentinel-populated Node through `encode_node_proto_gen`, symmetric
+    /// to the existing `decode_node_proto_gen_preserves_*` tests above.
+    #[test]
+    fn sentinel_completeness_encode_node_proto_gen() {
+        let node = core_v1::Node::sentinel();
+        let mut buf = Vec::new();
+        node.encode(&mut buf).unwrap();
+        let json =
+            decode_node_proto_gen(&buf).expect("sentinel Node must decode via generated path");
+
+        let raw = encode_node_proto_gen(&json);
+        let redecoded =
+            decode_node_proto_gen(&raw).expect("encoded sentinel Node bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded, "", &mut paths);
+
+        // Node is outside mayor-13y4a's scope (Pod/Volume/Container) and Node objects reach a
+        // real kubelet/scheduler almost exclusively via WATCH (a JSON pass-through in this
+        // codebase, unaffected by this encoder), so a straight schema-oracle assertion here
+        // would fail on pre-existing gaps this bead did not introduce and does not fix:
+        // spec.configSource (deprecated since 1.22), status.config.* (kubelet dynamic config,
+        // same deprecated feature), status.daemonEndpoints/images/volumesAttached/volumesInUse/
+        // runtimeHandlers/declaredFeatures/features/nodeInfo.swap. Tracked as a P3 follow-on
+        // rather than expanded here.
+        let excluded = [
+            "spec.configSource",
+            "status.config",
+            "status.daemonEndpoints",
+            "status.images",
+            "status.volumesAttached",
+            "status.volumesInUse",
+            "status.runtimeHandlers",
+            "status.declaredFeatures",
+            "status.features",
+            "status.nodeInfo.swap",
+        ];
+        let all = crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Node"]);
+        let expected: Vec<&str> = all
+            .iter()
+            .map(String::as_str)
+            .filter(|f| {
+                !excluded
+                    .iter()
+                    .any(|ex| *f == *ex || f.starts_with(&format!("{ex}.")))
+            })
+            .collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// `encode_nodelist_proto_gen` list-wrapper coverage; per-item field coverage is the test
+    /// above.
+    #[test]
+    fn sentinel_completeness_encode_nodelist_proto_gen() {
+        let node = core_v1::Node::sentinel();
+        let mut buf = Vec::new();
+        node.encode(&mut buf).unwrap();
+        let item =
+            decode_node_proto_gen(&buf).expect("sentinel Node must decode via generated path");
+        let list = serde_json::json!({ "metadata": { "resourceVersion": "99" }, "items": [item] });
+
+        let raw = encode_nodelist_proto_gen(&list);
+        let decoded_list =
+            core_v1::NodeList::decode(raw.as_slice()).expect("encoded NodeList must decode");
+        assert_eq!(
+            decoded_list.items.len(),
+            1,
+            "the sentinel item must survive the list wrapper"
+        );
+        assert_eq!(
+            decoded_list.metadata.unwrap().resource_version.as_deref(),
+            Some("99"),
+            "list resourceVersion must survive"
+        );
+    }
+
+    /// Round-trips a fully sentinel-populated Endpoints through `encode_endpoints_proto_gen`.
+    #[test]
+    fn sentinel_completeness_encode_endpoints_proto_gen() {
+        let eps = core_v1::Endpoints::sentinel();
+        let mut buf = Vec::new();
+        eps.encode(&mut buf).unwrap();
+        let json = decode_endpoints_proto_gen(&buf)
+            .expect("sentinel Endpoints must decode via generated path");
+
+        let raw = encode_endpoints_proto_gen(&json);
+        let redecoded =
+            decode_endpoints_proto_gen(&raw).expect("encoded sentinel Endpoints bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded, "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Endpoints"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// `encode_endpointslist_proto_gen` list-wrapper coverage; per-item field coverage is the
+    /// test above.
+    #[test]
+    fn sentinel_completeness_encode_endpointslist_proto_gen() {
+        let eps = core_v1::Endpoints::sentinel();
+        let mut buf = Vec::new();
+        eps.encode(&mut buf).unwrap();
+        let item = decode_endpoints_proto_gen(&buf)
+            .expect("sentinel Endpoints must decode via generated path");
+        let list = serde_json::json!({ "metadata": { "resourceVersion": "99" }, "items": [item] });
+
+        let raw = encode_endpointslist_proto_gen(&list);
+        let decoded_list = core_v1::EndpointsList::decode(raw.as_slice())
+            .expect("encoded EndpointsList must decode");
+        assert_eq!(
+            decoded_list.items.len(),
+            1,
+            "the sentinel item must survive the list wrapper"
+        );
+        assert_eq!(
+            decoded_list.metadata.unwrap().resource_version.as_deref(),
+            Some("99"),
+            "list resourceVersion must survive"
+        );
+    }
+
+    /// Round-trips a fully sentinel-populated Event through `encode_event_proto_gen`.
+    #[test]
+    fn sentinel_completeness_encode_event_proto_gen() {
+        let event = core_v1::Event::sentinel();
+        let mut buf = Vec::new();
+        event.encode(&mut buf).unwrap();
+        let json =
+            decode_event_proto_gen(&buf).expect("sentinel Event must decode via generated path");
+
+        let raw = encode_event_proto_gen(&json);
+        let redecoded =
+            decode_event_proto_gen(&raw).expect("encoded sentinel Event bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded, "", &mut paths);
+
+        let expected =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.Event"]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// `encode_eventlist_proto_gen` list-wrapper coverage; per-item field coverage is the test
+    /// above.
+    #[test]
+    fn sentinel_completeness_encode_eventlist_proto_gen() {
+        let event = core_v1::Event::sentinel();
+        let mut buf = Vec::new();
+        event.encode(&mut buf).unwrap();
+        let item =
+            decode_event_proto_gen(&buf).expect("sentinel Event must decode via generated path");
+        let list = serde_json::json!({ "metadata": { "resourceVersion": "99" }, "items": [item] });
+
+        let raw = encode_eventlist_proto_gen(&list);
+        let decoded_list =
+            core_v1::EventList::decode(raw.as_slice()).expect("encoded EventList must decode");
+        assert_eq!(
+            decoded_list.items.len(),
+            1,
+            "the sentinel item must survive the list wrapper"
+        );
+        assert_eq!(
+            decoded_list.metadata.unwrap().resource_version.as_deref(),
+            Some("99"),
+            "list resourceVersion must survive"
+        );
+    }
+
+    // ---- Sentinel completeness: encode_pod_proto_gen (JSON -> proto direction) -----------
+    //
+    // Symmetric to `sentinel_completeness_gen_pod_spec_to_json`/`gen_container_to_json` above,
+    // but for the opposite direction: those decode a sentinel-populated proto message and check
+    // every field reaches JSON; these start from that same decoded JSON (already known to carry
+    // every field the decode path supports) and check that `encode_pod_proto_gen` puts every one
+    // of those JSON fields back on the wire. A field present here but missing after the
+    // encode-then-decode round trip is a field `json_to_pod_spec_proto`/`json_to_container_proto`
+    // never reads from JSON at all — this is exactly the class of bug PR #1130 introduced and
+    // this bead's fix plugs: a client that negotiates protobuf (every real client-go typed
+    // clientset, by default) silently loses that field on every GET/LIST/WATCH.
+    //
+    // `expected` intentionally excludes fields this bead's scope explicitly defers (see the
+    // bead's follow-on beads): the ~15 rarely-used/deprecated VolumeSource variants other than
+    // hostPath/emptyDir/secret/configMap/persistentVolumeClaim/downwardAPI/projected, and DRA
+    // pod-level resourceClaims / PodLevelResources-alpha `resources` / HostnameOverride-alpha
+    // `hostnameOverride` / GenericWorkload-alpha `schedulingGroup` (none of which are exercised
+    // by certified-conformance today).
+    #[test]
+    fn sentinel_completeness_encode_pod_proto_gen() {
+        let json = sentinel_pod_json();
+        let raw = encode_pod_proto_gen(&json);
+        let redecoded = decode_pod_proto_gen(&raw)
+            .expect("encoded sentinel Pod bytes must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded, "", &mut paths);
+
+        let expected = [
+            "volumes.name",
+            "volumes.hostPath.path",
+            "volumes.emptyDir.medium",
+            "volumes.secret.secretName",
+            "volumes.configMap.name",
+            "volumes.persistentVolumeClaim.claimName",
+            "volumes.downwardAPI.items.path",
+            "volumes.projected.sources.secret.name",
+            "containers.name",
+            "containers.image",
+            "containers.command",
+            "containers.args",
+            "containers.workingDir",
+            "containers.ports.containerPort",
+            "containers.envFrom.prefix",
+            "containers.env.name",
+            "containers.resources.limits.__sentinel__",
+            "containers.resizePolicy.resourceName",
+            "containers.volumeMounts.subPathExpr",
+            "containers.livenessProbe.initialDelaySeconds",
+            "containers.readinessProbe.initialDelaySeconds",
+            "containers.startupProbe.initialDelaySeconds",
+            "containers.lifecycle.postStart.sleep.seconds",
+            "containers.terminationMessagePath",
+            "containers.terminationMessagePolicy",
+            "containers.imagePullPolicy",
+            "containers.securityContext.privileged",
+            "initContainers.name",
+            "ephemeralContainers.targetContainerName",
+            "restartPolicy",
+            "terminationGracePeriodSeconds",
+            "activeDeadlineSeconds",
+            "dnsPolicy",
+            "nodeSelector.__sentinel__",
+            "serviceAccountName",
+            "serviceAccount",
+            "automountServiceAccountToken",
+            "nodeName",
+            "hostNetwork",
+            "hostPID",
+            "hostIPC",
+            "shareProcessNamespace",
+            "securityContext.runAsUser",
+            "imagePullSecrets.name",
+            "hostname",
+            "subdomain",
+            "affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.weight",
+            "schedulerName",
+            "tolerations.key",
+            "hostAliases.ip",
+            "priorityClassName",
+            "priority",
+            "dnsConfig.nameservers",
+            "readinessGates.conditionType",
+            "runtimeClassName",
+            "enableServiceLinks",
+            "preemptionPolicy",
+            "overhead.__sentinel__",
+            "topologySpreadConstraints.maxSkew",
+            "setHostnameAsFQDN",
+            "os.name",
+            "schedulingGates.name",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Container.securityContext specifically, gated the same way `sentinel_completeness_gen_
+    /// security_context_to_json` gates the decode direction: seLinuxOptions/windowsOptions/
+    /// procMount/appArmorProfile are exactly the fields that class of bug hid previously.
+    #[test]
+    fn sentinel_completeness_encode_container_security_context() {
+        let json = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "img",
+                    "securityContext": {
+                        "capabilities": { "add": ["NET_ADMIN"], "drop": ["ALL"] },
+                        "privileged": true,
+                        "seLinuxOptions": { "user": "u", "role": "r", "type": "t", "level": "l" },
+                        "windowsOptions": { "runAsUserName": "ContainerAdministrator" },
+                        "runAsUser": 1000,
+                        "runAsGroup": 2000,
+                        "runAsNonRoot": true,
+                        "readOnlyRootFilesystem": true,
+                        "allowPrivilegeEscalation": false,
+                        "procMount": "Unmasked",
+                        "seccompProfile": { "type": "Localhost", "localhostProfile": "p.json" },
+                        "appArmorProfile": { "type": "Localhost", "localhostProfile": "k8s-apparmor-example-deny-write" }
+                    }
+                }]
+            }
+        });
+        let raw = encode_pod_proto_gen(&json);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded sentinel Pod bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(
+            &decoded["spec"]["containers"][0]["securityContext"],
+            "",
+            &mut paths,
+        );
+
+        let expected = [
+            "capabilities.add",
+            "capabilities.drop",
+            "privileged",
+            "seLinuxOptions.user",
+            "windowsOptions.runAsUserName",
+            "runAsUser",
+            "runAsGroup",
+            "runAsNonRoot",
+            "readOnlyRootFilesystem",
+            "allowPrivilegeEscalation",
+            "procMount",
+            "seccompProfile.type",
+            "appArmorProfile.type",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// Round-trips a fully sentinel-populated PodStatus through `encode_pod_proto_gen`,
+    /// symmetric to `sentinel_completeness_gen_pod_status_to_json` (proto -> JSON) above. This
+    /// is the test that would have caught `status.observedGeneration` being silently dropped by
+    /// `json_to_pod_status_proto`: the exact bug behind the live `[sig-node] Pods Extended (pod
+    /// generation) issue 500 podspec updates` failure, where a protobuf-polling client
+    /// (`WaitForPodObservedGeneration`) read back `observedGeneration: 0` forever regardless of
+    /// what the real kubelet had actually written to the stored JSON.
+    #[test]
+    fn sentinel_completeness_encode_pod_status_proto_gen() {
+        let pod = core_v1::Pod {
+            status: Some(core_v1::PodStatus::sentinel()),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+        let json =
+            decode_pod_proto_gen(&buf).expect("sentinel PodStatus must decode via generated path");
+
+        let raw = encode_pod_proto_gen(&json);
+        let redecoded =
+            decode_pod_proto_gen(&raw).expect("encoded sentinel PodStatus bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&redecoded["status"], "", &mut paths);
+
+        // Excluded, all alpha/feature-gated and outside mayor-13y4a's scope (Pod/Volume/
+        // Container hot-path fields) — tracked as a P3 follow-on rather than expanded here:
+        // resize/resizeStatus (InPlacePodVerticalScaling, deprecated in favor of the
+        // allocatedResources/resources this bead already covers), containerStatuses[].
+        // volumeMounts (VolumeMountStatus, 1.34+), containerStatuses[].user (ContainerUser,
+        // SupplementalGroupsPolicy), containerStatuses[].stopSignal (ContainerStopSignals),
+        // containerStatuses[].allocatedResourcesStatus (ResourceHealth, ResourceHealthStatus),
+        // and the DRA claim-status fields (resourceClaimStatuses, extendedResourceClaimStatus,
+        // nodeAllocatableResourceClaimStatuses).
+        let excluded_prefixes = ["resize", "resizeStatus"];
+        let excluded_substrings = [
+            ".volumeMounts",
+            ".user",
+            ".stopSignal",
+            ".allocatedResourcesStatus",
+        ];
+        let excluded_top_level = [
+            "resourceClaimStatuses",
+            "extendedResourceClaimStatus",
+            "nodeAllocatableResourceClaimStatuses",
+        ];
+        let all =
+            crate::proto_descriptor::expected_json_keys_for(&[".k8s.io.api.core.v1.PodStatus"]);
+        let expected: Vec<&str> = all
+            .iter()
+            .map(String::as_str)
+            .filter(|f| {
+                let top_level = f.split('.').next().unwrap_or(f);
+                !excluded_prefixes
+                    .iter()
+                    .any(|ex| *f == *ex || f.starts_with(&format!("{ex}.")))
+                    && !excluded_substrings.iter().any(|ex| f.contains(ex))
+                    && !excluded_top_level.contains(&top_level)
+            })
+            .collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// PodSpec.securityContext, gated the same way `sentinel_completeness_gen_pod_security_
+    /// context_to_json` gates the decode direction.
+    #[test]
+    fn sentinel_completeness_encode_pod_security_context() {
+        let json = serde_json::json!({
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "securityContext": {
+                    "seLinuxOptions": { "user": "u" },
+                    "windowsOptions": { "runAsUserName": "ContainerAdministrator" },
+                    "runAsUser": 1000,
+                    "runAsGroup": 2000,
+                    "runAsNonRoot": true,
+                    "fsGroup": 3000,
+                    "supplementalGroups": [4000],
+                    "supplementalGroupsPolicy": "Merge",
+                    "sysctls": [{ "name": "kernel.shm_rmid_forced", "value": "1" }],
+                    "fsGroupChangePolicy": "OnRootMismatch",
+                    "seccompProfile": { "type": "RuntimeDefault" },
+                    "appArmorProfile": { "type": "RuntimeDefault" },
+                    "seLinuxChangePolicy": "Recursive"
+                }
+            }
+        });
+        let raw = encode_pod_proto_gen(&json);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded sentinel Pod bytes must decode");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded["spec"]["securityContext"], "", &mut paths);
+
+        let expected = [
+            "seLinuxOptions.user",
+            "windowsOptions.runAsUserName",
+            "runAsUser",
+            "runAsGroup",
+            "runAsNonRoot",
+            "fsGroup",
+            "supplementalGroups",
+            "supplementalGroupsPolicy",
+            "sysctls.name",
+            "fsGroupChangePolicy",
+            "seccompProfile.type",
+            "appArmorProfile.type",
+            "seLinuxChangePolicy",
+        ];
+        assert_fields_present(&paths, &expected);
+    }
+
     // ---- Response-side protobuf encoder round-trip tests ------------------
     //
     // Each test round-trips JSON -> encode_*_proto_gen -> decode_*_proto_gen -> JSON.
@@ -10425,6 +11712,633 @@ mod tests {
             decoded["status"]["containerStatuses"][0]["ready"], true,
             "containerStatuses[].ready must survive the round trip — kube-proxy/kubectl's \
              READY column and readiness-gated traffic routing both depend on it"
+        );
+    }
+
+    /// A Job's per-pod `activeDeadlineSeconds` and a RuntimeClass-scheduled pod's
+    /// `runtimeClassName`/`overhead` must survive protobuf encoding: without
+    /// activeDeadlineSeconds a kubelet watching over protobuf (client-go's default) never
+    /// kills a pod that overruns its deadline; without runtimeClassName/overhead the
+    /// scheduler under-accounts for the sandbox's real resource footprint.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_active_deadline_runtime_class_and_overhead() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "deadline-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "activeDeadlineSeconds": 5000,
+                "runtimeClassName": "gvisor",
+                "overhead": { "cpu": "250m", "memory": "120Mi" }
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["activeDeadlineSeconds"], 5000,
+            "activeDeadlineSeconds must survive the round trip — before this fix the field \
+             was never read from JSON, so a Job's per-pod deadline was silently unenforceable \
+             for any protobuf-watching kubelet"
+        );
+        assert_eq!(
+            decoded["spec"]["runtimeClassName"], "gvisor",
+            "runtimeClassName must survive — otherwise the kubelet doesn't know which \
+             runtime handler to use and RuntimeClass scheduling is silently ignored"
+        );
+        assert_eq!(
+            decoded["spec"]["overhead"]["cpu"], "250m",
+            "overhead must survive — without it the scheduler doesn't reserve the sandbox's \
+             resource overhead, over-committing the node"
+        );
+    }
+
+    /// `kubectl debug`'s ephemeral container (and its terminal status) must survive protobuf
+    /// encoding: client-go's UpdateEphemeralContainers/pod-watch calls negotiate protobuf by
+    /// default, so before this fix the debug container was silently dropped before the
+    /// kubelet — or a status poller — ever saw it.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_ephemeral_containers_and_statuses() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "debug-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "ephemeralContainers": [{
+                    "name": "debugger",
+                    "image": "busybox",
+                    "targetContainerName": "c"
+                }]
+            },
+            "status": {
+                "ephemeralContainerStatuses": [{
+                    "name": "debugger",
+                    "state": { "terminated": { "exitCode": 0 } }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["ephemeralContainers"][0]["name"], "debugger",
+            "ephemeralContainers[].name must survive — before this fix the whole \
+             ephemeralContainers list was dropped by the encoder, so 'debugger' never \
+             appeared in the protobuf a kubelet watch decodes"
+        );
+        assert_eq!(
+            decoded["spec"]["ephemeralContainers"][0]["targetContainerName"], "c",
+            "targetContainerName must survive — the kubelet needs it to run the ephemeral \
+             container in the target container's namespaces"
+        );
+        assert_eq!(
+            decoded["status"]["ephemeralContainerStatuses"][0]["name"], "debugger",
+            "ephemeralContainerStatuses must survive — without it a client polling for the \
+             debug container's exit code over protobuf never observes it terminate"
+        );
+    }
+
+    /// `status.observedGeneration` must survive protobuf encoding on its own, independent of
+    /// `PodCondition.observedGeneration` (a same-named field nested under `conditions`, which
+    /// this test deliberately omits — see `sentinel_completeness_encode_pod_status_proto_gen`'s
+    /// note on suffix-matching masking one for the other). Before this fix, a protobuf-polling
+    /// client (e2e's `WaitForPodObservedGeneration`, used by `[sig-node] Pods Extended (pod
+    /// generation) issue 500 podspec updates`) always read back 0 regardless of what the real
+    /// kubelet had written, so it could never observe convergence and timed out.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_status_observed_generation_without_conditions() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "gen-pod", "namespace": "default" },
+            "spec": { "containers": [{ "name": "c", "image": "img" }] },
+            "status": { "phase": "Running", "observedGeneration": 500 }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["status"]["observedGeneration"], 500,
+            "status.observedGeneration must survive the round trip on its own — before this \
+             fix json_to_pod_status_proto never read this key from JSON at all, so every \
+             protobuf-negotiating GET returned observedGeneration=0"
+        );
+    }
+
+    /// `conditions[].observedGeneration` must survive protobuf encoding: e2e's
+    /// `WaitForPodConditionObservedGeneration` polls a specific condition's own
+    /// `observedGeneration` (distinct from the status-level field tested above) over protobuf,
+    /// and would time out the same way if this per-condition field were dropped.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_condition_observed_generation() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "cond-gen-pod", "namespace": "default" },
+            "spec": { "containers": [{ "name": "c", "image": "img" }] },
+            "status": {
+                "conditions": [{
+                    "type": "PodReadyToStartContainers",
+                    "status": "True",
+                    "observedGeneration": 3
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["status"]["conditions"][0]["observedGeneration"], 3,
+            "conditions[].observedGeneration must survive — before this fix \
+             json_to_pod_condition_proto never read this key, so WaitForPodConditionObserved\
+             Generation could never observe a specific condition's convergence"
+        );
+    }
+
+    /// In-place pod resize actuals (`containerStatuses[].resources`/`allocatedResources`) and
+    /// the per-container `resizePolicy` must survive protobuf encoding: without them, a
+    /// kubelet watching over protobuf reports every container as never-resized even after a
+    /// successful resize, and never learns whether a resize should restart the container.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_resize_policy_and_actuals() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "resize-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "img",
+                    "resizePolicy": [{ "resourceName": "memory", "restartPolicy": "RestartContainer" }]
+                }]
+            },
+            "status": {
+                "containerStatuses": [{
+                    "name": "c",
+                    "resources": { "requests": { "memory": "256Mi" } },
+                    "allocatedResources": { "memory": "256Mi" }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["containers"][0]["resizePolicy"][0]["restartPolicy"],
+            "RestartContainer",
+            "containers[].resizePolicy must survive — without it the kubelet doesn't know \
+             whether resizing memory requires restarting the container"
+        );
+        assert_eq!(
+            decoded["status"]["containerStatuses"][0]["resources"]["requests"]["memory"], "256Mi",
+            "containerStatuses[].resources must survive — this is the resize actual, not the \
+             desired spec; dropping it makes every resize look unactuated"
+        );
+        assert_eq!(
+            decoded["status"]["containerStatuses"][0]["allocatedResources"]["memory"], "256Mi",
+            "containerStatuses[].allocatedResources must survive — the kubelet compares this \
+             against the container's requests to admit further resizes"
+        );
+    }
+
+    /// `volumeMounts[].subPathExpr` (used by the Downward API to expand `$(NODE_NAME)`-style
+    /// references into a mount subpath) must survive protobuf encoding, or the kubelet mounts
+    /// the volume's root instead of the expanded subpath the pod spec actually requested.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_volume_mount_sub_path_expr() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "subpath-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "img",
+                    "volumeMounts": [{
+                        "name": "vol",
+                        "mountPath": "/etc/podinfo",
+                        "subPathExpr": "$(POD_NAME)"
+                    }]
+                }],
+                "volumes": [{ "name": "vol", "emptyDir": {} }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["containers"][0]["volumeMounts"][0]["subPathExpr"], "$(POD_NAME)",
+            "subPathExpr must survive the round trip — before this fix it was never read \
+             from JSON, so the kubelet mounted the volume's root instead of the pod's \
+             requested expanded subpath, breaking the Variable Expansion conformance test"
+        );
+    }
+
+    /// `env[].valueFrom.fieldRef` (and the sibling resourceFieldRef/configMapKeyRef/
+    /// secretKeyRef refs) must survive protobuf encoding. Before this fix
+    /// `json_to_env_var_proto` only ever read `name`/`value`, dropping `valueFrom` entirely —
+    /// a container whose env var comes from `metadata.annotations['x']` ends up with an env
+    /// var that has neither `value` nor `valueFrom` on the wire, and the real kubelet
+    /// hard-fails with "missing value for <name>" instead of resolving the annotation. This is
+    /// the root cause the live `[sig-node] Variable Expansion should verify that a failing
+    /// subpath expansion can be modified` conformance failure traced back to: the test updates
+    /// a pod's annotations, and the updated container's `$(ANNOTATION)` env var must resolve
+    /// via its `fieldRef` for the subPathExpr mount to succeed.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_env_var_value_from_field_ref() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "envvar-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "img",
+                    "env": [{
+                        "name": "ANNOTATION",
+                        "valueFrom": {
+                            "fieldRef": { "fieldPath": "metadata.annotations['notmysubpath']" }
+                        }
+                    }]
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["containers"][0]["env"][0]["valueFrom"]["fieldRef"]["fieldPath"],
+            "metadata.annotations['notmysubpath']",
+            "env[].valueFrom.fieldRef.fieldPath must survive the round trip — without it the \
+             kubelet cannot resolve the env var at all and refuses to start the container \
+             ('missing value for ANNOTATION'), even though value/valueFrom are mutually \
+             exclusive by design and dropping valueFrom leaves nothing to fall back to"
+        );
+    }
+
+    /// A `downwardAPI` volume (labels/annotations mounted as files) must survive protobuf
+    /// encoding, or the real kubelet — which only sees the pod via a protobuf watch — refuses
+    /// to mount it at all: "FailedMount ... no defaultMode used, not even the default value".
+    #[test]
+    fn encode_pod_proto_gen_round_trips_downward_api_volume() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "downward-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "volumes": [{
+                    "name": "podinfo",
+                    "downwardAPI": {
+                        "items": [{
+                            "path": "labels",
+                            "fieldRef": { "fieldPath": "metadata.labels" }
+                        }],
+                        "defaultMode": 256
+                    }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        let volume = &decoded["spec"]["volumes"][0]["downwardAPI"];
+        assert_eq!(
+            volume["items"][0]["path"], "labels",
+            "downwardAPI.items[].path must survive — before this fix the whole downwardAPI \
+             volume source was dropped, so the real kubelet's protobuf watch saw a Volume \
+             with no source at all and refused to mount it"
+        );
+        assert_eq!(
+            volume["items"][0]["fieldRef"]["fieldPath"], "metadata.labels",
+            "downwardAPI.items[].fieldRef.fieldPath must survive — this is what tells the \
+             kubelet which pod field to write into the file"
+        );
+        assert_eq!(
+            volume["defaultMode"], 256,
+            "downwardAPI.defaultMode must survive as the caller's explicit value, not fall \
+             back to the decoder's always-stamped default of 420 (0644)"
+        );
+    }
+
+    /// u7s never runs a defaulting pass over a stored Pod's `downwardAPI` volume (there is no
+    /// admission-time equivalent of upstream's `SetDefaults_PodSpec`), so a pod applied via
+    /// plain JSON — the common case, e.g. `kubectl apply` — has no `defaultMode` key in the
+    /// stored spec at all. This is the exact shape that broke live on lima-node-4: the
+    /// encoder must still stamp `defaultMode = 420` on the wire, or the real kubelet's
+    /// downwardAPI volume plugin refuses to mount it: "FailedMount ... no defaultMode used,
+    /// not even the default value for it" — even though the encoder now includes the
+    /// downwardAPI key at all (the fix verified by the test above).
+    #[test]
+    fn encode_pod_proto_gen_stamps_default_mode_when_stored_json_omits_it() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "downward-pod-no-mode", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "volumes": [{
+                    "name": "podinfo",
+                    "downwardAPI": {
+                        "items": [{ "path": "labels", "fieldRef": { "fieldPath": "metadata.labels" } }]
+                    }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["volumes"][0]["downwardAPI"]["defaultMode"], 420,
+            "defaultMode must be stamped to 420 (0644) even when the stored JSON never set \
+             one — the real kubelet's downwardAPI volume plugin hard-fails the mount \
+             (FailedMount: 'no defaultMode used, not even the default value for it') if the \
+             wire field is absent, and nothing else in u7s ever defaults this field"
+        );
+    }
+
+    /// A `projected` volume's `sources[]` (downwardAPI/configMap/secret/serviceAccountToken)
+    /// must survive protobuf encoding, or the mounted volume ends up empty — the same
+    /// FailedMount failure mode as a missing downwardAPI volume, just for the projected case.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_projected_volume_sources() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "projected-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "volumes": [{
+                    "name": "proj",
+                    "projected": {
+                        "sources": [
+                            { "downwardAPI": { "items": [{ "path": "labels", "fieldRef": { "fieldPath": "metadata.labels" } }] } },
+                            { "configMap": { "name": "cm1", "optional": true } },
+                            { "secret": { "name": "sec1" } },
+                            { "serviceAccountToken": { "audience": "aud1", "path": "token" } }
+                        ],
+                        "defaultMode": 256
+                    }
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        let sources = decoded["spec"]["volumes"][0]["projected"]["sources"]
+            .as_array()
+            .expect(
+                "projected.sources must be present — before this fix the whole projected \
+                 volume source was dropped, mounting an empty directory instead",
+            );
+        assert_eq!(sources.len(), 4, "all four projection sources must survive");
+        assert_eq!(
+            sources[0]["downwardAPI"]["items"][0]["path"], "labels",
+            "projected downwardAPI source must survive"
+        );
+        assert_eq!(
+            sources[1]["configMap"]["name"], "cm1",
+            "projected configMap source must survive"
+        );
+        assert_eq!(
+            sources[1]["configMap"]["optional"], true,
+            "projected configMap source's optional flag must survive"
+        );
+        assert_eq!(
+            sources[2]["secret"]["name"], "sec1",
+            "projected secret source must survive"
+        );
+        assert_eq!(
+            sources[3]["serviceAccountToken"]["audience"], "aud1",
+            "projected serviceAccountToken source must survive"
+        );
+    }
+
+    /// `enableServiceLinks` is a tri-state `*bool` upstream that the kubelet's
+    /// `makeEnvironmentVariables` reads directly: a nil value is a hard failure
+    /// ("nil pod.spec.enableServiceLinks encountered, cannot construct envvars"), not a
+    /// silently-defaulted false. A protobuf-negotiating client's read-modify-write update
+    /// loop (e.g. patching an annotation) does a GET first — if the encoder drops this field,
+    /// the client's local copy has it unset, and its follow-up PUT permanently bricks the
+    /// pod's env var construction on the next kubelet sync. This exact failure was caught
+    /// live by `[sig-node] Variable Expansion should verify that a failing subpath expansion
+    /// can be modified` timing out because the updated pod's container config could never be
+    /// constructed at all.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_enable_service_links_and_automount_service_account_token() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "esl-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "enableServiceLinks": false,
+                "automountServiceAccountToken": false,
+                "priority": 1000,
+                "preemptionPolicy": "Never",
+                "shareProcessNamespace": true,
+                "serviceAccount": "legacy-alias",
+                "setHostnameAsFQDN": true,
+                "os": { "name": "linux" },
+                "hostAliases": [{ "ip": "127.0.0.1", "hostnames": ["foo.local"] }],
+                "topologySpreadConstraints": [{
+                    "maxSkew": 1,
+                    "topologyKey": "kubernetes.io/hostname",
+                    "whenUnsatisfiable": "DoNotSchedule"
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        assert_eq!(
+            decoded["spec"]["enableServiceLinks"], false,
+            "enableServiceLinks=false must survive as an explicit value, not vanish and leave \
+             the kubelet with a nil pointer it hard-fails on"
+        );
+        assert_eq!(
+            decoded["spec"]["automountServiceAccountToken"], false,
+            "automountServiceAccountToken must survive — without it a pod that explicitly \
+             opted out of token automount gets one anyway"
+        );
+        assert_eq!(decoded["spec"]["priority"], 1000, "priority must survive");
+        assert_eq!(
+            decoded["spec"]["preemptionPolicy"], "Never",
+            "preemptionPolicy must survive"
+        );
+        assert_eq!(
+            decoded["spec"]["shareProcessNamespace"], true,
+            "shareProcessNamespace must survive"
+        );
+        assert_eq!(
+            decoded["spec"]["serviceAccount"], "legacy-alias",
+            "the deprecated serviceAccount alias must survive for legacy clients"
+        );
+        assert_eq!(
+            decoded["spec"]["setHostnameAsFQDN"], true,
+            "setHostnameAsFQDN must survive"
+        );
+        assert_eq!(
+            decoded["spec"]["os"]["name"], "linux",
+            "os.name must survive"
+        );
+        assert_eq!(
+            decoded["spec"]["hostAliases"][0]["ip"], "127.0.0.1",
+            "hostAliases must survive — without them the extra /etc/hosts entries a pod \
+             asked for silently never appear"
+        );
+        assert_eq!(
+            decoded["spec"]["topologySpreadConstraints"][0]["topologyKey"],
+            "kubernetes.io/hostname",
+            "topologySpreadConstraints must survive — without them the scheduler treats a pod \
+             that asked to be spread across topology domains as unconstrained"
+        );
+    }
+
+    /// Pod-level SecurityContext/affinity/imagePullSecrets/hostPID/hostIPC/dnsConfig/
+    /// readinessGates must survive protobuf encoding, or a protobuf-watching kubelet and
+    /// scheduler run/schedule the pod as if none of these were ever requested.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_pod_security_context_affinity_and_scheduling_fields() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "hardened-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "securityContext": {
+                    "runAsUser": 1000,
+                    "runAsGroup": 2000,
+                    "runAsNonRoot": true,
+                    "fsGroup": 3000,
+                    "supplementalGroups": [4000],
+                    "seccompProfile": { "type": "RuntimeDefault" }
+                },
+                "affinity": {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [{
+                                "matchExpressions": [{ "key": "disktype", "operator": "In", "values": ["ssd"] }]
+                            }]
+                        }
+                    }
+                },
+                "imagePullSecrets": [{ "name": "registry-cred" }],
+                "hostPID": true,
+                "hostIPC": true,
+                "dnsConfig": {
+                    "nameservers": ["1.2.3.4"],
+                    "searches": ["ns1.svc.cluster.local"],
+                    "options": [{ "name": "ndots", "value": "5" }]
+                },
+                "readinessGates": [{ "conditionType": "www.example.com/feature-1" }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        let sc = &decoded["spec"]["securityContext"];
+        assert_eq!(
+            sc["runAsUser"], 1000,
+            "securityContext.runAsUser must survive"
+        );
+        assert_eq!(sc["fsGroup"], 3000, "securityContext.fsGroup must survive");
+        assert_eq!(
+            sc["seccompProfile"]["type"], "RuntimeDefault",
+            "securityContext.seccompProfile must survive"
+        );
+        assert_eq!(
+            decoded["spec"]["affinity"]["nodeAffinity"]
+                ["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]
+                ["matchExpressions"][0]["key"],
+            "disktype",
+            "affinity.nodeAffinity must survive — before this fix the scheduler's node \
+             affinity constraint was silently dropped for any protobuf-encoded pod"
+        );
+        assert_eq!(
+            decoded["spec"]["imagePullSecrets"][0]["name"], "registry-cred",
+            "imagePullSecrets must survive — without it image pulls from a private registry \
+             fail with no credentials attached"
+        );
+        assert_eq!(decoded["spec"]["hostPID"], true, "hostPID must survive");
+        assert_eq!(decoded["spec"]["hostIPC"], true, "hostIPC must survive");
+        assert_eq!(
+            decoded["spec"]["dnsConfig"]["nameservers"][0], "1.2.3.4",
+            "dnsConfig.nameservers must survive"
+        );
+        assert_eq!(
+            decoded["spec"]["readinessGates"][0]["conditionType"], "www.example.com/feature-1",
+            "readinessGates must survive — without it the pod reports Ready before a \
+             controller-managed condition it depends on is ever evaluated"
+        );
+    }
+
+    /// Container-level SecurityContext/envFrom/probes/lifecycle/terminationMessage* must
+    /// survive protobuf encoding: without them a protobuf-watching kubelet runs the container
+    /// unconfined, without its ConfigMap-sourced env vars, and without any health checks or
+    /// lifecycle hooks the spec requested.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_container_security_context_probes_and_lifecycle() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "probed-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "img",
+                    "securityContext": {
+                        "privileged": false,
+                        "allowPrivilegeEscalation": false,
+                        "readOnlyRootFilesystem": true,
+                        "capabilities": { "add": ["NET_ADMIN"], "drop": ["ALL"] }
+                    },
+                    "envFrom": [{ "configMapRef": { "name": "cm-env" } }],
+                    "livenessProbe": {
+                        "httpGet": { "path": "/healthz", "port": 8080 },
+                        "initialDelaySeconds": 5
+                    },
+                    "readinessProbe": { "tcpSocket": { "port": 8081 } },
+                    "startupProbe": { "exec": { "command": ["cat", "/tmp/ready"] } },
+                    "lifecycle": { "preStop": { "exec": { "command": ["sleep", "5"] } } },
+                    "terminationMessagePath": "/dev/termination-log2",
+                    "terminationMessagePolicy": "FallbackToLogsOnError"
+                }]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = decode_pod_proto_gen(&raw).expect("encoded Pod bytes must decode");
+
+        let c = &decoded["spec"]["containers"][0];
+        assert_eq!(
+            c["securityContext"]["readOnlyRootFilesystem"], true,
+            "container securityContext must survive — without it a container the spec \
+             requested a read-only root filesystem for boots with a writable one instead"
+        );
+        assert_eq!(
+            c["securityContext"]["capabilities"]["add"][0], "NET_ADMIN",
+            "container securityContext.capabilities must survive"
+        );
+        assert_eq!(
+            c["envFrom"][0]["configMapRef"]["name"], "cm-env",
+            "envFrom must survive — without it the container starts without the ConfigMap's \
+             environment variables"
+        );
+        assert_eq!(
+            c["livenessProbe"]["httpGet"]["path"], "/healthz",
+            "livenessProbe must survive — without it a crashed/hung container is never \
+             restarted by the kubelet"
+        );
+        assert_eq!(
+            c["readinessProbe"]["tcpSocket"]["port"], 8081,
+            "readinessProbe must survive — without it the container is always considered \
+             ready for traffic regardless of its actual state"
+        );
+        assert_eq!(
+            c["startupProbe"]["exec"]["command"][0], "cat",
+            "startupProbe must survive"
+        );
+        assert_eq!(
+            c["lifecycle"]["preStop"]["exec"]["command"][0], "sleep",
+            "lifecycle.preStop must survive — without it the container is killed immediately \
+             instead of running its graceful-shutdown hook"
+        );
+        assert_eq!(
+            c["terminationMessagePath"], "/dev/termination-log2",
+            "terminationMessagePath must survive"
+        );
+        assert_eq!(
+            c["terminationMessagePolicy"], "FallbackToLogsOnError",
+            "terminationMessagePolicy must survive"
         );
     }
 
