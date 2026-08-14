@@ -5139,7 +5139,30 @@ fn json_to_volume_projection_proto(v: &serde_json::Value) -> core_v1::VolumeProj
                 path: jstr(sat, "path"),
             }
         }),
-        ..Default::default()
+        // podCertificate/clusterTrustBundle: supported on decode
+        // (gen_projected_volume_source_to_json) but missing here, so a protobuf-negotiating
+        // client reading back a pod that mounts either one would see the projected volume's
+        // sources[] entry silently vanish.
+        pod_certificate: v
+            .get("podCertificate")
+            .map(|pc| core_v1::PodCertificateProjection {
+                signer_name: jstr(pc, "signerName"),
+                key_type: jstr(pc, "keyType"),
+                max_expiration_seconds: ji32(pc, "maxExpirationSeconds"),
+                credential_bundle_path: jstr(pc, "credentialBundlePath"),
+                key_path: jstr(pc, "keyPath"),
+                certificate_chain_path: jstr(pc, "certificateChainPath"),
+                ..Default::default()
+            }),
+        cluster_trust_bundle: v.get("clusterTrustBundle").map(|ctb| {
+            core_v1::ClusterTrustBundleProjection {
+                name: jstr(ctb, "name"),
+                signer_name: jstr(ctb, "signerName"),
+                label_selector: ctb.get("labelSelector").map(json_to_label_selector_proto),
+                optional: jbool(ctb, "optional"),
+                path: jstr(ctb, "path"),
+            }
+        }),
     }
 }
 
@@ -5154,6 +5177,29 @@ fn json_to_projected_volume_source_proto(v: &serde_json::Value) -> core_v1::Proj
             .map(|a| a.iter().map(json_to_volume_projection_proto).collect())
             .unwrap_or_default(),
         default_mode: ji32(v, "defaultMode"),
+    }
+}
+
+/// Minimal JSON -> proto mirror of `gen_persistent_volume_claim_to_json`'s spec section, scoped
+/// to `EphemeralVolumeSource.volumeClaimTemplate.spec` — access modes and resource requests are
+/// what every real ephemeral-volume claim sets. selector/dataSource/dataSourceRef have no live
+/// consumer here, matching this file's existing PersistentVolumeSource decode precedent of
+/// covering what's actually exercised rather than the full upstream field set.
+fn json_to_persistent_volume_claim_spec_proto(
+    v: &serde_json::Value,
+) -> core_v1::PersistentVolumeClaimSpec {
+    core_v1::PersistentVolumeClaimSpec {
+        access_modes: jstrs(v, "accessModes"),
+        resources: v
+            .get("resources")
+            .map(|r| core_v1::VolumeResourceRequirements {
+                requests: json_quantity_map_to_proto(r, "requests"),
+                limits: json_quantity_map_to_proto(r, "limits"),
+            }),
+        volume_name: jstr(v, "volumeName"),
+        storage_class_name: jstr(v, "storageClassName"),
+        volume_mode: jstr(v, "volumeMode"),
+        ..Default::default()
     }
 }
 
@@ -5199,6 +5245,187 @@ fn json_to_volume_proto(v: &serde_json::Value) -> core_v1::Volume {
     }
     if let Some(proj) = v.get("projected") {
         src.projected = Some(json_to_projected_volume_source_proto(proj));
+    }
+    // The remaining VolumeSource variants below are all decode-side-complete (nfs/ephemeral/csi
+    // via decode_pod_proto_gen; the rest have a live proto struct with no encode-side JSON
+    // mapping at all) but were previously dropped here, so any client mounting one of these
+    // volume types and reading the pod back over protobuf would see the volume's source
+    // silently vanish.
+    if let Some(nfs) = v.get("nfs") {
+        src.nfs = Some(core_v1::NfsVolumeSource {
+            server: jstr(nfs, "server"),
+            path: jstr(nfs, "path"),
+            read_only: jbool(nfs, "readOnly"),
+        });
+    }
+    if let Some(iscsi) = v.get("iscsi") {
+        src.iscsi = Some(core_v1::IscsiVolumeSource {
+            target_portal: jstr(iscsi, "targetPortal"),
+            iqn: jstr(iscsi, "iqn"),
+            lun: ji32(iscsi, "lun"),
+            iscsi_interface: jstr(iscsi, "iscsiInterface"),
+            fs_type: jstr(iscsi, "fsType"),
+            read_only: jbool(iscsi, "readOnly"),
+            portals: jstrs(iscsi, "portals"),
+            chap_auth_discovery: jbool(iscsi, "chapAuthDiscovery"),
+            chap_auth_session: jbool(iscsi, "chapAuthSession"),
+            secret_ref: iscsi
+                .get("secretRef")
+                .map(json_to_local_object_reference_proto),
+            initiator_name: jstr(iscsi, "initiatorName"),
+        });
+    }
+    if let Some(g) = v.get("glusterfs") {
+        src.glusterfs = Some(core_v1::GlusterfsVolumeSource {
+            endpoints: jstr(g, "endpoints"),
+            path: jstr(g, "path"),
+            read_only: jbool(g, "readOnly"),
+        });
+    }
+    if let Some(rbd) = v.get("rbd") {
+        src.rbd = Some(core_v1::RbdVolumeSource {
+            monitors: jstrs(rbd, "monitors"),
+            image: jstr(rbd, "image"),
+            fs_type: jstr(rbd, "fsType"),
+            pool: jstr(rbd, "pool"),
+            user: jstr(rbd, "user"),
+            keyring: jstr(rbd, "keyring"),
+            secret_ref: rbd
+                .get("secretRef")
+                .map(json_to_local_object_reference_proto),
+            read_only: jbool(rbd, "readOnly"),
+        });
+    }
+    if let Some(gr) = v.get("gitRepo") {
+        src.git_repo = Some(core_v1::GitRepoVolumeSource {
+            repository: jstr(gr, "repository"),
+            revision: jstr(gr, "revision"),
+            directory: jstr(gr, "directory"),
+        });
+    }
+    if let Some(c) = v.get("cinder") {
+        src.cinder = Some(core_v1::CinderVolumeSource {
+            volume_id: jstr(c, "volumeID"),
+            fs_type: jstr(c, "fsType"),
+            read_only: jbool(c, "readOnly"),
+            secret_ref: c.get("secretRef").map(json_to_local_object_reference_proto),
+        });
+    }
+    if let Some(c) = v.get("cephfs") {
+        src.cephfs = Some(core_v1::CephFsVolumeSource {
+            monitors: jstrs(c, "monitors"),
+            path: jstr(c, "path"),
+            user: jstr(c, "user"),
+            secret_file: jstr(c, "secretFile"),
+            secret_ref: c.get("secretRef").map(json_to_local_object_reference_proto),
+            read_only: jbool(c, "readOnly"),
+        });
+    }
+    if let Some(fv) = v.get("flexVolume") {
+        src.flex_volume = Some(core_v1::FlexVolumeSource {
+            driver: jstr(fv, "driver"),
+            fs_type: jstr(fv, "fsType"),
+            secret_ref: fv
+                .get("secretRef")
+                .map(json_to_local_object_reference_proto),
+            read_only: jbool(fv, "readOnly"),
+            options: jstrmap(fv, "options"),
+        });
+    }
+    if let Some(f) = v.get("flocker") {
+        src.flocker = Some(core_v1::FlockerVolumeSource {
+            dataset_name: jstr(f, "datasetName"),
+            dataset_uuid: jstr(f, "datasetUUID"),
+        });
+    }
+    if let Some(af) = v.get("azureFile") {
+        src.azure_file = Some(core_v1::AzureFileVolumeSource {
+            secret_name: jstr(af, "secretName"),
+            share_name: jstr(af, "shareName"),
+            read_only: jbool(af, "readOnly"),
+        });
+    }
+    if let Some(vs) = v.get("vsphereVolume") {
+        src.vsphere_volume = Some(core_v1::VsphereVirtualDiskVolumeSource {
+            volume_path: jstr(vs, "volumePath"),
+            fs_type: jstr(vs, "fsType"),
+            storage_policy_name: jstr(vs, "storagePolicyName"),
+            storage_policy_id: jstr(vs, "storagePolicyID"),
+        });
+    }
+    if let Some(q) = v.get("quobyte") {
+        src.quobyte = Some(core_v1::QuobyteVolumeSource {
+            registry: jstr(q, "registry"),
+            volume: jstr(q, "volume"),
+            read_only: jbool(q, "readOnly"),
+            user: jstr(q, "user"),
+            group: jstr(q, "group"),
+            tenant: jstr(q, "tenant"),
+        });
+    }
+    if let Some(ad) = v.get("azureDisk") {
+        src.azure_disk = Some(core_v1::AzureDiskVolumeSource {
+            disk_name: jstr(ad, "diskName"),
+            disk_uri: jstr(ad, "diskURI"),
+            caching_mode: jstr(ad, "cachingMode"),
+            fs_type: jstr(ad, "fsType"),
+            read_only: jbool(ad, "readOnly"),
+            kind: jstr(ad, "kind"),
+        });
+    }
+    if let Some(pw) = v.get("portworxVolume") {
+        src.portworx_volume = Some(core_v1::PortworxVolumeSource {
+            volume_id: jstr(pw, "volumeID"),
+            fs_type: jstr(pw, "fsType"),
+            read_only: jbool(pw, "readOnly"),
+        });
+    }
+    if let Some(s) = v.get("scaleIO") {
+        src.scale_io = Some(core_v1::ScaleIoVolumeSource {
+            gateway: jstr(s, "gateway"),
+            system: jstr(s, "system"),
+            secret_ref: s.get("secretRef").map(json_to_local_object_reference_proto),
+            ssl_enabled: jbool(s, "sslEnabled"),
+            protection_domain: jstr(s, "protectionDomain"),
+            storage_pool: jstr(s, "storagePool"),
+            storage_mode: jstr(s, "storageMode"),
+            volume_name: jstr(s, "volumeName"),
+            fs_type: jstr(s, "fsType"),
+            read_only: jbool(s, "readOnly"),
+        });
+    }
+    if let Some(s) = v.get("storageos") {
+        src.storageos = Some(core_v1::StorageOsVolumeSource {
+            volume_name: jstr(s, "volumeName"),
+            volume_namespace: jstr(s, "volumeNamespace"),
+            fs_type: jstr(s, "fsType"),
+            read_only: jbool(s, "readOnly"),
+            secret_ref: s.get("secretRef").map(json_to_local_object_reference_proto),
+        });
+    }
+    if let Some(csi) = v.get("csi") {
+        src.csi = Some(core_v1::CsiVolumeSource {
+            driver: jstr(csi, "driver"),
+            read_only: jbool(csi, "readOnly"),
+            fs_type: jstr(csi, "fsType"),
+            volume_attributes: jstrmap(csi, "volumeAttributes"),
+            node_publish_secret_ref: csi
+                .get("nodePublishSecretRef")
+                .map(json_to_local_object_reference_proto),
+        });
+    }
+    if let Some(tmpl) = v
+        .get("ephemeral")
+        .and_then(|eph| eph.get("volumeClaimTemplate"))
+    {
+        src.ephemeral = Some(core_v1::EphemeralVolumeSource {
+            volume_claim_template: Some(core_v1::PersistentVolumeClaimTemplate {
+                metadata: Some(json_to_object_meta_proto(tmpl)),
+                spec: tmpl
+                    .get("spec")
+                    .map(json_to_persistent_volume_claim_spec_proto),
+            }),
+        });
     }
     core_v1::Volume {
         name: jstr(v, "name"),
@@ -11453,11 +11680,16 @@ mod tests {
     // clientset, by default) silently loses that field on every GET/LIST/WATCH.
     //
     // `expected` intentionally excludes fields this bead's scope explicitly defers (see the
-    // bead's follow-on beads): the ~15 rarely-used/deprecated VolumeSource variants other than
-    // hostPath/emptyDir/secret/configMap/persistentVolumeClaim/downwardAPI/projected, and DRA
-    // pod-level resourceClaims / PodLevelResources-alpha `resources` / HostnameOverride-alpha
-    // `hostnameOverride` / GenericWorkload-alpha `schedulingGroup` (none of which are exercised
-    // by certified-conformance today).
+    // bead's follow-on beads): DRA pod-level resourceClaims / PodLevelResources-alpha `resources`
+    // / HostnameOverride-alpha `hostnameOverride` / GenericWorkload-alpha `schedulingGroup` (none
+    // of which are exercised by certified-conformance today). It also can't cover the ~15
+    // rarely-used/deprecated VolumeSource variants (iscsi/glusterfs/rbd/gitRepo/cinder/cephfs/
+    // flexVolume/flocker/azureFile/vsphereVolume/quobyte/azureDisk/portworxVolume/scaleIO/
+    // storageos) even though json_to_volume_proto now encodes them: decode_pod_proto_gen itself
+    // never produces those keys in `sentinel_pod_json()`'s input, so there is nothing here for
+    // the encoder to round-trip. See
+    // `encode_pod_proto_gen_round_trips_rare_deprecated_volume_sources` below, which tests
+    // json_to_volume_proto for those variants directly against the raw protobuf struct instead.
     #[test]
     fn sentinel_completeness_encode_pod_proto_gen() {
         let json = sentinel_pod_json();
@@ -11477,6 +11709,15 @@ mod tests {
             "volumes.persistentVolumeClaim.claimName",
             "volumes.downwardAPI.items.path",
             "volumes.projected.sources.secret.name",
+            // nfs/ephemeral/csi and the projected podCertificate/clusterTrustBundle
+            // sub-variants: decode_pod_proto_gen already produces these keys (unlike the ~15
+            // variants excluded above), so this is a genuine round-trip check of the encoder
+            // branches added for them.
+            "volumes.nfs.server",
+            "volumes.ephemeral.volumeClaimTemplate.spec.accessModes",
+            "volumes.csi.driver",
+            "volumes.projected.sources.podCertificate.signerName",
+            "volumes.projected.sources.clusterTrustBundle.signerName",
             "containers.name",
             "containers.image",
             "containers.command",
@@ -12207,6 +12448,180 @@ mod tests {
         assert_eq!(
             sources[3]["serviceAccountToken"]["audience"], "aud1",
             "projected serviceAccountToken source must survive"
+        );
+    }
+
+    /// The ~15 rare/deprecated in-tree VolumeSource variants (iscsi/glusterfs/rbd/gitRepo/
+    /// cinder/cephfs/flexVolume/flocker/azureFile/vsphereVolume/quobyte/azureDisk/
+    /// portworxVolume/scaleIO/storageos) json_to_volume_proto now encodes.
+    ///
+    /// `decode_pod_proto_gen` has no JSON-generation branch for any of these (they were never
+    /// exercised on the decode side either — see the sentinel_completeness_encode_pod_proto_gen
+    /// comment above), so this test can't round-trip through it like the other
+    /// `encode_pod_proto_gen_round_trips_*` tests do. Instead it decodes the raw encoded bytes
+    /// straight through prost's own generated `Pod::decode`, which — unlike our hand-written
+    /// JSON layer — needs no per-field mapping to read back a field that's really on the wire.
+    /// This isolates exactly what's under test: whether `json_to_volume_proto` puts each field
+    /// on the wire at all. Before this fix, every one of these volumes silently encoded as an
+    /// empty `VolumeSource` on any protobuf-negotiating GET/LIST.
+    #[test]
+    fn encode_pod_proto_gen_round_trips_rare_deprecated_volume_sources() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "rare-volumes-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{ "name": "c", "image": "img" }],
+                "volumes": [
+                    { "name": "v-iscsi", "iscsi": {
+                        "targetPortal": "10.0.0.1:3260", "iqn": "iqn.2000-01.com.example:vol",
+                        "lun": 1, "fsType": "ext4", "readOnly": true
+                    }},
+                    { "name": "v-glusterfs", "glusterfs": {
+                        "endpoints": "glusterfs-cluster", "path": "myvol", "readOnly": true
+                    }},
+                    { "name": "v-rbd", "rbd": {
+                        "monitors": ["10.0.0.1:6789"], "image": "foo", "pool": "rbd",
+                        "user": "admin", "secretRef": { "name": "rbd-secret" }
+                    }},
+                    { "name": "v-gitrepo", "gitRepo": {
+                        "repository": "https://example.com/repo.git", "revision": "abc123",
+                        "directory": "src"
+                    }},
+                    { "name": "v-cinder", "cinder": {
+                        "volumeID": "vol-1", "fsType": "ext4",
+                        "secretRef": { "name": "cinder-secret" }
+                    }},
+                    { "name": "v-cephfs", "cephfs": {
+                        "monitors": ["10.0.0.1:6789"], "path": "/", "user": "admin",
+                        "secretRef": { "name": "cephfs-secret" }
+                    }},
+                    { "name": "v-flex", "flexVolume": {
+                        "driver": "example/flex", "fsType": "ext4",
+                        "secretRef": { "name": "flex-secret" },
+                        "options": { "foo": "bar" }
+                    }},
+                    { "name": "v-flocker", "flocker": { "datasetName": "my-dataset" }},
+                    { "name": "v-azurefile", "azureFile": {
+                        "secretName": "azure-secret", "shareName": "share1", "readOnly": true
+                    }},
+                    { "name": "v-vsphere", "vsphereVolume": {
+                        "volumePath": "[datastore1] volumes/myDisk", "fsType": "ext4"
+                    }},
+                    { "name": "v-quobyte", "quobyte": {
+                        "registry": "quobyte-registry:7861", "volume": "myvol", "user": "root"
+                    }},
+                    { "name": "v-azuredisk", "azureDisk": {
+                        "diskName": "mydisk", "diskURI": "https://example.blob/mydisk.vhd"
+                    }},
+                    { "name": "v-portworx", "portworxVolume": {
+                        "volumeID": "vol-1", "fsType": "ext4"
+                    }},
+                    { "name": "v-scaleio", "scaleIO": {
+                        "gateway": "https://scaleio", "system": "scaleio-sys",
+                        "secretRef": { "name": "scaleio-secret" }, "volumeName": "vol-1"
+                    }},
+                    { "name": "v-storageos", "storageos": {
+                        "volumeName": "vol-1", "secretRef": { "name": "storageos-secret" }
+                    }}
+                ]
+            }
+        });
+
+        let raw = encode_pod_proto_gen(&pod);
+        let decoded = core_v1::Pod::decode(raw.as_slice()).expect("encoded Pod bytes must decode");
+        let volumes = decoded.spec.expect("spec must survive").volumes;
+        let src = |i: usize| {
+            volumes[i]
+                .volume_source
+                .clone()
+                .expect("volume_source must be set")
+        };
+
+        assert_eq!(
+            src(0).iscsi.unwrap().target_portal.as_deref(),
+            Some("10.0.0.1:3260"),
+            "iscsi.targetPortal must survive protobuf encoding — before this fix the whole \
+             VolumeSource silently encoded empty and the kubelet had no target to attach to"
+        );
+        assert_eq!(
+            src(1).glusterfs.unwrap().endpoints.as_deref(),
+            Some("glusterfs-cluster"),
+            "glusterfs.endpoints must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(2).rbd.unwrap().secret_ref.unwrap().name.as_deref(),
+            Some("rbd-secret"),
+            "rbd.secretRef must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(3).git_repo.unwrap().repository.as_deref(),
+            Some("https://example.com/repo.git"),
+            "gitRepo.repository must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(4).cinder.unwrap().volume_id.as_deref(),
+            Some("vol-1"),
+            "cinder.volumeID must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(5).cephfs.unwrap().secret_ref.unwrap().name.as_deref(),
+            Some("cephfs-secret"),
+            "cephfs.secretRef must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(6)
+                .flex_volume
+                .unwrap()
+                .options
+                .get("foo")
+                .map(String::as_str),
+            Some("bar"),
+            "flexVolume.options must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(7).flocker.unwrap().dataset_name.as_deref(),
+            Some("my-dataset"),
+            "flocker.datasetName must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(8).azure_file.unwrap().share_name.as_deref(),
+            Some("share1"),
+            "azureFile.shareName must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(9).vsphere_volume.unwrap().volume_path.as_deref(),
+            Some("[datastore1] volumes/myDisk"),
+            "vsphereVolume.volumePath must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(10).quobyte.unwrap().volume.as_deref(),
+            Some("myvol"),
+            "quobyte.volume must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(11).azure_disk.unwrap().disk_name.as_deref(),
+            Some("mydisk"),
+            "azureDisk.diskName must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(12).portworx_volume.unwrap().volume_id.as_deref(),
+            Some("vol-1"),
+            "portworxVolume.volumeID must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(13).scale_io.unwrap().volume_name.as_deref(),
+            Some("vol-1"),
+            "scaleIO.volumeName must survive protobuf encoding"
+        );
+        assert_eq!(
+            src(14)
+                .storageos
+                .unwrap()
+                .secret_ref
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("storageos-secret"),
+            "storageos.secretRef must survive protobuf encoding"
         );
     }
 
