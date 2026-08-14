@@ -839,24 +839,11 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 echo "Applying kube-network-policies DaemonSet..."
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$KUBE_NETWORK_POLICIES_YAML"
 
-echo "Waiting for kube-network-policies DaemonSet to be Ready (up to 60s)..."
-NETPOL_READY=0
-for i in $(seq 1 60); do
-  DESIRED=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get ds kube-network-policies -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)
-  READY=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get ds kube-network-policies -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || true)
-  if [ -n "$DESIRED" ] && [ "$DESIRED" != "0" ] && [ "$DESIRED" = "$READY" ]; then
-    NETPOL_READY=1
-    break
-  fi
-  sleep 1
-done
-if [ "$NETPOL_READY" -eq 0 ]; then
-  echo "ERROR: kube-network-policies DaemonSet did not reach Ready within 60s (desired=${DESIRED:-?}, ready=${READY:-?})" >&2
-  echo "--- kube-network-policies pod status ---" >&2
-  kubectl --kubeconfig="$KUBECONFIG_PATH" get pods -n kube-system -l app=kube-network-policies -o wide >&2
-  exit 1
-fi
-echo "kube-network-policies DaemonSet Ready (${READY}/${DESIRED})."
+# No wait-for-Ready here: this script is run-all.sh's Step 3, before KCM (Step 4,
+# which materializes the DaemonSet's Pod) and the scheduler (Step 5, which places
+# it) exist — waiting here made desired/ready unable to ever leave 0/0 on a fresh
+# --reset, deadlocking every run. run-all.sh performs the wait itself once KCM,
+# the scheduler, and the final node topology are all up.
 
 # Inter-node pod routes: nothing else programs a path to a peer's pod subnet — no
 # CNI/BGP here, by design (static routes over the shared user-v2 network). Re-run

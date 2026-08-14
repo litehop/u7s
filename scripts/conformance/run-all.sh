@@ -389,6 +389,33 @@ if [ -n "$EXTRA_NODE" ]; then
   bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}
 fi
 
+# kube-network-policies DaemonSet-Ready wait: lima-start.sh (Step 3, above) applies
+# the manifest but deliberately does not wait — DaemonSet pod materialization is
+# KCM's job (Step 4) and placement is the scheduler's (Step 5), so waiting inside
+# Step 3 deadlocked every fresh --reset (desired/ready could never leave 0/0 before
+# KCM/scheduler existed to create+place the pod). Wait here instead, now that KCM,
+# the scheduler, and the final node topology (including any --extra-node join just
+# above) are all in place, so desiredNumberScheduled reflects every node that will
+# ever need its own pod.
+banner "Wait for kube-network-policies DaemonSet Ready"
+NETPOL_READY=0
+for i in $(seq 1 60); do
+  DESIRED=$(kubectl --kubeconfig="$KUBECONFIG" get ds kube-network-policies -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)
+  READY=$(kubectl --kubeconfig="$KUBECONFIG" get ds kube-network-policies -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || true)
+  if [ -n "$DESIRED" ] && [ "$DESIRED" != "0" ] && [ "$DESIRED" = "$READY" ]; then
+    NETPOL_READY=1
+    break
+  fi
+  sleep 1
+done
+if [ "$NETPOL_READY" -eq 0 ]; then
+  echo "ERROR: kube-network-policies DaemonSet did not reach Ready within 60s (desired=${DESIRED:-?}, ready=${READY:-?})" >&2
+  echo "--- kube-network-policies pod status ---" >&2
+  kubectl --kubeconfig="$KUBECONFIG" get pods -n kube-system -l app=kube-network-policies -o wide >&2
+  exit 1
+fi
+echo "kube-network-policies DaemonSet Ready (${READY}/${DESIRED})."
+
 # Start the run-metrics sampler (host+VM RSS, ring-gauge trajectory, an
 # initial /metrics snapshot) now that the final node topology is known — see
 # sample-run-metrics.sh for the three artifacts it produces and mayor-zpvp2
