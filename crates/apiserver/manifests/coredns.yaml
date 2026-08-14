@@ -3,10 +3,12 @@
 # bundle deliberately departs from upstream in three ways:
 #   - image pinned to v1.11.1, not upstream's v1.14.2 -- matches the version this addon has
 #     always run at in u7s; a version bump is a separate decision.
-#   - Corefile has no prometheus plugin and the Deployment has no resources.limits.memory --
-#     preserves the hand-written Corefile this bundle replaces (mayor-b1gz2 found that
-#     plugin/limit combination flaky here); prometheus scraping is a later, separate change.
+#   - the Deployment has no resources.limits.memory -- mayor-b1gz2 found the prometheus
+#     plugin + memory-limit combination flaky here, so the plugin (mayor-wclvi) stays but
+#     the limit does not.
 #   - no priorityClassName -- u7s seeds no PriorityClass objects.
+#   - no Service port / prometheus.io annotations for :9153 -- this is a pod-direct-scrape
+#     correlation signal (mayor-wclvi), not a ServiceMonitor target.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -70,6 +72,7 @@ data:
             pods insecure
             fallthrough in-addr.arpa ip6.arpa
         }
+        prometheus 0.0.0.0:9153
         forward . /etc/resolv.conf
         cache 30
         reload
@@ -107,6 +110,9 @@ spec:
           protocol: UDP
         - containerPort: 53
           name: dns-tcp
+          protocol: TCP
+        - containerPort: 9153
+          name: metrics
           protocol: TCP
         volumeMounts:
         - name: config-volume
