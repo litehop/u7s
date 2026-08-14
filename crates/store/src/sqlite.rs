@@ -58,9 +58,9 @@ pub(crate) struct RingShard {
     /// Push timestamps for `ring`'s entries, as whole seconds since the store's epoch, in
     /// lockstep with it: `push_secs[i]` is when `ring[i]` was pushed. Feeds
     /// `WATCH_RING_SPAN_SECONDS`, which reports how much history this shard actually covers —
-    /// the property that decides whether a reconnecting watch survives (see that gauge's doc,
-    /// which also explains why it is a span between two push times and not an age relative to
-    /// now).
+    /// the property that decides whether a reconnecting watch survives (see that histogram's
+    /// doc, which also explains why it is a span between two push times and not an age relative
+    /// to now).
     ///
     /// A side deque rather than a field on `InternalEvent` or a `(event, secs)` tuple in `ring`
     /// itself, for one reason: `ring` is created with `VecDeque::with_capacity(RING_CAPACITY+1)`,
@@ -226,7 +226,7 @@ pub struct SqliteStore {
     last_written_revision: Arc<AtomicU64>,
     /// Monotonic zero point for ring push timestamps (`RingShard::push_secs`). Stored as an
     /// `Instant` rather than a wall-clock `SystemTime` so the derived ages stay correct across
-    /// NTP steps and DST — the gauge measures elapsed retention, not a calendar time.
+    /// NTP steps and DST — the metric measures elapsed retention, not a calendar time.
     epoch: Instant,
 }
 
@@ -461,18 +461,18 @@ fn push_into_shard(
         );
         // The wall-clock span this shard's retained events cover: `now_secs` is this push's own
         // stamp, i.e. the NEWEST retained entry, so this is newest-minus-oldest and not the
-        // oldest entry's age relative to real "now". It therefore only refreshes on write — see
-        // `WATCH_RING_SPAN_SECONDS`' doc for why span is the quantity worth reporting and how to
-        // read a frozen value on an idle shard. `saturating_sub` rather than a bare subtraction
-        // so a monotonic-source anomaly can only ever report 0, never wrap a u32 into a nonsense
+        // oldest entry's age relative to real "now". Observed on every push, not just set — see
+        // `WATCH_RING_SPAN_SECONDS`' doc for why this must be a histogram over every push rather
+        // than a gauge a poller samples. `saturating_sub` rather than a bare subtraction so a
+        // monotonic-source anomaly can only ever report 0, never wrap a u32 into a nonsense
         // multi-decade span.
         crate::metrics::WATCH_RING_SPAN_SECONDS
             .with_label_values(&[shard_key_label])
-            .set(
+            .observe(f64::from(
                 secs_guard
                     .front()
-                    .map_or(0, |oldest| i64::from(now_secs.saturating_sub(*oldest))),
-            );
+                    .map_or(0, |oldest| now_secs.saturating_sub(*oldest)),
+            ));
     }
     // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
     // compaction can still receive DELETED events for objects deleted before compaction.
@@ -575,7 +575,7 @@ fn push_event_locked(
     // rather than read here, for two reasons: it is used for BOTH this event's push stamp and the
     // age subtraction below, so taking it once means a write can never report a negative age by
     // racing the clock forward between the two; and it keeps this function a pure function of its
-    // arguments, so `push_event_at` can drive the retained-history gauge deterministically in
+    // arguments, so `push_event_at` can drive the retained-history histogram deterministically in
     // tests instead of sleeping.
     if matched.is_empty() && event.value.is_none() {
         let shard = get_or_create_shard(shards, shard_key);
@@ -4282,8 +4282,49 @@ mod tests {
         );
     }
 
-    /// `WATCH_RING_SPAN_SECONDS` must report how far back a shard's retained history actually
-    /// reaches, in seconds — not merely that the shard holds N events.
+    /// Finds the gathered `u7s_watch_ring_span_seconds` series for one shard label. Used instead
+    /// of a direct `.get()` because this metric is a `HistogramVec`: it has no single "current
+    /// value" to read back (see the metric's own doc for exactly why that was the defect this
+    /// type change fixes) — tests must instead inspect the accumulated distribution.
+    fn span_metric(shard_label: &str) -> prometheus::proto::Metric {
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "u7s_watch_ring_span_seconds")
+            .expect(
+                "u7s_watch_ring_span_seconds must appear in gathered metric families once a \
+                 shard has recorded at least one push",
+            );
+        family
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "shard" && l.value() == shard_label)
+            })
+            .expect("gathered output must carry a series for the shard label that was observed")
+            .clone()
+    }
+
+    /// Cumulative count for the bucket whose upper bound is exactly `upper_bound` (one of the
+    /// fixed boundaries from `watch_ring_span_seconds_buckets`), e.g. `span_bucket_count(l, 1.0)`
+    /// is how many observed spans on shard `l` have been <= 1 second — the low-bucket reading a
+    /// ring-sizing decision actually needs, per the metric's own doc.
+    fn span_bucket_count(shard_label: &str, upper_bound: f64) -> u64 {
+        span_metric(shard_label)
+            .get_histogram()
+            .get_bucket()
+            .iter()
+            .find(|b| (b.upper_bound() - upper_bound).abs() < f64::EPSILON)
+            .unwrap_or_else(|| {
+                panic!("no bucket with upper_bound={upper_bound} for shard {shard_label}")
+            })
+            .cumulative_count()
+    }
+
+    /// `WATCH_RING_SPAN_SECONDS` must record how far back a shard's retained history actually
+    /// reaches, in seconds, on every push — not merely that the shard holds N events.
     ///
     /// Why it matters: the ring is read exactly once, at watch open, to bridge
     /// `from_revision -> now`. A reconnecting client's watch survives iff the ring still covers
@@ -4295,26 +4336,26 @@ mod tests {
     /// the wrong thing we would size the ring off a fiction.
     ///
     /// Note the measured quantity is a SPAN between two push times (newest retained minus
-    /// oldest retained), not the oldest entry's age against real "now" — see the gauge's doc.
-    /// The pushes below therefore also stand in for the clock: the span after pushing at t=45
-    /// is 45 because the newest entry IS the t=45 one.
+    /// oldest retained), not the oldest entry's age against real "now" — see the metric's own
+    /// doc. The pushes below therefore also stand in for the clock: the observation recorded by
+    /// pushing at t=45 is 45 because the newest entry IS the t=45 one. Asserted via
+    /// `sample_sum`/`sample_count` (a histogram's running total and observation count) rather
+    /// than a single readback, since each push is now an independent observation, not an
+    /// overwrite of one value.
     ///
-    /// Fails on revert: if the push stamp stops being recorded the gauge stays pinned at 0 and
-    /// the 30/45 assertions fail; if the subtraction is inverted it saturates to 0 likewise.
+    /// Fails on revert: if the push stamp stops being recorded every observation is 0 and
+    /// `sample_sum` never advances past 0; if the subtraction is inverted it saturates to 0
+    /// likewise.
     #[tokio::test]
     async fn ring_reports_retained_history_span_not_just_occupancy() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
-        // Unique resource-type root: the gauge lives in the process-global prometheus registry,
-        // so sharing a shard label with another test would let them clobber each other.
-        let span = || {
-            crate::metrics::WATCH_RING_SPAN_SECONDS
-                .with_label_values(&["/registry/spantest-basic/"])
-                .get()
-        };
+        // Unique resource-type root: the histogram lives in the process-global prometheus
+        // registry, so sharing a shard label with another test would let them clobber each other.
+        const SHARD: &str = "/registry/spantest-basic/";
         let push = |name: &str, rv: u64, at: u32| {
             store.push_event_at(
                 Arc::new(InternalEvent {
-                    key: format!("/registry/spantest-basic/default/{name}"),
+                    key: format!("{SHARD}default/{name}"),
                     revision: rv,
                     value: Some(svc_value(name, rv)),
                     is_create: true,
@@ -4326,55 +4367,55 @@ mod tests {
         };
 
         push("a", 1, 0);
+        let after_a = span_metric(SHARD).get_histogram().clone();
         assert_eq!(
-            span(),
-            0,
-            "a shard holding one just-written event has no history depth yet — reporting \
+            (after_a.get_sample_count(), after_a.get_sample_sum()),
+            (1, 0.0),
+            "a shard holding one just-written event has no history depth yet — observing \
              anything but 0 would overstate the replay cover available to a reconnecting watch"
         );
 
         push("b", 2, 30);
+        let after_b = span_metric(SHARD).get_histogram().clone();
         assert_eq!(
-            span(),
-            30,
-            "with the oldest retained event pushed at t=0 and the newest at t=30, this shard \
-             covers 30s of watch-replay history; occupancy (2) says nothing about that"
+            (after_b.get_sample_count(), after_b.get_sample_sum()),
+            (2, 30.0),
+            "with the oldest retained event pushed at t=0 and the newest at t=30, this push \
+             must observe 30s of watch-replay history; occupancy (2) says nothing about that"
         );
 
         push("c", 3, 45);
+        let after_c = span_metric(SHARD).get_histogram().clone();
         assert_eq!(
-            span(),
-            45,
+            (after_c.get_sample_count(), after_c.get_sample_sum()),
+            (3, 75.0),
             "the span must be measured from the OLDEST retained event (t=0), not the gap \
-             between the last two \
-             pushes — a watch reconnecting from 40s ago is still serviceable and must not be \
-             judged against the most recent write"
+             between the last two pushes — a watch reconnecting from 40s ago is still \
+             serviceable and must not be judged against the most recent write, so this push \
+             observes 45 (sum 30+45=75), not 15 (the t=30..t=45 gap)"
         );
     }
 
-    /// Once eviction discards a shard's oldest entries, the reported history span must fall to
-    /// match the new oldest entry.
+    /// Once eviction discards a shard's oldest entries, subsequent pushes must observe the new,
+    /// shrunken span — not the stale one from before eviction.
     ///
-    /// Why it matters: this is the case that decides whether the gauge can be trusted as a
+    /// Why it matters: this is the case that decides whether the metric can be trusted as a
     /// safety signal at all. A ring at capacity is exactly when its cover is shrinking and when
-    /// an operator most needs a true number; a gauge still measuring from an event already
-    /// evicted would claim the deepest history precisely when the least remains.
+    /// an operator most needs a true number; still observing spans measured from an event
+    /// already evicted would claim the deepest history precisely when the least remains.
     ///
     /// Fails on revert: dropping the `secs_guard.pop_front()` that pairs with the ring's
-    /// `pop_front` desynchronises the two deques, leaving a stale t=0 stamp at the front — this
-    /// asserts 0 and would instead see 100.
+    /// `pop_front` desynchronises the two deques, leaving a stale t=0 stamp at the front — the
+    /// final push would then observe 100 again instead of 0, and the low-bucket assertion below
+    /// would see 512 (unchanged) instead of 513.
     #[tokio::test]
     async fn ring_span_falls_when_eviction_discards_the_oldest_events() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
-        let span = || {
-            crate::metrics::WATCH_RING_SPAN_SECONDS
-                .with_label_values(&["/registry/spantest-evict/"])
-                .get()
-        };
+        const SHARD: &str = "/registry/spantest-evict/";
         let push = |i: u64, at: u32| {
             store.push_event_at(
                 Arc::new(InternalEvent {
-                    key: format!("/registry/spantest-evict/default/obj-{i}"),
+                    key: format!("{SHARD}default/obj-{i}"),
                     revision: i,
                     value: Some(svc_value("obj", i)),
                     is_create: true,
@@ -4385,34 +4426,131 @@ mod tests {
             );
         };
 
-        // Exactly fill the ring at t=0, so nothing has been evicted yet.
+        // Exactly fill the ring at t=0, so nothing has been evicted yet: RING_CAPACITY
+        // observations, all of value 0, all falling in the le=1 bucket (buckets are cumulative
+        // "<=" boundaries starting at 1 — see `watch_ring_span_seconds_buckets`'s doc).
         for i in 0..RING_CAPACITY as u64 {
             push(i + 1, 0);
         }
         assert_eq!(
-            span(),
-            0,
-            "ring filled entirely at t=0 spans no time — test setup broken"
+            span_bucket_count(SHARD, 1.0),
+            RING_CAPACITY as u64,
+            "ring filled entirely at t=0 spans no time on every one of those pushes — test \
+             setup broken"
         );
 
-        // One more push at t=100 forces the first eviction: the oldest t=0 entry goes.
+        // One more push at t=100 forces the first eviction: the oldest t=0 entry goes, but
+        // RING_CAPACITY-1 more t=0 entries remain, so this push still observes 100, not 0.
         push(RING_CAPACITY as u64 + 1, 100);
         assert_eq!(
-            span(),
-            100,
-            "one eviction leaves the remaining t=0 entries as the oldest, so cover is still 100s"
+            span_bucket_count(SHARD, 1.0),
+            RING_CAPACITY as u64,
+            "one eviction leaves the remaining t=0 entries as the oldest, so cover is still \
+             100s for this push — the le=1 (spans-no-time) bucket must not have grown"
+        );
+        assert_eq!(
+            span_bucket_count(SHARD, 128.0),
+            RING_CAPACITY as u64 + 1,
+            "the 100s observation must land in the bucket that covers it (le=128, since \
+             64 < 100 <= 128), on top of every earlier <=1s observation counted cumulatively"
         );
 
-        // Overwrite the whole ring at t=100: every t=0 entry must now be gone.
-        for i in 0..RING_CAPACITY as u64 {
+        // Overwrite the ring at t=100 one push short of RING_CAPACITY: exactly enough to evict
+        // every remaining t=0 entry, so the LAST of these pushes is the one where the ring turns
+        // fully homogeneous at t=100 and its own observation must be 0 (newest and oldest both
+        // t=100), not 100. (One push earlier already evicted the very first t=0 entry, leaving
+        // RING_CAPACITY-1 t=0 entries to clear here.)
+        for i in 0..RING_CAPACITY as u64 - 1 {
             push(RING_CAPACITY as u64 + 2 + i, 100);
         }
         assert_eq!(
-            span(),
-            0,
-            "after a full turnover every retained event was pushed at t=100, so the shard now \
-             covers 0s of history — a gauge still reporting 100 would be describing events the \
-             ring has already discarded, i.e. claiming replay cover that no longer exists"
+            span_bucket_count(SHARD, 1.0),
+            RING_CAPACITY as u64 + 1,
+            "after a full turnover the push that completes it observes 0s of history — a \
+             metric still recording 100 for that push would be describing events the ring has \
+             already discarded, i.e. claiming replay cover that no longer exists"
+        );
+    }
+
+    /// `u7s_watch_ring_span_seconds` must expose the WORST-CASE (minimum) span a shard has ever
+    /// produced, not whatever its most recent push happened to be — because the worst case is
+    /// the only reading a `RING_CAPACITY` sizing decision can safely be made against, and it is
+    /// exactly what an external Prometheus poller reliably misses.
+    ///
+    /// Why it matters (mayor-ukbhp): a hot shard's per-push span oscillates between a long
+    /// steady-state value and brief near-zero dips whenever the ring fully turns over — measured
+    /// in production as ~2s dips lasting a single push, surrounded by spans of 10s-500s. The
+    /// PRE-FIX gauge was `.set()` on every push and read by a poller sampling every 30s: at
+    /// RING_CAPACITY=512 that caught the sub-10s dip on only 3 of 51 samples, and at
+    /// RING_CAPACITY=1500 it never did, reporting a reassuring ~74s "minimum" that was almost
+    /// certainly single-digit in reality — wrong in the dangerous direction for a safety signal.
+    /// A test that reads a gauge immediately after a masking push cannot tell "we never dipped
+    /// low" from "we dipped low and then moved on," which is the exact blind spot being fixed
+    /// here — so this test does not read a single value at all; it inspects the accumulated
+    /// distribution, which is what actually changed.
+    ///
+    /// This test reproduces that shape directly: fill a shard, fully turn it over (which forces
+    /// exactly one push, the one that completes the turnover, to observe a near-zero span — see
+    /// `ring_span_falls_when_eviction_discards_the_oldest_events` for why only that one push
+    /// does), then immediately push one far-future event that makes the very next observation
+    /// huge. A single "current value" reading taken after all of this — the only thing the old
+    /// gauge could ever offer a poller — would show the huge value and hide that the shard had
+    /// just spanned under a second. The low bucket must still show that dip regardless.
+    ///
+    /// Fails on revert: reverting `WATCH_RING_SPAN_SECONDS` to an `IntGaugeVec` does not compile
+    /// against this test (no buckets to inspect) — the type change IS the fix, because a gauge
+    /// has no way to retain a value it already overwrote.
+    #[tokio::test]
+    async fn watch_ring_span_seconds_reports_worst_case_replay_cover_not_last_polled_value() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        const SHARD: &str = "/registry/spantest-worstcase/";
+        let push = |i: u64, at: u32| {
+            store.push_event_at(
+                Arc::new(InternalEvent {
+                    key: format!("{SHARD}default/obj-{i}"),
+                    revision: i,
+                    value: Some(svc_value("obj", i)),
+                    is_create: true,
+                    deleted_body: None,
+                }),
+                Some("default"),
+                at,
+            );
+        };
+
+        // Fill the ring at t=0 — every one of these RING_CAPACITY pushes trivially observes 0
+        // (a fresh/growing ring's oldest entry is always its own newest so far), which is why the
+        // baseline count below is RING_CAPACITY, not 0.
+        for i in 0..RING_CAPACITY as u64 {
+            push(i + 1, 0);
+        }
+        // Fully turn it over at t=3: every push here observes 3s EXCEPT the very last one, which
+        // completes the turnover and observes 0s — the ~2s-wide dip this bug is about. Exactly
+        // one MORE push beyond the fill's baseline ever records a value <=1s.
+        for i in 0..RING_CAPACITY as u64 {
+            push(RING_CAPACITY as u64 + 1 + i, 3);
+        }
+        // Immediately mask it: one push far in the future makes the NEXT (and from here on,
+        // every subsequent) observation huge, exactly as a poller landing after this instant
+        // would see if it could only ever read "the current value".
+        push(2 * RING_CAPACITY as u64 + 1, 1000);
+
+        assert_eq!(
+            span_bucket_count(SHARD, 1.0),
+            RING_CAPACITY as u64 + 1,
+            "the fill's RING_CAPACITY trivial zero-spans plus the one turnover-completing dip \
+             must both still be visible in the low bucket even after the masking push — a \
+             gauge's 'current value' at this point would show only the masking push's huge \
+             span, with no way to tell that a <=1s span had ever occurred at all"
+        );
+
+        let total_pushes = 2 * RING_CAPACITY as u64 + 1;
+        assert_eq!(
+            span_metric(SHARD).get_histogram().get_sample_count(),
+            total_pushes,
+            "every push must be observed, not merely occasionally sampled — this is the actual \
+             mechanism fix: a histogram records every write's span permanently, so a narrow \
+             worst-case window can never simply go unseen the way it did under external polling"
         );
     }
 
