@@ -217,65 +217,11 @@ const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
     ),
     (
         ".k8s.io.api.core.v1.VolumeSource",
-        "azureDisk",
-        "legacy in-tree volume plugin; upstream `Deprecated: AzureDisk is deprecated. All \
-         operations for the in-tree azureDisk type are redirected to the disk.csi.azure.com \
-         CSI driver.` (disk.csi.azure.com is the named CSI replacement; no release-note \
-         traceable, comment-only upstream change). u7s policy: defer to CSI migration path, \
-         no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "azureFile",
-        "legacy in-tree volume plugin; upstream `Deprecated: AzureFile is deprecated. All \
-         operations for the in-tree azureFile type are redirected to the file.csi.azure.com \
-         CSI driver.` (file.csi.azure.com is the named CSI replacement; plugin-code removal \
-         release-noted in CHANGELOG-1.28, kubernetes/kubernetes#118236, and the in-tree \
-         cloud-provider deprecation release-noted separately in CHANGELOG-1.30, \
-         kubernetes/kubernetes#122576 — two distinct events, neither is this API field's \
-         own comment). u7s policy: defer to CSI migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "cephfs",
-        "legacy in-tree volume plugin; upstream `Deprecated: CephFS is deprecated and the \
-         in-tree cephfs type is no longer supported.` (CephFS CSI driver is the \
-         replacement; deprecation release-noted in CHANGELOG-1.28, \
-         kubernetes/kubernetes#118143). u7s policy: defer to CSI migration path, no plan to \
-         implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "cinder",
-        "legacy in-tree volume plugin; upstream `Deprecated: Cinder is deprecated. All \
-         operations for the in-tree cinder type are redirected to the \
-         cinder.csi.openstack.org CSI driver.` (cinder.csi.openstack.org is the named CSI \
-         replacement; no release-note traceable, comment-only upstream change). u7s policy: \
-         defer to CSI migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
         "fc",
         "legacy in-tree volume plugin; NOT marked `Deprecated:` upstream as of the vendored \
          proto snapshot — omitted on its own merits as a protocol-specific block-storage \
          plugin with no CSI-agnostic value to this control plane, not because upstream has \
          deprecated it. Revisit if upstream formally deprecates/removes it.",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "flexVolume",
-        "legacy in-tree volume plugin; upstream `Deprecated: FlexVolume is deprecated. \
-         Consider using a CSIDriver instead.` (no specific CSI driver named upstream; no \
-         release-note traceable, comment-only upstream change). u7s policy: defer to CSI \
-         migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "flocker",
-        "legacy in-tree volume plugin; upstream `Deprecated: Flocker is deprecated and the \
-         in-tree flocker type is no longer supported.` (no CSI replacement named upstream — \
-         Flocker itself is defunct; no release-note traceable, comment-only upstream \
-         change). u7s policy: defer to CSI migration path, no plan to implement",
     ),
     (
         ".k8s.io.api.core.v1.VolumeSource",
@@ -288,91 +234,12 @@ const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
     ),
     (
         ".k8s.io.api.core.v1.VolumeSource",
-        "gitRepo",
-        "legacy in-tree volume plugin; upstream `Deprecated: GitRepo is deprecated. To \
-         provision a container with a git repo, mount an EmptyDir into an InitContainer \
-         that clones the repo using git, then mount the EmptyDir into the Pod's \
-         container.` (no CSI angle — upstream's own suggested replacement is an \
-         EmptyDir + InitContainer pattern, not a CSI driver; no release-note traceable, \
-         comment-only upstream change). u7s policy: defer to the upstream-recommended \
-         EmptyDir/InitContainer pattern, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "glusterfs",
-        "legacy in-tree volume plugin; upstream `Deprecated: Glusterfs is deprecated and \
-         the in-tree glusterfs type is no longer supported.` (no CSI replacement named \
-         upstream; no release-note traceable, comment-only upstream change). u7s policy: \
-         defer to CSI migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "iscsi",
-        "legacy in-tree volume plugin; NOT marked `Deprecated:` upstream as of the vendored \
-         proto snapshot — omitted on its own merits as a protocol-specific block-storage \
-         plugin with no CSI-agnostic value to this control plane, not because upstream has \
-         deprecated it. Revisit if upstream formally deprecates/removes it.",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
         "photonPersistentDisk",
         "legacy in-tree volume plugin; upstream `Deprecated: PhotonPersistentDisk is \
          deprecated and the in-tree photonPersistentDisk type is no longer supported.` (no \
          CSI replacement named upstream — Photon Controller itself is defunct; no \
          release-note traceable, comment-only upstream change). u7s policy: defer to CSI \
          migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "portworxVolume",
-        "legacy in-tree volume plugin; upstream `Deprecated: PortworxVolume is deprecated. \
-         All operations for the in-tree portworxVolume type are redirected to the \
-         pxd.portworx.com CSI driver.` (pxd.portworx.com is the named CSI replacement; no \
-         release-note traceable, comment-only upstream change). u7s policy: defer to CSI \
-         migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "quobyte",
-        "legacy in-tree volume plugin; upstream `Deprecated: Quobyte is deprecated and the \
-         in-tree quobyte type is no longer supported.` (no CSI replacement named upstream; \
-         no release-note traceable, comment-only upstream change). u7s policy: defer to CSI \
-         migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "rbd",
-        "legacy in-tree volume plugin; upstream `Deprecated: RBD is deprecated and the \
-         in-tree rbd type is no longer supported.` (RBD CSI driver is the replacement; \
-         deprecation release-noted in CHANGELOG-1.28, kubernetes/kubernetes#118552). u7s \
-         policy: defer to CSI migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "scaleIO",
-        "legacy in-tree volume plugin; upstream `Deprecated: ScaleIO is deprecated and the \
-         in-tree scaleIO type is no longer supported.` (no CSI replacement named upstream; \
-         no release-note traceable, comment-only upstream change). u7s policy: defer to CSI \
-         migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "storageos",
-        "legacy in-tree volume plugin; upstream `Deprecated: StorageOS is deprecated and \
-         the in-tree storageos type is no longer supported.` (no CSI replacement named \
-         upstream — StorageOS itself is defunct; no release-note traceable, comment-only \
-         upstream change). u7s policy: defer to CSI migration path, no plan to implement",
-    ),
-    (
-        ".k8s.io.api.core.v1.VolumeSource",
-        "vsphereVolume",
-        "legacy in-tree volume plugin; upstream `Deprecated: VsphereVolume is deprecated. \
-         All operations for the in-tree vsphereVolume type are redirected to the \
-         csi.vsphere.vmware.com CSI driver.` (csi.vsphere.vmware.com is the named CSI \
-         replacement; the adjacent in-tree vSphere cloud provider — not this API field \
-         itself — was deprecated/removed and release-noted in CHANGELOG-1.30, \
-         kubernetes/kubernetes#122937). u7s policy: defer to CSI migration path, no plan to \
-         implement",
     ),
     (
         ".k8s.io.api.core.v1.PersistentVolumeSource",
