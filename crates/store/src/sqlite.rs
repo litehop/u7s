@@ -63,12 +63,11 @@ pub(crate) struct RingShard {
     /// to now).
     ///
     /// A side deque rather than a field on `InternalEvent` or a `(event, secs)` tuple in `ring`
-    /// itself, for one reason: `ring` is created with `VecDeque::with_capacity(RING_CAPACITY+1)`,
-    /// so widening its element from 8 bytes (a thin `Arc`) to 16 (`Arc` + `u32` + padding) would
-    /// double every shard's pre-allocated slot array — ~+6 MB across the 73 shards a conformance
-    /// run creates, most of which stay nearly empty. This deque is deliberately NOT
-    /// pre-allocated, so it costs 4 bytes per event actually retained (~124 KB at a measured
-    /// 30,928) instead of per slot reserved.
+    /// itself, for one reason: widening `ring`'s element from 8 bytes (a thin `Arc`) to 16
+    /// (`Arc` + `u32` + padding) would double the retained-event cost of every shard. Neither
+    /// deque is pre-allocated — both grow on demand as events are pushed — so this deque costs
+    /// only 4 extra bytes per event actually retained, instead of doubling `ring`'s own 8 for
+    /// every entry.
     ///
     /// INVARIANT: `push_secs.len() == ring.len()`. Upheld because `push_event_locked` is the
     /// only code that touches this field at all, and it pushes/pops both deques together while
@@ -93,7 +92,7 @@ pub(crate) struct RingShard {
 impl RingShard {
     fn new() -> Self {
         Self {
-            ring: RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)),
+            ring: RwLock::new(VecDeque::new()),
             push_secs: RwLock::new(VecDeque::new()),
             horizon: AtomicU64::new(0),
             deletion_log: RwLock::new(DeletionLog::default()),
@@ -2755,6 +2754,30 @@ mod tests {
             "field-selector list by namespace=prod must return 1 pod; returning 0 means the \
              ns indexed column was not correctly populated by the single-parse put path, \
              breaking all namespace-scoped list queries"
+        );
+    }
+
+    /// A freshly-created shard must not commit memory for slots no event has been pushed into
+    /// yet.
+    ///
+    /// Why it matters: a conformance run creates dozens of shards (one per resource-type prefix
+    /// touched), and most sit far below `RING_CAPACITY` for their entire lifetime — see
+    /// `ring_capacity_is_pinned_to_512_and_evicts_oldest_first`'s doc for the measured
+    /// justification of the constant. Eagerly reserving `RING_CAPACITY + 1` slots the instant a
+    /// shard is created (rather than growing the ring as events actually arrive) commits that
+    /// memory for every shard whether or not it is ever used, and it never shrinks back down —
+    /// this fails on revert if `RingShard::new` goes back to
+    /// `VecDeque::with_capacity(RING_CAPACITY + 1)`.
+    #[test]
+    fn fresh_ring_shard_does_not_preallocate_ring_capacity() {
+        let shard = RingShard::new();
+        let capacity = shard.ring.read().expect("ring poisoned").capacity();
+        assert!(
+            capacity < 100,
+            "a brand-new shard's ring reserved {capacity} slots before a single event was \
+             pushed into it (RING_CAPACITY is {RING_CAPACITY}); eager pre-allocation like this \
+             commits dirty memory for every shard a conformance run creates, most of which \
+             never come close to filling it"
         );
     }
 
