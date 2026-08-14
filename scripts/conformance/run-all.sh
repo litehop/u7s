@@ -526,21 +526,6 @@ else
     else
       echo "warning: $DHAT_HEAP_FILE was not produced — apiserver may not have exited cleanly" >&2
     fi
-
-    # Re-copy the monitoring artifacts now that they cover the whole run:
-    # 06-run-sonobuoy.sh already copied a "post-run" snapshot of these into
-    # $RUN_DIR/monitoring/, but rss.csv/ring-age.csv kept growing afterward
-    # and the "pre-teardown" snapshot above (taken after that copy ran) isn't
-    # there yet either. $RUN_DIR was already resolved above for the dhat heap.
-    if [ -n "$RUN_DIR" ]; then
-      MONITORING_DIR="$RUN_DIR/monitoring"
-      mkdir -p "$MONITORING_DIR"
-      [ -f "$WORKDIR/rss.csv" ]      && cp "$WORKDIR/rss.csv" "$MONITORING_DIR/rss.csv"
-      [ -f "$WORKDIR/vm-free.csv" ]  && cp "$WORKDIR/vm-free.csv" "$MONITORING_DIR/vm-free.csv"
-      [ -f "$WORKDIR/ring-age.csv" ] && cp "$WORKDIR/ring-age.csv" "$MONITORING_DIR/ring-age.csv"
-      cp "$WORKDIR"/metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
-      echo "Monitoring artifacts: $MONITORING_DIR"
-    fi
   fi
 fi
 
@@ -556,6 +541,31 @@ if [ "$PROFILE" -eq 0 ]; then
   bash "$DIR/sample-run-metrics.sh" snapshot ${_WORKDIR_ARG} --label pre-teardown
   # shellcheck disable=SC2086
   bash "$DIR/sample-run-metrics.sh" stop ${_WORKDIR_ARG}
+fi
+
+# Re-copy the monitoring artifacts now that they cover the whole run:
+# 06-run-sonobuoy.sh already copied a "post-run" snapshot of these into
+# $RUN_DIR/monitoring/, but rss.csv/ring-age.csv kept growing afterward and
+# the final "pre-teardown" snapshot taken above (--profile or not) isn't
+# there yet either. This re-copy must run for EVERY invocation that produced
+# a $RUN_DIR (i.e. ran sonobuoy) -- NOT scoped to --profile, even though it
+# sits right next to the dhat-heap handling above and looks like it belongs
+# to that block. Scoping it to --profile is exactly the bug mayor-xzkqw
+# fixed: a plain conformance run never stops the apiserver here, so it never
+# went through the --profile branch above, and metrics-03-pre-teardown.prom
+# (plus any sampler growth since the sonobuoy-retrieve copy) stayed trapped
+# under --workdir -- ephemeral/gitignored/worker-scoped -- instead of
+# reaching the permanent per-run temp/e2e/<slug>/monitoring/ directory that's
+# meant to be the audited artifact set for a run. $RUN_DIR is unset entirely
+# under --stack-only (sonobuoy never ran), hence the ${RUN_DIR:-} default.
+if [ -n "${RUN_DIR:-}" ]; then
+  MONITORING_DIR="$RUN_DIR/monitoring"
+  mkdir -p "$MONITORING_DIR"
+  [ -f "$WORKDIR/rss.csv" ]      && cp "$WORKDIR/rss.csv" "$MONITORING_DIR/rss.csv"
+  [ -f "$WORKDIR/vm-free.csv" ]  && cp "$WORKDIR/vm-free.csv" "$MONITORING_DIR/vm-free.csv"
+  [ -f "$WORKDIR/ring-age.csv" ] && cp "$WORKDIR/ring-age.csv" "$MONITORING_DIR/ring-age.csv"
+  cp "$WORKDIR"/metrics-*.prom "$MONITORING_DIR/" 2>/dev/null || true
+  echo "Monitoring artifacts: $MONITORING_DIR"
 fi
 
 banner "Done"
