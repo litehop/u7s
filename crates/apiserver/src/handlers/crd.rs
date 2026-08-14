@@ -734,6 +734,17 @@ pub async fn delete_crd<S: Store>(
             .invalidate_by_target_api_versions(&target_api_versions);
     }
 
+    // Eagerly free this CRD's watch-ring shard(s) instead of waiting up to
+    // RING_SHARD_IDLE_GRACE after the last watcher disconnects: a deleted CRD's resource type
+    // can never be watched again, so there is no reason to hold its history alive. The prefix
+    // is version-independent (CRs are stored under `/registry/{group}/{plural}/...` regardless
+    // of served version), so this needs to run once per CRD, not once per version.
+    if let Some(plural) = existing["spec"]["names"]["plural"].as_str() {
+        state
+            .store
+            .evict_resource_type(&crate::keys::group_list_prefix(&group, plural, None));
+    }
+
     // Write a tombstone so CR handlers can return 410 Gone (not 404) for this
     // group after deletion. Informers treat 410 as "stop watching" and 404 as
     // a transient error retried indefinitely — without this, namespace deletion
@@ -2982,6 +2993,184 @@ mod tests {
             "tombstone must be removed when CRD is re-created; if it persists, CR requests \
              for group '{}' return 410 Gone instead of routing to the new CRD",
             group
+        );
+    }
+
+    /// Deleting a CRD must free its watch-ring shard immediately, not merely once idle-GC's
+    /// RING_SHARD_IDLE_GRACE elapses after the last watcher disconnects.
+    ///
+    /// Why it matters: CRD conformance churn creates and deletes dozens of transient CRDs per
+    /// run — leaving each one's shard alive until idle-GC would pin many-KiB of ring capacity
+    /// per dead CRD for up to 120s, and any watcher reconnecting with a stale resourceVersion
+    /// in that window would silently get a fresh-empty replay instead of the correct 410 Gone.
+    ///
+    /// Fails on revert: without the `evict_resource_type` call, the shard stays live and quiet
+    /// (it never evicted anything on its own, so its `horizon` field stays 0), and
+    /// `compaction_horizon_for` keeps reporting 0 after delete. This test asserts it instead
+    /// reflects the shard's highest-held revision, which only happens once the shard has
+    /// actually been torn down and its floor preserved into `reclaimed_horizons`.
+    #[tokio::test]
+    async fn delete_crd_evicts_watch_ring_shard_immediately() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let name = "widgets.teardown.example.com";
+        let group = "teardown.example.com";
+        let plural = "widgets";
+        let prefix = crate::keys::group_list_prefix(group, plural, None);
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, group, plural),
+        )
+        .await
+        .expect("create must succeed");
+
+        // Opening a watch is what brings a shard into existence (writes alone do not — see
+        // SqliteStore::watch's doc). Dropping it immediately still leaves the shard live until
+        // idle-GC's grace period — 120s in this non-store-crate build — which is exactly the
+        // delay this bead's fix must not wait for.
+        let watch_stream = store.watch(&prefix, 0).await.expect("watch must succeed");
+        drop(watch_stream);
+
+        // One real CR write, nowhere near RING_CAPACITY, so the shard's own eviction floor
+        // (`horizon`) never advances past 0 on its own — isolating "torn down" from "compacted".
+        let cr_key = format!("{prefix}default/widget-a");
+        let rv = store
+            .put(
+                &cr_key,
+                Bytes::from(
+                    serde_json::json!({"metadata": {"name": "widget-a", "namespace": "default"}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("CR write must succeed");
+
+        assert_eq!(
+            store.compaction_horizon_for(&prefix),
+            0,
+            "sanity check on test setup: a quiet shard that never evicted anything must report \
+             horizon 0 while it is still live"
+        );
+
+        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
+            .await
+            .expect("delete must succeed");
+
+        assert_eq!(
+            store.compaction_horizon_for(&prefix),
+            rv,
+            "CRD delete must eagerly free the resource-type shard rather than waiting 120s for \
+             idle-GC — CRD conformance churn (dozens of transient CRDs per run) would otherwise \
+             pin many-KiB of ring capacity per dead CRD until the grace period expires, and any \
+             watcher reconnecting with a stale RV in that window would silently get a \
+             fresh-empty replay instead of the correct 410 Gone"
+        );
+    }
+
+    /// Deleting a CRD must tear down EVERY shard rooted at its resource type, not just the
+    /// exact cluster-scoped key — a namespace-scoped shard for the same plural can coexist
+    /// alongside the cluster-scoped one (see `matching_shards`' doc in the store crate), and a
+    /// naive `shards.remove(cluster_scoped_key)` would miss it.
+    ///
+    /// Fails on revert to an exact-key-only teardown: the namespace-scoped shard (opened first
+    /// below, so it gets its own distinct map entry rather than being reused by the broader
+    /// cluster-scoped watch opened afterward — see `find_shard`'s doc) stays live and
+    /// untouched, so its `compaction_horizon_for` value never advances off 0 the way the
+    /// assertion below requires.
+    #[tokio::test]
+    async fn delete_crd_evicts_namespace_scoped_shard_too() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let name = "gadgets.teardown2.example.com";
+        let group = "teardown2.example.com";
+        let plural = "gadgets";
+        let cluster_prefix = crate::keys::group_list_prefix(group, plural, None);
+        let ns_prefix = crate::keys::group_list_prefix(group, plural, Some("default"));
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, group, plural),
+        )
+        .await
+        .expect("create must succeed");
+
+        // Namespace-scoped watch FIRST: opening the broader cluster-scoped watch afterward
+        // cannot reuse this shard (its key is longer than, and so not a prefix of, the
+        // cluster-scoped root), so both end up as distinct map entries — exactly the situation
+        // a naive exact-key teardown mishandles.
+        let ns_watch = store
+            .watch(&ns_prefix, 0)
+            .await
+            .expect("namespace-scoped watch must succeed");
+        drop(ns_watch);
+        let cluster_watch = store
+            .watch(&cluster_prefix, 0)
+            .await
+            .expect("cluster-scoped watch must succeed");
+        drop(cluster_watch);
+
+        // One write to an object under the namespace fans into BOTH shards (matching_shards
+        // finds every shard whose key is a prefix of this write's key), so both stay quiet
+        // (never evict on their own) yet both hold a real, nonzero revision.
+        let cr_key = format!("{ns_prefix}gadget-a");
+        let rv = store
+            .put(
+                &cr_key,
+                Bytes::from(
+                    serde_json::json!({"metadata": {"name": "gadget-a", "namespace": "default"}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("CR write must succeed");
+
+        assert_eq!(store.compaction_horizon_for(&ns_prefix), 0);
+        assert_eq!(store.compaction_horizon_for(&cluster_prefix), 0);
+
+        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
+            .await
+            .expect("delete must succeed");
+
+        assert_eq!(
+            store.compaction_horizon_for(&cluster_prefix),
+            rv,
+            "cluster-scoped shard must be torn down by CRD delete"
+        );
+        assert_eq!(
+            store.compaction_horizon_for(&ns_prefix),
+            rv,
+            "a naive exact-key `remove(cluster_scoped_key)` would leave namespace-scoped shards \
+             for the same resource type alive after CRD delete — the namespace-scoped ones \
+             would then serve empty/synthetic replays to reconnecting watchers, and their \
+             KiB-per-shard cost would leak until idle-GC (or forever if a watcher stays \
+             connected)"
         );
     }
 }
