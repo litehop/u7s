@@ -573,13 +573,19 @@ pub struct Volume {
     pub secret: Option<VolumeProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projected: Option<VolumeProjection>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "downwardAPI"
+    )]
+    pub downward_api: Option<VolumeProjection>,
     /// All other fields in this volume entry (e.g. emptyDir, hostPath).
     #[serde(flatten)]
     #[schemars(skip)]
     pub rest: serde_json::Value,
 }
 
-/// Typed representation of the subset of configMap/secret/projected volume
+/// Typed representation of the subset of configMap/secret/projected/downwardAPI volume
 /// source fields that the apiserver reads (defaultMode stamping).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

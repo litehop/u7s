@@ -34,64 +34,73 @@ use tower_service::Service;
 
 type EncoderFn = fn(&serde_json::Value) -> Vec<u8>;
 
-/// `kind` -> protobuf encoder, mirroring `proto::decoders()`'s dispatch shape but for the
-/// response direction. Deliberately scoped to the hot-path kinds named in the bead rather
-/// than the full ~65-kind decode surface — see `core_gen_adapter`/
+/// `(apiVersion, kind)` -> protobuf encoder, mirroring `proto::decoders()`'s dispatch shape but
+/// for the response direction. Deliberately scoped to the hot-path kinds named in the bead
+/// rather than the full ~65-kind decode surface — see `core_gen_adapter`/
 /// `net_disc_cert_policy_events_gen_adapter`'s `encode_*_proto_gen` doc comments for the
 /// field-coverage scope of each encoder.
-fn encoders() -> &'static std::collections::HashMap<&'static str, EncoderFn> {
-    static ENCODERS: std::sync::OnceLock<std::collections::HashMap<&'static str, EncoderFn>> =
-        std::sync::OnceLock::new();
+///
+/// Keyed by the pair, not `kind` alone: `events.k8s.io/v1.Event`/`EventList` share the exact
+/// `kind` string "Event"/"EventList" with the legacy `/api/v1` core Event/EventList this table
+/// also serves, but are unrelated proto messages with different field numbers entirely. A
+/// `kind`-only key sent every `events.k8s.io/v1` Event LIST through the core `v1.Event` proto
+/// schema instead — decodable by our own decoder (which shares the same mistake) but not by a
+/// real client-go typed `EventsV1` client, which failed with "proto: wrong wireType = 2 for
+/// field Nanos" trying to parse core Event's bytes as `events.k8s.io/v1.Event`.
+fn encoders() -> &'static std::collections::HashMap<(&'static str, &'static str), EncoderFn> {
+    static ENCODERS: std::sync::OnceLock<
+        std::collections::HashMap<(&'static str, &'static str), EncoderFn>,
+    > = std::sync::OnceLock::new();
     ENCODERS.get_or_init(|| {
-        let mut m: std::collections::HashMap<&'static str, EncoderFn> =
+        let mut m: std::collections::HashMap<(&'static str, &'static str), EncoderFn> =
             std::collections::HashMap::new();
         m.insert(
-            "Pod",
+            ("v1", "Pod"),
             crate::core_gen_adapter::encode_pod_proto_gen as EncoderFn,
         );
         m.insert(
-            "PodList",
+            ("v1", "PodList"),
             crate::core_gen_adapter::encode_podlist_proto_gen as EncoderFn,
         );
         m.insert(
-            "Service",
+            ("v1", "Service"),
             crate::core_gen_adapter::encode_service_proto_gen as EncoderFn,
         );
         m.insert(
-            "ServiceList",
+            ("v1", "ServiceList"),
             crate::core_gen_adapter::encode_servicelist_proto_gen as EncoderFn,
         );
         m.insert(
-            "Node",
+            ("v1", "Node"),
             crate::core_gen_adapter::encode_node_proto_gen as EncoderFn,
         );
         m.insert(
-            "NodeList",
+            ("v1", "NodeList"),
             crate::core_gen_adapter::encode_nodelist_proto_gen as EncoderFn,
         );
         m.insert(
-            "Endpoints",
+            ("v1", "Endpoints"),
             crate::core_gen_adapter::encode_endpoints_proto_gen as EncoderFn,
         );
         m.insert(
-            "EndpointsList",
+            ("v1", "EndpointsList"),
             crate::core_gen_adapter::encode_endpointslist_proto_gen as EncoderFn,
         );
         m.insert(
-            "Event",
+            ("v1", "Event"),
             crate::core_gen_adapter::encode_event_proto_gen as EncoderFn,
         );
         m.insert(
-            "EventList",
+            ("v1", "EventList"),
             crate::core_gen_adapter::encode_eventlist_proto_gen as EncoderFn,
         );
         m.insert(
-            "EndpointSlice",
+            ("discovery.k8s.io/v1", "EndpointSlice"),
             crate::net_disc_cert_policy_events_gen_adapter::encode_endpointslice_proto_gen
                 as EncoderFn,
         );
         m.insert(
-            "EndpointSliceList",
+            ("discovery.k8s.io/v1", "EndpointSliceList"),
             crate::net_disc_cert_policy_events_gen_adapter::encode_endpointslicelist_proto_gen
                 as EncoderFn,
         );
@@ -114,8 +123,8 @@ pub fn wants_protobuf(accept: &str) -> bool {
 pub fn negotiated_response(accept: &str, obj: serde_json::Value) -> Response<Body> {
     if wants_protobuf(accept) {
         if let Some(kind) = obj.get("kind").and_then(|k| k.as_str()) {
-            if let Some(encoder) = encoders().get(kind) {
-                let api_version = obj.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
+            let api_version = obj.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(encoder) = encoders().get(&(api_version, kind)) {
                 let raw = encoder(&obj);
                 let body = crate::proto::encode_k8s_envelope(kind, api_version, raw);
                 return (
@@ -1263,6 +1272,36 @@ mod tests {
             assert!(
                 body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
                 "{kind}: response body must start with the k8s protobuf magic prefix"
+            );
+        }
+    }
+
+    /// `events.k8s.io/v1.Event`/`EventList` share the exact `kind` string "Event"/"EventList"
+    /// with the legacy core `/api/v1` Event/EventList this dispatch table also serves, but the
+    /// two are unrelated proto messages with different field numbers entirely. Before this fix,
+    /// `encoders()` was keyed by `kind` alone, so an `events.k8s.io/v1` Event LIST with a
+    /// protobuf Accept header was encoded using the core `v1.Event` proto schema — bytes a real
+    /// client-go `EventsV1` typed client cannot parse, failing with "proto: wrong wireType = 2
+    /// for field Nanos" (the exact live failure behind `[sig-instrumentation] Events API should
+    /// delete a collection of events`). Since `events.k8s.io/v1.Event`/`EventList` have no
+    /// registered encoder of their own, they must fall back to JSON, not silently borrow the
+    /// core Event encoder.
+    #[tokio::test]
+    async fn negotiated_response_does_not_confuse_events_k8s_io_event_with_core_v1_event() {
+        for kind in ["Event", "EventList"] {
+            let obj = serde_json::json!({ "kind": kind, "apiVersion": "events.k8s.io/v1" });
+            let resp = negotiated_response("application/vnd.kubernetes.protobuf", obj.clone());
+
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                ct, "application/json",
+                "events.k8s.io/v1 {kind} has no registered encoder and must fall back to JSON, \
+                 not be silently mis-encoded as the unrelated core/v1 {kind} proto message"
             );
         }
     }

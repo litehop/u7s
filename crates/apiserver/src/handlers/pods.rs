@@ -4322,14 +4322,21 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     }
 
     // defaultMode for volume sources that require it.
-    // The kubelet refuses to mount ConfigMap/Secret volumes whose defaultMode is absent:
-    //   "no defaultMode used, not even the default value for it"
+    // The kubelet refuses to mount ConfigMap/Secret/DownwardAPI volumes whose defaultMode is
+    // absent: "no defaultMode used, not even the default value for it"
     // Real kube-apiserver defaults these to 0644 (420 decimal).
     //
     // We deserialize each volume into a typed Volume, stamp the missing defaultMode
     // on the typed field, then write the whole volumes array back. This ensures the
     // rename of defaultMode → somethingElse is a compile error rather than a silent
     // bug, and that untyped volume fields (emptyDir, hostPath, etc.) survive via `rest`.
+    //
+    // downwardAPI is included here (not just configMap/secret/projected): unlike those three,
+    // a top-level DownwardAPIVolumeSource has no other defaulting pass anywhere in u7s, so a
+    // pod created without an explicit defaultMode (the common case) would otherwise store one
+    // forever — and every consumer of the stored JSON (the watch stream is a straight JSON
+    // pass-through, not just a protobuf-negotiated GET/LIST) would hit the same kubelet
+    // mount failure.
     if let Some(ref mut volumes) = spec.volumes {
         let mut changed = false;
         for vol in volumes.iter_mut() {
@@ -4337,6 +4344,7 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
                 vol.config_map.as_mut(),
                 vol.secret.as_mut(),
                 vol.projected.as_mut(),
+                vol.downward_api.as_mut(),
             ]
             .into_iter()
             .flatten()
@@ -5238,6 +5246,56 @@ mod create_defaults_tests {
             pod["spec"]["volumes"][0]["secret"]["defaultMode"],
             serde_json::Value::Number(420.into()),
             "secret volume defaultMode must be set to 0644 (420) when absent"
+        );
+    }
+
+    /// A top-level `downwardAPI` volume has no other defaulting pass anywhere in u7s (unlike
+    /// configMap/secret/projected), so a pod created the ordinary way (no explicit
+    /// defaultMode, the common case) would otherwise store one with defaultMode permanently
+    /// absent. Every consumer of the stored JSON — including the watch stream, which is a
+    /// straight JSON pass-through and never goes through the protobuf encoder — would then
+    /// hit the real kubelet's "FailedMount ... no defaultMode used, not even the default
+    /// value for it" for the lifetime of the pod.
+    #[test]
+    fn downward_api_volume_default_mode_is_set_when_absent() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "volumes": [{
+                    "name": "podinfo",
+                    "downwardAPI": {
+                        "items": [{ "path": "labels", "fieldRef": { "fieldPath": "metadata.labels" } }]
+                    }
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["volumes"][0]["downwardAPI"]["defaultMode"],
+            serde_json::Value::Number(420.into()),
+            "downwardAPI volume defaultMode must be set to 0644 (420) when absent, or the \
+             stored pod never mounts for any client — protobuf or plain JSON"
+        );
+        assert_eq!(
+            pod["spec"]["volumes"][0]["downwardAPI"]["items"][0]["path"], "labels",
+            "stamping defaultMode must not clobber the volume's items"
+        );
+    }
+
+    #[test]
+    fn downward_api_volume_explicit_default_mode_is_preserved() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "volumes": [{
+                    "name": "podinfo",
+                    "downwardAPI": { "items": [], "defaultMode": 256 }
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["volumes"][0]["downwardAPI"]["defaultMode"],
+            serde_json::Value::Number(256.into()),
+            "explicit defaultMode must not be overridden"
         );
     }
 
@@ -6964,6 +7022,12 @@ mod generation_tests {
         assert!(
             pod["spec"]["volumes"][1]["projected"].is_null(),
             "apply_pod_spec_defaults must not inject a projected field into an emptyDir volume"
+        );
+        assert!(
+            pod["spec"]["volumes"][0]["downwardAPI"].is_null()
+                && pod["spec"]["volumes"][1]["downwardAPI"].is_null(),
+            "apply_pod_spec_defaults must not inject a downwardAPI field into a configMap or \
+             emptyDir volume — same 'kubelet sees two volume plugins' failure mode as projected"
         );
     }
 
