@@ -873,6 +873,10 @@ fn build_router(state: AppState) -> Router {
             "/apis/authentication.k8s.io/v1/tokenreviews",
             post(handlers::authorization::token_review),
         )
+        .route(
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            post(handlers::authorization::self_subject_review),
+        )
         // ServiceAccounts — token subresource (TokenRequest API)
         .route(
             "/api/v1/namespaces/{ns}/serviceaccounts/{name}/token",
@@ -1153,9 +1157,11 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:basic-user — grants every authenticated user the
-    // ability to create SelfSubjectAccessReviews and SelfSubjectRulesReviews.
-    // Argo CD calls these endpoints on startup to discover its own permissions;
-    // without this role those requests are denied with 403.
+    // ability to create SelfSubjectAccessReviews, SelfSubjectRulesReviews, and
+    // SelfSubjectReviews (matching upstream bootstrappolicy.go's basicUserRules).
+    // Argo CD calls the first two on startup to discover its own permissions, and
+    // `kubectl auth whoami` requires the third; without this role those requests
+    // are denied with 403.
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(GROUP, "clusterroles", None, "system:basic-user");
     let body = serde_json::json!({
@@ -1163,7 +1169,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:basic-user", "uid": "00000000-0000-0000-0000-000000000014", "creationTimestamp": TS },
         "rules": [
-            { "apiGroups": ["authorization.k8s.io"], "resources": ["selfsubjectaccessreviews","selfsubjectrulesreviews"], "verbs": ["create"] }
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["selfsubjectaccessreviews","selfsubjectrulesreviews"], "verbs": ["create"] },
+            { "apiGroups": ["authentication.k8s.io"], "resources": ["selfsubjectreviews"], "verbs": ["create"] }
         ]
     });
     put!(key, body, "system:basic-user", "ClusterRole");
@@ -4847,6 +4854,12 @@ mod tests {
         assert!(
             resources.iter().any(|r| r == "selfsubjectrulesreviews"),
             "system:basic-user must grant selfsubjectrulesreviews"
+        );
+        assert!(
+            resources.iter().any(|r| r == "selfsubjectreviews"),
+            "system:basic-user must grant selfsubjectreviews — without it, `kubectl auth \
+             whoami` (and any non-system:masters caller) gets 403 on every SelfSubjectReview, \
+             matching upstream bootstrappolicy.go's basicUserRules"
         );
 
         // ClusterRoleBinding system:basic-user must bind system:authenticated group.

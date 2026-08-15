@@ -1054,6 +1054,13 @@ fn authn_v1_resources() -> serde_json::Value {
         "groupVersion": "authentication.k8s.io/v1",
         "resources": [
             {
+                "name": "selfsubjectreviews",
+                "singularName": "selfsubjectreview",
+                "namespaced": false,
+                "kind": "SelfSubjectReview",
+                "verbs": ["create"]
+            },
+            {
                 "name": "tokenreviews",
                 "singularName": "tokenreview",
                 "namespaced": false,
