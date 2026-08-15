@@ -274,13 +274,17 @@ fn container_host_ports(containers: &[ContainerSpec]) -> Vec<HostPortClaim> {
         .collect()
 }
 
-/// A pod's `spec.affinity`. Only `nodeAffinity` is modeled — the scheduler has
-/// no pod-affinity/anti-affinity handling yet, out of scope for the
-/// SchedulerPredicates gap this fixes.
+/// A pod's `spec.affinity`. `preferredDuringSchedulingIgnoredDuringExecution`
+/// on `podAffinity`/`podAntiAffinity` is not modeled — it is a soft signal
+/// upstream only weighs during scoring, and this scheduler does no scoring
+/// (same reasoning `NodeAffinity` already documents for its own `preferred`
+/// term).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Affinity {
     node_affinity: Option<NodeAffinity>,
+    pod_affinity: Option<PodAffinity>,
+    pod_anti_affinity: Option<PodAntiAffinity>,
 }
 
 /// A pod's `spec.affinity.nodeAffinity`. Only the `required` term is modeled —
@@ -323,6 +327,68 @@ pub struct NodeSelectorRequirement {
     pub values: Vec<String>,
 }
 
+/// A `metav1.LabelSelector` (`podAffinityTerm.labelSelector`). `matchLabels`
+/// and `matchExpressions` are ANDed together, and — matching real Kubernetes
+/// semantics — a `None` selector matches NO pods (upstream's
+/// `LabelSelectorAsSelector` turns a nil selector into `labels.Nothing()`),
+/// while `Some` with both empty (an explicit `{}`) matches every pod.
+///
+/// `matchExpressions` reuses `NodeSelectorRequirement` rather than a new
+/// near-identical type: `metav1.LabelSelectorRequirement` and
+/// `v1.NodeSelectorRequirement` are wire-identical (`key`/`operator`/
+/// `values`), and `node_selector_requirement_matches` already treats the
+/// operators a label selector can legally use (`In`/`NotIn`/`Exists`/
+/// `DoesNotExist`) correctly — label selectors never use `Gt`/`Lt`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelSelectorSpec {
+    #[serde(default)]
+    pub match_labels: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub match_expressions: Vec<NodeSelectorRequirement>,
+}
+
+/// One `requiredDuringSchedulingIgnoredDuringExecution[]` entry of a
+/// `podAffinity`/`podAntiAffinity`. `namespaceSelector`/`matchLabelKeys`/
+/// `mismatchLabelKeys` are not modeled — narrow refinements of which
+/// namespaces/pods a term matches that the SchedulerPredicates gap this
+/// closes does not exercise. A term relying ONLY on one of them (no
+/// `namespaces`/`labelSelector` doing any of the real work) degrades to
+/// never matching any pod rather than silently matching every pod, the same
+/// fail-closed convention `node_selector_requirement_matches` uses for
+/// `Gt`/`Lt`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodAffinityTerm {
+    pub label_selector: Option<LabelSelectorSpec>,
+    /// Namespace names this term applies to. Empty means "this pod's own
+    /// namespace" — matches upstream's `PodAffinityTerm.Namespaces` default.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    #[serde(default)]
+    pub topology_key: String,
+}
+
+/// A pod's `spec.affinity.podAffinity`. Only the `required` term list is
+/// modeled — see `Affinity`'s doc comment for why `preferred` is out of
+/// scope.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodAffinity {
+    #[serde(default)]
+    pub required_during_scheduling_ignored_during_execution: Vec<PodAffinityTerm>,
+}
+
+/// A pod's `spec.affinity.podAntiAffinity`. Only the `required` term list is
+/// modeled — see `Affinity`'s doc comment for why `preferred` is out of
+/// scope.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodAntiAffinity {
+    #[serde(default)]
+    pub required_during_scheduling_ignored_during_execution: Vec<PodAffinityTerm>,
+}
+
 /// A pod's `spec.tolerations[]` entry.
 ///
 /// `key: None` (with `operator: "Exists"`) tolerates every taint regardless of
@@ -344,10 +410,19 @@ pub struct Toleration {
 }
 
 /// Minimal typed view of a Pod's metadata needed by the scheduler.
+///
+/// `labels` is shared by both consumers of this type: `PodObject` (a pod
+/// being considered for scheduling — its own labels feed the inter-pod
+/// affinity self-match bootstrap case, see `pod_affinity_satisfied`) and
+/// `PreemptionPodListItem` (an already-bound pod `NodeTally` tracks — its
+/// labels are what OTHER pending pods' podAffinity/podAntiAffinity terms
+/// match against).
 #[derive(Debug, Default, Deserialize)]
 struct PodMetadata {
     name: Option<String>,
     namespace: Option<String>,
+    #[serde(default)]
+    labels: std::collections::HashMap<String, String>,
 }
 
 /// A single `status.conditions[]` entry, as needed to read back whatever
@@ -404,6 +479,23 @@ pub struct PendingPod {
     /// The pod's `spec.affinity.nodeAffinity`, if any — gates which nodes it
     /// may be bound to by label, in addition to `node_selector`.
     pub node_affinity: Option<NodeAffinity>,
+    /// The pod's own `metadata.labels` — read by inter-pod affinity's
+    /// self-match bootstrap case (see `pod_affinity_satisfied`), which lets
+    /// the very first replica of a self-referencing podAffinity workload
+    /// (e.g. a StatefulSet whose pods affine to their own selector) actually
+    /// get scheduled instead of waiting forever for a matching pod that can
+    /// never exist until this one is placed.
+    pub labels: std::collections::HashMap<String, String>,
+    /// The pod's `spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution`
+    /// terms (empty if absent) — every term must be satisfied by at least
+    /// one already-tallied pod sharing the term's topology domain, see
+    /// `pod_affinity_satisfied`.
+    pub pod_affinity_terms: Vec<PodAffinityTerm>,
+    /// The pod's `spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution`
+    /// terms (empty if absent) — a node is rejected if ANY already-tallied
+    /// pod matching a term shares that term's topology domain with it, see
+    /// `pod_anti_affinity_satisfied`.
+    pub pod_anti_affinity_terms: Vec<PodAffinityTerm>,
     /// Summed `resources.requests.{cpu,memory,ephemeral-storage}` across the
     /// pod's containers — the NodeResourcesFit predicate's resource dimension.
     pub requests: ResourceRequests,
@@ -476,14 +568,28 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         .metadata
         .namespace
         .unwrap_or_else(|| "default".to_owned());
+    let labels = watch_event.object.metadata.labels;
     let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
     let priority = watch_event.object.spec.priority.unwrap_or(0);
     let tolerations = watch_event.object.spec.tolerations.unwrap_or_default();
-    let node_affinity = watch_event
-        .object
-        .spec
-        .affinity
-        .and_then(|a| a.node_affinity);
+    let affinity = watch_event.object.spec.affinity;
+    let pod_affinity_terms = affinity
+        .as_ref()
+        .and_then(|a| a.pod_affinity.as_ref())
+        .map(|pa| {
+            pa.required_during_scheduling_ignored_during_execution
+                .clone()
+        })
+        .unwrap_or_default();
+    let pod_anti_affinity_terms = affinity
+        .as_ref()
+        .and_then(|a| a.pod_anti_affinity.as_ref())
+        .map(|paa| {
+            paa.required_during_scheduling_ignored_during_execution
+                .clone()
+        })
+        .unwrap_or_default();
+    let node_affinity = affinity.and_then(|a| a.node_affinity);
     let requests = sum_container_requests(&watch_event.object.spec.containers);
     let host_ports = container_host_ports(&watch_event.object.spec.containers);
     let pvc_names = referenced_pvc_names(
@@ -497,6 +603,9 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         priority,
         tolerations,
         node_affinity,
+        labels,
+        pod_affinity_terms,
+        pod_anti_affinity_terms,
         requests,
         host_ports,
         pvc_names,
@@ -1050,16 +1159,19 @@ struct PreemptionPodListItem {
 }
 
 /// One pod's contribution to `NodeTally`: which node it currently occupies a
-/// slot on, its priority (preemption eligibility), its resource requests, and
-/// its hostPort claims.
+/// slot on, its namespace/labels (what an inter-pod affinity/anti-affinity
+/// term matches against), its priority (preemption eligibility), its
+/// resource requests, and its hostPort claims.
 ///
 /// Populated both by `apply_event` (a real watch event carries the pod's full
-/// `spec.containers`) and by `assume`'s fast path (the pending pod's own
-/// already-computed `host_ports`) — see `NodeTally::assume`'s doc comment for
-/// why the latter matters.
+/// `metadata`/`spec.containers`) and by `assume`'s fast path (the pending
+/// pod's own already-computed `labels`/`host_ports`) — see `NodeTally::assume`'s
+/// doc comment for why the latter matters.
 #[derive(Debug, Clone)]
 struct TalliedPod {
     node_name: String,
+    namespace: String,
+    labels: std::collections::HashMap<String, String>,
     priority: i32,
     requests: ResourceRequests,
     host_ports: Vec<HostPortClaim>,
@@ -1210,6 +1322,7 @@ impl NodeTally {
             .metadata
             .namespace
             .unwrap_or_else(|| "default".to_owned());
+        let labels = watch_event.object.metadata.labels;
         let key = format!("{namespace}/{name}");
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
@@ -1230,6 +1343,8 @@ impl NodeTally {
                     key,
                     TalliedPod {
                         node_name,
+                        namespace,
+                        labels,
                         priority,
                         requests,
                         host_ports,
@@ -1270,15 +1385,16 @@ impl NodeTally {
     /// called the instant the scheduler decides to bind, before the bind's
     /// HTTP call even completes. `remove` undoes this if the bind then fails.
     ///
-    /// `host_ports` — like `requests` — is the pending pod's own
-    /// already-computed value at decision time, not something read back from
-    /// a watch event: without it, a hostPort a scheduling decision just
+    /// `host_ports`/`labels` — like `requests` — are the pending pod's own
+    /// already-computed values at decision time, not something read back from
+    /// a watch event: without them, a hostPort a scheduling decision just
     /// reserved on `node_name` would stay invisible to `usage_by_node`/the
-    /// NodePorts filter for every OTHER concurrent decision until the real
-    /// bind's watch event round-tripped through `apply_event` — the same
-    /// read-after-write race `requests` already closes for cpu/memory (see
-    /// this struct's doc comment), left open for hostPorts until now only
-    /// because widening this signature required a coordinated `main.rs` edit.
+    /// NodePorts filter, and this pod's labels would stay invisible to
+    /// inter-pod affinity/anti-affinity, for every OTHER concurrent decision
+    /// until the real bind's watch event round-tripped through `apply_event`
+    /// — the same read-after-write race `requests` already closes for
+    /// cpu/memory (see this struct's doc comment).
+    #[allow(clippy::too_many_arguments)]
     pub fn assume(
         &mut self,
         namespace: &str,
@@ -1287,11 +1403,14 @@ impl NodeTally {
         priority: i32,
         requests: ResourceRequests,
         host_ports: Vec<HostPortClaim>,
+        labels: std::collections::HashMap<String, String>,
     ) {
         self.pods.insert(
             format!("{namespace}/{pod_name}"),
             TalliedPod {
                 node_name: node_name.to_owned(),
+                namespace: namespace.to_owned(),
+                labels,
                 priority,
                 requests,
                 host_ports,
@@ -1417,6 +1536,40 @@ impl NodeTally {
             })
             .collect()
     }
+
+    /// Namespace/labels/node of every tallied pod, cluster-wide — the input
+    /// `pod_affinity_satisfied`/`pod_anti_affinity_satisfied` need to check a
+    /// pending pod's required podAffinity/podAntiAffinity terms against pods
+    /// scheduled ANYWHERE in the cluster, not just on one candidate node,
+    /// since a term's topology domain can span multiple nodes (e.g. every
+    /// node in a zone).
+    ///
+    /// Unlike `pods_on`, does NOT exclude pods claimed by an in-flight
+    /// preemption plan (`reserved_victims`): such a pod is still physically
+    /// running until its eviction is actually confirmed, so it must keep
+    /// counting for affinity/anti-affinity purposes exactly like
+    /// `usage_by_node` keeps counting it for resource capacity — only the
+    /// preemption search itself (`pods_on`) needs to hide it from other
+    /// concurrent plans.
+    pub fn tallied_pod_labels(&self) -> Vec<TalliedPodLabels> {
+        self.pods
+            .values()
+            .map(|p| TalliedPodLabels {
+                node_name: p.node_name.clone(),
+                namespace: p.namespace.clone(),
+                labels: p.labels.clone(),
+            })
+            .collect()
+    }
+}
+
+/// One tallied pod's namespace/labels, keyed by which node it occupies — see
+/// `NodeTally::tallied_pod_labels`.
+#[derive(Debug, Clone)]
+pub struct TalliedPodLabels {
+    pub node_name: String,
+    pub namespace: String,
+    pub labels: std::collections::HashMap<String, String>,
 }
 
 /// Return true when `node` is eligible to host `pod` at all, independent of
@@ -1560,7 +1713,9 @@ pub fn host_ports_fit(node_ports: &[HostPortClaim], pod_ports: &[HostPortClaim])
 }
 
 /// Among every node in `list` that qualifies for `pod` (see
-/// `node_qualifies_for_pod`) AND has at least one free pod slot AND enough
+/// `node_qualifies_for_pod`) AND satisfies `pod`'s required podAffinity/
+/// podAntiAffinity terms against `tallied_pods` (see
+/// `InterPodAffinityContext`) AND has at least one free pod slot AND enough
 /// uncommitted cpu/memory/ephemeral-storage/extended resources to fit
 /// `pod.requests` (NodeResourcesFit) AND has no hostPort conflict with
 /// `pod.host_ports` (NodePorts — see `host_ports_fit`), select the LEAST
@@ -1599,13 +1754,30 @@ pub fn select_node_with_capacity(
     list: NodeList,
     pod: &PendingPod,
     node_usage: &std::collections::HashMap<String, NodeUsage>,
+    tallied_pods: &[TalliedPodLabels],
 ) -> anyhow::Result<String> {
+    // Built once, up front, from the full node list — `list.items` is
+    // consumed piecemeal by the `.into_iter().filter(...)` below, so every
+    // OTHER node's labels (needed to resolve a tallied pod's topology
+    // domain) must be captured before that starts.
+    let node_labels_by_name: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = list
+        .items
+        .iter()
+        .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+        .collect();
+    let affinity_ctx = InterPodAffinityContext::build(pod, tallied_pods, &node_labels_by_name);
     let usage_of = |name: &str| node_usage.get(name).cloned().unwrap_or_default();
     let candidates: Vec<NodeItem> = list
         .items
         .into_iter()
         .filter(|n| {
             if !node_qualifies_for_pod(n, pod) {
+                return false;
+            }
+            if !affinity_ctx.node_qualifies(&n.metadata.labels) {
                 return false;
             }
             let usage = usage_of(&n.metadata.name);
@@ -1889,6 +2061,211 @@ pub fn node_affinity_matches(
     )
 }
 
+/// Return true when `labels` satisfies `selector`. Mirrors upstream's
+/// `metav1.LabelSelectorAsSelector`: a `None` selector matches NOTHING (the
+/// "nil labelSelector" case), while `Some` with both `matchLabels` and
+/// `matchExpressions` empty matches EVERYTHING — these are opposite
+/// defaults, so they cannot be collapsed into one "empty means match-all"
+/// rule the way `node_selector_matches`'s bare map can.
+fn label_selector_matches(
+    labels: &std::collections::HashMap<String, String>,
+    selector: Option<&LabelSelectorSpec>,
+) -> bool {
+    let Some(selector) = selector else {
+        return false;
+    };
+    selector
+        .match_labels
+        .iter()
+        .all(|(k, v)| labels.get(k) == Some(v))
+        && selector
+            .match_expressions
+            .iter()
+            .all(|req| node_selector_requirement_matches(labels, req))
+}
+
+/// Return true when `candidate_namespace` is one of the namespaces
+/// `term_namespaces` applies to. An empty `term_namespaces` means "this
+/// pod's own namespace" (`pod_namespace`) — matches upstream's
+/// `PodAffinityTerm.Namespaces` default.
+fn term_namespace_matches(
+    term_namespaces: &[String],
+    pod_namespace: &str,
+    candidate_namespace: &str,
+) -> bool {
+    if term_namespaces.is_empty() {
+        candidate_namespace == pod_namespace
+    } else {
+        term_namespaces.iter().any(|n| n == candidate_namespace)
+    }
+}
+
+/// Return true when a pod with `candidate_namespace`/`candidate_labels`
+/// satisfies `term`, evaluated relative to `pod_namespace` (the pending
+/// pod's own namespace — what an empty `term.namespaces` falls back to).
+/// Shared by `topology_pairs_matched_by_terms` (checking already-tallied
+/// pods) and the self-match bootstrap case in `pod_affinity_satisfied`
+/// (checking the pending pod against its own terms).
+fn pod_matches_affinity_term(
+    term: &PodAffinityTerm,
+    pod_namespace: &str,
+    candidate_namespace: &str,
+    candidate_labels: &std::collections::HashMap<String, String>,
+) -> bool {
+    term_namespace_matches(&term.namespaces, pod_namespace, candidate_namespace)
+        && label_selector_matches(candidate_labels, term.label_selector.as_ref())
+}
+
+/// For each `(topologyKey, topologyValue)` pair some node currently carries,
+/// whether at least one pod in `tallied` — anywhere in the cluster, not just
+/// on that node — matches one of `terms` AND occupies a node with that
+/// pair. Built once per scheduling decision (the pending pod's own required
+/// terms and the current tally do not change while candidate nodes are being
+/// evaluated for THIS pod), not once per candidate node — mirrors upstream's
+/// PreFilter-computed `topologyToMatchedTermCount`, just recomputed fresh
+/// each time instead of incrementally maintained across a whole Filter pass.
+fn topology_pairs_matched_by_terms(
+    terms: &[PodAffinityTerm],
+    pod_namespace: &str,
+    tallied: &[TalliedPodLabels],
+    node_labels_by_name: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
+) -> std::collections::HashSet<(String, String)> {
+    let mut matched = std::collections::HashSet::new();
+    for term in terms {
+        if term.topology_key.is_empty() {
+            continue;
+        }
+        for p in tallied {
+            if !pod_matches_affinity_term(term, pod_namespace, &p.namespace, &p.labels) {
+                continue;
+            }
+            if let Some(value) = node_labels_by_name
+                .get(&p.node_name)
+                .and_then(|labels| labels.get(&term.topology_key))
+            {
+                matched.insert((term.topology_key.clone(), value.clone()));
+            }
+        }
+    }
+    matched
+}
+
+/// Return true when `node_labels` satisfies every one of `pod`'s required
+/// podAffinity terms — each term requires that, within the topology domain
+/// (the set of nodes sharing `term.topologyKey`'s value) `node_labels`
+/// belongs to, `matched` records at least one already-tallied pod matching
+/// the term. A node missing `term.topologyKey` entirely fails the term
+/// outright (mirrors upstream: "all topology labels must exist on the
+/// node" — there is no domain to test membership in).
+///
+/// The self-match rescue mirrors upstream's `satisfyPodAffinity`: if
+/// LITERALLY NO pod anywhere in the cluster matches any of `pod`'s terms
+/// (`matched` empty overall, not just empty for this node's domain) AND
+/// `pod`'s own labels/namespace would satisfy every one of its own terms,
+/// every node carrying the required topology labels is admitted. Without
+/// this, the very first replica of a self-referencing podAffinity workload
+/// (e.g. a StatefulSet whose pods affine to their own selector) could never
+/// be scheduled — no other matching pod can ever exist until this one is
+/// placed somewhere.
+fn pod_affinity_satisfied(
+    pod: &PendingPod,
+    node_labels: &std::collections::HashMap<String, String>,
+    matched: &std::collections::HashSet<(String, String)>,
+) -> bool {
+    if pod.pod_affinity_terms.is_empty() {
+        return true;
+    }
+    let mut all_terms_have_a_match = true;
+    for term in &pod.pod_affinity_terms {
+        let Some(value) = node_labels.get(&term.topology_key) else {
+            return false;
+        };
+        if !matched.contains(&(term.topology_key.clone(), value.clone())) {
+            all_terms_have_a_match = false;
+        }
+    }
+    if all_terms_have_a_match {
+        return true;
+    }
+    matched.is_empty()
+        && pod.pod_affinity_terms.iter().all(|term| {
+            pod_matches_affinity_term(term, &pod.namespace, &pod.namespace, &pod.labels)
+        })
+}
+
+/// Return true when `node_labels` satisfies every one of `pod`'s required
+/// podAntiAffinity terms — a term is violated (node rejected) when `matched`
+/// records an already-tallied pod sharing `node_labels`'s value for
+/// `term.topologyKey`. Unlike `pod_affinity_satisfied`, a node missing
+/// `term.topologyKey` entirely satisfies that term (no domain, so nothing to
+/// conflict with) rather than failing it — mirrors upstream's
+/// `satisfyPodAntiAffinity`, which only checks a term when the node actually
+/// carries the topology label.
+fn pod_anti_affinity_satisfied(
+    pod: &PendingPod,
+    node_labels: &std::collections::HashMap<String, String>,
+    matched: &std::collections::HashSet<(String, String)>,
+) -> bool {
+    pod.pod_anti_affinity_terms.iter().all(|term| {
+        node_labels
+            .get(&term.topology_key)
+            .is_none_or(|value| !matched.contains(&(term.topology_key.clone(), value.clone())))
+    })
+}
+
+/// Cluster-wide state for evaluating one pending pod's required podAffinity/
+/// podAntiAffinity terms against every candidate node in a single scheduling
+/// decision, built ONCE (not once per candidate node) via `build` — see
+/// `topology_pairs_matched_by_terms`'s doc comment for why that's safe.
+///
+/// Deliberately does NOT implement upstream's "existing pod's own
+/// anti-affinity blocks the incoming pod" (symmetric) direction —
+/// `ErrReasonExistingAntiAffinityRulesNotMatch` in upstream's
+/// `interpodaffinity/filtering.go` — which would require tallying every
+/// scheduled pod's OWN required anti-affinity terms, not just its labels.
+/// Only the incoming pod's own terms, matched against already-tallied pods,
+/// are enforced.
+struct InterPodAffinityContext<'a> {
+    pod: &'a PendingPod,
+    affinity_matched: std::collections::HashSet<(String, String)>,
+    anti_affinity_matched: std::collections::HashSet<(String, String)>,
+}
+
+impl<'a> InterPodAffinityContext<'a> {
+    fn build(
+        pod: &'a PendingPod,
+        tallied: &[TalliedPodLabels],
+        node_labels_by_name: &std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        >,
+    ) -> Self {
+        Self {
+            pod,
+            affinity_matched: topology_pairs_matched_by_terms(
+                &pod.pod_affinity_terms,
+                &pod.namespace,
+                tallied,
+                node_labels_by_name,
+            ),
+            anti_affinity_matched: topology_pairs_matched_by_terms(
+                &pod.pod_anti_affinity_terms,
+                &pod.namespace,
+                tallied,
+                node_labels_by_name,
+            ),
+        }
+    }
+
+    fn node_qualifies(&self, node_labels: &std::collections::HashMap<String, String>) -> bool {
+        pod_affinity_satisfied(self.pod, node_labels, &self.affinity_matched)
+            && pod_anti_affinity_satisfied(self.pod, node_labels, &self.anti_affinity_matched)
+    }
+}
+
 /// Return true when `toleration` tolerates `taint`, mirroring Kubernetes'
 /// `Toleration.ToleratesTaint`: an empty `key` only ever matches when paired
 /// with `operator: Exists` (the "tolerate everything" wildcard); otherwise the
@@ -2073,11 +2450,16 @@ fn select_and_reserve_node(
 ) -> Result<String, PickNodeError> {
     let candidates = list.items.len();
     let mut tally_guard = tally.lock().expect("tally lock poisoned");
-    let node =
-        select_node_with_capacity(list, pod, &tally_guard.usage_by_node()).map_err(|_| {
-            debug!(pod = %pod.pod_name, candidates, "pick_node: no node had capacity");
-            PickNodeError::NoCapacity
-        })?;
+    let node = select_node_with_capacity(
+        list,
+        pod,
+        &tally_guard.usage_by_node(),
+        &tally_guard.tallied_pod_labels(),
+    )
+    .map_err(|_| {
+        debug!(pod = %pod.pod_name, candidates, "pick_node: no node had capacity");
+        PickNodeError::NoCapacity
+    })?;
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
@@ -2085,6 +2467,7 @@ fn select_and_reserve_node(
         pod.priority,
         pod.requests.clone(),
         pod.host_ports.clone(),
+        pod.labels.clone(),
     );
     Ok(node)
 }
@@ -2198,10 +2581,26 @@ pub async fn find_preemption_plan(
         )));
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+    let node_labels_by_name: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = list
+        .items
+        .iter()
+        .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+        .collect();
+    let tallied_pods = tally
+        .lock()
+        .expect("tally lock poisoned")
+        .tallied_pod_labels();
+    let affinity_ctx = InterPodAffinityContext::build(pod, &tallied_pods, &node_labels_by_name);
 
     let mut best: Option<(usize, PreemptionPlan)> = None;
     for (index, node) in list.items.iter().enumerate() {
         if !node_qualifies_for_pod(node, pod) {
+            continue;
+        }
+        if !affinity_ctx.node_qualifies(&node.metadata.labels) {
             continue;
         }
         let capacity = pod_count_capacity(node);
@@ -2318,6 +2717,7 @@ fn verify_and_reserve_preemption(
         pod.priority,
         pod.requests.clone(),
         pod.host_ports.clone(),
+        pod.labels.clone(),
     );
     // Claim the victims under this SAME lock acquisition, not a later one —
     // otherwise a fresher concurrent plan's search could still see them as
@@ -4977,13 +5377,173 @@ mod tests {
             // least-loaded candidate by pod count alone.
         ]
         .into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_ne!(
             result.ok(),
             Some("cordoned-empty".to_owned()),
             "the cordoned node must never be selected even though it has the \
              fewest pods — picking it here is the exact mechanism that caused \
              the 0806-1102 deterministic conformance failure"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // InterPodAffinity Filter: spec.affinity.podAffinity/podAntiAffinity's
+    // requiredDuringSchedulingIgnoredDuringExecution terms. Before this fix,
+    // crates/scheduler had zero matching logic for either field — a pod
+    // declaring "only run me next to X" or "never run me next to Y" was
+    // scheduled as if it had no affinity constraints at all, silently
+    // ignoring the user's explicit co-location/anti-co-location intent.
+    // ---------------------------------------------------------------------------
+
+    /// A required podAffinity/podAntiAffinity term restricted to `topology_key`,
+    /// matching any already-tallied pod whose labels satisfy `match_labels`.
+    fn podaffinity_term(topology_key: &str, match_labels: &[(&str, &str)]) -> PodAffinityTerm {
+        PodAffinityTerm {
+            label_selector: Some(LabelSelectorSpec {
+                match_labels: match_labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                match_expressions: Vec::new(),
+            }),
+            namespaces: Vec::new(),
+            topology_key: topology_key.to_owned(),
+        }
+    }
+
+    /// An already-tallied pod occupying `node_name`, for `tallied_pods`.
+    fn tallied(node_name: &str, namespace: &str, labels: &[(&str, &str)]) -> TalliedPodLabels {
+        TalliedPodLabels {
+            node_name: node_name.to_owned(),
+            namespace: namespace.to_owned(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// A required podAffinity term must admit a node sharing the topology
+    /// domain (here, `zone`) with an already-tallied pod matching the term,
+    /// and reject a node in a DIFFERENT domain even though it is otherwise
+    /// unconstrained — this is what lets a pod declare "co-locate me with
+    /// the cache tier" and have it actually enforced, not just parsed.
+    #[test]
+    fn interpodaffinity_filter_admits_node_when_required_affinity_pod_present_because_that_is_the_placement_intent(
+    ) {
+        let list = NodeList {
+            items: vec![
+                make_node("worker-same-zone", &[("zone", "a")]),
+                make_node("worker-other-zone", &[("zone", "b")]),
+            ],
+        };
+        let mut pod = empty_pending_pod();
+        pod.pod_affinity_terms = vec![podaffinity_term("zone", &[("app", "cache")])];
+        let tallied_pods = [tallied("worker-same-zone", "default", &[("app", "cache")])];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert_eq!(
+            result.ok(),
+            Some("worker-same-zone".to_owned()),
+            "the only node sharing the matching pod's topology domain must be \
+             selected — picking the other zone (or failing outright) means \
+             podAffinity is parsed but never actually enforced"
+        );
+    }
+
+    /// A required podAffinity term with no matching pod ANYWHERE in the
+    /// cluster, and whose own labels do not satisfy its own term either,
+    /// must reject every node — otherwise a pod that explicitly asked to be
+    /// co-located with a specific workload gets bound wherever, defeating
+    /// the whole point of declaring the constraint.
+    #[test]
+    fn interpodaffinity_filter_rejects_node_when_required_affinity_pod_absent_because_placement_intent_is_unmet(
+    ) {
+        let list = NodeList {
+            items: vec![make_node("worker-0", &[("zone", "a")])],
+        };
+        let mut pod = empty_pending_pod();
+        pod.pod_affinity_terms = vec![podaffinity_term("zone", &[("app", "cache")])];
+        // No tallied pods anywhere, and the pod's own labels (empty) do not
+        // match its own term either — so the self-match bootstrap case
+        // (see `pod_affinity_satisfied`) must not rescue this node.
+        let result = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
+        assert!(
+            result.is_err(),
+            "with no matching pod anywhere and the pod itself not matching its \
+             own term, every node must be rejected — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// The self-match bootstrap case: when NO pod anywhere matches a
+    /// required podAffinity term, but the pending pod's OWN labels satisfy
+    /// its own term, every node carrying the topology label is admitted.
+    /// Without this, the very first replica of a self-referencing
+    /// podAffinity workload (e.g. a StatefulSet whose pods affine to their
+    /// own selector) could never be scheduled — no other matching pod can
+    /// ever exist until this one is placed somewhere.
+    #[test]
+    fn interpodaffinity_filter_admits_first_self_affinity_pod_when_no_matching_pod_exists_yet_because_the_workload_would_otherwise_never_bootstrap(
+    ) {
+        let list = NodeList {
+            items: vec![make_node("worker-0", &[("zone", "a")])],
+        };
+        let mut pod = empty_pending_pod();
+        pod.labels = [("app".to_owned(), "cache".to_owned())].into();
+        pod.pod_affinity_terms = vec![podaffinity_term("zone", &[("app", "cache")])];
+        let result = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
+        assert_eq!(
+            result.ok(),
+            Some("worker-0".to_owned()),
+            "the first self-affinity pod must be admitted when it would satisfy \
+             its own term once placed — otherwise a self-referencing workload \
+             (e.g. a StatefulSet affining to its own selector) can never bootstrap"
+        );
+    }
+
+    /// A required podAntiAffinity term must reject a node sharing the
+    /// topology domain with an already-tallied pod matching the term — this
+    /// is what lets a pod declare "never run me next to another replica of
+    /// myself" and have it actually enforced.
+    #[test]
+    fn interpodaffinity_filter_rejects_node_when_required_antiaffinity_pod_exists_because_placement_would_violate_user_placement_rule(
+    ) {
+        let list = NodeList {
+            items: vec![make_node("worker-0", &[("zone", "a")])],
+        };
+        let mut pod = empty_pending_pod();
+        pod.pod_anti_affinity_terms = vec![podaffinity_term("zone", &[("app", "cache")])];
+        let tallied_pods = [tallied("worker-0", "default", &[("app", "cache")])];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert!(
+            result.is_err(),
+            "the only node shares the anti-affinity term's topology domain with \
+             a matching pod, so it must be rejected — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// A required podAntiAffinity term with no matching pod anywhere must
+    /// admit the node — the positive control proving the anti-affinity
+    /// Filter does not reject every node unconditionally, only ones that
+    /// actually violate the constraint.
+    #[test]
+    fn interpodaffinity_filter_admits_node_when_required_antiaffinity_pod_absent_because_no_placement_conflict_exists(
+    ) {
+        let list = NodeList {
+            items: vec![make_node("worker-0", &[("zone", "a")])],
+        };
+        let mut pod = empty_pending_pod();
+        pod.pod_anti_affinity_terms = vec![podaffinity_term("zone", &[("app", "cache")])];
+        let result = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
+        assert_eq!(
+            result.ok(),
+            Some("worker-0".to_owned()),
+            "with no matching pod anywhere, the anti-affinity term has nothing \
+             to conflict with, so the node must still be admitted"
         );
     }
 
@@ -5077,7 +5637,7 @@ mod tests {
             ("lima-node-3".to_owned(), usage_with_pod_count(0)),
         ]
         .into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_eq!(
             result.ok(),
             Some("lima-node".to_owned()),
@@ -5143,7 +5703,7 @@ mod tests {
         let list = NodeList { items: vec![node] };
         let pod = empty_pending_pod();
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_err(),
             "a NoSchedule-tainted node with no matching toleration must be skipped \
@@ -5162,7 +5722,7 @@ mod tests {
         let mut pod = empty_pending_pod();
         pod.tolerations = vec![toleration("dedicated", "gpu", "NoSchedule")];
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_eq!(
             result.unwrap(),
             "tainted-node",
@@ -5362,7 +5922,7 @@ mod tests {
             match_fields: vec![],
         }]));
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_err(),
             "a node whose labels satisfy no required nodeAffinity term must be \
@@ -5383,7 +5943,7 @@ mod tests {
             match_fields: vec![],
         }]));
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_eq!(
             result.unwrap(),
             "worker-0",
@@ -5412,7 +5972,7 @@ mod tests {
             match_fields: vec![requirement("metadata.name", "In", &["node-b"])],
         }]));
         let counts: std::collections::HashMap<String, NodeUsage> = Default::default();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_eq!(
             result.unwrap(),
             "node-b",
@@ -5499,6 +6059,9 @@ mod tests {
             priority: 0,
             tolerations: Vec::new(),
             node_affinity: None,
+            labels: Default::default(),
+            pod_affinity_terms: Vec::new(),
+            pod_anti_affinity_terms: Vec::new(),
             requests: ResourceRequests::default(),
             host_ports: Vec::new(),
             pvc_names: Vec::new(),
@@ -5520,7 +6083,7 @@ mod tests {
         // Node already has 110 pods — at capacity.
         let counts: std::collections::HashMap<String, NodeUsage> =
             [("worker-0".to_owned(), usage_with_pod_count(110))].into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_err(),
             "a node at pod capacity must return Err so the pod stays Pending, \
@@ -5542,7 +6105,7 @@ mod tests {
         // Node has 109 pods — one slot free.
         let counts: std::collections::HashMap<String, NodeUsage> =
             [("worker-0".to_owned(), usage_with_pod_count(109))].into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_ok(),
             "a node with a free slot must be selected — if this fails, scheduling is \
@@ -5567,7 +6130,7 @@ mod tests {
             ("worker-free".to_owned(), usage_with_pod_count(50)),
         ]
         .into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_ok(),
             "must pick worker-free when worker-full is at capacity"
@@ -5598,7 +6161,7 @@ mod tests {
             ("worker-idle".to_owned(), usage_with_pod_count(1)),
         ]
         .into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_eq!(
             result.unwrap(),
             "worker-idle",
@@ -5634,7 +6197,7 @@ mod tests {
             };
             let pod = empty_pending_pod(); // BestEffort: zero cpu/memory/ephemeral requests
             let usage = tally.usage_by_node();
-            let chosen = select_node_with_capacity(list, &pod, &usage)
+            let chosen = select_node_with_capacity(list, &pod, &usage, &[])
                 .unwrap_or_else(|e| panic!("pod {i} failed to schedule: {e}"));
             tally.assume(
                 "default",
@@ -5643,6 +6206,7 @@ mod tests {
                 0,
                 ResourceRequests::default(),
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
         }
 
@@ -5678,7 +6242,7 @@ mod tests {
             ("worker-1".to_owned(), usage_with_pod_count(110)),
         ]
         .into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_err(),
             "all nodes full must return Err so the pod stays Pending, not be bound \
@@ -5698,7 +6262,7 @@ mod tests {
         let pod = empty_pending_pod();
         let counts: std::collections::HashMap<String, NodeUsage> =
             [("worker-0".to_owned(), usage_with_pod_count(999))].into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_ok(),
             "a node with unknown capacity (empty string) must not be blocked — \
@@ -5815,6 +6379,7 @@ mod tests {
             0,
             requests(5600, 0, 0),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -5825,7 +6390,7 @@ mod tests {
         pod.requests.cpu_milli = 4000; // 5600 (tallied) + 4000 > 8000 allocatable
 
         let usage = tally.usage_by_node();
-        let result = select_node_with_capacity(list, &pod, &usage);
+        let result = select_node_with_capacity(list, &pod, &usage, &[]);
 
         assert!(
             result.is_err(),
@@ -5930,6 +6495,7 @@ mod tests {
                 0,
                 requests(1000, 0, 0),
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
             guard.assume(
                 "default",
@@ -5938,6 +6504,7 @@ mod tests {
                 0,
                 requests(1000, 0, 0),
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
         }
 
@@ -6013,6 +6580,7 @@ mod tests {
                     100,
                     requests(1000, 0, 0),
                     Vec::new(),
+                    std::collections::HashMap::new(),
                 );
             }
         }
@@ -6122,6 +6690,7 @@ mod tests {
                 100,
                 requests(1000, 0, 0),
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
             guard.assume(
                 "default",
@@ -6130,6 +6699,7 @@ mod tests {
                 100,
                 requests(1000, 0, 0),
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
         }
         // Saturated by the two fillers — the first plan needs to evict
@@ -6192,6 +6762,7 @@ mod tests {
             100,
             requests(1000, 0, 0),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         let mut node = make_node_with_capacity("worker-0", &[], "110");
@@ -6224,6 +6795,7 @@ mod tests {
             100,
             requests(1000, 0, 0),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         // Now saturated by preemptor-1 + the recreated filler-a; a second
@@ -6267,6 +6839,7 @@ mod tests {
             0,
             requests(8000, 0, 0),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
         tally.remove("default", "filler");
 
@@ -6277,7 +6850,7 @@ mod tests {
         pod.requests.cpu_milli = 4000;
 
         let usage = tally.usage_by_node();
-        let result = select_node_with_capacity(list, &pod, &usage);
+        let result = select_node_with_capacity(list, &pod, &usage, &[]);
         assert!(
             result.is_ok(),
             "removing the filler pod's reservation must free its 8000m cpu — \
@@ -6330,6 +6903,7 @@ mod tests {
             1000,
             requests(1000, 0, 0),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         // Mirrors the nominatedNodeName status PATCH's watch-echo: same pod,
@@ -6485,7 +7059,7 @@ mod tests {
         usage.host_ports = vec![host_port_claim(54322, "", "TCP")];
         let counts: std::collections::HashMap<String, NodeUsage> =
             [("worker-0".to_owned(), usage)].into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert!(
             result.is_err(),
             "a node already holding a wildcard-hostIP claim on the pending \
@@ -6513,7 +7087,7 @@ mod tests {
         usage.host_ports = vec![host_port_claim(54321, "10.0.0.5", "TCP")];
         let counts: std::collections::HashMap<String, NodeUsage> =
             [("worker-0".to_owned(), usage)].into();
-        let result = select_node_with_capacity(list, &pod, &counts);
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
         assert_eq!(
             result.unwrap(),
             "worker-0",
@@ -6547,8 +7121,13 @@ mod tests {
         let mut pod_a = empty_pending_pod();
         pod_a.pod_name = "pod-a".to_owned();
         pod_a.host_ports = vec![host_port_claim(8080, "", "TCP")];
-        let chosen = select_node_with_capacity(list(), &pod_a, &tally.usage_by_node())
-            .expect("pod-a has no competing claim yet, so it must schedule");
+        let chosen = select_node_with_capacity(
+            list(),
+            &pod_a,
+            &tally.usage_by_node(),
+            &tally.tallied_pod_labels(),
+        )
+        .expect("pod-a has no competing claim yet, so it must schedule");
         tally.assume(
             "default",
             "pod-a",
@@ -6556,6 +7135,7 @@ mod tests {
             0,
             ResourceRequests::default(),
             pod_a.host_ports.clone(),
+            pod_a.labels.clone(),
         );
 
         // No `apply_event` call in between — pod-b's decision must not need
@@ -6563,7 +7143,12 @@ mod tests {
         let mut pod_b = empty_pending_pod();
         pod_b.pod_name = "pod-b".to_owned();
         pod_b.host_ports = vec![host_port_claim(8080, "", "TCP")];
-        let result = select_node_with_capacity(list(), &pod_b, &tally.usage_by_node());
+        let result = select_node_with_capacity(
+            list(),
+            &pod_b,
+            &tally.usage_by_node(),
+            &tally.tallied_pod_labels(),
+        );
 
         assert!(
             result.is_err(),
@@ -6734,6 +7319,7 @@ mod tests {
             1000,
             ResourceRequests::default(),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
         tally.register_preemption_waiter(
             preemptor,
@@ -6866,6 +7452,7 @@ mod tests {
             1000,
             pod.requests.clone(),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         // Baseline: with nothing else on the node, the reservation still
@@ -6885,6 +7472,7 @@ mod tests {
             0,
             requests(1000, 0, 0),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         assert!(
@@ -7177,7 +7765,7 @@ mod tests {
             },
         )]
         .into();
-        let result = select_node_with_capacity(list, &pod, &usage);
+        let result = select_node_with_capacity(list, &pod, &usage, &[]);
         assert!(
             result.is_err(),
             "a node with free pod-count capacity but no free cpu must still be \
@@ -7204,7 +7792,7 @@ mod tests {
             },
         )]
         .into();
-        let result = select_node_with_capacity(list, &pod, &usage);
+        let result = select_node_with_capacity(list, &pod, &usage, &[]);
         assert_eq!(
             result.unwrap(),
             "worker-0",
