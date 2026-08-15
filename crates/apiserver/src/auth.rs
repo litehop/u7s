@@ -1136,6 +1136,75 @@ where
                     }
                 }
 
+                // Impersonate-Uid — same authorization pattern as User/Group above, but
+                // against the "uids" resource in authentication.k8s.io (matching upstream's
+                // WithImpersonation filter). Without this, a caller using
+                // rest.Config.Impersonate.UID (e.g. the SelfSubjectReview e2e test) would
+                // have its requested UID silently dropped instead of round-tripping.
+                let impersonate_uid = req
+                    .headers()
+                    .get("Impersonate-Uid")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_owned());
+                if let Some(ref uid) = impersonate_uid {
+                    if !rbac_index.is_allowed(&AuthzRequest {
+                        username: &authenticated_user.username,
+                        groups: &authenticated_user.groups,
+                        verb: "impersonate",
+                        api_group: "authentication.k8s.io",
+                        resource: "uids",
+                        subresource: "",
+                        namespace: None,
+                        name: Some(uid),
+                        non_resource_url: None,
+                    }) {
+                        return Ok(forbidden_response(
+                            &authenticated_user.username,
+                            "impersonate",
+                            uid,
+                        ));
+                    }
+                }
+
+                // Impersonate-Extra-<key> — one repeatable header per key (client-go emits a
+                // separate header instance per value). Each key's subresource on "userextras"
+                // is authorized per value, mirroring upstream. Header names from the http crate
+                // are always lowercase, so the prefix match below is case-insensitive for free.
+                let mut impersonate_extra: HashMap<String, Vec<String>> = HashMap::new();
+                for (name, value) in req.headers().iter() {
+                    let Some(key) = name.as_str().strip_prefix("impersonate-extra-") else {
+                        continue;
+                    };
+                    let Ok(v) = value.to_str() else {
+                        continue;
+                    };
+                    impersonate_extra
+                        .entry(key.to_owned())
+                        .or_default()
+                        .push(v.to_owned());
+                }
+                for (key, values) in &impersonate_extra {
+                    for value in values {
+                        if !rbac_index.is_allowed(&AuthzRequest {
+                            username: &authenticated_user.username,
+                            groups: &authenticated_user.groups,
+                            verb: "impersonate",
+                            api_group: "authentication.k8s.io",
+                            resource: "userextras",
+                            subresource: key,
+                            namespace: None,
+                            name: Some(value),
+                            non_resource_url: None,
+                        }) {
+                            return Ok(forbidden_response(
+                                &authenticated_user.username,
+                                "impersonate",
+                                value,
+                            ));
+                        }
+                    }
+                }
+
                 // All impersonation checks passed — substitute impersonated identity.
                 // If the caller supplied explicit groups, use them verbatim.
                 // If no groups were provided, add system:authenticated as Kubernetes does.
@@ -1147,9 +1216,9 @@ where
 
                 UserInfo {
                     username: impersonate_user,
-                    uid: String::new(),
+                    uid: impersonate_uid.unwrap_or_default(),
                     groups,
-                    extra: HashMap::new(),
+                    extra: impersonate_extra,
                 }
             } else {
                 authenticated_user
@@ -3286,6 +3355,168 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "caller without impersonate verb must get 403 — \
              failing this would allow any authenticated user to escalate to cluster-admin"
+        );
+    }
+
+    /// ClusterRole granting `impersonate` on `users`/`groups` (core group) AND
+    /// `uids`/`userextras` (authentication.k8s.io), bound to alice — the superset needed
+    /// to exercise full Impersonate-Uid / Impersonate-Extra-* substitution.
+    fn make_rbac_with_full_impersonation() -> Arc<RbacIndex> {
+        let idx = Arc::new(RbacIndex::new());
+
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/full-impersonator";
+        let role_val = serde_json::json!({
+            "rules": [
+                { "apiGroups": [""], "resources": ["users", "groups"], "verbs": ["impersonate"] },
+                { "apiGroups": ["authentication.k8s.io"], "resources": ["uids", "userextras/*"], "verbs": ["impersonate"] }
+            ]
+        });
+        idx.apply_object(role_key, &role_val);
+
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-full-impersonator";
+        let bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "alice" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "full-impersonator"
+            }
+        });
+        idx.apply_object(bind_key, &bind_val);
+
+        // bob is the impersonation target; give him a trivially checkable permission so a
+        // successful downstream request confirms his identity (not alice's) was used.
+        let role_key2 = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-reader";
+        let role_val2 = serde_json::json!({ "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }] });
+        idx.apply_object(role_key2, &role_val2);
+        let bind_key2 = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-pod-reader";
+        let bind_val2 = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "bob" }],
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "pod-reader" }
+        });
+        idx.apply_object(bind_key2, &bind_val2);
+
+        idx
+    }
+
+    /// `rest.Config.Impersonate.UID`/`.Extra` (used by e.g. the upstream SelfSubjectReview
+    /// e2e test, which sets both to verify the identity round-trips through the apiserver)
+    /// must reach the substituted identity the same way Impersonate-User/-Group already do.
+    /// Before this fix, uid/extra were hardcoded to empty regardless of the headers sent,
+    /// silently discarding them.
+    #[tokio::test]
+    async fn impersonation_substitutes_uid_and_extra_when_caller_has_impersonate_verb_on_those_resources(
+    ) {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_full_impersonation();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            serde_json::to_string(&serde_json::json!({ "uid": user.uid, "extra": user.extra }))
+                .unwrap()
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header("Impersonate-Uid", "uniq-id")
+            .header("Impersonate-Extra-known-languages", "python")
+            .header("Impersonate-Extra-known-languages", "javascript")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "bob can list pods via alice's impersonation — the request must succeed once \
+             alice holds impersonate on uids/userextras too"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            val["uid"], "uniq-id",
+            "Impersonate-Uid must reach the substituted identity's uid field"
+        );
+        assert_eq!(
+            val["extra"]["known-languages"],
+            serde_json::json!(["python", "javascript"]),
+            "repeated Impersonate-Extra-<key> header values must all be preserved, in order"
+        );
+    }
+
+    /// A caller authorized to impersonate `users`/`groups` but NOT `uids` must still be
+    /// denied when Impersonate-Uid is present. If the User/Group check alone were
+    /// sufficient, UID impersonation would silently bypass RBAC for any impersonator.
+    #[tokio::test]
+    async fn impersonation_denied_when_caller_lacks_impersonate_verb_on_uid() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        // users/groups-only impersonator — no uids/userextras grant.
+        let idx = make_rbac_with_impersonator_and_target();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .header("Impersonate-Uid", "some-uid")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "caller without impersonate on uids must be denied when Impersonate-Uid is set — \
+             otherwise the users/groups grant alone would let UID impersonation bypass RBAC"
         );
     }
 

@@ -685,6 +685,78 @@ pub async fn token_review<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// SelfSubjectReview
+// ---------------------------------------------------------------------------
+//
+// authentication.k8s.io/v1 "who am I" identity readback. Like the SAR/SSAR/SSRR
+// family above, this is a create-only virtual resource with no persisted state:
+// the server just mirrors the caller's already-authenticated identity (populated
+// into request extensions by the auth middleware, including any impersonation
+// substitution) back into status.userInfo. Upstream's SelfSubjectReview type has
+// no spec field at all, so unlike its siblings this handler never reads the
+// request body: client-go's generated clientset defaults to protobuf content
+// negotiation for built-in types, and (unlike SAR/SSAR/SSRR/TokenReview, see
+// rbac_gen_adapter.rs) there is no registered protobuf decoder for this kind
+// because there are no spec fields to decode into JSON -- attempting to
+// serde_json-parse a real protobuf-encoded body here would 400 every
+// protobuf-negotiating client for no reason, since nothing in the body is ever
+// used regardless of encoding.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfSubjectReviewResponse {
+    api_version: &'static str,
+    kind: &'static str,
+    status: SelfSubjectReviewStatus,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfSubjectReviewStatus {
+    user_info: SelfSubjectReviewUserInfo,
+}
+
+#[derive(Serialize)]
+struct SelfSubjectReviewUserInfo {
+    username: String,
+    uid: String,
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    extra: std::collections::HashMap<String, Vec<String>>,
+}
+
+pub async fn self_subject_review(
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Status::not_acceptable(
+            "selfsubjectreviews does not implement the Table conversion".into(),
+        )
+        .into_response();
+    }
+
+    let resp = SelfSubjectReviewResponse {
+        api_version: "authentication.k8s.io/v1",
+        kind: "SelfSubjectReview",
+        status: SelfSubjectReviewStatus {
+            user_info: SelfSubjectReviewUserInfo {
+                username: user.username,
+                uid: user.uid,
+                groups: user.groups,
+                extra: user.extra,
+            },
+        },
+    };
+
+    (StatusCode::CREATED, Json(resp)).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2364,5 +2436,233 @@ mod handler_tests {
             StatusCode::CREATED,
             "SelfSubjectAccessReview POST with application/json must return 201 CREATED"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // self_subject_review
+    // -----------------------------------------------------------------------
+
+    /// SelfSubjectReview exists so a client can confirm which identity the apiserver
+    /// actually assigned it -- e.g. right after exchanging a short-lived token via
+    /// TokenRequest, when the client has no other way to read its own resolved identity
+    /// back. The handler must mirror the caller's authenticated username and groups
+    /// verbatim into status.userInfo.
+    #[tokio::test]
+    async fn selfsubjectreview_returns_authenticated_user_because_clients_need_identity_readback_after_token_exchange(
+    ) {
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                post(self_subject_review),
+            )
+            .with_state(make_state());
+
+        let req = json_req(
+            "POST",
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            serde_json::json!({}),
+            user("alice", &["developers"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SelfSubjectReview must respond 201 CREATED"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "SelfSubjectReview");
+        assert_eq!(val["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(
+            val["status"]["userInfo"]["username"], "alice",
+            "status.userInfo.username must echo the caller's own authenticated identity, \
+             not some other user"
+        );
+    }
+
+    /// Dashboard-style clients (and anything correlating a request with its issuing
+    /// credential) read uid, groups, and extra out of SelfSubjectReview -- e.g. a service
+    /// account token's bound-pod JTI lives in `extra`. If any of these were dropped on
+    /// the way from the auth context into the response, such tooling would silently
+    /// under-render or lose the correlation.
+    #[tokio::test]
+    async fn selfsubjectreview_populates_groups_and_extra_fields_from_auth_context_because_dashboard_clients_render_them(
+    ) {
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                post(self_subject_review),
+            )
+            .with_state(make_state());
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "authentication.kubernetes.io/credential-id".to_owned(),
+            vec!["JTI=abc123".to_owned()],
+        );
+        let caller = UserInfo {
+            username: "system:serviceaccount:default:builder".to_owned(),
+            uid: "sa-uid-42".to_owned(),
+            groups: vec![
+                "system:serviceaccounts".to_owned(),
+                "system:authenticated".to_owned(),
+            ],
+            extra,
+        };
+
+        let req = json_req(
+            "POST",
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            serde_json::json!({}),
+            caller,
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["userInfo"]["uid"], "sa-uid-42",
+            "uid must be forwarded so callers can distinguish a recreated identity of the \
+             same name from the original"
+        );
+        assert_eq!(
+            val["status"]["userInfo"]["groups"],
+            serde_json::json!(["system:serviceaccounts", "system:authenticated"]),
+            "all of the caller's groups must be forwarded, not just the first"
+        );
+        assert_eq!(
+            val["status"]["userInfo"]["extra"]["authentication.kubernetes.io/credential-id"],
+            serde_json::json!(["JTI=abc123"]),
+            "extra attributes must be forwarded verbatim so audit/dashboard tooling can \
+             correlate the request with its issuing credential"
+        );
+    }
+
+    /// A request with no credentials authenticates as system:anonymous in the
+    /// system:unauthenticated group (see auth.rs's anonymous fallback). SelfSubjectReview
+    /// must report that identity verbatim -- silently substituting some other identity
+    /// would let an unauthenticated caller believe it is signed in when it is not.
+    #[tokio::test]
+    async fn selfsubjectreview_with_anonymous_request_returns_system_anonymous_because_that_is_the_actual_identity(
+    ) {
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                post(self_subject_review),
+            )
+            .with_state(make_state());
+
+        let req = json_req(
+            "POST",
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            serde_json::json!({}),
+            user("system:anonymous", &["system:unauthenticated"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["userInfo"]["username"], "system:anonymous",
+            "an unauthenticated caller must see its real (anonymous) identity, never a \
+             masked or defaulted one"
+        );
+        assert_eq!(
+            val["status"]["userInfo"]["groups"],
+            serde_json::json!(["system:unauthenticated"])
+        );
+    }
+
+    /// Upstream's SelfSubjectReview type has no `spec` field at all -- it is a pure
+    /// create-only readback. A client that (incorrectly) sends SAR-shaped `spec` content
+    /// must still get back its own identity unaffected, not a 400 or a response
+    /// influenced by that content.
+    #[tokio::test]
+    async fn selfsubjectreview_ignores_spec_field_because_upstream_resource_has_no_spec() {
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                post(self_subject_review),
+            )
+            .with_state(make_state());
+
+        let req = json_req(
+            "POST",
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            serde_json::json!({
+                "spec": {
+                    "resourceAttributes": { "verb": "delete", "resource": "secrets" }
+                }
+            }),
+            user("bob", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an unused spec field must not cause a 400 -- it simply isn't part of this resource"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["userInfo"]["username"], "bob",
+            "spec content must have zero influence on the identity readback"
+        );
+    }
+
+    /// client-go's generated clientset (used by `kubectl auth whoami` and the upstream
+    /// `AuthenticationV1().SelfSubjectReviews()` client) defaults to protobuf content
+    /// negotiation for built-in types. Since SelfSubjectReview has no spec to decode,
+    /// there is deliberately no registered protobuf decoder for it (see
+    /// rbac_gen_adapter.rs's Kind->decoder map in proto.rs) -- the handler must never
+    /// attempt to serde_json-parse the body, or every protobuf-negotiating client would
+    /// get a spurious 400 even though nothing in the body is ever used.
+    #[tokio::test]
+    async fn selfsubjectreview_does_not_attempt_to_decode_the_body_because_protobuf_clients_have_no_registered_decoder_for_this_kind(
+    ) {
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                post(self_subject_review),
+            )
+            .with_state(make_state());
+
+        // Bytes that are neither valid JSON nor a decodable k8s protobuf envelope --
+        // representative of what extract_body falls back to returning unchanged when no
+        // Kind-specific decoder exists for a protobuf-negotiated request.
+        let garbage = Bytes::from_static(&[0xff, 0x00, 0x01, 0x02, 0x7f]);
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/apis/authentication.k8s.io/v1/selfsubjectreviews")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(Body::from(garbage))
+            .unwrap();
+        req.extensions_mut().insert(user("carol", &[]));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an undecodable protobuf-negotiated body must not produce a 400 -- the handler \
+             never needs to read the body at all, so real client-go callers (which default \
+             to protobuf for built-in types) must still succeed"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["status"]["userInfo"]["username"], "carol");
     }
 }
