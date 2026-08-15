@@ -1,9 +1,9 @@
 use prost::Message;
 
-use crate::rbac_authz_authn_gen::k8s::io::api::authentication::v1 as authn_v1;
-use crate::rbac_authz_authn_gen::k8s::io::api::authorization::v1 as authz_v1;
-use crate::rbac_authz_authn_gen::k8s::io::api::rbac::v1 as rbac_v1;
-use crate::rbac_authz_authn_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::authentication::v1 as authn_v1;
+use u7s_proto_generated::k8s::io::api::authorization::v1 as authz_v1;
+use u7s_proto_generated::k8s::io::api::rbac::v1 as rbac_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 // ---- shared helpers --------------------------------------------------------
 

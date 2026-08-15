@@ -52,6 +52,7 @@ prost           = "0.14"
 hmac            = "0.13"
 sha2            = "0.11"
 u7s-sentinel    = { path = "../sentinel" }
+u7s-proto-generated = { path = "../proto-generated" }
 prometheus      = { version = "0.14", default-features = false, features = ["process"] }
 dhat            = { version = "0.3", optional = true }
 rlimit          = "0.11"
@@ -61,8 +62,7 @@ socket2         = "0.6"
 dhat = ["dep:dhat"]
 
 [build-dependencies]
-prost-build              = "0.14"
-protoc-bin-vendored      = "3.2"
+u7s-proto-generated      = { path = "../proto-generated" }
 prost                    = "0.14"
 prost-types              = "0.14"
 heck                     = "0.5"

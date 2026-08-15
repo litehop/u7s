@@ -1,11 +1,11 @@
 use prost::Message;
 
-use crate::net_disc_cert_policy_events_gen::k8s::io::api::certificates::v1 as certs_v1;
-use crate::net_disc_cert_policy_events_gen::k8s::io::api::discovery::v1 as discovery_v1;
-use crate::net_disc_cert_policy_events_gen::k8s::io::api::events::v1 as events_v1;
-use crate::net_disc_cert_policy_events_gen::k8s::io::api::networking::v1 as networking_v1;
-use crate::net_disc_cert_policy_events_gen::k8s::io::api::policy::v1 as policy_v1;
-use crate::net_disc_cert_policy_events_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::certificates::v1 as certs_v1;
+use u7s_proto_generated::k8s::io::api::discovery::v1 as discovery_v1;
+use u7s_proto_generated::k8s::io::api::events::v1 as events_v1;
+use u7s_proto_generated::k8s::io::api::networking::v1 as networking_v1;
+use u7s_proto_generated::k8s::io::api::policy::v1 as policy_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
@@ -16,7 +16,7 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
 }
 
 fn gen_int_or_string_to_json(
-    ios: &crate::net_disc_cert_policy_events_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
+    ios: &u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
 ) -> serde_json::Value {
     if ios.r#type.unwrap_or(0) == 0 {
         serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
@@ -26,7 +26,7 @@ fn gen_int_or_string_to_json(
 }
 
 fn gen_object_reference_to_json(
-    r: crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference,
+    r: u7s_proto_generated::k8s::io::api::core::v1::ObjectReference,
 ) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
@@ -1108,8 +1108,8 @@ fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
 
 fn json_to_object_reference_proto(
     v: &serde_json::Value,
-) -> crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference {
-    crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference {
+) -> u7s_proto_generated::k8s::io::api::core::v1::ObjectReference {
+    u7s_proto_generated::k8s::io::api::core::v1::ObjectReference {
         kind: jstr(v, "kind"),
         namespace: jstr(v, "namespace"),
         name: jstr(v, "name"),
@@ -1591,7 +1591,7 @@ mod tests {
                 ..Default::default()
             }),
             regarding: Some(
-                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference {
+                u7s_proto_generated::k8s::io::api::core::v1::ObjectReference {
                     kind: Some("Pod".to_string()),
                     name: Some("my-pod".to_string()),
                     namespace: Some("default".to_string()),
@@ -1780,7 +1780,7 @@ mod tests {
     /// received raw protobuf bytes it can't JSON-parse, failing every such request outright.
     #[test]
     fn decode_networkpolicy_proto_gen_preserves_pod_selector_ingress_and_policy_types() {
-        use crate::net_disc_cert_policy_events_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
+        use u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
 
         let np = networking_v1::NetworkPolicy {
             metadata: Some(meta_v1::ObjectMeta {
@@ -2042,15 +2042,13 @@ mod tests {
             action: Some("Started".to_string()),
             reason: Some("Started".to_string()),
             regarding: Some(
-                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference::sentinel(),
+                u7s_proto_generated::k8s::io::api::core::v1::ObjectReference::sentinel(),
             ),
-            related: Some(
-                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::ObjectReference::sentinel(),
-            ),
+            related: Some(u7s_proto_generated::k8s::io::api::core::v1::ObjectReference::sentinel()),
             note: Some("a note".to_string()),
             r#type: Some("Normal".to_string()),
             deprecated_source: Some(
-                crate::net_disc_cert_policy_events_gen::k8s::io::api::core::v1::EventSource::sentinel(),
+                u7s_proto_generated::k8s::io::api::core::v1::EventSource::sentinel(),
             ),
             deprecated_first_timestamp: Some(meta_v1::Time::sentinel()),
             deprecated_last_timestamp: Some(meta_v1::Time::sentinel()),

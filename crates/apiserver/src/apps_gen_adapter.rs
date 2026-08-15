@@ -1,8 +1,8 @@
 use prost::Message;
 
-use crate::apps_gen::k8s::io::api::apps::v1 as apps_v1;
-use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
-use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::apps::v1 as apps_v1;
+use u7s_proto_generated::k8s::io::api::core::v1 as core_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
@@ -203,7 +203,7 @@ pub fn decode_statefulset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 // ---- Decoder A: Deployment -------------------------------------------------
 
 fn gen_apps_int_or_string_to_json(
-    ios: crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
+    ios: u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
 ) -> serde_json::Value {
     if ios.r#type.unwrap_or(0) == 0 {
         serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
@@ -574,14 +574,14 @@ mod tests {
                     r#type: Some("RollingUpdate".to_string()),
                     rolling_update: Some(apps_v1::RollingUpdateDeployment {
                         max_unavailable: Some(
-                            crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
+                            u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
                                 r#type: Some(1),
                                 str_val: Some("25%".to_string()),
                                 ..Default::default()
                             },
                         ),
                         max_surge: Some(
-                            crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
+                            u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
                                 r#type: Some(0),
                                 int_val: Some(1),
                                 ..Default::default()
@@ -1007,7 +1007,7 @@ mod tests {
                 ..Default::default()
             }),
             data: Some(
-                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                     raw: Some(br#"{"spec":{"replicas":3}}"#.to_vec()),
                 },
             ),
@@ -1160,7 +1160,7 @@ mod tests {
                     rolling_update: Some(apps_v1::RollingUpdateStatefulSetStrategy {
                         partition: Some(2),
                         max_unavailable: Some(
-                            crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
+                            u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
                                 r#type: Some(1),
                                 str_val: Some("20%".to_string()),
                                 ..Default::default()
@@ -1295,7 +1295,7 @@ mod tests {
                     r#type: Some("RollingUpdate".to_string()),
                     rolling_update: Some(apps_v1::RollingUpdateDaemonSet {
                         max_unavailable: Some(
-                            crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
+                            u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString {
                                 r#type: Some(0),
                                 int_val: Some(2),
                                 ..Default::default()
@@ -1606,7 +1606,7 @@ mod tests {
         let cr = apps_v1::ControllerRevision {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             data: Some(
-                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                     raw: Some(br#"{"a":1}"#.to_vec()),
                 },
             ),
