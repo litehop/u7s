@@ -1,15 +1,15 @@
 use prost::Message;
 
-use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
-use crate::apps_gen::k8s::io::api::resource::v1 as resource_v1;
-use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::core::v1 as core_v1;
+use u7s_proto_generated::k8s::io::api::resource::v1 as resource_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
 }
 
 fn gen_quantity_to_json(
-    q: Option<crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity>,
+    q: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity>,
 ) -> Option<serde_json::Value> {
     q.and_then(|q| q.string)
         .filter(|s| !s.is_empty())
@@ -19,7 +19,7 @@ fn gen_quantity_to_json(
 fn gen_quantity_map_to_json(
     map: std::collections::HashMap<
         String,
-        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity,
+        u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity,
     >,
 ) -> serde_json::Value {
     let mut out = serde_json::Map::new();
@@ -32,7 +32,7 @@ fn gen_quantity_map_to_json(
 }
 
 fn gen_raw_extension_to_json(
-    ext: Option<crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension>,
+    ext: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension>,
 ) -> Option<serde_json::Value> {
     let raw = ext?.raw?;
     if raw.is_empty() {
@@ -1242,19 +1242,19 @@ mod tests {
                         "memory".to_string(),
                         resource_v1::DeviceCapacity {
                             value: Some(
-                                crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                                     string: Some("80Gi".to_string()),
                                 },
                             ),
                             request_policy: Some(resource_v1::CapacityRequestPolicy {
                                 valid_range: Some(resource_v1::CapacityRequestPolicyRange {
                                     min: Some(
-                                        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                                             string: Some("1Gi".to_string()),
                                         },
                                     ),
                                     max: Some(
-                                        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                                             string: Some("80Gi".to_string()),
                                         },
                                     ),
@@ -1305,7 +1305,7 @@ mod tests {
                         opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                             driver: Some("gpu.example.com".to_string()),
                             parameters: Some(
-                                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                     raw: Some(br#"{"clockSpeed":"3.5GHz"}"#.to_vec()),
                                 },
                             ),
@@ -1350,7 +1350,7 @@ mod tests {
                             opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                                 driver: Some("gpu.example.com".to_string()),
                                 parameters: Some(
-                                    crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                    u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                         raw: Some(br#"{"mig":"1g.10gb"}"#.to_vec()),
                                     },
                                 ),
@@ -1367,7 +1367,7 @@ mod tests {
                     pool: Some("node-1".to_string()),
                     device: Some("gpu-0".to_string()),
                     data: Some(
-                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                             raw: Some(br#"{"uuid":"GPU-1234"}"#.to_vec()),
                         },
                     ),
@@ -1415,7 +1415,7 @@ mod tests {
                                 opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                                     driver: Some("gpu.example.com".to_string()),
                                     parameters: Some(
-                                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                             raw: Some(br#"{"mig":"2g.20gb"}"#.to_vec()),
                                         },
                                     ),
@@ -1572,7 +1572,7 @@ mod tests {
                         opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                             driver: Some("__sentinel__".to_string()),
                             parameters: Some(
-                                crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                     raw: Some(br#"1"#.to_vec()),
                                 },
                             ),
@@ -1615,7 +1615,7 @@ mod tests {
                             opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                                 driver: Some("__sentinel__".to_string()),
                                 parameters: Some(
-                                    crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                    u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                         raw: Some(br#"1"#.to_vec()),
                                     },
                                 ),
@@ -1629,7 +1629,7 @@ mod tests {
             status: Some(resource_v1::ResourceClaimStatus {
                 devices: vec![resource_v1::AllocatedDeviceStatus {
                     data: Some(
-                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                             raw: Some(br#"2"#.to_vec()),
                         },
                     ),
@@ -1642,7 +1642,7 @@ mod tests {
                                 opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                                     driver: Some("__sentinel__".to_string()),
                                     parameters: Some(
-                                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                             raw: Some(br#"3"#.to_vec()),
                                         },
                                     ),
@@ -1686,7 +1686,7 @@ mod tests {
                                 opaque: Some(resource_v1::OpaqueDeviceConfiguration {
                                     driver: Some("__sentinel__".to_string()),
                                     parameters: Some(
-                                        crate::apps_gen::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
                                             raw: Some(br#"1"#.to_vec()),
                                         },
                                     ),

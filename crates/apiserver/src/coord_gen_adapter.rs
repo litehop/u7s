@@ -1,7 +1,7 @@
 use prost::Message;
 
-use crate::coord_gen::k8s::io::api::coordination::v1 as coord_v1;
-use crate::coord_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::coordination::v1 as coord_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 // ---- shared helpers --------------------------------------------------------
 
@@ -78,7 +78,7 @@ mod tests {
     use super::*;
 
     fn make_test_lease_bytes() -> Vec<u8> {
-        use crate::coord_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+        use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
         let lease = coord_v1::Lease {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("test-lease".to_string()),
@@ -104,7 +104,7 @@ mod tests {
     }
 
     fn make_test_lease_bytes_with_alpha_fields() -> Vec<u8> {
-        use crate::coord_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+        use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
         let lease = coord_v1::Lease {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("coordinated-lease".to_string()),
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn generated_lease_spec_covers_all_proto_fields_by_construction() {
-        use crate::coord_gen::k8s::io::api::coordination::v1::LeaseSpec;
+        use u7s_proto_generated::k8s::io::api::coordination::v1::LeaseSpec;
         let spec = LeaseSpec {
             holder_identity: Some("x".to_string()),
             lease_duration_seconds: Some(1),
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn sentinel_completeness_decode_lease_proto_gen_a() {
-        use crate::coord_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+        use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
         let lease = coord_v1::Lease {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             spec: Some(coord_v1::LeaseSpec::sentinel()),

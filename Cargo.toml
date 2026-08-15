@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/store", "crates/apiserver", "crates/scheduler", "crates/kubeconfig", "crates/sentinel", "crates/sentinel-derive"]
+members = ["crates/store", "crates/apiserver", "crates/scheduler", "crates/kubeconfig", "crates/sentinel", "crates/sentinel-derive", "crates/proto-generated"]
 resolver = "2"
 
 [profile.release]

@@ -27,8 +27,10 @@ use std::sync::OnceLock;
 use prost::Message;
 use prost_types::{field_descriptor_proto::Type, DescriptorProto, FileDescriptorSet};
 
-/// The descriptor set protoc emits next to the generated structs (see `build.rs`).
-const DESCRIPTOR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/k8s_descriptors.bin"));
+/// The descriptor set protoc emits, owned by `u7s-proto-generated` now that the prost invocation
+/// lives there (see that crate's `build.rs`) rather than being re-emitted into this crate's own
+/// `OUT_DIR`.
+use u7s_proto_generated::DESCRIPTOR_BYTES;
 
 // `OPAQUE_MESSAGES`/`RENAMES`/`INLINE_EMBEDS`/`DELIBERATE_OMISSIONS`/`KNOWN_GAPS` and the
 // `json_key`/`is_excluded`/`is_inline_embed` helpers built on them live in `proto_exceptions.rs`,

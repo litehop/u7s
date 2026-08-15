@@ -1,10 +1,10 @@
 use prost::Message;
 
-use crate::storage_node_flow_gen::k8s::io::api::flowcontrol::v1 as flowcontrol_v1;
-use crate::storage_node_flow_gen::k8s::io::api::node::v1 as node_v1;
-use crate::storage_node_flow_gen::k8s::io::api::scheduling::v1 as scheduling_v1;
-use crate::storage_node_flow_gen::k8s::io::api::storage::v1 as storage_v1;
-use crate::storage_node_flow_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::flowcontrol::v1 as flowcontrol_v1;
+use u7s_proto_generated::k8s::io::api::node::v1 as node_v1;
+use u7s_proto_generated::k8s::io::api::scheduling::v1 as scheduling_v1;
+use u7s_proto_generated::k8s::io::api::storage::v1 as storage_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
@@ -15,7 +15,7 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
 }
 
 fn gen_quantity_opt_to_json(
-    q: Option<crate::storage_node_flow_gen::k8s::io::apimachinery::pkg::api::resource::Quantity>,
+    q: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity>,
 ) -> Option<serde_json::Value> {
     q.and_then(|q| q.string)
         .filter(|s| !s.is_empty())
@@ -847,8 +847,8 @@ mod tests {
 
     fn quantity(
         s: &str,
-    ) -> crate::storage_node_flow_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-        crate::storage_node_flow_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+    ) -> u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
             string: Some(s.to_string()),
         }
     }
@@ -1205,14 +1205,12 @@ mod tests {
                 node_selector: [("runtime".to_string(), "gvisor".to_string())]
                     .into_iter()
                     .collect(),
-                tolerations: vec![
-                    crate::storage_node_flow_gen::k8s::io::api::core::v1::Toleration {
-                        key: Some("sandbox".to_string()),
-                        operator: Some("Exists".to_string()),
-                        effect: Some("NoSchedule".to_string()),
-                        ..Default::default()
-                    },
-                ],
+                tolerations: vec![u7s_proto_generated::k8s::io::api::core::v1::Toleration {
+                    key: Some("sandbox".to_string()),
+                    operator: Some("Exists".to_string()),
+                    effect: Some("NoSchedule".to_string()),
+                    ..Default::default()
+                }],
             }),
         };
         let mut buf = Vec::new();
@@ -1641,14 +1639,15 @@ mod tests {
         let obj = storage_v1::StorageClass {
             metadata: Some(meta_v1::ObjectMeta::sentinel()),
             provisioner: Some("csi.example.com".to_string()),
-            parameters: [("type".to_string(), "gp3".to_string())].into_iter().collect(),
+            parameters: [("type".to_string(), "gp3".to_string())]
+                .into_iter()
+                .collect(),
             reclaim_policy: Some("Retain".to_string()),
             mount_options: vec!["noatime".to_string()],
             allow_volume_expansion: Some(true),
             volume_binding_mode: Some("WaitForFirstConsumer".to_string()),
             allowed_topologies: vec![
-                crate::storage_node_flow_gen::k8s::io::api::core::v1::TopologySelectorTerm::sentinel(
-                ),
+                u7s_proto_generated::k8s::io::api::core::v1::TopologySelectorTerm::sentinel(),
             ],
         };
         let mut buf = Vec::new();

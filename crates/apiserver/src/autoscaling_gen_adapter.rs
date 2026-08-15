@@ -1,8 +1,8 @@
 use prost::Message;
 
-use crate::apps_gen::k8s::io::api::autoscaling::v1 as autoscaling_v1;
-use crate::apps_gen::k8s::io::api::autoscaling::v2 as autoscaling_v2;
-use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::autoscaling::v1 as autoscaling_v1;
+use u7s_proto_generated::k8s::io::api::autoscaling::v2 as autoscaling_v2;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
@@ -13,7 +13,7 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
 }
 
 fn gen_quantity_to_json(
-    q: Option<crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity>,
+    q: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity>,
 ) -> Option<serde_json::Value> {
     q.and_then(|q| q.string)
         .filter(|s| !s.is_empty())
