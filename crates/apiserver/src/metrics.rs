@@ -262,6 +262,32 @@ pub static BOOTSTRAP_APPLY_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(
     counter
 });
 
+/// Nominal concurrency-share seats for a PriorityLevelConfiguration, labeled by
+/// `priority_level` — matches upstream `apiserver_flowcontrol_nominal_limit_seats`. The
+/// upstream APF e2e conformance test (`[sig-api-machinery] API priority and fairness`)
+/// polls `/metrics` for exactly this series (by name and `priority_level` label) as part of
+/// its "wait for steady state" check after creating a PriorityLevelConfiguration; without it,
+/// that poll never observes the new priority level and times out. Set from
+/// `handlers::resource`'s create/replace hooks whenever a PriorityLevelConfiguration is
+/// written — u7s has no fair-queuing controller loop actually consuming these seats (see
+/// `crate::apf`'s module doc), so the value is the object's own declared
+/// `nominalConcurrencyShares`, not a live-computed allocation.
+pub static APF_NOMINAL_LIMIT_SEATS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "apiserver_flowcontrol_nominal_limit_seats",
+            "Nominal number of execution seats configured for each priority level, broken out \
+             by priority_level.",
+        ),
+        &["priority_level"],
+    )
+    .expect("static metric definition is valid");
+    prometheus::default_registry()
+        .register(Box::new(gauge.clone()))
+        .expect("apiserver_flowcontrol_nominal_limit_seats is registered exactly once per process");
+    gauge
+});
+
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;

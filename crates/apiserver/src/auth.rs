@@ -19,10 +19,12 @@ use tower::Layer;
 use tower_service::Service;
 use u7s_store::{SqliteStore, Store};
 
+use crate::apf;
 use crate::keys::object_key;
 use crate::metrics::record_request_total;
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::sa_sig_cache::{self, SigCache};
+use crate::state::FlowControlCache;
 use crate::status::Status;
 use crate::util::{rfc3339_to_unix_secs, validate_cli_path};
 
@@ -681,6 +683,18 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
 // ---------------------------------------------------------------------------
 
 /// Paths that skip auth entirely.
+///
+/// `/version` is deliberately NOT here (unlike real kube-apiserver's few truly
+/// unauthenticated paths, `/version` still goes through authn/authz there too — see
+/// `WithAuthentication`/`WithAuthorization` wrapping the full handler chain upstream).
+/// Skipping auth for it meant `AuthService::call`'s classification hook (and
+/// Impersonate-* header handling) never ran for `/version` at all, which is exactly
+/// the endpoint the upstream APF conformance test polls to check for
+/// `X-Kubernetes-PF-*` response headers. Anonymous callers still reach it: `authenticate`
+/// falls back to `system:anonymous`/`system:unauthenticated`, and the seeded
+/// `system:public-info-viewer` ClusterRoleBinding grants that group `get` on `/version`
+/// — so removing this exemption changes nothing about who can call it, only that the
+/// full pipeline (classification, impersonation, `apiserver_request_total`) now runs.
 fn is_exempt(path: &str) -> bool {
     matches!(
         path,
@@ -691,7 +705,6 @@ fn is_exempt(path: &str) -> bool {
             | "/api/"
             | "/apis"
             | "/apis/"
-            | "/version"
             | "/discovery/v2"
             | "/openapi/v2"
             | "/openapi/v3"
@@ -945,6 +958,7 @@ pub struct AuthLayer {
     sa_decoding_key: Option<Arc<DecodingKey>>,
     store: Arc<SqliteStore>,
     sig_cache: Arc<SigCache>,
+    flowcontrol_cache: Arc<FlowControlCache>,
 }
 
 impl AuthLayer {
@@ -954,6 +968,7 @@ impl AuthLayer {
         sa_decoding_key: Option<Arc<DecodingKey>>,
         store: Arc<SqliteStore>,
         sig_cache: Arc<SigCache>,
+        flowcontrol_cache: Arc<FlowControlCache>,
     ) -> Self {
         AuthLayer {
             rbac_index,
@@ -961,6 +976,7 @@ impl AuthLayer {
             sa_decoding_key,
             store,
             sig_cache,
+            flowcontrol_cache,
         }
     }
 }
@@ -976,6 +992,7 @@ impl<S> Layer<S> for AuthLayer {
             sa_decoding_key: self.sa_decoding_key.clone(),
             store: Arc::clone(&self.store),
             sig_cache: Arc::clone(&self.sig_cache),
+            flowcontrol_cache: Arc::clone(&self.flowcontrol_cache),
         }
     }
 }
@@ -992,6 +1009,35 @@ pub struct AuthService<S> {
     sa_decoding_key: Option<Arc<DecodingKey>>,
     store: Arc<SqliteStore>,
     sig_cache: Arc<SigCache>,
+    flowcontrol_cache: Arc<FlowControlCache>,
+}
+
+/// Classify an already-authorized request against the cached FlowSchemas/
+/// PriorityLevelConfigurations, for setting the `X-Kubernetes-PF-*` response headers
+/// real kube-apiserver always sets. Returns `None` when the cache is cold (see
+/// `FlowControlCache`'s doc — classification is best-effort, never a store
+/// round-trip on the request hot path) or when nothing matches.
+fn classify_request(
+    flowcontrol_cache: &FlowControlCache,
+    verb: &str,
+    parsed: &ParsedPath,
+    non_resource_url: Option<&str>,
+    user: &UserInfo,
+) -> Option<apf::Classification> {
+    let flow_schemas = flowcontrol_cache.flow_schemas.read().unwrap().clone()?;
+    let priority_levels = flowcontrol_cache.priority_levels.read().unwrap().clone()?;
+    let digest = apf::RequestDigest {
+        username: &user.username,
+        groups: &user.groups,
+        verb,
+        api_group: &parsed.api_group,
+        resource: &parsed.resource,
+        subresource: &parsed.subresource,
+        namespace: parsed.namespace.as_deref(),
+        is_resource_request: non_resource_url.is_none(),
+        path: non_resource_url.unwrap_or(""),
+    };
+    apf::classify(&flow_schemas, &priority_levels, &digest)
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -1040,6 +1086,7 @@ where
         let token_map = Arc::clone(&self.token_map);
         let sa_decoding_key = self.sa_decoding_key.clone();
         let store = Arc::clone(&self.store);
+        let flowcontrol_cache = Arc::clone(&self.flowcontrol_cache);
         let sig_cache = Arc::clone(&self.sig_cache);
         let mut inner = self.inner.clone();
 
@@ -1221,9 +1268,28 @@ where
                 return Ok(forbidden_response(&user.username, verb, &parsed.resource));
             }
 
+            // 2a. Classify the request against the cached FlowSchemas/
+            // PriorityLevelConfigurations, before `user` moves into the request
+            // extensions below — see `classify_request`'s doc for why a cold cache
+            // (classification skipped) is acceptable here but never a store fallback.
+            let classification =
+                classify_request(&flowcontrol_cache, verb, &parsed, non_resource_url, &user);
+
             // 3. Attach UserInfo to request extensions and pass through.
             req.extensions_mut().insert(user);
-            let resp = inner.call(req).await;
+            let mut resp = inner.call(req).await;
+            // Set the same two response headers real kube-apiserver always sets once a
+            // request has been classified — see `k8s.io/api/flowcontrol/v1/types.go`'s
+            // `ResponseHeaderMatchedFlowSchemaUID` / `ResponseHeaderMatchedPriorityLevelConfigurationUID`.
+            if let (Ok(r), Some(c)) = (&mut resp, &classification) {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&c.flow_schema_uid) {
+                    r.headers_mut().insert("X-Kubernetes-PF-FlowSchema-UID", hv);
+                }
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&c.priority_level_uid) {
+                    r.headers_mut()
+                        .insert("X-Kubernetes-PF-PriorityLevel-UID", hv);
+                }
+            }
             // Recorded here, not content_type.rs: path/verb/scope are already parsed above
             // and the final status is available now — a pure .inc(), never a header/body
             // mutation, so this cannot repeat the chunked-response header-mutation incident.
@@ -1657,12 +1723,15 @@ mod tests {
     #[test]
     fn test_exempt_paths() {
         // Discovery and health paths must not require auth.
-        for path in &["/healthz", "/readyz", "/livez", "/api", "/apis", "/version"] {
+        for path in &["/healthz", "/readyz", "/livez", "/api", "/apis"] {
             assert!(is_exempt(path), "{path} must be exempt");
         }
         // Non-exempt paths must not be skipped.
         assert!(!is_exempt("/api/v1/pods"));
         assert!(!is_exempt("/apis/apps/v1/deployments"));
+        // /version must NOT be exempt — see is_exempt's doc for why it needs to run
+        // through the full authn/authz/classification pipeline like upstream.
+        assert!(!is_exempt("/version"));
     }
 
     /// Upstream e2e clients (Discovery, kubectl proxy) call AbsPath('/api/') and
@@ -3209,6 +3278,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         // Request as alice, impersonating bob.
@@ -3270,6 +3340,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let req = Request::builder()
@@ -3320,6 +3391,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let req = Request::builder()
@@ -3536,6 +3608,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         // Exactly the request client-go's ConfigMap informer issues: a LIST (not watch)
@@ -3614,6 +3687,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let req = Request::builder()
@@ -3686,6 +3760,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
         let req_allowed = Request::builder()
             .method("GET")
@@ -3732,6 +3807,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
         let req_denied = Request::builder()
             .method("GET")
@@ -3830,6 +3906,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let cases: [(&str, &str, &str); 3] = [
@@ -3945,6 +4022,7 @@ mod tests {
             None,
             Arc::new(make_test_store()),
             Arc::new(make_test_sig_cache()),
+            Arc::new(FlowControlCache::new()),
         )
         .layer(ChunkedWatchService);
 
@@ -4030,6 +4108,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         // (verb, uri) — LIST mirrors a tombstoned-CRD-group or expired-continue-token
@@ -4102,6 +4181,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let before_401 = REQUEST_TOTAL
@@ -4155,6 +4235,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let before_403 = REQUEST_TOTAL
@@ -4184,6 +4265,287 @@ mod tests {
             "an RBAC denial must be counted with the already-resolved group/version/resource/ \
              scope and code=403 — otherwise a caller retrying a forbidden call repeatedly is \
              invisible in apiserver_request_total"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // APF classification response headers
+    // ---------------------------------------------------------------------------
+
+    /// A warm `FlowControlCache` with one FlowSchema matching `username` (via a `User`
+    /// subject, wildcard resource/non-resource rules) referencing a PriorityLevelConfiguration
+    /// named "custom-pl", plus the catch-all pair every real cluster also carries — so a
+    /// non-matching user still gets classified via the fallback, exactly like real clusters.
+    fn make_warm_flowcontrol_cache(username: &str) -> Arc<FlowControlCache> {
+        let fs_specific: apf::FlowSchemaObj = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "specific", "uid": "fs-specific-uid" },
+            "spec": {
+                "matchingPrecedence": 1000,
+                "priorityLevelConfiguration": { "name": "custom-pl" },
+                "rules": [{
+                    "subjects": [{ "kind": "User", "user": { "name": username } }],
+                    "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"], "clusterScope": true }],
+                    "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }]
+                }]
+            }
+        }))
+        .expect("test FlowSchema JSON must parse");
+        let fs_catch_all: apf::FlowSchemaObj = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "catch-all", "uid": "fs-catch-all-uid" },
+            "spec": {
+                "matchingPrecedence": 10000,
+                "priorityLevelConfiguration": { "name": "catch-all-pl" },
+                "rules": [{
+                    "subjects": [{ "kind": "Group", "group": { "name": "*" } }],
+                    "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"], "clusterScope": true }],
+                    "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }]
+                }]
+            }
+        }))
+        .expect("test FlowSchema JSON must parse");
+        let pl_specific: apf::PriorityLevelObj = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "custom-pl", "uid": "pl-custom-uid" }
+        }))
+        .expect("test PriorityLevelConfiguration JSON must parse");
+        let pl_catch_all: apf::PriorityLevelObj = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "catch-all-pl", "uid": "pl-catch-all-uid" }
+        }))
+        .expect("test PriorityLevelConfiguration JSON must parse");
+
+        let cache = FlowControlCache::new();
+        *cache.flow_schemas.write().unwrap() = Some(Arc::new(vec![fs_specific, fs_catch_all]));
+        *cache.priority_levels.write().unwrap() = Some(Arc::new(vec![pl_specific, pl_catch_all]));
+        Arc::new(cache)
+    }
+
+    /// Before this fix, `AuthService::call` never set the `X-Kubernetes-PF-FlowSchema-UID` /
+    /// `X-Kubernetes-PF-PriorityLevel-UID` response headers at all — `kubectl -v=8` against a
+    /// real request showed zero APF headers regardless of the FlowSchemas/PriorityLevel-
+    /// Configurations registered. This is the exact upstream conformance-test assertion
+    /// (`[sig-api-machinery] API priority and fairness ... requests can be classified`): the
+    /// response headers must carry the matched FlowSchema/PriorityLevelConfiguration's UIDs,
+    /// not their names (upstream deliberately hides names from callers — see
+    /// `setResponseHeaders`'s doc upstream).
+    #[tokio::test]
+    async fn matched_request_gets_flowschema_and_prioritylevel_uid_response_headers() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = allow_all_rbac("noxu");
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "noxu-token".to_owned(),
+            UserInfo {
+                username: "noxu".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                make_warm_flowcontrol_cache("noxu"),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces")
+            .header("authorization", "Bearer noxu-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        assert_eq!(
+            resp.headers()
+                .get("X-Kubernetes-PF-FlowSchema-UID")
+                .and_then(|v| v.to_str().ok()),
+            Some("fs-specific-uid"),
+            "the user-specific FlowSchema (matchingPrecedence=1000) must win over the \
+             catch-all (10000) for a matching user"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-Kubernetes-PF-PriorityLevel-UID")
+                .and_then(|v| v.to_str().ok()),
+            Some("pl-custom-uid"),
+            "the response must carry the matched FlowSchema's own PriorityLevelConfiguration \
+             UID, not the catch-all's"
+        );
+    }
+
+    /// A user not named by any specific FlowSchema must still fall back to the catch-all —
+    /// this is the conformance test's second assertion ("non-empty UID... for a non-matching
+    /// user"). Without a working fallback, such a user would get no classification at all.
+    #[tokio::test]
+    async fn non_matching_user_still_gets_classified_via_catch_all_fallback() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = allow_all_rbac("someone-else");
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "someone-else-token".to_owned(),
+            UserInfo {
+                username: "someone-else".to_owned(),
+                uid: "2".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                // Cache is warm for "noxu"'s specific FlowSchema — "someone-else" doesn't
+                // match it and must fall through to the catch-all pair.
+                make_warm_flowcontrol_cache("noxu"),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces")
+            .header("authorization", "Bearer someone-else-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        assert_eq!(
+            resp.headers()
+                .get("X-Kubernetes-PF-FlowSchema-UID")
+                .and_then(|v| v.to_str().ok()),
+            Some("fs-catch-all-uid"),
+            "a user not named by the specific FlowSchema must be classified via the \
+             catch-all, not left unclassified"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-Kubernetes-PF-PriorityLevel-UID")
+                .and_then(|v| v.to_str().ok()),
+            Some("pl-catch-all-uid")
+        );
+    }
+
+    /// When the FlowControlCache is cold (e.g. a test that seeds the store directly without
+    /// going through `AppState::init_flowcontrol_cache`), classification must be silently
+    /// skipped rather than block the request or panic — see `FlowControlCache`'s doc for why
+    /// a cold cache is acceptable (classification is best-effort, never a store fallback on
+    /// the hot path).
+    #[tokio::test]
+    async fn cold_flowcontrol_cache_skips_classification_without_breaking_the_request() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = allow_all_rbac("noxu");
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "noxu-token".to_owned(),
+            UserInfo {
+                username: "noxu".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces")
+            .header("authorization", "Bearer noxu-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a cold classification cache must never block an otherwise-authorized request"
+        );
+        assert!(
+            resp.headers()
+                .get("X-Kubernetes-PF-FlowSchema-UID")
+                .is_none(),
+            "a cold cache must produce no APF headers rather than a bogus/empty one"
+        );
+    }
+
+    /// Regression guard for removing "/version" from `is_exempt`: a caller with NO
+    /// Authorization header at all must still reach `/version`, exactly as it could when
+    /// the path was fully auth-exempt. `authenticate`'s anonymous fallback plus the seeded
+    /// `system:public-info-viewer` grant (bound to `system:unauthenticated`) must combine
+    /// to make this work — if either piece regressed, load-balancer-style unauthenticated
+    /// version probes would start getting 401/403 instead of 200.
+    #[tokio::test]
+    async fn anonymous_caller_still_reaches_version_after_removing_its_auth_exemption() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        // Mirrors the shape of the real seeded system:public-info-viewer ClusterRole +
+        // ClusterRoleBinding (see seed_rbac in lib.rs) — just the /version grant.
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/system:public-info-viewer",
+            &serde_json::json!({
+                "rules": [{ "nonResourceURLs": ["/version"], "verbs": ["get"] }]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:public-info-viewer",
+            &serde_json::json!({
+                "subjects": [{ "kind": "Group", "name": "system:unauthenticated" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "system:public-info-viewer"
+                }
+            }),
+        );
+
+        let app = Router::new()
+            .route("/version", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                idx,
+                HashMap::new(),
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/version")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "an anonymous caller must still get /version via the system:unauthenticated \
+             grant — removing is_exempt's bypass must not require a credential"
         );
     }
 }
