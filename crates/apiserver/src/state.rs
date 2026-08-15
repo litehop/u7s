@@ -216,6 +216,36 @@ impl ApiServiceCache {
     }
 }
 
+/// In-memory cache of the two `flowcontrol.apiserver.k8s.io/v1` resource sets
+/// (FlowSchemas and PriorityLevelConfigurations), parsed into `crate::apf`'s typed
+/// shapes so `AuthLayer` never re-parses raw JSON on the request-classification hot
+/// path (`AuthService::call` reads a cloned `Arc` per request).
+///
+/// Cache invalidation strategy: inline, write-through — identical to
+/// `AdmissionConfigCache` (see its doc for the full rationale). Every handler that
+/// writes a FlowSchema/PriorityLevelConfiguration (`handlers/resource.rs`) calls
+/// `AppState::refresh_flowcontrol_cache` immediately after the store write succeeds.
+///
+/// `None` = cache cold (not yet populated; `AuthLayer` skips classification rather
+/// than fall back to a store round-trip on every single request — classification is
+/// best-effort header-setting, not correctness-critical the way RBAC authorization
+/// is). `Some(v)` = cache warm; use directly. The cache is warmed at startup by
+/// `init_flowcontrol_cache`, after `seed_flowcontrol` has written the mandatory
+/// defaults.
+pub struct FlowControlCache {
+    pub(crate) flow_schemas: RwLock<Option<Arc<Vec<crate::apf::FlowSchemaObj>>>>,
+    pub(crate) priority_levels: RwLock<Option<Arc<Vec<crate::apf::PriorityLevelObj>>>>,
+}
+
+impl FlowControlCache {
+    pub fn new() -> Self {
+        FlowControlCache {
+            flow_schemas: RwLock::new(None),
+            priority_levels: RwLock::new(None),
+        }
+    }
+}
+
 /// One resolved, cache-safe (`STATIC_GROUPS`-or-CRD-backed, never `APIService`-backed) API
 /// group's discovery entry, as plain owned data rather than `types::APIGroupDiscovery` — that
 /// type derives only `Debug`/`Serialize` (deliberately kept minimal since it used to be built
@@ -558,6 +588,10 @@ pub struct AppState<S = SqliteStore> {
     /// time) — `run()` overwrites this field directly once `--sa-sig-cache-size` /
     /// `U7S_SA_SIG_CACHE_SIZE` has been resolved. See `sa_sig_cache` module doc.
     pub sa_sig_cache: Arc<SigCache>,
+    /// In-memory cache of the FlowSchema/PriorityLevelConfiguration object sets, used by
+    /// `AuthLayer` to classify requests. See `FlowControlCache` for the invalidation
+    /// strategy.
+    pub flowcontrol_cache: Arc<FlowControlCache>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -625,6 +659,7 @@ impl<S> Clone for AppState<S> {
             cr_schema_cache: self.cr_schema_cache.clone(),
             cr_conversion_cache: self.cr_conversion_cache.clone(),
             sa_sig_cache: self.sa_sig_cache.clone(),
+            flowcontrol_cache: self.flowcontrol_cache.clone(),
         }
     }
 }
@@ -824,6 +859,7 @@ impl<S: Store> AppState<S> {
             sa_sig_cache: Arc::new(SigCache::new_with_capacity(
                 crate::sa_sig_cache::DEFAULT_CAPACITY,
             )),
+            flowcontrol_cache: Arc::new(FlowControlCache::new()),
         }
     }
 
@@ -1052,6 +1088,84 @@ impl<S: Store> AppState<S> {
     pub async fn init_apiservice_cache(&self) {
         self.refresh_apiservice_cache().await;
         tracing::info!("apiservice cache: initialized from store");
+    }
+
+    /// Refresh the FlowSchema/PriorityLevelConfiguration cache from the store.
+    ///
+    /// Called inline by `handlers/resource.rs` immediately after a successful store write to
+    /// either resource — mirrors `refresh_admission_config`'s write-through invalidation.
+    /// Objects that fail to parse into `crate::apf`'s typed shapes (e.g. a `spec` missing the
+    /// required `priorityLevelConfiguration.name`) are logged and skipped rather than aborting
+    /// the whole refresh, so one malformed object cannot blind classification for every other
+    /// FlowSchema/PriorityLevelConfiguration.
+    pub async fn refresh_flowcontrol_cache(&self) {
+        const GROUP: &str = "flowcontrol.apiserver.k8s.io";
+
+        let fs_prefix = format!("/registry/{GROUP}/flowschemas/");
+        match self.store.list(&fs_prefix, ListOptions::default()).await {
+            Ok(resp) => {
+                let items: Vec<crate::apf::FlowSchemaObj> = resp
+                    .items
+                    .into_iter()
+                    .filter_map(|item| {
+                        match serde_json::from_slice::<crate::apf::FlowSchemaObj>(&item.value) {
+                            Ok(fs) => Some(fs),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "flowcontrol cache: failed to parse FlowSchema {}: {e}",
+                                    item.key
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                *self.flowcontrol_cache.flow_schemas.write().unwrap() = Some(Arc::new(items));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "flowcontrol cache: failed to refresh flowschemas: {e}; cache unchanged"
+                );
+            }
+        }
+
+        let pl_prefix = format!("/registry/{GROUP}/prioritylevelconfigurations/");
+        match self.store.list(&pl_prefix, ListOptions::default()).await {
+            Ok(resp) => {
+                let items: Vec<crate::apf::PriorityLevelObj> = resp
+                    .items
+                    .into_iter()
+                    .filter_map(|item| {
+                        match serde_json::from_slice::<crate::apf::PriorityLevelObj>(&item.value) {
+                            Ok(pl) => Some(pl),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "flowcontrol cache: failed to parse PriorityLevelConfiguration {}: {e}",
+                                    item.key
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                *self.flowcontrol_cache.priority_levels.write().unwrap() = Some(Arc::new(items));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "flowcontrol cache: failed to refresh prioritylevelconfigurations: {e}; cache unchanged"
+                );
+            }
+        }
+    }
+
+    /// Populate the FlowSchema/PriorityLevelConfiguration cache from objects already persisted
+    /// in the store. Must be called once at startup, after `seed_flowcontrol` has written the
+    /// mandatory defaults, so `AuthLayer`'s APF classification has something to match against
+    /// from the very first request instead of a cold cache (see `FlowControlCache`'s doc for
+    /// why a cold cache means classification is silently skipped, not a store fallback).
+    pub async fn init_flowcontrol_cache(&self) {
+        self.refresh_flowcontrol_cache().await;
+        tracing::info!("flowcontrol cache: initialized from store");
     }
 
     /// Attempt to allocate the next available clusterIP from the service CIDR.

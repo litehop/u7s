@@ -401,7 +401,14 @@ pub(crate) async fn create_resource<S: Store>(
     if group == APISERVICE_GROUP {
         state.refresh_apiservice_cache().await;
     }
+    if group == FLOWCONTROL_GROUP {
+        state.refresh_flowcontrol_cache().await;
+        if plural == PLC_PLURAL {
+            record_priority_level_metric(&obj.body);
+        }
+    }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
+    write_flowcontrol_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
@@ -641,7 +648,14 @@ pub(crate) async fn replace_resource<S: Store>(
     if group == APISERVICE_GROUP {
         state.refresh_apiservice_cache().await;
     }
+    if group == FLOWCONTROL_GROUP {
+        state.refresh_flowcontrol_cache().await;
+        if plural == PLC_PLURAL {
+            record_priority_level_metric(&obj.body);
+        }
+    }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
+    write_flowcontrol_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     Ok(Json(obj.body).into_response())
 }
@@ -3742,6 +3756,9 @@ pub(crate) const ADMISSION_GROUP: &str = "admissionregistration.k8s.io";
 pub(crate) const VAP_PLURAL: &str = "validatingadmissionpolicies";
 pub(crate) const VAPB_PLURAL: &str = "validatingadmissionpolicybindings";
 pub(crate) const APISERVICE_GROUP: &str = "apiregistration.k8s.io";
+pub(crate) const FLOWCONTROL_GROUP: &str = "flowcontrol.apiserver.k8s.io";
+pub(crate) const FLOWSCHEMA_PLURAL: &str = "flowschemas";
+pub(crate) const PLC_PLURAL: &str = "prioritylevelconfigurations";
 
 const BUILTIN_GROUPS: &[&str] = &[
     "",
@@ -4001,6 +4018,89 @@ pub(crate) async fn write_vap_status<S: Store>(
         status["typeChecking"] = type_checking;
     }
     obj_body["status"] = status;
+    let bytes = match serde_json::to_vec(obj_body) {
+        Ok(b) => bytes::Bytes::from(b),
+        Err(_) => return,
+    };
+    if let Ok(new_rv) = store.put(key, bytes, Some(stored_rv)).await {
+        obj_body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    }
+}
+
+/// Set `apiserver_flowcontrol_nominal_limit_seats{priority_level=<name>}` from a
+/// PriorityLevelConfiguration's own declared `nominalConcurrencyShares` (`spec.limited.*` for
+/// `Limited` type, `spec.exempt.*` for `Exempt`). Called from `create_resource`/
+/// `replace_resource` whenever a PriorityLevelConfiguration is written — see
+/// `crate::metrics::APF_NOMINAL_LIMIT_SEATS`'s doc for why the upstream APF e2e conformance
+/// test needs this series to exist at all.
+fn record_priority_level_metric(body: &serde_json::Value) {
+    let Some(name) = body["metadata"]["name"].as_str().filter(|n| !n.is_empty()) else {
+        return;
+    };
+    let seats = body["spec"]["limited"]["nominalConcurrencyShares"]
+        .as_i64()
+        .or_else(|| body["spec"]["exempt"]["nominalConcurrencyShares"].as_i64())
+        .unwrap_or(0);
+    crate::metrics::APF_NOMINAL_LIMIT_SEATS
+        .with_label_values(&[name])
+        .set(seats);
+}
+
+/// After a FlowSchema write, set `status.conditions[type=Dangling]` by checking whether the
+/// referenced PriorityLevelConfiguration actually exists in the store. Real kube-apiserver
+/// computes this via the `priority-and-fairness-config-consumer` controller loop; u7s has no
+/// controller loop, so — like `write_vap_status` — it is set synchronously right after create.
+/// Without this, a user-created FlowSchema never gets `status.conditions` at all, and the
+/// upstream e2e conformance test polling for `Dangling: False` times out after 30s. Store
+/// errors are silenced with `let _ =`/early return so a status write failure never breaks the
+/// create/update response.
+pub(crate) async fn write_flowcontrol_status<S: Store>(
+    store: &S,
+    group: &str,
+    plural: &str,
+    key: &str,
+    obj_body: &mut serde_json::Value,
+    stored_rv: u64,
+) {
+    if group != FLOWCONTROL_GROUP || plural != FLOWSCHEMA_PLURAL {
+        return;
+    }
+    let pl_name = match obj_body["spec"]["priorityLevelConfiguration"]["name"].as_str() {
+        Some(n) if !n.is_empty() => n.to_owned(),
+        _ => return,
+    };
+    let pl_key = group_object_key(FLOWCONTROL_GROUP, PLC_PLURAL, None, &pl_name);
+    let pl_exists = matches!(store.get(&pl_key).await, Ok(Some(_)));
+
+    let now = crate::util::utc_now_rfc3339();
+    let (status, reason, message) = if pl_exists {
+        (
+            "False",
+            "Found",
+            format!(
+                "This FlowSchema references the PriorityLevelConfiguration object named \
+                 \"{pl_name}\" and it exists"
+            ),
+        )
+    } else {
+        (
+            "True",
+            "NotFound",
+            format!(
+                "This FlowSchema references the PriorityLevelConfiguration object named \
+                 \"{pl_name}\" but there is no such object"
+            ),
+        )
+    };
+    obj_body["status"] = serde_json::json!({
+        "conditions": [{
+            "type": "Dangling",
+            "status": status,
+            "reason": reason,
+            "message": message,
+            "lastTransitionTime": now
+        }]
+    });
     let bytes = match serde_json::to_vec(obj_body) {
         Ok(b) => bytes::Bytes::from(b),
         Err(_) => return,
@@ -19655,6 +19755,149 @@ mod tests {
         assert_eq!(
             remaining_obj["metadata"]["name"], "beta",
             "the surviving Lease must be beta (holderIdentity=beta doesn't match the selector)"
+        );
+    }
+
+    // -- write_flowcontrol_status --
+
+    /// Before this fix, a user-created FlowSchema got no `status.conditions` at all — the
+    /// upstream APF conformance test's 30s poll for `status.conditions[type=Dangling]==False`
+    /// timed out regardless of whether the referenced PriorityLevelConfiguration existed.
+    #[tokio::test]
+    async fn write_flowcontrol_status_sets_dangling_false_when_referenced_priority_level_exists() {
+        let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory store");
+        let pl_key =
+            crate::keys::group_object_key(FLOWCONTROL_GROUP, PLC_PLURAL, None, "custom-pl");
+        store
+            .put(
+                &pl_key,
+                bytes::Bytes::from(
+                    serde_json::json!({ "metadata": { "name": "custom-pl" } }).to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("seed PriorityLevelConfiguration must not fail");
+
+        let mut body = serde_json::json!({
+            "metadata": { "name": "custom-fs" },
+            "spec": {
+                "matchingPrecedence": 1000,
+                "priorityLevelConfiguration": { "name": "custom-pl" }
+            }
+        });
+        let key =
+            crate::keys::group_object_key(FLOWCONTROL_GROUP, FLOWSCHEMA_PLURAL, None, "custom-fs");
+        let rv = store
+            .put(&key, bytes::Bytes::from(body.to_string()), None)
+            .await
+            .expect("seed FlowSchema must not fail");
+
+        write_flowcontrol_status(
+            &store,
+            FLOWCONTROL_GROUP,
+            FLOWSCHEMA_PLURAL,
+            &key,
+            &mut body,
+            rv,
+        )
+        .await;
+
+        assert_eq!(
+            body["status"]["conditions"][0]["type"], "Dangling",
+            "write_flowcontrol_status must set a Dangling condition"
+        );
+        assert_eq!(
+            body["status"]["conditions"][0]["status"], "False",
+            "Dangling must be False when the referenced PriorityLevelConfiguration exists — \
+             this is exactly what the upstream conformance test polls for"
+        );
+    }
+
+    /// A FlowSchema referencing a PriorityLevelConfiguration that does not exist must be
+    /// surfaced as `Dangling: True` — silently reporting False here would hide a real
+    /// misconfiguration from `kubectl get flowschemas` / `kubectl describe`.
+    #[tokio::test]
+    async fn write_flowcontrol_status_sets_dangling_true_when_referenced_priority_level_is_missing()
+    {
+        let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory store");
+        let mut body = serde_json::json!({
+            "metadata": { "name": "dangling-fs" },
+            "spec": {
+                "matchingPrecedence": 1000,
+                "priorityLevelConfiguration": { "name": "does-not-exist" }
+            }
+        });
+        let key = crate::keys::group_object_key(
+            FLOWCONTROL_GROUP,
+            FLOWSCHEMA_PLURAL,
+            None,
+            "dangling-fs",
+        );
+        let rv = store
+            .put(&key, bytes::Bytes::from(body.to_string()), None)
+            .await
+            .expect("seed FlowSchema must not fail");
+
+        write_flowcontrol_status(
+            &store,
+            FLOWCONTROL_GROUP,
+            FLOWSCHEMA_PLURAL,
+            &key,
+            &mut body,
+            rv,
+        )
+        .await;
+
+        assert_eq!(
+            body["status"]["conditions"][0]["status"], "True",
+            "Dangling must be True when the referenced PriorityLevelConfiguration does not \
+             exist in the store"
+        );
+    }
+
+    /// Writing anything other than a FlowSchema (e.g. the PriorityLevelConfiguration itself)
+    /// must leave `status` untouched — this guards against `write_flowcontrol_status`
+    /// accidentally overwriting a PriorityLevelConfiguration's own status.conditions.
+    #[tokio::test]
+    async fn write_flowcontrol_status_is_a_no_op_for_non_flowschema_writes() {
+        let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory store");
+        let mut body = serde_json::json!({ "metadata": { "name": "custom-pl" } });
+        let key = crate::keys::group_object_key(FLOWCONTROL_GROUP, PLC_PLURAL, None, "custom-pl");
+        let rv = store
+            .put(&key, bytes::Bytes::from(body.to_string()), None)
+            .await
+            .expect("seed must not fail");
+
+        write_flowcontrol_status(&store, FLOWCONTROL_GROUP, PLC_PLURAL, &key, &mut body, rv).await;
+
+        assert!(
+            body.get("status").is_none(),
+            "write_flowcontrol_status must not touch a PriorityLevelConfiguration's status"
+        );
+    }
+
+    // -- record_priority_level_metric --
+
+    /// The upstream APF conformance test polls `/metrics` for
+    /// `apiserver_flowcontrol_nominal_limit_seats{priority_level=<name>}` as part of its
+    /// "wait for steady state" check after creating a PriorityLevelConfiguration — without
+    /// this metric being set, that poll never observes the new priority level and the test
+    /// times out even once classification and status.conditions both work.
+    #[test]
+    fn record_priority_level_metric_sets_gauge_from_nominal_concurrency_shares() {
+        let body = serde_json::json!({
+            "metadata": { "name": "metric-test-pl" },
+            "spec": { "type": "Limited", "limited": { "nominalConcurrencyShares": 7 } }
+        });
+        record_priority_level_metric(&body);
+        assert_eq!(
+            crate::metrics::APF_NOMINAL_LIMIT_SEATS
+                .with_label_values(&["metric-test-pl"])
+                .get(),
+            7,
+            "the gauge must reflect this PriorityLevelConfiguration's own declared \
+             nominalConcurrencyShares"
         );
     }
 }

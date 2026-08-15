@@ -1,5 +1,6 @@
 mod admission;
 mod admissionreg_gen_adapter;
+mod apf;
 mod apiextensions_gen;
 mod apiextensions_gen_adapter;
 mod apiregistration_gen_adapter;
@@ -423,6 +424,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // read from cache instead of falling back to the store.
     state.init_apiservice_cache().await;
 
+    // 10c-pre3. Populate the FlowSchema/PriorityLevelConfiguration cache from the objects
+    // seed_flowcontrol just wrote, so AuthLayer's APF classification has FlowSchemas/
+    // PriorityLevelConfigurations to match against from the very first request.
+    state.init_flowcontrol_cache().await;
+
     // 10c. Keep the kubernetes Endpoints in sync with the kubernetes EndpointSlice.
     // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
     // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
@@ -508,6 +514,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             state.sa_decoding_key.clone(),
             Arc::clone(&state.store),
             Arc::clone(&state.sa_sig_cache),
+            Arc::clone(&state.flowcontrol_cache),
         ))
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -6348,6 +6355,7 @@ mod tests {
             state.sa_decoding_key.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
+            std::sync::Arc::clone(&state.flowcontrol_cache),
         ));
 
         for path in ["/openapi/v2", "/openapi/v3"] {

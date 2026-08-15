@@ -720,6 +720,7 @@ mod tests {
                 state.sa_decoding_key.clone(),
                 Arc::clone(&state.store),
                 Arc::clone(&state.sa_sig_cache),
+                Arc::clone(&state.flowcontrol_cache),
             ))
             .layer(crate::inflight::InflightLayer::new())
             .layer(axum::extract::DefaultBodyLimit::max(crate::MAX_BODY_BYTES));
