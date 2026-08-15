@@ -6,3 +6,9 @@ resolver = "2"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+
+[profile.dist]
+inherits = "release"
+
+[profile.dist.package.u7s-proto-generated]
+opt-level = "s"
