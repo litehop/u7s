@@ -42,6 +42,26 @@ fn main() {
         codegen::generate_pod_status(descriptor_bytes),
     )
     .expect("failed to write generated PodStatus codec");
+    std::fs::write(
+        out_dir.join("namespace_gen.rs"),
+        codegen::generate_namespace(descriptor_bytes),
+    )
+    .expect("failed to write generated Namespace codec");
+    std::fs::write(
+        out_dir.join("namespace_status_gen.rs"),
+        codegen::generate_namespace_status(descriptor_bytes),
+    )
+    .expect("failed to write generated NamespaceStatus codec");
+    std::fs::write(
+        out_dir.join("configmap_gen.rs"),
+        codegen::generate_configmap(descriptor_bytes),
+    )
+    .expect("failed to write generated ConfigMap codec");
+    std::fs::write(
+        out_dir.join("secret_gen.rs"),
+        codegen::generate_secret(descriptor_bytes),
+    )
+    .expect("failed to write generated Secret codec");
 
     println!(
         "cargo:rerun-if-changed={}",
