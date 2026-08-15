@@ -1428,6 +1428,19 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("CertificateSigningRequest", false, true),
     );
 
+    // certificates.k8s.io/v1beta1 — cluster-scoped; no status field on this type at all
+    // (kubelet reads spec.trustBundle directly via the clusterTrustBundle projection).
+    m.insert(
+        rk("certificates.k8s.io", "v1beta1", "clustertrustbundles"),
+        rm("ClusterTrustBundle", false, false),
+    );
+    // certificates.k8s.io/v1beta1 — namespaced; has_status=true: spec is immutable after
+    // create, status.certificateChain is written by the signer via /status.
+    m.insert(
+        rk("certificates.k8s.io", "v1beta1", "podcertificaterequests"),
+        rm("PodCertificateRequest", true, true),
+    );
+
     // apiregistration.k8s.io/v1 — cluster-scoped
     // The KCM GC graph builder lists every resource type it discovers. We advertise
     // apiregistration.k8s.io in discovery (STATIC_GROUPS); without a registry entry

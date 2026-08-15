@@ -10,6 +10,7 @@ mod auth;
 mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
 mod bootstrap_apply;
+mod certificates_v1beta1_gen_adapter;
 mod content_type;
 mod coord_gen_adapter;
 mod core_gen_adapter;
@@ -889,6 +890,27 @@ fn build_router(state: AppState) -> Router {
             get(handlers::csr::get_csr)
                 .put(handlers::approval::put_approval)
                 .patch(handlers::approval::patch_approval),
+        )
+        // ClusterTrustBundle (certificates.k8s.io/v1beta1) — dedicated POST handler
+        // validates spec.trustBundle (PEM X.509 CA certs) before storing; every kubelet
+        // that mounts it via a clusterTrustBundle projected volume trusts its contents.
+        // Must be registered before the generic cluster-scoped catch-all.
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/clustertrustbundles",
+            get(handlers::certificates::list_cluster_trust_bundles)
+                .post(handlers::certificates::create_cluster_trust_bundle)
+                .delete(handlers::certificates::delete_collection_cluster_trust_bundles),
+        )
+        // PodCertificateRequest (certificates.k8s.io/v1beta1) — dedicated POST handler
+        // validates the +required spec fields and strips any client-supplied status
+        // (status is the signer's exclusive right, written only via /status). Must be
+        // registered before the generic namespaced catch-all.
+        .route(
+            "/apis/certificates.k8s.io/v1beta1/namespaces/{ns}/podcertificaterequests",
+            get(handlers::certificates::list_pod_certificate_requests)
+                .post(handlers::certificates::create_pod_certificate_request)
+                .delete(handlers::certificates::delete_collection_pod_certificate_requests)
+                .patch(handlers::certificates::patch_collection_pod_certificate_requests),
         )
         // Generic cluster-scoped resources — collection
         .route(

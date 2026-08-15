@@ -176,6 +176,11 @@ async fn core_and_crd_groups<S: Store>(state: &AppState<S>) -> Vec<APIGroup> {
             // autoscaling advertises both v2 (preferred) and v1.
             if *name == "autoscaling" {
                 make_group(name, version, &["v2", "v1"])
+            } else if *name == "certificates.k8s.io" {
+                // v1 (GA, CertificateSigningRequest) stays preferred over v1beta1
+                // (ClusterTrustBundle, PodCertificateRequest) — same GA-over-beta
+                // preference upstream kube-apiserver applies.
+                make_group(name, version, &["v1", "v1beta1"])
             } else {
                 make_group(name, version, &[version])
             }
@@ -796,6 +801,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("autoscaling", "v2") => Some(autoscaling_v2_resources()),
         ("batch", "v1") => Some(batch_v1_resources()),
         ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
+        ("certificates.k8s.io", "v1beta1") => Some(certificates_v1beta1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
         ("events.k8s.io", "v1") => Some(events_v1_resources()),
@@ -1271,6 +1277,37 @@ fn certificates_v1_resources() -> serde_json::Value {
                 "singularName": "",
                 "namespaced": false,
                 "kind": "CertificateSigningRequest",
+                "verbs": ["get", "patch", "update"]
+            }
+        ]
+    })
+}
+
+fn certificates_v1beta1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "certificates.k8s.io/v1beta1",
+        "resources": [
+            {
+                "name": "clustertrustbundles",
+                "singularName": "clustertrustbundle",
+                "namespaced": false,
+                "kind": "ClusterTrustBundle",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "podcertificaterequests",
+                "singularName": "podcertificaterequest",
+                "namespaced": true,
+                "kind": "PodCertificateRequest",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "podcertificaterequests/status",
+                "singularName": "",
+                "namespaced": true,
+                "kind": "PodCertificateRequest",
                 "verbs": ["get", "patch", "update"]
             }
         ]
