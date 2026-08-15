@@ -65,6 +65,16 @@ provision:
       # The 10-crio.conf shipped by the cri-o package already sets the correct path.
       mkdir -p /etc/crio/crio.conf.d
 
+      # Alias a "test-handler" runtime to the same cri-o-bundled runc used by the
+      # package's own "runc" entry above. Upstream's RuntimeClass e2e suite
+      # (test/e2e/framework/node/runtimeclass) hardcodes "test-handler" as the
+      # handler name and expects it preconfigured in the container runtime —
+      # this is the same block cri-o's own upstream CI adds for that suite
+      # (cri-o/cri-o contrib/test/ci/e2e-base.yml), just pointed at the
+      # crio-bundled runc path instead of a system /usr/bin/runc (which isn't
+      # installed on this image; see the crun path caution above).
+      printf '[crio.runtime.runtimes.test-handler]\nruntime_path = "/usr/libexec/crio/runc"\nruntime_type = "oci"\nruntime_root = "/run/runc"\nmonitor_path = "/usr/libexec/crio/conmon"\n' > /etc/crio/crio.conf.d/20-test-handler.conf
+
       # Enable the CNI 1.0.0 conflist bridge config.
       # The cri-o package ships two CNI configs:
       #   10-crio-bridge.conf         — old 0.4.0 single-plugin format (fails with crun 1.26+)
