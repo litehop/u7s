@@ -493,6 +493,13 @@ pub(crate) async fn create_pod<S: Store>(
                     Ok(rc_obj) => {
                         tracing::debug!(rc = %rc_name, overhead = %rc_obj["overhead"], "injecting RuntimeClass overhead into pod");
                         apply_runtime_class_overhead(&mut obj.body, &rc_obj);
+                        if let Err(msg) = apply_runtime_class_scheduling(&mut obj.body, &rc_obj) {
+                            // Real kube-apiserver's RuntimeClass admission plugin rejects
+                            // the pod outright on a nodeSelector conflict rather than
+                            // silently picking a side — a pod that ignores this could
+                            // land on a node the RuntimeClass forbids.
+                            return Err(Status::forbidden(format!("pod rejected: {msg}")));
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(rc = %rc_name, err = %e, "failed to parse stored RuntimeClass — overhead not injected");
@@ -4594,6 +4601,62 @@ pub(crate) fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &ser
     }
 }
 
+/// Merge `scheduling.nodeSelector`/`scheduling.tolerations` from a RuntimeClass into
+/// `pod.spec`, mirroring upstream's RuntimeClass admission plugin (`setScheduling` in
+/// plugin/pkg/admission/runtimeclass/admission.go).
+///
+/// nodeSelector keys are merged into `pod.spec.nodeSelector`. A key present on both
+/// sides with different values is rejected outright (`Err`) rather than silently
+/// picking one side — without this a Pod's own nodeSelector could quietly overrule
+/// the RuntimeClass's placement requirement, or vice versa, and the caller couldn't
+/// tell which one actually took effect.
+///
+/// `scheduling.tolerations` are appended to `pod.spec.tolerations`, skipping entries
+/// already present verbatim (idempotent re-admission, e.g. under `dryRun`).
+///
+/// The RuntimeClass JSON must be the full stored object; a RuntimeClass with no
+/// `.scheduling` is a no-op.
+pub(crate) fn apply_runtime_class_scheduling(
+    pod: &mut serde_json::Value,
+    rc: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(rc_selector) = rc["scheduling"]["nodeSelector"].as_object() {
+        let mut merged = pod["spec"]["nodeSelector"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        for (key, rc_value) in rc_selector {
+            if let Some(pod_value) = merged.get(key) {
+                if pod_value != rc_value {
+                    return Err(format!(
+                        "conflict: runtimeClass.scheduling.nodeSelector[{key}] = {rc_value}; \
+                         pod.spec.nodeSelector[{key}] = {pod_value}"
+                    ));
+                }
+            }
+            merged.insert(key.clone(), rc_value.clone());
+        }
+        pod["spec"]["nodeSelector"] = serde_json::Value::Object(merged);
+    }
+
+    if let Some(rc_tolerations) = rc["scheduling"]["tolerations"].as_array() {
+        let mut merged = pod["spec"]["tolerations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for t in rc_tolerations {
+            if !merged.contains(t) {
+                merged.push(t.clone());
+            }
+        }
+        if !merged.is_empty() {
+            pod["spec"]["tolerations"] = serde_json::Value::Array(merged);
+        }
+    }
+
+    Ok(())
+}
+
 /// The two built-in Kubernetes PriorityClasses that are always resolvable, even
 /// when no PriorityClass object has been created for them. Upstream's
 /// PriorityClass admission plugin (plugin/pkg/admission/priority) special-cases
@@ -8087,6 +8150,180 @@ mod pure_logic_tests {
             "pod.spec.overhead must remain absent when RuntimeClass has no podFixed overhead"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // apply_runtime_class_scheduling
+    // -----------------------------------------------------------------------
+
+    /// A RuntimeClass with no `.scheduling` must leave the pod's own nodeSelector
+    /// and tolerations exactly as the client posted them.
+    ///
+    /// Without this no-op guard, a RuntimeClass that only sets `overhead` (no
+    /// scheduling constraints at all) could still clobber a pod's placement —
+    /// e.g. wiping tolerations the client explicitly set — for no reason tied to
+    /// the RuntimeClass definition.
+    #[test]
+    fn runtime_class_without_scheduling_leaves_pod_unchanged() {
+        let rc = serde_json::json!({ "handler": "no-scheduling" });
+        let mut pod = serde_json::json!({
+            "spec": {
+                "nodeSelector": {"disk": "ssd"},
+                "tolerations": [{"key": "dedicated", "operator": "Exists"}]
+            }
+        });
+
+        apply_runtime_class_scheduling(&mut pod, &rc).expect("no-op must not error");
+
+        assert_eq!(
+            pod["spec"]["nodeSelector"],
+            serde_json::json!({"disk": "ssd"}),
+            "pod.spec.nodeSelector must be untouched when the RuntimeClass has no scheduling"
+        );
+        assert_eq!(
+            pod["spec"]["tolerations"],
+            serde_json::json!([{"key": "dedicated", "operator": "Exists"}]),
+            "pod.spec.tolerations must be untouched when the RuntimeClass has no scheduling"
+        );
+    }
+
+    /// A RuntimeClass's `scheduling.nodeSelector` must merge into a pod's
+    /// nodeSelector when the keys don't conflict.
+    ///
+    /// Conformance test '[sig-node] RuntimeClass should run a Pod requesting a
+    /// RuntimeClass with scheduling with taints' asserts the created pod's
+    /// nodeSelector equals the RuntimeClass's full nodeSelector even though the
+    /// pod only set one of the two keys itself — without the merge, the pod is
+    /// missing the RuntimeClass's placement key and never lands on the intended
+    /// (labeled) node.
+    #[test]
+    fn runtime_class_scheduling_nodeselector_merges_cleanly_when_no_conflict() {
+        let rc = serde_json::json!({
+            "scheduling": {
+                "nodeSelector": {"foo": "bar", "fizz": "buzz"}
+            }
+        });
+        let mut pod = serde_json::json!({
+            "spec": { "nodeSelector": {"foo": "bar"} }
+        });
+
+        apply_runtime_class_scheduling(&mut pod, &rc).expect("no conflict must not error");
+
+        assert_eq!(
+            pod["spec"]["nodeSelector"],
+            serde_json::json!({"foo": "bar", "fizz": "buzz"}),
+            "RuntimeClass.scheduling.nodeSelector keys absent from the pod's own \
+             nodeSelector must be merged in, or the pod won't be constrained to \
+             the nodes the RuntimeClass requires"
+        );
+    }
+
+    /// A RuntimeClass's `scheduling.tolerations` must be appended to the pod's
+    /// tolerations.
+    ///
+    /// Conformance test '[sig-node] RuntimeClass should run a Pod requesting a
+    /// RuntimeClass with scheduling with taints' taints the target node and
+    /// expects the pod to still schedule there — without this merge the pod
+    /// carries no toleration for that taint and sits Pending forever.
+    #[test]
+    fn runtime_class_scheduling_tolerations_appended_to_pod() {
+        let rc = serde_json::json!({
+            "scheduling": {
+                "tolerations": [{"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"}]
+            }
+        });
+        let mut pod = serde_json::json!({ "spec": {} });
+
+        apply_runtime_class_scheduling(&mut pod, &rc).expect("toleration append must not error");
+
+        assert_eq!(
+            pod["spec"]["tolerations"],
+            serde_json::json!([{"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"}]),
+            "RuntimeClass.scheduling.tolerations must be copied onto the pod, or a \
+             pod requesting the RuntimeClass can never schedule onto a node the \
+             RuntimeClass's own taint tolerations were meant to unblock"
+        );
+    }
+
+    /// A RuntimeClass with both `scheduling.nodeSelector` and
+    /// `scheduling.tolerations` must merge both onto the pod in one pass.
+    #[test]
+    fn runtime_class_scheduling_nodeselector_and_tolerations_merge_together() {
+        let rc = serde_json::json!({
+            "scheduling": {
+                "nodeSelector": {"fizz": "buzz"},
+                "tolerations": [{"key": "foo", "operator": "Exists", "effect": "NoSchedule"}]
+            }
+        });
+        let mut pod = serde_json::json!({
+            "spec": { "nodeSelector": {"foo": "bar"} }
+        });
+
+        apply_runtime_class_scheduling(&mut pod, &rc).expect("no conflict must not error");
+
+        assert_eq!(
+            pod["spec"]["nodeSelector"],
+            serde_json::json!({"foo": "bar", "fizz": "buzz"}),
+            "nodeSelector merge must not be skipped just because tolerations are also present"
+        );
+        assert_eq!(
+            pod["spec"]["tolerations"],
+            serde_json::json!([{"key": "foo", "operator": "Exists", "effect": "NoSchedule"}]),
+            "toleration append must not be skipped just because nodeSelector is also present"
+        );
+    }
+
+    /// A pod's nodeSelector key that conflicts with the RuntimeClass's own
+    /// `scheduling.nodeSelector` value for that key must be rejected.
+    ///
+    /// Conformance test '[sig-node] RuntimeClass should reject a Pod requesting a
+    /// RuntimeClass with conflicting node selector' expects 403 Forbidden here.
+    /// Silently picking either side's value would let a pod land on a node the
+    /// RuntimeClass's own placement rule forbids (or vice versa), with no
+    /// indication to the client that its selector was ignored.
+    #[test]
+    fn runtime_class_scheduling_nodeselector_conflict_rejected_because_pod_could_land_on_wrong_node(
+    ) {
+        let rc = serde_json::json!({
+            "scheduling": {
+                "nodeSelector": {"foo": "conflict"}
+            }
+        });
+        let mut pod = serde_json::json!({
+            "spec": { "nodeSelector": {"foo": "bar"} }
+        });
+
+        let result = apply_runtime_class_scheduling(&mut pod, &rc);
+
+        assert!(
+            result.is_err(),
+            "a pod nodeSelector value that disagrees with the RuntimeClass's \
+             nodeSelector for the same key must be rejected, not silently merged"
+        );
+    }
+
+    /// A toleration already present on the pod (verbatim) must not be duplicated
+    /// when the RuntimeClass also specifies it.
+    ///
+    /// Re-admission must be idempotent (e.g. a webhook retry or `dryRun`) — a
+    /// naive append would grow `pod.spec.tolerations` unboundedly on every retry.
+    #[test]
+    fn runtime_class_scheduling_tolerations_not_duplicated_when_already_present() {
+        let toleration = serde_json::json!({"key": "foo", "operator": "Exists"});
+        let rc = serde_json::json!({
+            "scheduling": { "tolerations": [toleration] }
+        });
+        let mut pod = serde_json::json!({
+            "spec": { "tolerations": [toleration] }
+        });
+
+        apply_runtime_class_scheduling(&mut pod, &rc).expect("must not error");
+
+        assert_eq!(
+            pod["spec"]["tolerations"].as_array().map(Vec::len),
+            Some(1),
+            "an identical toleration already on the pod must not be duplicated by the merge"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9579,6 +9816,174 @@ mod handler_tests {
         assert!(
             stored.is_none(),
             "rejected pod must not be persisted in the store"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RuntimeClass scheduling merge regression tests
+    // -----------------------------------------------------------------------
+
+    /// Creating a pod with spec.runtimeClassName referencing a RuntimeClass that
+    /// defines scheduling.nodeSelector and scheduling.tolerations must result in
+    /// the stored pod having both merged into its spec.
+    ///
+    /// Conformance test '[sig-node] RuntimeClass should run a Pod requesting a
+    /// RuntimeClass with scheduling with taints' creates a pod like this, taints
+    /// the target node, and expects the pod to schedule there. Before this merge,
+    /// the stored pod kept only its own nodeSelector key and had no tolerations
+    /// at all, so it sat Pending against the node's taint for the full 300s
+    /// timeout.
+    #[tokio::test]
+    async fn create_pod_merges_runtime_class_scheduling_into_pod_spec() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let rc = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1",
+            "kind": "RuntimeClass",
+            "metadata": {"name": "scheduled-rc"},
+            "handler": "scheduled-rc",
+            "scheduling": {
+                "nodeSelector": {"foo": "bar", "fizz": "buzz"},
+                "tolerations": [
+                    {"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"}
+                ]
+            }
+        });
+        store
+            .put(
+                "/registry/node.k8s.io/runtimeclasses/scheduled-rc",
+                Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed RuntimeClass");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "scheduled-pod", "namespace": "default"},
+            "spec": {
+                "runtimeClassName": "scheduled-rc",
+                "nodeSelector": {"foo": "bar"},
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a pod whose own nodeSelector agrees with the RuntimeClass's must be admitted"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/scheduled-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["nodeSelector"],
+            serde_json::json!({"foo": "bar", "fizz": "buzz"}),
+            "the RuntimeClass's fizz=buzz nodeSelector key must be merged in even \
+             though the pod only set foo=bar itself — otherwise the pod is not \
+             constrained to the node the RuntimeClass requires"
+        );
+        assert_eq!(
+            stored_v["spec"]["tolerations"],
+            serde_json::json!([
+                {"key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule"}
+            ]),
+            "the RuntimeClass's toleration must be copied onto the pod, or the pod \
+             can never schedule onto a node carrying the taint the RuntimeClass \
+             expects it to tolerate"
+        );
+    }
+
+    /// A pod whose own nodeSelector conflicts with the RuntimeClass's
+    /// scheduling.nodeSelector value for the same key must be rejected with 403,
+    /// and must not be persisted.
+    ///
+    /// Conformance test '[sig-node] RuntimeClass should reject a Pod requesting a
+    /// RuntimeClass with conflicting node selector' expects exactly this. Before
+    /// this check, u7s created the pod successfully instead of rejecting it.
+    #[tokio::test]
+    async fn create_pod_rejects_conflicting_runtime_class_node_selector() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let rc = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1",
+            "kind": "RuntimeClass",
+            "metadata": {"name": "conflict-rc"},
+            "handler": "conflict-rc",
+            "scheduling": {
+                "nodeSelector": {"foo": "conflict"}
+            }
+        });
+        store
+            .put(
+                "/registry/node.k8s.io/runtimeclasses/conflict-rc",
+                Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed RuntimeClass");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "conflict-pod", "namespace": "default"},
+            "spec": {
+                "runtimeClassName": "conflict-rc",
+                "nodeSelector": {"foo": "bar"},
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a pod nodeSelector value that conflicts with the RuntimeClass's own \
+             nodeSelector for the same key must be rejected — silently accepting \
+             it means either the pod's or the RuntimeClass's placement intent is \
+             ignored with no error"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/conflict-pod")
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "rejected pod must not be persisted — a persisted-but-unschedulable \
+             pod fills node capacity for no reason"
         );
     }
 
