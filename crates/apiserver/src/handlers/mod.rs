@@ -1,6 +1,7 @@
 pub mod aggregation;
 pub mod approval;
 pub mod authorization;
+pub mod certificates;
 pub mod core;
 pub mod cr;
 pub mod crd;

@@ -1,27 +1,7 @@
-#![allow(clippy::doc_lazy_continuation)]
-#![allow(clippy::tabs_in_doc_comments)]
-#![allow(clippy::doc_overindented_list_items)]
-#![allow(dead_code)]
-
-pub mod k8s {
-    pub mod io {
-        // apimachinery is generated once by build.rs; apps_gen is the sole `include!` site so
-        // every wrapper's ObjectMeta/LabelSelector/etc. is one Rust type, not a nominally
-        // distinct copy per wrapper.
-        pub use crate::apps_gen::k8s::io::apimachinery;
-        pub mod apiextensions_apiserver {
-            pub mod pkg {
-                pub mod apis {
-                    pub mod apiextensions {
-                        pub mod v1 {
-                            include!(concat!(
-                                env!("OUT_DIR"),
-                                "/k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.rs"
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+// The generated message types (and the prost invocation that produces them) now live in
+// u7s-proto-generated — see that crate's lib.rs. This module is kept as a thin re-export rather
+// than deleted so every existing `crate::apiextensions_gen::...` call site keeps resolving
+// without a crate-wide rename. Its only remaining call sites are `#[cfg(test)]` fixtures in
+// proto.rs, so a non-test build sees this re-export as unused.
+#[allow(unused_imports)]
+pub use u7s_proto_generated::k8s;

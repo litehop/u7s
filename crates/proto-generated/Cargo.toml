@@ -1,0 +1,19 @@
+[package]
+name    = "u7s-proto-generated"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# prost carries the vendored .proto files' own doc comments onto the generated structs verbatim,
+# and some of those upstream comments contain triple-backtick code fences (e.g. JSON examples)
+# that rustdoc would otherwise try to compile as doctests — matching u7s-apiserver's own
+# `doctest = false`, set for the same reason before this crate existed.
+doctest = false
+
+[dependencies]
+prost           = "0.14"
+u7s-sentinel    = { path = "../sentinel" }
+
+[build-dependencies]
+prost-build              = "0.14"
+protoc-bin-vendored      = "3.2"

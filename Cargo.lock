@@ -3571,9 +3571,7 @@ dependencies = [
  "jsonwebtoken",
  "prometheus",
  "prost",
- "prost-build",
  "prost-types",
- "protoc-bin-vendored",
  "rcgen",
  "reqwest",
  "rlimit",
@@ -3595,6 +3593,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "u7s-proto-generated",
  "u7s-sentinel",
  "u7s-store",
  "uuid",
@@ -3620,6 +3619,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "u7s-proto-generated"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "u7s-sentinel",
 ]
 
 [[package]]

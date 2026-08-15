@@ -1,14 +1,14 @@
 use prost::Message;
 
-use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
-use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::api::batch::v1 as batch_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
 }
 
 fn gen_pod_template_spec_to_json(
-    tmpl: crate::apps_gen::k8s::io::api::core::v1::PodTemplateSpec,
+    tmpl: u7s_proto_generated::k8s::io::api::core::v1::PodTemplateSpec,
 ) -> serde_json::Value {
     crate::core_gen_adapter::gen_pod_template_spec_to_json(tmpl)
 }
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn generated_cronjob_status_active_survives_decode_by_construction() {
-        use crate::apps_gen::k8s::io::api::core::v1::ObjectReference;
+        use u7s_proto_generated::k8s::io::api::core::v1::ObjectReference;
         let cj = batch_v1::CronJob {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("my-cj".to_string()),
@@ -700,7 +700,7 @@ mod tests {
     /// all, so it silently disappeared from the stored object on the very next write.
     #[test]
     fn decode_job_proto_gen_preserves_selector_and_manual_selector() {
-        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1::LabelSelector;
+        use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1::LabelSelector;
         let job = batch_v1::Job {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("manual-selector-job".to_string()),
@@ -1105,7 +1105,7 @@ mod tests {
     /// gen_object_reference_to_json) only carried 5 of them before this fix.
     #[test]
     fn decode_cronjob_proto_gen_preserves_active_resource_version_and_field_path() {
-        use crate::apps_gen::k8s::io::api::core::v1::ObjectReference;
+        use u7s_proto_generated::k8s::io::api::core::v1::ObjectReference;
         let cj = batch_v1::CronJob {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("ref-fields-cj".to_string()),

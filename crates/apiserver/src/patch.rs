@@ -3175,7 +3175,10 @@ mod tests {
             ("ContainerStatus", "allocatedResourcesStatus"),
         ];
 
-        let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto-include");
+        // proto-include now lives in the u7s-proto-generated crate, which owns the prost
+        // invocation, not here.
+        let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../proto-generated/proto-include");
         let mut proto_paths = Vec::new();
         collect_proto_files(&proto_dir, &mut proto_paths);
         assert!(

@@ -1,7 +1,7 @@
 use prost::Message;
 
-use crate::apiregistration_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
-use crate::apiregistration_gen::k8s::io::kube_aggregator::pkg::apis::apiregistration::v1 as apiregistration_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::kube_aggregator::pkg::apis::apiregistration::v1 as apiregistration_v1;
 
 // ---- shared helpers --------------------------------------------------------
 

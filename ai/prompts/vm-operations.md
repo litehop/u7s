@@ -284,6 +284,29 @@ If the node does not register:
 limactl shell <VM> sudo journalctl -u kubelet --no-pager --utc -n 30
 ```
 
+### VM bring-up stalls — ARP/usernet socket failure (per-VM recovery)
+
+Symptom: `limactl shell <VM> ip neigh show 192.168.104.2` shows the gateway as
+`INCOMPLETE`, or `ping 192.168.104.2` from inside the VM returns `Destination Host
+Unreachable`, or bring-up stalls for 5+ min at hostagent `wait_port` with `dial
+unix .../_networks/user-v2/user-v2_ep.sock: connect: no such file or directory`.
+Root cause: a defect in Lima's shared `limactl usernet` daemon matching upstream
+containers/gvisor-tap-vsock PR #613, not yet in any shipped Lima release — see bd
+memory `lima-usernet-arp-defect-root-cause-gvisor-tap-vsock-pr-613-not-yet-in-any-lima-release`.
+
+Recovery for **YOUR OWN VM only**:
+```bash
+limactl stop --force <VM>
+limactl start <VM>
+```
+Verify: `limactl shell <VM> ip neigh show 192.168.104.2` → `REACHABLE`.
+
+This does NOT touch the shared usernet daemon and does NOT affect other in-flight
+VMs — safe to run autonomously even with 3+ other workers live. Do not touch the
+shared daemon or any VM other than your own. See bd memory
+`limactl-stop-force-plus-start-recovers-per-vm-from-o61zz` for the full mitigation
+record.
+
 ---
 
 ## Step 4 — Start KCM
@@ -446,6 +469,38 @@ It reaches the same apiserver either way. If a `limactl shell <VM> ... kubectl .
 command fails, that is the signal you took the wrong path — switch to the host-side
 form rather than hunting for a kubectl binary inside the VM (there isn't one).
 
+### Beta-gated specs and `--unsafe-focus`
+
+A bare `--focus '<regex>'` can report **`Will run 0 of 7579 specs`** even when the
+regex is correct — do not conclude "no matching specs" from a zero count alone.
+`06-run-sonobuoy.sh`'s `FEATUREGATE_LABEL_FILTER` (currently `'FeatureGate:
+isSubsetOf {VolumeAttributesClass}'`) is applied on top of every `--focus` run and
+silently excludes any Beta- or Alpha-gated spec whose FeatureGate isn't in that
+allow-set — the regex matched, the filter just discarded the match downstream.
+
+Two scouts hit this independently in the same session (ClusterTrustBundle/
+PodCertificate, and APF/CLE) — both saw the 0-of-7579 report on a correct regex
+before finding the cause.
+
+**Diagnostic flow when `--focus` reports zero matches:**
+1. Is the regex correct? (grep the upstream test file for the exact `ginkgo.It`
+   text — see "Locating the failing test's source" above.)
+2. Is the feature Beta or Alpha as of the pinned upstream (`1.36.2`)? (check the
+   API group version — `v1alpha1`/`v1beta1` vs `v1` — or bd memories for
+   feature-gate status.)
+3. If either might be true, re-run with `--unsafe-focus` added — it wipes the
+   FeatureGate label-filter (and the `[Flaky]` skip) for that invocation and
+   exposes the true PASS/FAIL/SKIP count:
+   ```bash
+   scripts/conformance/run-all.sh --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT> --focus "<FOCUS>" --unsafe-focus
+   ```
+
+`--unsafe-focus` only has an effect combined with `--focus`; it is a no-op with a
+bare run or `--all-e2e` (both already apply both filters unconditionally). It is
+an opt-in escape hatch, not a new default — the FeatureGate filter also exists to
+stop a named test from accidentally re-triggering a known-crashing Beta spec; see
+`run-all.sh`'s own `--unsafe-focus` doc comment for specifics.
+
 ---
 
 ## Logs
@@ -479,3 +534,30 @@ including any crash-loops). To collect manually (e.g. after a `--stack-only` run
 ```bash
 limactl shell <VM> sudo journalctl -u kubelet --no-pager --utc > kubelet.log
 ```
+
+---
+
+## Worktree removal — evacuate artifacts first (mayor)
+
+Gitignored worker outputs (`ai/findings/*.md`, `temp/e2e/<timestamp>-conformance/`
++ its `.tar.gz`, `temp/profile/`) live only inside the worker's own worktree.
+`git worktree remove --force` deletes the entire subtree, gitignored files
+included — there is no recovery once it runs.
+
+Before removing any worker worktree, evacuate first:
+1. Read the worker's return message for any file paths under
+   `<worktree>/(ai/findings|temp/e2e|temp/profile)/`.
+2. `mv` each mentioned artifact to the mayor-side equivalent path, e.g.:
+   ```bash
+   mv <worktree>/ai/findings/<slug>-YYYY-MM-DD.md /Users/balint.erdos/u7s/ai/findings/
+   mv <worktree>/temp/e2e/<timestamp>-conformance /Users/balint.erdos/u7s/temp/e2e/
+   mv <worktree>/temp/e2e/<timestamp>-conformance.tar.gz /Users/balint.erdos/u7s/temp/e2e/
+   ```
+3. `ls -la` the destination to confirm the evacuation succeeded.
+4. Only THEN run `git worktree remove --force <worktree>`.
+
+Losing a findings doc means either re-dispatching the investigation (5-30 min) or
+relying on the worker's return message plus banked bd memory — rarely as detailed
+as the original document. See bd memory
+`evacuate-worker-run-artifacts-before-worktree-removal` for the full procedure
+and casualty history.

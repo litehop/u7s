@@ -1,8 +1,8 @@
 use prost::Message;
 
-use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
-use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
-use crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
+use u7s_proto_generated::k8s::io::api::core::v1 as core_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
 
 // ---- shared helpers --------------------------------------------------------
 
@@ -5268,7 +5268,7 @@ mod tests {
             spec: Some(core_v1::PersistentVolumeSpec {
                 capacity: std::collections::HashMap::from([(
                     "storage".to_string(),
-                    crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                    u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                         string: Some("5Gi".to_string()),
                     },
                 )]),
@@ -6428,7 +6428,7 @@ mod tests {
                 }],
                 overhead: std::collections::HashMap::from([(
                     "cpu".to_string(),
-                    crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                    u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                         string: Some("250m".to_string()),
                     },
                 )]),
@@ -6766,13 +6766,13 @@ mod tests {
                 resources: Some(core_v1::ResourceRequirements {
                     limits: std::collections::HashMap::from([(
                         "cpu".to_string(),
-                        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                        u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                             string: Some("500m".to_string()),
                         },
                     )]),
                     requests: std::collections::HashMap::from([(
                         "cpu".to_string(),
-                        crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                        u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                             string: Some("250m".to_string()),
                         },
                     )]),
@@ -6852,7 +6852,7 @@ mod tests {
                     resources: Some(core_v1::ResourceRequirements {
                         limits: std::collections::HashMap::from([(
                             "cpu".to_string(),
-                            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                                 string: Some("100m".to_string()),
                             },
                         )]),
@@ -7224,7 +7224,7 @@ mod tests {
                                     resources: Some(core_v1::VolumeResourceRequirements {
                                         requests: std::collections::HashMap::from([(
                                             "storage".to_string(),
-                                            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                                                 string: Some("1Gi".to_string()),
                                             },
                                         )]),
@@ -7736,7 +7736,7 @@ mod tests {
                         empty_dir: Some(core_v1::EmptyDirVolumeSource {
                             medium: Some("Memory".to_string()),
                             size_limit: Some(
-                                crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+                                u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                                     string: Some("1Gi".to_string()),
                                 },
                             ),
@@ -7939,8 +7939,8 @@ mod tests {
     fn generated_resourcequota_preserves_status_hard_and_used_for_status_subresource_replace() {
         fn quantity(
             s: &str,
-        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        ) -> u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                 string: Some(s.to_string()),
             }
         }
@@ -7988,8 +7988,8 @@ mod tests {
     fn generated_node_preserves_status_for_status_subresource_replace() {
         fn quantity(
             s: &str,
-        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        ) -> u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                 string: Some(s.to_string()),
             }
         }
@@ -8629,8 +8629,8 @@ mod tests {
     fn decode_persistentvolumeclaim_proto_gen_preserves_status_capacity() {
         fn quantity(
             s: &str,
-        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        ) -> u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                 string: Some(s.to_string()),
             }
         }
@@ -8741,8 +8741,8 @@ mod tests {
     fn decode_persistentvolumeclaim_proto_gen_preserves_status_allocated_resources() {
         fn quantity(
             s: &str,
-        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        ) -> u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                 string: Some(s.to_string()),
             }
         }
@@ -9262,8 +9262,8 @@ mod tests {
     fn decode_limitrange_proto_gen_preserves_max_and_default_limits() {
         fn quantity(
             s: &str,
-        ) -> crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
-            crate::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity {
+        ) -> u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
+            u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity {
                 string: Some(s.to_string()),
             }
         }

@@ -1,7 +1,7 @@
 use prost::Message;
 
-use crate::apiextensions_gen::k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiext_v1;
-use crate::apiextensions_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+use u7s_proto_generated::k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiext_v1;
+use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)

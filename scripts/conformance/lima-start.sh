@@ -47,6 +47,7 @@ source "$(dirname "$0")/_lib.sh"
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
+_NETWORK_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _NODE_SUFFIX_OVERRIDE=""
 VERBOSE=0
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
+    --network) _NETWORK_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --node-suffix) _NODE_SUFFIX_OVERRIDE="$2"; shift 2 ;;
     --verbose) VERBOSE=1; shift ;;
@@ -76,6 +78,7 @@ KUBE_PROXY_V=2
 [ "$VERBOSE" -eq 1 ] && KUBE_PROXY_V=5
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
+NETWORK="${_NETWORK_OVERRIDE:-user-v2}"
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
 # serving cert) so a 2nd node can join the same cluster without colliding with — or,
 # for the Pod's immutable spec.nodeName, 403'ing against — node 1's.
@@ -96,14 +99,16 @@ VM_NAME="${U7S_VM_NAME:-lima-node}"
 # When a non-default kubelet port is requested, write a patched yaml with the
 # correct hostPort into the worktree temp dir so each worker VM uses its own
 # host-side port and parallel workers don't collide on 10250.
-if [ "$KUBELET_PORT" != "10250" ]; then
+if [ "$KUBELET_PORT" != "10250" ] || [ "$NETWORK" != "user-v2" ]; then
   if [ -n "$_WORKDIR_OVERRIDE" ]; then
     _YAML_DIR="$_WORKDIR_OVERRIDE"
   else
     _YAML_DIR="$PWD/temp/u7s"
   fi
   mkdir -p "$_YAML_DIR"
-  sed "s/hostPort: 10250/hostPort: ${KUBELET_PORT}/" "$LIMA_YAML" > "$_YAML_DIR/kubelet-patched.yaml"
+  sed -e "s/hostPort: 10250/hostPort: ${KUBELET_PORT}/" \
+      -e "s/lima: user-v2/lima: ${NETWORK}/" \
+      "$LIMA_YAML" > "$_YAML_DIR/kubelet-patched.yaml"
   LIMA_YAML="$_YAML_DIR/kubelet-patched.yaml"
 fi
 # --workdir sets the kubeconfig path. Takes priority over ambient $KUBECONFIG so
