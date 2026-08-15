@@ -1113,6 +1113,7 @@ mod tests {
                     ..Default::default()
                 },
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
             guard.assume(
                 "default",
@@ -1124,6 +1125,7 @@ mod tests {
                     ..Default::default()
                 },
                 Vec::new(),
+                std::collections::HashMap::new(),
             );
         }
 

@@ -18,6 +18,9 @@ fn realistic_pending_pod() -> PendingPod {
         priority: 0,
         tolerations: Vec::new(),
         node_affinity: None,
+        labels: HashMap::new(),
+        pod_affinity_terms: Vec::new(),
+        pod_anti_affinity_terms: Vec::new(),
         requests: ResourceRequests {
             cpu_milli: 100,
             memory_milli: 128 * 1024 * 1024 * 1000,
@@ -72,7 +75,12 @@ fn bench_select_node_with_capacity(c: &mut Criterion) {
             b.iter_batched(
                 || node_list_matching_last(size),
                 |list| {
-                    select_node_with_capacity(black_box(list), black_box(&pod), black_box(&usage))
+                    select_node_with_capacity(
+                        black_box(list),
+                        black_box(&pod),
+                        black_box(&usage),
+                        black_box(&[]),
+                    )
                 },
                 BatchSize::SmallInput,
             );
