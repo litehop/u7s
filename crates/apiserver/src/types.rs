@@ -771,6 +771,60 @@ pub struct CsrCondition {
 }
 
 // ---------------------------------------------------------------------------
+// ClusterTrustBundle typed fields (certificates.k8s.io/v1beta1)
+// ---------------------------------------------------------------------------
+
+/// Typed `spec` for a ClusterTrustBundle.
+///
+/// `trust_bundle` has no `#[serde(default)]`: upstream marks it `+required` (no
+/// `omitempty`), so a create body that omits it entirely must fail deserialization
+/// the same way CSR's `request` field does. `signer_name` is genuinely optional
+/// upstream (`omitempty`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterTrustBundleSpec {
+    #[serde(default)]
+    pub signer_name: String,
+    /// PEM bundle of one or more PEM-wrapped, DER-formatted X.509 CA certificates.
+    pub trust_bundle: String,
+    /// Remaining fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// PodCertificateRequest typed fields (certificates.k8s.io/v1beta1)
+// ---------------------------------------------------------------------------
+
+/// Typed `spec` for a PodCertificateRequest. All fields below are `+required`
+/// upstream (no `omitempty`); a create body missing any of them must fail
+/// deserialization, mirroring CSR's `request`/`signerName` handling.
+///
+/// The three `*Uid` fields need an explicit `rename`: `#[serde(rename_all = "camelCase")]`
+/// only capitalizes the first letter after each underscore (`pod_uid` -> `podUid`), but
+/// upstream's wire field is `podUID` (acronym kept upper-case) — without the override,
+/// every create would 422 with "podUID is required" even when the caller sent it correctly.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodCertificateRequestSpec {
+    pub signer_name: String,
+    pub pod_name: String,
+    #[serde(rename = "podUID")]
+    pub pod_uid: String,
+    pub service_account_name: String,
+    #[serde(rename = "serviceAccountUID")]
+    pub service_account_uid: String,
+    pub node_name: String,
+    #[serde(rename = "nodeUID")]
+    pub node_uid: String,
+    /// Remaining fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
 // Defaulting typed structs — handlers/defaults.rs
 //
 // Each struct types only the fields a `default_X` function in

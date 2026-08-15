@@ -753,6 +753,14 @@ fn decoders() -> &'static std::collections::HashMap<&'static str, DecoderFn> {
             crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen,
         );
         m.insert(
+            "ClusterTrustBundle",
+            crate::certificates_v1beta1_gen_adapter::decode_clustertrustbundle_proto_gen,
+        );
+        m.insert(
+            "PodCertificateRequest",
+            crate::certificates_v1beta1_gen_adapter::decode_podcertificaterequest_proto_gen,
+        );
+        m.insert(
             "PriorityClass",
             crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen,
         );
@@ -10789,7 +10797,7 @@ mod tests {
     /// single-decoder `m.insert()` added to `decoders()`.
     #[test]
     fn decoders_registers_one_entry_per_kind_with_no_silent_shadowing() {
-        const EXPECTED_KINDS: usize = 62;
+        const EXPECTED_KINDS: usize = 64;
         assert_eq!(
             decoders().len(),
             EXPECTED_KINDS,
