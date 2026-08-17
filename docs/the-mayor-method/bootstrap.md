@@ -97,9 +97,10 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 
 **Set up loops.** If they don't exist already, create:
 - 60m — reread this file + siblings; reassert posture to operator
-- 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs, orphaned host processes — body below)
+- 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs, orphaned host processes — see body below)
 - 30m — cluster review (3+ same-surface beads → one PR; 8–12 sweet spot)
-- 30m — merge PRs (green only; no --admin)
+- 5m — merge PRs (green only; no --admin; serialize update-branch under
+  strict-mode without Merge Queue — see body below)
 - 15m — bead dispatch pass (filter out decisions/EPICs/release-coupled/v1.x/hot-zone)
 - 10m — dashboard refresh (REPLACE stale content, don't append — see the
   Dashboard section's snapshot/≤40-line rules; the loop body must say "rewrite
@@ -107,6 +108,33 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 
 The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
+
+**Merge PR loop body — serialization under strict-mode without Merge Queue.**
+The main-branch ruleset (18156794) requires up-to-date branches
+(`strict_required_status_checks_policy: true`). GitHub's Merge Queue would
+satisfy that automatically, but it's an org-only feature this repo can't use,
+so the only way to bring a BEHIND PR up to date is `gh pr update-branch`.
+Triggering it on every BEHIND PR at once is a trap: only the first PR to
+land keeps its CI run valid — the instant it merges, every other in-flight
+update-branch's CI cycle is invalidated against the new main and has to
+re-run. Serialize instead: never more than one CI cycle in flight.
+
+1. Enumerate open PRs and their check state:
+   `gh pr list --state open --json number,title,mergeStateStatus,statusCheckRollup | jq`.
+2. Merge any CLEAN PR (checks_pending=0 AND checks_failed=0 AND
+   mergeStateStatus=CLEAN): `gh pr merge <N> --merge --delete-branch`. NEVER
+   `--admin`. After each successful merge: `git pull --ff-only` + `git remote
+   prune origin`, then remove the merged worker's worktree (and its branch,
+   if it survived `--delete-branch`).
+3. Serialization guard: if ANY open PR still has pending checks
+   (checks_pending > 0), STOP — a re-check is already in flight, and another
+   update-branch trigger would only get invalidated. Only once ALL remaining
+   open PRs have completed checks (0 pending across the board) pick the
+   lowest-numbered BEHIND PR and run `gh pr update-branch <N>` to start ITS
+   re-check. Trigger at most ONE update-branch per tick — never in parallel.
+
+The load-bearing invariant: at most one CI cycle in flight across all open
+PRs at any given time.
 
 **Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
 Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
@@ -136,7 +164,7 @@ If you don't know which transport you're on, run the pattern anyway — cheap
 on the CLI, load-bearing in the extension. See bd memory
 `claude-code-cron-loops-blocked-by-background-workers-in-stream-json-transport`.
 
-**Worktree hygiene loop body — orphaned host processes (mayor-yfvxn).**
+**Worktree hygiene loop body — STEP A: orphaned host processes (mayor-yfvxn).**
 `git worktree remove` does not kill the host-side processes a worker's
 conformance run started: `u7s-apiserver` and `u7s-scheduler` are plain
 backgrounded processes, and `konnectivity-server` is started via `disown`
@@ -172,10 +200,42 @@ instead (the `.../temp/u7s/kubeconfig` path for apiserver/scheduler, the
    of silently retrying (a process that survives one kill may be zombied or
    reparented and need manual investigation).
 
+Beyond the host-process cleanup above (existing mayor-yfvxn body), the loop
+now also handles worktree metadata and stale branch pruning:
+
+**STEP B — worktree metadata.** `git worktree prune -v` — safe by
+definition: it only removes metadata for worktrees whose directories are
+already gone. No safeguards needed.
+
+**STEP C — stale worker branches, in-flight-safe.** Refresh first: `git
+fetch origin main`. Compute the branches currently checked out in any
+worktree: `git worktree list --porcelain | awk '/^branch refs\/heads\// {sub("refs/heads/","",$2); print $2}'`.
+For each `worker/agent-*` branch: SKIP if it's in that checked-out set
+(guards in-flight workers — pre-push branches and ones with no upstream
+yet); SKIP if `git cherry origin/main <branch>` produces any output
+(unmerged by patch-id — this also catches squash-merges, which `git branch
+--merged main` would miss). Otherwise, `git branch -D <branch>`. The
+two-part safety: the worktree-checkout guard protects in-flight workers,
+and the patch-id check protects unmerged work once a worktree is gone.
+
+**STEP D — non-worker branches with a gone upstream.**
+```bash
+git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads/ \
+  | awk '$2 == "[gone]" {print $1}' | xargs -r git branch -d
+```
+Lowercase `-d` refuses to delete anything unmerged, an extra safety net.
+This only matches branches whose tracked upstream is now gone; branches
+with no upstream at all (e.g. `investigation/*`) never match.
+
 This loop is the drift backstop, not the primary defense: workers are
 required to run `scripts/conformance/reset.sh --host-only` as their own
 final step before ending a session (see `dispatch-prompt-template.md`'s
-Common preamble), so in the normal case this loop finds nothing to kill.
+Common preamble), so in the normal case STEP A finds nothing to kill. STEPs
+B–D were added after a concrete incident: a 3-worker dispatch batch skipped
+`isolation="worktree"` on 2 of 3 workers and polluted the mayor checkout,
+and separately 25+ stale `worker/agent-*` branches had accumulated from
+prior sessions with no auto-pruning — this loop body now closes both gaps
+at the automation layer.
 
 **Establish the stance (first session only).** Every project has a stance
 (pre-alpha, production-stable, refactor-only, greenfield, perf-critical,
