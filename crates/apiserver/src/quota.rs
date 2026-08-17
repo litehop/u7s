@@ -358,6 +358,13 @@ async fn sum_service_quota_units<S: Store>(store: &S, namespace: &str, resource:
 }
 
 /// Count the current number of objects of a given resource kind in a namespace.
+///
+/// Tries the built-in-resource keyspace (`/registry/<group>/<plural>/<ns>/`) first, then
+/// falls back to the CRD-backed keyspace (`/registry/cr/<group>/<plural>/<ns>/`, see
+/// `handlers::cr::cr_store_key`) when that comes up empty. A given `(group, plural)` pair
+/// is never both, so this is safe — without the fallback, a `count/<crd>.<group>` quota's
+/// admission check always saw 0 existing CRs (the built-in prefix is structurally never
+/// populated for CRD-backed resources), so the hard limit could never trigger.
 async fn count_objects<S: Store>(
     state: &AppState<S>,
     namespace: &str,
@@ -365,10 +372,21 @@ async fn count_objects<S: Store>(
     plural: &str,
 ) -> u64 {
     let prefix = group_list_prefix(group, plural, Some(namespace));
-    match state.store.list(&prefix, ListOptions::default()).await {
+    let count = match state.store.list(&prefix, ListOptions::default()).await {
         Ok(resp) => resp.items.len() as u64,
         Err(e) => {
             tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
+            0
+        }
+    };
+    if count > 0 || group.is_empty() {
+        return count;
+    }
+    let cr_prefix = crate::handlers::cr::cr_list_prefix(group, plural, Some(namespace));
+    match state.store.list(&cr_prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items.len() as u64,
+        Err(e) => {
+            tracing::warn!("quota: failed to count CR {plural} in {namespace}: {e}");
             0
         }
     }
@@ -715,8 +733,8 @@ pub async fn check_resource_quota<S: Store>(
                         );
                         return Err(Status::forbidden(format!(
                             "exceeded quota: {quota_name}, requested: \
-                             {quota_resource}={incoming}, used: {existing}, \
-                             limited: {hard_limit}"
+                             {quota_resource}={incoming}, used: {quota_resource}={existing}, \
+                             limited: {quota_resource}={hard_limit}"
                         )));
                     }
                     continue;
@@ -745,7 +763,7 @@ pub async fn check_resource_quota<S: Store>(
                         );
                         return Err(Status::forbidden(format!(
                             "exceeded quota: {quota_name}, requested: {quota_resource}=1, \
-                             used: {current}, limited: {hard_limit}"
+                             used: {quota_resource}={current}, limited: {quota_resource}={hard_limit}"
                         )));
                     }
                     continue;
@@ -790,8 +808,8 @@ pub async fn check_resource_quota<S: Store>(
                             );
                             return Err(Status::forbidden(format!(
                                 "exceeded quota: {quota_name}, requested: \
-                                 {quota_resource}={req_str}, used: {used_str}, \
-                                 limited: {limit_str}"
+                                 {quota_resource}={req_str}, used: {quota_resource}={used_str}, \
+                                 limited: {quota_resource}={limit_str}"
                             )));
                         }
                     }
@@ -801,6 +819,24 @@ pub async fn check_resource_quota<S: Store>(
     }
 
     Ok(())
+}
+
+/// Splits a `"<resource>.<group>"`-shaped quota resource name on the KNOWN `resource`
+/// prefix (not the last dot) and compares the remainder to `group`.
+///
+/// CRD groups are conventionally domain-like (e.g. `example.com`) and DRA's built-in
+/// group is `resource.k8s.io` — both contain dots themselves. Splitting on the LAST dot
+/// (`rfind('.')`) instead mis-parses `"widgets.example.com"` as resource=`"widgets.example"`,
+/// group=`"com"`, so it never matches the real `(resource="widgets", group="example.com")`
+/// pair — silently making `count/widgets.example.com` (or `count/resourceclaims.resource.k8s.io`)
+/// never cover its own resource, so ResourceQuota admission never enforces the hard limit at all
+/// (upstream conformance: "capture the life of a custom resource",
+/// "[DRA] ... count/resourceclaims.resource.k8s.io ResourceQuota").
+fn resource_group_matches(quota_suffix: &str, resource: &str, group: &str) -> bool {
+    quota_suffix
+        .strip_prefix(resource)
+        .and_then(|rest| rest.strip_prefix('.'))
+        == Some(group)
 }
 
 /// Returns true if the quota resource name covers the given (group, plural) resource.
@@ -813,26 +849,17 @@ pub fn quota_resource_covers(quota_resource: &str, group: &str, resource: &str) 
     }
     // count/* pattern
     if let Some(suffix) = quota_resource.strip_prefix("count/") {
-        // suffix may be "pods", "deployments.apps", etc.
+        // suffix may be "pods", "deployments.apps", "widgets.example.com", etc.
         if suffix == resource && group.is_empty() {
             return true;
         }
-        // "deployments.apps" → resource="deployments", group="apps"
-        if let Some(dot) = suffix.rfind('.') {
-            let r = &suffix[..dot];
-            let g = &suffix[dot + 1..];
-            if r == resource && g == group {
-                return true;
-            }
+        if resource_group_matches(suffix, resource, group) {
+            return true;
         }
     }
     // "deployments.apps" style (no count/ prefix)
-    if let Some(dot) = quota_resource.rfind('.') {
-        let r = &quota_resource[..dot];
-        let g = &quota_resource[dot + 1..];
-        if r == resource && g == group {
-            return true;
-        }
+    if resource_group_matches(quota_resource, resource, group) {
+        return true;
     }
     false
 }
@@ -905,6 +932,39 @@ mod tests {
     #[test]
     fn quota_resource_covers_mismatch_returns_false() {
         assert!(!quota_resource_covers("secrets", "", "pods"));
+    }
+
+    /// "count/widgets.example.com" (a CRD count quota, group has its own dot) must cover
+    /// (group="example.com", resource="widgets"). Splitting on the LAST dot instead of the
+    /// known resource prefix would mis-parse this as resource="widgets.example", group="com",
+    /// silently making the quota never apply — the exact bug behind upstream conformance's
+    /// "should create a ResourceQuota and capture the life of a custom resource" (a second CR
+    /// past the count/1 hard limit was admitted instead of rejected).
+    #[test]
+    fn quota_resource_covers_count_crd_with_dotted_group() {
+        assert!(
+            quota_resource_covers("count/widgets.example.com", "example.com", "widgets"),
+            "count/<resource>.<group> must cover the resource even when <group> itself \
+             contains dots (CRD groups are conventionally domain-like)"
+        );
+        assert!(
+            !quota_resource_covers("count/widgets.example.com", "example.com", "gadgets"),
+            "a mismatched resource name must still not match, even with a dotted group"
+        );
+    }
+
+    /// "count/resourceclaims.resource.k8s.io" (DRA's built-in group has two dots) must cover
+    /// (group="resource.k8s.io", resource="resourceclaims") — same root cause as the CRD case
+    /// above, reproduces upstream conformance's "[DRA] control plane supports
+    /// count/resourceclaims.resource.k8s.io ResourceQuota" (a second ResourceClaim past the
+    /// count/1 hard limit was admitted instead of rejected).
+    #[test]
+    fn quota_resource_covers_count_dra_resourceclaims() {
+        assert!(quota_resource_covers(
+            "count/resourceclaims.resource.k8s.io",
+            "resource.k8s.io",
+            "resourceclaims"
+        ));
     }
 
     // -- check_resource_quota --
@@ -991,6 +1051,94 @@ mod tests {
             err.0,
             axum::http::StatusCode::FORBIDDEN,
             "quota exceeded must return 403 Forbidden"
+        );
+    }
+
+    /// A `count/<crd>.<group>` quota at its hard limit must deny a new custom resource.
+    /// CRs are stored under `/registry/cr/<group>/<plural>/<ns>/` (see
+    /// `handlers::cr::cr_store_key`), NOT the built-in `/registry/<group>/<plural>/<ns>/`
+    /// keyspace `count_objects` checks first — without the CR-keyspace fallback,
+    /// `count_objects` always saw 0 existing CRs and the hard limit could never trigger.
+    /// Reproduces upstream conformance's "should create a ResourceQuota and capture the
+    /// life of a custom resource".
+    #[tokio::test]
+    async fn check_quota_count_crd_denies_when_cr_keyspace_at_limit() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "crd-quota", "namespace": "default" },
+            "spec": { "hard": { "count/widgets.example.com": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/crd-quota", quota).await;
+
+        // One existing CR, stored under the CR keyspace — not the built-in keyspace.
+        seed(
+            &state,
+            "/registry/cr/example.com/widgets/default/widget-1",
+            json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": { "name": "widget-1", "namespace": "default" }
+            }),
+        )
+        .await;
+
+        let result = check_resource_quota(&state, "default", "example.com", "widgets", None).await;
+        assert!(
+            result.is_err(),
+            "a second custom resource must be denied once count/widgets.example.com=1 is \
+             already claimed by a CR stored in the CR keyspace"
+        );
+    }
+
+    /// The exceeded-quota error message must repeat `<resource>=<value>` in ALL THREE of
+    /// requested/used/limited — mirroring upstream's `ResourceList.String()` rendering —
+    /// not bare numbers for used/limited. Upstream conformance tests assert on this exact
+    /// substring (e.g. DRA's "supports count/resourceclaims.resource.k8s.io ResourceQuota":
+    /// `ContainSubstring("exceeded quota: object-count, requested:
+    /// count/resourceclaims.resource.k8s.io=1, used: count/resourceclaims.resource.k8s.io=1,
+    /// limited: count/resourceclaims.resource.k8s.io=1")`) — a bare number there left the
+    /// create correctly REJECTED but failed the test's message-content assertion.
+    #[tokio::test]
+    async fn check_quota_denial_message_repeats_resource_name_in_used_and_limited() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "object-count", "namespace": "default" },
+            "spec": { "hard": { "count/resourceclaims.resource.k8s.io": "1" } }
+        });
+        seed(
+            &state,
+            "/registry/resourcequotas/default/object-count",
+            quota,
+        )
+        .await;
+        seed(
+            &state,
+            "/registry/resource.k8s.io/resourceclaims/default/claim-0",
+            json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceClaim",
+                "metadata": { "name": "claim-0", "namespace": "default" }
+            }),
+        )
+        .await;
+
+        let err =
+            check_resource_quota(&state, "default", "resource.k8s.io", "resourceclaims", None)
+                .await
+                .expect_err("quota at limit must deny the second claim");
+        assert_eq!(
+            err.1.message,
+            "exceeded quota: object-count, requested: count/resourceclaims.resource.k8s.io=1, \
+             used: count/resourceclaims.resource.k8s.io=1, \
+             limited: count/resourceclaims.resource.k8s.io=1",
+            "denial message must match upstream's exact ResourceList.String() format so \
+             conformance tests asserting on message content (not just error-occurred) pass"
         );
     }
 
