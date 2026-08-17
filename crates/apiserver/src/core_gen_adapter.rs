@@ -7336,6 +7336,169 @@ mod tests {
         );
     }
 
+    /// hostPID/hostIPC are the same plain (non-pointer), gogoproto-`nullable=false` bool class
+    /// as hostNetwork just above, and — until mayor-swxjj — were the one pair in that class
+    /// still missing the true-only guard. A real client-go protobuf write (e.g. the
+    /// controller-manager's ReplicationController controller resubmitting a pod after only
+    /// changing its labels) always puts an explicit `false` for both on the wire even when the
+    /// pod never touched them, because the real upstream Go type has no way to represent
+    /// "unset" for a non-pointer bool. Without this guard, decoding that PUT body fabricates
+    /// `"hostPID": false`/`"hostIPC": false` on a pod stored without either key, and
+    /// `validate_pod_spec_immutable`'s whole-spec deep-equal (crates/apiserver/src/handlers/
+    /// pods.rs) rejects it as a spec change that never happened — this was the 3rd recurrence
+    /// of the RC/Job label-only-PUT immutability regression (mayor-y6gtg / mayor-swxjj).
+    #[test]
+    fn generated_pod_spec_omits_host_pid_and_host_ipc_when_wire_carries_the_zero_value() {
+        let untouched_pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("host-pid-ipc-unset-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_pid: Some(false),
+                host_ipc: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        untouched_pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with host_pid/host_ipc=false must decode");
+
+        assert!(
+            result["spec"].get("hostPID").is_none(),
+            "hostPID must be omitted when the wire only carries the zero value — a real \
+             protobuf sender always writes false for a pod that never asked for the host PID \
+             namespace, so emitting the key here fabricates an explicit false the source \
+             object never had"
+        );
+        assert!(
+            result["spec"].get("hostIPC").is_none(),
+            "hostIPC must be omitted when the wire only carries the zero value — same \
+             fabrication risk as hostPID/hostNetwork"
+        );
+
+        let true_pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("host-pid-ipc-true-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                host_pid: Some(true),
+                host_ipc: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf2 = Vec::new();
+        true_pod.encode(&mut buf2).unwrap();
+
+        let result2 =
+            decode_pod_proto_gen(&buf2).expect("Pod with host_pid/host_ipc=true must decode");
+
+        assert_eq!(
+            result2["spec"]["hostPID"], true,
+            "an explicit hostPID=true must still survive decode — true is the only value a \
+             plain bool can carry that unambiguously reflects real user intent"
+        );
+        assert_eq!(
+            result2["spec"]["hostIPC"], true,
+            "an explicit hostIPC=true must still survive decode — same as hostPID"
+        );
+    }
+
+    /// Container.stdin/stdinOnce/tty are the same plain (non-pointer), gogoproto-
+    /// `nullable=false` bool class as PodSpec.hostNetwork/hostPID/hostIPC, and were also
+    /// missing the true-only guard until mayor-swxjj. `kubectl attach`/`kubectl run -it`
+    /// aside, the practical consequence mirrors the PodSpec-level fields: any real protobuf
+    /// PUT of a container that never touched these fields fabricates an explicit `false`,
+    /// which a stored pod created without them (e.g. via a JSON-writing client) then compares
+    /// unequal against under validate_pod_spec_immutable's whole-spec deep-equal.
+    #[test]
+    fn generated_container_omits_stdin_stdin_once_tty_when_wire_carries_the_zero_value() {
+        let untouched_pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("stdin-tty-unset-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    stdin: Some(false),
+                    stdin_once: Some(false),
+                    tty: Some(false),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        untouched_pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with stdin/stdinOnce/tty=false must decode");
+
+        for key in ["stdin", "stdinOnce", "tty"] {
+            assert!(
+                result["spec"]["containers"][0].get(key).is_none(),
+                "containers[0].{key} must be omitted when the wire only carries the zero \
+                 value — a real protobuf sender always writes false for a container that \
+                 never asked for it, so emitting the key here fabricates an explicit false \
+                 the source object never had"
+            );
+        }
+
+        let true_pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("stdin-tty-true-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    stdin: Some(true),
+                    stdin_once: Some(true),
+                    tty: Some(true),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf2 = Vec::new();
+        true_pod.encode(&mut buf2).unwrap();
+
+        let result2 =
+            decode_pod_proto_gen(&buf2).expect("Pod with stdin/stdinOnce/tty=true must decode");
+
+        for key in ["stdin", "stdinOnce", "tty"] {
+            assert_eq!(
+                result2["spec"]["containers"][0][key], true,
+                "an explicit containers[0].{key}=true must still survive decode — true is the \
+                 only value a plain bool can carry that unambiguously reflects real user intent"
+            );
+        }
+    }
+
     /// Container-level securityContext survives protobuf decode.
     ///
     /// P1 security bug: without this, gen_container_to_json silently drops the entire
