@@ -136,6 +136,6 @@ Always run `cargo fmt --all` before pushing. Then verify with
 Before every push, run in this order:
 1. `cargo fmt --all -- --check`
 2. `cargo test --workspace --quiet` (or `-p <crate>` for the touched crate)
-3. `cargo clippy --workspace --tests -- -D warnings`
+3. `cargo clippy --workspace --tests --no-deps -- -D warnings`
 
 These match exactly what CI and the pre-push hook enforce.
