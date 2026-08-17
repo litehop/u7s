@@ -11,8 +11,9 @@
 #
 # Usage:
 #   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--unsafe-focus] [--all-e2e]
-#                                  [--stack-only] [--vm <name>] [--binary <path>] [--port <N>]
-#                                  [--workdir <path>] [--konnectivity-server-port <N>]
+#                                  [--stack-only] [--vm <name>] [--network <name>]
+#                                  [--binary <path>] [--port <N>] [--workdir <path>]
+#                                  [--konnectivity-server-port <N>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
@@ -78,6 +79,17 @@
 #             child scripts (lima-start, 04-start-kcm, 06-run-sonobuoy) use the
 #             same VM. Allows multiple workers to run in parallel against their
 #             own isolated VMs. Also settable via U7S_VM_NAME env var.
+#   --network Lima network to provision the VM's `networks:` stanza with (default:
+#             unset -- lima-start.sh itself falls back to user-v2). Forwarded
+#             verbatim to lima-start.sh (Step 3) and, if --extra-node is also
+#             given, to that node's add-node.sh/lima-start.sh too, so both nodes
+#             of a 2-node stack land on the same isolated network instead of a
+#             primary on its own network and a peer silently defaulting back to
+#             the shared user-v2 (no route between them). See lima-start.sh's own
+#             --network for the ARP-flap isolation this exists for (mayor-njq7j/
+#             PR #1194). Omitting this on a --reset of a VM previously isolated
+#             onto its own network (e.g. lima-node -> user-v2-mayor) silently
+#             reprovisions it back onto the shared default network (mayor-c4syr).
 #   --ip      Host IP for the apiserver and konnectivity-server to bind to
 #             (default: 127.0.0.1). Set to a loopback alias (e.g. 127.0.0.2) to
 #             run multiple workers in parallel without port collisions. Exports
@@ -166,6 +178,7 @@ KUBELET_PORT=""
 KONNECTIVITY_SERVER_PORT=""
 EXTRA_NODE=""
 EXTRA_KUBELET_PORT=""
+NETWORK=""
 PROFILE=0
 DHAT_DEPTH=""
 SAMPLE_INTERVAL=""
@@ -180,6 +193,7 @@ while [[ $# -gt 0 ]]; do
     -vv) VERBOSE=$((VERBOSE + 2)); shift ;;
     -vvv) VERBOSE=$((VERBOSE + 3)); shift ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
+    --network) NETWORK="$2"; shift 2 ;;
     --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
     --binary) BINARY="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -281,6 +295,7 @@ _KUBELET_PORT_ARG=""
 _KONNECTIVITY_SERVER_PORT_ARG=""
 _WORKDIR_ARG=""
 _VM_ARG=""
+_NETWORK_ARG=""
 _KCM_V_ARG=""
 _VERBOSE_ARG=""
 _EXTRA_NODE_ARG=""
@@ -304,6 +319,7 @@ _UNSAFE_FOCUS_ARG=""
 [ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"
 _WORKDIR_ARG="--workdir $WORKDIR"
 [ -n "${U7S_VM_NAME:-}" ] && _VM_ARG="--vm $U7S_VM_NAME"
+[ -n "$NETWORK" ] && _NETWORK_ARG="--network $NETWORK"
 [ -n "$EXTRA_NODE" ] && _EXTRA_NODE_ARG="--extra-node $EXTRA_NODE"
 # The apiserver is started (step 2) before the extra node joins (after step 5) — but
 # run-all.sh already knows the extra node's name and kubelet port from its own CLI args,
@@ -368,7 +384,7 @@ echo "Using KUBECONFIG=$KUBECONFIG"
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}
+bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
@@ -386,7 +402,7 @@ bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
 if [ -n "$EXTRA_NODE" ]; then
   banner "Extra node: join $EXTRA_NODE"
   # shellcheck disable=SC2086
-  bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}
+  bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
 fi
 
 # kube-network-policies DaemonSet-Ready wait: lima-start.sh (Step 3, above) applies
