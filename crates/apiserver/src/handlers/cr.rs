@@ -593,7 +593,12 @@ fn cr_store_key(group: &str, plural: &str, namespace: Option<&str>, name: &str) 
     }
 }
 
-fn cr_list_prefix(group: &str, plural: &str, namespace: Option<&str>) -> String {
+/// `pub(crate)` so `quota::count_objects` can fall back to this keyspace when counting
+/// CRD-backed resources for `count/<crd>.<group>` ResourceQuota admission — CRs live under
+/// `/registry/cr/...`, not the generic `/registry/<group>/<plural>/...` built-in layout, so
+/// the quota module needs this exact prefix rather than re-deriving (and risking drift from)
+/// its own copy.
+pub(crate) fn cr_list_prefix(group: &str, plural: &str, namespace: Option<&str>) -> String {
     match namespace {
         Some(ns) => format!("/registry/cr/{group}/{plural}/{ns}/"),
         None => format!("/registry/cr/{group}/{plural}/"),
@@ -2422,6 +2427,15 @@ pub async fn create_cr_namespaced<S: Store>(
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
+
+    // ResourceQuota: ensure object count does not exceed hard limits (e.g. `count/<crd>.<group>`).
+    // Custom resources went through admission webhooks above but were never checked against
+    // ResourceQuota at all — a quota's count/* hard limit on a CRD-backed resource silently
+    // never enforced. Held across check-then-write like resource.rs's generic create path:
+    // without the lock, concurrent creates of the same CR type can each observe pre-write
+    // usage, all pass the check, and collectively exceed the quota.
+    let _quota_lock = state.quota_admission_locks.lock(&ns).await;
+    crate::quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj)).await?;
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let ns_key = cluster_object_key("namespaces", &ns);
@@ -7663,6 +7677,72 @@ mod tests {
         assert!(
             result.is_ok(),
             "CRD without schema must accept any body (permissive mode)"
+        );
+    }
+
+    // A `count/<crd>.<group>` ResourceQuota at its hard limit must reject a second custom
+    // resource create. Before this fix, `create_cr_namespaced` never called
+    // `quota::check_resource_quota` at all — CR creation was completely unenforced by
+    // ResourceQuota — reproducing upstream conformance's "should create a ResourceQuota and
+    // capture the life of a custom resource" (a second CR past count/1 was admitted instead
+    // of rejected).
+    #[tokio::test]
+    async fn create_cr_namespaced_denies_second_cr_when_count_quota_at_limit() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "crd-quota", "namespace": "argocd" },
+            "spec": { "hard": { "count/applications.argoproj.io": "1" } }
+        });
+        state
+            .store
+            .put(
+                "/registry/resourcequotas/argocd/crd-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed quota");
+
+        let first = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("app-1", "argocd"),
+        )
+        .await;
+        assert!(
+            first.is_ok(),
+            "first CR must be admitted (quota not yet at limit)"
+        );
+
+        let second = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("app-2", "argocd"),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "second CR must be denied once count/applications.argoproj.io=1 is already \
+             claimed — without ResourceQuota admission wired into create_cr_namespaced, \
+             CR creation is never checked against quota at all"
         );
     }
 
