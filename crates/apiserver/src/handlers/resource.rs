@@ -473,10 +473,7 @@ pub(crate) async fn replace_resource<S: Store>(
 
     // Read the stored object once: used for (a) immutability enforcement on
     // PriorityClass.value, (b) status restoration when the resource has a dedicated status
-    // subresource, and (c) UID restoration (see stored_uid below). Cluster-scoped resources
-    // (Node, ClusterRole, StorageClass, ...) have no per-type gate as narrow as (a)/(b) for
-    // most of them, so the read is also triggered whenever the incoming body's UID is blank —
-    // conditional on that predicate rather than firing unconditionally on every PUT.
+    // subresource, and (c) UID restoration/conflict-check (see stored_uid below).
     let is_priorityclass = group == "scheduling.k8s.io" && plural == "priorityclasses";
     let incoming_uid_blank = obj.body["metadata"]["uid"]
         .as_str()
@@ -486,10 +483,10 @@ pub(crate) async fn replace_resource<S: Store>(
     // whose PUT body omits it — including a protobuf-content-type PUT, since the wire decoder
     // never emits this field — must not be trusted as "not being deleted".
     let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
-    let needs_stored_read = is_priorityclass
-        || meta.has_status_subresource
-        || incoming_uid_blank
-        || incoming_deletion_timestamp_blank;
+    // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
+    // must be compared against the stored uid below (see stored_uid mismatch check) —
+    // metadata.uid is immutable identity, not just something to fill in when absent.
+    let needs_stored_read = true;
     let (stored_status, stored_uid, stored_deletion_timestamp, stored_deletion_grace) =
         if needs_stored_read {
             let parsed = state
@@ -543,6 +540,26 @@ pub(crate) async fn replace_resource<S: Store>(
             if !uid.is_empty() {
                 obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
             }
+        }
+    } else if let Some(stored_uid_str) = stored_uid
+        .as_ref()
+        .and_then(|u| u.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        // A non-blank incoming uid that mismatches the stored uid is identity forgery, not
+        // a legitimate update: rest.BeforeUpdate in real kube-apiserver rejects this with
+        // 409. owner_ref_is_live below determines whether an ownerReference is "live"
+        // purely by comparing stored uid == ownerRef.uid — letting a client silently
+        // overwrite an object's uid would let it forge a match against a stale/foreign
+        // ownerReference and corrupt cascade-GC decisions, and would defeat controllers'
+        // "same name, different uid ⇒ different object" recreate-detection.
+        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        if incoming_uid_str != stored_uid_str {
+            return Err(Status::conflict(format!(
+                "{} \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable",
+                meta.kind
+            )));
         }
     }
 
@@ -1137,6 +1154,15 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
+        // metadata.uid is immutable identity, restored unconditionally after every patch
+        // type below (including JSON Patch, whose array shape can't be caught by an
+        // object-key strip). Without this, a caller holding only ordinary `patch` rights on
+        // any resource could forge uid to match a stale/foreign ownerReference and corrupt
+        // owner_ref_is_live's cascade-GC decision, or defeat controllers' "same name,
+        // different uid ⇒ different object" recreate-detection — see stamp_metadata (create)
+        // and replace_resource's uid-mismatch check (PUT) for the other two mutation paths.
+        let stored_uid = current.body["metadata"]["uid"].clone();
+
         match patch_type {
             PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
             PatchType::StrategicMerge => {
@@ -1147,6 +1173,8 @@ pub(crate) async fn do_patch<S: Store>(
                 apply_json_patch(&mut current.body, &patch)?;
             }
         }
+
+        current.body["metadata"]["uid"] = stored_uid;
 
         if meta.has_status_subresource {
             match stored_status {
@@ -2104,12 +2132,10 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // never emits this field — must not be trusted as "not being deleted".
     let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
     let is_pvc = group.is_empty() && plural == "persistentvolumeclaims";
-    let needs_stored_read = super::defaults::is_workload_resource(&group, &plural)
-        || super::defaults::is_endpointslice(&group, &plural)
-        || meta.has_status_subresource
-        || (group.is_empty() && (plural == "secrets" || plural == "configmaps"))
-        || is_pvc
-        || incoming_deletion_timestamp_blank;
+    // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
+    // must be compared against the stored uid below (see stored_uid mismatch check) —
+    // metadata.uid is immutable identity, not just something to fill in when absent.
+    let needs_stored_read = true;
     let (
         spec_before_replace,
         stored_status,
@@ -2238,15 +2264,35 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // StaleSlices() check permanently treats the tracked (real) UID as missing from the
     // informer once the informer's cached copy carries the blank one instead — every later
     // sync fails with "EndpointSlice informer cache is out of date" forever.
-    if obj.body["metadata"]["uid"]
+    let incoming_uid_blank = obj.body["metadata"]["uid"]
         .as_str()
         .map(str::is_empty)
-        .unwrap_or(true)
-    {
+        .unwrap_or(true);
+    if incoming_uid_blank {
         if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
             if !uid.is_empty() {
                 obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
             }
+        }
+    } else if let Some(stored_uid_str) = stored_uid
+        .as_ref()
+        .and_then(|u| u.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        // A non-blank incoming uid that mismatches the stored uid is identity forgery, not
+        // a legitimate update: rest.BeforeUpdate in real kube-apiserver rejects this with
+        // 409. owner_ref_is_live determines whether an ownerReference is "live" purely by
+        // comparing stored uid == ownerRef.uid — letting a client silently overwrite an
+        // object's uid would let it forge a match against a stale/foreign ownerReference
+        // and corrupt cascade-GC decisions, and would defeat controllers' "same name,
+        // different uid ⇒ different object" recreate-detection.
+        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        if incoming_uid_str != stored_uid_str {
+            return Err(Status::conflict(format!(
+                "{} \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable",
+                meta.kind
+            )));
         }
     }
 
@@ -8023,6 +8069,95 @@ mod tests {
         assert_eq!(v["metadata"]["labels"]["env"], "prod");
     }
 
+    /// A merge-patch PATCH that carries metadata.uid must not change the stored uid.
+    /// do_patch is the shared PATCH path for every built-in resource type, so this is a
+    /// cross-cutting identity-forgery gap: without unconditionally restoring uid after the
+    /// patch merge, a caller holding only ordinary `patch` rights on any resource could
+    /// forge uid to match a stale/foreign ownerReference (corrupting GC's owner-liveness
+    /// check, owner_ref_is_live) or defeat controllers' "same name, different uid ⇒
+    /// different object" recreate-detection.
+    #[tokio::test]
+    async fn patch_resource_merge_patch_cannot_change_uid() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let real_uid = "22222222-2222-2222-2222-222222222222";
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "patch-node-uid", "uid": real_uid, "resourceVersion": "1" },
+            "spec": { "drivers": [] }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/patch-node-uid",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"metadata": {"uid": "attacker-uid"}});
+
+        let mut merge_headers = axum::http::HeaderMap::new();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let patch_result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "patch-node-uid".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let result = match patch_result {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!(
+                "merge-patch attempting to set uid must still succeed (uid is \
+                just silently restored, not rejected)"
+            ),
+        };
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], real_uid,
+            "a merge-patch carrying metadata.uid must not change the stored uid — the \
+             response must reflect the original, server-assigned identity"
+        );
+
+        let stored = store
+            .get("/registry/storage.k8s.io/csinodes/patch-node-uid")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["metadata"]["uid"], real_uid,
+            "the persisted object must retain the original uid, not the patch's forged value"
+        );
+    }
+
     /// A plain strategic-merge PATCH (no `resourceVersion` in its body — the shape real
     /// clients send, e.g. `test/e2e/apps/job.go`'s "Patching the Job" step) must succeed
     /// even when another writer raced in and bumped the object's resourceVersion between
@@ -10383,6 +10518,91 @@ mod tests {
         assert_eq!(
             stored_obj["metadata"]["generation"], 2,
             "generation must increment from 1 to 2 when endpoints content changed on this PUT"
+        );
+    }
+
+    /// replace_namespaced_resource (PUT) must reject a body whose non-blank metadata.uid
+    /// mismatches the stored object's uid with 409 Conflict, rather than silently persisting
+    /// the client's forged value. metadata.uid is immutable identity: owner_ref_is_live
+    /// determines whether an ownerReference is "live" purely by comparing stored uid ==
+    /// ownerRef.uid, so a client that could freely overwrite uid could forge a match
+    /// against a stale/foreign owner reference and corrupt GC's cascade-delete decision, or
+    /// defeat controllers' "same name, different uid ⇒ different object" recreate-detection.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_mismatched_uid_with_409() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let key = "/registry/configmaps/default/my-cm";
+        let real_uid = "11111111-1111-1111-1111-111111111111";
+        let created = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "my-cm", "namespace": "default", "uid": real_uid },
+            "data": { "k": "v" }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&created).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed put must succeed");
+
+        // Attacker-controlled PUT carries a non-blank uid that does not match the stored one.
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "my-cm", "namespace": "default", "uid": "attacker-uid" },
+            "data": { "k": "v2" }
+        });
+
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "my-cm".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "a PUT carrying a uid that mismatches the stored object's uid must be \
+                 rejected with 409, not silently persisted as identity forgery"
+            ),
+            Ok(_) => panic!("expected 409 for a PUT with a mismatched non-blank uid"),
+        }
+
+        let stored = store
+            .get(key)
+            .await
+            .expect("store get must succeed")
+            .expect("object must still exist");
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["metadata"]["uid"], real_uid,
+            "the rejected PUT must not have mutated the stored uid"
         );
     }
 
