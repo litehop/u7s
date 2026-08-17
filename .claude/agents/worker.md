@@ -58,7 +58,7 @@ bd show <id>
 
 # 5. Run quality gates (CWD is already the worktree root)
 cargo test --workspace --quiet 2>&1 | tail -30
-cargo clippy --workspace --tests --quiet -- -D warnings 2>&1 | tail -20
+cargo clippy --workspace --tests --quiet --no-deps -- -D warnings 2>&1 | tail -20
 
 # 6. Commit
 git add <files>

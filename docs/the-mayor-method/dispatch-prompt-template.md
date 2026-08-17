@@ -228,13 +228,13 @@ minutes per iteration:
 - **pre-commit** (`.githooks/pre-commit`) — runs `cargo fmt --check` only. Formatting,
   no test/clippy.
 - **pre-push** (`.githooks/pre-push`) — runs `cargo test --workspace` AND
-  `cargo clippy --workspace --tests -- -D warnings`. This is authoritative; if it
+  `cargo clippy --workspace --tests --no-deps -- -D warnings`. This is authoritative; if it
   fails, `git push` is rejected with no stacktrace context.
 
 **Order of operations that minimises wasted work**:
 
 1. Make your edit.
-2. Run `cargo test --workspace` and `cargo clippy --workspace --tests -- -D warnings`
+2. Run `cargo test --workspace` and `cargo clippy --workspace --tests --no-deps -- -D warnings`
    ONCE, before commit. This is your "see failures with context" pass. If either
    fails, fix and re-run only the affected target (`cargo test -p <crate>` or
    `cargo test <testname>`) — never re-run the whole workspace on every edit iteration.
@@ -408,7 +408,7 @@ git status --short              # must be clean
 Quality gate — mandatory, run in this exact order, paste output into return:
 ```bash
 cargo test --workspace --quiet
-cargo clippy --workspace --tests --quiet -- -D warnings
+cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
 ```
 Do not proceed to commit if any command fails. The pre-commit hook checks
 `cargo fmt` (formatting only) and the pre-push hook re-runs test+clippy —
