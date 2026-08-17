@@ -165,6 +165,9 @@ struct PodSpec {
     /// `volumes` as literal JSON `null`.
     #[serde(default)]
     volumes: Option<Vec<PodVolume>>,
+    /// The pod's `spec.topologySpreadConstraints` — see `TopologySpreadConstraint`.
+    #[serde(default)]
+    topology_spread_constraints: Vec<TopologySpreadConstraint>,
 }
 
 /// One `spec.volumes[]` entry — only the two sources that reference a PVC
@@ -389,6 +392,40 @@ pub struct PodAntiAffinity {
     pub required_during_scheduling_ignored_during_execution: Vec<PodAffinityTerm>,
 }
 
+/// One `spec.topologySpreadConstraints[]` entry: at most `maxSkew` pods may
+/// separate the topology domain (grouped by `topologyKey`, e.g. a zone or
+/// hostname) with the FEWEST pods matching `labelSelector` from the one with
+/// the most — see `TopologySpreadContext` for the actual skew computation.
+///
+/// `minDomains`, `nodeAffinityPolicy`, `nodeTaintsPolicy`, and
+/// `matchLabelKeys` are not modeled — newer, finer-grained knobs upstream
+/// only uses to narrow which topology domains/pods take part in the spread
+/// calculation at all. Omitting them defaults to upstream's own defaults
+/// for each (`minDomains: 1`, `nodeAffinityPolicy: Honor`,
+/// `nodeTaintsPolicy: Ignore` — i.e. every domain and every node counts,
+/// matching this MVP's existing choice not to model node-inclusion policies
+/// for inter-pod affinity either), not to "ignore the field silently
+/// diverges from upstream's actual behavior" — the one exception being
+/// `matchLabelKeys`, whose absence just means `labelSelector` alone decides
+/// matching, exactly as if it were never set.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologySpreadConstraint {
+    #[serde(default)]
+    pub max_skew: i32,
+    #[serde(default)]
+    pub topology_key: String,
+    /// Upstream's Filter plugin only ever enforces `DoNotSchedule` terms —
+    /// `ScheduleAnyway` terms feed its Score plugin instead, purely a
+    /// placement PREFERENCE. This scheduler has no Score phase yet (mirrors
+    /// `Affinity`'s doc comment for `preferred` affinity terms), so a
+    /// `ScheduleAnyway` constraint is parsed but never filters a node — see
+    /// `TopologySpreadContext::build`.
+    #[serde(default)]
+    pub when_unsatisfiable: String,
+    pub label_selector: Option<LabelSelectorSpec>,
+}
+
 /// A pod's `spec.tolerations[]` entry.
 ///
 /// `key: None` (with `operator: "Exists"`) tolerates every taint regardless of
@@ -518,6 +555,11 @@ pub struct PendingPod {
     /// `node_qualifies_for_pod` then treats as "nothing to restrict on",
     /// exactly like an absent pod-level `nodeAffinity`.
     pub pv_node_affinities: Vec<NodeSelectorSpec>,
+    /// The pod's `spec.topologySpreadConstraints` (empty if absent) — each
+    /// `whenUnsatisfiable: DoNotSchedule` entry rejects a candidate node that
+    /// would push its topology domain's skew beyond `maxSkew`, see
+    /// `TopologySpreadContext`.
+    pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -596,6 +638,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         pod_name,
         watch_event.object.spec.volumes.as_deref().unwrap_or(&[]),
     );
+    let topology_spread_constraints = watch_event.object.spec.topology_spread_constraints;
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
@@ -610,6 +653,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
         host_ports,
         pvc_names,
         pv_node_affinities: Vec::new(),
+        topology_spread_constraints,
     })
 }
 
@@ -1715,11 +1759,13 @@ pub fn host_ports_fit(node_ports: &[HostPortClaim], pod_ports: &[HostPortClaim])
 /// Among every node in `list` that qualifies for `pod` (see
 /// `node_qualifies_for_pod`) AND satisfies `pod`'s required podAffinity/
 /// podAntiAffinity terms against `tallied_pods` (see
-/// `InterPodAffinityContext`) AND has at least one free pod slot AND enough
-/// uncommitted cpu/memory/ephemeral-storage/extended resources to fit
-/// `pod.requests` (NodeResourcesFit) AND has no hostPort conflict with
-/// `pod.host_ports` (NodePorts — see `host_ports_fit`), select the LEAST
-/// LOADED one.
+/// `InterPodAffinityContext`) AND satisfies every hard
+/// (`whenUnsatisfiable: DoNotSchedule`) `topologySpreadConstraints` entry
+/// against `tallied_pods` (see `TopologySpreadContext`) AND has at least one
+/// free pod slot AND enough uncommitted cpu/memory/ephemeral-storage/extended
+/// resources to fit `pod.requests` (NodeResourcesFit) AND has no hostPort
+/// conflict with `pod.host_ports` (NodePorts — see `host_ports_fit`), select
+/// the LEAST LOADED one.
 ///
 /// "Least loaded" ranks primarily by tallied pod count, then (as a tie-break
 /// only) by tallied cpu/memory/ephemeral-storage requests. Pod count must lead
@@ -1769,6 +1815,7 @@ pub fn select_node_with_capacity(
         .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
         .collect();
     let affinity_ctx = InterPodAffinityContext::build(pod, tallied_pods, &node_labels_by_name);
+    let topology_ctx = TopologySpreadContext::build(pod, tallied_pods, &node_labels_by_name);
     let usage_of = |name: &str| node_usage.get(name).cloned().unwrap_or_default();
     let candidates: Vec<NodeItem> = list
         .items
@@ -1778,6 +1825,9 @@ pub fn select_node_with_capacity(
                 return false;
             }
             if !affinity_ctx.node_qualifies(&n.metadata.labels) {
+                return false;
+            }
+            if !topology_ctx.node_qualifies(&n.metadata.labels) {
                 return false;
             }
             let usage = usage_of(&n.metadata.name);
@@ -2263,6 +2313,145 @@ impl<'a> InterPodAffinityContext<'a> {
     fn node_qualifies(&self, node_labels: &std::collections::HashMap<String, String>) -> bool {
         pod_affinity_satisfied(self.pod, node_labels, &self.affinity_matched)
             && pod_anti_affinity_satisfied(self.pod, node_labels, &self.anti_affinity_matched)
+    }
+}
+
+/// For one topology-spread `constraint`, every topology-domain VALUE some
+/// node currently carries under `constraint.topologyKey`, mapped to how many
+/// already-tallied pods matching `constraint.labelSelector` occupy that
+/// domain.
+///
+/// Every domain value observed among `node_labels_by_name` is seeded at 0
+/// FIRST, even if no matching pod occupies it — mirroring upstream's
+/// `calPreFilterState`, whose `s.TpValueToMatchNum[i][value] += count` map
+/// insertion has the side effect of creating a zero entry for every domain a
+/// node exists in, regardless of whether any pod matches there. Without this,
+/// a domain with truly nothing on it would be ABSENT from the map rather than
+/// present at 0, and `TopologySpreadContext::build`'s `.values().min()` would
+/// then only ever see domains that already have at least one match — putting
+/// a floor under the computed minimum that lets a heavily loaded cluster's
+/// skew look smaller than it really is.
+///
+/// Only pods in `pod_namespace` (the pending pod's own namespace) count —
+/// mirrors upstream's `countPodsMatchSelector`, which explicitly skips pods
+/// in a different namespace: a spread constraint only ever balances sibling
+/// replicas of the SAME namespaced workload, not every pod in the cluster
+/// that happens to share a label.
+fn topology_domain_counts(
+    constraint: &TopologySpreadConstraint,
+    pod_namespace: &str,
+    tallied: &[TalliedPodLabels],
+    node_labels_by_name: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
+) -> std::collections::HashMap<String, i32> {
+    let mut counts: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for node_labels in node_labels_by_name.values() {
+        if let Some(value) = node_labels.get(&constraint.topology_key) {
+            counts.entry(value.clone()).or_insert(0);
+        }
+    }
+    for p in tallied {
+        if p.namespace != pod_namespace {
+            continue;
+        }
+        if !label_selector_matches(&p.labels, constraint.label_selector.as_ref()) {
+            continue;
+        }
+        if let Some(value) = node_labels_by_name
+            .get(&p.node_name)
+            .and_then(|labels| labels.get(&constraint.topology_key))
+        {
+            *counts.entry(value.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// One hard (`whenUnsatisfiable: DoNotSchedule`) topology-spread constraint's
+/// pre-computed skew inputs: the domain->matchCount map (see
+/// `topology_domain_counts`) and its global minimum across every domain —
+/// upstream's `minMatchNum`, computed once (not once per candidate node) by
+/// `TopologySpreadContext::build`.
+struct TopologySpreadTerm<'a> {
+    constraint: &'a TopologySpreadConstraint,
+    counts: std::collections::HashMap<String, i32>,
+    min_match_num: i32,
+}
+
+/// Cluster-wide state for evaluating one pending pod's hard
+/// (`whenUnsatisfiable: DoNotSchedule`) `topologySpreadConstraints` against
+/// every candidate node in a single scheduling decision, built ONCE via
+/// `build` — mirrors `InterPodAffinityContext`.
+///
+/// `ScheduleAnyway` constraints are dropped entirely at `build` time: they
+/// are upstream's soft, Score-phase-only preference (see
+/// `TopologySpreadConstraint`'s doc comment), and this scheduler has no Score
+/// phase, so keeping them here would only cost cycles for no effect.
+struct TopologySpreadContext<'a> {
+    pod: &'a PendingPod,
+    terms: Vec<TopologySpreadTerm<'a>>,
+}
+
+impl<'a> TopologySpreadContext<'a> {
+    fn build(
+        pod: &'a PendingPod,
+        tallied: &[TalliedPodLabels],
+        node_labels_by_name: &std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        >,
+    ) -> Self {
+        let terms = pod
+            .topology_spread_constraints
+            .iter()
+            .filter(|c| c.when_unsatisfiable == "DoNotSchedule" && !c.topology_key.is_empty())
+            .map(|constraint| {
+                let counts = topology_domain_counts(
+                    constraint,
+                    &pod.namespace,
+                    tallied,
+                    node_labels_by_name,
+                );
+                let min_match_num = counts.values().min().copied().unwrap_or(0);
+                TopologySpreadTerm {
+                    constraint,
+                    counts,
+                    min_match_num,
+                }
+            })
+            .collect();
+        Self { pod, terms }
+    }
+
+    /// Return true when `node_labels` violates none of this pod's hard
+    /// spread constraints. A node missing a constraint's `topologyKey`
+    /// entirely is rejected outright — mirrors upstream's
+    /// `ErrReasonNodeLabelNotMatch`: there is no domain to test skew against.
+    ///
+    /// Otherwise, mirrors upstream's exact judging criterion: `existing
+    /// matching count in this node's domain` + `1 if this pod's own labels
+    /// would themselves match the constraint's selector, else 0` -
+    /// `the global minimum matching count across every domain` must not
+    /// exceed `maxSkew`. The self-match term matters even for a pod with no
+    /// tallied siblings anywhere yet — without it, the very first replica of
+    /// a spread-constrained workload would see skew 0 everywhere and never
+    /// actually reserve the "slot" its own placement is about to fill,
+    /// letting a second replica land in the very same domain a moment later.
+    fn node_qualifies(&self, node_labels: &std::collections::HashMap<String, String>) -> bool {
+        self.terms.iter().all(|term| {
+            let Some(value) = node_labels.get(&term.constraint.topology_key) else {
+                return false;
+            };
+            let match_num = term.counts.get(value).copied().unwrap_or(0);
+            let self_match_num = i32::from(label_selector_matches(
+                &self.pod.labels,
+                term.constraint.label_selector.as_ref(),
+            ));
+            let skew = match_num + self_match_num - term.min_match_num;
+            skew <= term.constraint.max_skew
+        })
     }
 }
 
@@ -5548,6 +5737,237 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // PodTopologySpread Filter: spec.topologySpreadConstraints. Before this fix,
+    // crates/scheduler had zero handling of this field — a pod asking to be
+    // spread across zones/hostnames could land arbitrarily (in practice, every
+    // replica piling onto whichever node `select_node_with_capacity` tried
+    // first), silently defeating the availability guarantee the field exists
+    // to express.
+    // ---------------------------------------------------------------------------
+
+    /// A hard (`DoNotSchedule`) `topologySpreadConstraints[]` entry spreading
+    /// on `topology_key` with `max_skew`, matching already-tallied pods whose
+    /// labels satisfy `match_labels`.
+    fn topology_spread_constraint(
+        topology_key: &str,
+        max_skew: i32,
+        when_unsatisfiable: &str,
+        match_labels: &[(&str, &str)],
+    ) -> TopologySpreadConstraint {
+        TopologySpreadConstraint {
+            max_skew,
+            topology_key: topology_key.to_owned(),
+            when_unsatisfiable: when_unsatisfiable.to_owned(),
+            label_selector: Some(LabelSelectorSpec {
+                match_labels: match_labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                match_expressions: Vec::new(),
+            }),
+        }
+    }
+
+    /// maxSkew=1 across 3 zones, 2 already-tallied matching pods piled onto
+    /// zone-a and none in zone-b/zone-c: placing the pending pod (which
+    /// itself matches the constraint's selector) into zone-a would make that
+    /// domain's count 3 against zone-b/zone-c's 0 — a skew of 3, blowing past
+    /// maxSkew=1. Reverting the Filter (or computing skew wrong) would let
+    /// this pod pile onto the already-overloaded zone, exactly the pattern
+    /// `topologySpreadConstraints` exists to prevent.
+    #[test]
+    fn select_node_with_capacity_rejects_zone_that_would_exceed_max_skew() {
+        let list = NodeList {
+            items: vec![
+                make_node("node-a", &[("topology.kubernetes.io/zone", "zone-a")]),
+                make_node("node-b", &[("topology.kubernetes.io/zone", "zone-b")]),
+                make_node("node-c", &[("topology.kubernetes.io/zone", "zone-c")]),
+            ],
+        };
+        let mut pod = empty_pending_pod();
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        pod.topology_spread_constraints = vec![topology_spread_constraint(
+            "topology.kubernetes.io/zone",
+            1,
+            "DoNotSchedule",
+            &[("app", "web")],
+        )];
+        let tallied_pods = [
+            tallied("node-a", "default", &[("app", "web")]),
+            tallied("node-a", "default", &[("app", "web")]),
+        ];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert_ne!(
+            result.ok(),
+            Some("node-a".to_owned()),
+            "zone-a already carries 2 matching pods against 0 elsewhere — \
+             placing a 3rd there produces skew 3 > maxSkew 1, so it must be \
+             rejected in favor of an emptier zone"
+        );
+    }
+
+    /// The same shape as above, but the pending pod's ONLY viable node (via
+    /// `nodeSelector`) is the overloaded zone — every candidate violates the
+    /// hard constraint, so scheduling must fail outright (`Err`), NOT silently
+    /// fall back to binding the pod somewhere that violates its own explicit
+    /// spreading requirement.
+    #[test]
+    fn select_node_with_capacity_returns_err_when_every_candidate_violates_hard_constraint() {
+        let list = NodeList {
+            items: vec![
+                make_node("node-a", &[("topology.kubernetes.io/zone", "a")]),
+                make_node("node-b", &[("topology.kubernetes.io/zone", "b")]),
+            ],
+        };
+        let mut pod = empty_pending_pod();
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        // Only node-b is a real candidate; node-a exists solely to give the
+        // skew computation an (empty) zone to compare against, mirroring a
+        // real cluster where the emptiest zone's node is unusable for some
+        // other reason (cordoned, tainted, out of capacity).
+        pod.node_selector = [("topology.kubernetes.io/zone".to_owned(), "b".to_owned())].into();
+        pod.topology_spread_constraints = vec![topology_spread_constraint(
+            "topology.kubernetes.io/zone",
+            1,
+            "DoNotSchedule",
+            &[("app", "web")],
+        )];
+        let tallied_pods = [
+            tallied("node-b", "default", &[("app", "web")]),
+            tallied("node-b", "default", &[("app", "web")]),
+            tallied("node-b", "default", &[("app", "web")]),
+        ];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert!(
+            result.is_err(),
+            "the only nodeSelector-eligible node violates the hard spread \
+             constraint (skew 4 > maxSkew 1) — the pod must stay Pending, not \
+             be bound to node-a (which the nodeSelector excludes anyway) or \
+             to the violating node-b — got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// The identical shape as the rejection test above (same 2 zones, same
+    /// nodeSelector pinning the only candidate to the overloaded zone, same
+    /// skew 4 > maxSkew 1), except `whenUnsatisfiable: ScheduleAnyway` —
+    /// upstream treats this as a Score-phase-only preference, never a Filter
+    /// rejection. Since this scheduler has no Score phase, a `ScheduleAnyway`
+    /// constraint must be a pure no-op: the pod schedules onto node-b anyway,
+    /// even though the byte-for-byte equivalent `DoNotSchedule` constraint
+    /// (see the test above) rejects it outright. Using a single-zone shape
+    /// here would not catch a "treat ScheduleAnyway as hard" regression: with
+    /// only one domain, that domain is always both the min and the max, so
+    /// skew can never exceed a maxSkew of 1 regardless of whether the
+    /// constraint is enforced — the multi-zone shape is what actually makes
+    /// enforcement observable.
+    #[test]
+    fn select_node_with_capacity_ignores_schedule_anyway_constraint_even_when_it_would_violate_max_skew(
+    ) {
+        let list = NodeList {
+            items: vec![
+                make_node("node-a", &[("topology.kubernetes.io/zone", "a")]),
+                make_node("node-b", &[("topology.kubernetes.io/zone", "b")]),
+            ],
+        };
+        let mut pod = empty_pending_pod();
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        pod.node_selector = [("topology.kubernetes.io/zone".to_owned(), "b".to_owned())].into();
+        pod.topology_spread_constraints = vec![topology_spread_constraint(
+            "topology.kubernetes.io/zone",
+            1,
+            "ScheduleAnyway",
+            &[("app", "web")],
+        )];
+        let tallied_pods = [
+            tallied("node-b", "default", &[("app", "web")]),
+            tallied("node-b", "default", &[("app", "web")]),
+            tallied("node-b", "default", &[("app", "web")]),
+        ];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert_eq!(
+            result.ok(),
+            Some("node-b".to_owned()),
+            "whenUnsatisfiable: ScheduleAnyway must never filter a node — this \
+             scheduler has no Score phase to weigh it as a soft preference \
+             instead, so treating it as hard here would wrongly block \
+             scheduling entirely (the equivalent DoNotSchedule constraint \
+             returns Err for this exact shape — see the test above)"
+        );
+    }
+
+    /// The constraint's `labelSelector` matches none of the 3 already-tallied
+    /// pods on node-a (they carry `app=web`, the selector requires
+    /// `app=other`) — so node-a's matching count is 0, identical to every
+    /// other domain, and the constraint has no actual restricting effect.
+    /// A labelSelector that never matches an existing pod must not block
+    /// scheduling, even onto a node that already hosts many (non-matching)
+    /// pods.
+    #[test]
+    fn select_node_with_capacity_schedules_freely_when_selector_matches_no_existing_pods() {
+        let list = NodeList {
+            items: vec![
+                make_node("node-a", &[("topology.kubernetes.io/zone", "a")]),
+                make_node("node-b", &[("topology.kubernetes.io/zone", "b")]),
+            ],
+        };
+        let mut pod = empty_pending_pod();
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        pod.topology_spread_constraints = vec![topology_spread_constraint(
+            "topology.kubernetes.io/zone",
+            1,
+            "DoNotSchedule",
+            &[("app", "other")],
+        )];
+        let tallied_pods = [
+            tallied("node-a", "default", &[("app", "web")]),
+            tallied("node-a", "default", &[("app", "web")]),
+            tallied("node-a", "default", &[("app", "web")]),
+        ];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert_eq!(
+            result.ok(),
+            Some("node-a".to_owned()),
+            "a labelSelector matching zero existing pods imposes no real \
+             constraint — node-a must remain selectable (and, since usage is \
+             otherwise tied, win the normal list-order tie-break) despite \
+             already hosting 3 pods"
+        );
+    }
+
+    /// A pod with NO `topologySpreadConstraints` at all must behave exactly
+    /// as before this feature existed: already-tallied pods' topology domains
+    /// are irrelevant to it. This is the negative control — if building a
+    /// `TopologySpreadContext` from an empty constraint list ever started
+    /// synthesizing a restriction (e.g. a default constraint), this pod would
+    /// wrongly reject the only available node despite asking for no spreading
+    /// at all.
+    #[test]
+    fn select_node_with_capacity_unaffected_by_topology_when_pod_has_no_spread_constraints() {
+        let list = NodeList {
+            items: vec![make_node("node-a", &[("topology.kubernetes.io/zone", "a")])],
+        };
+        let pod = empty_pending_pod();
+        let tallied_pods = [
+            tallied("node-a", "default", &[("app", "web")]),
+            tallied("node-a", "default", &[("app", "web")]),
+            tallied("node-a", "default", &[("app", "web")]),
+        ];
+        let result =
+            select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &tallied_pods);
+        assert_eq!(
+            result.ok(),
+            Some("node-a".to_owned()),
+            "a pod with no topologySpreadConstraints must schedule normally \
+             regardless of how already-tallied pods are distributed"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // Bound-PVC PV nodeAffinity (Immediate-mode binding): a topology-aware CSI
     // driver stamps spec.nodeAffinity on the PV it provisions, and by the time
     // an Immediate-mode PVC's pod is scheduled that PVC is ALREADY bound to
@@ -6066,6 +6486,7 @@ mod tests {
             host_ports: Vec::new(),
             pvc_names: Vec::new(),
             pv_node_affinities: Vec::new(),
+            topology_spread_constraints: Vec::new(),
         }
     }
 

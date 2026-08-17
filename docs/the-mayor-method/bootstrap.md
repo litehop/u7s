@@ -117,7 +117,14 @@ so the only way to bring a BEHIND PR up to date is `gh pr update-branch`.
 Triggering it on every BEHIND PR at once is a trap: only the first PR to
 land keeps its CI run valid — the instant it merges, every other in-flight
 update-branch's CI cycle is invalidated against the new main and has to
-re-run. Serialize instead: never more than one CI cycle in flight.
+re-run. Serialize instead: never more than one FRESH CI cycle (checks
+running against the current main) in flight. That is NOT the same as "wait
+whenever any pending checks exist" — a BEHIND PR's pending checks are
+running against a stale base and are already moot: the moment
+`update-branch` swaps in the new base those checks get invalidated and
+re-triggered anyway, so waiting for them first buys nothing. Only a
+BLOCKED PR's pending checks (running against the CURRENT base, i.e. a
+fresh post-update-branch cycle already in flight) are worth waiting on.
 
 1. Enumerate open PRs and their check state:
    `gh pr list --state open --json number,title,mergeStateStatus,statusCheckRollup | jq`.
@@ -126,15 +133,23 @@ re-run. Serialize instead: never more than one CI cycle in flight.
    `--admin`. After each successful merge: `git pull --ff-only` + `git remote
    prune origin`, then remove the merged worker's worktree (and its branch,
    if it survived `--delete-branch`).
-3. Serialization guard: if ANY open PR still has pending checks
-   (checks_pending > 0), STOP — a re-check is already in flight, and another
-   update-branch trigger would only get invalidated. Only once ALL remaining
-   open PRs have completed checks (0 pending across the board) pick the
-   lowest-numbered BEHIND PR and run `gh pr update-branch <N>` to start ITS
-   re-check. Trigger at most ONE update-branch per tick — never in parallel.
+3. Serialization guard: if ANY open PR is BLOCKED with pending checks
+   (mergeStateStatus=BLOCKED, checks still running against its CURRENT
+   base) — a fresh CI cycle is already in flight — STOP; another
+   update-branch trigger would only get invalidated. Otherwise, pending
+   checks belong only to BEHIND PRs and are moot (stale base), so pick the
+   lowest-numbered BEHIND PR and run `gh pr update-branch <N>`
+   immediately — do not wait for that PR's own stale-base checks to finish
+   first. Trigger at most ONE update-branch per tick — never in parallel.
 
-The load-bearing invariant: at most one CI cycle in flight across all open
-PRs at any given time.
+The load-bearing invariant: at most one FRESH CI cycle (checks against the
+current main) in flight across all open PRs at any given time — not "zero
+pending checks anywhere." BEHIND-with-pending is never a reason to wait.
+
+2026-08-17: #1205 sat BEHIND for 15 min (across the 09:13Z/09:18Z/09:23Z
+merge ticks) because the guard waited on its own stale-base pending
+checks; corrected to trigger `update-branch` immediately when the only
+open PR needing it is BEHIND, since stale-base pending checks are moot.
 
 **Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
 Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
