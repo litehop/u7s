@@ -631,11 +631,17 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
     }
 }
 
+/// Stamp server-owned identity fields on a newly-created object.
+///
+/// `uid` is ALWAYS assigned fresh here, unconditionally overwriting any client-supplied
+/// value. Real kube-apiserver's FillObjectMetaSystemFields does the same on create; a
+/// client-chosen uid would let a caller forge object identity — e.g. matching a
+/// stale/foreign `ownerReference.uid` to manipulate GC's owner-liveness check, or
+/// defeating controllers' "same name, different uid means a different object"
+/// recreate-detection.
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
-    if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
-        obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
-    }
+    obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     if meta
         .creation_timestamp
         .as_deref()
@@ -1609,21 +1615,31 @@ mod tests {
     }
 
     #[test]
-    fn stamp_metadata_preserves_client_supplied_uid() {
-        // If the client supplies a UID (e.g. during restore or testing), the server
-        // must not overwrite it.
+    fn stamp_metadata_overwrites_client_supplied_uid_on_create() {
+        // metadata.uid must be server-generated and immutable identity, never
+        // client-chosen. A client that could set an arbitrary uid on create could
+        // forge object identity to match a stale/foreign ownerReference.uid, tricking
+        // GC's owner-liveness check (owner_ref_is_live compares stored uid ==
+        // ownerRef.uid) into treating a dead owner as live or vice versa, and would
+        // defeat controllers' "same name, different uid means a different object"
+        // recreate-detection.
         let mut obj = Object::from_bytes(&bytes::Bytes::from(
             serde_json::json!({
-                "metadata": { "name": "hello-world", "uid": "my-custom-uid" }
+                "metadata": { "name": "hello-world", "uid": "attacker-chosen-uid" }
             })
             .to_string(),
         ))
         .unwrap();
         stamp_metadata(&mut obj);
-        assert_eq!(
-            obj.body["metadata"]["uid"].as_str().unwrap(),
-            "my-custom-uid",
-            "server must not overwrite a client-supplied uid"
+        let uid = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        assert_ne!(
+            uid, "attacker-chosen-uid",
+            "server must always overwrite a client-supplied uid on create — \
+             letting it through would let any create request forge object identity"
+        );
+        assert!(
+            uuid::Uuid::parse_str(uid).is_ok(),
+            "uid must be a server-generated UUID v4; got: {uid}"
         );
     }
 
