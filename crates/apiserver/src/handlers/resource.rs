@@ -1124,6 +1124,15 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
+        // Capture the whole PVC spec before patch: validate_pvc_spec_immutable (below,
+        // after the patch is applied) needs the full pre-patch spec to allowlist-check
+        // every field, not just the resize-relevant ones pvc_before_patch captures above.
+        let pvc_spec_before_patch = if group.is_empty() && plural == "persistentvolumeclaims" {
+            Some(current.body["spec"].clone())
+        } else {
+            None
+        };
+
         // Capture spec before patch for generation tracking on workload resources.
         let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
             Some(current.body["spec"].clone())
@@ -1193,6 +1202,11 @@ pub(crate) async fn do_patch<S: Store>(
                     "{plural}/{name} .value is immutable and cannot be updated"
                 )));
             }
+        }
+
+        if let Some(ref old_spec) = pvc_spec_before_patch {
+            validate_pvc_spec_immutable(old_spec, &current.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
         }
 
         if let Some((ref old_size, ref sc_name)) = pvc_before_patch {
@@ -1398,6 +1412,53 @@ async fn reject_disallowed_pvc_resize<S: Store>(
         "{plural} \"{name}\" is forbidden: only dynamically provisioned pvc can be resized and \
          the storageclass that provisions the pvc must support resize"
     )))
+}
+
+/// Reject a PersistentVolumeClaim spec update that changes any field outside the narrow
+/// upstream-allowed set — an allowlist mirroring `ValidatePersistentVolumeClaimUpdate` in
+/// `pkg/apis/core/validation` (release-1.36). Only `spec.resources` may change once a PVC
+/// exists; `volumeName`, `storageClassName`, `accessModes`, `dataSource`, `dataSourceRef`,
+/// `volumeMode`, `selector`, and any other spec field are frozen at creation time.
+///
+/// This is the same allowlist shape `validate_pod_spec_immutable` uses (mayor-j1zls, PR
+/// #1213): munge the one upstream-permitted mutable field out of a clone of `new_spec`
+/// using `old_spec`'s value, then require the rest to deep-equal `old_spec`. Any field not
+/// explicitly munged is frozen by construction, so a PVC spec field added upstream tomorrow
+/// is immutable by default here instead of silently allowed until someone remembers to add
+/// a dedicated check for it — which is exactly how `volumeName`/`storageClassName`/
+/// `accessModes` went unchecked before this function existed (mayor-7kuzu).
+///
+/// `spec.resources`'s own directional rules — shrink forbidden, grow gated on
+/// `StorageClass.allowVolumeExpansion` — are enforced separately by
+/// `reject_disallowed_pvc_resize` and deliberately NOT duplicated here: this function only
+/// decides whether a *change* to `resources` is permitted at all, not whether the
+/// particular change is a valid resize.
+fn validate_pvc_spec_immutable(
+    old_spec: &serde_json::Value,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    if old_spec == new_spec {
+        return Ok(());
+    }
+    let mut munged = new_spec.clone();
+    if let Some(m) = munged.as_object_mut() {
+        match old_spec.get("resources") {
+            Some(v) if !v.is_null() => {
+                m.insert("resources".to_string(), v.clone());
+            }
+            _ => {
+                m.remove("resources");
+            }
+        }
+    }
+    if munged == *old_spec {
+        return Ok(());
+    }
+    Err(
+        "spec: Forbidden: pvc updates may not change fields other than spec.resources \
+         (and only via a grow permitted by the bound StorageClass)"
+            .into(),
+    )
 }
 
 pub(crate) async fn patch_resource<S: Store>(
@@ -2138,6 +2199,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     let needs_stored_read = true;
     let (
         spec_before_replace,
+        pvc_spec_before_replace,
         stored_status,
         stored_generation,
         stored_uid,
@@ -2199,6 +2261,17 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         } else {
             None
         };
+        // Captured pre-`apply_defaults` (below) so validate_pvc_spec_immutable, called after
+        // it, compares two specs defaulted the same way: this stored spec was defaulted at
+        // create time, while obj.body's incoming spec is raw client input until apply_defaults
+        // runs on it further down. Comparing before that would false-positive-reject a PUT
+        // that legitimately omits a server-defaulted field (e.g. spec.volumeMode) the stored
+        // object carries.
+        let pvc_spec_before_replace = if is_pvc {
+            parsed.as_ref().map(|v| v["spec"].clone())
+        } else {
+            None
+        };
         let status = if meta.has_status_subresource {
             parsed.as_ref().map(|v| v["status"].clone())
         } else {
@@ -2232,6 +2305,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
         (
             spec,
+            pvc_spec_before_replace,
             status,
             generation,
             uid,
@@ -2240,7 +2314,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             deletion_grace,
         )
     } else {
-        (None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None)
     };
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
@@ -2325,6 +2399,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+
+    // A PUT may only change spec.resources on a PVC — see validate_pvc_spec_immutable. Runs
+    // after apply_defaults (above) so both sides are defaulted the same way — see
+    // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
+    if let Some(ref old_spec) = pvc_spec_before_replace {
+        validate_pvc_spec_immutable(old_spec, &obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+    }
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -17370,6 +17452,389 @@ mod tests {
                  be rejected — the shrink check is missing from do_patch"
             ),
         }
+    }
+
+    /// PATCH changing `spec.volumeName` on an already-bound PVC must return 422.
+    ///
+    /// Before the mayor-7kuzu allowlist rewrite, `validate_pvc_spec_immutable` didn't exist
+    /// and nothing checked this field at all: a caller holding only ordinary `patch pvc`
+    /// rights could silently repoint a bound claim at an unrelated PersistentVolume,
+    /// misdirecting a workload's storage — potentially exposing another tenant's volume
+    /// contents to it — without ever touching the PV's own RBAC surface.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_pvc_volume_name_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "bound-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeName": "pv-a",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "volumeName": "pv-b" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "bound-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH rewriting a bound PVC's spec.volumeName must return 422 — the field is \
+                 frozen once the claim is bound so a plain `patch pvc` caller can't redirect \
+                 the claim to an unrelated PV"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing PersistentVolumeClaim.spec.volumeName must be rejected — \
+                 accepting it lets a caller misdirect a bound claim's storage to a different \
+                 PersistentVolume, a potential cross-tenant data exposure"
+            ),
+        }
+    }
+
+    /// PATCH changing `spec.storageClassName` on an existing PVC must return 422.
+    ///
+    /// Upstream only permits setting this field once, from empty; the pre-rewrite guard
+    /// never checked it at all, so a plain `patch pvc` could rewrite an already-provisioned
+    /// claim onto a different StorageClass, desyncing it from the class that actually
+    /// provisioned (and, per the resize check, gates expansion on) its backing volume.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_pvc_storage_class_name_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "sc-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "standard",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "storageClassName": "fast" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "sc-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing spec.storageClassName from \"standard\" to \"fast\" on an \
+                 existing PVC must return 422 — storageClassName is only settable once"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing PersistentVolumeClaim.spec.storageClassName must be rejected \
+                 once already set — accepting it desyncs the claim from the StorageClass that \
+                 actually provisioned its backing volume"
+            ),
+        }
+    }
+
+    /// PATCH changing `spec.accessModes` on an existing PVC must return 422.
+    ///
+    /// accessModes is immutable after creation upstream. The pre-rewrite guard never
+    /// checked it, so a plain `patch pvc` could widen (e.g. ReadWriteOnce -> ReadWriteMany)
+    /// or narrow a claim's access modes after the fact, letting a consumer that cached the
+    /// original modes at bind time behave inconsistently with what the underlying volume
+    /// actually supports.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_pvc_access_modes_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "am-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "accessModes": ["ReadWriteMany"] } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "am-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing spec.accessModes post-create must return 422 — accessModes is \
+                 immutable once the claim exists"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing PersistentVolumeClaim.spec.accessModes must be rejected — \
+                 accepting it lets a claim's declared access mode drift from what the bound \
+                 volume actually supports"
+            ),
+        }
+    }
+
+    /// PATCH increasing `spec.resources.requests.storage` must still succeed when the bound
+    /// StorageClass allows expansion — the mayor-7kuzu allowlist rewrite must not regress
+    /// `reject_disallowed_pvc_resize`'s existing "grow is fine when the StorageClass opts in"
+    /// path while freezing every other field.
+    #[tokio::test]
+    async fn patch_namespaced_resource_allows_pvc_storage_increase_when_expansion_allowed() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "can-expand-allowlist" },
+            "provisioner": "csi-hostpath",
+            "allowVolumeExpansion": true
+        });
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "grow-allowlist-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "can-expand-allowlist",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        let patch = serde_json::json!({
+            "spec": { "resources": { "requests": { "storage": "2Gi" } } }
+        });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "grow-allowlist-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        result.expect(
+            "PATCH growing spec.resources.requests.storage must succeed when the bound \
+             StorageClass allows expansion — the allowlist rewrite must munge spec.resources \
+             out of the deep-equal check, not freeze it alongside every other field",
+        );
+    }
+
+    /// PATCH with no actual field changes must succeed — the allowlist deep-equal in
+    /// `validate_pvc_spec_immutable` must short-circuit on `old_spec == new_spec` rather
+    /// than false-positive reject a no-op update (e.g. a controller re-PATCHing the same
+    /// spec it already observed).
+    #[tokio::test]
+    async fn patch_namespaced_resource_allows_pvc_patch_with_no_spec_changes() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "noop-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "standard",
+                "volumeName": "pv-noop",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        // Re-PATCH a harmless metadata-only change (a label), touching no spec field.
+        let patch = serde_json::json!({ "metadata": { "labels": { "env": "prod" } } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "noop-pvc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        result.expect(
+            "PATCH that doesn't touch spec at all must succeed — an allowlist immutability \
+             check must never false-positive reject a metadata-only update just because the \
+             PVC also happens to carry frozen fields like volumeName/storageClassName",
+        );
     }
 
     /// Deleting a Job must remove the `batch.kubernetes.io/job-tracking` finalizer from
