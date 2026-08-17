@@ -263,6 +263,56 @@ fn validate_crd_schema(
     Ok(())
 }
 
+/// Reject a PUT/PATCH that changes spec.group, spec.scope, or spec.names.{plural,singular,kind}
+/// relative to the stored CRD. These four fields are structural identity, immutable upstream:
+/// CRs are stored under a group-and-plural-keyed prefix (see build_new_crd's storage-key
+/// comment), so changing spec.group or spec.names.plural on an existing CRD orphans every
+/// already-stored CR under the old key prefix — permanently unreachable through the CRD's new
+/// identity, not merely a validation gap. Changing spec.scope would likewise desync
+/// namespaced-vs-cluster-scoped storage key shape for existing objects. See mayor-fu462.
+fn reject_structural_field_change(
+    existing: &serde_json::Value,
+    new_spec: &CustomResourceDefinitionSpec,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    let existing_group = existing["spec"]["group"].as_str().unwrap_or("");
+    if existing_group != new_spec.group {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.group is immutable (was '{existing_group}', got '{}')",
+            new_spec.group
+        )));
+    }
+    let existing_scope = existing["spec"]["scope"].as_str().unwrap_or("");
+    if existing_scope != new_spec.scope {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.scope is immutable (was '{existing_scope}', got '{}')",
+            new_spec.scope
+        )));
+    }
+    let existing_plural = existing["spec"]["names"]["plural"].as_str().unwrap_or("");
+    if existing_plural != new_spec.names.plural {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.names.plural is immutable (was '{existing_plural}', got '{}')",
+            new_spec.names.plural
+        )));
+    }
+    let existing_singular = existing["spec"]["names"]["singular"].as_str().unwrap_or("");
+    if existing_singular != new_spec.names.singular {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.names.singular is immutable (was '{existing_singular}', got '{}')",
+            new_spec.names.singular
+        )));
+    }
+    let existing_kind = existing["spec"]["names"]["kind"].as_str().unwrap_or("");
+    if existing_kind != new_spec.names.kind {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.names.kind is immutable (was '{existing_kind}', got '{}')",
+            new_spec.names.kind
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -609,18 +659,34 @@ pub async fn replace_crd<S: Store>(
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
 
-    // Preserve server-assigned fields from stored copy if not present in incoming.
-    if crd.metadata.uid.is_empty() || crd.metadata.creation_timestamp.is_empty() {
-        if crd.metadata.uid.is_empty() {
-            if let Some(uid) = existing["metadata"]["uid"].as_str() {
-                crd.metadata.uid = uid.to_string();
-            }
+    reject_structural_field_change(&existing, &crd.spec, &name)?;
+
+    // Preserve server-assigned creationTimestamp from stored copy if not present in incoming.
+    if crd.metadata.creation_timestamp.is_empty() {
+        if let Some(ts) = existing["metadata"]["creationTimestamp"].as_str() {
+            crd.metadata.creation_timestamp = ts.to_string();
         }
-        if crd.metadata.creation_timestamp.is_empty() {
-            if let Some(ts) = existing["metadata"]["creationTimestamp"].as_str() {
-                crd.metadata.creation_timestamp = ts.to_string();
-            }
+    }
+
+    // metadata.uid is immutable identity, exactly like the generic replace_resource path
+    // (resource.rs): a blank incoming uid is restored from the stored object, but a
+    // non-blank incoming uid that mismatches the stored one is identity forgery, not a
+    // legitimate update — allowing it would let a client forge a match against a
+    // stale/foreign ownerReference (corrupting owner_ref_is_live's cascade-GC decision) or
+    // defeat controllers' "same name, different uid ⇒ different object" recreate-detection.
+    // CustomResourceDefinition routes around the generic path entirely (bespoke handler), so
+    // it never got 2pzru's fix — see mayor-mhgms.
+    let existing_uid = existing["metadata"]["uid"].as_str().unwrap_or("");
+    if crd.metadata.uid.is_empty() {
+        if !existing_uid.is_empty() {
+            crd.metadata.uid = existing_uid.to_string();
         }
+    } else if !existing_uid.is_empty() && crd.metadata.uid != existing_uid {
+        return Err(Status::conflict(format!(
+            "{KIND} \"{name}\": the object was updated with a mismatched uid \
+             (got {}, expected {existing_uid}) — uid is immutable",
+            crd.metadata.uid
+        )));
     }
 
     crd.api_version = API_VERSION.to_string();
@@ -877,6 +943,10 @@ pub async fn patch_crd<S: Store>(
     // Captured before the patch mutates `current` in place, so this reflects the CRD
     // generation the pre-patch cr_schema_cache entries were cached under.
     let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&current);
+    // Snapshot the pre-patch value for reject_structural_field_change below — `current` is
+    // mutated in place by the patch application, so the stored spec.group/scope/names.* would
+    // otherwise be lost by the time we can compare against them.
+    let existing = current.clone();
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
@@ -906,6 +976,21 @@ pub async fn patch_crd<S: Store>(
     // Preserve server-assigned type meta.
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
+
+    // Reject rather than silently drop: a patch that changes a structural identity field
+    // is a client error the caller must correct, not something to merge-and-ignore.
+    reject_structural_field_change(&existing, &crd.spec, &name)?;
+
+    // metadata.uid is immutable identity, restored unconditionally after every patch type
+    // above — mirrors do_patch (resource.rs) and patch_cr's restore, since
+    // CustomResourceDefinition routes around the generic PATCH path entirely and previously
+    // had no uid handling at all. Without this, a caller holding only ordinary CRD `patch`
+    // rights could forge uid to match a stale/foreign ownerReference and corrupt
+    // owner_ref_is_live's cascade-GC decision — see mayor-mhgms.
+    crd.metadata.uid = existing["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
     validate_crd_schema(&crd.spec)?;
 
@@ -1952,6 +2037,257 @@ mod tests {
         assert_eq!(
             json["code"], 404,
             "PATCH on missing CRD must return 404 NotFound"
+        );
+    }
+
+    /// replace_crd must reject a PUT that changes spec.group relative to the stored CRD.
+    ///
+    /// CRs are stored under a group-and-plural-keyed prefix (see build_new_crd's storage-key
+    /// comment): if a client could silently change spec.group via PUT, every CR already stored
+    /// under the old group prefix becomes permanently unreachable — a silent data-loss-adjacent
+    /// bug, not just a validation gap. Fails on revert: without the reject_structural_field_change
+    /// call in replace_crd, this PUT (which only changes spec.group) succeeds with 200.
+    #[tokio::test]
+    async fn replace_crd_rejects_mismatched_spec_group_with_422() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let rv = stored_val["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name, "resourceVersion": rv },
+                "spec": {
+                    "group": "other.com",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        let err = err_status(
+            replace_crd(
+                State(state),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                replace_body,
+            )
+            .await,
+        );
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "PUT changing spec.group must be rejected with 422 Invalid, not silently accepted \
+             — otherwise every CR already stored under the old group prefix is orphaned"
+        );
+    }
+
+    /// patch_crd must reject a merge-patch that changes spec.names.plural relative to the
+    /// stored CRD.
+    ///
+    /// spec.names.plural determines the storage key prefix CRs live under; a patch that changes
+    /// it must be rejected outright (422) rather than merged-and-applied, since silently
+    /// orphaning every already-stored CR under the old plural is worse than refusing the patch.
+    /// Fails on revert: without the reject_structural_field_change call in patch_crd, this
+    /// merge-patch (which only changes spec.names.plural) succeeds with 200.
+    #[tokio::test]
+    async fn patch_crd_rejects_change_to_names_plural_with_422() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "names": { "plural": "gadgets" } } });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = err_status(
+            patch_crd(
+                State(state),
+                Path(name.to_string()),
+                test_user(),
+                headers,
+                patch_bytes,
+            )
+            .await,
+        );
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "merge-patch changing spec.names.plural must be rejected with 422 Invalid, not \
+             silently merged — otherwise every CR already stored under the old plural is orphaned"
+        );
+    }
+
+    /// replace_crd only filled `crd.metadata.uid` from the stored object when the incoming
+    /// uid was empty — a non-empty, mismatched client-supplied uid was silently persisted,
+    /// unlike the generic replace_resource path (resource.rs), which 409s on exactly this.
+    /// Letting it through would let a client forge a match against a stale/foreign
+    /// ownerReference, corrupting owner_ref_is_live's cascade-GC decision. Fails on revert:
+    /// without the uid-mismatch check, this PUT (matching resourceVersion, forged uid) would
+    /// succeed with 200 instead of 409.
+    #[tokio::test]
+    async fn replace_crd_rejects_mismatched_uid_with_409() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let rv = stored_val["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let real_uid = stored_val["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(!real_uid.is_empty(), "create must assign a uid");
+
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name, "uid": "attacker-uid", "resourceVersion": rv },
+                "spec": {
+                    "group": "example.com",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        let err = err_status(
+            replace_crd(
+                State(state),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                replace_body,
+            )
+            .await,
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "PUT with a mismatched non-blank metadata.uid must return 409 Conflict — uid is \
+             immutable identity, not a client-settable field"
+        );
+    }
+
+    /// patch_crd applied merge_patch/apply_json_patch directly to the full stored JSON
+    /// (including metadata.uid) with zero uid handling anywhere in the function. A caller
+    /// holding only ordinary CRD `patch` rights could forge uid to match a stale/foreign
+    /// ownerReference, corrupting owner_ref_is_live's cascade-GC decision. Fails on revert:
+    /// without restoring the pre-patch uid after the patch is applied, the forged uid below
+    /// would be persisted and this assertion would fail.
+    #[tokio::test]
+    async fn patch_crd_cannot_change_uid() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let real_uid = stored_val["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(!real_uid.is_empty(), "create must assign a uid");
+
+        let patch = serde_json::json!({ "metadata": { "uid": "attacker-uid" } });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect(
+            "a patch attempting to set uid must still succeed (uid is silently restored, \
+             not rejected — matches do_patch's PATCH semantics)",
+        )
+        .into_response();
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], real_uid,
+            "a merge-patch carrying metadata.uid must not change the stored uid"
         );
     }
 

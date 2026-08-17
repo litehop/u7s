@@ -381,19 +381,52 @@ pub(crate) async fn replace_namespace<S: Store>(
     // status.phase/status.conditions that the real namespace controller last wrote via
     // /status. Mirrors replace_pod's stored_status handling and the generic
     // replace_namespaced_resource in resource.rs.
-    let stored_status = state
+    let stored_obj = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok())
-        .map(|v| v["status"].clone());
+        .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+    let stored_status = stored_obj.as_ref().map(|v| v["status"].clone());
     match stored_status {
         Some(ref s) if !s.is_null() => {
             obj.body["status"] = s.clone();
         }
         _ => {
             obj.body.as_object_mut().map(|m| m.remove("status"));
+        }
+    }
+
+    // metadata.uid is immutable identity, exactly like the generic replace_namespaced_resource
+    // path (resource.rs): a blank incoming uid is restored from the stored object, but a
+    // non-blank incoming uid that mismatches the stored one is identity forgery, not a
+    // legitimate update — allowing it would let a client forge a match against a stale/foreign
+    // ownerReference (corrupting owner_ref_is_live's cascade-GC decision) or defeat
+    // controllers' "same name, different uid ⇒ different object" recreate-detection. Namespace
+    // routes around the generic path entirely (bespoke handler), so it never got 2pzru's fix —
+    // see mayor-mhgms.
+    let stored_uid = stored_obj.as_ref().map(|v| v["metadata"]["uid"].clone());
+    let incoming_uid_blank = obj.body["metadata"]["uid"]
+        .as_str()
+        .map(str::is_empty)
+        .unwrap_or(true);
+    if incoming_uid_blank {
+        if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
+            if !uid.is_empty() {
+                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            }
+        }
+    } else if let Some(stored_uid_str) = stored_uid
+        .as_ref()
+        .and_then(|u| u.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        if incoming_uid_str != stored_uid_str {
+            return Err(Status::conflict(format!(
+                "Namespace \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable"
+            )));
         }
     }
 
@@ -495,7 +528,17 @@ pub(crate) async fn patch_namespace<S: Store>(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
+    // metadata.uid is immutable identity, restored unconditionally after the patch is
+    // applied — exactly like do_patch (resource.rs) already does for the generic path. This
+    // branch applies the merge-patch directly to the full stored object body (including
+    // metadata.uid) with no other uid handling, so without this a caller holding only
+    // ordinary namespace `patch` rights could forge uid to match a stale/foreign
+    // ownerReference and corrupt owner_ref_is_live's cascade-GC decision — see mayor-mhgms.
+    let stored_uid = current.body["metadata"]["uid"].clone();
+
     crate::patch::merge_patch(&mut current.body, &patch);
+
+    current.body["metadata"]["uid"] = stored_uid;
 
     // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -2004,6 +2047,85 @@ mod tests {
         );
     }
 
+    // patch_namespace's merge-patch branch applies the patch directly to the full stored
+    // object body (including metadata.uid) and used to persist the result with zero uid
+    // handling. A caller holding only ordinary namespace `patch` rights could forge uid to
+    // match a stale/foreign ownerReference, corrupting owner_ref_is_live's cascade-GC
+    // decision. Fails on revert: without restoring the pre-patch uid after merge_patch, the
+    // forged uid below would be persisted and this assertion would fail.
+    #[tokio::test]
+    async fn patch_namespace_cannot_change_uid() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("uid-forge-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "uid-forge-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let real_uid = stored_val["metadata"]["uid"]
+            .as_str()
+            .expect("create must assign a uid")
+            .to_string();
+        assert!(!real_uid.is_empty());
+
+        let patch_body =
+            Bytes::from(serde_json::json!({ "metadata": { "uid": "attacker-uid" } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace(
+                State(state.clone()),
+                Path("uid-forge-ns".to_string()),
+                axum::extract::Query(PatchQuery::default()),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "a patch attempting to set uid must still succeed (uid is silently restored, \
+             not rejected — matches do_patch's PATCH semantics)"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "uid-forge-ns",
+            ))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let after_val: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse after patch");
+        assert_eq!(
+            after_val["metadata"]["uid"], real_uid,
+            "a merge-patch carrying metadata.uid must not change the stored uid"
+        );
+    }
+
     // delete_namespace must leave the "kubernetes" finalizer (and deletionTimestamp) in
     // place rather than self-clearing it. deletionTimestamp != nil && "kubernetes" in
     // spec.finalizers is the real KCM namespace-controller's ONLY watch trigger for its
@@ -3046,6 +3168,79 @@ mod tests {
             StatusCode::CONFLICT,
             "stale resourceVersion on replace_namespace must return 409 Conflict — \
              OCC is the guard against lost-update races in concurrent namespace updates"
+        );
+    }
+
+    // replace_namespace never touched metadata.uid at all — a non-blank, mismatched
+    // client-supplied uid was silently persisted, unlike the generic replace_resource path
+    // (resource.rs), which 409s on exactly this. Letting it through would let a client forge
+    // a match against a stale/foreign ownerReference, corrupting owner_ref_is_live's
+    // cascade-GC decision. Fails on revert: without the uid-mismatch check, this PUT (valid
+    // resourceVersion, forged uid) would succeed with 200 instead of 409.
+    #[tokio::test]
+    async fn replace_namespace_rejects_mismatched_uid_with_409() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("uid-guard-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored_entry = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "uid-guard-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&stored_entry.value).expect("parse stored");
+        let rv = stored["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1")
+            .to_string();
+        let real_uid = stored["metadata"]["uid"].as_str().unwrap_or("").to_string();
+        assert!(!real_uid.is_empty());
+
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "uid-guard-ns",
+                    "uid": "attacker-uid",
+                    "resourceVersion": rv
+                }
+            })
+            .to_string(),
+        );
+
+        let result = replace_namespace(
+            State(state),
+            Path("uid-guard-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            replace_body,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("replace with a mismatched, non-blank uid must fail"),
+        };
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "PUT with a mismatched non-blank metadata.uid must return 409 Conflict — uid is \
+             immutable identity, not a client-settable field"
         );
     }
 
