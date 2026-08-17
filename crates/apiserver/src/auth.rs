@@ -3507,6 +3507,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let req = Request::builder()
@@ -3571,6 +3572,7 @@ mod tests {
                 None,
                 Arc::new(make_test_store()),
                 Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
             ));
 
         let req = Request::builder()
