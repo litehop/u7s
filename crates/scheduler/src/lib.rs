@@ -1597,8 +1597,9 @@ impl NodeTally {
     /// concurrent plans.
     pub fn tallied_pod_labels(&self) -> Vec<TalliedPodLabels> {
         self.pods
-            .values()
-            .map(|p| TalliedPodLabels {
+            .iter()
+            .map(|(key, p)| TalliedPodLabels {
+                key: key.clone(),
                 node_name: p.node_name.clone(),
                 namespace: p.namespace.clone(),
                 labels: p.labels.clone(),
@@ -1608,9 +1609,15 @@ impl NodeTally {
 }
 
 /// One tallied pod's namespace/labels, keyed by which node it occupies — see
-/// `NodeTally::tallied_pod_labels`.
+/// `NodeTally::tallied_pod_labels`. `key` ("namespace/name", matching
+/// `PreemptionPlan.victims`' entries) lets `find_preemption_candidate` pick
+/// out which of these belong to a candidate node's own selected preemption
+/// victims, so their contribution to topology-spread/inter-pod-affinity
+/// counts can be discounted before judging that node's qualification — see
+/// `TopologySpreadContext::node_qualifies_excluding_victims`.
 #[derive(Debug, Clone)]
 pub struct TalliedPodLabels {
+    pub key: String,
     pub node_name: String,
     pub namespace: String,
     pub labels: std::collections::HashMap<String, String>,
@@ -2167,13 +2174,20 @@ fn pod_matches_affinity_term(
 }
 
 /// For each `(topologyKey, topologyValue)` pair some node currently carries,
-/// whether at least one pod in `tallied` — anywhere in the cluster, not just
-/// on that node — matches one of `terms` AND occupies a node with that
-/// pair. Built once per scheduling decision (the pending pod's own required
-/// terms and the current tally do not change while candidate nodes are being
-/// evaluated for THIS pod), not once per candidate node — mirrors upstream's
+/// how many pods in `tallied` — anywhere in the cluster, not just on that
+/// node — match one of `terms` AND occupy a node with that pair. Built once
+/// per scheduling decision (the pending pod's own required terms and the
+/// current tally do not change while candidate nodes are being evaluated for
+/// THIS pod), not once per candidate node — mirrors upstream's
 /// PreFilter-computed `topologyToMatchedTermCount`, just recomputed fresh
 /// each time instead of incrementally maintained across a whole Filter pass.
+///
+/// A per-pair COUNT, not just a boolean "has a match" — rather than a plain
+/// `HashSet` — so `InterPodAffinityContext::node_qualifies_excluding_victims`
+/// can discount a candidate node's own about-to-be-evicted victims from a
+/// pair's count without losing track of whether some OTHER pod (on a
+/// different node sharing the same topology value) still legitimately
+/// matches there too.
 fn topology_pairs_matched_by_terms(
     terms: &[PodAffinityTerm],
     pod_namespace: &str,
@@ -2182,8 +2196,8 @@ fn topology_pairs_matched_by_terms(
         String,
         std::collections::HashMap<String, String>,
     >,
-) -> std::collections::HashSet<(String, String)> {
-    let mut matched = std::collections::HashSet::new();
+) -> std::collections::HashMap<(String, String), i32> {
+    let mut matched = std::collections::HashMap::new();
     for term in terms {
         if term.topology_key.is_empty() {
             continue;
@@ -2196,7 +2210,9 @@ fn topology_pairs_matched_by_terms(
                 .get(&p.node_name)
                 .and_then(|labels| labels.get(&term.topology_key))
             {
-                matched.insert((term.topology_key.clone(), value.clone()));
+                *matched
+                    .entry((term.topology_key.clone(), value.clone()))
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -2223,7 +2239,7 @@ fn topology_pairs_matched_by_terms(
 fn pod_affinity_satisfied(
     pod: &PendingPod,
     node_labels: &std::collections::HashMap<String, String>,
-    matched: &std::collections::HashSet<(String, String)>,
+    matched: &std::collections::HashMap<(String, String), i32>,
 ) -> bool {
     if pod.pod_affinity_terms.is_empty() {
         return true;
@@ -2233,7 +2249,10 @@ fn pod_affinity_satisfied(
         let Some(value) = node_labels.get(&term.topology_key) else {
             return false;
         };
-        if !matched.contains(&(term.topology_key.clone(), value.clone())) {
+        let has_match = matched
+            .get(&(term.topology_key.clone(), value.clone()))
+            .is_some_and(|count| *count > 0);
+        if !has_match {
             all_terms_have_a_match = false;
         }
     }
@@ -2257,12 +2276,14 @@ fn pod_affinity_satisfied(
 fn pod_anti_affinity_satisfied(
     pod: &PendingPod,
     node_labels: &std::collections::HashMap<String, String>,
-    matched: &std::collections::HashSet<(String, String)>,
+    matched: &std::collections::HashMap<(String, String), i32>,
 ) -> bool {
     pod.pod_anti_affinity_terms.iter().all(|term| {
-        node_labels
-            .get(&term.topology_key)
-            .is_none_or(|value| !matched.contains(&(term.topology_key.clone(), value.clone())))
+        node_labels.get(&term.topology_key).is_none_or(|value| {
+            matched
+                .get(&(term.topology_key.clone(), value.clone()))
+                .is_none_or(|count| *count <= 0)
+        })
     })
 }
 
@@ -2280,8 +2301,8 @@ fn pod_anti_affinity_satisfied(
 /// are enforced.
 struct InterPodAffinityContext<'a> {
     pod: &'a PendingPod,
-    affinity_matched: std::collections::HashSet<(String, String)>,
-    anti_affinity_matched: std::collections::HashSet<(String, String)>,
+    affinity_matched: std::collections::HashMap<(String, String), i32>,
+    anti_affinity_matched: std::collections::HashMap<(String, String), i32>,
 }
 
 impl<'a> InterPodAffinityContext<'a> {
@@ -2311,9 +2332,89 @@ impl<'a> InterPodAffinityContext<'a> {
     }
 
     fn node_qualifies(&self, node_labels: &std::collections::HashMap<String, String>) -> bool {
-        pod_affinity_satisfied(self.pod, node_labels, &self.affinity_matched)
-            && pod_anti_affinity_satisfied(self.pod, node_labels, &self.anti_affinity_matched)
+        self.node_qualifies_excluding_victims(node_labels, &[])
     }
+
+    /// Same judgment as `node_qualifies`, but as if every pod in `victims` —
+    /// this candidate node's own about-to-be-evicted preemption victims,
+    /// always physically located on this SAME node (see
+    /// `find_preemption_candidate`) — had already been removed. Mirrors
+    /// upstream's `selectVictimsOnNode` calling `RemovePod` on the
+    /// InterPodAffinity plugin's cycle state for each selected victim before
+    /// re-checking the node: a node whose only affinity/anti-affinity
+    /// violation is a pod about to be evicted from IT is still a valid
+    /// preemption target.
+    ///
+    /// Skips the discount entirely (and so allocates nothing) when
+    /// `victims` is empty — `node_qualifies`'s common, non-preemption-plan
+    /// case.
+    fn node_qualifies_excluding_victims(
+        &self,
+        node_labels: &std::collections::HashMap<String, String>,
+        victims: &[&TalliedPodLabels],
+    ) -> bool {
+        if victims.is_empty() {
+            return pod_affinity_satisfied(self.pod, node_labels, &self.affinity_matched)
+                && pod_anti_affinity_satisfied(self.pod, node_labels, &self.anti_affinity_matched);
+        }
+        let affinity_matched = discount_matched_pairs(
+            &self.pod.pod_affinity_terms,
+            &self.pod.namespace,
+            &self.affinity_matched,
+            node_labels,
+            victims,
+        );
+        let anti_affinity_matched = discount_matched_pairs(
+            &self.pod.pod_anti_affinity_terms,
+            &self.pod.namespace,
+            &self.anti_affinity_matched,
+            node_labels,
+            victims,
+        );
+        pod_affinity_satisfied(self.pod, node_labels, &affinity_matched)
+            && pod_anti_affinity_satisfied(self.pod, node_labels, &anti_affinity_matched)
+    }
+}
+
+/// Build a copy of `matched`'s per-`(topologyKey, value)` pair counts (see
+/// `topology_pairs_matched_by_terms`) with each of `terms`'s contribution
+/// from `victims` subtracted out — the `InterPodAffinityContext` counterpart
+/// to `TopologySpreadContext::node_qualifies_excluding_victims`'s inline
+/// discount, extracted here (rather than inlined the same way) because a
+/// pod's required affinity/anti-affinity terms can each carry a DIFFERENT
+/// `topologyKey` — unlike `TopologySpreadConstraint`, where the discount is
+/// computed once per constraint — so `pod_affinity_satisfied`/
+/// `pod_anti_affinity_satisfied` need the discount already folded into the
+/// map before they iterate `pod`'s terms themselves.
+///
+/// `victims` are only ever on this one candidate node (see
+/// `find_preemption_candidate`), so — exactly like the topology-spread
+/// case — only the ONE domain value `node_labels` itself carries for each
+/// term's `topologyKey` is ever discounted; a match contributed by some
+/// OTHER node sharing that same topology value is untouched.
+fn discount_matched_pairs(
+    terms: &[PodAffinityTerm],
+    pod_namespace: &str,
+    matched: &std::collections::HashMap<(String, String), i32>,
+    node_labels: &std::collections::HashMap<String, String>,
+    victims: &[&TalliedPodLabels],
+) -> std::collections::HashMap<(String, String), i32> {
+    let mut discounted = matched.clone();
+    for term in terms {
+        let Some(value) = node_labels.get(&term.topology_key) else {
+            continue;
+        };
+        let discount = victims
+            .iter()
+            .filter(|v| pod_matches_affinity_term(term, pod_namespace, &v.namespace, &v.labels))
+            .count() as i32;
+        if discount > 0 {
+            if let Some(count) = discounted.get_mut(&(term.topology_key.clone(), value.clone())) {
+                *count -= discount;
+            }
+        }
+    }
+    discounted
 }
 
 /// For one topology-spread `constraint`, every topology-domain VALUE some
@@ -2440,16 +2541,59 @@ impl<'a> TopologySpreadContext<'a> {
     /// actually reserve the "slot" its own placement is about to fill,
     /// letting a second replica land in the very same domain a moment later.
     fn node_qualifies(&self, node_labels: &std::collections::HashMap<String, String>) -> bool {
+        self.node_qualifies_excluding_victims(node_labels, &[])
+    }
+
+    /// Same judgment as `node_qualifies`, but as if every pod in `victims` —
+    /// this candidate node's own about-to-be-evicted preemption victims,
+    /// always physically located on this SAME node (see
+    /// `find_preemption_candidate`) — had already been removed. Mirrors
+    /// upstream's `selectVictimsOnNode` calling `RemovePod` on the
+    /// PodTopologySpread plugin's cycle state for each selected victim
+    /// before re-checking the node: a node whose only skew violation is
+    /// caused by a pod about to be evicted from IT is still a valid
+    /// preemption target, not falsely rejected as if that pod would keep
+    /// occupying its domain forever.
+    ///
+    /// `victims` are only ever on this one node, so only the ONE domain
+    /// value THIS node itself carries for a constraint's `topologyKey` is
+    /// ever discounted — every other domain's count is untouched, and
+    /// `term.min_match_num` (the precomputed, common case) is reused as-is
+    /// whenever there is nothing to discount for this term.
+    fn node_qualifies_excluding_victims(
+        &self,
+        node_labels: &std::collections::HashMap<String, String>,
+        victims: &[&TalliedPodLabels],
+    ) -> bool {
         self.terms.iter().all(|term| {
             let Some(value) = node_labels.get(&term.constraint.topology_key) else {
                 return false;
             };
-            let match_num = term.counts.get(value).copied().unwrap_or(0);
+            let discount = victims
+                .iter()
+                .filter(|v| {
+                    v.namespace == self.pod.namespace
+                        && label_selector_matches(
+                            &v.labels,
+                            term.constraint.label_selector.as_ref(),
+                        )
+                })
+                .count() as i32;
+            let match_num = term.counts.get(value).copied().unwrap_or(0) - discount;
             let self_match_num = i32::from(label_selector_matches(
                 &self.pod.labels,
                 term.constraint.label_selector.as_ref(),
             ));
-            let skew = match_num + self_match_num - term.min_match_num;
+            let min_match_num = if discount == 0 {
+                term.min_match_num
+            } else {
+                term.counts
+                    .iter()
+                    .map(|(v, c)| if v == value { c - discount } else { *c })
+                    .min()
+                    .unwrap_or(term.min_match_num)
+            };
+            let skew = match_num + self_match_num - min_match_num;
             skew <= term.constraint.max_skew
         })
     }
@@ -2798,19 +2942,26 @@ pub async fn find_preemption_plan(
 /// `pick_node`, for the same reason.
 ///
 /// Considers every node that qualifies for `pod` (`node_qualifies_for_pod`)
-/// AND satisfies its required podAffinity/podAntiAffinity terms
-/// (`InterPodAffinityContext`) AND satisfies every hard
-/// (`whenUnsatisfiable: DoNotSchedule`) `topologySpreadConstraints` entry
-/// (`TopologySpreadContext`) — the same two contexts, and the same
+/// AND, once that node's own preemption victims (`select_preemption_victims`)
+/// have been selected and virtually removed, satisfies its required
+/// podAffinity/podAntiAffinity terms (`InterPodAffinityContext`) AND every
+/// hard (`whenUnsatisfiable: DoNotSchedule`) `topologySpreadConstraints`
+/// entry (`TopologySpreadContext`) — the same two contexts, and the same
 /// `node_qualifies` conjuncts, `select_node_with_capacity` applies for direct
-/// scheduling. Without the `TopologySpreadContext` conjunct, a topology-
+/// scheduling, evaluated here via each context's `_excluding_victims`
+/// counterpart. Without the `TopologySpreadContext` conjunct, a topology-
 /// constrained pod could still trigger preemption onto a node that violates
 /// its own `maxSkew` — the exact placement the direct-scheduling path
-/// already refuses. Neither context is recomputed to account for the
-/// candidate's own victims being evicted: a node already carrying enough
-/// matching pods to violate the pod's spread constraint is rejected up
-/// front, exactly as `select_node_with_capacity` would reject it, rather
-/// than trying to model post-eviction skew.
+/// already refuses. And without discounting the node's own victims first, a
+/// node whose ONLY topology/affinity violation is a pod already about to be
+/// evicted from it would be rejected outright — mirrors upstream's
+/// `selectVictimsOnNode`, which calls `RemovePod` on every plugin's cycle
+/// state as each victim is chosen, so PodTopologySpread/InterPodAffinity are
+/// re-checked with victims already discounted.
+///
+/// Victims are therefore selected BEFORE the affinity/topology check here,
+/// the reverse of `select_node_with_capacity`'s ordering — which pods would
+/// even be evicted depends on capacity fit, so that has to run first.
 ///
 /// Among qualifying nodes, returns the cheapest (fewest-victims) viable
 /// `(node index, PreemptionPlan)` — a node with at least one lower-priority
@@ -2834,12 +2985,6 @@ fn find_preemption_candidate(
         if !node_qualifies_for_pod(node, pod) {
             continue;
         }
-        if !affinity_ctx.node_qualifies(&node.metadata.labels) {
-            continue;
-        }
-        if !topology_ctx.node_qualifies(&node.metadata.labels) {
-            continue;
-        }
         let capacity = pod_count_capacity(node);
         let node_name = &node.metadata.name;
         let node_pods = tally
@@ -2855,6 +3000,19 @@ fn find_preemption_candidate(
             &node.status.allocatable,
         );
         if victims.is_empty() {
+            continue;
+        }
+        // Every victim is, by construction, one of `node_pods` — i.e.
+        // physically on THIS candidate node — so this is exactly the set
+        // `node_qualifies_excluding_victims` needs to discount.
+        let victim_pods: Vec<&TalliedPodLabels> = tallied_pods
+            .iter()
+            .filter(|p| victims.iter().any(|v| v == &p.key))
+            .collect();
+        if !affinity_ctx.node_qualifies_excluding_victims(&node.metadata.labels, &victim_pods) {
+            continue;
+        }
+        if !topology_ctx.node_qualifies_excluding_victims(&node.metadata.labels, &victim_pods) {
             continue;
         }
         debug!(
@@ -5645,8 +5803,12 @@ mod tests {
     }
 
     /// An already-tallied pod occupying `node_name`, for `tallied_pods`.
+    /// `key` is a placeholder, never a real preemption victim's — these
+    /// tests exercise `node_qualifies` (the no-discount path), not
+    /// `find_preemption_candidate`'s victim discounting.
     fn tallied(node_name: &str, namespace: &str, labels: &[(&str, &str)]) -> TalliedPodLabels {
         TalliedPodLabels {
+            key: format!("{namespace}/unused-{node_name}"),
             node_name: node_name.to_owned(),
             namespace: namespace.to_owned(),
             labels: labels
@@ -7296,24 +7458,33 @@ mod tests {
     // node_qualifies_for_pod + InterPodAffinityContext — so a topology-
     // constrained pod could still trigger preemption onto a node its own
     // maxSkew forbids, exactly the placement direct scheduling now refuses.
+    //
+    // mayor-82iqj then taught that same candidate search to discount a
+    // node's own selected preemption victims before judging its topology/
+    // affinity qualification (mirrors upstream's `selectVictimsOnNode`
+    // calling `RemovePod` on each plugin's cycle state per victim) — a node
+    // whose ONLY spread violation is a pod about to be evicted from it is a
+    // valid target, not a false rejection.
     // -------------------------------------------------------------------
 
-    /// `find_preemption_candidate` must reject a candidate node that would
-    /// violate the pending pod's own hard `topologySpreadConstraints` even
-    /// though evicting its lower-priority occupant would otherwise free a
-    /// slot there — zone-a already carries this pod's only matching sibling,
-    /// so placing a second replica there produces skew 2 > maxSkew 1, the
-    /// exact spread violation `topologySpreadConstraints` exists to prevent.
-    /// Zone-b needs preemption too (so this is a genuine choice between two
+    /// `find_preemption_candidate` must target a candidate node whose only
+    /// hard `topologySpreadConstraints` violation would be resolved by
+    /// evicting that SAME node's own preemption victim — zone-a's only
+    /// matching sibling is precisely the low-priority pod preemption would
+    /// evict there, so post-eviction skew is 1 <= maxSkew 1, not the
+    /// pre-eviction 2 > 1 a naive current-state check would see. Zone-b
+    /// needs preemption too (so this is a genuine choice between two
     /// preemptable candidates, not a case where zone-b would already win via
-    /// direct scheduling), but carries none of the pod's matching siblings,
-    /// so it must win instead. Before this fix, the missing
-    /// `TopologySpreadContext` conjunct let node-a (the first, and — absent
-    /// the topology check — equally cheap, tie-broken-by-list-order
-    /// candidate) win instead, evicting a real pod onto the very zone the
-    /// pending pod asked not to be piled onto.
+    /// direct scheduling) but carries none of the pod's matching siblings,
+    /// so if the fix were absent zone-b would incorrectly look like the only
+    /// legal choice. Before mayor-82iqj's fix, `TopologySpreadContext`
+    /// judged every candidate against the CURRENT tally — never discounting
+    /// a node's own about-to-be-evicted occupant — so this exact node-a was
+    /// rejected outright even though evicting its own victim makes it fully
+    /// compliant, forcing preemption onto zone-b (a real disruption) when
+    /// zone-a was the correct, spread-compliant target all along.
     #[test]
-    fn find_preemption_candidate_rejects_zone_that_would_violate_spread_constraint() {
+    fn find_preemption_candidate_targets_zone_whose_own_victim_resolves_the_spread_violation() {
         let list = NodeList {
             items: vec![
                 make_node_with_capacity(
@@ -7340,8 +7511,10 @@ mod tests {
         let tally = std::sync::Mutex::new(NodeTally::default());
         {
             let mut guard = tally.lock().expect("tally lock poisoned");
-            // zone-a's only slot is already occupied by a low-priority pod
-            // matching the pending pod's own spread selector.
+            // zone-a's only slot is occupied by a low-priority pod matching
+            // the pending pod's own spread selector — it is also the ONLY
+            // pod that would be preempted there, so evicting it fully
+            // resolves the skew this constraint would otherwise flag.
             guard.assume(
                 "default",
                 "web-a",
@@ -7384,12 +7557,123 @@ mod tests {
             find_preemption_candidate(&list, &pod, &tallied_pods, &node_labels_by_name, &tally);
         assert_eq!(
             best.map(|(_, plan)| plan.node_name),
+            Some("node-a".to_owned()),
+            "zone-a's only matching sibling is exactly the pod its own \
+             preemption plan would evict — post-eviction skew is 1 <= \
+             maxSkew 1, so zone-a must win, not be rejected as if that \
+             sibling would keep occupying its domain forever"
+        );
+    }
+
+    /// The fix above must not become a blanket "ignore this node's zone"
+    /// pass: discounting must ONLY ever remove a candidate's own selected
+    /// victims, never a matching sibling parked on a DIFFERENT node that
+    /// merely shares the same zone. zone-a here spans two nodes: node-a1
+    /// hosts the pending pod's own low-priority victim (would be evicted),
+    /// but node-a2 hosts a SEPARATE, higher-priority sibling that is never a
+    /// candidate for eviction and so must keep counting against zone-a's
+    /// skew. Evicting node-a1's own victim alone therefore does NOT resolve
+    /// the violation (zone-a still carries one real matching sibling via
+    /// node-a2) — node-a1 must still be rejected, and preemption must fall
+    /// through to zone-b. If discounting ever subtracted more than a
+    /// candidate's OWN victims — e.g. by naively re-deriving `min_match_num`
+    /// from a zeroed-out zone-a instead of only node-a1's own contribution —
+    /// this would wrongly let node-a1 win, piling a second replica onto a
+    /// zone that already holds one via node-a2.
+    #[test]
+    fn find_preemption_candidate_still_rejects_zone_whose_violation_survives_its_own_eviction() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity(
+                    "node-a1",
+                    &[("topology.kubernetes.io/zone", "zone-a")],
+                    "1",
+                ),
+                make_node_with_capacity(
+                    "node-a2",
+                    &[("topology.kubernetes.io/zone", "zone-a")],
+                    "1",
+                ),
+                make_node_with_capacity(
+                    "node-b",
+                    &[("topology.kubernetes.io/zone", "zone-b")],
+                    "1",
+                ),
+            ],
+        };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            // node-a1's only occupant is a low-priority matching sibling —
+            // this IS the pod preemption would evict there.
+            guard.assume(
+                "default",
+                "web-a1",
+                "node-a1",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "web".to_owned())].into(),
+            );
+            // node-a2's occupant is ALSO a matching sibling, but too
+            // high-priority to ever be selected as a victim — it must
+            // still count against zone-a's skew no matter what happens on
+            // node-a1.
+            guard.assume(
+                "default",
+                "web-a2",
+                "node-a2",
+                1000,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "web".to_owned())].into(),
+            );
+            // zone-b's only slot is an unrelated low-priority filler, so
+            // zone-b needs preemption too but carries no matching sibling.
+            guard.assume(
+                "default",
+                "filler-b",
+                "node-b",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "other".to_owned())].into(),
+            );
+        }
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod = empty_pending_pod();
+        pod.priority = 100;
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        pod.topology_spread_constraints = vec![topology_spread_constraint(
+            "topology.kubernetes.io/zone",
+            1,
+            "DoNotSchedule",
+            &[("app", "web")],
+        )];
+
+        let best =
+            find_preemption_candidate(&list, &pod, &tallied_pods, &node_labels_by_name, &tally);
+        assert_eq!(
+            best.map(|(_, plan)| plan.node_name),
             Some("node-b".to_owned()),
-            "zone-a already carries the pod's only matching sibling (skew \
-             would be 2 > maxSkew 1 even after evicting the low-priority \
-             occupant there) — preemption must target the empty zone-b \
-             instead, never the zone the pod's own spread constraint forbids \
-             piling onto"
+            "node-a2's higher-priority matching sibling is untouched by \
+             node-a1's own eviction, so zone-a still carries a real match — \
+             node-a1 must stay rejected and preemption must fall through to \
+             zone-b, proving the victim discount never reaches beyond a \
+             candidate's OWN selected victims"
         );
     }
 
