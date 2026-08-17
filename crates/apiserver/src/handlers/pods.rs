@@ -4856,15 +4856,21 @@ pub(crate) fn initialize_pod_generation(pod: &mut serde_json::Value) {
 /// deep-equal regardless.
 ///
 /// Both sides are spec-defaulted the same way `increment_pod_generation_if_spec_changed`
-/// does before any comparison runs (and `automountServiceAccountToken` — never decoded
-/// from protobuf — is stripped from both), so a client PUT/PATCH that omits
-/// already-defaulted fields (dnsPolicy, serviceAccountName, probe periods, port
-/// protocol, ...) isn't mistaken for an illegal spec change by the trailing whole-spec
-/// deep-equal: those fields are normalized identically on both sides first. A
-/// newly-discovered decode asymmetry on a field this defaulting doesn't yet cover would
-/// surface as a false-positive 422 here; the fix is to extend `apply_pod_spec_defaults`
-/// (or the `automountServiceAccountToken`-style strip above it), not to relax this
-/// function back into a blocklist.
+/// does before any comparison runs, so a client PUT/PATCH that omits already-defaulted
+/// fields (dnsPolicy, serviceAccountName, probe periods, port protocol, ...) isn't
+/// mistaken for an illegal spec change by the trailing whole-spec deep-equal: those
+/// fields are normalized identically on both sides first. A newly-discovered decode
+/// asymmetry on a field this defaulting doesn't yet cover would surface as a
+/// false-positive 422 here; the fix is to extend `apply_pod_spec_defaults`, not to
+/// relax this function back into a blocklist.
+///
+/// `automountServiceAccountToken` is deliberately NOT munged or stripped here: it
+/// round-trips through the protobuf adapter like any other bool field (see
+/// `encode_pod_proto_gen_round_trips_enable_service_links_and_automount_service_account_token`
+/// in core_gen_adapter.rs), `apply_automount_sa_token_default` always resolves it to an
+/// explicit `true`/`false` at create time (never leaves it absent), and upstream
+/// `ValidatePodUpdate` freezes it post-creation — so it is correctly caught by the
+/// trailing deep-equal like every other unlisted field.
 pub(crate) fn validate_pod_spec_immutable(
     spec_before: &serde_json::Value,
     spec_after: &serde_json::Value,
@@ -4873,11 +4879,6 @@ pub(crate) fn validate_pod_spec_immutable(
     apply_pod_spec_defaults(&mut old_pod);
     let mut new_pod = serde_json::json!({ "spec": spec_after.clone() });
     apply_pod_spec_defaults(&mut new_pod);
-    for spec in [&mut old_pod["spec"], &mut new_pod["spec"]] {
-        if let Some(m) = spec.as_object_mut() {
-            m.remove("automountServiceAccountToken");
-        }
-    }
     let old_spec = old_pod["spec"].clone();
     let new_spec = new_pod["spec"].clone();
 
@@ -11813,6 +11814,54 @@ mod handler_tests {
             "patch_pod must reject a schedulerName change via ordinary `patch pods` — \
              accepting it lets a caller retarget a pod to a different scheduler profile \
              without ever touching the scheduler-scoped RBAC surface"
+        );
+    }
+
+    /// A merge-patch PATCH changing `spec.automountServiceAccountToken` must be rejected.
+    /// Upstream `ValidatePodUpdate` freezes this field post-creation; letting a bare
+    /// `patch pods` caller flip it lets a workload that was created with the SA-token
+    /// mount suppressed (`automountServiceAccountToken: false`) silently regain the
+    /// projected token volume — a privilege change no admission plugin re-evaluates
+    /// after create. `validate_pod_spec_immutable` used to strip this field from both
+    /// sides of its comparison before diffing (on the mistaken belief the field was
+    /// never decoded from protobuf; `core_gen_adapter.rs`'s round-trip tests show it
+    /// is), so this PATCH used to silently succeed — mayor-cxnj0.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_change_automount_service_account_token() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "automount-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "automountServiceAccountToken": false
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"automountServiceAccountToken": true}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/automount-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject an automountServiceAccountToken change via ordinary \
+             `patch pods` — accepting it lets a caller silently re-enable SA token \
+             automount on a pod that was created with it explicitly suppressed"
         );
     }
 
