@@ -62,6 +62,46 @@ fn main() {
         codegen::generate_secret(descriptor_bytes),
     )
     .expect("failed to write generated Secret codec");
+    std::fs::write(
+        out_dir.join("resourcequota_spec_gen.rs"),
+        codegen::generate_resourcequota_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceQuotaSpec codec");
+    std::fs::write(
+        out_dir.join("resourcequota_gen.rs"),
+        codegen::generate_resourcequota(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceQuota codec");
+    std::fs::write(
+        out_dir.join("limitrange_spec_gen.rs"),
+        codegen::generate_limitrange_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated LimitRangeSpec codec");
+    std::fs::write(
+        out_dir.join("limitrange_gen.rs"),
+        codegen::generate_limitrange(descriptor_bytes),
+    )
+    .expect("failed to write generated LimitRange codec");
+    std::fs::write(
+        out_dir.join("replicationcontroller_spec_gen.rs"),
+        codegen::generate_replicationcontroller_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ReplicationControllerSpec codec");
+    std::fs::write(
+        out_dir.join("replicationcontroller_status_gen.rs"),
+        codegen::generate_replicationcontroller_status(descriptor_bytes),
+    )
+    .expect("failed to write generated ReplicationControllerStatus codec");
+    std::fs::write(
+        out_dir.join("replicationcontroller_gen.rs"),
+        codegen::generate_replicationcontroller(descriptor_bytes),
+    )
+    .expect("failed to write generated ReplicationController codec");
+    std::fs::write(
+        out_dir.join("event_gen.rs"),
+        codegen::generate_event(descriptor_bytes),
+    )
+    .expect("failed to write generated Event codec");
 
     println!(
         "cargo:rerun-if-changed={}",
