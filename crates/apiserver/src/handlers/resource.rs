@@ -472,9 +472,13 @@ pub(crate) async fn replace_resource<S: Store>(
     let key = group_object_key(&group, &plural, None, &name);
 
     // Read the stored object once: used for (a) immutability enforcement on
-    // PriorityClass.value, (b) status restoration when the resource has a dedicated status
-    // subresource, and (c) UID restoration/conflict-check (see stored_uid below).
+    // PriorityClass.value, PersistentVolume, StorageClass, and Node, (b) status restoration
+    // when the resource has a dedicated status subresource, and (c) UID restoration/conflict
+    // check (see stored_uid below).
     let is_priorityclass = group == "scheduling.k8s.io" && plural == "priorityclasses";
+    let is_pv = group.is_empty() && plural == "persistentvolumes";
+    let is_storageclass = group == "storage.k8s.io" && plural == "storageclasses";
+    let is_node = group.is_empty() && plural == "nodes";
     let incoming_uid_blank = obj.body["metadata"]["uid"]
         .as_str()
         .map(str::is_empty)
@@ -487,47 +491,82 @@ pub(crate) async fn replace_resource<S: Store>(
     // must be compared against the stored uid below (see stored_uid mismatch check) —
     // metadata.uid is immutable identity, not just something to fill in when absent.
     let needs_stored_read = true;
-    let (stored_status, stored_uid, stored_deletion_timestamp, stored_deletion_grace) =
-        if needs_stored_read {
-            let parsed = state
-                .store
-                .get(&key)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+    let (
+        stored_status,
+        stored_uid,
+        stored_deletion_timestamp,
+        stored_deletion_grace,
+        pv_spec_before_replace,
+        storageclass_before_replace,
+        node_spec_before_replace,
+    ) = if needs_stored_read {
+        let parsed = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
 
-            // Immutability check: PriorityClass.value drives scheduling/preemption ordering
-            // cluster-wide; allowing it to change post-create would silently reorder
-            // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
-            if is_priorityclass {
-                if let Some(ref stored_val) = parsed {
-                    if obj.body["value"] != stored_val["value"] {
-                        return Err(Status::unprocessable_entity(format!(
-                            "{plural}/{name} .value is immutable and cannot be updated"
-                        )));
-                    }
+        // Immutability check: PriorityClass.value drives scheduling/preemption ordering
+        // cluster-wide; allowing it to change post-create would silently reorder
+        // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
+        if is_priorityclass {
+            if let Some(ref stored_val) = parsed {
+                if obj.body["value"] != stored_val["value"] {
+                    return Err(Status::unprocessable_entity(format!(
+                        "{plural}/{name} .value is immutable and cannot be updated"
+                    )));
                 }
             }
+        }
 
-            let status = if meta.has_status_subresource {
-                parsed.as_ref().map(|v| v["status"].clone())
-            } else {
-                None
-            };
-            // UID is immutable and system-assigned. Captured whenever we already have the
-            // stored object in hand so a blind PUT that omits it can be defended against,
-            // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
-            let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
-            let deletion_timestamp = parsed
-                .as_ref()
-                .map(|v| v["metadata"]["deletionTimestamp"].clone());
-            let deletion_grace = parsed
-                .as_ref()
-                .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
-            (status, uid, deletion_timestamp, deletion_grace)
+        let status = if meta.has_status_subresource {
+            parsed.as_ref().map(|v| v["status"].clone())
         } else {
-            (None, None, None, None)
+            None
         };
+        // UID is immutable and system-assigned. Captured whenever we already have the
+        // stored object in hand so a blind PUT that omits it can be defended against,
+        // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
+        let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+        let deletion_timestamp = parsed
+            .as_ref()
+            .map(|v| v["metadata"]["deletionTimestamp"].clone());
+        let deletion_grace = parsed
+            .as_ref()
+            .map(|v| v["metadata"]["deletionGracePeriodSeconds"].clone());
+        // Captured pre-`apply_defaults` (below), mirroring pvc_spec_before_replace in
+        // replace_namespaced_resource: the stored spec was defaulted at create time, so the
+        // comparison below (after apply_defaults runs on the incoming body) must compare two
+        // specs defaulted the same way, or a PUT that legitimately omits a server-defaulted
+        // field (e.g. PersistentVolume.spec.volumeMode) would false-positive-reject.
+        let pv_spec_before_replace = if is_pv {
+            parsed.as_ref().map(|v| v["spec"].clone())
+        } else {
+            None
+        };
+        let storageclass_before_replace = if is_storageclass {
+            parsed.clone()
+        } else {
+            None
+        };
+        let node_spec_before_replace = if is_node {
+            parsed.as_ref().map(|v| v["spec"].clone())
+        } else {
+            None
+        };
+        (
+            status,
+            uid,
+            deletion_timestamp,
+            deletion_grace,
+            pv_spec_before_replace,
+            storageclass_before_replace,
+            node_spec_before_replace,
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
 
     // UID is immutable; a client's blind PUT (built from a locally-held copy that never
     // repopulated system-assigned fields) can omit it. Real kube-apiserver's generic update
@@ -581,6 +620,23 @@ pub(crate) async fn replace_resource<S: Store>(
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
+
+    // A PUT may only change the fields ValidatePersistentVolumeUpdate/ValidateStorageClassUpdate/
+    // ValidateNodeUpdate leave mutable — see the doc comments on each validator. Runs after
+    // apply_defaults (above) so both sides are defaulted the same way, mirroring
+    // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
+    if let Some(ref old_spec) = pv_spec_before_replace {
+        validate_pv_spec_immutable(old_spec, &obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+    }
+    if let Some(ref old_body) = storageclass_before_replace {
+        validate_storageclass_immutable(old_body, &obj.body)
+            .map_err(Status::unprocessable_entity)?;
+    }
+    if let Some(ref old_spec) = node_spec_before_replace {
+        validate_node_spec_immutable(old_spec, &obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+    }
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -1133,8 +1189,29 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        // Capture spec before patch for generation tracking on workload resources.
+        // Capture spec before patch for generation tracking on workload resources; also used
+        // below by validate_workload_spec_immutable for Deployment/DaemonSet/StatefulSet.
         let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
+            Some(current.body["spec"].clone())
+        } else {
+            None
+        };
+
+        // Capture PersistentVolume/StorageClass/Node state before patch: each has its own
+        // narrow set of upstream-frozen fields (validate_pv_spec_immutable /
+        // validate_storageclass_immutable / validate_node_spec_immutable, checked below after
+        // the patch is applied).
+        let pv_spec_before_patch = if group.is_empty() && plural == "persistentvolumes" {
+            Some(current.body["spec"].clone())
+        } else {
+            None
+        };
+        let storageclass_before_patch = if group == "storage.k8s.io" && plural == "storageclasses" {
+            Some(current.body.clone())
+        } else {
+            None
+        };
+        let node_spec_before_patch = if group.is_empty() && plural == "nodes" {
             Some(current.body["spec"].clone())
         } else {
             None
@@ -1206,6 +1283,26 @@ pub(crate) async fn do_patch<S: Store>(
 
         if let Some(ref old_spec) = pvc_spec_before_patch {
             validate_pvc_spec_immutable(old_spec, &current.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        if let Some(ref old_spec) = spec_before_patch {
+            validate_workload_spec_immutable(group, plural, old_spec, &current.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        if let Some(ref old_spec) = pv_spec_before_patch {
+            validate_pv_spec_immutable(old_spec, &current.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        if let Some(ref old_body) = storageclass_before_patch {
+            validate_storageclass_immutable(old_body, &current.body)
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        if let Some(ref old_spec) = node_spec_before_patch {
+            validate_node_spec_immutable(old_spec, &current.body["spec"])
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -1459,6 +1556,204 @@ fn validate_pvc_spec_immutable(
          (and only via a grow permitted by the bound StorageClass)"
             .into(),
     )
+}
+
+/// Reject a Deployment or DaemonSet spec update that changes `spec.selector`, and a
+/// StatefulSet spec update that changes any field outside upstream's narrow mutable set.
+/// Shared by both PUT (`replace_namespaced_resource`) and PATCH (`do_patch`) via the
+/// `spec_before_replace`/`spec_before_patch` snapshot both paths already capture for every
+/// `is_workload_resource` kind (generation tracking) — ReplicaSet, Job, CronJob, and
+/// PodDisruptionBudget have no upstream update-time field-immutability rule and fall through
+/// to `Ok(())` unchanged.
+///
+/// Deployment: `ValidateDeploymentUpdate` (apps validation.go L712, release-1.36) —
+/// `spec.selector` determines which Pods the deployment/replicaset controllers claim as
+/// theirs; letting it change post-create would silently reparent or orphan already-running
+/// Pods without ever going through a rolling update.
+///
+/// DaemonSet: `ValidateDaemonSetSpecUpdate` (L402-403) — same selector semantics for the
+/// daemonset controller.
+///
+/// StatefulSet: `ValidateStatefulSetUpdate` (L258-268) — delegates to
+/// `validate_statefulset_spec_immutable` below.
+fn validate_workload_spec_immutable(
+    group: &str,
+    plural: &str,
+    old_spec: &serde_json::Value,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    if group != "apps" {
+        return Ok(());
+    }
+    match plural {
+        "deployments" | "daemonsets" => {
+            if old_spec["selector"] == new_spec["selector"] {
+                Ok(())
+            } else {
+                Err("spec.selector: Forbidden: field is immutable".into())
+            }
+        }
+        "statefulsets" => validate_statefulset_spec_immutable(old_spec, new_spec),
+        _ => Ok(()),
+    }
+}
+
+/// StatefulSet spec fields upstream leaves mutable on update (`ValidateStatefulSetUpdate`,
+/// apps validation.go L258-268, release-1.36).
+const STATEFULSET_MUTABLE_SPEC_FIELDS: [&str; 7] = [
+    "replicas",
+    "ordinals",
+    "template",
+    "updateStrategy",
+    "revisionHistoryLimit",
+    "persistentVolumeClaimRetentionPolicy",
+    "minReadySeconds",
+];
+
+/// Reject a StatefulSet spec update that changes any field outside
+/// `STATEFULSET_MUTABLE_SPEC_FIELDS`. Mirrors upstream's own `ValidateStatefulSetUpdate`
+/// exactly: it deep-copies the new spec, zeroes precisely this set of fields back to the old
+/// spec's value, and rejects any residual diff — a whole-spec allowlist, not a per-field
+/// blocklist, because `selector` and `serviceName` drive Pod-ordinal naming and headless-
+/// Service DNS, and `volumeClaimTemplates` drives per-ordinal PVC creation; changing any of
+/// them post-create would desync already-created Pods/PVCs from the spec that (re)created
+/// them.
+fn validate_statefulset_spec_immutable(
+    old_spec: &serde_json::Value,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    if old_spec == new_spec {
+        return Ok(());
+    }
+    let mut munged = new_spec.clone();
+    if let Some(m) = munged.as_object_mut() {
+        for field in STATEFULSET_MUTABLE_SPEC_FIELDS {
+            match old_spec.get(field) {
+                Some(v) if !v.is_null() => {
+                    m.insert(field.to_string(), v.clone());
+                }
+                _ => {
+                    m.remove(field);
+                }
+            }
+        }
+    }
+    if munged == *old_spec {
+        return Ok(());
+    }
+    Err(
+        "spec: Forbidden: updates to statefulset spec for fields other than 'replicas', \
+         'ordinals', 'template', 'updateStrategy', 'revisionHistoryLimit', \
+         'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden"
+            .into(),
+    )
+}
+
+/// `PersistentVolumeSpec` fields upstream (`ValidatePersistentVolumeUpdate`, core
+/// validation.go L2274-2279, release-1.36) leaves mutable on a PersistentVolume update.
+/// Listing the mutable set here — rather than enumerating every current-and-future
+/// `PersistentVolumeSource` backend type (`hostPath`, `nfs`, `csi`, `local`, ...), which
+/// upstream inlines directly onto `spec` — keeps this correct without needing an update every
+/// time upstream adds a new volume-source type: whatever backend field(s) remain after
+/// stripping this list off both sides *are* `spec.persistentVolumeSource`, upstream's other
+/// immutable field here (besides `volumeMode`, checked separately below).
+const PV_MUTABLE_SPEC_FIELDS: [&str; 8] = [
+    "capacity",
+    "accessModes",
+    "claimRef",
+    "persistentVolumeReclaimPolicy",
+    "storageClassName",
+    "mountOptions",
+    "nodeAffinity",
+    "volumeAttributesClassName",
+];
+
+fn validate_pv_spec_immutable(
+    old_spec: &serde_json::Value,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    if old_spec["volumeMode"] != new_spec["volumeMode"] {
+        return Err("volumeMode: Forbidden: field is immutable".into());
+    }
+    let strip_mutable = |spec: &serde_json::Value| {
+        let mut v = spec.clone();
+        if let Some(m) = v.as_object_mut() {
+            for field in PV_MUTABLE_SPEC_FIELDS {
+                m.remove(field);
+            }
+            m.remove("volumeMode");
+        }
+        v
+    };
+    if strip_mutable(old_spec) == strip_mutable(new_spec) {
+        return Ok(());
+    }
+    Err(
+        "spec.persistentvolumesource: Forbidden: spec.persistentvolumesource is immutable \
+         after creation"
+            .into(),
+    )
+}
+
+/// Fields upstream (`ValidateStorageClassUpdate`, storage validation.go L63-71, release-1.36)
+/// treats as immutable on a StorageClass update — note this kind has no `spec` wrapper, these
+/// are top-level fields. `allowVolumeExpansion` is deliberately excluded: upstream leaves it
+/// mutable so an operator can retrofit expansion support onto an already-provisioning class.
+fn validate_storageclass_immutable(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Result<(), String> {
+    for field in [
+        "provisioner",
+        "parameters",
+        "reclaimPolicy",
+        "volumeBindingMode",
+    ] {
+        if old[field] != new[field] {
+            return Err(format!("{field}: Forbidden: field is immutable"));
+        }
+    }
+    Ok(())
+}
+
+/// Node.spec.podCIDR/podCIDRs/providerID once-set immutability (`ValidateNodeUpdate`, core
+/// validation.go L7371-7387, release-1.36): kube-controller-manager's node-ipam-controller
+/// assigns podCIDR exactly once (empty -> valid) via a plain node update, and
+/// cloud-controller-manager does the same for providerID; once either is non-empty, the
+/// CNI/cloud-provider wiring for the node is derived from that value and does not react to it
+/// moving, so any further change is forbidden.
+fn validate_node_spec_immutable(
+    old_spec: &serde_json::Value,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    let old_pod_cidr = old_spec["podCIDR"].as_str().unwrap_or("");
+    if !old_pod_cidr.is_empty() && old_spec["podCIDR"] != new_spec["podCIDR"] {
+        return Err(
+            "spec.podCIDR: Forbidden: node updates may not change podCIDR except from \"\" \
+             to valid"
+                .into(),
+        );
+    }
+    let old_pod_cidrs_empty = old_spec["podCIDRs"]
+        .as_array()
+        .map(|a| a.is_empty())
+        .unwrap_or(true);
+    if !old_pod_cidrs_empty && old_spec["podCIDRs"] != new_spec["podCIDRs"] {
+        return Err(
+            "spec.podCIDRs: Forbidden: node updates may not change podCIDR except from \"\" \
+             to valid"
+                .into(),
+        );
+    }
+    let old_provider_id = old_spec["providerID"].as_str().unwrap_or("");
+    if !old_provider_id.is_empty() && old_spec["providerID"] != new_spec["providerID"] {
+        return Err(
+            "spec.providerID: Forbidden: node updates may not change providerID except \
+             from \"\" to valid"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn patch_resource<S: Store>(
@@ -2405,6 +2700,14 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
     if let Some(ref old_spec) = pvc_spec_before_replace {
         validate_pvc_spec_immutable(old_spec, &obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+    }
+
+    // Deployment/DaemonSet selector and StatefulSet full-spec-freeze immutability — see
+    // validate_workload_spec_immutable. Same apply_defaults-then-compare ordering as the PVC
+    // check above.
+    if let Some(ref old_spec) = spec_before_replace {
+        validate_workload_spec_immutable(&group, &plural, old_spec, &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
     }
 
@@ -10720,10 +11023,17 @@ mod tests {
 
         let key = "/registry/storage.k8s.io/storageclasses/blind-put-sc";
         let original_uid = "b3e1f6a0-1c2d-4e3f-9a5b-6d7c8e9f0a1b";
+        // reclaimPolicy/volumeBindingMode are included here (matching what
+        // default_storageclass would have stamped at create time) since mayor-0shuc's
+        // StorageClass immutability check compares this seed against the PUT body below —
+        // this test's own concern is UID restoration, not those fields, so both sides must
+        // agree on them.
         let created = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "StorageClass",
             "provisioner": "kubernetes.io/no-provisioner",
+            "reclaimPolicy": "Delete",
+            "volumeBindingMode": "Immediate",
             "metadata": {
                 "name": "blind-put-sc",
                 "uid": original_uid
@@ -10745,7 +11055,8 @@ mod tests {
             "apiVersion": "storage.k8s.io/v1",
             "kind": "StorageClass",
             "provisioner": "kubernetes.io/no-provisioner",
-            "volumeBindingMode": "WaitForFirstConsumer",
+            "reclaimPolicy": "Delete",
+            "volumeBindingMode": "Immediate",
             "metadata": { "name": "blind-put-sc" }
         });
 
@@ -14709,6 +15020,9 @@ mod tests {
             "spec": {
                 "replicas": 3,
                 "selector": { "matchLabels": { "app": "nginx" } },
+                "podManagementPolicy": "OrderedReady",
+                "updateStrategy": { "type": "RollingUpdate", "rollingUpdate": { "partition": 0 } },
+                "revisionHistoryLimit": 10,
                 "template": {
                     "metadata": { "labels": { "app": "nginx" } },
                     "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
@@ -15074,6 +15388,9 @@ mod tests {
             "spec": {
                 "replicas": 5,
                 "selector": { "matchLabels": { "app": "web" } },
+                "podManagementPolicy": "OrderedReady",
+                "updateStrategy": { "type": "RollingUpdate", "rollingUpdate": { "partition": 0 } },
+                "revisionHistoryLimit": 10,
                 "template": {
                     "metadata": { "labels": { "app": "web" } },
                     "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
@@ -20583,6 +20900,1075 @@ mod tests {
             7,
             "the gauge must reflect this PriorityLevelConfiguration's own declared \
              nominalConcurrencyShares"
+        );
+    }
+
+    // -- mayor-0shuc: generic-path immutability for Deployment/DaemonSet/StatefulSet
+    // selector/spec, PersistentVolume, StorageClass, and Node --
+
+    fn deployment_body(
+        name: &str,
+        ns: &str,
+        selector_app: &str,
+        replicas: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": selector_app } },
+                "replicas": replicas,
+                "template": {
+                    "metadata": { "labels": { "app": selector_app } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        })
+    }
+
+    /// PUT changing Deployment.spec.selector must return 422.
+    ///
+    /// Upstream `ValidateDeploymentUpdate` (apps validation.go L712, release-1.36) freezes
+    /// `spec.selector` via `ValidateImmutableField`. Before this fix, the generic
+    /// `replace_namespaced_resource` path had no field-immutability enforcement for
+    /// Deployment at all: a caller holding only ordinary `update deployments` rights could
+    /// silently repoint an existing Deployment onto an unrelated set of Pods (or orphan the
+    /// ones it already owns) without the deployment controller ever running a rolling update.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_deployment_selector_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let deployment = deployment_body("sel-deploy", ns, "sel-deploy", 1);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "deployments".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .expect("Deployment create must succeed");
+
+        let changed = deployment_body("sel-deploy", ns, "different", 1);
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "deployments".into(),
+                "sel-deploy".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing Deployment.spec.selector must return 422 — the generic replace \
+                 path had no immutability enforcement for this field before mayor-0shuc"
+            ),
+            Ok(_) => panic!(
+                "PUT changing Deployment.spec.selector must be rejected — accepting it lets a \
+                 caller silently reparent or orphan already-running Pods"
+            ),
+        }
+    }
+
+    /// PATCH changing Deployment.spec.selector must return 422 — mirrors the PUT test above
+    /// but for `do_patch`, the other generic mutation path with the same gap before this fix.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_deployment_selector_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let deployment = deployment_body("sel-deploy-patch", ns, "sel-deploy-patch", 1);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "deployments".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .expect("Deployment create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "selector": { "matchLabels": { "app": "different" } } } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "deployments".into(),
+                "sel-deploy-patch".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing Deployment.spec.selector must return 422 — immutability must \
+                 be enforced for both write methods, matching the PUT check"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing Deployment.spec.selector must be rejected — do_patch had no \
+                 immutability enforcement for this field before mayor-0shuc"
+            ),
+        }
+    }
+
+    /// PUT changing only Deployment.spec.replicas (a mutable field) must still succeed — a
+    /// naive "reject any PUT that touches spec" implementation would wrongly reject this.
+    #[tokio::test]
+    async fn replace_namespaced_resource_allows_deployment_replicas_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let deployment = deployment_body("scale-deploy", ns, "scale-deploy", 1);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "deployments".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .expect("Deployment create must succeed");
+
+        let scaled = deployment_body("scale-deploy", ns, "scale-deploy", 3);
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "deployments".into(),
+                "scale-deploy".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&scaled).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT changing only Deployment.spec.replicas must succeed — selector immutability \
+             must not reject unrelated mutable-field changes",
+        );
+    }
+
+    fn daemonset_body(name: &str, ns: &str, selector_app: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": selector_app } },
+                "template": {
+                    "metadata": { "labels": { "app": selector_app } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        })
+    }
+
+    /// PUT changing DaemonSet.spec.selector must return 422.
+    ///
+    /// Upstream `ValidateDaemonSetSpecUpdate` (apps validation.go L402-403, release-1.36)
+    /// freezes `spec.selector` the same way Deployment does; before this fix nothing enforced
+    /// it here either.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_daemonset_selector_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "kube-system";
+        let ds = daemonset_body("sel-ds", ns, "sel-ds");
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "daemonsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ds).unwrap()),
+        )
+        .await
+        .expect("DaemonSet create must succeed");
+
+        let changed = daemonset_body("sel-ds", ns, "different");
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "daemonsets".into(),
+                "sel-ds".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing DaemonSet.spec.selector must return 422"
+            ),
+            Ok(_) => panic!(
+                "PUT changing DaemonSet.spec.selector must be rejected — accepting it lets a \
+                 caller silently reparent or orphan already-running Pods on every node"
+            ),
+        }
+    }
+
+    /// PATCH changing DaemonSet.spec.selector must return 422 — mirrors the PUT test above.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_daemonset_selector_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "kube-system";
+        let ds = daemonset_body("sel-ds-patch", ns, "sel-ds-patch");
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "daemonsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ds).unwrap()),
+        )
+        .await
+        .expect("DaemonSet create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "selector": { "matchLabels": { "app": "different" } } } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "daemonsets".into(),
+                "sel-ds-patch".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing DaemonSet.spec.selector must return 422"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing DaemonSet.spec.selector must be rejected — do_patch had no \
+                 immutability enforcement for this field before mayor-0shuc"
+            ),
+        }
+    }
+
+    /// PATCH changing an unrelated, mutable DaemonSet field (a template image) must still
+    /// succeed — guards against an over-eager selector check rejecting normal rollouts.
+    #[tokio::test]
+    async fn patch_namespaced_resource_allows_daemonset_image_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "kube-system";
+        let ds = daemonset_body("rollout-ds", ns, "rollout-ds");
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "daemonsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ds).unwrap()),
+        )
+        .await
+        .expect("DaemonSet create must succeed");
+
+        let patch = serde_json::json!({
+            "spec": { "template": { "spec": { "containers": [{ "name": "c", "image": "busybox:2" }] } } }
+        });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "daemonsets".into(),
+                "rollout-ds".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH changing only the DaemonSet template image must succeed — selector \
+             immutability must not block ordinary rollouts",
+        );
+    }
+
+    fn statefulset_body(
+        name: &str,
+        ns: &str,
+        selector_app: &str,
+        service_name: &str,
+        replicas: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "selector": { "matchLabels": { "app": selector_app } },
+                "serviceName": service_name,
+                "replicas": replicas,
+                "template": {
+                    "metadata": { "labels": { "app": selector_app } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        })
+    }
+
+    /// PATCH changing StatefulSet.spec.serviceName must return 422.
+    ///
+    /// Upstream `ValidateStatefulSetUpdate` (apps validation.go L258-268, release-1.36)
+    /// freezes every spec field except `replicas`, `ordinals`, `template`, `updateStrategy`,
+    /// `revisionHistoryLimit`, `persistentVolumeClaimRetentionPolicy`, and `minReadySeconds`.
+    /// `serviceName` names the headless Service used for stable per-Pod DNS; changing it
+    /// post-create would desync already-created Pods' DNS from the value StatefulSet used to
+    /// generate their hostnames.
+    #[tokio::test]
+    async fn patch_namespaced_resource_rejects_statefulset_service_name_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let sts = statefulset_body("web", ns, "web", "web-svc", 1);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "statefulsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+        )
+        .await
+        .expect("StatefulSet create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "serviceName": "other-svc" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "statefulsets".into(),
+                "web".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing StatefulSet.spec.serviceName must return 422 — the generic \
+                 patch path had zero field-immutability enforcement for StatefulSet before \
+                 mayor-0shuc"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing StatefulSet.spec.serviceName must be rejected — accepting it \
+                 desyncs already-created Pods' stable DNS from the value used to generate them"
+            ),
+        }
+    }
+
+    /// PUT changing StatefulSet.spec.selector must return 422 — same freeze, PUT path.
+    #[tokio::test]
+    async fn replace_namespaced_resource_rejects_statefulset_selector_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let sts = statefulset_body("web-put", ns, "web-put", "web-put-svc", 1);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "statefulsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+        )
+        .await
+        .expect("StatefulSet create must succeed");
+
+        let changed = statefulset_body("web-put", ns, "different", "web-put-svc", 1);
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "statefulsets".into(),
+                "web-put".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing StatefulSet.spec.selector must return 422"
+            ),
+            Ok(_) => panic!(
+                "PUT changing StatefulSet.spec.selector must be rejected — accepting it lets \
+                 already-created Pods silently fall outside the set the StatefulSet claims"
+            ),
+        }
+    }
+
+    /// PATCH changing only StatefulSet.spec.replicas (an upstream-mutable field) must still
+    /// succeed — the whole-spec-freeze allowlist must not reject the one mutation that
+    /// scaling a StatefulSet actually requires.
+    #[tokio::test]
+    async fn patch_namespaced_resource_allows_statefulset_replicas_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let ns = "default";
+        let sts = statefulset_body("scale-sts", ns, "scale-sts", "scale-svc", 1);
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("apps".into(), "v1".into(), ns.into(), "statefulsets".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+        )
+        .await
+        .expect("StatefulSet create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "replicas": 5 } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                ns.into(),
+                "statefulsets".into(),
+                "scale-sts".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH changing only StatefulSet.spec.replicas must succeed — the whole-spec \
+             freeze must not reject StatefulSet's own scaling mutation",
+        );
+    }
+
+    fn pv_body(name: &str, host_path: &str, reclaim_policy: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": name },
+            "spec": {
+                "capacity": { "storage": "1Gi" },
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": { "path": host_path },
+                "persistentVolumeReclaimPolicy": reclaim_policy
+            }
+        })
+    }
+
+    /// PATCH changing PersistentVolume.spec.hostPath (the `persistentVolumeSource`) must
+    /// return 422.
+    ///
+    /// Upstream `ValidatePersistentVolumeUpdate` (core validation.go L2274-2279, release-1.36)
+    /// freezes `spec.persistentVolumeSource` after creation. Before this fix, the generic
+    /// PATCH/PUT paths had no field-immutability enforcement for PersistentVolume at all: a
+    /// caller with plain `patch pv` rights could silently repoint an already-bound PV at a
+    /// different backing store while every PVC/Pod that mounted it kept believing it was
+    /// still reading/writing the original one.
+    #[tokio::test]
+    async fn patch_resource_rejects_pv_persistent_volume_source_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = pv_body("data-pv", "/mnt/data-a", "Retain");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "hostPath": { "path": "/mnt/data-b" } } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "data-pv".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing PersistentVolume.spec.hostPath must return 422 — \
+                 persistentVolumeSource is immutable after creation"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing PersistentVolume.spec.hostPath must be rejected — accepting \
+                 it silently repoints every PVC/Pod bound to this PV at a different backing \
+                 store without their knowledge"
+            ),
+        }
+    }
+
+    /// PUT changing PersistentVolume.spec.volumeMode must return 422 — the other field
+    /// upstream freezes on PersistentVolume update, exercised on the PUT path this time.
+    #[tokio::test]
+    async fn replace_resource_rejects_pv_volume_mode_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = pv_body("mode-pv", "/mnt/mode-data", "Retain");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let mut changed = pv_body("mode-pv", "/mnt/mode-data", "Retain");
+        changed["spec"]["volumeMode"] = serde_json::json!("Block");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "mode-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing PersistentVolume.spec.volumeMode from the create-time default \
+                 (Filesystem) to Block must return 422 — volumeMode is immutable"
+            ),
+            Ok(_) => panic!(
+                "PUT changing PersistentVolume.spec.volumeMode must be rejected — kubelet's \
+                 volume manager assumes this never changes once a Pod has mounted the volume"
+            ),
+        }
+    }
+
+    /// PATCH changing only PersistentVolume.spec.persistentVolumeReclaimPolicy (a mutable
+    /// field) must still succeed — a naive "reject any spec change" implementation would
+    /// wrongly reject this.
+    #[tokio::test]
+    async fn patch_resource_allows_pv_reclaim_policy_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = pv_body("policy-pv", "/mnt/policy-data", "Retain");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "persistentVolumeReclaimPolicy": "Delete" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "policy-pv".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH changing only PersistentVolume.spec.persistentVolumeReclaimPolicy must \
+             succeed — persistentVolumeSource/volumeMode immutability must not reject \
+             unrelated mutable-field changes",
+        );
+    }
+
+    fn storageclass_body(name: &str, provisioner: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": name },
+            "provisioner": provisioner,
+            "reclaimPolicy": "Delete",
+            "volumeBindingMode": "Immediate"
+        })
+    }
+
+    /// PATCH changing StorageClass.provisioner must return 422.
+    ///
+    /// Upstream `ValidateStorageClassUpdate` (storage validation.go L63-71, release-1.36)
+    /// freezes `provisioner`, `parameters`, `reclaimPolicy`, and `volumeBindingMode`. Before
+    /// this fix nothing enforced any of them: a caller with plain `patch storageclasses`
+    /// rights could silently redirect future dynamic provisioning for this class to a
+    /// completely different (potentially malicious) provisioner without ever needing
+    /// `delete`/`create` rights on StorageClass.
+    #[tokio::test]
+    async fn patch_resource_rejects_storageclass_provisioner_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let sc = storageclass_body("prov-sc", "csi-hostpath");
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let patch = serde_json::json!({ "provisioner": "csi-other" });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+                "prov-sc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing StorageClass.provisioner must return 422 — provisioner is \
+                 immutable after creation"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing StorageClass.provisioner must be rejected — accepting it \
+                 silently redirects future dynamic provisioning to a different provisioner"
+            ),
+        }
+    }
+
+    /// PUT changing StorageClass.reclaimPolicy must return 422 — same freeze, PUT path.
+    #[tokio::test]
+    async fn replace_resource_rejects_storageclass_reclaim_policy_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let sc = storageclass_body("reclaim-sc", "csi-hostpath");
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let mut changed = storageclass_body("reclaim-sc", "csi-hostpath");
+        changed["reclaimPolicy"] = serde_json::json!("Retain");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+                "reclaim-sc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing StorageClass.reclaimPolicy must return 422"
+            ),
+            Ok(_) => panic!(
+                "PUT changing StorageClass.reclaimPolicy must be rejected — accepting it \
+                 changes what happens to every PV this class has already provisioned"
+            ),
+        }
+    }
+
+    /// PATCH changing only StorageClass.allowVolumeExpansion must still succeed.
+    ///
+    /// This field is deliberately NOT in upstream's immutable set (storage validation.go
+    /// L63-71 lists only provisioner/parameters/reclaimPolicy/volumeBindingMode) — an
+    /// operator must be able to retrofit expansion support onto an already-provisioning
+    /// class. A naive "freeze everything" implementation would wrongly reject this.
+    #[tokio::test]
+    async fn patch_resource_allows_storageclass_allow_volume_expansion_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let sc = storageclass_body("expand-sc", "csi-hostpath");
+        create_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sc).unwrap()),
+        )
+        .await
+        .expect("StorageClass create must succeed");
+
+        let patch = serde_json::json!({ "allowVolumeExpansion": true });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+                "expand-sc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH changing only StorageClass.allowVolumeExpansion must succeed — it is \
+             deliberately not part of the immutable set",
+        );
+    }
+
+    fn node_body(name: &str, pod_cidr: Option<&str>) -> serde_json::Value {
+        let mut spec = serde_json::json!({});
+        if let Some(cidr) = pod_cidr {
+            spec["podCIDR"] = serde_json::json!(cidr);
+        }
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": name },
+            "spec": spec
+        })
+    }
+
+    /// PATCH changing an already-set Node.spec.podCIDR must return 422.
+    ///
+    /// Upstream `ValidateNodeUpdate` (core validation.go L7371-7387, release-1.36) allows
+    /// `podCIDR` to move from empty to a valid value exactly once (how KCM's
+    /// node-ipam-controller assigns it) but forbids any further change. Before this fix,
+    /// nothing enforced that: a caller with plain `patch nodes` rights (far short of
+    /// cluster-admin) could reassign a live node's pod CIDR out from under the CNI plugin
+    /// that already programmed routes for the original range.
+    #[tokio::test]
+    async fn patch_resource_rejects_node_pod_cidr_change_once_set() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let node = node_body("cidr-node", Some("10.244.1.0/24"));
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .expect("Node create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "podCIDR": "10.244.2.0/24" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into(), "cidr-node".into())),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing an already-set Node.spec.podCIDR must return 422"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing Node.spec.podCIDR once set must be rejected — accepting it \
+                 desyncs the node from the routes the CNI plugin already programmed"
+            ),
+        }
+    }
+
+    /// PUT changing an already-set Node.spec.providerID must return 422 — the other
+    /// once-set field upstream freezes on Node update, exercised on the PUT path.
+    #[tokio::test]
+    async fn replace_resource_rejects_node_provider_id_change_once_set() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut node = node_body("provider-node", None);
+        node["spec"]["providerID"] = serde_json::json!("aws:///us-east-1a/i-abc123");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .expect("Node create must succeed");
+
+        let mut changed = node_body("provider-node", None);
+        changed["spec"]["providerID"] = serde_json::json!("aws:///us-east-1a/i-def456");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "nodes".into(),
+                "provider-node".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing an already-set Node.spec.providerID must return 422"
+            ),
+            Ok(_) => panic!(
+                "PUT changing Node.spec.providerID once set must be rejected — cloud-provider \
+                 integrations key off this value never moving once assigned"
+            ),
+        }
+    }
+
+    /// PATCH setting Node.spec.podCIDR from empty to a value must still succeed — this is
+    /// exactly how KCM's node-ipam-controller assigns it, and upstream explicitly allows the
+    /// empty -> valid transition. A naive "freeze podCIDR unconditionally" implementation
+    /// would wrongly reject every real cluster's node bring-up.
+    #[tokio::test]
+    async fn patch_resource_allows_node_pod_cidr_set_from_empty() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let node = node_body("fresh-node", None);
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .expect("Node create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "podCIDR": "10.244.9.0/24" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into(), "fresh-node".into())),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH setting Node.spec.podCIDR from empty to a value must succeed — this is \
+             exactly how kube-controller-manager's node-ipam-controller assigns it",
+        );
+
+        // A second assignment (already non-empty) must now be rejected — the exception is
+        // "empty -> valid exactly once", not "always allow setting podCIDR".
+        let second_patch = serde_json::json!({ "spec": { "podCIDR": "10.244.10.0/24" } });
+        let mut merge_headers2 = json_headers();
+        merge_headers2.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let second_result = patch_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into(), "fresh-node".into())),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers2,
+            bytes::Bytes::from(serde_json::to_vec(&second_patch).unwrap()),
+        )
+        .await;
+        assert_eq!(
+            second_result.err().map(|e| e.0),
+            Some(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+            "once Node.spec.podCIDR is non-empty, a further change must be rejected — only \
+             the initial empty -> valid transition is permitted"
         );
     }
 }
