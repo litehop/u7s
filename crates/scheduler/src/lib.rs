@@ -2782,7 +2782,52 @@ pub async fn find_preemption_plan(
         .lock()
         .expect("tally lock poisoned")
         .tallied_pod_labels();
-    let affinity_ctx = InterPodAffinityContext::build(pod, &tallied_pods, &node_labels_by_name);
+
+    let (index, plan) =
+        find_preemption_candidate(&list, pod, &tallied_pods, &node_labels_by_name, tally)
+            .ok_or(FindPreemptionPlanError::NoViablePlan)?;
+    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
+        .map_err(|_| FindPreemptionPlanError::NoViablePlan)?;
+
+    Ok(plan)
+}
+
+/// The synchronous candidate-search step behind `find_preemption_plan`, split
+/// out so its filtering logic can be exercised in a unit test without a live
+/// API server — mirrors `select_and_reserve_node`'s relationship to
+/// `pick_node`, for the same reason.
+///
+/// Considers every node that qualifies for `pod` (`node_qualifies_for_pod`)
+/// AND satisfies its required podAffinity/podAntiAffinity terms
+/// (`InterPodAffinityContext`) AND satisfies every hard
+/// (`whenUnsatisfiable: DoNotSchedule`) `topologySpreadConstraints` entry
+/// (`TopologySpreadContext`) — the same two contexts, and the same
+/// `node_qualifies` conjuncts, `select_node_with_capacity` applies for direct
+/// scheduling. Without the `TopologySpreadContext` conjunct, a topology-
+/// constrained pod could still trigger preemption onto a node that violates
+/// its own `maxSkew` — the exact placement the direct-scheduling path
+/// already refuses. Neither context is recomputed to account for the
+/// candidate's own victims being evicted: a node already carrying enough
+/// matching pods to violate the pod's spread constraint is rejected up
+/// front, exactly as `select_node_with_capacity` would reject it, rather
+/// than trying to model post-eviction skew.
+///
+/// Among qualifying nodes, returns the cheapest (fewest-victims) viable
+/// `(node index, PreemptionPlan)` — a node with at least one lower-priority
+/// pod whose eviction would free enough room (`select_preemption_victims`).
+/// `None` when no such node exists.
+fn find_preemption_candidate(
+    list: &NodeList,
+    pod: &PendingPod,
+    tallied_pods: &[TalliedPodLabels],
+    node_labels_by_name: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
+    tally: &std::sync::Mutex<NodeTally>,
+) -> Option<(usize, PreemptionPlan)> {
+    let affinity_ctx = InterPodAffinityContext::build(pod, tallied_pods, node_labels_by_name);
+    let topology_ctx = TopologySpreadContext::build(pod, tallied_pods, node_labels_by_name);
 
     let mut best: Option<(usize, PreemptionPlan)> = None;
     for (index, node) in list.items.iter().enumerate() {
@@ -2790,6 +2835,9 @@ pub async fn find_preemption_plan(
             continue;
         }
         if !affinity_ctx.node_qualifies(&node.metadata.labels) {
+            continue;
+        }
+        if !topology_ctx.node_qualifies(&node.metadata.labels) {
             continue;
         }
         let capacity = pod_count_capacity(node);
@@ -2828,12 +2876,7 @@ pub async fn find_preemption_plan(
             ));
         }
     }
-
-    let (index, plan) = best.ok_or(FindPreemptionPlanError::NoViablePlan)?;
-    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
-        .map_err(|_| FindPreemptionPlanError::NoViablePlan)?;
-
-    Ok(plan)
+    best
 }
 
 /// Resolve a node's pod-count capacity, preferring `status.allocatable.pods`
@@ -7242,6 +7285,189 @@ mod tests {
              invisible to pods_on, hiding the recreated pod's real resource \
              usage and making the node look like it already has spare \
              capacity it does not have — got {victims2:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // find_preemption_candidate + TopologySpreadContext (mayor-s7zxr): the
+    // Filter-phase fix (mayor-dnjnh) taught select_node_with_capacity to
+    // reject a node that would violate a pod's topologySpreadConstraints,
+    // but find_preemption_plan's separate candidate search kept using only
+    // node_qualifies_for_pod + InterPodAffinityContext — so a topology-
+    // constrained pod could still trigger preemption onto a node its own
+    // maxSkew forbids, exactly the placement direct scheduling now refuses.
+    // -------------------------------------------------------------------
+
+    /// `find_preemption_candidate` must reject a candidate node that would
+    /// violate the pending pod's own hard `topologySpreadConstraints` even
+    /// though evicting its lower-priority occupant would otherwise free a
+    /// slot there — zone-a already carries this pod's only matching sibling,
+    /// so placing a second replica there produces skew 2 > maxSkew 1, the
+    /// exact spread violation `topologySpreadConstraints` exists to prevent.
+    /// Zone-b needs preemption too (so this is a genuine choice between two
+    /// preemptable candidates, not a case where zone-b would already win via
+    /// direct scheduling), but carries none of the pod's matching siblings,
+    /// so it must win instead. Before this fix, the missing
+    /// `TopologySpreadContext` conjunct let node-a (the first, and — absent
+    /// the topology check — equally cheap, tie-broken-by-list-order
+    /// candidate) win instead, evicting a real pod onto the very zone the
+    /// pending pod asked not to be piled onto.
+    #[test]
+    fn find_preemption_candidate_rejects_zone_that_would_violate_spread_constraint() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity(
+                    "node-a",
+                    &[("topology.kubernetes.io/zone", "zone-a")],
+                    "1",
+                ),
+                make_node_with_capacity(
+                    "node-b",
+                    &[("topology.kubernetes.io/zone", "zone-b")],
+                    "1",
+                ),
+            ],
+        };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            // zone-a's only slot is already occupied by a low-priority pod
+            // matching the pending pod's own spread selector.
+            guard.assume(
+                "default",
+                "web-a",
+                "node-a",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "web".to_owned())].into(),
+            );
+            // zone-b's only slot is occupied by an unrelated low-priority
+            // filler, so zone-b ALSO needs preemption — this pod cannot
+            // simply pick zone-b directly via select_node_with_capacity
+            // without reaching this search at all.
+            guard.assume(
+                "default",
+                "filler-b",
+                "node-b",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "other".to_owned())].into(),
+            );
+        }
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod = empty_pending_pod();
+        pod.priority = 100;
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        pod.topology_spread_constraints = vec![topology_spread_constraint(
+            "topology.kubernetes.io/zone",
+            1,
+            "DoNotSchedule",
+            &[("app", "web")],
+        )];
+
+        let best =
+            find_preemption_candidate(&list, &pod, &tallied_pods, &node_labels_by_name, &tally);
+        assert_eq!(
+            best.map(|(_, plan)| plan.node_name),
+            Some("node-b".to_owned()),
+            "zone-a already carries the pod's only matching sibling (skew \
+             would be 2 > maxSkew 1 even after evicting the low-priority \
+             occupant there) — preemption must target the empty zone-b \
+             instead, never the zone the pod's own spread constraint forbids \
+             piling onto"
+        );
+    }
+
+    /// The negative control for the fix above: a pod with NO
+    /// `topologySpreadConstraints` must see `find_preemption_candidate`
+    /// behave exactly as before the fix — the empty `TopologySpreadContext`
+    /// built from an empty constraint list must impose no restriction at
+    /// all, so the normal list-order tie-break (both candidates need exactly
+    /// one eviction) still picks node-a. If building a `TopologySpreadContext`
+    /// ever started synthesizing a restriction for a pod that asked for none,
+    /// this would wrongly reject node-a and over-filter preemption targets
+    /// that have nothing to do with topology spreading.
+    #[test]
+    fn find_preemption_candidate_unaffected_by_topology_when_pod_has_no_spread_constraints() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity(
+                    "node-a",
+                    &[("topology.kubernetes.io/zone", "zone-a")],
+                    "1",
+                ),
+                make_node_with_capacity(
+                    "node-b",
+                    &[("topology.kubernetes.io/zone", "zone-b")],
+                    "1",
+                ),
+            ],
+        };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.assume(
+                "default",
+                "web-a",
+                "node-a",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "web".to_owned())].into(),
+            );
+            guard.assume(
+                "default",
+                "filler-b",
+                "node-b",
+                0,
+                ResourceRequests::default(),
+                Vec::new(),
+                [("app".to_owned(), "other".to_owned())].into(),
+            );
+        }
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod = empty_pending_pod();
+        pod.priority = 100;
+        pod.labels = [("app".to_owned(), "web".to_owned())].into();
+        // No topology_spread_constraints set at all.
+
+        let best =
+            find_preemption_candidate(&list, &pod, &tallied_pods, &node_labels_by_name, &tally);
+        assert_eq!(
+            best.map(|(_, plan)| plan.node_name),
+            Some("node-a".to_owned()),
+            "a pod with no topologySpreadConstraints must be unaffected by \
+             TopologySpreadContext — both candidates need exactly one \
+             eviction, so the ordinary list-order tie-break must still pick \
+             node-a"
         );
     }
 
