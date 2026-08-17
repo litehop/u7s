@@ -13,17 +13,23 @@
 # still never touches KCM/scheduler; that invariant is unrelated and must hold.
 #
 # Usage:
-#   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--verbose]
+#   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>]
+#                                    [--network <name>] [--verbose]
 #
 # Delegates to lima-start.sh --node-suffix "-2" so the joining node's per-node
 # resources (konnectivity-agent Pod/Secret, kubelet serving cert, pod CIDR) don't
-# collide with the primary node's.
+# collide with the primary node's. --network is forwarded to that same
+# lima-start.sh call (not defaulted here) so a 2-node stack whose primary was
+# isolated onto its own network (mayor-njq7j/PR #1194) can put the 2nd node on
+# the SAME network instead of silently defaulting to lima-start.sh's own
+# user-v2 fallback, which would leave the two nodes with no route to each
+# other (mayor-c4syr).
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ $# -lt 2 ]; then
-  echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--verbose]" >&2
+  echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--network <name>] [--verbose]" >&2
   exit 1
 fi
 VM_NAME="$1"
@@ -32,11 +38,13 @@ shift 2
 
 _PORT_OVERRIDE=""
 _WORKDIR_OVERRIDE=""
+_NETWORK_OVERRIDE=""
 _VERBOSE_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
+    --network) _NETWORK_OVERRIDE="$2"; shift 2 ;;
     --verbose) _VERBOSE_ARG="--verbose"; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -61,6 +69,8 @@ echo "Primary cluster is reachable."
 
 _WORKDIR_ARG=""
 [ -n "$_WORKDIR_OVERRIDE" ] && _WORKDIR_ARG="--workdir $_WORKDIR_OVERRIDE"
+_NETWORK_ARG=""
+[ -n "$_NETWORK_OVERRIDE" ] && _NETWORK_ARG="--network $_NETWORK_OVERRIDE"
 
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} --node-suffix "-2" ${_VERBOSE_ARG}
+bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "-2" ${_VERBOSE_ARG}
