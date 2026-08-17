@@ -1139,6 +1139,13 @@ pub(crate) async fn patch_pod<S: Store>(
 
         current_obj.body["status"] = stored_status;
 
+        // Enforce the same spec-immutability guard replace_pod (PUT) already applies —
+        // without this, a caller holding only `patch pods` (not `pods/binding`) could set
+        // spec.nodeName directly, bypassing the scheduler entirely, or rewrite containers/
+        // resources/tolerations on an already-running pod a live kubelet is watching.
+        validate_pod_spec_immutable(&spec_before, &current_obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+
         // Restore the stored generation before computing the increment so that
         // a patch attempting to set generation is ignored.
         current_obj.body["metadata"]["generation"] = stored_generation;
@@ -4855,6 +4862,23 @@ pub(crate) fn validate_pod_spec_immutable(
 
     if old_spec == new_spec {
         return Ok(());
+    }
+
+    // spec.nodeName is frozen once set: real Kubernetes assigns it exactly once, only via
+    // the /binding subresource (a separate RBAC verb, `create pods/binding`, precisely so
+    // that ordinary `patch`/`update pods` rights can't reassign a running pod's node).
+    // Without this, a caller holding only `patch pods` can reassign an already-scheduled
+    // pod straight to a node of their choosing, bypassing the scheduler's taints/
+    // tolerations/affinity/resource-fit checks and the pods/binding RBAC boundary entirely.
+    if let Some(old_node_name) = old_spec["nodeName"].as_str().filter(|s| !s.is_empty()) {
+        let new_node_name = new_spec["nodeName"].as_str().filter(|s| !s.is_empty());
+        if new_node_name != Some(old_node_name) {
+            return Err(
+                "spec.nodeName: Forbidden: pod nodeName is immutable once set — \
+                 reassign via the /binding subresource, not a direct spec update"
+                    .into(),
+            );
+        }
     }
 
     let old_containers = old_spec["containers"]
@@ -11521,6 +11545,52 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A merge-patch PATCH attempting to move an already-bound pod to a different node must
+    /// be rejected, exactly like replace_pod's PUT path already is. `patch pods` is a
+    /// commonly-granted, seemingly low-risk verb — distinct from `create pods/binding`,
+    /// which real Kubernetes scopes to the scheduler specifically so that node assignment
+    /// bypasses neither the scheduler's fit/taint/affinity checks nor that RBAC boundary.
+    /// Without validate_pod_spec_immutable wired into patch_pod, this PATCH would silently
+    /// reassign the pod straight to the attacker's chosen node.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_reassign_node_name() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "victim",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "nodeName": "control-plane-node"
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"nodeName": "other-node"}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/victim")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject a nodeName change via ordinary `patch pods` — accepting \
+             it bypasses both the scheduler and the pods/binding RBAC boundary"
+        );
     }
 
     /// A strategic-merge-patch PATCH on the MAIN pod endpoint that sets status.phase
