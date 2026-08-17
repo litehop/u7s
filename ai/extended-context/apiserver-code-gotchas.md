@@ -62,10 +62,10 @@ upstream — that is rare and a different (bigger) fix than the usual adapter ov
 function's fields against the generated struct in the same pass — there are likely
 siblings also missing.
 
-## ⚠️ PATTERN — ObjectMeta serde round-trip drops ownerReferences (and any field ObjectMeta doesn't declare)
-Several handlers round-trip an object's metadata through the typed `ObjectMeta` struct: `serde_json::from_value::<ObjectMeta>(obj["metadata"])` then `to_value(...)` back. **`ObjectMeta` does NOT declare every metadata field — notably `ownerReferences` — so the round-trip SILENTLY DROPS undeclared fields.** This dropped ownerReferences on EVERY create / decode until found, breaking GC/ownership cluster-wide. Bitten 3×, each a different code path:
-- `create_namespaced_resource` ObjectMeta round-trip — #626
-- `object_meta_to_json` (proto path) — #626
-- `stamp_cr_fields` (cr.rs, for custom resources) — #629
-
-**Current workaround pattern (used in all 3 fixes):** save the field before the round-trip and restore it after — `let saved = obj["metadata"]["ownerReferences"].clone(); /* round-trip */; if !saved.is_null() { obj["metadata"]["ownerReferences"] = saved; }`. **Better long-term fix (worth a bead):** either add the missing fields (ownerReferences at minimum) to the `ObjectMeta` struct so the round-trip is lossless, OR stop round-tripping metadata through ObjectMeta where only a couple of fields are being set (mutate the JSON in place). When you add a NEW handler that touches metadata, do NOT round-trip through ObjectMeta without preserving ownerReferences (and audit whether other fields like finalizers/managedFields are at risk too).
+## ⚠️ PATTERN — ObjectMeta serde round-trip drops ownerReferences (HISTORICAL, fixed)
+This class of bug is fixed at the type level: `ObjectMeta` now declares an `owner_references`
+field (PR #1079, mayor-0bd14.2), so the `serde_json::from_value::<ObjectMeta>` /
+`to_value(...)` round-trip is lossless. The 3 manual save/restore workarounds this section
+used to document (`create_namespaced_resource`, `object_meta_to_json`, `stamp_cr_fields`) were
+all removed once the type-level fix landed (PR #1081). Kept as a pointer to why `ObjectMeta`
+looks the way it does — do not reintroduce a save/restore workaround for this field.
