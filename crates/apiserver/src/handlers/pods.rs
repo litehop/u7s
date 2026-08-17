@@ -4813,37 +4813,58 @@ pub(crate) fn initialize_pod_generation(pod: &mut serde_json::Value) {
     pod["metadata"]["generation"] = serde_json::json!(1i64);
 }
 
-/// Reject a pod-spec update that rewrites `containers[*].resources` /
-/// `initContainers[*].resources`, or that adds/removes containers, or that
-/// violates the narrow upstream rules on `activeDeadlineSeconds` (decrease/set
-/// only) and `tolerations` (additions only) — mirrors the relevant parts of
-/// `ValidatePodUpdate` in `pkg/apis/core/validation`.
+/// Reject a pod-spec update that changes any field outside Kubernetes' narrow
+/// upstream-allowed set of pod-spec mutations — an allowlist, mirroring
+/// `validatePodSpecUpdate` in `pkg/apis/core/validation` (release-1.36).
 ///
-/// Resource changes are immutable via the generic PUT/PATCH pod update; they
-/// are only permitted through the `/resize` subresource (`validate_resize_patch`
-/// / `apply_resize_patch`), which additionally enforces QoS-class stability and
-/// resource-removal rules. Without this guard a client can rewrite
-/// containers[].resources via a plain PUT, bypassing those rules entirely and
-/// letting ResourceQuota's captured pod-creation totals go stale (the pod's
-/// resources on disk no longer match what quota admission accounted for).
+/// Algorithm: build a MUNGED copy of `new_spec` with each upstream-permitted
+/// mutable field overwritten from `old_spec` — after first enforcing that
+/// field's own directional rule (e.g. tolerations may only grow, resources may
+/// not change via this path at all). Any field NOT explicitly munged away is
+/// then subject to a full deep-equal against `old_spec`; a diff anywhere else
+/// (schedulerName, serviceAccountName, securityContext, volumes, dnsPolicy,
+/// nodeSelector/affinity on an already-scheduled pod, ...) is rejected. This is
+/// the inverse of the previous blocklist shape, which enumerated a handful of
+/// forbidden changes and fell through to `Ok(())` for everything else —
+/// silently allowing any field the blocklist hadn't been told about yet.
 ///
-/// Unlike upstream's approach of munging every allowed-mutable field and then
-/// requiring the *whole* remaining spec to be byte-identical, this diffs only
-/// the fields it actually polices. A whole-spec comparison is fragile here:
-/// GC/RC/Job controllers (and the conformance tests that exercise them)
-/// legitimately PUT a pod back with only `metadata.ownerReferences` or
-/// `metadata.labels` changed — spec byte-for-byte unchanged from the server's
-/// point of view — but the object round-trips through client-go's protobuf
-/// encoder and our proto decoder on the way back in. Any decode asymmetry on a
-/// field this function doesn't care about (dnsPolicy, probe defaults, port
-/// protocol, ...) would then read as a spec change and 422 a metadata-only
-/// update, breaking pod adoption/release/orphaning cluster-wide. Scoping the
-/// diff to the fields upstream actually restricts avoids that false positive
-/// while still blocking the one thing this guard exists for.
+/// Upstream-permitted mutations implemented here:
+/// - `containers[].image` / `initContainers[].image` — unconstrained (graceful
+///   rollout of a new image on a running pod).
+/// - `activeDeadlineSeconds` — may be set from unset, decreased, or cleared
+///   back to unset (controllers clear it); may never increase.
+/// - `tolerations` — append-only; every existing entry must survive verbatim.
+/// - `schedulingGates` — deletion-only; no new gate may be added post-creation.
+/// - `nodeSelector` / `affinity` — mutable ONLY while the pod is still gated
+///   (unscheduled AND `schedulingGates` non-empty); frozen once scheduled or
+///   ungated.
+/// - `terminationGracePeriodSeconds` — a negative value is normalized to 1
+///   before comparison (upstream's "terminate now" clamp); any other change
+///   is still frozen.
+/// - `containers[]/initContainers[].resources` — handled by the pre-existing
+///   dedicated resize guard below (kept verbatim). Resource changes are
+///   immutable via the generic PUT/PATCH pod update; they are only permitted
+///   through the `/resize` subresource (`validate_resize_patch` /
+///   `apply_resize_patch`), which additionally enforces QoS-class stability
+///   and resource-removal rules. Without this guard a client could rewrite
+///   containers[].resources via a plain PUT, bypassing those rules entirely
+///   and letting ResourceQuota's captured pod-creation totals go stale.
+///
+/// `spec.nodeName` gets its own dedicated check ahead of the munge purely for
+/// a clearer, more actionable error message pointing at `/binding` — it is
+/// never in the allowed set, so a bare change would be caught by the trailing
+/// deep-equal regardless.
 ///
 /// Both sides are spec-defaulted the same way `increment_pod_generation_if_spec_changed`
-/// does, so a client PUT that omits already-defaulted fields (dnsPolicy,
-/// serviceAccountName, ...) isn't mistaken for an illegal spec change.
+/// does before any comparison runs (and `automountServiceAccountToken` — never decoded
+/// from protobuf — is stripped from both), so a client PUT/PATCH that omits
+/// already-defaulted fields (dnsPolicy, serviceAccountName, probe periods, port
+/// protocol, ...) isn't mistaken for an illegal spec change by the trailing whole-spec
+/// deep-equal: those fields are normalized identically on both sides first. A
+/// newly-discovered decode asymmetry on a field this defaulting doesn't yet cover would
+/// surface as a false-positive 422 here; the fix is to extend `apply_pod_spec_defaults`
+/// (or the `automountServiceAccountToken`-style strip above it), not to relax this
+/// function back into a blocklist.
 pub(crate) fn validate_pod_spec_immutable(
     spec_before: &serde_json::Value,
     spec_after: &serde_json::Value,
@@ -4857,8 +4878,8 @@ pub(crate) fn validate_pod_spec_immutable(
             m.remove("automountServiceAccountToken");
         }
     }
-    let old_spec = &old_pod["spec"];
-    let new_spec = &new_pod["spec"];
+    let old_spec = old_pod["spec"].clone();
+    let new_spec = new_pod["spec"].clone();
 
     if old_spec == new_spec {
         return Ok(());
@@ -4882,6 +4903,8 @@ pub(crate) fn validate_pod_spec_immutable(
         );
     }
 
+    // Container/init-container count changes are rejected up front: the by-index munge
+    // below assumes both arrays already have matching lengths.
     let old_containers = old_spec["containers"]
         .as_array()
         .cloned()
@@ -4909,24 +4932,21 @@ pub(crate) fn validate_pod_spec_immutable(
         );
     }
 
+    // activeDeadlineSeconds: may be set from unset, decreased, or cleared back to unset
+    // (a controller may clear it once it has already acted on the deadline); may never
+    // increase — that would let a client extend a countdown already in progress.
     let old_ads = old_spec["activeDeadlineSeconds"].as_i64();
     let new_ads = new_spec["activeDeadlineSeconds"].as_i64();
-    match (old_ads, new_ads) {
-        (Some(old), Some(new)) if new > old => {
+    if let (Some(old), Some(new)) = (old_ads, new_ads) {
+        if new > old {
             return Err("spec.activeDeadlineSeconds: Forbidden: must be less than \
                          or equal to previous value"
                 .into());
         }
-        (Some(_), None) => {
-            return Err(
-                "spec.activeDeadlineSeconds: Forbidden: must not update from \
-                         a positive integer to nil value"
-                    .into(),
-            );
-        }
-        _ => {}
     }
 
+    // tolerations: append-only. Every existing toleration must survive verbatim; only
+    // new entries may be added (e.g. by a controller reacting to a newly observed taint).
     let old_tolerations = old_spec["tolerations"]
         .as_array()
         .cloned()
@@ -4945,6 +4965,30 @@ pub(crate) fn validate_pod_spec_immutable(
         }
     }
 
+    // schedulingGates: deletion-only. A gate may be removed (signalling the pod is ready
+    // for scheduling) but never added once the pod exists — adding gates is reserved for
+    // pod creation.
+    let old_gates = old_spec["schedulingGates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let new_gates = new_spec["schedulingGates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for g in &new_gates {
+        if !old_gates.contains(g) {
+            return Err(
+                "spec.schedulingGates: Forbidden: only deletion is allowed, \
+                         tried to add a scheduling gate"
+                    .into(),
+            );
+        }
+    }
+
+    // containers[]/initContainers[].resources: kept verbatim from the pre-rewrite guard.
+    // See normalize_container_resources for why an empty {} and an absent key must
+    // compare equal here.
     for (i, (old_c, new_c)) in old_containers.iter().zip(new_containers.iter()).enumerate() {
         if normalize_container_resources(&old_c["resources"])
             != normalize_container_resources(&new_c["resources"])
@@ -4966,7 +5010,103 @@ pub(crate) fn validate_pod_spec_immutable(
         }
     }
 
-    Ok(())
+    // Every check above enforces a directional rule for one specific mutable field. Now
+    // build the munged copy: overwrite each of those fields (plus the unconstrained ones,
+    // like image) in a clone of new_spec with old_spec's value, so a legitimate mutation
+    // there doesn't register as a diff below. Any field NOT explicitly munged here stays
+    // subject to the trailing whole-spec deep-equal — this is what makes the guard an
+    // allowlist rather than a blocklist: a new upstream-forbidden field added to PodSpec
+    // tomorrow is frozen by default, with no code change required here.
+    let mut munged = new_spec.clone();
+
+    if let Some(containers) = munged.get_mut("containers").and_then(|v| v.as_array_mut()) {
+        for (i, c) in containers.iter_mut().enumerate() {
+            if let Some(old_c) = old_containers.get(i) {
+                munge_field(c, "image", old_c);
+                munge_field(c, "resources", old_c);
+            }
+        }
+    }
+    if let Some(init) = munged
+        .get_mut("initContainers")
+        .and_then(|v| v.as_array_mut())
+    {
+        for (i, c) in init.iter_mut().enumerate() {
+            if let Some(old_c) = old_init.get(i) {
+                munge_field(c, "image", old_c);
+                munge_field(c, "resources", old_c);
+            }
+        }
+    }
+    munge_field(&mut munged, "activeDeadlineSeconds", &old_spec);
+    munge_field(&mut munged, "tolerations", &old_spec);
+    munge_field(&mut munged, "schedulingGates", &old_spec);
+
+    // nodeSelector/affinity: mutable only while the pod is still gated — unscheduled
+    // (nodeName unset; already enforced equal to old_spec's above) AND schedulingGates
+    // still non-empty. Once scheduled or ungated, these are frozen like everything else.
+    let still_gated = old_node_name.is_none() && !old_gates.is_empty();
+    if still_gated {
+        munge_field(&mut munged, "nodeSelector", &old_spec);
+        munge_field(&mut munged, "affinity", &old_spec);
+    }
+
+    // terminationGracePeriodSeconds: a negative value means "terminate now", which
+    // upstream normalizes to 1 before storing — treat a negative incoming value as
+    // equivalent to 1 rather than as a forbidden change. Any other change is still
+    // frozen by the deep-equal below.
+    if munged["terminationGracePeriodSeconds"]
+        .as_i64()
+        .is_some_and(|v| v < 0)
+    {
+        munged["terminationGracePeriodSeconds"] = serde_json::json!(1);
+    }
+
+    if munged == old_spec {
+        return Ok(());
+    }
+
+    let mut changed_fields: Vec<&str> = Vec::new();
+    if let (Some(m), Some(o)) = (munged.as_object(), old_spec.as_object()) {
+        let mut keys: Vec<&str> = m.keys().chain(o.keys()).map(String::as_str).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for k in keys {
+            if m.get(k) != o.get(k) {
+                changed_fields.push(k);
+            }
+        }
+    }
+    Err(format!(
+        "spec: Forbidden: pod updates may not change fields other than \
+         containers[*].image, initContainers[*].image, activeDeadlineSeconds, \
+         tolerations (additions only), schedulingGates (deletions only), \
+         nodeSelector/affinity (only while scheduling-gated), \
+         terminationGracePeriodSeconds (negative normalized to 1), and \
+         containers[*].resources via /resize — changed field(s): {}",
+        changed_fields.join(", ")
+    ))
+}
+
+/// Overwrite `dst[key]` with `src[key]`, or remove `dst[key]` entirely if `src` has no
+/// (non-null) value for it — used by `validate_pod_spec_immutable` to erase an
+/// already-validated, legitimate mutation from the trailing whole-spec deep-equal.
+/// Removing rather than inserting `null` matters: this codebase's patch appliers
+/// (`merge_patch`, `strategic_merge_patch`) represent "no value" as an absent key,
+/// never an explicit `null`, so leaving a `null` behind here would make `dst` compare
+/// unequal to `src` even when both mean the same thing.
+fn munge_field(dst: &mut serde_json::Value, key: &str, src: &serde_json::Value) {
+    let Some(m) = dst.as_object_mut() else {
+        return;
+    };
+    match src.get(key) {
+        Some(v) if !v.is_null() => {
+            m.insert(key.to_string(), v.clone());
+        }
+        _ => {
+            m.remove(key);
+        }
+    }
 }
 
 /// Normalize a container's `resources` value for the immutability comparison above so
@@ -11638,6 +11778,368 @@ mod handler_tests {
             "patch_pod must reject a blank-to-set nodeName write via ordinary `patch pods` \
              — the first assignment is exactly as security-sensitive as a reassignment, and \
              must go through the /binding subresource"
+        );
+    }
+
+    /// A merge-patch PATCH changing `spec.schedulerName` must be rejected. `schedulerName`
+    /// picks which scheduler profile owns the pod's placement decisions; a caller holding
+    /// only `patch pods` (not the scheduler's own credentials) must not be able to steer a
+    /// pod to a different scheduler profile after the fact — that is the same class of
+    /// scheduler bypass mq366 fixed for `nodeName`, just for the field one step upstream
+    /// of it. Before the allowlist rewrite, `validate_pod_spec_immutable`'s blocklist never
+    /// checked this field at all, so this PATCH silently succeeded.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_change_scheduler_name() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "sched-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"schedulerName": "other-scheduler"}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/sched-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject a schedulerName change via ordinary `patch pods` — \
+             accepting it lets a caller retarget a pod to a different scheduler profile \
+             without ever touching the scheduler-scoped RBAC surface"
+        );
+    }
+
+    /// A merge-patch PATCH changing `spec.serviceAccountName` must be rejected.
+    /// serviceAccountName determines which ServiceAccount's projected token gets mounted
+    /// into the pod; letting a bare `patch pods` caller change it after creation is
+    /// adjacent to SA-token privilege escalation — the pod would start requesting a
+    /// different identity's credentials without ever going through the admission checks
+    /// that ran at create time. The pre-rewrite blocklist never checked this field.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_change_service_account_name() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "sa-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"serviceAccountName": "other-sa"}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/sa-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject a serviceAccountName change via ordinary `patch pods` — \
+             accepting it is adjacent to SA-token privilege escalation on an existing pod"
+        );
+    }
+
+    /// A merge-patch PATCH changing `spec.securityContext` must be rejected. securityContext
+    /// carries hostNetwork/hostPID/hostIPC and per-pod runAsUser/runAsGroup — a direct
+    /// privilege-context change on an already-admitted pod, bypassing whatever PodSecurity
+    /// admission or webhook ran at create time. The pre-rewrite blocklist never checked this
+    /// field, so a `patch pods`-only caller could flip a pod to run as root after the fact.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_change_security_context() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "secctx-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"securityContext": {"runAsUser": 0}}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/secctx-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject a securityContext change via ordinary `patch pods` — \
+             accepting it lets a caller escalate an existing pod to run as root with no \
+             admission re-check"
+        );
+    }
+
+    /// A merge-patch PATCH updating only `containers[].image` on an already-running pod
+    /// must be allowed — this is the standard graceful-rollout mechanism controllers use
+    /// (e.g. a Deployment's RollingUpdate strategy patches the image of pods it owns
+    /// in-place in some flows). Rejecting it would be a regression from the allowlist
+    /// rewrite: upstream explicitly permits this field to change via a plain update.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_can_update_container_image() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "image-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx:1.0"}],
+                    "nodeName": "node-1"
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body =
+            serde_json::json!({"spec": {"containers": [{"name": "app", "image": "nginx:2.0"}]}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/image-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an image-only change on a running pod must succeed — upstream explicitly \
+             allows graceful image rollouts through a plain pod update"
+        );
+    }
+
+    /// A merge-patch PATCH decreasing `spec.activeDeadlineSeconds` must be allowed —
+    /// upstream permits shrinking (but never growing) an in-progress deadline, e.g. a
+    /// controller tightening a pod's allotted runtime after observing it's misbehaving.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_can_decrease_active_deadline_seconds() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "ads-decrease-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "activeDeadlineSeconds": 60
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"activeDeadlineSeconds": 30}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/ads-decrease-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "decreasing activeDeadlineSeconds (60 -> 30) must succeed — upstream allows \
+             tightening an in-progress deadline"
+        );
+    }
+
+    /// A merge-patch PATCH increasing `spec.activeDeadlineSeconds` must still be rejected
+    /// after the allowlist rewrite — this was already enforced by the pre-rewrite blocklist
+    /// and must not regress, or a pod could extend a countdown that's already in progress,
+    /// defeating the deadline's purpose.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_increase_active_deadline_seconds() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "ads-increase-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "activeDeadlineSeconds": 60
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"activeDeadlineSeconds": 120}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/ads-increase-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "increasing activeDeadlineSeconds (60 -> 120) must still be rejected — it would \
+             let a client extend a deadline countdown already in progress"
+        );
+    }
+
+    /// A merge-patch PATCH changing `spec.dnsPolicy` must be rejected. dnsPolicy is frozen
+    /// upstream once a pod exists; letting it change post-creation could silently move a
+    /// running pod between hostNetwork-DNS and cluster-DNS resolution, which the kubelet
+    /// only wires up at sandbox-creation time. Not previously checked by name in the
+    /// blocklist — this is one of the fields mayor-cxnj0 flagged, now frozen automatically
+    /// by the trailing whole-spec deep-equal instead of needing its own dedicated check.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_change_dns_policy() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "dns-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "dnsPolicy": "ClusterFirstWithHostNet"
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"dnsPolicy": "ClusterFirst"}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/dns-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject a dnsPolicy change — the allowlist rewrite must freeze \
+             every field outside its explicit allowed set, not just the ones with a \
+             dedicated check"
+        );
+    }
+
+    /// A merge-patch PATCH that appends a new toleration while keeping every existing one
+    /// must be allowed — upstream permits growing a pod's toleration set (e.g. a controller
+    /// reacting to a newly-observed taint) without allowing existing tolerations to be
+    /// weakened or removed.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_can_append_toleration() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "toleration-append-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "tolerations": [{"key": "existing", "operator": "Exists"}]
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"tolerations": [
+            {"key": "existing", "operator": "Exists"},
+            {"key": "new", "operator": "Exists"}
+        ]}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/toleration-append-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "appending a new toleration while keeping the existing one must succeed — \
+             upstream allows tolerations to only grow"
+        );
+    }
+
+    /// A merge-patch PATCH that drops an existing toleration must be rejected — removing a
+    /// toleration a pod was scheduled with could let the kubelet's taint-manager evict it
+    /// off a node it was legitimately tolerating, entirely outside the scheduler's control.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_remove_toleration() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "toleration-remove-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}],
+                    "tolerations": [
+                        {"key": "keep-me", "operator": "Exists"},
+                        {"key": "drop-me", "operator": "Exists"}
+                    ]
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"tolerations": [{"key": "keep-me", "operator": "Exists"}]}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/toleration-remove-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "dropping an existing toleration must be rejected — it could let the kubelet's \
+             taint-manager evict the pod off a node it was legitimately scheduled onto"
         );
     }
 
