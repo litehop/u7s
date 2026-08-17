@@ -905,11 +905,27 @@ pub fn generate_container(descriptor_bytes: &[u8]) -> String {
 
 /// `Container` fields whose JSON shape needs more than `emit_field_encode`/`field_decode_rhs` can
 /// derive on their own — each maps to an existing (or, for `ports`/`env`/`envFrom`/
-/// `volumeMounts`, newly extracted) hand-written pair in `core_gen_adapter.rs`. Every `Container`
-/// field with no entry here is genuinely just "if Some/non-empty, insert", confirmed against
-/// `generated.proto`'s `message Container` field-by-field.
+/// `volumeMounts`, newly extracted) hand-written pair in `core_gen_adapter.rs`, with one
+/// exception: `stdin`/`stdinOnce`/`tty` are plain (non-pointer), gogoproto-`nullable=false` bool
+/// fields — the same class as `PodSpec.hostNetwork`/`hostPID`/`hostIPC` (see `hostNetwork`'s
+/// generated-code call site in `pod_spec_delegated_field` for the full explanation) — so they
+/// need the same true-only guard rather than the mechanical `Some`-gated default. Every other
+/// `Container` field with no entry here is genuinely just "if Some/non-empty, insert", confirmed
+/// against `generated.proto`'s `message Container` field-by-field.
 fn container_delegated_field(field_name: &str) -> Option<(&'static str, &'static str)> {
     match field_name {
+        "stdin" => Some((
+            "    if let Some(true) = c.stdin {\n        cm.insert(\"stdin\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+            "jbool(v, \"stdin\")",
+        )),
+        "stdinOnce" => Some((
+            "    if let Some(true) = c.stdin_once {\n        cm.insert(\"stdinOnce\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+            "jbool(v, \"stdinOnce\")",
+        )),
+        "tty" => Some((
+            "    if let Some(true) = c.tty {\n        cm.insert(\"tty\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+            "jbool(v, \"tty\")",
+        )),
         "ports" => Some((
             "    if !c.ports.is_empty() {\n        cm.insert(\"ports\".to_string(), serde_json::Value::Array(c.ports.into_iter().map(gen_container_port_to_json).collect()));\n    }\n",
             "v.get(\"ports\").and_then(|a| a.as_array()).map(|a| a.iter().map(json_to_container_port_proto).collect()).unwrap_or_default()",
@@ -1066,9 +1082,9 @@ pub fn generate_pod_spec(descriptor_bytes: &[u8]) -> String {
 /// `initContainers`/`ephemeralContainers` delegate to their own (generated or hand-written)
 /// per-element encoders; `containers` alone is unconditionally emitted (upstream has no
 /// `omitempty` on it — a Pod always has at least one container). `activeDeadlineSeconds`/
-/// `hostNetwork` preserve business-rule guards (a positive-only filter and a true-only filter,
-/// the latter documented at length on `hostNetwork`'s own generated-code call site) no schema
-/// annotation encodes. `imagePullSecrets`/`readinessGates`/`schedulingGates` project one field
+/// `hostNetwork`/`hostPID`/`hostIPC` preserve business-rule guards (a positive-only filter and
+/// a true-only filter, the latter documented at length on `hostNetwork`'s own generated-code
+/// call site) no schema annotation encodes. `imagePullSecrets`/`readinessGates`/`schedulingGates` project one field
 /// out of their element type and skip elements missing it. `affinity`/`securityContext`/
 /// `resources`/`os`/`schedulingGroup` delegate to existing (or, for the two single-field structs,
 /// inline) converters.
@@ -1125,6 +1141,22 @@ fn pod_spec_delegated_field(field_name: &str) -> Option<(&'static str, &'static 
         "hostNetwork" => Some((
             "    if let Some(true) = spec.host_network {\n        spec_map.insert(\"hostNetwork\".to_string(), serde_json::Value::Bool(true));\n    }\n",
             "jbool(v, \"hostNetwork\")",
+        )),
+        // hostPID/hostIPC are the same plain (non-pointer), gogoproto-`nullable=false` bool
+        // class as hostNetwork just above — see that field's guard for the full explanation.
+        // A real client-go protobuf write always puts an explicit `false` for either on the
+        // wire even when the caller never touched them, so without this true-only guard a
+        // metadata-only PUT resubmitted through a protobuf client fabricates "hostPID: false"/
+        // "hostIPC: false" on a pod that never had the key, which validate_pod_spec_immutable's
+        // whole-spec deep-equal then rejects as a spec change that never happened (mayor-swxjj,
+        // 3rd recurrence of the RC/Job label-only-PUT immutability regression, mayor-y6gtg).
+        "hostPID" => Some((
+            "    if let Some(true) = spec.host_pid {\n        spec_map.insert(\"hostPID\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+            "jbool(v, \"hostPID\")",
+        )),
+        "hostIPC" => Some((
+            "    if let Some(true) = spec.host_ipc {\n        spec_map.insert(\"hostIPC\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+            "jbool(v, \"hostIPC\")",
         )),
         "schedulingGates" => Some((
             "    if !spec.scheduling_gates.is_empty() {\n        let gates: Vec<serde_json::Value> = spec.scheduling_gates.into_iter().filter_map(|g| g.name.filter(|s| !s.is_empty())).map(|name| serde_json::json!({ \"name\": name })).collect();\n        spec_map.insert(\"schedulingGates\".to_string(), serde_json::Value::Array(gates));\n    }\n",
