@@ -447,11 +447,28 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     }
 }
 
+/// Returns true if the pod's `spec.priorityClassName` is one of `values`.
+///
+/// A pod with no `priorityClassName` set never matches any non-empty `values` list —
+/// this makes `NotIn` correctly include unclassed pods (they're "not in" any named
+/// priority class) and `In` correctly exclude them.
+fn pod_matches_priority_class(object: Option<&Value>, values: &[&str]) -> bool {
+    object.is_some_and(|pod| {
+        pod["spec"]["priorityClassName"]
+            .as_str()
+            .is_some_and(|pc| values.contains(&pc))
+    })
+}
+
 /// Returns true if the object matches all expressions in a scopeSelector.
 ///
-/// Supported operators: Exists (pod must match scopeName), DoesNotExist (must not match).
-/// In/NotIn with values are not implemented (unused by conformance tests); unknown operators
-/// are treated as matching (conservative default).
+/// Supported operators: Exists (pod must match scopeName), DoesNotExist (must not match),
+/// and In/NotIn for the `PriorityClass` scope (pod's `priorityClassName` in/not-in
+/// `values`). Without In/NotIn support, a quota scoped to e.g. `PriorityClass In
+/// [pclass4]` degenerated to unscoped — every pod counted against it regardless of
+/// priority class (upstream conformance: "should verify ResourceQuota's priority class
+/// scope"). In/NotIn on any other scope name is unimplemented and treated as matching
+/// (conservative default), as are unknown operators.
 fn object_matches_scope_selector(scope_selector: &Value, object: Option<&Value>) -> bool {
     let exprs = match scope_selector["matchExpressions"].as_array() {
         Some(arr) => arr,
@@ -463,7 +480,20 @@ fn object_matches_scope_selector(scope_selector: &Value, object: Option<&Value>)
         match operator {
             "Exists" => object_matches_scope(scope_name, object),
             "DoesNotExist" => !object_matches_scope(scope_name, object),
-            // In/NotIn with values — not implemented; treat as match (conservative)
+            "In" | "NotIn" if scope_name == "PriorityClass" => {
+                let values: Vec<&str> = expr["values"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let in_values = pod_matches_priority_class(object, &values);
+                if operator == "In" {
+                    in_values
+                } else {
+                    !in_values
+                }
+            }
+            // In/NotIn for scope names other than PriorityClass — not implemented;
+            // treat as match (conservative default).
             _ => true,
         }
     })
@@ -547,17 +577,13 @@ pub async fn count_quota_usage<S: Store>(
             })
         })
         .unwrap_or(false);
+    // Any non-empty scopeSelector needs scope-aware counting, not just the enumerated
+    // scope names below — e.g. `PriorityClass In [...]` (via `object_matches_scope_selector`'s
+    // In/NotIn handling) must also exclude non-matching pods from status.used, or a
+    // PriorityClass-scoped quota's status.used would report the raw unfiltered pod count.
     let has_scope_selector = quota["spec"]["scopeSelector"]["matchExpressions"]
         .as_array()
-        .map(|arr| {
-            arr.iter().any(|expr| {
-                matches!(
-                    expr["scopeName"].as_str(),
-                    Some("BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating")
-                )
-            })
-        })
-        .unwrap_or(false);
+        .is_some_and(|arr| !arr.is_empty());
     let has_pod_scopes = has_scopes_array || has_scope_selector;
 
     let mut used = std::collections::BTreeMap::new();
@@ -1342,6 +1368,67 @@ mod tests {
         );
     }
 
+    // -- PriorityClass scopeSelector (In/NotIn) matching --
+
+    /// A quota scoped to `PriorityClass In [pclass4]` must NOT match a pod using a
+    /// different priority class (pclass3), and MUST match a pod using pclass4.
+    ///
+    /// Before this fix, `object_matches_scope_selector`'s `_ => true` catch-all made every
+    /// In/NotIn expression match unconditionally, so a `PriorityClass In [...]` quota
+    /// behaved as fully unscoped: pods with an unrelated priority class still counted
+    /// against its hard pod-count limit. This reproduces upstream conformance's "should
+    /// verify ResourceQuota's priority class scope" — a pod using pclass3 wrongly consumed
+    /// the quota's `pods: 1` hard limit, causing a subsequent unrelated pod create to be
+    /// rejected with "exceeded quota".
+    #[test]
+    fn scope_selector_in_priority_class_matches_only_listed_values() {
+        let scope_selector = json!({
+            "matchExpressions": [{
+                "scopeName": "PriorityClass",
+                "operator": "In",
+                "values": ["pclass4"]
+            }]
+        });
+        let pod_pclass3 = json!({ "spec": { "priorityClassName": "pclass3" } });
+        let pod_pclass4 = json!({ "spec": { "priorityClassName": "pclass4" } });
+
+        assert!(
+            !object_matches_scope_selector(&scope_selector, Some(&pod_pclass3)),
+            "a pod whose priorityClassName is NOT in the scopeSelector's In-list must not \
+             match the quota's scope — else the quota behaves as unscoped"
+        );
+        assert!(
+            object_matches_scope_selector(&scope_selector, Some(&pod_pclass4)),
+            "a pod whose priorityClassName IS in the scopeSelector's In-list must match \
+             the quota's scope"
+        );
+    }
+
+    /// A quota scoped to `PriorityClass NotIn [pclass7]` must match a pod using a
+    /// different priority class and must NOT match a pod using pclass7 itself —
+    /// the exact inverse of the `In` case, both driven by the same operator branch.
+    #[test]
+    fn scope_selector_not_in_priority_class_excludes_only_listed_values() {
+        let scope_selector = json!({
+            "matchExpressions": [{
+                "scopeName": "PriorityClass",
+                "operator": "NotIn",
+                "values": ["pclass7"]
+            }]
+        });
+        let pod_pclass7 = json!({ "spec": { "priorityClassName": "pclass7" } });
+        let pod_other = json!({ "spec": { "priorityClassName": "pclass-other" } });
+
+        assert!(
+            !object_matches_scope_selector(&scope_selector, Some(&pod_pclass7)),
+            "a pod whose priorityClassName IS in the NotIn list must not match the scope"
+        );
+        assert!(
+            object_matches_scope_selector(&scope_selector, Some(&pod_other)),
+            "a pod whose priorityClassName is NOT in the NotIn list must match the scope"
+        );
+    }
+
     /// pod_is_best_effort returns true for a pod with no resource constraints.
     #[test]
     fn pod_is_best_effort_with_no_resources() {
@@ -1370,6 +1457,63 @@ mod tests {
         assert!(
             !pod_is_best_effort(&pod),
             "pod with CPU requests must NOT be BestEffort"
+        );
+    }
+
+    /// A `PriorityClass In [pclass4]`-scoped quota's status.used.pods must stay "0" when
+    /// only non-matching (pclass3) pods exist in the namespace — `count_quota_usage` must
+    /// route pod counting through the scope-filtered path for ANY non-empty scopeSelector,
+    /// not just the four hard-coded scope names (BestEffort/NotBestEffort/Terminating/
+    /// NotTerminating). Before this fix, a PriorityClass scopeSelector fell through to the
+    /// unscoped raw pod count, so status.used.pods would wrongly report the pod as
+    /// consuming the quota — reproduces the status half of upstream conformance's "should
+    /// verify ResourceQuota's priority class scope".
+    #[tokio::test]
+    async fn count_quota_usage_excludes_non_matching_priority_class_pods() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "quota-priorityclass", "namespace": "default" },
+            "spec": {
+                "scopeSelector": {
+                    "matchExpressions": [{
+                        "scopeName": "PriorityClass",
+                        "operator": "In",
+                        "values": ["pclass4"]
+                    }]
+                },
+                "hard": { "pods": "1" }
+            }
+        });
+        seed(
+            &state,
+            "/registry/resourcequotas/default/quota-priorityclass",
+            quota.clone(),
+        )
+        .await;
+
+        // A pod using an unrelated priority class must not count against this quota.
+        let non_matching_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "testpod-pclass3", "namespace": "default" },
+            "spec": { "priorityClassName": "pclass3", "containers": [{"name": "c"}] }
+        });
+        seed(
+            &state,
+            "/registry/pods/default/testpod-pclass3",
+            non_matching_pod,
+        )
+        .await;
+
+        let used = count_quota_usage(&*state.store, &quota).await;
+        assert_eq!(
+            used.get("pods").map(String::as_str),
+            Some("0"),
+            "a pod using a priority class outside the quota's scopeSelector In-list must \
+             not be counted in status.used.pods"
         );
     }
 
