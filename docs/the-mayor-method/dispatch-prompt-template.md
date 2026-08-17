@@ -220,7 +220,7 @@ reshape it into single allowlisted commands; do not abandon the task.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
 
-### Git hooks & cargo verification (mandatory — avoid ~1 min wastes per pass)
+### Git hooks & cargo verification (mandatory — know warm vs. cold cost per pass)
 
 The repo has both a pre-commit and a pre-push hook. Knowing what each runs saves
 minutes per iteration:
@@ -231,20 +231,41 @@ minutes per iteration:
   `cargo clippy --workspace --tests --no-deps -- -D warnings`. This is authoritative; if it
   fails, `git push` is rejected with no stacktrace context.
 
+**Warm vs. cold cache — this is the number that actually matters for Bash
+timeouts.** As-of measurements (12-core Apple Silicon Mac, mayor-ektcp audit,
+2026-08-17 — full breakdown in `ai/findings/cargo-test-perf-audit-2026-08-17.md`,
+gitignored, not in the committed tree; expect drift as the workspace grows or
+on different hardware — treat as a range, not a promise):
+
+- **Warm cache** (target/ already built by a prior `cargo test`/`cargo build`
+  in the SAME worktree, e.g. your own step-2 run below): `cargo test
+  --workspace` ~25-30s, `cargo clippy --workspace --tests --no-deps -- -D
+  warnings` ~15-20s. Both fit comfortably inside Bash's default 2-min timeout.
+- **Cold cache** (a brand-new worktree with no prior `cargo` invocation at
+  all — true for every worker's FIRST build/test/push): compiling test
+  binaries from scratch adds ~55-60s on top of the warm numbers above, so a
+  cold `cargo test --workspace` can run ~80-85s total. This is why a worker's
+  first `git push` (which triggers the pre-push hook's test+clippy) can blow
+  past a 2-min default Bash timeout even though later, warm-cache pushes
+  finish quickly. If this is your worktree's first push, set a longer
+  `timeout` param up front (300s is a safe buffer) rather than let the
+  default fire and force a retry.
+
 **Order of operations that minimises wasted work**:
 
 1. Make your edit.
 2. Run `cargo test --workspace` and `cargo clippy --workspace --tests --no-deps -- -D warnings`
-   ONCE, before commit. This is your "see failures with context" pass. If either
+   ONCE, before commit. This is your "see failures with context" pass — it's
+   also what warms the cache for every later run in this worktree. If either
    fails, fix and re-run only the affected target (`cargo test -p <crate>` or
    `cargo test <testname>`) — never re-run the whole workspace on every edit iteration.
 3. `git add` + `git commit`. Pre-commit runs `cargo fmt --check` — the ONLY new
    thing the hook adds. If `fmt` fails, run `cargo fmt` and re-commit.
 4. `git push`. Pre-push re-runs test+clippy. Because you haven't touched source
-   since step 2, compilation is cached and only test EXECUTION time is spent
-   (~20-30s on this workspace, not the full ~1 min a cold run takes). Do NOT
-   manually re-run test+clippy right before push — the hook is going to do it
-   anyway; a manual pre-push run just doubles that ~20-30s for zero signal.
+   since step 2, compilation is cached and only test EXECUTION time is spent —
+   see "warm cache" above for the expected wall-clock. Do NOT manually
+   re-run test+clippy right before push — the hook is going to do it anyway;
+   a manual pre-push run just doubles that warm-cache cost for zero signal.
 
 **Reading `cargo test` output — do NOT grep for FAILURE/ERROR after a green run.**
 
@@ -256,11 +277,12 @@ test result: ok. 2790 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; f
 ```
 
 `0 failed` IS the pass signal — nothing more to verify. Re-running `cargo test`
-piped to `grep -E 'FAILED|ERROR'` duplicates the ~1 min run for zero additional
-signal (a failure would have shown in the first run's summary and the failing
-test's own output). If a test failed and you need its stacktrace, use
-`cargo test -- --nocapture <testname>` on the ONE test — never re-run the whole
-workspace.
+piped to `grep -E 'FAILED|ERROR'` duplicates the run above (warm-cache ~25-30s,
+or ~80s+ if this is a cold worktree's first run — see "Git hooks & cargo
+verification" above) for zero additional signal (a failure would have shown in
+the first run's summary and the failing test's own output). If a test failed
+and you need its stacktrace, use `cargo test -- --nocapture <testname>` on the
+ONE test — never re-run the whole workspace.
 
 If `--quiet` output feels sparse and you want fuller detail on the first run, drop
 `--quiet` — the un-quiet output still ends with the same summary line but includes
@@ -812,20 +834,25 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - **Workers re-run `cargo test` after a green pass to grep for FAILURE/ERROR.**
   Observed repeatedly: worker runs `cargo test --workspace --quiet`, sees no
   failure lines, doesn't trust the silent-success, re-runs piped to `grep -E
-  'FAILED|ERROR'` — duplicating the ~1 min test-suite run for zero additional
-  signal. `cargo test`'s summary line (`test result: ok. N passed; 0 failed;`)
-  IS authoritative; grep-verification adds nothing. The "Reading `cargo test`
-  output" note in the common preamble tells the worker to trust the summary
-  line and use `cargo test -- --nocapture <testname>` if a specific test's
-  stacktrace is needed.
+  'FAILED|ERROR'` — duplicating the test-suite run (~25-30s warm-cache, more
+  on a cold worktree — see "Git hooks & cargo verification") for zero
+  additional signal. `cargo test`'s summary line (`test result: ok. N passed;
+  0 failed;`) IS authoritative; grep-verification adds nothing. The "Reading
+  `cargo test` output" note in the common preamble tells the worker to trust
+  the summary line and use `cargo test -- --nocapture <testname>` if a
+  specific test's stacktrace is needed.
 - **Workers manually re-run test+clippy right before `git push`.** They ran it
   before commit (correct), then re-run it before push "to be safe" — but the
   pre-push hook runs the exact same commands unconditionally right after. Cargo
-  caches compilation across the two runs but test EXECUTION still re-runs
-  (~20-30s each on this workspace). Net: ~20-30s of duplicated wall-clock per
-  push, for zero signal (the hook would have caught anything a manual re-run
-  would have caught). Common preamble now explicitly says: run test+clippy ONCE
-  before commit, do NOT re-run before push.
+  caches compilation across the two runs but test EXECUTION still re-runs:
+  ~25-30s for `cargo test --workspace` plus ~15-20s for `cargo clippy
+  --workspace --tests --no-deps -- -D warnings` (warm-cache numbers; clippy's
+  `--no-deps` flag itself was a fix — mayor-patf1, PR #1212, measured 2.9x
+  speedup from 45.5s to 15.8s warm, since propagated to `.claude/settings.json`
+  (mayor-snjh1, PR #1214) and CI (mayor-dajfe, PR #1215)). Net: ~40-50s of
+  duplicated wall-clock per push, for zero signal (the hook would have caught
+  anything a manual re-run would have caught). Common preamble now explicitly
+  says: run test+clippy ONCE before commit, do NOT re-run before push.
 - **Mayor "gets into the flow" and codes instead of dispatching.** The
   four-condition exception test is easy to rationalize past once the mayor has
   already read several files. The fourth condition (≤2 files read) is the
