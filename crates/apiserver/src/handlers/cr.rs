@@ -604,15 +604,19 @@ fn cr_list_prefix(group: &str, plural: &str, namespace: Option<&str>) -> String 
 // Metadata stamping on create
 // ---------------------------------------------------------------------------
 
+/// Stamp server-owned identity fields on a newly-created CR. `uid` is ALWAYS assigned
+/// fresh here, unconditionally overwriting any client-supplied value — same invariant as
+/// the built-in resource create path (`stamp_metadata`). A client-chosen uid on a CR would
+/// let it forge object identity just as easily as on a built-in resource: matching a
+/// stale/foreign `ownerReference.uid` to manipulate GC's owner-liveness check, or defeating
+/// controllers' "same name, different uid ⇒ different object" recreate-detection.
 fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
     obj["kind"] = serde_json::Value::String(kind.to_string());
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
-    if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
-        meta.uid = Some(new_cr_uid());
-    }
+    meta.uid = Some(new_cr_uid());
     if meta
         .creation_timestamp
         .as_deref()
@@ -653,19 +657,46 @@ fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
     Ok(())
 }
 
-fn resolve_cr_metadata(stored: &serde_json::Value, incoming: &mut serde_json::Value) {
+/// Reconcile server-owned metadata on a CR PUT (replace).
+///
+/// uid is immutable identity, exactly like the built-in resource replace path
+/// (`replace_resource`/`replace_namespaced_resource`): a blank incoming uid is restored
+/// from the stored object, but a non-blank incoming uid that mismatches the stored one is
+/// rejected with 409 rather than silently persisted — accepting it would let a client forge
+/// a CR's identity to match a stale/foreign ownerReference (corrupting GC's owner-liveness
+/// check) or defeat controllers' "same name, different uid ⇒ different object"
+/// recreate-detection.
+fn resolve_cr_metadata(
+    stored: &serde_json::Value,
+    incoming: &mut serde_json::Value,
+    name: &str,
+    kind: &str,
+) -> Result<(), crate::status::StatusError> {
     let stored_meta: crate::types::ObjectMeta =
         serde_json::from_value(stored["metadata"].clone()).unwrap_or_default();
     let mut incoming_meta: crate::types::ObjectMeta =
         serde_json::from_value(incoming["metadata"].take()).unwrap_or_default();
-    if incoming_meta
+    let incoming_uid_blank = incoming_meta
         .uid
         .as_deref()
         .map(|s| s.is_empty())
-        .unwrap_or(true)
-        && stored_meta.uid.is_some()
-    {
-        incoming_meta.uid = stored_meta.uid;
+        .unwrap_or(true);
+    if incoming_uid_blank {
+        if stored_meta.uid.is_some() {
+            incoming_meta.uid = stored_meta.uid;
+        }
+    } else if let Some(stored_uid) = stored_meta.uid.as_deref().filter(|s| !s.is_empty()) {
+        let incoming_uid = incoming_meta.uid.as_deref().unwrap_or("");
+        if incoming_uid != stored_uid {
+            // Restore incoming["metadata"] before erroring so a caller that ignores the
+            // Err still observes a consistent object rather than one missing metadata
+            // (take() above emptied it).
+            incoming["metadata"] = serde_json::to_value(&incoming_meta).unwrap_or_default();
+            return Err(Status::conflict(format!(
+                "{kind} \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid}, expected {stored_uid}) — uid is immutable"
+            )));
+        }
     }
     if incoming_meta
         .creation_timestamp
@@ -677,6 +708,7 @@ fn resolve_cr_metadata(stored: &serde_json::Value, incoming: &mut serde_json::Va
         incoming_meta.creation_timestamp = stored_meta.creation_timestamp;
     }
     incoming["metadata"] = serde_json::to_value(incoming_meta).unwrap_or_default();
+    Ok(())
 }
 
 fn new_cr_uid() -> String {
@@ -1636,7 +1668,7 @@ pub async fn replace_cr<S: Store>(
     // Preserve uid + creationTimestamp from stored.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    resolve_cr_metadata(&existing, &mut obj);
+    resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
     // update .status — clients must use PUT /status for that.
@@ -2465,7 +2497,7 @@ pub async fn replace_cr_namespaced<S: Store>(
 
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    resolve_cr_metadata(&existing, &mut obj);
+    resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
     // update .status — clients must use PUT /status for that.
@@ -2917,11 +2949,16 @@ pub async fn patch_cr<S: Store>(
         dry_run: false,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    debug_assert_eq!(
-        old["metadata"]["uid"], obj["metadata"]["uid"],
-        "old_object passed to run_validating_webhooks must be the same resource's pre-patch \
-         state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
-    );
+    // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
+    // (stored) value here, after both the patch body and any mutating webhook have had a
+    // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
+    // and was a silent no-op in release, meaning a caller with only ordinary CR `patch`
+    // rights could forge uid to match a stale/foreign ownerReference (corrupting GC's
+    // owner-liveness check) or defeat controllers' recreate-detection, in every release
+    // build. Restoring (rather than rejecting with 409) matches do_patch's behavior for
+    // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
+    // value it carries.
+    obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
@@ -3131,11 +3168,16 @@ pub async fn patch_cr_namespaced<S: Store>(
         dry_run: false,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    debug_assert_eq!(
-        old["metadata"]["uid"], obj["metadata"]["uid"],
-        "old_object passed to run_validating_webhooks must be the same resource's pre-patch \
-         state, not a stray object — otherwise oldSelf/immutability checks compare unrelated UIDs"
-    );
+    // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
+    // (stored) value here, after both the patch body and any mutating webhook have had a
+    // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
+    // and was a silent no-op in release, meaning a caller with only ordinary CR `patch`
+    // rights could forge uid to match a stale/foreign ownerReference (corrupting GC's
+    // owner-liveness check) or defeat controllers' recreate-detection, in every release
+    // build. Restoring (rather than rejecting with 409) matches do_patch's behavior for
+    // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
+    // value it carries.
+    obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_ref(), &mut obj);
 
@@ -5807,6 +5849,99 @@ mod tests {
         assert_eq!(stored_resp.status(), StatusCode::OK);
     }
 
+    /// A merge-patch PATCH on a cluster-scoped CR attempting to change metadata.uid must
+    /// leave the stored uid unchanged. Before this fix, the only guard here was a
+    /// `debug_assert_eq!` — a panic in debug builds, but a silent no-op in release, meaning
+    /// a caller holding only ordinary CR `patch` rights could forge uid to match a
+    /// stale/foreign ownerReference (corrupting GC's owner-liveness check) or defeat
+    /// controllers' recreate-detection in every release build. This test runs in the
+    /// harness's default (debug) test profile specifically so a revert of the restore back
+    /// to the old debug_assert_eq! shows up as a hard panic, not just a silently-passing
+    /// release-mode gap.
+    #[tokio::test]
+    async fn patch_cr_merge_patch_cannot_change_uid() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let name = "uid-forge-widget".to_string();
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let before = get_cr(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                name.clone(),
+            )),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get must succeed before patch"));
+        let before_body = axum::body::to_bytes(before.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let before_json: serde_json::Value = serde_json::from_slice(&before_body).unwrap();
+        let real_uid = before_json["metadata"]["uid"]
+            .as_str()
+            .expect("create must assign a uid")
+            .to_string();
+        assert!(!real_uid.is_empty());
+
+        let patch_body =
+            Bytes::from(serde_json::json!({ "metadata": { "uid": "attacker-uid" } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        assert!(
+            patch_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".into(),
+                    "v1".into(),
+                    "widgets".into(),
+                    name.clone()
+                )),
+                test_user(),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "a patch attempting to set uid must still succeed (uid is silently restored, \
+             not rejected)"
+        );
+
+        let after = get_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into(), name)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get must succeed after patch"));
+        let after_body = axum::body::to_bytes(after.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let after_json: serde_json::Value = serde_json::from_slice(&after_body).unwrap();
+        assert_eq!(
+            after_json["metadata"]["uid"], real_uid,
+            "a merge-patch carrying metadata.uid must not change the stored uid"
+        );
+    }
+
     // PATCH on a group with no CRD installed must return 404.
     // This verifies that patch_cr_namespaced correctly propagates CRD-not-found as 404.
     #[tokio::test]
@@ -5895,24 +6030,30 @@ mod tests {
         );
     }
 
-    // stamp_cr_fields must preserve existing uid when already present,
-    // because a replace operation must not change the identity of the object.
+    // stamp_cr_fields is only ever called on create (create_cr/create_cr_namespaced and
+    // patch_cr's SSA-upsert-on-missing branch) — CR replace goes through
+    // resolve_cr_metadata instead, which enforces uid immutability by rejecting a
+    // mismatch. A client-supplied uid on create must therefore always be overwritten, the
+    // same invariant stamp_metadata enforces for built-in resources: letting a create
+    // request choose its own uid would let it forge identity to match a stale/foreign
+    // ownerReference or defeat recreate-detection.
     #[test]
-    fn stamp_cr_preserves_existing_uid_on_replace() {
+    fn stamp_cr_fields_overwrites_client_supplied_uid_on_create() {
         let mut obj = serde_json::json!({
             "metadata": {
-                "uid": "existing-uid-abc",
+                "uid": "attacker-chosen-uid",
                 "creationTimestamp": "2024-01-01T00:00:00Z"
             }
         });
         stamp_cr_fields(&mut obj, "example.io", "v1", "Widget");
-        assert_eq!(
-            obj["metadata"]["uid"], "existing-uid-abc",
-            "existing uid must be preserved"
+        assert_ne!(
+            obj["metadata"]["uid"], "attacker-chosen-uid",
+            "server must always overwrite a client-supplied uid on create — letting it \
+             through would let any CR create request forge object identity"
         );
         assert_eq!(
             obj["metadata"]["creationTimestamp"], "2024-01-01T00:00:00Z",
-            "existing creationTimestamp must be preserved"
+            "existing creationTimestamp must still be preserved"
         );
     }
 
@@ -6048,7 +6189,7 @@ mod tests {
             }
         });
         let mut incoming = serde_json::json!({ "metadata": {} });
-        resolve_cr_metadata(&stored, &mut incoming);
+        resolve_cr_metadata(&stored, &mut incoming, "widget-1", "Widget").unwrap();
         assert_eq!(
             incoming["metadata"]["uid"], "stored-uid-xyz",
             "uid must be copied from stored into incoming"
@@ -6057,6 +6198,24 @@ mod tests {
             incoming["metadata"]["creationTimestamp"], "2024-06-01T00:00:00Z",
             "creationTimestamp must be copied from stored into incoming"
         );
+    }
+
+    /// A PUT that carries a non-blank uid mismatching the stored one is identity forgery,
+    /// not a legitimate update: without this rejection a caller with ordinary CR update
+    /// rights could rewrite a CR's uid to match a stale/foreign ownerReference and corrupt
+    /// GC's owner-liveness check, or defeat controllers' recreate-detection.
+    #[test]
+    fn resolve_cr_metadata_rejects_mismatched_uid() {
+        let stored = serde_json::json!({
+            "metadata": { "uid": "real-uid", "creationTimestamp": "2024-06-01T00:00:00Z" }
+        });
+        let mut incoming = serde_json::json!({ "metadata": { "uid": "attacker-uid" } });
+        let result = resolve_cr_metadata(&stored, &mut incoming, "widget-1", "Widget");
+        assert!(
+            result.is_err(),
+            "a mismatched non-blank uid must be rejected, not silently overwritten or accepted"
+        );
+        assert_eq!(result.unwrap_err().0, axum::http::StatusCode::CONFLICT);
     }
 
     fn watch_query() -> super::super::generic::CollectionQuery {
