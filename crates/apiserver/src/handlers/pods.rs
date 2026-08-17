@@ -5255,18 +5255,6 @@ pub(crate) fn increment_pod_generation_if_spec_changed(
     let mut before_pod = serde_json::json!({ "spec": spec_before.clone() });
     apply_pod_spec_defaults(&mut before_pod);
 
-    // Strip fields that the u7s protobuf decoder does not decode from PodSpec (skipped
-    // proto fields). These fields are set at create-time and cannot change via a Replace
-    // sent over protobuf; comparing them would produce phantom generation bumps whenever
-    // client-go (which always uses protobuf) does any update, including a no-op replace.
-    // Stripping from both sides keeps the comparison symmetric.
-    for spec in [&mut after_pod["spec"], &mut before_pod["spec"]] {
-        if let Some(m) = spec.as_object_mut() {
-            // field 9 — automountServiceAccountToken is skipped by the proto decoder
-            m.remove("automountServiceAccountToken");
-        }
-    }
-
     if after_pod["spec"] != before_pod["spec"] {
         let current = pod["metadata"]["generation"].as_i64().unwrap_or(1);
         pod["metadata"]["generation"] = serde_json::json!(current + 1);
@@ -7200,6 +7188,36 @@ mod generation_tests {
             serde_json::json!(2i64),
             "generation must increment to 2 on a real spec change — controllers use \
              generation/observedGeneration to detect new work; no increment means stale reconcile"
+        );
+    }
+
+    /// A changed automountServiceAccountToken must still bump generation.
+    ///
+    /// increment_pod_generation_if_spec_changed used to strip this field from both sides
+    /// of the comparison under a false "proto decoder skips it" premise (mayor-6hw91,
+    /// mirroring mayor-cxnj0's fix to validate_pod_spec_immutable). Guards against that
+    /// strip being reintroduced, which would silently hide this field's changes from
+    /// generation tracking.
+    #[test]
+    fn automount_service_account_token_change_bumps_generation() {
+        let spec_before = serde_json::json!({
+            "containers": [{"name": "app", "image": "nginx:1.0"}],
+            "automountServiceAccountToken": true
+        });
+        let mut pod = serde_json::json!({
+            "metadata": {"generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}],
+                "automountServiceAccountToken": false
+            }
+        });
+        increment_pod_generation_if_spec_changed(&mut pod, &spec_before);
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(2i64),
+            "generation must increment when automountServiceAccountToken changes — a stale \
+             strip of this field from the comparison would hide the change from controllers \
+             gating on observedGeneration"
         );
     }
 
