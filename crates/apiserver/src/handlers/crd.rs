@@ -263,6 +263,56 @@ fn validate_crd_schema(
     Ok(())
 }
 
+/// Reject a PUT/PATCH that changes spec.group, spec.scope, or spec.names.{plural,singular,kind}
+/// relative to the stored CRD. These four fields are structural identity, immutable upstream:
+/// CRs are stored under a group-and-plural-keyed prefix (see build_new_crd's storage-key
+/// comment), so changing spec.group or spec.names.plural on an existing CRD orphans every
+/// already-stored CR under the old key prefix — permanently unreachable through the CRD's new
+/// identity, not merely a validation gap. Changing spec.scope would likewise desync
+/// namespaced-vs-cluster-scoped storage key shape for existing objects. See mayor-fu462.
+fn reject_structural_field_change(
+    existing: &serde_json::Value,
+    new_spec: &CustomResourceDefinitionSpec,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    let existing_group = existing["spec"]["group"].as_str().unwrap_or("");
+    if existing_group != new_spec.group {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.group is immutable (was '{existing_group}', got '{}')",
+            new_spec.group
+        )));
+    }
+    let existing_scope = existing["spec"]["scope"].as_str().unwrap_or("");
+    if existing_scope != new_spec.scope {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.scope is immutable (was '{existing_scope}', got '{}')",
+            new_spec.scope
+        )));
+    }
+    let existing_plural = existing["spec"]["names"]["plural"].as_str().unwrap_or("");
+    if existing_plural != new_spec.names.plural {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.names.plural is immutable (was '{existing_plural}', got '{}')",
+            new_spec.names.plural
+        )));
+    }
+    let existing_singular = existing["spec"]["names"]["singular"].as_str().unwrap_or("");
+    if existing_singular != new_spec.names.singular {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.names.singular is immutable (was '{existing_singular}', got '{}')",
+            new_spec.names.singular
+        )));
+    }
+    let existing_kind = existing["spec"]["names"]["kind"].as_str().unwrap_or("");
+    if existing_kind != new_spec.names.kind {
+        return Err(Status::unprocessable_entity(format!(
+            "{name}: spec.names.kind is immutable (was '{existing_kind}', got '{}')",
+            new_spec.names.kind
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -609,6 +659,8 @@ pub async fn replace_crd<S: Store>(
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
 
+    reject_structural_field_change(&existing, &crd.spec, &name)?;
+
     // Preserve server-assigned fields from stored copy if not present in incoming.
     if crd.metadata.uid.is_empty() || crd.metadata.creation_timestamp.is_empty() {
         if crd.metadata.uid.is_empty() {
@@ -877,6 +929,10 @@ pub async fn patch_crd<S: Store>(
     // Captured before the patch mutates `current` in place, so this reflects the CRD
     // generation the pre-patch cr_schema_cache entries were cached under.
     let (old_group, old_versions, old_rv) = crd_schema_cache_identity(&current);
+    // Snapshot the pre-patch value for reject_structural_field_change below — `current` is
+    // mutated in place by the patch application, so the stored spec.group/scope/names.* would
+    // otherwise be lost by the time we can compare against them.
+    let existing = current.clone();
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
@@ -906,6 +962,10 @@ pub async fn patch_crd<S: Store>(
     // Preserve server-assigned type meta.
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
+
+    // Reject rather than silently drop: a patch that changes a structural identity field
+    // is a client error the caller must correct, not something to merge-and-ignore.
+    reject_structural_field_change(&existing, &crd.spec, &name)?;
 
     validate_crd_schema(&crd.spec)?;
 
@@ -1952,6 +2012,119 @@ mod tests {
         assert_eq!(
             json["code"], 404,
             "PATCH on missing CRD must return 404 NotFound"
+        );
+    }
+
+    /// replace_crd must reject a PUT that changes spec.group relative to the stored CRD.
+    ///
+    /// CRs are stored under a group-and-plural-keyed prefix (see build_new_crd's storage-key
+    /// comment): if a client could silently change spec.group via PUT, every CR already stored
+    /// under the old group prefix becomes permanently unreachable — a silent data-loss-adjacent
+    /// bug, not just a validation gap. Fails on revert: without the reject_structural_field_change
+    /// call in replace_crd, this PUT (which only changes spec.group) succeeds with 200.
+    #[tokio::test]
+    async fn replace_crd_rejects_mismatched_spec_group_with_422() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let stored = state
+            .store
+            .get(&store_key(name))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored");
+        let rv = stored_val["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name, "resourceVersion": rv },
+                "spec": {
+                    "group": "other.com",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        let err = err_status(
+            replace_crd(
+                State(state),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                replace_body,
+            )
+            .await,
+        );
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "PUT changing spec.group must be rejected with 422 Invalid, not silently accepted \
+             — otherwise every CR already stored under the old group prefix is orphaned"
+        );
+    }
+
+    /// patch_crd must reject a merge-patch that changes spec.names.plural relative to the
+    /// stored CRD.
+    ///
+    /// spec.names.plural determines the storage key prefix CRs live under; a patch that changes
+    /// it must be rejected outright (422) rather than merged-and-applied, since silently
+    /// orphaning every already-stored CR under the old plural is worse than refusing the patch.
+    /// Fails on revert: without the reject_structural_field_change call in patch_crd, this
+    /// merge-patch (which only changes spec.names.plural) succeeds with 200.
+    #[tokio::test]
+    async fn patch_crd_rejects_change_to_names_plural_with_422() {
+        let state = make_state();
+        let name = "widgets.example.com";
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, "example.com", "widgets"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "names": { "plural": "gadgets" } } });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = err_status(
+            patch_crd(
+                State(state),
+                Path(name.to_string()),
+                test_user(),
+                headers,
+                patch_bytes,
+            )
+            .await,
+        );
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "merge-patch changing spec.names.plural must be rejected with 422 Invalid, not \
+             silently merged — otherwise every CR already stored under the old plural is orphaned"
         );
     }
 
