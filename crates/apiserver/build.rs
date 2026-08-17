@@ -33,6 +33,11 @@ fn main() {
     )
     .expect("failed to write generated ContainerStatus codec");
     std::fs::write(
+        out_dir.join("ephemeral_container_gen.rs"),
+        codegen::generate_ephemeral_container(descriptor_bytes),
+    )
+    .expect("failed to write generated EphemeralContainer codec");
+    std::fs::write(
         out_dir.join("pod_spec_gen.rs"),
         codegen::generate_pod_spec(descriptor_bytes),
     )
