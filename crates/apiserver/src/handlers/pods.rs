@@ -4864,21 +4864,22 @@ pub(crate) fn validate_pod_spec_immutable(
         return Ok(());
     }
 
-    // spec.nodeName is frozen once set: real Kubernetes assigns it exactly once, only via
-    // the /binding subresource (a separate RBAC verb, `create pods/binding`, precisely so
-    // that ordinary `patch`/`update pods` rights can't reassign a running pod's node).
-    // Without this, a caller holding only `patch pods` can reassign an already-scheduled
-    // pod straight to a node of their choosing, bypassing the scheduler's taints/
-    // tolerations/affinity/resource-fit checks and the pods/binding RBAC boundary entirely.
-    if let Some(old_node_name) = old_spec["nodeName"].as_str().filter(|s| !s.is_empty()) {
-        let new_node_name = new_spec["nodeName"].as_str().filter(|s| !s.is_empty());
-        if new_node_name != Some(old_node_name) {
-            return Err(
-                "spec.nodeName: Forbidden: pod nodeName is immutable once set — \
-                 reassign via the /binding subresource, not a direct spec update"
-                    .into(),
-            );
-        }
+    // spec.nodeName may only ever be assigned via the /binding subresource (a separate
+    // RBAC verb, `create pods/binding`, precisely so that ordinary `patch`/`update pods`
+    // rights can't assign or reassign a pod's node). This includes the very first
+    // assignment: a not-yet-scheduled pod (stored nodeName blank/absent) must reject a
+    // direct spec write just as much as an already-bound pod does — otherwise a caller
+    // holding only `patch pods` can steer an unscheduled pod straight to a node of their
+    // choosing, bypassing the scheduler's taints/tolerations/affinity/resource-fit checks
+    // and the pods/binding RBAC boundary entirely.
+    let old_node_name = old_spec["nodeName"].as_str().filter(|s| !s.is_empty());
+    let new_node_name = new_spec["nodeName"].as_str().filter(|s| !s.is_empty());
+    if new_node_name != old_node_name {
+        return Err(
+            "spec.nodeName: Forbidden: pod nodeName is immutable once set — \
+             reassign via the /binding subresource, not a direct spec update"
+                .into(),
+        );
     }
 
     let old_containers = old_spec["containers"]
@@ -11590,6 +11591,53 @@ mod handler_tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             "patch_pod must reject a nodeName change via ordinary `patch pods` — accepting \
              it bypasses both the scheduler and the pods/binding RBAC boundary"
+        );
+    }
+
+    /// A merge-patch PATCH setting nodeName on a pod that has never been scheduled (stored
+    /// spec.nodeName absent/blank) must be rejected exactly like the already-bound case
+    /// above. nodeName may ONLY ever be assigned via the /binding subresource — even the
+    /// very first assignment — because `create pods/binding` is a distinct, scheduler-scoped
+    /// RBAC verb from `patch pods`. Before this fix, validate_pod_spec_immutable only froze
+    /// nodeName once the STORED value was already non-blank, so a caller holding just
+    /// `patch pods` could steer a not-yet-scheduled pod straight to a node of their choosing
+    /// on the first write, bypassing the scheduler's fit/taint/affinity checks entirely.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_cannot_set_node_name_on_unscheduled_pod() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "never-scheduled-pod",
+            serde_json::json!({
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}]
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"spec": {"nodeName": "attacker-node"}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/never-scheduled-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patch_pod must reject a blank-to-set nodeName write via ordinary `patch pods` \
+             — the first assignment is exactly as security-sensitive as a reassignment, and \
+             must go through the /binding subresource"
         );
     }
 
