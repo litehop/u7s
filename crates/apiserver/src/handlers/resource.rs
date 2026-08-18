@@ -1217,6 +1217,20 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
+        // Save the stored generation so a PATCH that sets metadata.generation cannot
+        // inflate or deflate it — generation is server-managed; only increment (on spec
+        // change) is allowed, never client override. Mirrors patch_pod's stored_generation
+        // capture/restore (pods.rs). Without this, a caller with only `patch` rights could
+        // smuggle metadata.generation through the patch body: deflating it fools
+        // `kubectl rollout status`/`apply --wait` (which poll observedGeneration >=
+        // generation) into reporting a stale rollout complete, or inflating it toward
+        // i64::MAX risks overflow on a later increment.
+        let stored_generation = if super::defaults::is_workload_resource(group, plural) {
+            Some(current.body["metadata"]["generation"].clone())
+        } else {
+            None
+        };
+
         // apply-patch+yaml bodies are genuine YAML; every other patch type is JSON.
         let mut patch: serde_json::Value = if is_ssa {
             ssa_body_to_json(&body)?
@@ -1339,6 +1353,12 @@ pub(crate) async fn do_patch<S: Store>(
             .map_err(Status::unprocessable_entity)?;
 
         if let Some(ref spec_before) = spec_before_patch {
+            // Restore the stored generation before computing the increment so that a patch
+            // attempting to set metadata.generation is ignored — same restore-then-increment
+            // order as patch_pod (pods.rs).
+            if let Some(ref g) = stored_generation {
+                current.body["metadata"]["generation"] = g.clone();
+            }
             super::defaults::increment_workload_generation_if_spec_changed(
                 &mut current.body,
                 spec_before,
@@ -15212,6 +15232,214 @@ mod tests {
             "generation must increment from the true stored value (3 -> 4) when the spec \
              changes via a PUT that omits metadata.generation — resetting to 1-based counting \
              (e.g. landing at 2) desyncs status.observedGeneration from the real change history"
+        );
+    }
+
+    /// Seeds a Deployment via the generic PATCH path (do_patch, via
+    /// patch_namespaced_resource) at the given stored generation and returns the
+    /// AppState/store/key so a test can PATCH it and inspect the persisted result.
+    ///
+    /// Shared by the do_patch generation-smuggling regression tests below: each one only
+    /// differs in the patch body and expected outcome, so the setup is factored out to keep
+    /// the attack scenario itself (the interesting part) readable.
+    async fn seed_deployment_for_generation_patch_test(
+        generation: i64,
+    ) -> (
+        crate::state::AppState<u7s_store::SqliteStore>,
+        std::sync::Arc<u7s_store::SqliteStore>,
+        &'static str,
+    ) {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "gen-patch-deploy",
+                "namespace": "default",
+                "generation": generation
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "pause:3.10.1" }] }
+                }
+            },
+            "status": { "observedGeneration": generation, "replicas": 1 }
+        });
+        let key = "/registry/apps/deployments/default/gen-patch-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (state, store, key)
+    }
+
+    /// Applies a merge-patch to the seeded Deployment via the generic PATCH handler
+    /// (patch_namespaced_resource -> do_patch), returning the persisted object.
+    async fn patch_deployment_and_read_stored(
+        state: crate::state::AppState<u7s_store::SqliteStore>,
+        store: &std::sync::Arc<u7s_store::SqliteStore>,
+        key: &str,
+        patch_body: serde_json::Value,
+    ) -> serde_json::Value {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "deployments".to_string(),
+                "gen-patch-deploy".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("merge-patch Deployment must succeed, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        serde_json::from_slice(&stored.value).unwrap()
+    }
+
+    /// A spec-changing PATCH that also smuggles a LOWER metadata.generation than the stored
+    /// value must not deflate the stored generation — only increment from the true stored
+    /// value. Before the do_patch restore fix, merge_patch applied the client's
+    /// metadata.generation as an ordinary scalar overwrite, so the increment ran against the
+    /// client's value (1) instead of the stored value (100), landing at 2 instead of 101.
+    ///
+    /// This matters because a caller holding only `patch` (not `update`) rights on a
+    /// Deployment could deflate generation below (or equal to) status.observedGeneration
+    /// while changing spec: `kubectl rollout status`/`apply --wait`, which poll
+    /// `observedGeneration >= generation`, would then report a stale rollout as already
+    /// complete — a false-positive completion signal that hides an in-flight rollout.
+    #[tokio::test]
+    async fn patch_deployment_cannot_deflate_generation_via_smuggled_metadata() {
+        let (state, store, key) = seed_deployment_for_generation_patch_test(100).await;
+
+        let patch = serde_json::json!({
+            "metadata": { "generation": 1 },
+            "spec": { "replicas": 5 }
+        });
+        let v = patch_deployment_and_read_stored(state, &store, key, patch).await;
+
+        assert_eq!(
+            v["metadata"]["generation"], 101,
+            "a PATCH smuggling metadata.generation=1 on a Deployment already at generation=100 \
+             must still land at 101 (increment from the true stored value), not 2 (increment \
+             from the client-supplied value) — otherwise a caller with only `patch` rights can \
+             deflate generation below status.observedGeneration and fool rollout-status pollers \
+             into reporting an in-flight rollout as already complete"
+        );
+    }
+
+    /// A spec-changing PATCH that smuggles a HUGE metadata.generation must not inflate the
+    /// stored generation — only increment from the true stored value. Before the do_patch
+    /// restore fix, the increment ran against the client's value (999999999), landing at
+    /// 1000000000 instead of 6.
+    ///
+    /// This matters because repeated inflating PATCHes push generation toward i64::MAX; once
+    /// there, a later spec-changing PATCH/PUT would overflow the increment (panic in debug,
+    /// silently wrap negative in release), breaking every consumer's assumption that
+    /// generation only ever increases.
+    #[tokio::test]
+    async fn patch_deployment_cannot_inflate_generation_via_smuggled_metadata() {
+        let (state, store, key) = seed_deployment_for_generation_patch_test(5).await;
+
+        let patch = serde_json::json!({
+            "metadata": { "generation": 999_999_999 },
+            "spec": { "replicas": 5 }
+        });
+        let v = patch_deployment_and_read_stored(state, &store, key, patch).await;
+
+        assert_eq!(
+            v["metadata"]["generation"], 6,
+            "a PATCH smuggling metadata.generation=999999999 on a Deployment at generation=5 \
+             must still land at 6 (increment from the true stored value), not 1000000000 \
+             (increment from the client-supplied value) — otherwise a caller with only `patch` \
+             rights can push generation toward i64::MAX and risk an overflow on a later \
+             spec-changing update"
+        );
+    }
+
+    /// A spec-changing PATCH that omits metadata.generation entirely (the common case — most
+    /// patches only touch the fields they care about) must still increment from the true
+    /// stored value, exactly like the PUT case covered by
+    /// put_deployment_without_generation_increments_from_stored_value_not_reset_to_1. This is
+    /// the restore's no-op path: it must not regress the already-correct "no client value at
+    /// all" behavior while fixing the "client sent an attacker-controlled value" cases above.
+    #[tokio::test]
+    async fn patch_deployment_without_generation_increments_from_stored_value() {
+        let (state, store, key) = seed_deployment_for_generation_patch_test(42).await;
+
+        let patch = serde_json::json!({ "spec": { "replicas": 5 } });
+        let v = patch_deployment_and_read_stored(state, &store, key, patch).await;
+
+        assert_eq!(
+            v["metadata"]["generation"], 43,
+            "a spec-changing PATCH that never mentions metadata.generation must still \
+             increment from the true stored value (42 -> 43) — this is the ordinary path every \
+             `kubectl scale`/controller PATCH takes, and the generation restore fix must not \
+             regress it"
+        );
+    }
+
+    /// Defense-in-depth: even if metadata.generation somehow reaches i64::MAX (the do_patch
+    /// restore above prevents a client from getting it there via smuggling, but the increment
+    /// helper is shared by every PUT/PATCH workload path), the next spec-changing PATCH must
+    /// not wrap around to a negative generation. A negative generation would look like a
+    /// rollback to every consumer that assumes generation only increases, and
+    /// `observedGeneration >= generation` checks would behave unpredictably.
+    #[tokio::test]
+    async fn patch_deployment_generation_saturates_instead_of_overflowing() {
+        // Seeded at i64::MAX itself (not i64::MAX - 1): incrementing i64::MAX - 1 lands
+        // exactly on i64::MAX with no overflow arithmetic involved at all, so it wouldn't
+        // exercise (or regress-detect) the overflow guard. Only current == i64::MAX makes
+        // `current + 1` actually overflow.
+        let (state, store, key) = seed_deployment_for_generation_patch_test(i64::MAX).await;
+
+        let patch = serde_json::json!({ "spec": { "replicas": 5 } });
+        let v = patch_deployment_and_read_stored(state, &store, key, patch).await;
+
+        let stored_generation = v["metadata"]["generation"]
+            .as_i64()
+            .expect("generation must remain a valid i64, not wrap to something unrepresentable");
+        assert_eq!(
+            stored_generation,
+            i64::MAX,
+            "generation must saturate at i64::MAX instead of wrapping negative — a negative \
+             generation would look like a rollback to any consumer (kubectl, controllers) that \
+             assumes generation is monotonically increasing"
         );
     }
 
