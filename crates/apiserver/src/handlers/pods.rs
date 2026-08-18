@@ -4534,10 +4534,26 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
                 }
                 if let Some(env) = container["env"].as_array_mut() {
                     for var in env {
+                        // Guard: only enter if valueFrom.fieldRef already exists as an
+                        // object. `var["valueFrom"]["fieldRef"]` (IndexMut) would
+                        // autovivify `valueFrom: {fieldRef: null}` into every env var
+                        // that has no `valueFrom` at all (a plain `value: "..."` var),
+                        // corrupting the stored pod at create time — and a client's
+                        // protobuf round trip of that corruption later decodes the "no
+                        // fieldRef" state as `{}` instead of `null`, which this loop then
+                        // treats differently (is_object() true vs false), producing a
+                        // spurious "containers changed" 422 on every subsequent
+                        // annotation-only update (mayor conformance regression
+                        // 0818-1112, "[sig-node] Variable Expansion").
+                        let has_field_ref_object = var
+                            .get("valueFrom")
+                            .and_then(|vf| vf.get("fieldRef"))
+                            .is_some_and(|fr| fr.is_object());
+                        if !has_field_ref_object {
+                            continue;
+                        }
                         let field_ref = &mut var["valueFrom"]["fieldRef"];
-                        if field_ref.is_object()
-                            && (field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "")
-                        {
+                        if field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "" {
                             field_ref["apiVersion"] = serde_json::json!("v1");
                         }
                     }
@@ -5267,6 +5283,65 @@ mod pod_resources_immutability_tests {
         assert!(
             result.unwrap_err().contains("resources"),
             "the rejection must name resources as the forbidden field"
+        );
+    }
+
+    /// A plain-value env var (`value: "foo"`, no `valueFrom` at all) must survive a real
+    /// client's protobuf GET/decode-mutate-encode/PUT round trip (as an annotation-only
+    /// update performs) without being flagged as a containers change.
+    ///
+    /// Regression (Conformance run 0818-1112, "[sig-node] Variable Expansion ... should
+    /// succeed in writing subpaths in container" / "... failing subpath expansion can be
+    /// modified"): the fieldRef.apiVersion defaulting loop in `apply_pod_spec_defaults`
+    /// used naive chained JSON indexing (`var["valueFrom"]["fieldRef"]`), which
+    /// autovivifies `valueFrom: {fieldRef: null}` into *every* env var lacking a
+    /// `valueFrom` — corrupting the stored pod at create time. Encoding that corrupted
+    /// shape to protobuf (for a client's GET) and decoding a client's re-PUT of it back
+    /// produces `valueFrom: {fieldRef: {}}` instead (an empty embedded message is still
+    /// present on the wire, just not `null`), and the immutability guard's own second
+    /// defaulting pass then stamps `apiVersion: "v1"` into that `{}` shape (since `{}` is
+    /// an object) but leaves the `null` shape alone (since `null` is not an object) — so
+    /// the two sides diverge and every annotation-only update on a pod with such an env
+    /// var is rejected 422. This test exercises the real create-defaulting and
+    /// encode/decode functions rather than hand-written fixtures, so it fails on revert
+    /// regardless of which layer the fix lands in.
+    #[test]
+    fn env_var_without_value_from_survives_protobuf_round_trip() {
+        // What a client submits on create: a plain `value:` env var, no valueFrom.
+        let mut created = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "pause",
+                    "env": [{"name": "POD_NAME", "value": "foo"}]
+                }]
+            }
+        });
+        apply_pod_spec_defaults(&mut created);
+        let spec_before = created["spec"].clone();
+
+        // Simulate the e2e framework's PodClient().Update(): a fresh GET (protobuf
+        // encode of the stored spec) decoded back into the client's object, then
+        // PUT (protobuf decode on the way back into u7s) — annotations are the only
+        // thing that changes, so re-encoding/decoding the untouched spec must be a
+        // no-op for this comparison.
+        let stored_pod = serde_json::json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": spec_before.clone(),
+        });
+        let raw = crate::core_gen_adapter::encode_pod_proto_gen(&stored_pod);
+        let decoded =
+            crate::core_gen_adapter::decode_pod_proto_gen(&raw).expect("must decode back");
+        let spec_after = decoded["spec"].clone();
+
+        assert_eq!(
+            validate_pod_spec_immutable(&spec_before, &spec_after),
+            Ok(()),
+            "an env var with no real fieldRef must not be treated as changed just because \
+             its \"no fieldRef set\" representation differs (absent/null vs an empty {{}} \
+             message) between the stored copy and a protobuf-round-tripped copy — \
+             otherwise every annotation-only update on a pod with a plain-value env var \
+             is rejected 422"
         );
     }
 }
