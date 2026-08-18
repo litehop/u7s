@@ -181,6 +181,10 @@ async fn core_and_crd_groups<S: Store>(state: &AppState<S>) -> Vec<APIGroup> {
                 // (ClusterTrustBundle, PodCertificateRequest) — same GA-over-beta
                 // preference upstream kube-apiserver applies.
                 make_group(name, version, &["v1", "v1beta1"])
+            } else if *name == "coordination.k8s.io" {
+                // v1 (GA, Lease) stays preferred over v1alpha2 (LeaseCandidate,
+                // CoordinatedLeaderElection) — same GA-over-alpha preference upstream applies.
+                make_group(name, version, &["v1", "v1alpha2"])
             } else {
                 make_group(name, version, &[version])
             }
@@ -803,6 +807,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
         ("certificates.k8s.io", "v1beta1") => Some(certificates_v1beta1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
+        ("coordination.k8s.io", "v1alpha2") => Some(coordination_v1alpha2_resources()),
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
         ("events.k8s.io", "v1") => Some(events_v1_resources()),
         ("flowcontrol.apiserver.k8s.io", "v1") => Some(flowcontrol_v1_resources()),
@@ -1332,6 +1337,23 @@ fn coordination_v1_resources() -> serde_json::Value {
                 "singularName": "lease",
                 "namespaced": true,
                 "kind": "Lease",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn coordination_v1alpha2_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "coordination.k8s.io/v1alpha2",
+        "resources": [
+            {
+                "name": "leasecandidates",
+                "singularName": "leasecandidate",
+                "namespaced": true,
+                "kind": "LeaseCandidate",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]

@@ -219,7 +219,7 @@ pub(crate) async fn get_resource<S: Store>(
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -475,7 +475,7 @@ pub(crate) async fn replace_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -802,7 +802,7 @@ pub(crate) async fn delete_resource<S: Store>(
             "cannot delete bootstrap RBAC object {name}"
         )));
     }
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let body = extract_body(&body, content_type(&headers));
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
@@ -1933,7 +1933,7 @@ pub(crate) async fn patch_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -2162,7 +2162,7 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -2603,7 +2603,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -3034,7 +3034,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             "cannot delete bootstrap RBAC object {name}"
         )));
     }
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let body = extract_body(&body, content_type(&headers));
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
@@ -3270,7 +3270,7 @@ pub(crate) async fn patch_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    validate_name_for_group("name", &name, &group)?;
+    validate_name_for_group("name", &name, &group, &plural)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {

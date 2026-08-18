@@ -1,6 +1,7 @@
 use prost::Message;
 
 use u7s_proto_generated::k8s::io::api::coordination::v1 as coord_v1;
+use u7s_proto_generated::k8s::io::api::coordination::v1alpha2 as coord_v1alpha2;
 use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
 // ---- shared helpers --------------------------------------------------------
@@ -64,6 +65,53 @@ pub fn decode_lease_proto_gen_a(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(v) = spec.preferred_holder.filter(|s| !s.is_empty()) {
             spec_map.insert("preferredHolder".to_string(), serde_json::Value::String(v));
+        }
+        if !spec_map.is_empty() {
+            obj["spec"] = serde_json::Value::Object(spec_map);
+        }
+    }
+
+    Some(obj)
+}
+
+// ---- LeaseCandidate (coordination.k8s.io/v1alpha2) ----
+//
+// CoordinatedLeaderElection candidates: namespaced, spec-only (no /status subresource — see
+// upstream types.go, which declares no Status field on this type at all).
+
+pub fn decode_leasecandidate_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let candidate = coord_v1alpha2::LeaseCandidate::decode(data).ok()?;
+    let meta = gen_object_meta_to_json(candidate.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "coordination.k8s.io/v1alpha2",
+        "kind": "LeaseCandidate",
+        "metadata": meta
+    });
+
+    if let Some(spec) = candidate.spec {
+        let mut spec_map = serde_json::Map::new();
+        if let Some(v) = spec.lease_name.filter(|s| !s.is_empty()) {
+            spec_map.insert("leaseName".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(t) = spec.ping_time.as_ref() {
+            if let Some(ts) = gen_microtime_to_rfc3339(t) {
+                spec_map.insert("pingTime".to_string(), serde_json::Value::String(ts));
+            }
+        }
+        if let Some(t) = spec.renew_time.as_ref() {
+            if let Some(ts) = gen_microtime_to_rfc3339(t) {
+                spec_map.insert("renewTime".to_string(), serde_json::Value::String(ts));
+            }
+        }
+        if let Some(v) = spec.binary_version.filter(|s| !s.is_empty()) {
+            spec_map.insert("binaryVersion".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = spec.emulation_version.filter(|s| !s.is_empty()) {
+            spec_map.insert("emulationVersion".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = spec.strategy.filter(|s| !s.is_empty()) {
+            spec_map.insert("strategy".to_string(), serde_json::Value::String(v));
         }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
@@ -273,6 +321,145 @@ mod tests {
             decoded.get("spec").is_none(),
             "an unset LeaseSpec must omit `spec` entirely, not emit `spec: null` or `spec: {{}}` \
              — a present-but-empty spec could be misread as \"lease held with no identity\""
+        );
+    }
+
+    // ---- LeaseCandidate (coordination.k8s.io/v1alpha2) ----
+
+    fn make_test_leasecandidate_bytes() -> Vec<u8> {
+        let candidate = coord_v1alpha2::LeaseCandidate {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("candidate-a".to_string()),
+                namespace: Some("kube-system".to_string()),
+                resource_version: Some("42".to_string()),
+                uid: Some("cand-uid-1".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(coord_v1alpha2::LeaseCandidateSpec {
+                lease_name: Some("apiserver-leader".to_string()),
+                binary_version: Some("1.36.0".to_string()),
+                emulation_version: Some("1.35.0".to_string()),
+                strategy: Some("OldestEmulationVersion".to_string()),
+                renew_time: Some(meta_v1::MicroTime {
+                    seconds: Some(1_700_000_000),
+                    nanos: Some(123_456_000),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        candidate.encode(&mut buf).unwrap();
+        buf
+    }
+
+    /// CoordinatedLeaderElection picks a winner by comparing `leaseName`/`binaryVersion`/
+    /// `strategy` across every candidate for a Lease; if any of those three drop on decode,
+    /// the scheduler/controller-manager leader election either can't find its own candidate
+    /// object or silently applies the wrong tie-break strategy.
+    #[test]
+    fn decode_leasecandidate_proto_gen_emits_fields_leader_election_compares() {
+        let bytes = make_test_leasecandidate_bytes();
+        let decoded =
+            decode_leasecandidate_proto_gen(&bytes).expect("LeaseCandidate decode must succeed");
+
+        assert_eq!(
+            decoded["apiVersion"], "coordination.k8s.io/v1alpha2",
+            "apiVersion must be coordination.k8s.io/v1alpha2: kubectl/client-go route on it"
+        );
+        assert_eq!(decoded["kind"], "LeaseCandidate");
+        assert_eq!(decoded["metadata"]["name"], "candidate-a");
+        assert_eq!(decoded["metadata"]["namespace"], "kube-system");
+        assert_eq!(
+            decoded["spec"]["leaseName"], "apiserver-leader",
+            "leaseName must survive: it's how a candidate is matched to the Lease it contends for"
+        );
+        assert_eq!(
+            decoded["spec"]["binaryVersion"], "1.36.0",
+            "binaryVersion must survive: coordinated leader election tie-breaks on it"
+        );
+        assert_eq!(
+            decoded["spec"]["emulationVersion"], "1.35.0",
+            "emulationVersion must survive: required whenever strategy is OldestEmulationVersion"
+        );
+        assert_eq!(
+            decoded["spec"]["strategy"], "OldestEmulationVersion",
+            "strategy must survive: determines which candidate's vote wins on conflict"
+        );
+        assert!(
+            decoded["spec"]["renewTime"].is_string(),
+            "renewTime MicroTime must be emitted: garbage collection of stale candidates depends \
+             on it"
+        );
+    }
+
+    #[test]
+    fn generated_leasecandidate_spec_covers_all_proto_fields_by_construction() {
+        let spec = coord_v1alpha2::LeaseCandidateSpec {
+            lease_name: Some("x".to_string()),
+            ping_time: None,
+            renew_time: None,
+            binary_version: Some("1.0.0".to_string()),
+            emulation_version: Some("1.0.0".to_string()),
+            strategy: Some("y".to_string()),
+        };
+        let mut buf = Vec::new();
+        spec.encode(&mut buf).unwrap();
+        let decoded = coord_v1alpha2::LeaseCandidateSpec::decode(buf.as_slice()).unwrap();
+        assert_eq!(
+            decoded.strategy.as_deref(),
+            Some("y"),
+            "strategy field must survive round-trip: present in the generated struct by \
+             construction, not by authoring discipline"
+        );
+    }
+
+    // ---- Sentinel completeness: decode_leasecandidate_proto_gen ----
+    //
+    // Same rationale as `sentinel_completeness_decode_lease_proto_gen_a` above: builds a
+    // fully-populated LeaseCandidate, decodes it through the real entry point, and asserts every
+    // schema field reaches the JSON — so a field added upstream (or dropped from this adapter)
+    // fails a test instead of silently missing from kubectl's view of leader-election state.
+    #[test]
+    fn sentinel_completeness_decode_leasecandidate_proto_gen() {
+        let candidate = coord_v1alpha2::LeaseCandidate {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(coord_v1alpha2::LeaseCandidateSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        candidate.encode(&mut buf).unwrap();
+        let decoded = decode_leasecandidate_proto_gen(&buf)
+            .expect("sentinel LeaseCandidate must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(&decoded, "", &mut paths);
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
+            ".k8s.io.api.coordination.v1alpha2.LeaseCandidateSpec",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    // ---- Field-omission: decode_leasecandidate_proto_gen with an all-default LeaseCandidate ----
+    //
+    // Mirrors `decode_lease_proto_gen_a_omits_unset_fields_instead_of_emitting_null`: an unset
+    // spec must omit `spec` entirely rather than emit `spec: null`/`spec: {{}}`, since a
+    // present-but-empty spec could be misread as "candidate with no leaseName/strategy" instead
+    // of "candidate object not yet fully populated."
+    #[test]
+    fn decode_leasecandidate_proto_gen_omits_unset_fields_instead_of_emitting_null() {
+        let candidate = coord_v1alpha2::LeaseCandidate::default();
+        let mut buf = Vec::new();
+        candidate.encode(&mut buf).unwrap();
+        let decoded = decode_leasecandidate_proto_gen(&buf)
+            .expect("all-default LeaseCandidate must still decode");
+
+        assert_no_stray_nulls(&decoded, &["creationTimestamp"]);
+        assert!(
+            decoded.get("spec").is_none(),
+            "an unset LeaseCandidateSpec must omit `spec` entirely, not emit `spec: null` or \
+             `spec: {{}}`"
         );
     }
 }
