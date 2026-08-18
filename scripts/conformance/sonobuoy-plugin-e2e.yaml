@@ -2,6 +2,12 @@ podSpec:
   containers: []
   nodeSelector:
     kubernetes.io/os: linux
+  # system-cluster-critical is one of the two built-in PriorityClasses u7s
+  # resolves without needing a seeded PriorityClass object (see apiserver
+  # lib.rs's PriorityClass admission special-case) -- it keeps this pod out
+  # of the kubelet's own soft-eviction ranking during the same memory
+  # pressure that triggers the NotReady flap below.
+  priorityClassName: system-cluster-critical
   restartPolicy: Never
   serviceAccountName: sonobuoy-serviceaccount
   tolerations:
@@ -12,6 +18,20 @@ podSpec:
     operator: Exists
   - key: kubernetes.io/e2e-evict-taint-key
     operator: Exists
+  # mayor-vmye0: a memory-pressure spike under real full-suite churn can gap
+  # kubelet's NodeLease heartbeat past node-controller's node-monitor-grace-
+  # period (observed 87.1s gap vs. the 40s default), tripping the
+  # node.kubernetes.io/not-ready:NoExecute taint. Without this toleration,
+  # node-controller's TaintManager evicts this pod (the e2e-job pod itself)
+  # on a BRIEF flap, silently losing the whole run's results. 120s is longer
+  # than the observed flap but still bounded -- a genuinely dead node still
+  # gets its pod evicted and rescheduled, just not one that recovers in time.
+  # See ai/findings/mayor-jhtxe-clusterip-latency-2026-08-18.md for the full
+  # DELETE/eviction timeline.
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+    tolerationSeconds: 120
 sonobuoy-config:
   driver: Job
   plugin-name: e2e
