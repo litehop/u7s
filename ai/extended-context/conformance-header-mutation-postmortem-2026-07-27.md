@@ -250,9 +250,10 @@ verified to fail on revert.
 - Enabling tooling PR: [#906](https://github.com/valerauko/u7s/pull/906) (`mayor-tfggx`).
 - Regressing PR: #895 (`040855f1`, `feat(apiserver): structured access log with
   user_agent/latency/request_id`).
-- **Open follow-up**: `mayor-mo96q` (P3, optional, non-blocking) — root-cause the exact
-  mechanism via a minimal standalone repro. See the "Honest caveat on mechanism" section
-  above.
+- Follow-up investigation: `mayor-mo96q` (CLOSED 2026-07-28, inconclusive) and
+  `mayor-e25ge` (CLOSED 2026-07-30, inconclusive) — root-caused the exact mechanism as
+  far as time-boxed investigation could take it; see the Addendum sections above for the
+  full mechanism-narrowing writeup.
 - bd memories: `content-type-header-mutation-breaks-watch-streams`,
   `bisection-incremental-cherry-pick-technique`.
 
