@@ -193,7 +193,19 @@ provision:
       # serializeImagePulls/maxParallelImagePulls: HTTP/2 removed the pod-admission pacing that used to hide
       # the upstream-default single-worker image-pull queue's cost under 16-way conformance load (mayor-w98yt).
       # NOTE: maxParallelImagePulls has no CLI flag equivalent — it must be set here, not via kubelet ExecStart.
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\n' > /etc/kubelet-config.yaml
+      #
+      # registryPullQPS: a csi-hostpath --focus run deploys ~15-16 concurrent CSI driver
+      # StatefulSets, each with ~8 sidecar containers (csi-attacher/provisioner/resizer/
+      # snapshotter/node-driver-registrar/liveness-probe/health-monitor), landing 100+ image
+      # pull requests within the same few seconds. That burst blew past the upstream default
+      # (registryPullQPS=5, registryBurst=10) — a SEPARATE token-bucket gate from
+      # maxParallelImagePulls above: the parallelism semaphore bounds concurrent in-flight
+      # pulls, while the QPS limiter independently throttles the *rate* of pull attempts
+      # regardless of concurrency — producing 274 "ErrImagePull: pull QPS exceeded" events and
+      # 0/324 specs ever starting Setup. `0` is kubelet's own documented off-switch
+      # ("If 0, unlimited", per `kubelet --help`'s --registry-qps doc), not a magic number;
+      # maxParallelImagePulls: 10 above remains the real concurrency bound.
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\nregistryPullQPS: 0\n' > /etc/kubelet-config.yaml
       printf '[Service]\nExecStart=\nExecStart=/usr/bin/kubelet \\\n  --config=/etc/kubelet-config.yaml \\\n  --kubeconfig=/etc/kubelet-kubeconfig \\\n  --hostname-override=lima-node \\\n  --v=2\n' > /etc/systemd/system/kubelet.service.d/u7s.conf
       systemctl daemon-reload
 
