@@ -1217,6 +1217,15 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
+        // Capture the Service spec before patch: validate_service_cluster_ip_immutable
+        // (below, after the patch is applied) needs the stored clusterIP/type to reject a
+        // patch that repoints an already-allocated clusterIP onto a different address.
+        let svc_spec_before_patch = if group.is_empty() && plural == "services" {
+            Some(current.body["spec"].clone())
+        } else {
+            None
+        };
+
         // Save the stored generation so a PATCH that sets metadata.generation cannot
         // inflate or deflate it — generation is server-managed; only increment (on spec
         // change) is allowed, never client override. Mirrors patch_pod's stored_generation
@@ -1317,6 +1326,11 @@ pub(crate) async fn do_patch<S: Store>(
 
         if let Some(ref old_spec) = node_spec_before_patch {
             validate_node_spec_immutable(old_spec, &current.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        if let Some(ref old_spec) = svc_spec_before_patch {
+            validate_service_cluster_ip_immutable(old_spec, &current.body["spec"])
                 .map_err(Status::unprocessable_entity)?;
         }
 
@@ -1616,6 +1630,39 @@ fn validate_workload_spec_immutable(
         "statefulsets" => validate_statefulset_spec_immutable(old_spec, new_spec),
         _ => Ok(()),
     }
+}
+
+/// Reject a client-driven change to `spec.clusterIP` once a Service already has one
+/// allocated. Mirrors upstream's `validateUpgradeDowngradeClusterIPs`
+/// (pkg/apis/core/validation/validation.go, release-1.36): a Service's clusterIP is the
+/// exact address every in-cluster DNS record and proxy rule for that Service points to,
+/// and it's the allocator's only bookkeeping key for "this VIP is taken" — a caller with
+/// only `patch`/`update` rights on Services could otherwise repoint an existing Service's
+/// clusterIP onto an address already handed to a *different* Service, silently hijacking
+/// whatever traffic still resolves to that VIP. `maybe_allocate_cluster_ip` only ever
+/// *fills in* an empty clusterIP; nothing previously stopped a client from overwriting an
+/// already-set one.
+///
+/// Exempted, matching upstream's own "bail out for ExternalName" branch in
+/// `validateUpgradeDowngradeClusterIPs`: a transition to or from `ExternalName` on either
+/// side. ExternalName Services carry no clusterIP at all — `default_service_spec` forces
+/// the field blank whenever the (new) type is ExternalName — so there is no VIP to
+/// protect while either the stored or incoming type is ExternalName.
+fn validate_service_cluster_ip_immutable(
+    old_spec: &serde_json::Value,
+    new_spec: &serde_json::Value,
+) -> Result<(), String> {
+    let old_type = old_spec["type"].as_str().unwrap_or("ClusterIP");
+    let new_type = new_spec["type"].as_str().unwrap_or("ClusterIP");
+    if old_type == "ExternalName" || new_type == "ExternalName" {
+        return Ok(());
+    }
+    let old_ip = old_spec["clusterIP"].as_str().unwrap_or("");
+    let new_ip = new_spec["clusterIP"].as_str().unwrap_or("");
+    if old_ip == new_ip {
+        return Ok(());
+    }
+    Err("spec.clusterIP: Forbidden: field is immutable once set".into())
 }
 
 /// StatefulSet spec fields upstream leaves mutable on update (`ValidateStatefulSetUpdate`,
@@ -2508,6 +2555,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // never emits this field — must not be trusted as "not being deleted".
     let incoming_deletion_timestamp_blank = obj.body["metadata"]["deletionTimestamp"].is_null();
     let is_pvc = group.is_empty() && plural == "persistentvolumeclaims";
+    let is_service = group.is_empty() && plural == "services";
     // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
     // must be compared against the stored uid below (see stored_uid mismatch check) —
     // metadata.uid is immutable identity, not just something to fill in when absent.
@@ -2515,6 +2563,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     let (
         spec_before_replace,
         pvc_spec_before_replace,
+        svc_spec_before_replace,
         stored_status,
         stored_generation,
         stored_uid,
@@ -2587,6 +2636,15 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         } else {
             None
         };
+        // Captured pre-`apply_defaults` for the same reason as pvc_spec_before_replace above:
+        // validate_service_cluster_ip_immutable, called after apply_defaults runs on the
+        // incoming body, needs the stored spec's already-defaulted clusterIP/type to compare
+        // against.
+        let svc_spec_before_replace = if is_service {
+            parsed.as_ref().map(|v| v["spec"].clone())
+        } else {
+            None
+        };
         let status = if meta.has_status_subresource {
             parsed.as_ref().map(|v| v["status"].clone())
         } else {
@@ -2621,6 +2679,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         (
             spec,
             pvc_spec_before_replace,
+            svc_spec_before_replace,
             status,
             generation,
             uid,
@@ -2629,7 +2688,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             deletion_grace,
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None)
     };
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
@@ -2728,6 +2787,16 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // check above.
     if let Some(ref old_spec) = spec_before_replace {
         validate_workload_spec_immutable(&group, &plural, old_spec, &obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+    }
+
+    // A PUT may not repoint an already-allocated spec.clusterIP onto a different address
+    // (except across an ExternalName type transition) — see
+    // validate_service_cluster_ip_immutable. Same apply_defaults-then-compare ordering as
+    // the PVC check above; runs after maybe_allocate_cluster_ip too, since that call only
+    // fills in an empty clusterIP and never changes an already-set one.
+    if let Some(ref old_spec) = svc_spec_before_replace {
+        validate_service_cluster_ip_immutable(old_spec, &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
     }
 
@@ -19321,6 +19390,240 @@ mod tests {
             u32::from(ip) & mask,
             base & mask,
             "allocated clusterIP {ip} must be within 10.96.0.0/12"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Service spec.clusterIP immutability regression tests
+    //
+    // maybe_allocate_cluster_ip only ever fills in an empty clusterIP; before this
+    // fix nothing stopped a caller with `patch`/`update` rights from rewriting an
+    // already-allocated clusterIP onto a different address — e.g. one already
+    // handed to a different Service — silently hijacking whatever DNS/proxy
+    // routing still points at that VIP. If validate_service_cluster_ip_immutable
+    // is removed or its call sites are dropped, these tests fail.
+    // ---------------------------------------------------------------------------
+
+    /// PATCH changing an already-allocated Service.spec.clusterIP to a different
+    /// address must return 422, not silently rewrite the VIP.
+    #[tokio::test]
+    async fn patch_service_rejects_cluster_ip_change() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/12");
+        let ns = "default";
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "cip-svc", "namespace": ns },
+            "spec": { "type": "ClusterIP", "clusterIP": "10.96.0.5", "ports": [{ "port": 80 }] }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), ns.into(), "services".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .expect("Service create with static clusterIP must succeed");
+
+        let patch = serde_json::json!({ "spec": { "clusterIP": "10.96.0.99" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                ns.into(),
+                "services".into(),
+                "cip-svc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH rewriting an already-allocated clusterIP to a different address must \
+                 return 422 — a caller with only `patch services` rights could otherwise \
+                 repoint the VIP onto an address already allocated to a different Service"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing spec.clusterIP from 10.96.0.5 to 10.96.0.99 must be rejected — \
+                 accepting it lets any patch-services caller collide a Service's VIP with \
+                 another Service's allocated address"
+            ),
+        }
+    }
+
+    /// PUT changing an already-allocated Service.spec.clusterIP to a different
+    /// address must return 422 — same protection, PUT path.
+    #[tokio::test]
+    async fn replace_service_rejects_cluster_ip_change() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/12");
+        let ns = "default";
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "cip-put-svc", "namespace": ns },
+            "spec": { "type": "ClusterIP", "clusterIP": "10.96.0.6", "ports": [{ "port": 80 }] }
+        });
+        let create_resp = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), ns.into(), "services".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .expect("Service create with static clusterIP must succeed")
+        .into_response();
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let rv = created["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        let replacement = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "cip-put-svc", "namespace": ns, "resourceVersion": rv },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.96.0.199",
+                "ports": [{ "port": 80 }]
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                ns.into(),
+                "services".into(),
+                "cip-put-svc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&replacement).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT rewriting an already-allocated clusterIP to a different address must \
+                 return 422 — the same VIP-collision risk as the PATCH path"
+            ),
+            Ok(_) => panic!(
+                "PUT changing spec.clusterIP from 10.96.0.6 to 10.96.0.199 must be rejected — \
+                 a full replace is not an escape hatch around clusterIP immutability"
+            ),
+        }
+    }
+
+    /// PATCH changing spec.clusterIP is exempted from the immutability check when the
+    /// Service is transitioning to/from ExternalName.
+    ///
+    /// ExternalName Services carry no clusterIP at all — apply_defaults unconditionally
+    /// clears the field for that type — so there is no VIP to protect against collision
+    /// while either the stored or incoming type is ExternalName. This mirrors upstream's
+    /// `validateUpgradeDowngradeClusterIPs`, which bails out entirely for ExternalName on
+    /// either side. If the exemption regresses, ordinary type-transition patches (e.g. the
+    /// conformance test flow that flips a Service to ExternalName) start failing with 422
+    /// instead of completing the transition.
+    #[tokio::test]
+    async fn patch_service_allows_cluster_ip_change_during_externalname_transition() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/12");
+        let ns = "default";
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "cip-extname-svc", "namespace": ns },
+            "spec": { "type": "ClusterIP", "clusterIP": "10.96.0.7", "ports": [{ "port": 80 }] }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), ns.into(), "services".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .expect("Service create with static clusterIP must succeed");
+
+        // Transition to ExternalName while ALSO explicitly changing clusterIP in the same
+        // patch — this is the exact combination that would trip the immutability check
+        // were it not exempted for an ExternalName transition.
+        let patch = serde_json::json!({
+            "spec": {
+                "type": "ExternalName",
+                "externalName": "my.external.host.example.com",
+                "clusterIP": "10.96.0.177"
+            }
+        });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let resp = patch_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                ns.into(),
+                "services".into(),
+                "cip-extname-svc".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("PATCH transitioning a Service to ExternalName must succeed: {e:?}")
+        })
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["type"], "ExternalName",
+            "the type transition itself must have applied"
+        );
+        assert_eq!(
+            v["spec"]["clusterIP"],
+            serde_json::Value::String(String::new()),
+            "an ExternalName Service must end up with clusterIP cleared, matching \
+             default_service_spec, regardless of what clusterIP value the transitioning \
+             patch carried"
         );
     }
 
