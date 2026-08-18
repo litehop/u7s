@@ -47,7 +47,7 @@ subtle      = "2"
 reqwest     = { version = "0.13", features = ["stream", "rustls"], default-features = false }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 boon            = "0.6"
-yaml-rust2      = "0.11"
+yaml-rust2      = "0.12"
 prost           = "0.14"
 hmac            = "0.13"
 sha2            = "0.11"
