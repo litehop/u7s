@@ -170,7 +170,11 @@ pub fn increment_workload_generation_if_spec_changed(
 ) {
     if obj["spec"] != *spec_before {
         let current = obj["metadata"]["generation"].as_i64().unwrap_or(1);
-        obj["metadata"]["generation"] = serde_json::json!(current + 1);
+        // Defense-in-depth: callers restore the stored generation before reaching here, but
+        // saturate instead of wrapping/panicking on overflow so a value that somehow arrives
+        // near i64::MAX (a bug elsewhere, not a client-controlled path) can't wrap negative and
+        // break every consumer's monotonicity assumption.
+        obj["metadata"]["generation"] = serde_json::json!(current.saturating_add(1));
     }
 }
 
