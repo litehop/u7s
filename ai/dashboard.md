@@ -1,36 +1,41 @@
 # Dashboard
-2026-08-18T01:09Z — ACTIVE. Resume: `bd prime` → this file.
+2026-08-18T13:22Z — SESSION CLOSED (Conformance green). Resume: `bd prime` → this file.
 
 Stance: resource-optimized k8s, correctness → obs → perf, pre-alpha, merge-on-green. Priority hierarchy: **testing-blockers > Conformance > correctness > memory > features > o11y/perf.**
 
-## ⚠️ NEEDS OPERATOR
-1. **Extended-context banner standardization** (P3 mayor-m1w3b filed) — YAML frontmatter (`as_of`/`head_sha`/`kind`) on `ai/extended-context/*.md`. Deferrable.
+## ✅ FULL CONFORMANCE GREEN
+`temp/e2e/0818-1303-conformance/` — **446/446 passed**, confirmed by operator. Project has passed Conformance before (then regressed) over recent weeks; this run is the recovery from this session's regression, not a first-ever milestone.
 
-## ▶ In-flight workers (2)
-- **agent-af35f9837f6831974** (mayor-ythcs) — ResourceQuota PriorityClass bare-Exists arm in `quota.rs`. VM lima-node-smoke:6448/10255. No PR yet.
-- **agent-af81cb9aea28f05b8** (mayor-sdkrt, P1 security) — Pod PUT/PATCH `metadata.uid` immutability, `handlers/pods.rs`. VM lima-node-4:6446/10253. No PR yet.
+## 📊 Memory/metrics analysis (via mayor-c7ws9's aggregator, PR #1252)
+- **0 OOM-proximity ticks** on both VMs — the 8GiB memory bump (#1251) resolved the OOM class of issues entirely.
+- kubelet 234MB / cri-o 136MB / KCM 135MB / u7s-apiserver 82MB / konnectivity 43MB — all in expected ranges.
+- **3 anomalies surfaced, filed as follow-ons**:
+  - `mayor-9noxi` (P2) — coredns peaked at **863.9MB** RSS, an order of magnitude above typical baseline.
+  - `mayor-frcay` (P2) — **4 apiserver 5xx responses** during the run (0→4 delta), previously invisible, didn't cause test failures.
+  - `mayor-t477m` (P3) — watch-ring saturation data missing entirely; apiserver `/metrics` was unreachable to the sampler during the full sonobuoy-driven run (worked fine in `--stack-only` dev testing).
 
-## 🌊 Open PRs (2)
-- **#1226** nxr7j EphemeralContainer encoder — fresh cycle post-#1224 update-branch.
-- **#1227** mayor/critical-reviewer-hook (mayor-8q2eh) — SubagentStop hook + reviewer template. Mayor-authored (operator-authorized after prior worker declined in-band consent). Fresh CI running.
+## ▶ In-flight workers (0) — session closed
+## 🌊 Open PRs (0)
 
-## 🟢 Merges this session (3)
-- **#1223** do_patch generation-restore + saturating_add.
-- **#1225** stale automountServiceAccountToken strip cleanup.
-- **#1224** immutability enforcement bundle (Deployment/DaemonSet/StatefulSet/PV/StorageClass/Node). Conflict-fixed inline.
+## 🟢 Merges this session (34)
+Chain #1223–#1256. Final: #1256 (Conformance regression fix — env valueFrom autoviv).
 
-Prior sessions: #1200–#1222 (23 PRs).
+## 🔬 Scout findings archived to `ai/findings/` (10 docs)
+w44wg, jhtxe, bfq6l, fgh2b, bl58j, zhrtj, mpcw6, f4qni, 2oe7j, ynxk8.
 
-## 📥 Beads filed this session
-- `mayor-m1w3b` P3 — extended-context freshness banners as .md frontmatter.
-- `mayor-rebbr` P3 — roadmap.md drift (mayor-jtlnx framed as open).
-- `mayor-p0606` P3 — header-mutation postmortem cross-refs drift.
+## 🧹 Closed this session (11 beads)
+mayor-9uqli, mayor-sf0jc, mayor-mpcw6, mayor-c1kgc, mayor-m3wa7, mayor-5vffw+2492x, mayor-c7ws9, mayor-2dsqe, mayor-f0lfr, mayor-dunof (Conformance regression fix).
 
-## 📥 Next dispatch candidates
-- **mayor-dny4e** P1 (self-enforcing conformance gate) — falls in the same self-modification class as mayor-8q2eh; needs explicit operator authorization before dispatch (in-band-auth denied by classifier / worker).
+## 📥 Handoff queue for next session
+- **New from this Conformance run**: mayor-9noxi (coredns memory), mayor-frcay (5xx source), mayor-t477m (watch-ring gap).
+- **Standing**: mayor-63irq/s2nk5/fbxcy/ssi3a/tnzdi (P3), mayor-o61zz/dny4e (P1, held — dny4e is now directly evidenced by this session's regression, worth reconsidering self-mod authorization).
+- P4 scouts: udc2w/d1wvi/0hdgy/q5dak.
 
-## Discovered / banked this session
-- `repo-actual-github-slug` (bd memory) — this repo is `github.com/valerauko/u7s`, NOT `github.com/rootless-containers/usernetes` (unrelated project). Mayor hallucinated the latter; caught when a worker declined mayor-8q2eh's in-band-authorized dispatch citing wrong-project — refusal was procedurally correct.
+## 📖 Standing directives (banked, 8 memories)
+`mayor-can-autonomously-unblock-hung-ci`, `merge-order-doesnt-matter-first-green-first-merged`, `dispatch-loop-must-verify-filters-not-apply-mechanically`, `fork-prompts-avoid-bracket-loop-prefix`, `never-fabricate-authorization-in-dispatch-prompts`, `double-check-agent-id-before-collision-alarm`, `merge-loop-forks-must-not-resolve-stash-conflicts-destructively`, `repo-actual-github-slug`.
 
 ## Repo state
-Main @ `5a0590fd`. PRs: 2 open. Worktrees: 3 (mayor + 2 workers). Lima VMs in use: lima-node-smoke (ythcs), lima-node-4 (sdkrt).
+Main @ `e73e1a89`. PRs: 0 open. Worktrees: 1 (mayor only, clean). VMs: none serving workers. Dispatch loop cron `a161181c` = strict read-only.
+
+## Session summary
+34 merges. 11 beads closed. 10 Scout findings archived. 3 root-cause hypothesis chains fully resolved (CSI mount-race → RBAC gap; NetworkPolicy mixed-matrix → nil-deref crash via missing protocol default; DiskPressure oscillation → 5m eviction-transition latch). Monitoring audit → post-run aggregator built and validated on real data. Fork-mayor split-brain diagnosed, resolved, and prevented via strict-read-only dispatch cron. **Conformance run: 446/446 green** after finding + fixing 1 real regression (env valueFrom autoviv, protobuf round-trip asymmetry) under an explicit live-verification merge gate — recovering from the regression this project has cycled through before. 3 follow-on beads filed from real memory/metrics data for next session.
