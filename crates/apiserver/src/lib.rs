@@ -1459,6 +1459,13 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:monitoring — read-only access to health/metrics endpoints.
+    // Upstream also advertises "/metrics/slis" plus "/livez/*","/readyz/*","/healthz/*"
+    // (per-healthcheck subpaths). Neither is advertised here: we have no healthz
+    // checker framework (our /healthz, /readyz, /livez handlers are unconditional
+    // "ok", not a set of named checks), so there is no SLI data to back a
+    // "/metrics/slis" route — advertising it in RBAC without a route would be a
+    // 404 trap for any caller who reads this ClusterRole and expects the endpoint
+    // to exist.
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(GROUP, "clusterroles", None, "system:monitoring");
     let body = serde_json::json!({
@@ -1466,7 +1473,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:monitoring", "uid": "00000000-0000-0000-0000-000000000026", "creationTimestamp": TS },
         "rules": [
-            { "nonResourceURLs": ["/metrics","/metrics/slis","/healthz","/readyz","/livez"], "verbs": ["get"] }
+            { "nonResourceURLs": ["/metrics","/healthz","/readyz","/livez"], "verbs": ["get"] }
         ]
     });
     put!(key, body, "system:monitoring", "ClusterRole");
@@ -4917,6 +4924,53 @@ mod tests {
             "ClusterRoleBinding must reference system:basic-user role"
         );
         assert_eq!(bu_bind["roleRef"]["kind"].as_str(), Some("ClusterRole"));
+    }
+
+    #[tokio::test]
+    async fn system_monitoring_role_does_not_grant_metrics_slis() {
+        // Upstream's system:monitoring ClusterRole advertises "/metrics/slis", but we have
+        // no healthz-checker framework behind it (our /healthz, /readyz, /livez handlers are
+        // unconditional "ok", not a set of named checks producing per-check SLI data), so no
+        // axum route ever serves it. If "/metrics/slis" were listed here, any caller who reads
+        // this ClusterRole and is granted "get" on it would be RBAC-authorized for an endpoint
+        // that 404s on every request — a silent over-promise. This test pins the ClusterRole to
+        // only what we actually serve; if it starts failing, someone re-added the dangling grant
+        // (or, if a route for /metrics/slis now exists, this test's assumption should be revisited
+        // together with re-adding the grant).
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let key = keys::group_object_key(GROUP, "clusterroles", None, "system:monitoring");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "ClusterRole system:monitoring must exist after seeding"
+        );
+        let cr: serde_json::Value =
+            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+        let non_resource_urls: Vec<&str> = cr["rules"]
+            .as_array()
+            .expect("rules must be an array")
+            .iter()
+            .flat_map(|r| {
+                r["nonResourceURLs"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            !non_resource_urls.contains(&"/metrics/slis"),
+            "system:monitoring must not advertise /metrics/slis — no axum route serves it, so \
+             granting it here would let RBAC promise an endpoint that 404s for every caller"
+        );
+        assert!(
+            non_resource_urls.contains(&"/metrics"),
+            "system:monitoring must still grant /metrics — that route does exist and is the \
+             ClusterRole's whole purpose"
+        );
     }
 
     #[tokio::test]
