@@ -1,42 +1,36 @@
 # Dashboard
-2026-08-15T00:36Z — Mayor session on CLI. **2 workers active, 0 open PRs.** Resume: `bd prime` → this file.
+2026-08-18T01:09Z — ACTIVE. Resume: `bd prime` → this file.
 
-Stance: resource-optimized k8s, correctness → obs → perf, pre-alpha, merge-on-green.
+Stance: resource-optimized k8s, correctness → obs → perf, pre-alpha, merge-on-green. Priority hierarchy: **testing-blockers > Conformance > correctness > memory > features > o11y/perf.**
 
-## ▶ IN PROGRESS (2 workers, both VM-heavy, dispatched pre-agent-md-fix)
-- **mayor-pxae4** — RuntimeClass e2e coverage scout under cri-o. VM `lima-node-2` / port 6444 / kubelet 10251.
-- **mayor-lry4o** — PodDisruptionBudget e2e coverage scout. VM `lima-node-4` / port 6446 / kubelet 10253. Also a datapoint for mayor-3g1ft (lima-node-4 network-loss watch) if it hits.
+## ⚠️ NEEDS OPERATOR
+1. **Extended-context banner standardization** (P3 mayor-m1w3b filed) — YAML frontmatter (`as_of`/`head_sha`/`kind`) on `ai/extended-context/*.md`. Deferrable.
 
-Also a low-concurrency stress test of the just-recreated shared `usernet` daemon (mayor-o61zz P1 workaround verification).
+## ▶ In-flight workers (2)
+- **agent-af35f9837f6831974** (mayor-ythcs) — ResourceQuota PriorityClass bare-Exists arm in `quota.rs`. VM lima-node-smoke:6448/10255. No PR yet.
+- **agent-af81cb9aea28f05b8** (mayor-sdkrt, P1 security) — Pod PUT/PATCH `metadata.uid` immutability, `handlers/pods.rs`. VM lima-node-4:6446/10253. No PR yet.
 
-## 👀 Watch — agent-md MCP fix (operator-applied, needs verification)
-Operator added MCP tools to `worker.md` + `researcher.md` line 6 (`mcp__mcpls,mcp__lima-node*`). **Two caveats surfaced:**
-1. `researcher.md` has a single-underscore typo: `mcp_lima-node*` (should be `mcp__lima-node*` like `worker.md`). Won't match anything — trivial one-char fix pending.
-2. Worker toolsets are sealed from Agent-launch time, so the two in-flight workers above do NOT retroactively gain MCP. Next dispatch will be the verification — and only then if agent md hot-reloads without a session restart (unverified; operator flagged).
+## 🌊 Open PRs (2)
+- **#1226** nxr7j EphemeralContainer encoder — fresh cycle post-#1224 update-branch.
+- **#1227** mayor/critical-reviewer-hook (mayor-8q2eh) — SubagentStop hook + reviewer template. Mayor-authored (operator-authorized after prior worker declined in-band consent). Fresh CI running.
 
-## 🧠 Memories this session
-- `mcpls-lsp-unavailable-in-worker-worktrees-project-trust-not-warmup` — updated in place: RESOLVED, actual root cause was worker.md allowlist (not project-trust). Verification pending on next dispatch.
-- `e2e-test-has-no-kube-api-qps-flag` — hardcoded 20/50 QPS in conformance image.
-- `crd-delete-watch-teardown-not-urgent-timeoutseconds-is-the-recovery-path` — `timeoutSeconds` drives Reflector relist to the existing 410 tombstone path.
+## 🟢 Merges this session (3)
+- **#1223** do_patch generation-restore + saturating_add.
+- **#1225** stale automountServiceAccountToken strip cleanup.
+- **#1224** immutability enforcement bundle (Deployment/DaemonSet/StatefulSet/PV/StorageClass/Node). Conflict-fixed inline.
 
-## ✅ merged this session
-- **#1189 → `4194974f`** (renovate: uuid → v1.24.1).
-- **#1188 → `b38bacf0`** (mayor-9n1s7-side-fix: NetworkPolicy endPort validation).
+Prior sessions: #1200–#1222 (23 PRs).
 
-## Recently closed
-- **mayor-0g968** (mcpls scout) — verdict superseded; real cause was worker.md allowlist.
-- **mayor-qlnxh** (e2e QPS scout) — deferred.
-- **mayor-m5gjv** (CRD-delete watch-teardown scout) — deferred.
+## 📥 Beads filed this session
+- `mayor-m1w3b` P3 — extended-context freshness banners as .md frontmatter.
+- `mayor-rebbr` P3 — roadmap.md drift (mayor-jtlnx framed as open).
+- `mayor-p0606` P3 — header-mutation postmortem cross-refs drift.
 
-## Queued (not dispatched)
-- **mayor-fgh2b** (P1, blocked-by o61zz cleared) — dstIP NetworkPolicy bisect.
-- **mayor-bfq6l / ejm5s / 5v9gl / w44wg** — P2 heavy scouts (VM).
-- **mayor-53fir / w6oeb / ud31w / moejy / j0g9u / 8n64y** — P3 e2e-coverage scouts (VM).
-- **mayor-n62ww / gnf1o** — codegen Phases 3/4 (large, split-or-hold pending).
+## 📥 Next dispatch candidates
+- **mayor-dny4e** P1 (self-enforcing conformance gate) — falls in the same self-modification class as mayor-8q2eh; needs explicit operator authorization before dispatch (in-band-auth denied by classifier / worker).
+
+## Discovered / banked this session
+- `repo-actual-github-slug` (bd memory) — this repo is `github.com/valerauko/u7s`, NOT `github.com/rootless-containers/usernetes` (unrelated project). Mayor hallucinated the latter; caught when a worker declined mayor-8q2eh's in-band-authorized dispatch citing wrong-project — refusal was procedurally correct.
 
 ## Repo state
-Main at `4194974f`. Worktrees: 3 (mayor + 2 workers). Open PRs: 0. VMs: 2 provisioning (lima-node-2, lima-node-4). Uncommitted: `.claude/agents/worker.md`, `.claude/agents/researcher.md` (operator's MCP fix, not committed yet).
-
-## Live docs
-- ADRs: [`network-policy-engine`](docs/decisions/network-policy-engine.md) · [`proto-adapter-codegen`](docs/decisions/proto-adapter-codegen.md)
-- Findings: [`t6mh5`](ai/findings/t6mh5-e2e-suite-taxonomy-2026-08-14.md) · [`9n1s7`](ai/findings/9n1s7-netpol-enforcement-bisect-2026-08-14.md)
+Main @ `5a0590fd`. PRs: 2 open. Worktrees: 3 (mayor + 2 workers). Lima VMs in use: lima-node-smoke (ythcs), lima-node-4 (sdkrt).
