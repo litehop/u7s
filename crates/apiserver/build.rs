@@ -107,6 +107,46 @@ fn main() {
         codegen::generate_event(descriptor_bytes),
     )
     .expect("failed to write generated Event codec");
+    std::fs::write(
+        out_dir.join("node_spec_gen.rs"),
+        codegen::generate_node_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated NodeSpec codec");
+    std::fs::write(
+        out_dir.join("node_status_gen.rs"),
+        codegen::generate_node_status(descriptor_bytes),
+    )
+    .expect("failed to write generated NodeStatus codec");
+    std::fs::write(
+        out_dir.join("node_gen.rs"),
+        codegen::generate_node(descriptor_bytes),
+    )
+    .expect("failed to write generated Node codec");
+    std::fs::write(
+        out_dir.join("persistentvolume_spec_gen.rs"),
+        codegen::generate_persistentvolume_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated PersistentVolumeSpec codec");
+    std::fs::write(
+        out_dir.join("persistentvolume_status_gen.rs"),
+        codegen::generate_persistentvolume_status(descriptor_bytes),
+    )
+    .expect("failed to write generated PersistentVolumeStatus codec");
+    std::fs::write(
+        out_dir.join("persistentvolume_gen.rs"),
+        codegen::generate_persistentvolume(descriptor_bytes),
+    )
+    .expect("failed to write generated PersistentVolume codec");
+    std::fs::write(
+        out_dir.join("persistentvolumeclaim_spec_gen.rs"),
+        codegen::generate_persistentvolumeclaim_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated PersistentVolumeClaimSpec codec");
+    std::fs::write(
+        out_dir.join("persistentvolumeclaim_status_gen.rs"),
+        codegen::generate_persistentvolumeclaim_status(descriptor_bytes),
+    )
+    .expect("failed to write generated PersistentVolumeClaimStatus codec");
 
     println!(
         "cargo:rerun-if-changed={}",

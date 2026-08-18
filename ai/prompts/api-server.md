@@ -1346,20 +1346,31 @@ Without pagination, a `list` of 10,000 Pods serializes all 10,000 objects into a
 
 ### Tokio worker threads
 
-Set `worker_threads(2)` for the control plane target (1 shared vCPU). Use `thread_stack_size(512 * 1024)` to reduce stack RSS. At 2 threads × 512 KB = 1 MB stack vs default 2 threads × 8 MB = 16 MB.
+Do not hardcode `worker_threads(2)` unconditionally: a static value tuned for the
+control plane's 1-shared-vCPU footprint target becomes a self-imposed bottleneck the
+moment the same binary runs on a many-core host (e.g. local dev / conformance
+testing), starving the TCP accept loop and TLS handshakes behind other scheduled work
+under sustained concurrent load even while idle CPU cores sit unused. Scale to
+`std::thread::available_parallelism()`, floored at `2` to preserve the footprint
+target on a genuinely single/few-core host:
 
 ```rust
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() { ... }
-// Or via builder:
+fn runtime_worker_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(2)
+}
+
 tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(2)
+    .worker_threads(runtime_worker_threads())
     .thread_stack_size(512 * 1024)
     .enable_all()
     .build()
     .unwrap()
     .block_on(async_main());
 ```
+
+Still use `thread_stack_size(512 * 1024)` to reduce stack RSS per thread (512 KB vs
+tokio's 8 MB default) — that reduction scales with thread count regardless of how
+many threads are provisioned.
 
 ### Memory allocator
 
