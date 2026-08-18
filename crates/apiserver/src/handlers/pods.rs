@@ -587,6 +587,8 @@ pub(crate) async fn create_pod<S: Store>(
     // webhooks see the fully-defaulted object, matching upstream ordering.
     apply_pod_spec_defaults(&mut obj.body);
     validate_pod_sysctls(&obj.body).map_err(Status::unprocessable_entity)?;
+    super::defaults::validate_pod_certificate_projections(&obj.body)
+        .map_err(Status::unprocessable_entity)?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds.

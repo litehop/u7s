@@ -101,7 +101,8 @@ pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::statu
     Ok(())
 }
 
-/// Validate a resource name, allowing colons for RBAC resources.
+/// Validate a resource name, allowing colons for RBAC resources and for
+/// signer-scoped ClusterTrustBundle names.
 ///
 /// RBAC resources (ClusterRole, ClusterRoleBinding, Role, RoleBinding) use
 /// colons in names by Kubernetes convention (e.g. `system:node`,
@@ -112,6 +113,7 @@ pub(crate) fn validate_name_for_group(
     label: &str,
     value: &str,
     group: &str,
+    plural: &str,
 ) -> Result<(), crate::status::StatusError> {
     if group == RBAC_GROUP && value.contains(':') {
         // For RBAC names with colons, apply the same checks except the charset check.
@@ -131,7 +133,53 @@ pub(crate) fn validate_name_for_group(
         }
         return Ok(());
     }
+    if group == CERTIFICATES_GROUP && plural == CLUSTER_TRUST_BUNDLES_PLURAL && value.contains(':')
+    {
+        return validate_cluster_trust_bundle_name(label, value);
+    }
     validate_name(label, value)
+}
+
+const CERTIFICATES_GROUP: &str = "certificates.k8s.io";
+const CLUSTER_TRUST_BUNDLES_PLURAL: &str = "clustertrustbundles";
+
+/// Validate a signer-scoped ClusterTrustBundle name of the form
+/// `<signerName-with-'/'-replaced-by-':'>:<suffix>`.
+///
+/// Upstream's `ValidateClusterTrustBundleName` (apimachinery
+/// `pkg/apis/core/validation/names.go`) requires the name to have prefix
+/// `strings.ReplaceAll(signerName, "/", ":") + ":"` when `spec.signerName` is set — e.g.
+/// signer `example.com/my-signer` may own a bundle named
+/// `example.com:my-signer:primary-bundle`. This path-parameter validator (used by every
+/// GET/PUT/PATCH/DELETE-by-name handler) only ever sees the bare name, not the object's
+/// `spec.signerName`, so it cannot check the exact prefix match — but it can still reject
+/// path traversal and garbage input by requiring every `:`-delimited segment to itself be
+/// a valid DNS-label-safe segment, exactly like the full name would be without colons.
+///
+/// Without this exception, upstream's own e2e hermetic pod-certificate signer (which
+/// creates bundles named exactly this way) gets a 400 on its very first `Get()` call —
+/// before it ever reaches `Create()` — because the pre-existing generic charset check
+/// (`[a-z0-9.-]+`, no colons) rejects the name outright.
+fn validate_cluster_trust_bundle_name(
+    label: &str,
+    value: &str,
+) -> Result<(), crate::status::StatusError> {
+    if value.is_empty() || value.len() > 253 {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must be 1–253 characters",
+            value
+        )));
+    }
+    if value.contains('/') || value.contains("..") {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must not contain '/' or '..'",
+            value
+        )));
+    }
+    for segment in value.split(':') {
+        validate_name(label, segment)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2210,21 +2258,22 @@ mod resolve_name_tests {
     #[test]
     fn validate_name_for_group_allows_colon_in_rbac_names() {
         assert!(
-            validate_name_for_group("name", "system:node", RBAC_GROUP).is_ok(),
+            validate_name_for_group("name", "system:node", RBAC_GROUP, CLUSTER_ROLES).is_ok(),
             "system:node must be valid for RBAC group — colon is conventional in RBAC names"
         );
         assert!(
             validate_name_for_group(
                 "name",
                 "svcaccounts-9027-system:service-account-issuer-discovery",
-                RBAC_GROUP
+                RBAC_GROUP,
+                CLUSTER_ROLE_BINDINGS,
             )
             .is_ok(),
             "user-created CRB name with embedded colon must be valid for RBAC — \
              the OIDC conformance test creates and then deletes such bindings"
         );
         assert!(
-            validate_name_for_group("name", "system:node", "").is_err(),
+            validate_name_for_group("name", "system:node", "", "pods").is_err(),
             "system:node must be REJECTED for non-RBAC groups — colons are only allowed in RBAC"
         );
     }
@@ -2233,12 +2282,85 @@ mod resolve_name_tests {
     #[test]
     fn validate_name_for_group_rejects_path_traversal_in_rbac() {
         assert!(
-            validate_name_for_group("name", "system:../../secrets", RBAC_GROUP).is_err(),
+            validate_name_for_group("name", "system:../../secrets", RBAC_GROUP, CLUSTER_ROLES)
+                .is_err(),
             "path traversal via '..' must be rejected even for RBAC group"
         );
         assert!(
-            validate_name_for_group("name", "system:/secrets", RBAC_GROUP).is_err(),
+            validate_name_for_group("name", "system:/secrets", RBAC_GROUP, CLUSTER_ROLES).is_err(),
             "slash must be rejected even for RBAC group"
+        );
+    }
+
+    // -- validate_name_for_group: ClusterTrustBundle signer-scoped names --
+
+    /// Upstream's own e2e hermetic pod-certificate signer creates ClusterTrustBundle
+    /// objects named `<signerName-with-'/'-as-':'>:<suffix>` (e.g.
+    /// `e2e.example.com:projected-podcertificate-3533:primary-bundle`) and immediately
+    /// `Get()`s that name before ever calling `Create()`. Before this fix, that `Get()`
+    /// hit the generic `[a-z0-9.-]+` charset check (no colons) and returned 400 — so the
+    /// signer never got past its very first API call, and every "Projected PodCertificate"
+    /// conformance spec that depends on it timed out waiting for a certificate that was
+    /// never issued.
+    #[test]
+    fn validate_name_for_group_allows_signer_scoped_colon_name_for_cluster_trust_bundle() {
+        assert!(
+            validate_name_for_group(
+                "name",
+                "e2e.example.com:projected-podcertificate-3533:primary-bundle",
+                CERTIFICATES_GROUP,
+                CLUSTER_TRUST_BUNDLES_PLURAL,
+            )
+            .is_ok(),
+            "a signer-scoped ClusterTrustBundle name must be accepted so the e2e hermetic \
+             signer's Get()-before-Create() call doesn't 400 before it ever runs"
+        );
+    }
+
+    /// A colon-containing name must still be rejected for every OTHER resource type —
+    /// the exception is scoped exactly to certificates.k8s.io/clustertrustbundles, not a
+    /// blanket relaxation of the charset check.
+    #[test]
+    fn validate_name_for_group_rejects_colon_name_for_non_cluster_trust_bundle_resource() {
+        assert!(
+            validate_name_for_group(
+                "name",
+                "e2e.example.com:signer:bundle",
+                CERTIFICATES_GROUP,
+                "podcertificaterequests",
+            )
+            .is_err(),
+            "the colon exception must not leak to other certificates.k8s.io resource types"
+        );
+    }
+
+    /// A name that merely happens to contain a colon isn't automatically valid: each
+    /// `:`-delimited segment must still pass the ordinary DNS-label charset check — a
+    /// stray `!` (or any other invalid character) anywhere in the name must still 400,
+    /// regardless of which signer supposedly owns it.
+    #[test]
+    fn validate_name_for_group_rejects_invalid_chars_in_cluster_trust_bundle_name_regardless_of_signer(
+    ) {
+        assert!(
+            validate_name_for_group(
+                "name",
+                "random-invalid-chars!",
+                CERTIFICATES_GROUP,
+                CLUSTER_TRUST_BUNDLES_PLURAL,
+            )
+            .is_err(),
+            "garbage characters must be rejected even with no signer prefix at all"
+        );
+        assert!(
+            validate_name_for_group(
+                "name",
+                "example.com:signer:random-invalid-chars!",
+                CERTIFICATES_GROUP,
+                CLUSTER_TRUST_BUNDLES_PLURAL,
+            )
+            .is_err(),
+            "garbage characters in the suffix segment must be rejected even when the \
+             signer-prefix segments are otherwise well-formed"
         );
     }
 }

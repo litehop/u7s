@@ -257,6 +257,54 @@ pub(crate) fn validate_pod_certificate_request_spec(
         )));
     }
 
+    validate_max_expiration_seconds(&spec)?;
+
+    Ok(())
+}
+
+/// Validate `spec.maxExpirationSeconds`, mirroring upstream's
+/// `ValidatePodCertificateRequestCreate` (pkg/apis/certificates/validation/validation.go):
+/// the field is `+required`, and bounded to `[MinMaxExpirationSeconds,
+/// MaxMaxExpirationSeconds]` (1h–91d) for ordinary signers, or the tighter
+/// `KubernetesMaxMaxExpirationSeconds` (24h) ceiling for `kubernetes.io` signers.
+///
+/// Without this check a client (including a buggy or malicious signer-adjacent
+/// controller) could request a PodCertificateRequest with an absurdly long-lived
+/// certificate — kubelet mounts whatever a signer eventually issues into the pod's
+/// filesystem verbatim, so an unbounded lifetime here becomes an unbounded-lifetime
+/// credential on disk.
+fn validate_max_expiration_seconds(
+    spec: &PodCertificateRequestSpec,
+) -> Result<(), crate::status::StatusError> {
+    use super::defaults::{
+        is_kubernetes_signer_name, KUBERNETES_MAX_MAX_EXPIRATION_SECONDS,
+        MAX_MAX_EXPIRATION_SECONDS, MIN_MAX_EXPIRATION_SECONDS,
+    };
+
+    let Some(seconds) = spec.max_expiration_seconds else {
+        return Err(Status::unprocessable_entity(
+            "spec.maxExpirationSeconds must be set".to_string(),
+        ));
+    };
+
+    if seconds < MIN_MAX_EXPIRATION_SECONDS {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.maxExpirationSeconds: Invalid value: {seconds}: must be in the range \
+             [{MIN_MAX_EXPIRATION_SECONDS}, {MAX_MAX_EXPIRATION_SECONDS}]"
+        )));
+    }
+    let max = if is_kubernetes_signer_name(&spec.signer_name) {
+        KUBERNETES_MAX_MAX_EXPIRATION_SECONDS
+    } else {
+        MAX_MAX_EXPIRATION_SECONDS
+    };
+    if seconds > max {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.maxExpirationSeconds: Invalid value: {seconds}: must be in the range \
+             [{MIN_MAX_EXPIRATION_SECONDS}, {max}]"
+        )));
+    }
+
     Ok(())
 }
 
@@ -491,7 +539,8 @@ mod tests {
             "serviceAccountName": "default",
             "serviceAccountUID": "sa-uid-1",
             "nodeName": "node-1",
-            "nodeUID": "node-uid-1"
+            "nodeUID": "node-uid-1",
+            "maxExpirationSeconds": 3600
         })
     }
 
@@ -791,6 +840,82 @@ mod tests {
         if let Err(err) = validate_pod_certificate_request_spec(&body) {
             panic!(
                 "a spec with all seven required fields present must pass validation, got status={}",
+                err.0
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PodCertificateRequest: spec.maxExpirationSeconds bounds
+    // -----------------------------------------------------------------------
+
+    /// Upstream's `ValidatePodCertificateRequestCreate` treats `maxExpirationSeconds` as
+    /// `+required` (no `omitempty`) -- a request that omits it entirely must be rejected,
+    /// not silently accepted with an unbounded/undefined certificate lifetime.
+    #[test]
+    fn validate_pod_certificate_request_missing_max_expiration_seconds_returns_422() {
+        let mut spec = valid_pcr_spec();
+        spec.as_object_mut().unwrap().remove("maxExpirationSeconds");
+        let body = serde_json::json!({"spec": spec});
+        let err = validate_pod_certificate_request_spec(&body)
+            .expect_err("maxExpirationSeconds must be required, matching upstream");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A value below the upstream 1-hour floor (`certificates.MinMaxExpirationSeconds`)
+    /// must be rejected -- a shorter-lived cert than any signer can reasonably issue and
+    /// rotate in time is a footgun, not a valid request.
+    #[test]
+    fn validate_pod_certificate_request_max_expiration_seconds_below_minimum_returns_422() {
+        let mut spec = valid_pcr_spec();
+        spec["maxExpirationSeconds"] = serde_json::json!(3599);
+        let body = serde_json::json!({"spec": spec});
+        let err = validate_pod_certificate_request_spec(&body)
+            .expect_err("3599s is below the 3600s (1h) upstream minimum and must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A value above the upstream 91-day ceiling (`certificates.MaxMaxExpirationSeconds`)
+    /// for a non-`kubernetes.io` signer must be rejected -- kubelet mounts whatever a
+    /// signer eventually issues verbatim onto disk, so an unbounded lifetime here becomes
+    /// an unbounded-lifetime credential on the node.
+    #[test]
+    fn validate_pod_certificate_request_max_expiration_seconds_above_maximum_returns_422() {
+        let mut spec = valid_pcr_spec();
+        spec["maxExpirationSeconds"] = serde_json::json!(91 * 24 * 60 * 60 + 1);
+        let body = serde_json::json!({"spec": spec});
+        let err = validate_pod_certificate_request_spec(&body).expect_err(
+            "91d + 1s exceeds the 91-day upstream maximum for a non-kubernetes.io signer",
+        );
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A `kubernetes.io`-namespaced signer is held to the tighter 24h ceiling
+    /// (`certificates.KubernetesMaxMaxExpirationSeconds`), not the generic 91-day one --
+    /// a request that would be valid for any other signer must still be rejected here.
+    #[test]
+    fn validate_pod_certificate_request_kubernetes_signer_max_expiration_seconds_uses_24h_ceiling()
+    {
+        let mut spec = valid_pcr_spec();
+        spec["signerName"] = serde_json::json!("kubernetes.io/kube-apiserver-client");
+        spec["maxExpirationSeconds"] = serde_json::json!(25 * 60 * 60);
+        let body = serde_json::json!({"spec": spec});
+        let err = validate_pod_certificate_request_spec(&body).expect_err(
+            "a kubernetes.io signer must reject 25h -- its ceiling is 24h, not the generic 91d",
+        );
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The upstream minimum (3600s, exactly 1h) is inclusive -- the boundary value itself
+    /// must be accepted, not rejected as "below minimum".
+    #[test]
+    fn validate_pod_certificate_request_max_expiration_seconds_at_minimum_boundary_is_ok() {
+        let mut spec = valid_pcr_spec();
+        spec["maxExpirationSeconds"] = serde_json::json!(3600);
+        let body = serde_json::json!({"spec": spec});
+        if let Err(err) = validate_pod_certificate_request_spec(&body) {
+            panic!(
+                "exactly 3600s (the minimum) must be accepted, got status={}",
                 err.0
             );
         }
