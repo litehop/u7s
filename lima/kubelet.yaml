@@ -15,7 +15,18 @@ vmOpts:
       binfmt: true
 
 cpus: 8
-memory: 4GiB
+# 4GiB was the original default but proved too small for real conformance load:
+# kubelet+CRI-O+CoreDNS+metrics-server+kube-proxy plus ~15-20+ concurrent e2e
+# test pods plus the sonobuoy aggregator/e2e-job pods repeatedly drove the
+# kernel OOM-killer to kill sonobuoy/agnhost/coredns (mayor-5vffw, --focus
+# 'Simple'; mayor-2492x, sig-network Services family at --procs=16, memory
+# usage measured at 3663/3894MB used with a real OOM-kill logged in kubelet's
+# own oom_watcher). A curated 15-spec csi-hostpath focus even OOM'd within 6s
+# at 4GiB (mayor-bfq6l), and the sonobuoy aggregator itself still OOM'd at
+# 4GiB during a full-suite run (mayor-fgh2b), which needed a manual bump to
+# 6GiB to complete — 8GiB below adds documented margin beyond that observed
+# floor (session findings archived 2026-08-18 under ai/findings/).
+memory: 8GiB
 disk: 20GiB
 
 # Shared unprivileged switch so multiple VMs can reach each other directly (needed
