@@ -177,6 +177,23 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
+# mayor-f0lfr: pre-seed the sonobuoy namespace + a LimitRange (see
+# sonobuoy-namespace-limitrange.yaml for the full rationale) so u7s's own
+# LimitRange admission promotes the aggregator pod out of BestEffort QoS --
+# sonobuoy's own plugin schema has no override point for the aggregator's
+# resources. `sonobuoy run`'s manifest-apply step tolerates the namespace
+# already existing (cluster-scoped AlreadyExists is explicitly non-fatal in
+# sonobuoy's pkg/client/run.go handleCreateError); its separate
+# "existingnamespace" PREFLIGHT check does NOT (hard failure -- see the
+# --skip-preflight flag added to SONOBUOY_BASE_ARGS below), so creating the
+# namespace here ahead of time is only safe combined with that flag. This
+# runs against $KUBECONFIG (host-side, port-forwarded), not the in-VM
+# /tmp/sonobuoy-kubeconfig -- both reach the same apiserver.
+echo "Pre-seeding sonobuoy namespace + aggregator LimitRange..."
+kubectl --kubeconfig="$KUBECONFIG" create namespace sonobuoy \
+  --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply -f -
+kubectl --kubeconfig="$KUBECONFIG" apply -f scripts/conformance/sonobuoy-namespace-limitrange.yaml
+
 # Allow-set for FeatureGate-tagged tests u7s knowingly supports beyond GA.
 # Grow item-by-item as new gates surface, always checking the new gate
 # against upstream's release-1.36 test/conformance/testdata/conformance.yaml
@@ -221,7 +238,17 @@ build_filter_args() {
   fi
 }
 
-SONOBUOY_BASE_ARGS="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
+# mayor-f0lfr: --skip-preflight=existingnamespace skips ONLY sonobuoy's own
+# "existingnamespace" preflight check (cmd/sonobuoy/app/args.go's
+# AddSkipPreflightFlag / pkg/client/preflight.go's preflightExistingNamespace)
+# -- required because the pre-seed step above deliberately creates the
+# `sonobuoy` namespace ahead of `sonobuoy run` so the LimitRange is resident
+# before the aggregator pod is. Without this flag that preflight check is a
+# HARD failure ("namespace already exists", confirmed live), unlike the
+# lenient AlreadyExists tolerance in pkg/client/run.go's handleCreateError
+# used for the manifest-apply step itself. dnscheck/versioncheck (the other
+# two built-in preflight checks) are left enabled.
+SONOBUOY_BASE_ARGS="run -p /tmp/sonobuoy-plugin-e2e.yaml --wait --skip-preflight=existingnamespace --kubeconfig /tmp/sonobuoy-kubeconfig"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
