@@ -755,6 +755,82 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     Ok(())
 }
 
+/// Upstream `certificates.MinMaxExpirationSeconds` (1 hour) and
+/// `certificates.MaxMaxExpirationSeconds` (91 days) — the bounds a non-Kubernetes signer
+/// may issue a pod certificate for.
+///
+/// `pub(crate)` because `handlers::certificates` reuses the exact same bounds when
+/// validating `PodCertificateRequest.spec.maxExpirationSeconds` directly — one constant
+/// per bound instead of two copies that could silently drift apart.
+pub(crate) const MIN_MAX_EXPIRATION_SECONDS: i64 = 3600;
+pub(crate) const MAX_MAX_EXPIRATION_SECONDS: i64 = 91 * 24 * 60 * 60;
+/// Upstream `certificates.KubernetesMaxMaxExpirationSeconds` (24 hours) — the tighter
+/// upper bound for signers under the `kubernetes.io` (or `*.kubernetes.io`) namespace.
+pub(crate) const KUBERNETES_MAX_MAX_EXPIRATION_SECONDS: i64 = 24 * 60 * 60;
+
+/// Mirrors upstream's `IsKubernetesSignerName` (pkg/apis/core/validation/names.go):
+/// a signer is a "Kubernetes signer" if its domain segment is exactly `kubernetes.io`
+/// or ends with `.kubernetes.io`.
+pub(crate) fn is_kubernetes_signer_name(signer_name: &str) -> bool {
+    let host = signer_name.split('/').next().unwrap_or("");
+    host == "kubernetes.io" || host.ends_with(".kubernetes.io")
+}
+
+/// Validates `spec.volumes[].projected.sources[].podCertificate.maxExpirationSeconds` at
+/// Pod admission time.
+///
+/// Upstream (`pkg/apis/core/validation/validation.go`) enforces this bound on the Pod
+/// spec itself, not just on the `PodCertificateRequest` object kubelet later creates from
+/// it — a Pod requesting an out-of-range duration must be rejected at CREATE, before it is
+/// ever scheduled. Without this check u7s accepts the Pod, and the out-of-range request
+/// only surfaces later (or never) at the signer, far from the client that created the Pod.
+/// Conformance: `[sig-auth] ServiceAccounts should fail pod startup when
+/// MaxExpirationSeconds exceeds/is less than` (test/e2e/auth/projected_podcertificate.go)
+/// expects Pod creation itself to fail with this exact message substring.
+///
+/// `pub(crate)` and called directly from `handlers::pods::create_pod`, NOT wired through
+/// `validate_resource` above: Pod create/replace/patch have their own dedicated handlers
+/// (registered as literal routes, like `handlers::certificates`'s ClusterTrustBundle) that
+/// never call the generic `validate_resource` — wiring it in here would be dead code.
+pub(crate) fn validate_pod_certificate_projections(obj: &serde_json::Value) -> Result<(), String> {
+    let Some(volumes) = obj["spec"]["volumes"].as_array() else {
+        return Ok(());
+    };
+    for volume in volumes {
+        let Some(sources) = volume["projected"]["sources"].as_array() else {
+            continue;
+        };
+        for source in sources {
+            let pod_cert = &source["podCertificate"];
+            if pod_cert.is_null() {
+                continue;
+            }
+            let Some(max_expiration_seconds) = pod_cert["maxExpirationSeconds"].as_i64() else {
+                continue;
+            };
+            if max_expiration_seconds < MIN_MAX_EXPIRATION_SECONDS {
+                return Err(format!(
+                    "spec.volumes[].projected.sources[].podCertificate.maxExpirationSeconds: \
+                     Invalid value: {max_expiration_seconds}: if provided, maxExpirationSeconds must be >= {MIN_MAX_EXPIRATION_SECONDS}"
+                ));
+            }
+            let signer_name = pod_cert["signerName"].as_str().unwrap_or("");
+            let max_max = if is_kubernetes_signer_name(signer_name) {
+                KUBERNETES_MAX_MAX_EXPIRATION_SECONDS
+            } else {
+                MAX_MAX_EXPIRATION_SECONDS
+            };
+            if max_expiration_seconds > max_max {
+                return Err(format!(
+                    "spec.volumes[].projected.sources[].podCertificate.maxExpirationSeconds: \
+                     Invalid value: {max_expiration_seconds}: if provided, maxExpirationSeconds must be <= {max_max}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates NetworkPolicy `spec.{ingress,egress}[].ports[].endPort` at admission.
 ///
 /// Upstream (`pkg/apis/networking/validation/validation.go`'s
@@ -3979,6 +4055,122 @@ mod tests {
         assert!(
             validate_resource("networking.k8s.io", "networkpolicies", &obj).is_ok(),
             "NetworkPolicy with both port and endPort set must pass validation"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: Pod spec podCertificate maxExpirationSeconds bounds
+    // ---------------------------------------------------------------------------
+
+    fn pod_with_pod_certificate_max_expiration(seconds: i64) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "c", "image": "busybox"}],
+                "volumes": [{
+                    "name": "certs",
+                    "projected": {
+                        "sources": [{
+                            "podCertificate": {
+                                "signerName": "example.com/signer",
+                                "keyType": "ED25519",
+                                "maxExpirationSeconds": seconds,
+                                "credentialBundlePath": "bundle.pem"
+                            }
+                        }]
+                    }
+                }]
+            }
+        })
+    }
+
+    /// Conformance `[sig-auth] ... should fail pod startup when MaxExpirationSeconds is
+    /// less than minimum (1h)` creates a Pod with `maxExpirationSeconds: 3599` and expects
+    /// Pod CREATE itself to fail with an error containing "maxExpirationSeconds must be >=
+    /// 3600" -- upstream enforces this at the Pod spec level, not just later on the
+    /// PodCertificateRequest kubelet derives from it. Without this check u7s accepts the
+    /// Pod and the invalid request only surfaces (if ever) deep inside a signer.
+    #[test]
+    fn pod_certificate_max_expiration_below_minimum_rejected() {
+        let obj = pod_with_pod_certificate_max_expiration(3599);
+        let result = validate_pod_certificate_projections(&obj);
+        assert!(
+            result.is_err(),
+            "maxExpirationSeconds below the 3600s minimum must be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("maxExpirationSeconds must be >= 3600"),
+            "error message must match upstream's exact wording, which conformance asserts on"
+        );
+    }
+
+    /// Same bound, upper end: `should fail pod startup when MaxExpirationSeconds exceeds
+    /// maximum (91d)` uses `91*24*60*60 + 1` seconds and expects the same CREATE-time
+    /// rejection, with the message naming the signer-appropriate ceiling (91 days for a
+    /// non-kubernetes.io signer).
+    #[test]
+    fn pod_certificate_max_expiration_above_maximum_rejected() {
+        let obj = pod_with_pod_certificate_max_expiration(91 * 24 * 60 * 60 + 1);
+        let result = validate_pod_certificate_projections(&obj);
+        assert!(
+            result.is_err(),
+            "maxExpirationSeconds above the 91-day maximum must be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("maxExpirationSeconds must be <= 7862400"),
+            "error message must name the exact upstream ceiling (91 days in seconds)"
+        );
+    }
+
+    /// A `kubernetes.io`-namespaced signer is held to a tighter 24h ceiling than the
+    /// generic 91-day one -- a request for 25h must be rejected even though it would be
+    /// fine for any other signer, mirroring upstream's `IsKubernetesSignerName` branch.
+    #[test]
+    fn pod_certificate_max_expiration_kubernetes_signer_uses_24h_ceiling() {
+        let mut obj = pod_with_pod_certificate_max_expiration(25 * 60 * 60);
+        obj["spec"]["volumes"][0]["projected"]["sources"][0]["podCertificate"]["signerName"] =
+            serde_json::Value::String("kubernetes.io/kube-apiserver-client".to_string());
+        let result = validate_pod_certificate_projections(&obj);
+        assert!(
+            result.is_err(),
+            "a kubernetes.io signer must reject a 25h request -- its ceiling is 24h, not 91d"
+        );
+        assert!(
+            result.unwrap_err().contains("maxExpirationSeconds must be <= 86400"),
+            "error must cite the Kubernetes-signer ceiling (24h in seconds), not the generic 91d one"
+        );
+    }
+
+    /// A value within bounds (1 hour, the exact minimum) must pass -- the boundary itself
+    /// is valid, only values strictly below it are rejected.
+    #[test]
+    fn pod_certificate_max_expiration_at_minimum_boundary_passes() {
+        let obj = pod_with_pod_certificate_max_expiration(3600);
+        assert!(
+            validate_pod_certificate_projections(&obj).is_ok(),
+            "exactly 3600 seconds (the minimum) must be accepted, not rejected"
+        );
+    }
+
+    /// A Pod with no podCertificate projected source at all (the overwhelming common case)
+    /// must never be affected by this check.
+    #[test]
+    fn pod_without_pod_certificate_volume_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+        });
+        assert!(
+            validate_pod_certificate_projections(&obj).is_ok(),
+            "a Pod with no volumes at all must not be rejected by podCertificate bounds checking"
         );
     }
 
