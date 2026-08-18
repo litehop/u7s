@@ -205,7 +205,22 @@ provision:
       # 0/324 specs ever starting Setup. `0` is kubelet's own documented off-switch
       # ("If 0, unlimited", per `kubelet --help`'s --registry-qps doc), not a magic number;
       # maxParallelImagePulls: 10 above remains the real concurrency bound.
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\nregistryPullQPS: 0\n' > /etc/kubelet-config.yaml
+      #
+      # ClusterTrustBundle(Projection)/PodCertificateRequest: Beta-since-1.36.2
+      # (mayor-moejy) but default-OFF (`kubelet --help` lists all three as
+      # "BETA - default=false"), so the real kubelet silently skips the
+      # `clusterTrustBundle`/`podCertificate` projected-volume sources on a Pod spec
+      # without these gates — the mounttest container never sees its expected file and
+      # the pod hangs waiting for Ready instead of erroring loudly (mayor-17kra). u7s's
+      # apiserver already serves certificates.k8s.io/v1beta1 ClusterTrustBundle +
+      # PodCertificateRequest CRUD (PR #1195); these gates are what make the real
+      # kubelet actually act on them. ClusterTrustBundle itself (not just its
+      # ...Projection variant) also gates kubelet's client-go lister/informer for the
+      # resource type, so the projection is inert without it too. PodCertificateRequest
+      # still needs a signer to approve/issue (tracked separately) — enabling it here
+      # only gets kubelet as far as creating the PodCertificateRequest object, which is
+      # real kubelet-side behavior this bead is scoped to.
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\nregistryPullQPS: 0\nfeatureGates:\n  ClusterTrustBundle: true\n  ClusterTrustBundleProjection: true\n  PodCertificateRequest: true\n' > /etc/kubelet-config.yaml
       printf '[Service]\nExecStart=\nExecStart=/usr/bin/kubelet \\\n  --config=/etc/kubelet-config.yaml \\\n  --kubeconfig=/etc/kubelet-kubeconfig \\\n  --hostname-override=lima-node \\\n  --v=2\n' > /etc/systemd/system/kubelet.service.d/u7s.conf
       systemctl daemon-reload
 
