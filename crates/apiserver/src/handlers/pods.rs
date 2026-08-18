@@ -749,6 +749,33 @@ pub(crate) async fn replace_pod<S: Store>(
     let stored_generation = stored_obj.body["metadata"]["generation"].clone();
     obj.body["metadata"]["generation"] = stored_generation;
 
+    // metadata.uid is immutable identity, exactly like the generic replace_namespaced_resource
+    // path (resource.rs): a blank incoming uid is restored from the stored object, but a
+    // non-blank incoming uid that mismatches the stored one is identity forgery, not a
+    // legitimate update — allowing it would let a caller holding only `update pods` (not
+    // `create`/`delete pods`) forge a match against a stale/foreign ownerReference, corrupting
+    // owner_ref_is_live's cascade-GC decision for ReplicaSet/Job/DaemonSet controllers.
+    let stored_uid = stored_obj.body["metadata"]["uid"].clone();
+    let incoming_uid_blank = obj.body["metadata"]["uid"]
+        .as_str()
+        .map(str::is_empty)
+        .unwrap_or(true);
+    if incoming_uid_blank {
+        if let Some(uid) = stored_uid.as_str() {
+            if !uid.is_empty() {
+                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            }
+        }
+    } else if let Some(stored_uid_str) = stored_uid.as_str().filter(|s| !s.is_empty()) {
+        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        if incoming_uid_str != stored_uid_str {
+            return Err(Status::conflict(format!(
+                "Pod \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable"
+            )));
+        }
+    }
+
     // deletionTimestamp is server-owned, exactly like generation above: a protobuf-encoded PUT
     // never round-trips this field (the wire decoder drops it — see the equivalent restoration
     // in replace_resource/replace_namespaced_resource) and a JSON PUT built from a stale local
@@ -1123,6 +1150,13 @@ pub(crate) async fn patch_pod<S: Store>(
         // status through this endpoint (e.g. fake a pod Ready+podIP), for ANY patch type
         // including JSON Patch, whose array shape can't be caught by an object-key strip.
         let stored_status = current_obj.body["status"].clone();
+        // Save the stored uid: metadata.uid is immutable identity, restored unconditionally
+        // after the patch is applied, exactly like do_patch (resource.rs) already does for the
+        // generic path. Without this, a caller holding only `patch pods` rights could forge
+        // uid to match a stale/foreign ownerReference and corrupt owner_ref_is_live's
+        // cascade-GC decision for ReplicaSet/Job/DaemonSet controllers, for ANY patch type
+        // (Merge, StrategicMerge, JSON Patch).
+        let stored_uid = current_obj.body["metadata"]["uid"].clone();
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
@@ -1138,6 +1172,7 @@ pub(crate) async fn patch_pod<S: Store>(
         }
 
         current_obj.body["status"] = stored_status;
+        current_obj.body["metadata"]["uid"] = stored_uid;
 
         // Enforce the same spec-immutability guard replace_pod (PUT) already applies —
         // without this, a caller holding only `patch pods` (not `pods/binding`) could set
@@ -12304,6 +12339,105 @@ mod handler_tests {
         );
     }
 
+    /// metadata.uid must survive every PATCH content-type on the main pod endpoint. A caller
+    /// holding only `patch pods` RBAC (not `create`/`delete pods`) must not be able to forge
+    /// a pod's uid to match a stale/foreign ownerReference — owner_ref_is_live keys purely on
+    /// uid equality, so a forged match would hijack ReplicaSet/Job/DaemonSet cascade-GC,
+    /// letting the attacker's pod either escape deletion or get someone else's pod deleted in
+    /// its place. Fails on revert: without restoring the pre-patch uid, each patch below would
+    /// persist the attacker-supplied uid and this assertion would fail.
+    #[tokio::test]
+    async fn patch_pod_cannot_change_uid() {
+        use axum::body::to_bytes;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {"uid": "real-uid-0001"}}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        // Merge patch.
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(
+                &serde_json::json!({"metadata": {"uid": "attacker-uid-merge"}}),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], "real-uid-0001",
+            "a merge-patch carrying metadata.uid must not change the stored uid — a \
+             patch-only caller could otherwise forge ownerReference matches and hijack GC"
+        );
+
+        // Strategic merge patch.
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(
+                &serde_json::json!({"metadata": {"uid": "attacker-uid-strategic"}}),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], "real-uid-0001",
+            "a strategic-merge-patch carrying metadata.uid must not change the stored uid — \
+             a patch-only caller could otherwise forge ownerReference matches and hijack GC"
+        );
+
+        // JSON Patch — array-shaped, so an object-key strip on the incoming patch would never
+        // catch this; the guard must snapshot/restore around the apply regardless of shape.
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/json-patch+json")
+            .body(json_body(&serde_json::json!([
+                { "op": "replace", "path": "/metadata/uid", "value": "attacker-uid-json" }
+            ])))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], "real-uid-0001",
+            "a JSON Patch carrying metadata.uid must not change the stored uid — a \
+             patch-only caller could otherwise forge ownerReference matches and hijack GC"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_val["metadata"]["uid"], "real-uid-0001",
+            "the persisted store record must retain the original uid across all three patch \
+             content-types, not just the response bodies"
+        );
+    }
+
     /// PATCH with an unsupported content-type must return 415.
     #[tokio::test]
     async fn patch_pod_unsupported_content_type_returns_415() {
@@ -13583,6 +13717,154 @@ mod handler_tests {
             v["status"]["observedGeneration"], 5,
             "PUT body's stale observedGeneration=0 must not clobber the real value kubelet \
              set via /status — this is the exact field that regressed in production"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod — metadata.uid immutability
+    // -----------------------------------------------------------------------
+
+    /// A PUT whose body carries a non-blank uid that mismatches the stored one must be
+    /// rejected with 409, and the stored pod must be left untouched. metadata.uid is
+    /// immutable identity: owner_ref_is_live determines cascade-GC purely by comparing
+    /// stored uid == ownerRef.uid, so silently accepting a forged uid here would let a
+    /// caller holding only `update pods` RBAC (not `create`/`delete pods`) rewrite an
+    /// existing pod's identity to match a stale/foreign ownerReference and hijack
+    /// ReplicaSet/Job/DaemonSet garbage collection. Fails on revert: without the
+    /// uid-mismatch check, this PUT (valid resourceVersion, forged uid) would succeed with
+    /// 200 instead of 409.
+    #[tokio::test]
+    async fn replace_pod_rejects_mismatched_uid_with_409() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {"uid": "real-uid-0001"}}),
+        )
+        .await;
+
+        let stored_rv = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "uid": "attacker-uid",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "PUT with a mismatched non-blank metadata.uid must return 409 Conflict — uid is \
+             immutable identity, and accepting it would let a patch/update-only caller forge \
+             ownerReference matches and hijack cascade-GC"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], "real-uid-0001",
+            "the rejected PUT must not have mutated the stored pod's uid"
+        );
+    }
+
+    /// A PUT whose body omits (blanks) metadata.uid must have it restored from the stored
+    /// object rather than persisting a blank uid. Real client-go Update() callers (and a
+    /// dynamic/typed client round-tripping a locally-held object) commonly omit uid; without
+    /// restoration, a blank uid would be persisted and broadcast to watchers, permanently
+    /// breaking any controller that identifies this pod by uid (e.g. ownerReference
+    /// tracking). Fails on revert: without restoring a blank incoming uid, the stored pod
+    /// would end up with an empty uid instead of the original one.
+    #[tokio::test]
+    async fn replace_pod_restores_blank_uid_from_stored() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {"uid": "real-uid-0001"}}),
+        )
+        .await;
+
+        let stored_rv = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a PUT that simply omits uid (not a forgery attempt) must succeed, with uid \
+             silently restored from the stored object"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], "real-uid-0001",
+            "a blank incoming uid must be restored from the stored object, not persisted \
+             as blank — a blank stored uid would break any controller identifying this pod \
+             by uid (e.g. ownerReference tracking)"
         );
     }
 
