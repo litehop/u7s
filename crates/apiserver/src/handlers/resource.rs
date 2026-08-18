@@ -1723,7 +1723,8 @@ fn validate_statefulset_spec_immutable(
 /// upstream inlines directly onto `spec` — keeps this correct without needing an update every
 /// time upstream adds a new volume-source type: whatever backend field(s) remain after
 /// stripping this list off both sides *are* `spec.persistentVolumeSource`, upstream's other
-/// immutable field here (besides `volumeMode`, checked separately below).
+/// immutable field here (besides `volumeMode` and `nodeAffinity`, both checked separately
+/// below).
 const PV_MUTABLE_SPEC_FIELDS: [&str; 8] = [
     "capacity",
     "accessModes",
@@ -1741,6 +1742,14 @@ fn validate_pv_spec_immutable(
 ) -> Result<(), String> {
     if old_spec["volumeMode"] != new_spec["volumeMode"] {
         return Err("volumeMode: Forbidden: field is immutable".into());
+    }
+    // Upstream `validatePvNodeAffinity` (core validation.go L9412-9418, release-1.36) only
+    // runs "if oldPv.Spec.NodeAffinity != nil" — a PV created without nodeAffinity may have
+    // it set exactly once, but once set the local/topology binding it encodes is frozen,
+    // since nothing re-evaluates already-bound PVCs/Pods against a nodeAffinity that moved
+    // out from under them.
+    if !old_spec["nodeAffinity"].is_null() && old_spec["nodeAffinity"] != new_spec["nodeAffinity"] {
+        return Err("spec.nodeAffinity: Forbidden: spec.nodeAffinity is immutable once set".into());
     }
     let strip_mutable = |spec: &serde_json::Value| {
         let mut v = spec.clone();
@@ -22137,6 +22146,328 @@ mod tests {
             "PATCH changing only PersistentVolume.spec.persistentVolumeReclaimPolicy must \
              succeed — persistentVolumeSource/volumeMode immutability must not reject \
              unrelated mutable-field changes",
+        );
+    }
+
+    fn pv_node_affinity(hostname: &str) -> serde_json::Value {
+        serde_json::json!({
+            "required": {
+                "nodeSelectorTerms": [{
+                    "matchExpressions": [{
+                        "key": "kubernetes.io/hostname",
+                        "operator": "In",
+                        "values": [hostname]
+                    }]
+                }]
+            }
+        })
+    }
+
+    /// PUT setting PersistentVolume.spec.nodeAffinity for the first time (blank -> set) must
+    /// succeed.
+    ///
+    /// Upstream `ValidatePersistentVolumeUpdate` (core validation.go L2281-2285, release-1.36)
+    /// only runs `validatePvNodeAffinity` "if oldPv.Spec.NodeAffinity != nil" — a PV created
+    /// without a node affinity (the common case before topology-aware provisioning assigns
+    /// one) must still be able to have it set later. A naive "nodeAffinity is always
+    /// immutable" implementation would wrongly reject this.
+    #[tokio::test]
+    async fn replace_resource_allows_pv_nodeaffinity_set_from_blank() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = pv_body("blank-affinity-pv", "/mnt/blank-affinity", "Retain");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let mut changed = pv_body("blank-affinity-pv", "/mnt/blank-affinity", "Retain");
+        changed["spec"]["nodeAffinity"] = pv_node_affinity("node1");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "blank-affinity-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT setting PersistentVolume.spec.nodeAffinity from blank must succeed — this is \
+             how an operator retrofits topology constraints onto a PV that was provisioned \
+             without one",
+        );
+    }
+
+    /// PUT changing an already-set PersistentVolume.spec.nodeAffinity must return 422.
+    ///
+    /// Upstream freezes `spec.nodeAffinity` once non-nil (core validation.go L2281-2285,
+    /// release-1.36): the scheduler binds a Pod to a node compatible with the PV's node
+    /// affinity, and kubelet's volume manager mounts based on that same constraint, so letting
+    /// a plain PATCH/PUT retarget which nodes can reach the volume would desync a Pod already
+    /// scheduled against the original constraint from the storage it was placed for.
+    #[tokio::test]
+    async fn replace_resource_rejects_pv_nodeaffinity_change_once_set() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut pv = pv_body("affinity-pv", "/mnt/affinity-data", "Retain");
+        pv["spec"]["nodeAffinity"] = pv_node_affinity("node1");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let mut changed = pv_body("affinity-pv", "/mnt/affinity-data", "Retain");
+        changed["spec"]["nodeAffinity"] = pv_node_affinity("node2");
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "affinity-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&changed).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT changing an already-set PersistentVolume.spec.nodeAffinity must return 422"
+            ),
+            Ok(_) => panic!(
+                "PUT changing PersistentVolume.spec.nodeAffinity once set must be rejected — \
+                 accepting it silently retargets which nodes a bound PV is reachable from, out \
+                 from under a Pod already scheduled against the original constraint"
+            ),
+        }
+    }
+
+    /// PUT re-submitting the same PersistentVolume.spec.nodeAffinity value must still succeed
+    /// — the once-set check must compare against the stored value, not just reject on
+    /// presence; a naive "reject any write once nodeAffinity is non-null" implementation would
+    /// wrongly break the idempotent re-apply `kubectl apply` performs on every reconcile.
+    #[tokio::test]
+    async fn replace_resource_allows_pv_nodeaffinity_no_op() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut pv = pv_body("noop-affinity-pv", "/mnt/noop-affinity", "Retain");
+        pv["spec"]["nodeAffinity"] = pv_node_affinity("node1");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "noop-affinity-pv".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PUT re-submitting the same PersistentVolume.spec.nodeAffinity value must succeed \
+             — the immutability check must compare values, not merely whether the field is set",
+        );
+    }
+
+    /// PATCH setting PersistentVolume.spec.nodeAffinity for the first time (blank -> set) must
+    /// succeed — same blank -> set exception as the PUT path, exercised through the PATCH
+    /// wiring in `patch_resource` (a separate call site from `replace_resource`'s).
+    #[tokio::test]
+    async fn patch_resource_allows_pv_nodeaffinity_set_from_blank() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let pv = pv_body(
+            "patch-blank-affinity-pv",
+            "/mnt/patch-blank-affinity",
+            "Retain",
+        );
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "nodeAffinity": pv_node_affinity("node1") } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "patch-blank-affinity-pv".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH setting PersistentVolume.spec.nodeAffinity from blank must succeed — this \
+             is how an operator retrofits topology constraints onto a PV that was provisioned \
+             without one",
+        );
+    }
+
+    /// PATCH changing an already-set PersistentVolume.spec.nodeAffinity must return 422 — the
+    /// other half of the once-set check, exercised through `patch_resource`'s own call site
+    /// into `validate_pv_spec_immutable` (do_patch wires this up separately from
+    /// `replace_resource`, so a regression that drops one wiring without the other must be
+    /// caught here, not just on the PUT path).
+    #[tokio::test]
+    async fn patch_resource_rejects_pv_nodeaffinity_change_once_set() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut pv = pv_body("patch-affinity-pv", "/mnt/patch-affinity-data", "Retain");
+        pv["spec"]["nodeAffinity"] = pv_node_affinity("node1");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "nodeAffinity": pv_node_affinity("node2") } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "patch-affinity-pv".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH changing an already-set PersistentVolume.spec.nodeAffinity must return \
+                 422"
+            ),
+            Ok(_) => panic!(
+                "PATCH changing PersistentVolume.spec.nodeAffinity once set must be rejected \
+                 — accepting it silently retargets which nodes a bound PV is reachable from, \
+                 out from under a Pod already scheduled against the original constraint"
+            ),
+        }
+    }
+
+    /// PATCH re-submitting the same PersistentVolume.spec.nodeAffinity value must still
+    /// succeed — mirrors the PUT no-op test, but through the PATCH path, which merges the
+    /// unchanged value back onto the stored spec rather than replacing the whole object.
+    #[tokio::test]
+    async fn patch_resource_allows_pv_nodeaffinity_no_op() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+        let mut pv = pv_body(
+            "patch-noop-affinity-pv",
+            "/mnt/patch-noop-affinity",
+            "Retain",
+        );
+        pv["spec"]["nodeAffinity"] = pv_node_affinity("node1");
+        create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "persistentvolumes".into())),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+        )
+        .await
+        .expect("PersistentVolume create must succeed");
+
+        let patch = serde_json::json!({ "spec": { "nodeAffinity": pv_node_affinity("node1") } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let result = patch_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "persistentvolumes".into(),
+                "patch-noop-affinity-pv".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        result.expect(
+            "PATCH re-submitting the same PersistentVolume.spec.nodeAffinity value must \
+             succeed — the immutability check must compare values, not merely whether the \
+             field is set",
         );
     }
 
