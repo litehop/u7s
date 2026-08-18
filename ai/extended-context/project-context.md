@@ -3,6 +3,8 @@ name: project-context
 description: Core technical context for u7s — goals, constraints, design decisions, and open questions established in the founding session.
 metadata:
   type: project
+as_of: 2026-08-13
+kind: project-state
 ---
 
 ## What u7s is

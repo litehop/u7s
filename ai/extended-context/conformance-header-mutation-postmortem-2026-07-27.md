@@ -1,3 +1,8 @@
+---
+as_of: 2026-07-27
+kind: postmortem
+---
+
 # Postmortem: `content_type.rs` header-mutation conformance regression
 
 **Status:** Resolved. **Duration:** 2026-07-25 → 2026-07-27 (~3 days elapsed, several hours

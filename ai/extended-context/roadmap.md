@@ -3,6 +3,8 @@ name: roadmap
 description: u7s roadmap — current state and priorities via a per-component decision matrix and horizontal gates. Not a phase list. Durable north star, decision framework, and guiding principles live in north-star.md; this file changes often and links back rather than restating them.
 metadata:
   type: project
+as_of: 2026-08-18
+kind: roadmap
 ---
 
 # u7s Roadmap
