@@ -13,6 +13,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -31,6 +32,7 @@ jobs:
   kubectl:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
@@ -285,6 +287,7 @@ jobs:
   kubelet:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
@@ -307,7 +310,18 @@ jobs:
           mkdir -p ~/bin
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
+      - name: Cache cri-o apt archives
+        id: cache-crio-apt
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: crio-apt-${{ matrix.k8s }}-${{ runner.arch }}
+
       - name: Install cri-o and crun
+        # UNCHANGED — no `if:` gate. On cache hit, apt-get install finds the
+        # .deb already in /var/cache/apt/archives and skips the network fetch
+        # from download.opensuse.org (the slow/flaky part). apt-get update
+        # still runs. systemctl enable + CNI conflist write always run.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -698,6 +712,7 @@ jobs:
   kcm:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
