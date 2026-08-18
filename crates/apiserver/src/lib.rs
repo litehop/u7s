@@ -1300,7 +1300,17 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings","roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","escalate","bind"] },
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","volumeattachments","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
+            // attachdetach-controller creates/deletes VolumeAttachments to drive CSI
+            // ControllerPublish/Unpublish (matches upstream's per-controller
+            // system:controller:attachdetach-controller role — see the seeded-but-unused
+            // copy elsewhere in this function). With --use-service-account-credentials=false
+            // this identity runs that controller too, so the grant has to live here instead:
+            // without `create`, kubelet's volume manager waits forever for an attach that
+            // never happens and every CSI pod using an attachable driver (e.g. csi-hostpath)
+            // hangs in ContainerCreating, live-confirmed via kcm.log's "system:kube-controller-manager
+            // is not allowed to create volumeattachments" before this fix.
+            { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get","list","watch","create","delete"] },
             // namespace-controller needs these two subresources specifically (the base
             // "namespaces" rule above doesn't cover them) to record deletion-progress
             // conditions and clear the "kubernetes" finalizer once a namespace's contents
@@ -5386,6 +5396,96 @@ mod tests {
             "the generic wildcard rule must stop short of `create` on arbitrary types — if \
              create is also allowed, this identity is silently cluster-admin-equivalent and \
              the dedicated least-privilege identity provides no real boundary"
+        );
+    }
+
+    /// Regression test (mayor-omwgo): with --use-service-account-credentials=false, the
+    /// attach-detach controller also runs as system:kube-controller-manager and must be able
+    /// to CREATE and DELETE VolumeAttachments to drive CSI attach/detach. Without `create`
+    /// here, a real kube-controller-manager process live-logged "system:kube-controller-manager
+    /// is not allowed to create volumeattachments" on every retry, kubelet's volume manager
+    /// never saw the volume as attached, and every pod using an attachable CSI driver
+    /// (e.g. csi-hostpath) hung in ContainerCreating for the full 300s test timeout —
+    /// confirmed via a live sonobuoy `csi-hostpath` run before this fix. Also checks the
+    /// boundary: csidrivers gets no dedicated `create` grant from this fix, matching
+    /// upstream's real bootstrap policy split between VolumeAttachments (create/delete) and
+    /// CSIDriver/CSINode (read-only) for this controller — kubelet and the CSI driver's own
+    /// sidecars own those write paths, not KCM.
+    #[tokio::test]
+    async fn kcm_identity_can_create_and_delete_volumeattachments() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+
+        let create_va = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "create",
+            api_group: "storage.k8s.io",
+            resource: "volumeattachments",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&create_va),
+            "system:kube-controller-manager must be allowed to CREATE volumeattachments — \
+             without it the attach-detach controller can never attach a CSI volume and every \
+             pod using an attachable driver hangs in ContainerCreating forever, live-confirmed \
+             via kcm.log before this fix"
+        );
+
+        let delete_va = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "delete",
+            api_group: "storage.k8s.io",
+            resource: "volumeattachments",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&delete_va),
+            "system:kube-controller-manager must be allowed to DELETE volumeattachments — \
+             without it the attach-detach controller can never detach a CSI volume and the \
+             VolumeAttachment object leaks forever after the pod using it is gone"
+        );
+
+        // csidrivers gets no dedicated create grant (unlike volumeattachments above) — the
+        // attach-detach controller only reads CSIDriver to decide attachability, it never
+        // creates one. (update/delete/patch on csidrivers fall through the pre-existing
+        // generic-cleanup wildcard shared with the GC/quota/namespace controllers — see
+        // kcm_identity_can_discover_and_cleanup_but_not_create_arbitrary_resource_types —
+        // but that wildcard deliberately stops short of `create`, same boundary asserted there.)
+        let create_csidriver = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "create",
+            api_group: "storage.k8s.io",
+            resource: "csidrivers",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&create_csidriver),
+            "csidrivers must not get a dedicated create grant for this identity — the \
+             attach-detach controller never creates a CSIDriver, only volumeattachments needed \
+             a new grant for this fix"
         );
     }
 
