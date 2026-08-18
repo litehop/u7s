@@ -1,3 +1,8 @@
+---
+as_of: 2026-08-17
+kind: initiative-state
+---
+
 # Memory management state
 
 **AS OF 2026-08-17 — full refresh by mayor-pks56 (NOT mayor-rr177's cron: that cron is audit-only, it files P3 drift beads against this doc but never edits it — see the corrected description in `ai/extended-context/README.md`, mayor-ir84r).** Every bead ID cited below was re-verified via `bd show` on 2026-08-17. Nothing mechanically refreshes this doc's content after the beads it cites close — the next refresh happens whenever mayor-rr177's audit next flags drift here, picked up manually or by a dispatched worker.
