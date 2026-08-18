@@ -675,6 +675,53 @@ fn default_service_ip_fields_spec(spec: &mut ServiceSpec) {
     }
 }
 
+/// Reject `ipFamilyPolicy`/`ipFamilies` combinations the cluster cannot actually satisfy.
+///
+/// u7s's `ServiceIpAllocator` (state.rs) only ever allocates from a single, IPv4-only
+/// CIDR — `--service-cluster-ip-range` (args.rs) takes exactly one range and there is no
+/// second allocator for any other family. Without this check, a Service requesting
+/// `ipFamilyPolicy: RequireDualStack`, or explicitly listing a family other than IPv4 in
+/// `ipFamilies`, was accepted and echoed back verbatim while only ever getting a single
+/// IPv4 ClusterIP allocated — silently breaking dual-stack routing for kube-proxy, DNS,
+/// or any other consumer that trusts the advertised policy/family list.
+///
+/// Mirrors upstream's `Allocators.initIPFamilyFields`
+/// (pkg/registry/core/service/storage/alloc.go), which rejects `RequireDualStack` when
+/// fewer than two per-family allocators are configured ("this cluster is not configured
+/// for dual-stack services") and rejects any explicitly requested family lacking an
+/// allocator ("not configured on this cluster") — regardless of policy.
+///
+/// ExternalName Services have no ClusterIP family at all and are skipped, matching
+/// `default_service_ip_fields_spec`'s ExternalName early return.
+///
+/// Must be called on the client-supplied body *before* `maybe_allocate_cluster_ip` runs,
+/// so a rejected create/update never leaks an allocated IP back to the pool.
+pub(crate) fn validate_service_ip_family_fields(obj: &serde_json::Value) -> Result<(), String> {
+    if obj["spec"]["type"].as_str() == Some("ExternalName") {
+        return Ok(());
+    }
+
+    if obj["spec"]["ipFamilyPolicy"].as_str() == Some("RequireDualStack") {
+        return Err(
+            "spec.ipFamilyPolicy: Invalid value: \"RequireDualStack\": this cluster is not \
+             configured for dual-stack services"
+                .to_string(),
+        );
+    }
+
+    if let Some(families) = obj["spec"]["ipFamilies"].as_array() {
+        for family in families {
+            if family.as_str() != Some("IPv4") {
+                return Err(format!(
+                    "spec.ipFamilies: Invalid value: {family}: not configured on this cluster"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a resource after defaults have been applied. Returns an error string
 /// suitable for a 400 Bad Request if required fields are missing.
 ///
@@ -701,6 +748,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     }
     if group == "networking.k8s.io" && plural == "networkpolicies" {
         validate_network_policy_ports(obj)?;
+    }
+    if group.is_empty() && plural == "services" {
+        validate_service_ip_family_fields(obj)?;
     }
     Ok(())
 }
