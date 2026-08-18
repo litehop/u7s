@@ -61,7 +61,7 @@ k3s idles at ~750 MB RSS on a 1 GB node; k0s at ~658 MB. On a 1 GB VPS this leav
 
 ### Tokio runtime cost
 
-Tokio itself adds ~400 bytes per task for the task header. With 100 active tasks (watches + reconcilers) that is 40 KB — negligible. The thread pool uses one stack per worker thread. With `worker_threads(2)` that is 2 MB of stack space by default. Use `RUST_MIN_STACK` or `builder.thread_stack_size()` to reduce to 512 KB per thread.
+Tokio itself adds ~400 bytes per task for the task header. With 100 active tasks (watches + reconcilers) that is 40 KB — negligible. The thread pool uses one stack per worker thread; worker-thread count should scale to `std::thread::available_parallelism()` (floored at the target deployment's minimum of 2, not hardcoded to exactly 2 on every host — a static value tuned for a 1-shared-vCPU target starves the accept loop under sustained concurrent load on larger hosts). At the default 8 MB/thread that is 2 MB+ of stack space; use `RUST_MIN_STACK` or `builder.thread_stack_size()` to reduce to 512 KB per thread regardless of thread count.
 
 ---
 
