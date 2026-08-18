@@ -7747,12 +7747,16 @@ mod pure_logic_tests {
     // json_navigate_one
     // -----------------------------------------------------------------------
 
-    /// Traversing into an object with a known key succeeds.
+    /// Traversing into an object with a known key returns a reference to that key's
+    /// value specifically, not the root or some other field. A bug that returned the
+    /// wrong child (e.g. the root object, or a sibling key) here would silently corrupt
+    /// every patch/status subresource path that traverses through an object segment.
     #[test]
     fn navigate_one_object_known_key() {
         let mut obj = serde_json::json!({"spec": {"nodeName": "worker-1"}});
         let result = json_navigate_one(&mut obj, "spec");
-        assert!(result.is_ok());
+        let val = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(*val, serde_json::json!({"nodeName": "worker-1"}));
     }
 
     /// Traversing into an object with an unknown key returns 422.

@@ -1,3 +1,8 @@
+---
+as_of: 2026-08-17
+kind: gotchas
+---
+
 # Apiserver code gotchas
 
 Scope: non-obvious correctness constraints in the u7s apiserver that a fresh mayor (or worker) would not infer from the code alone — each has bitten conformance before. These are "why the code is shaped this way," not operational process (those live in `bd memories`). Recategorized from bead memories 2026-06-26 because they are code-findings, not operational rules.
