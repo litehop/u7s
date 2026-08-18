@@ -430,11 +430,54 @@ fn pod_is_terminating(pod: &Value) -> bool {
     pod["spec"]["activeDeadlineSeconds"].is_number()
 }
 
+/// Returns true if a single PodAffinityTerm-shaped object declares cross-namespace
+/// affinity — i.e. it sets a non-empty `namespaces` list or a non-null `namespaceSelector`.
+///
+/// Mirrors upstream `crossNamespacePodAffinityTerm`
+/// (pkg/quota/v1/evaluator/core/pods.go, release-1.36).
+fn affinity_term_is_cross_namespace(term: &Value) -> bool {
+    term["namespaces"]
+        .as_array()
+        .is_some_and(|ns| !ns.is_empty())
+        || term["namespaceSelector"].is_object()
+}
+
+/// Returns true if the pod declares at least one cross-namespace podAffinity or
+/// podAntiAffinity term (required or preferred).
+///
+/// Mirrors upstream `usesCrossNamespacePodAffinity`
+/// (pkg/quota/v1/evaluator/core/pods.go, release-1.36): a pod only "uses" cross-namespace
+/// affinity when a term reaches beyond its own namespace via `namespaces` or
+/// `namespaceSelector` — a same-namespace affinity/anti-affinity term (topologyKey only)
+/// does not count.
+fn pod_uses_cross_namespace_affinity(pod: &Value) -> bool {
+    let affinity = &pod["spec"]["affinity"];
+    for kind in ["podAffinity", "podAntiAffinity"] {
+        let terms = &affinity[kind];
+        if terms["requiredDuringSchedulingIgnoredDuringExecution"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(affinity_term_is_cross_namespace))
+        {
+            return true;
+        }
+        if terms["preferredDuringSchedulingIgnoredDuringExecution"]
+            .as_array()
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|w| affinity_term_is_cross_namespace(&w["podAffinityTerm"]))
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns true if the object matches the given ResourceQuota scope.
 ///
-/// Implemented scopes: BestEffort, NotBestEffort, Terminating, NotTerminating.
-/// Unknown scopes are treated conservatively: the object is assumed to match
-/// (quota applies), which is the safe default.
+/// Implemented scopes: BestEffort, NotBestEffort, Terminating, NotTerminating,
+/// CrossNamespacePodAffinity. Unknown scopes are treated conservatively: the object is
+/// assumed to match (quota applies), which is the safe default.
 fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     match scope {
         "BestEffort" => object.is_some_and(pod_is_best_effort),
@@ -442,6 +485,10 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
         // A pod matches Terminating iff spec.activeDeadlineSeconds is set.
         "Terminating" => object.is_some_and(pod_is_terminating),
         "NotTerminating" => object.is_none_or(|pod| !pod_is_terminating(pod)),
+        // A pod matches CrossNamespacePodAffinity iff it declares a podAffinity or
+        // podAntiAffinity term with `namespaces` or `namespaceSelector` set — i.e. it is
+        // genuinely cross-namespace, not just any pod with affinity/anti-affinity rules.
+        "CrossNamespacePodAffinity" => object.is_some_and(pod_uses_cross_namespace_affinity),
         // Unknown scopes: assume match (conservative — don't silently skip quotas).
         _ => true,
     }
@@ -1365,6 +1412,97 @@ mod tests {
             !object_matches_scope("Terminating", Some(&non_terminating_pod)),
             "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
              else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+    }
+
+    // -- CrossNamespacePodAffinity scope matching --
+
+    /// A pod whose podAffinity term sets a non-empty `namespaces` list is genuinely
+    /// cross-namespace and must match the CrossNamespacePodAffinity scope. Before this
+    /// fix, every scope name other than the four hard-coded ones fell through to the
+    /// `_ => true` default, so this already passed for the wrong reason — the negative
+    /// test below is what actually pins the fix down.
+    #[test]
+    fn cross_namespace_pod_affinity_scope_matches_pod_with_namespaces_on_pod_affinity() {
+        let pod = json!({
+            "spec": {
+                "affinity": {
+                    "podAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "topologyKey": "kubernetes.io/hostname",
+                            "namespaces": ["ns1"]
+                        }]
+                    }
+                }
+            }
+        });
+        assert!(
+            object_matches_scope("CrossNamespacePodAffinity", Some(&pod)),
+            "a podAffinity term with a non-empty `namespaces` list reaches into another \
+             namespace and must match CrossNamespacePodAffinity — else a genuinely \
+             cross-namespace pod would be excluded from the scope's quota accounting"
+        );
+    }
+
+    /// A pod whose podAntiAffinity term sets a `namespaceSelector` (not `namespaces`) is
+    /// also cross-namespace and must match — upstream's `crossNamespacePodAffinityTerm`
+    /// treats `namespaces` and `namespaceSelector` as equally sufficient.
+    #[test]
+    fn cross_namespace_pod_affinity_scope_matches_pod_with_namespace_selector_on_anti_affinity() {
+        let pod = json!({
+            "spec": {
+                "affinity": {
+                    "podAntiAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "topologyKey": "kubernetes.io/hostname",
+                            "namespaceSelector": {
+                                "matchLabels": {"team": "foo"}
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        assert!(
+            object_matches_scope("CrossNamespacePodAffinity", Some(&pod)),
+            "a podAntiAffinity term with a `namespaceSelector` reaches into other \
+             namespaces via label selection and must match CrossNamespacePodAffinity"
+        );
+    }
+
+    /// A pod with a podAntiAffinity term that has NEITHER `namespaces` NOR
+    /// `namespaceSelector` (single-namespace anti-affinity) must NOT match
+    /// CrossNamespacePodAffinity. This is the exact bug reported by mayor-5vxfn: before
+    /// this fix, `object_matches_scope`'s `_ => true` fall-through counted every pod with
+    /// ANY affinity/anti-affinity rule against a CrossNamespacePodAffinity-scoped quota,
+    /// so `status.used.pods` incremented for a pod that upstream's conformance test
+    /// explicitly asserts "does not use cross namespace affinity" and must not count.
+    #[test]
+    fn cross_namespace_pod_affinity_scope_does_not_match_single_namespace_anti_affinity() {
+        let pod = json!({
+            "spec": {
+                "affinity": {
+                    "podAntiAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "topologyKey": "region",
+                            "labelSelector": {
+                                "matchExpressions": [{
+                                    "key": "security",
+                                    "operator": "In",
+                                    "values": ["S2"]
+                                }]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        assert!(
+            !object_matches_scope("CrossNamespacePodAffinity", Some(&pod)),
+            "a podAntiAffinity term scoped to topologyKey only (no `namespaces` or \
+             `namespaceSelector`) stays within its own namespace and must NOT match \
+             CrossNamespacePodAffinity — else every anti-affinity pod wrongly consumes a \
+             CrossNamespacePodAffinity-scoped quota's hard limit (mayor-5vxfn)"
         );
     }
 
