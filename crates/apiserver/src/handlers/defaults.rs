@@ -68,6 +68,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     {
         default_role_ref_api_group(obj);
     }
+    if let ("networking.k8s.io", "networkpolicies") = (group, plural) {
+        default_networkpolicy(obj);
+    }
     if let ("resource.k8s.io", "resourceclaims") = (group, plural) {
         default_resourceclaim(obj);
     }
@@ -432,6 +435,37 @@ fn default_role_ref_api_group(obj: &mut serde_json::Value) {
         role_ref.api_group = Some("rbac.authorization.k8s.io".to_string());
     }
     obj["roleRef"] = serde_json::to_value(&role_ref).expect("RoleRefFields is always serializable");
+}
+
+/// Default `NetworkPolicyPort.protocol` to `"TCP"` when absent on ingress/egress port
+/// rules, matching real Kubernetes' `SetDefaults_NetworkPolicyPort`
+/// (pkg/apis/networking/v1/defaults.go). Never overwrites an explicit value.
+///
+/// The vendored `kube-network-policies` v1.1.0 DaemonSet unconditionally dereferences
+/// `*policyPort.Protocol` in `evaluatePorts()` with no nil check. Without this default, a
+/// NetworkPolicy port rule that omits `protocol` (a valid, upstream-legal shape -- see the
+/// `[sig-network] Netpol API ... endport field` conformance test) reaches the engine as
+/// `protocol: null`, and the first real packet evaluated against it panics with a
+/// nil-pointer dereference. The DaemonSet then CrashLoopBackOffs, and because its own
+/// nftables NFQUEUE rule uses `flags bypass`, every packet arriving during the crash
+/// window is unconditionally ACCEPTED node-wide -- a fail-open blast radius across every
+/// NetworkPolicy on the node, not just the one that omitted `protocol`.
+fn default_networkpolicy(obj: &mut serde_json::Value) {
+    for direction in ["ingress", "egress"] {
+        let Some(rules) = obj["spec"][direction].as_array_mut() else {
+            continue;
+        };
+        for rule in rules.iter_mut() {
+            let Some(ports) = rule["ports"].as_array_mut() else {
+                continue;
+            };
+            for port in ports.iter_mut() {
+                if port["protocol"].is_null() {
+                    port["protocol"] = serde_json::Value::String("TCP".to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Apply all Service defaults in the correct order.
@@ -4055,6 +4089,62 @@ mod tests {
         assert!(
             validate_resource("networking.k8s.io", "networkpolicies", &obj).is_ok(),
             "NetworkPolicy with both port and endPort set must pass validation"
+        );
+    }
+
+    /// A NetworkPolicy ingress port rule with no `protocol` must have it defaulted to TCP.
+    ///
+    /// The vendored `kube-network-policies` v1.1.0 DaemonSet dereferences
+    /// `*policyPort.Protocol` with no nil check in its packet-evaluation engine; a port
+    /// rule that omits `protocol` (the exact shape upstream's own "endport field"
+    /// conformance test constructs) reaches it as `protocol: null` and panics with a
+    /// nil-pointer dereference, crash-looping the DaemonSet. Because its nftables NFQUEUE
+    /// rule uses `flags bypass`, every packet during the resulting crash-loop window is
+    /// accepted node-wide regardless of policy. Reverting this default reopens that
+    /// fail-open window.
+    #[test]
+    fn network_policy_port_protocol_defaults_to_tcp_when_omitted() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "np", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "ingress": [{"ports": [{"port": 81}]}]
+            }
+        });
+
+        apply_defaults("networking.k8s.io", "networkpolicies", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["ingress"][0]["ports"][0]["protocol"], "TCP",
+            "spec.ingress[].ports[].protocol must default to TCP -- absent protocol \
+             crashes the vendored kube-network-policies engine on the first evaluated packet"
+        );
+    }
+
+    /// A NetworkPolicy port rule with an explicit protocol must not be overwritten.
+    ///
+    /// A UDP rule silently rewritten to TCP would stop matching UDP traffic, breaking the
+    /// policy it was written to enforce.
+    #[test]
+    fn network_policy_port_existing_protocol_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "np", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "egress": [{"ports": [{"port": 53, "protocol": "UDP"}]}]
+            }
+        });
+
+        apply_defaults("networking.k8s.io", "networkpolicies", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["egress"][0]["ports"][0]["protocol"], "UDP",
+            "an explicit UDP protocol must survive defaulting -- overwriting it to TCP \
+             would silently stop the policy from matching the UDP traffic it targets"
         );
     }
 
