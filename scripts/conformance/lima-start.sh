@@ -418,6 +418,27 @@ if [ -f "$CA_CERT" ]; then
     echo "error: could not determine ${VM_NAME}'s IP for the kubelet serving cert SAN" >&2
     exit 1
   fi
+  # Same "scope global" selection as LIMA_VM_IP above (not a hardcoded "eth0") —
+  # needed below to attach NODE_IPV6 to the right device despite the same LP:#2136392
+  # NIC-rename flakiness (observed live on this exact image: enp0s1, not eth0).
+  LIMA_VM_IFACE=$(limactl shell "$VM_NAME" ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | head -1 || true)
+  if [ -z "$LIMA_VM_IFACE" ]; then
+    echo "error: could not determine ${VM_NAME}'s network interface for the dual-stack node IP" >&2
+    exit 1
+  fi
+
+  # Give this node a stable ULA (fd00::/8) IPv6 address so kubelet has a 2nd-family
+  # address to report as a node address. lima's user-v2 network is IPv4-only (no
+  # SLAAC/DHCPv6 — verified: the primary interface only ever gets a link-local fe80::
+  # address), so without this, node.status.addresses only ever carries an IPv4
+  # InternalIP and upstream's [Feature:IPv6DualStack] "should have at least one
+  # dual-stack node" e2e (dual_stack.go) fails every run. This address only needs to
+  # exist on a local interface for kubelet's --node-ip validation below — it never
+  # needs to be routable off the VM. Reuses POD_SUBNET_OCTET (already unique per
+  # node) so a multi-node run never collides. `ip addr replace` is idempotent
+  # (unlike `add`, which errors on a 2nd run against the same address).
+  NODE_IPV6="fd85:${POD_SUBNET_OCTET}::1"
+  limactl shell "$VM_NAME" sudo ip -6 addr replace "${NODE_IPV6}/64" dev "$LIMA_VM_IFACE"
 
   if [ ! -f "$KUBELET_TLS_KEY" ] || [ ! -f "$KUBELET_TLS_CRT" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$KUBELET_TLS_KEY"
@@ -456,6 +477,7 @@ ExecStart=/usr/bin/kubelet \\\\
   --tls-cert-file=/etc/kubelet-tls.crt \\\\
   --tls-private-key-file=/etc/kubelet-tls.key \\\\
   --hostname-override=${VM_NAME} \\\\
+  --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\
   --v=${KUBELET_V}
 # Matches kube-proxy.service's LimitNOFILE below — sustained conformance load
 # (one FD per container log/exec/attach stream) can exceed the systemd default
