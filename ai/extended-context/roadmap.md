@@ -3,6 +3,8 @@ name: roadmap
 description: u7s roadmap — current state and priorities via a per-component decision matrix and horizontal gates. Not a phase list. Durable north star, decision framework, and guiding principles live in north-star.md; this file changes often and links back rather than restating them.
 metadata:
   type: project
+as_of: 2026-08-18
+kind: roadmap
 ---
 
 # u7s Roadmap
@@ -216,8 +218,18 @@ Closed since last revision: `mayor-axi12` (superseded 2026-08-13 by `mayor-c6rml
 | Bead | Priority | Note |
 |---|---|---|
 | `mayor-rvkq` | P3 | CRD CEL validation (`x-kubernetes-validations`). A CEL evaluator already exists for `ValidatingAdmissionPolicy` — this would wire it into CR schema validation, not build one from scratch. Trigger: real workload uses CEL in a CRD schema |
-| `mayor-jtlnx` | P3 | PARTIALLY VERIFIED 2026-08-14 against two fresh full-conformance runs: `mayor-9sd51`/PR #1134's fix holds for the `deleteCollection` path (zero fatal errors in either run), but the same tombstoned-CRD condition still surfaces a non-fatal `deleteAllContent`-path error 9-11×/run. Doesn't block conformance (both runs 446/446 or 444/446), but the verb-scoping fix may need extending. See bead notes for exact log evidence |
 | `mayor-9xsn3` | P3 | DRA v1alpha3 registration. Deferred to 1.37 upstream bump (schema growing there) |
+
+Closed since last revision: `mayor-jtlnx` (CLOSED 2026-08-14, no-fix-warranted) —
+verified against two fresh full-conformance runs that `mayor-9sd51`/PR #1134's fix
+eliminates 100% of the original fatal `deleteCollection` signature. A different,
+non-fatal error still surfaces ~once per 446-spec run via `deleteAllContent`'s
+unscoped `listCollection` sweep, but it self-heals via KCM's own retry in
+single-digit milliseconds and does not block conformance. Extending verb-scoping
+to that LIST path was investigated and explicitly rejected: it risks reintroducing
+the informer-relist-hangs-forever bug `mayor-9sd51` fixed, since there's no safe
+way to distinguish a namespace-deleter sweep LIST from an informer relist LIST at
+the handler level. No PR opened; see bead close reason for full evidence.
 
 ---
 
