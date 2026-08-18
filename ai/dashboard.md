@@ -4,7 +4,7 @@
 Stance: resource-optimized k8s, correctness → obs → perf, pre-alpha, merge-on-green. Priority hierarchy: **testing-blockers > Conformance > correctness > memory > features > o11y/perf.**
 
 ## ✅ FULL CONFORMANCE GREEN
-`temp/e2e/0818-1303-conformance/` — **446/446 passed**, confirmed by operator. First full green Conformance run this project has had.
+`temp/e2e/0818-1303-conformance/` — **446/446 passed**, confirmed by operator. Project has passed Conformance before (then regressed) over recent weeks; this run is the recovery from this session's regression, not a first-ever milestone.
 
 ## 📊 Memory/metrics analysis (via mayor-c7ws9's aggregator, PR #1252)
 - **0 OOM-proximity ticks** on both VMs — the 8GiB memory bump (#1251) resolved the OOM class of issues entirely.
@@ -38,4 +38,4 @@ mayor-9uqli, mayor-sf0jc, mayor-mpcw6, mayor-c1kgc, mayor-m3wa7, mayor-5vffw+249
 Main @ `e73e1a89`. PRs: 0 open. Worktrees: 1 (mayor only, clean). VMs: none serving workers. Dispatch loop cron `a161181c` = strict read-only.
 
 ## Session summary
-34 merges. 11 beads closed. 10 Scout findings archived. 3 root-cause hypothesis chains fully resolved (CSI mount-race → RBAC gap; NetworkPolicy mixed-matrix → nil-deref crash via missing protocol default; DiskPressure oscillation → 5m eviction-transition latch). Monitoring audit → post-run aggregator built and validated on real data. Fork-mayor split-brain diagnosed, resolved, and prevented via strict-read-only dispatch cron. **First full Conformance run: 446/446 green** after finding + fixing 1 real regression (env valueFrom autoviv, protobuf round-trip asymmetry) under an explicit live-verification merge gate. 3 follow-on beads filed from real memory/metrics data for next session.
+34 merges. 11 beads closed. 10 Scout findings archived. 3 root-cause hypothesis chains fully resolved (CSI mount-race → RBAC gap; NetworkPolicy mixed-matrix → nil-deref crash via missing protocol default; DiskPressure oscillation → 5m eviction-transition latch). Monitoring audit → post-run aggregator built and validated on real data. Fork-mayor split-brain diagnosed, resolved, and prevented via strict-read-only dispatch cron. **Conformance run: 446/446 green** after finding + fixing 1 real regression (env valueFrom autoviv, protobuf round-trip asymmetry) under an explicit live-verification merge gate — recovering from the regression this project has cycled through before. 3 follow-on beads filed from real memory/metrics data for next session.
