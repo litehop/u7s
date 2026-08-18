@@ -1469,6 +1469,13 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("Lease", true, false),
     );
 
+    // coordination.k8s.io/v1alpha2 — namespaced; no /status subresource (upstream types.go
+    // declares Spec only — CoordinatedLeaderElection candidates are alpha).
+    m.insert(
+        rk("coordination.k8s.io", "v1alpha2", "leasecandidates"),
+        rm("LeaseCandidate", true, false),
+    );
+
     // discovery.k8s.io/v1
     m.insert(
         rk("discovery.k8s.io", "v1", "endpointslices"),
@@ -1687,6 +1694,25 @@ mod tests {
             "IngressClass has no status subresource"
         );
         assert_eq!(meta.kind, "IngressClass");
+    }
+
+    /// LeaseCandidate (coordination.k8s.io/v1alpha2) must be registered so CoordinatedLeaderElection
+    /// clients (client-go's typed clientset, used by the e2e CLE specs) can create/list/watch
+    /// candidate objects. Without this entry, `kubectl apply`/client-go writes to this GVK 404
+    /// via the CR-handler fallback (no CRD installed) instead of being served as a built-in type.
+    #[test]
+    fn leasecandidate_registered_as_namespaced_with_no_status_subresource() {
+        let registry = build_registry();
+        let key = rk("coordination.k8s.io", "v1alpha2", "leasecandidates");
+        let meta = registry
+            .get(&key)
+            .expect("leasecandidates must be in build_registry");
+        assert!(meta.namespaced, "LeaseCandidate is namespaced");
+        assert!(
+            !meta.has_status_subresource,
+            "LeaseCandidate has no status field at all upstream (spec-only type)"
+        );
+        assert_eq!(meta.kind, "LeaseCandidate");
     }
 
     /// kubelet lists node.k8s.io/v1/runtimeclasses on startup. Without this entry the

@@ -116,6 +116,12 @@ pub mod k8s {
                 pub mod v1 {
                     include!(concat!(env!("OUT_DIR"), "/k8s.io.api.coordination.v1.rs"));
                 }
+                pub mod v1alpha2 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/k8s.io.api.coordination.v1alpha2.rs"
+                    ));
+                }
             }
             pub mod storage {
                 pub mod v1 {

@@ -30,6 +30,10 @@ fn main() {
                     .to_str()
                     .unwrap(),
                 include_dir
+                    .join("k8s.io/api/coordination/v1alpha2/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
                     .join("k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto")
                     .to_str()
                     .unwrap(),
