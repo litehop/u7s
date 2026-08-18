@@ -77,6 +77,18 @@
         ],
         "matcher": ""
       }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/critical-reviewer-dispatch.sh",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   },
   "enabledMcpjsonServers": [

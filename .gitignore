@@ -26,3 +26,7 @@ temp/*
 
 .claude/scheduled_tasks.json
 .claude/plans/
+
+# Critical-reviewer queue: hook writes review-request markers here; ephemeral.
+.claude/review-queue/*
+!.claude/review-queue/.gitkeep
