@@ -417,6 +417,56 @@ pub(crate) async fn create_resource<S: Store>(
     Ok(resp)
 }
 
+/// Reject a PUT whose declared `resourceVersion` no longer matches the object's current
+/// stored value, before any field-immutability validation below ever runs.
+///
+/// Mirrors real kube-apiserver's actual check order (`genericregistry.Store.Update`'s
+/// `GuaranteedUpdate` closure, `staging/src/k8s.io/apiserver/pkg/registry/generic/registry/
+/// store.go`): the resourceVersion CAS precondition is compared against the just-read stored
+/// object BEFORE `rest.BeforeUpdate` ever calls the resource's `ValidateUpdate` — which is
+/// where `validate_pvc_spec_immutable` and every other `validate_*_immutable` check in this
+/// file live upstream. A resourceVersion mismatch there is *always* surfaced as 409 Conflict,
+/// never as a validation error — the whole point being that client-go's optimistic-
+/// concurrency retry logic recognizes 409 as "re-GET and reapply", not as a hard failure.
+///
+/// Every `validate_*_immutable` check in this file (PVC, PV, StorageClass, Node,
+/// PriorityClass.value, workload spec, Service clusterIP, Secret/ConfigMap immutable)
+/// compares the incoming PUT body against `parsed`, the object as it stands *right now* —
+/// not against whatever the client's own resourceVersion claims it was based on. Without
+/// this check running first, a client PUTing a resourceVersion-stale copy of an object that
+/// something else has since mutated gets whichever of those checks trips first: a
+/// permanent-looking 422 instead of the retryable 409 kube-apiserver would give. This is
+/// exactly what sustained a 1035-request HTTP 422 storm against KCM's persistent-volume-
+/// binder and pv-protection-controller (mayor-nw9hj): the binder's informer hadn't yet
+/// observed the watch event for its own prior successful bind, so its next reconcile PUT
+/// still carried the pre-bind `spec.volumeName` — genuinely stale by resourceVersion, but
+/// u7s validated it against the post-bind stored spec first and rejected it as an
+/// immutable-field violation on every retry for the rest of the test window, instead of the
+/// 409 that would have told the binder's own retry machinery to simply re-GET and try again.
+fn check_replace_resource_version_precondition(
+    expected_revision: Option<u64>,
+    parsed: &Option<serde_json::Value>,
+    name: &str,
+    kind: &str,
+) -> Result<(), crate::status::StatusError> {
+    let Some(expected) = expected_revision else {
+        return Ok(());
+    };
+    let current = parsed
+        .as_ref()
+        .and_then(|v| v["metadata"]["resourceVersion"].as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if current == expected {
+        return Ok(());
+    }
+    Err(store_err(
+        StoreError::RevisionMismatch { expected, current },
+        name,
+        kind,
+    ))
+}
+
 pub(crate) async fn replace_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
@@ -506,6 +556,11 @@ pub(crate) async fn replace_resource<S: Store>(
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+
+        // Stale-resourceVersion PUTs must 409, not fall through into the immutability
+        // checks below using the (by-then-moved-on) freshly-read `parsed` — see
+        // check_replace_resource_version_precondition's doc comment (mayor-nw9hj).
+        check_replace_resource_version_precondition(expected_revision, &parsed, &name, &meta.kind)?;
 
         // Immutability check: PriorityClass.value drives scheduling/preemption ordering
         // cluster-wide; allowing it to change post-create would silently reorder
@@ -1548,22 +1603,37 @@ async fn reject_disallowed_pvc_resize<S: Store>(
 /// Reject a PersistentVolumeClaim spec update that changes any field outside the narrow
 /// upstream-allowed set — an allowlist mirroring `ValidatePersistentVolumeClaimUpdate` in
 /// `pkg/apis/core/validation` (release-1.36). Only `spec.resources` may change once a PVC
-/// exists; `volumeName`, `storageClassName`, `accessModes`, `dataSource`, `dataSourceRef`,
-/// `volumeMode`, `selector`, and any other spec field are frozen at creation time.
+/// exists (plus the one-time `volumeName` transition below); `storageClassName`,
+/// `accessModes`, `dataSource`, `dataSourceRef`, `volumeMode`, `selector`, and any other
+/// spec field are frozen at creation time.
 ///
 /// This is the same allowlist shape `validate_pod_spec_immutable` uses (mayor-j1zls, PR
-/// #1213): munge the one upstream-permitted mutable field out of a clone of `new_spec`
-/// using `old_spec`'s value, then require the rest to deep-equal `old_spec`. Any field not
+/// #1213): munge the upstream-permitted mutable fields out of a clone of `new_spec` using
+/// `old_spec`'s value, then require the rest to deep-equal `old_spec`. Any field not
 /// explicitly munged is frozen by construction, so a PVC spec field added upstream tomorrow
 /// is immutable by default here instead of silently allowed until someone remembers to add
 /// a dedicated check for it — which is exactly how `volumeName`/`storageClassName`/
 /// `accessModes` went unchecked before this function existed (mayor-7kuzu).
 ///
+/// `spec.volumeName` gets the same one-time-transition treatment upstream gives it
+/// (`ValidatePersistentVolumeClaimUpdate`, validation.go: `if len(oldPvc.Spec.VolumeName)
+/// == 0 { oldPvcClone.Spec.VolumeName = newPvcClone.Spec.VolumeName }` — "volumeName
+/// changes are allowed once"): the PersistentVolumeClaim binder controller MUST be able to
+/// set this field via a plain Update() the very first time a claim binds, since every PVC
+/// is created with it unset and only the binder ever populates it. Without this exception,
+/// this allowlist blanket-froze volumeName from creation — including its very first,
+/// legitimate transition from empty to the bound PV's name — so no dynamically-provisioned
+/// PVC could ever reach `Bound` via a normal PUT/PATCH at all (mayor-nw9hj: this is what
+/// actually sustained the reported HTTP 422 storm against KCM's persistent-volume-binder,
+/// not merely a transient stale-retry race). Once `volumeName` is non-empty, it goes back
+/// to being frozen exactly like every other field here — a caller can't redirect an
+/// already-bound claim to a different PersistentVolume.
+///
 /// `spec.resources`'s own directional rules — shrink forbidden, grow gated on
 /// `StorageClass.allowVolumeExpansion` — are enforced separately by
 /// `reject_disallowed_pvc_resize` and deliberately NOT duplicated here: this function only
-/// decides whether a *change* to `resources` is permitted at all, not whether the
-/// particular change is a valid resize.
+/// decides whether a *change* to `resources` (or `volumeName`) is permitted at all, not
+/// whether the particular change is a valid resize.
 fn validate_pvc_spec_immutable(
     old_spec: &serde_json::Value,
     new_spec: &serde_json::Value,
@@ -1582,7 +1652,30 @@ fn validate_pvc_spec_immutable(
             }
         }
     }
-    if munged == *old_spec {
+
+    // volumeName may transition from empty to set exactly once: munge the OLD spec's copy
+    // (not new_spec's) to match whatever the incoming value is, but only while old_spec's
+    // volumeName is still empty/absent. Once old_spec already carries a real volumeName,
+    // no munge happens and any further change is caught by the deep-equal check below,
+    // exactly like every other frozen field.
+    let old_volume_name_empty = old_spec
+        .get("volumeName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty();
+    let mut old_for_compare = old_spec.clone();
+    if old_volume_name_empty {
+        if let Some(m) = old_for_compare.as_object_mut() {
+            match munged.get("volumeName") {
+                Some(v) if !v.is_null() => {
+                    m.insert("volumeName".to_string(), v.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if munged == old_for_compare {
         return Ok(());
     }
     Err(
@@ -2591,6 +2684,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+
+        // Stale-resourceVersion PUTs must 409, not fall through into the immutability
+        // checks below using the (by-then-moved-on) freshly-read `parsed` — see
+        // check_replace_resource_version_precondition's doc comment (mayor-nw9hj).
+        check_replace_resource_version_precondition(expected_revision, &parsed, &name, &meta.kind)?;
 
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
         // reject any update that modifies data/binaryData/stringData or clears the
@@ -18148,6 +18246,149 @@ mod tests {
         }
     }
 
+    /// A PUT that reuses a resourceVersion-stale copy of a PVC — the exact shape of KCM's
+    /// persistent-volume-binder retrying a bind from an informer cache that hasn't yet
+    /// observed its own prior successful write — must return 409 Conflict, not 422
+    /// Unprocessable Entity, when the stale copy also disagrees with the (now-current)
+    /// stored spec on an otherwise-immutable field like `volumeName`.
+    ///
+    /// Without `check_replace_resource_version_precondition` running before
+    /// `validate_pvc_spec_immutable`, this test fails with 422: the immutability check
+    /// compares the stale retry's spec against the freshly-read (already-advanced) stored
+    /// spec, finds a genuine mismatch, and rejects it as an immutable-field violation before
+    /// the resourceVersion mismatch is ever noticed. Real kube-apiserver's generic registry
+    /// always checks resourceVersion first (see check_replace_resource_version_precondition's
+    /// doc comment) — client-go's optimistic-concurrency retry logic treats 409 as "re-GET
+    /// and reapply" but treats 422 as a terminal validation failure, so getting 422 here
+    /// instead of 409 is exactly the mechanism that sustained the 1035-request HTTP 422
+    /// storm against KCM's persistent-volume-binder (mayor-nw9hj), which permanently blocked
+    /// every csi-hostpath PVC from ever reaching Bound.
+    #[tokio::test]
+    async fn replace_namespaced_resource_returns_409_not_422_for_stale_pvc_bind_retry() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "stale-bind-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "csi-hostpath-sc",
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        let create_resp = create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PVC create must succeed: {e:?}"))
+        .into_response();
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let rv0 = created["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // KCM's persistent-volume-binder's first bind: PUT setting spec.volumeName,
+        // declaring the resourceVersion it read the (still-unbound) claim at. This is the
+        // "PUT -> 200" half of the storm signature.
+        let bound_to_a = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "stale-bind-pvc",
+                "namespace": "default",
+                "resourceVersion": rv0
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "csi-hostpath-sc",
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeName": "pv-a"
+            }
+        });
+        replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "stale-bind-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&bound_to_a).unwrap()),
+        )
+        .await
+        .expect("first bind PUT must succeed");
+
+        // Simulated retry from a stale informer cache: still declares the pre-bind
+        // resourceVersion (rv0), diverging on spec.volumeName from what's now actually
+        // stored ("pv-a") — the same shape a race under concurrent binding load can produce.
+        let stale_retry = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "stale-bind-pvc",
+                "namespace": "default",
+                "resourceVersion": rv0
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "csi-hostpath-sc",
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeName": "pv-b"
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "stale-bind-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&stale_retry).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "a resourceVersion-stale PUT must 409, even when it also disagrees with the \
+                 current stored spec on an immutable field — client-go's retry logic only \
+                 knows how to recover from 409 (re-GET and reapply), not 422; got message {:?}",
+                err.1.message
+            ),
+            Ok(_) => panic!(
+                "a resourceVersion-stale PVC bind retry must be rejected as a conflict, not \
+                 silently accepted"
+            ),
+        }
+    }
+
     /// PATCH shrinking a PVC's `spec.resources.requests.storage` must return 403 Forbidden.
     ///
     /// Mirrors the PUT test above but for PATCH (strategic-merge-patch), exercising the
@@ -18227,6 +18468,126 @@ mod tests {
             Ok(_) => panic!(
                 "PATCH shrinking PersistentVolumeClaim.spec.resources.requests.storage must \
                  be rejected — the shrink check is missing from do_patch"
+            ),
+        }
+    }
+
+    /// PUT setting `spec.volumeName` on an unbound PVC (empty -> a real PV name) must
+    /// succeed, and a SUBSEQUENT PUT trying to change it again must still be rejected.
+    ///
+    /// Upstream's `ValidatePersistentVolumeClaimUpdate` explicitly permits this one-time
+    /// transition ("volumeName changes are allowed once") because every PVC is created
+    /// with volumeName unset and only the PersistentVolumeClaim binder controller ever
+    /// populates it, via a plain Update() — not a dedicated bind subresource. Before this
+    /// fix, `validate_pvc_spec_immutable`'s allowlist treated volumeName as frozen from
+    /// creation with no exception, so this very first, legitimate bind PUT was rejected
+    /// with 422 just like any other spec change — meaning no dynamically-provisioned PVC
+    /// could ever reach `Bound` at all (mayor-nw9hj).
+    #[tokio::test]
+    async fn replace_namespaced_resource_allows_pvc_first_bind_then_freezes_volume_name() {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "first-bind-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+        )
+        .await
+        .expect("PVC create must succeed");
+
+        // First bind: volumeName transitions from unset to "pv-a". This is exactly what
+        // KCM's persistent-volume-binder does via bindClaimToVolume's Update() call.
+        let bind = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "first-bind-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeName": "pv-a"
+            }
+        });
+        replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "first-bind-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&bind).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "first PUT transitioning spec.volumeName from empty to \"pv-a\" must succeed \
+                 — upstream explicitly allows this one-time transition, and rejecting it \
+                 means no PVC could ever bind: {e:?}"
+            )
+        });
+
+        // Second attempt: volumeName is now non-empty, so any further change is frozen
+        // exactly like every other allowlisted field.
+        let rebind = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "first-bind-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } },
+                "volumeName": "pv-b"
+            }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "first-bind-pvc".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&rebind).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT repointing an already-bound PVC's spec.volumeName must still 422 — the \
+                 one-time transition exception must not make the field permanently mutable"
+            ),
+            Ok(_) => panic!(
+                "PUT changing an already-bound PVC's spec.volumeName to a different \
+                 PersistentVolume must be rejected — accepting it lets a caller misdirect a \
+                 bound claim's storage to unrelated storage"
             ),
         }
     }
