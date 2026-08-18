@@ -13,7 +13,7 @@
 #   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--unsafe-focus] [--all-e2e]
 #                                  [--stack-only] [--vm <name>] [--network <name>]
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
-#                                  [--konnectivity-server-port <N>]
+#                                  [--konnectivity-server-port <N>] [--procs <N>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
@@ -55,6 +55,14 @@
 #                --all-e2e widens). If --stack-only is also given, --stack-only
 #                wins and --all-e2e is ignored (warning printed to stderr), same
 #                as --focus's existing interaction with --stack-only.
+#   --procs   Ginkgo parallelism (E2E_EXTRA_GINKGO_ARGS=--procs=<N>), forwarded to
+#             06-run-sonobuoy.sh's build_filter_args for both the --focus and
+#             --all-e2e/certified-conformance paths. Defaults to 16 (unchanged
+#             behavior) when omitted. Dial this down (e.g. 4) on memory-constrained
+#             VMs — 16 concurrent ginkgo processes each running their own test
+#             namespace/pod churn OOMs a 4GiB lima VM under concurrent-load
+#             scouting, where --focus's own matched-spec-count was the only
+#             (weaker, imprecise) cap on real parallelism.
 #   -v, -vv, -vvv  Repeatable-flag tiered debug logging, apt-style (--verbose is
 #                kept as an alias for a single -v). -v scopes RUST_LOG to u7s's own
 #                crates: u7s_apiserver=debug,u7s_store=debug,u7s_scheduler=debug,info.
@@ -182,6 +190,7 @@ NETWORK=""
 PROFILE=0
 DHAT_DEPTH=""
 SAMPLE_INTERVAL=""
+PROCS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -206,6 +215,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE=1; shift ;;
     --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
+    --procs) PROCS="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -263,6 +273,16 @@ fi
 # own default of 10, which would look like the flag was simply ignored.
 if [ -n "$DHAT_DEPTH" ] && ! [[ "$DHAT_DEPTH" =~ ^[0-9]+$ ]]; then
   echo "error: --dhat-depth must be a non-negative integer, got '$DHAT_DEPTH'" >&2
+  exit 1
+fi
+
+# --procs is forwarded verbatim into 06-run-sonobuoy.sh's build_filter_args as
+# ginkgo's --procs=<N> -- reject a non-positive-integer here (typo, "0", a
+# stray flag value) instead of letting it reach ginkgo's own argv, where the
+# failure mode would be an inscrutable sonobuoy plugin error deep inside the
+# VM instead of an immediate, clearly-labeled message at invocation time.
+if [ -n "$PROCS" ] && ! [[ "$PROCS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --procs must be a positive integer, got '$PROCS'" >&2
   exit 1
 fi
 
@@ -330,6 +350,8 @@ _WORKDIR_ARG="--workdir $WORKDIR"
 [ "$UNSAFE_FOCUS" -eq 1 ] && _UNSAFE_FOCUS_ARG="--unsafe-focus"
 _SAMPLE_INTERVAL_ARG=""
 [ -n "$SAMPLE_INTERVAL" ] && _SAMPLE_INTERVAL_ARG="--interval $SAMPLE_INTERVAL"
+_PROCS_ARG=""
+[ -n "$PROCS" ] && _PROCS_ARG="--procs $PROCS"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -457,7 +479,7 @@ else
   banner "Step 6/6: Run sonobuoy"
   export SONOBUOY_FOCUS="$FOCUS"
   # shellcheck disable=SC2086
-  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG}
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_EXTRA_NODE_ARG} ${_ALL_E2E_ARG} ${_UNSAFE_FOCUS_ARG} ${_PROCS_ARG}
 
   # Build provenance: record what was actually tested (git SHA, dhat feature/
   # depth, node topology, exact invocation) into this run's own meta/build.json

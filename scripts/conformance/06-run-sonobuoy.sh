@@ -4,6 +4,9 @@
 # Reads --focus from SONOBUOY_FOCUS env var or CLI argument. --all-e2e widens
 # the run to the full e2e ginkgo set instead of --mode=certified-conformance
 # (see run-all.sh for the mutual-exclusivity/precedence rules with --focus).
+# --procs overrides ginkgo's --procs=<N> parallelism (default 16) — see
+# run-all.sh's own --procs doc comment for why (16 OOMs a 4GiB VM under
+# concurrent-load scouting).
 #
 # Part of the scripts/conformance/ orchestration sequence.
 set -euo pipefail
@@ -16,6 +19,14 @@ WORKDIR="$PWD/temp/u7s"
 UNPACK=1
 PORT="${U7S_PORT:-6443}"
 EXTRA_NODE=""
+# Ginkgo parallelism for E2E_EXTRA_GINKGO_ARGS=--procs=<N> in build_filter_args
+# below. 16 was previously hardcoded there with no override — under
+# concurrent-load scouting (multiple workers each running their own sonobuoy
+# invocation), 16 ginkgo processes per worker OOMs a 4GiB lima VM. run-all.sh
+# forwards --procs verbatim; kept at 16 by default so an invocation that omits
+# it behaves exactly as before (see run-all.sh's --all-e2e doc comment on
+# PR #966's --procs=16 baseline).
+PROCS=16
 # --unsafe-focus only has an effect inside the --focus branch below (it wipes
 # that branch's FeatureGate/[Flaky] filters). Given with --all-e2e or bare
 # (certified-conformance), it's a structural no-op: neither of those branches
@@ -35,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
+    --procs) PROCS="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -200,12 +212,12 @@ build_filter_args() {
   local apply="$1"
   if [ "$apply" -eq 1 ]; then
     FILTER_ARGS=(
-      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16|--label-filter=${FEATUREGATE_LABEL_FILTER}"
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${FEATUREGATE_LABEL_FILTER}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
       "--e2e-skip=\[Flaky\]"
     )
   else
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16")
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}")
   fi
 }
 
