@@ -147,6 +147,26 @@ fn main() {
         codegen::generate_persistentvolumeclaim_status(descriptor_bytes),
     )
     .expect("failed to write generated PersistentVolumeClaimStatus codec");
+    std::fs::write(
+        out_dir.join("service_spec_gen.rs"),
+        codegen::generate_service_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceSpec codec");
+    std::fs::write(
+        out_dir.join("service_status_gen.rs"),
+        codegen::generate_service_status(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceStatus codec");
+    std::fs::write(
+        out_dir.join("service_gen.rs"),
+        codegen::generate_service(descriptor_bytes),
+    )
+    .expect("failed to write generated Service codec");
+    std::fs::write(
+        out_dir.join("endpoints_gen.rs"),
+        codegen::generate_endpoints(descriptor_bytes),
+    )
+    .expect("failed to write generated Endpoints codec");
 
     println!(
         "cargo:rerun-if-changed={}",

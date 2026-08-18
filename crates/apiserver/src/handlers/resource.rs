@@ -2196,7 +2196,12 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
 
     // Auto-allocate clusterIP for Services that don't specify one.
     // Must run before apply_defaults so the allocated IP feeds into ipFamilies/clusterIPs.
+    // The ip-family check runs first, on the raw client body, so a Service the cluster
+    // cannot satisfy (e.g. ipFamilyPolicy: RequireDualStack) is rejected before an IP is
+    // ever taken from the pool — rejecting after allocation would leak it.
     if group.is_empty() && plural == "services" {
+        super::defaults::validate_service_ip_family_fields(&obj.body)
+            .map_err(Status::unprocessable_entity)?;
         maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
     }
 
@@ -2775,7 +2780,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // stored object carries no IP to preserve.
     // maybe_allocate_cluster_ip is a no-op when clusterIP is already set or when
     // the type is (still) ExternalName, so calling it unconditionally is safe.
+    // The ip-family check runs first, on the raw client body, for the same
+    // leak-avoidance reason as the create path above.
     if group.is_empty() && plural == "services" {
+        super::defaults::validate_service_ip_family_fields(&obj.body)
+            .map_err(Status::unprocessable_entity)?;
         maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
     }
 
@@ -11532,6 +11541,151 @@ mod tests {
             v["spec"]["clusterIPs"].is_null(),
             "headless Service must not have clusterIPs set"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Service dual-stack ipFamilyPolicy/ipFamilies validation regression tests
+    //
+    // u7s's ServiceIpAllocator only ever allocates from a single IPv4 CIDR — there
+    // is no second allocator for any other family. Before this fix, a Service
+    // claiming ipFamilyPolicy: RequireDualStack (or explicitly listing a
+    // non-IPv4 family) was accepted and echoed back verbatim while only ever
+    // getting one IPv4 ClusterIP allocated, silently breaking dual-stack routing
+    // for any consumer (kube-proxy, DNS) that trusts the advertised policy. If
+    // validate_service_ip_family_fields is removed or its call sites dropped,
+    // these tests fail.
+    // ---------------------------------------------------------------------------
+
+    /// Creating a Service with ipFamilyPolicy: RequireDualStack on a cluster that
+    /// only has an IPv4 allocator must be rejected with 422, not silently stored
+    /// with a single allocated IPv4 ClusterIP.
+    ///
+    /// Also asserts the rejected attempt does not leak an IP from the pool: a
+    /// second, plain Service created afterward must still receive the very first
+    /// allocatable address, proving the earlier failed create never touched the
+    /// allocator.
+    #[tokio::test]
+    async fn create_service_rejects_require_dual_stack_policy() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::net::Ipv4Addr;
+
+        // Small CIDR so the first-allocatable address (offset 2) is deterministic.
+        let state = make_state_with_cidr_for_resource_tests("10.0.0.0/29");
+
+        let dual_stack_svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "dual-svc", "namespace": "default" },
+            "spec": {
+                "type": "ClusterIP",
+                "ipFamilyPolicy": "RequireDualStack",
+                "ports": [{ "port": 80 }]
+            }
+        });
+        let result = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&dual_stack_svc).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "RequireDualStack on a single-IPv4-family cluster must return 422 — \
+                 accepting it stores a Service that claims dual-stack routing while \
+                 only ever getting one allocated ClusterIP"
+            ),
+            Ok(_) => panic!(
+                "Service with ipFamilyPolicy: RequireDualStack must be rejected — this \
+                 cluster has no second-family allocator to actually satisfy it"
+            ),
+        }
+
+        // The rejected create must not have consumed an IP: a plain Service created
+        // next should get the first allocatable address in the range.
+        let plain_svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "plain-svc", "namespace": "default" },
+            "spec": { "type": "ClusterIP", "ports": [{ "port": 80 }] }
+        });
+        let resp = create_namespaced_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&plain_svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("plain Service create must succeed: {e:?}"))
+        .into_response();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let cluster_ip = v["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+        assert_eq!(
+            cluster_ip,
+            Ipv4Addr::new(10, 0, 0, 2).to_string(),
+            "the rejected RequireDualStack create must not have leaked the first \
+             allocatable IP (10.0.0.2) from the pool — got {cluster_ip}"
+        );
+    }
+
+    /// Creating a Service with an explicit ipFamilies entry the cluster cannot
+    /// allocate (IPv6) must be rejected with 422, regardless of ipFamilyPolicy.
+    ///
+    /// This is the exact shape reported live: ipFamilyPolicy: PreferDualStack with
+    /// ipFamilies: [IPv4, IPv6] was accepted and echoed back verbatim while only a
+    /// single IPv4 ClusterIP was ever allocated for it.
+    #[tokio::test]
+    async fn create_service_rejects_explicit_ipv6_family() {
+        use axum::extract::{Path, State};
+
+        let state = make_state_with_cidr_for_resource_tests("10.0.0.0/29");
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "prefer-dual-svc", "namespace": "default" },
+            "spec": {
+                "type": "ClusterIP",
+                "ipFamilyPolicy": "PreferDualStack",
+                "ipFamilies": ["IPv4", "IPv6"],
+                "ports": [{ "port": 80 }]
+            }
+        });
+        let result = create_namespaced_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "ipFamilies: [IPv4, IPv6] on a single-IPv4-family cluster must return 422 \
+                 — accepting it stores a Service that advertises IPv6 support it can never \
+                 actually allocate"
+            ),
+            Ok(_) => panic!(
+                "Service explicitly requesting IPv6 in spec.ipFamilies must be rejected — \
+                 this cluster has no IPv6 allocator to satisfy it"
+            ),
+        }
     }
 
     fn proto_headers() -> axum::http::HeaderMap {
