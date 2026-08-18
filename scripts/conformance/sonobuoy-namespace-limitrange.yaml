@@ -1,0 +1,37 @@
+# mayor-f0lfr: the sonobuoy AGGREGATOR pod (namespace `sonobuoy`, pod name
+# "sonobuoy" -- distinct from the "sonobuoy-e2e-job-*" worker pod that
+# sonobuoy-plugin-e2e.yaml already bounds) is generated entirely by
+# sonobuoy's own compiled-in Go code (cmd/sonobuoy/app, pkg/plugin/
+# aggregation). There is no CLI flag or plugin-manifest field to set its
+# resources -- confirmed at v0.57.3 source by mayor-vmye0/mayor-o4fmo's
+# audits. It therefore ships BestEffort (resources: {}), which the kernel's
+# global OOM killer treats as its highest-priority (first) victim under any
+# node memory pressure: observed OOMKilled ~55s into a csi-hostpath focus
+# run once kubelet's registryPullQPS gate (mayor-5v9gl) stopped incidentally
+# throttling how fast the run's early event/log volume could spike.
+#
+# Since sonobuoy's own schema has no override point for the aggregator, this
+# LimitRange is applied to the `sonobuoy` namespace BEFORE `sonobuoy run`
+# (see 06-run-sonobuoy.sh). u7s's own LimitRange admission
+# (apply_limit_ranges, crates/apiserver/src/limit_range.rs) injects default
+# requests/limits into ANY container that omits them, regardless of which
+# client created the pod -- so it reaches the aggregator's container even
+# though sonobuoy's plugin schema never could.
+#
+# Deliberately request-only (no `default` limit key), matching the e2e
+# container's own precedent already in sonobuoy-plugin-e2e.yaml: a request
+# promotes the pod from BestEffort to Burstable QoS (dramatically lowering
+# its oom_score_adj so it escapes first-in-line eviction) without capping
+# the aggregator's legitimate memory growth into a different, equally-fatal
+# memcg OOM.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: sonobuoy-aggregator-defaults
+  namespace: sonobuoy
+spec:
+  limits:
+  - type: Container
+    defaultRequest:
+      cpu: 100m
+      memory: 256Mi
