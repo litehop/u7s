@@ -818,6 +818,12 @@ pub struct PodCertificateRequestSpec {
     pub node_name: String,
     #[serde(rename = "nodeUID")]
     pub node_uid: String,
+    /// `+required` upstream but typed as `Option` here (rather than a bare `i64`) so a
+    /// request that omits it entirely still deserializes — letting
+    /// `validate_pod_certificate_request_spec` report the more specific "must be set"
+    /// error instead of the generic "required field" deserialization failure the other
+    /// (string) fields above produce.
+    pub max_expiration_seconds: Option<i64>,
     /// Remaining fields preserved opaquely.
     #[serde(flatten)]
     #[schemars(skip)]
