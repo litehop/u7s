@@ -476,8 +476,8 @@ fn pod_uses_cross_namespace_affinity(pod: &Value) -> bool {
 /// Returns true if the object matches the given ResourceQuota scope.
 ///
 /// Implemented scopes: BestEffort, NotBestEffort, Terminating, NotTerminating,
-/// CrossNamespacePodAffinity. Unknown scopes are treated conservatively: the object is
-/// assumed to match (quota applies), which is the safe default.
+/// CrossNamespacePodAffinity, PriorityClass. Unknown scopes are treated conservatively:
+/// the object is assumed to match (quota applies), which is the safe default.
 fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     match scope {
         "BestEffort" => object.is_some_and(pod_is_best_effort),
@@ -489,6 +489,14 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
         // podAntiAffinity term with `namespaces` or `namespaceSelector` set — i.e. it is
         // genuinely cross-namespace, not just any pod with affinity/anti-affinity rules.
         "CrossNamespacePodAffinity" => object.is_some_and(pod_uses_cross_namespace_affinity),
+        // Bare `PriorityClass` (and scopeSelector's Exists operator, routed here from
+        // object_matches_scope_selector) is a plain existence check — In/NotIn are
+        // handled separately by object_matches_scope_selector.
+        "PriorityClass" => object.is_some_and(|pod| {
+            pod["spec"]["priorityClassName"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        }),
         // Unknown scopes: assume match (conservative — don't silently skip quotas).
         _ => true,
     }
@@ -544,6 +552,21 @@ fn object_matches_scope_selector(scope_selector: &Value, object: Option<&Value>)
             _ => true,
         }
     })
+}
+
+/// Returns true if `quota` restricts pod counting by scope — a non-empty `spec.scopes`
+/// array, or a `spec.scopeSelector` with at least one `matchExpressions` entry.
+///
+/// Safe to use for ANY scope name: `object_matches_scope`'s conservative default
+/// (`_ => true`) makes an unrecognized scope match every pod, so routing through the
+/// scope-filtered path never produces a stricter (wrong) result than the unfiltered count.
+fn quota_has_pod_scopes(quota: &Value) -> bool {
+    quota["spec"]["scopes"]
+        .as_array()
+        .is_some_and(|arr| !arr.is_empty())
+        || quota["spec"]["scopeSelector"]["matchExpressions"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty())
 }
 
 /// Count pods in `namespace` that match all scopes on `quota`.
@@ -611,27 +634,7 @@ pub async fn count_quota_usage<S: Store>(
     };
 
     // Is scope filtering needed? Only when the quota has scopes AND those scopes are pod-scopes.
-    // Scope filtering applies when the quota has spec.scopes (pod-scope names) or
-    // spec.scopeSelector (matchExpressions with pod-scope names like Terminating).
-    let has_scopes_array = quota["spec"]["scopes"]
-        .as_array()
-        .map(|arr| {
-            arr.iter().any(|s| {
-                matches!(
-                    s.as_str(),
-                    Some("BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating")
-                )
-            })
-        })
-        .unwrap_or(false);
-    // Any non-empty scopeSelector needs scope-aware counting, not just the enumerated
-    // scope names below — e.g. `PriorityClass In [...]` (via `object_matches_scope_selector`'s
-    // In/NotIn handling) must also exclude non-matching pods from status.used, or a
-    // PriorityClass-scoped quota's status.used would report the raw unfiltered pod count.
-    let has_scope_selector = quota["spec"]["scopeSelector"]["matchExpressions"]
-        .as_array()
-        .is_some_and(|arr| !arr.is_empty());
-    let has_pod_scopes = has_scopes_array || has_scope_selector;
+    let has_pod_scopes = quota_has_pod_scopes(quota);
 
     let mut used = std::collections::BTreeMap::new();
     for (resource_name, _) in hard {
@@ -824,7 +827,18 @@ pub async fn check_resource_quota<S: Store>(
                             Some(p) => p,
                             None => (group, resource),
                         };
-                    let current = count_objects(state, namespace, count_group, count_plural).await;
+                    // A scoped quota's "current" pod count must only include pods that
+                    // match its scope — otherwise an unrelated (non-matching) pod already
+                    // in the namespace inflates the count and wrongly denies a create that
+                    // the quota's scope was never meant to restrict.
+                    let current = if count_group.is_empty()
+                        && count_plural == "pods"
+                        && quota_has_pod_scopes(quota)
+                    {
+                        count_scope_filtered_pods(&*state.store, namespace, quota).await
+                    } else {
+                        count_objects(state, namespace, count_group, count_plural).await
+                    };
                     if current >= hard_limit {
                         tracing::debug!(
                             quota = %quota_name,
@@ -1506,6 +1520,73 @@ mod tests {
         );
     }
 
+    // -- PriorityClass bare-existence scope matching --
+
+    /// A pod with no `priorityClassName` must NOT match the bare `PriorityClass` scope.
+    ///
+    /// Before this fix, `object_matches_scope` had no arm for the bare scope name
+    /// `"PriorityClass"` (only the In/NotIn branch of `object_matches_scope_selector`
+    /// special-cased it), so it fell through to the conservative `_ => true` default and
+    /// counted every pod — a `spec.scopes: ["PriorityClass"]` quota behaved as unscoped.
+    #[test]
+    fn priority_class_scope_does_not_match_pod_without_priority_class_name() {
+        let pod = json!({
+            "spec": {
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        assert!(
+            !object_matches_scope("PriorityClass", Some(&pod)),
+            "a pod with no priorityClassName set has nothing to scope on and must NOT \
+             match the bare PriorityClass scope — else a PriorityClass-scoped quota would \
+             wrongly count every unclassed pod against its hard limit"
+        );
+    }
+
+    /// A pod with any non-empty `priorityClassName` must match the bare `PriorityClass`
+    /// scope — upstream's check is existence-only, not tied to a specific class name.
+    #[test]
+    fn priority_class_scope_matches_pod_with_priority_class_name() {
+        let pod = json!({ "spec": { "priorityClassName": "system-cluster-critical" } });
+        assert!(
+            object_matches_scope("PriorityClass", Some(&pod)),
+            "a pod that declares any priorityClassName must match the bare PriorityClass \
+             scope, or a PriorityClass-scoped quota would never capture usage for pods \
+             that legitimately belong to it"
+        );
+    }
+
+    /// The same bare-existence semantics must apply when the scope is expressed via
+    /// `scopeSelector.matchExpressions` with `operator: Exists` — that branch of
+    /// `object_matches_scope_selector` routes straight into `object_matches_scope`, so it
+    /// shares the exact bug fixed above (and must share the fix).
+    #[test]
+    fn scope_selector_exists_priority_class_follows_bare_existence_semantics() {
+        let scope_selector = json!({
+            "matchExpressions": [{
+                "scopeName": "PriorityClass",
+                "operator": "Exists"
+            }]
+        });
+        let pod_without_pc = json!({
+            "spec": { "containers": [{"name": "c", "image": "nginx"}] }
+        });
+        let pod_with_pc = json!({ "spec": { "priorityClassName": "pclass8" } });
+
+        assert!(
+            !object_matches_scope_selector(&scope_selector, Some(&pod_without_pc)),
+            "a `scopeSelector` with operator Exists on PriorityClass must NOT match a pod \
+             with no priorityClassName — else the Exists form of the scope diverges from \
+             the bare `spec.scopes: [\"PriorityClass\"]` form for the same pod"
+        );
+        assert!(
+            object_matches_scope_selector(&scope_selector, Some(&pod_with_pc)),
+            "a `scopeSelector` with operator Exists on PriorityClass must match a pod that \
+             declares any priorityClassName — reproduces upstream conformance's \
+             \"should verify ResourceQuota's priority class scope ... (ScopeSelectorOpExists)\""
+        );
+    }
+
     // -- PriorityClass scopeSelector (In/NotIn) matching --
 
     /// A quota scoped to `PriorityClass In [pclass4]` must NOT match a pod using a
@@ -1652,6 +1733,142 @@ mod tests {
             Some("0"),
             "a pod using a priority class outside the quota's scopeSelector In-list must \
              not be counted in status.used.pods"
+        );
+    }
+
+    /// A bare `spec.scopes: ["PriorityClass"]`-scoped quota's status.used.pods must exclude
+    /// a pod with no `priorityClassName` and include one that has it set.
+    ///
+    /// `count_quota_usage` only routes pod counting through the scope-filtered path when
+    /// `has_pod_scopes` is true; before this fix, its scope-name allowlist recognized only
+    /// BestEffort/NotBestEffort/Terminating/NotTerminating, so a bare `["PriorityClass"]`
+    /// quota fell through to the unfiltered raw pod count regardless of the
+    /// `object_matches_scope("PriorityClass", ...)` fix above.
+    #[tokio::test]
+    async fn count_quota_usage_excludes_pods_without_priority_class_for_bare_scope() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "quota-priorityclass-bare", "namespace": "default" },
+            "spec": {
+                "scopes": ["PriorityClass"],
+                "hard": { "pods": "1" }
+            }
+        });
+        seed(
+            &state,
+            "/registry/resourcequotas/default/quota-priorityclass-bare",
+            quota.clone(),
+        )
+        .await;
+
+        // A pod with no priorityClassName must not count against a bare PriorityClass scope.
+        let unclassed_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "testpod-unclassed", "namespace": "default" },
+            "spec": { "containers": [{"name": "c"}] }
+        });
+        seed(
+            &state,
+            "/registry/pods/default/testpod-unclassed",
+            unclassed_pod,
+        )
+        .await;
+
+        let used = count_quota_usage(&*state.store, &quota).await;
+        assert_eq!(
+            used.get("pods").map(String::as_str),
+            Some("0"),
+            "a pod with no priorityClassName must not be counted against a bare \
+             `spec.scopes: [\"PriorityClass\"]` quota — else the quota behaves as unscoped \
+             and would reject unrelated pod creates once its hard limit is 'reached' by \
+             pods that were never eligible for it"
+        );
+
+        // A pod with any priorityClassName set must count against the same quota.
+        let classed_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "testpod-classed", "namespace": "default" },
+            "spec": { "priorityClassName": "system-cluster-critical", "containers": [{"name": "c"}] }
+        });
+        seed(
+            &state,
+            "/registry/pods/default/testpod-classed",
+            classed_pod,
+        )
+        .await;
+
+        let used = count_quota_usage(&*state.store, &quota).await;
+        assert_eq!(
+            used.get("pods").map(String::as_str),
+            Some("1"),
+            "a pod that declares a priorityClassName must be counted against a bare \
+             `spec.scopes: [\"PriorityClass\"]` quota"
+        );
+    }
+
+    /// A bare `spec.scopes: ["PriorityClass"]`-scoped quota with `hard: {pods: "1"}` must
+    /// ALLOW creating a scope-matching pod even when a non-matching (unclassed) pod already
+    /// exists in the namespace — the quota's admission-time "current" count must only
+    /// include pods that match its scope.
+    ///
+    /// This pins down a live kubectl repro found while fixing the bare-existence arm above:
+    /// `check_resource_quota`'s count-based path used a scope-blind `count_objects`, so an
+    /// unrelated pod with no priorityClassName inflated `used` to 1, which collided with
+    /// `hard: pods=1` and denied the second, scope-matching pod outright — even though the
+    /// quota was never meant to restrict the first pod at all.
+    #[tokio::test]
+    async fn check_resource_quota_priority_class_scope_ignores_non_matching_pod_for_admission() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "quota-priorityclass-bare", "namespace": "default" },
+            "spec": {
+                "scopes": ["PriorityClass"],
+                "hard": { "pods": "1" }
+            }
+        });
+        seed(
+            &state,
+            "/registry/resourcequotas/default/quota-priorityclass-bare",
+            quota,
+        )
+        .await;
+
+        // An unclassed pod exists but does not match the PriorityClass scope.
+        let unclassed_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "testpod-unclassed", "namespace": "default" },
+            "spec": { "containers": [{"name": "c"}] }
+        });
+        seed(
+            &state,
+            "/registry/pods/default/testpod-unclassed",
+            unclassed_pod,
+        )
+        .await;
+
+        // Creating a scope-matching pod must be allowed: the existing unclassed pod
+        // must not count against this quota's hard limit of 1.
+        let classed_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "testpod-classed", "namespace": "default" },
+            "spec": { "priorityClassName": "system-cluster-critical", "containers": [{"name": "c"}] }
+        });
+        let result = check_resource_quota(&state, "default", "", "pods", Some(&classed_pod)).await;
+        assert!(
+            result.is_ok(),
+            "a pod matching the PriorityClass scope must be admitted even with an \
+             unrelated non-matching pod already in the namespace — an unscoped admission \
+             count would wrongly deny this create with 'exceeded quota'"
         );
     }
 
