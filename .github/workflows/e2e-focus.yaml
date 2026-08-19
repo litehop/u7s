@@ -34,7 +34,10 @@ jobs:
   e2e-focus:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Tight while the sonobuoy step below is unproven -- a hang anywhere in
+    # this job should fail fast instead of burning 20+ minutes per iteration.
+    # Raise once sonobuoy is confirmed reliably completing.
+    timeout-minutes: 15
     permissions:
       contents: read
     strategy:
@@ -348,6 +351,10 @@ jobs:
           kubectl apply -f scripts/conformance/sonobuoy-namespace-limitrange.yaml
 
       - name: Run sonobuoy (RollingUpdateDeployment + kubectl exec)
+        # Short step-level timeout while this is new and unproven: a hang here
+        # should fail fast instead of burning the whole job's timeout-minutes
+        # budget on every iteration.
+        timeout-minutes: 5
         env:
           KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
         run: |
@@ -357,6 +364,25 @@ jobs:
             --skip-preflight=existingnamespace \
             --kubeconfig "$KUBECONFIG" \
             --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones\$|Kubectl client Simple pod should support exec\$"
+
+      - name: Diagnose sonobuoy on failure
+        # cancelled() too: interrupting a hung run mid-debug (gh run cancel)
+        # produces a "cancelled" conclusion, not "failure" -- without this,
+        # exactly the scenario this step exists for would skip it.
+        if: failure() || cancelled()
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          echo "=== sonobuoy status ==="
+          sonobuoy status --kubeconfig "$KUBECONFIG" || true
+          echo "=== pods -n sonobuoy -o wide ==="
+          kubectl get pods -n sonobuoy -o wide || true
+          echo "=== describe pods -n sonobuoy ==="
+          kubectl describe pods -n sonobuoy || true
+          echo "=== events -n sonobuoy ==="
+          kubectl get events -n sonobuoy --sort-by=.lastTimestamp || true
+          echo "=== aggregator pod logs (sonobuoy/sonobuoy) ==="
+          kubectl logs -n sonobuoy sonobuoy || true
 
       - name: Retrieve sonobuoy results
         env:
@@ -445,7 +471,12 @@ jobs:
           pkill -f "target/release/u7s-apiserver --db" 2>/dev/null || true
 
       - name: Upload logs on failure
-        if: failure()
+        # cancelled() too -- confirmed live that a manual `gh run cancel`
+        # (used to interrupt a hang instead of waiting out the full job
+        # timeout) produces a "cancelled" job conclusion, which a bare
+        # if: failure() does not match, so this step silently skipped on
+        # exactly the runs it exists to capture logs for.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-focus-logs-${{ matrix.k8s }}
