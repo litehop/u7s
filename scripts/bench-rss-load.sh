@@ -38,9 +38,13 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # 1. Build
 # ---------------------------------------------------------------------------
-echo "==> Building release binaries..."
-cargo build --release -p u7s-apiserver
-cargo build --release -p u7s-scheduler
+if [ -z "${SKIP_BUILD:-}" ]; then
+    echo "==> Building release binaries..."
+    cargo build --release -p u7s-apiserver
+    cargo build --release -p u7s-scheduler
+else
+    echo "==> SKIP_BUILD set — using prebuilt binaries in target/release/"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Start server
