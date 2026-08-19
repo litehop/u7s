@@ -209,7 +209,9 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f scripts/conformance/sonobuoy-namespa
 # OTHER [FeatureGate:X] is skipped -- this is what stops a Beta-gated spec
 # like HPAConfigurableTolerance (which crashed vendored kcm 14 minutes into a
 # 12.6h --all-e2e run, temp/e2e/0805-2202-conformance) from running at all.
-FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass}'
+# SidecarContainers is GA+LockToDefault=true since 1.33 -- same stale-label
+# rationale as VolumeAttributesClass above.
+FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass, SidecarContainers}'
 
 # build_filter_args populates the FILTER_ARGS array with the sonobuoy argv
 # elements for this invocation. apply=1 wires in the FeatureGate allow-set
