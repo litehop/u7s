@@ -355,7 +355,9 @@ limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && 
 [Journal]
 RateLimitBurst=100000
 RateLimitIntervalSec=30s
-SystemMaxUse=6G
+SystemMaxUse=5G
+SystemMaxFileSize=32M
+SystemMaxFiles=160
 SystemKeepFree=100M
 Storage=persistent
 EOF

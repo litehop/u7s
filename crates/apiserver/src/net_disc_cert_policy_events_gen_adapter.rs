@@ -18,11 +18,7 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
 fn gen_int_or_string_to_json(
     ios: &u7s_proto_generated::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
 ) -> serde_json::Value {
-    if ios.r#type.unwrap_or(0) == 0 {
-        serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
-    } else {
-        serde_json::Value::String(ios.str_val.clone().unwrap_or_default())
-    }
+    crate::core_gen_adapter::gen_int_or_string_to_json(ios)
 }
 
 fn gen_object_reference_to_json(
