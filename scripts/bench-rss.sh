@@ -13,9 +13,13 @@ SCHEDULER_PID=""
 TMPDIR="$(mktemp -d /tmp/u7s-bench-XXXXXX)"
 trap 'if [ -n "$SCHEDULER_PID" ]; then kill "$SCHEDULER_PID" 2>/dev/null || true; fi; if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi; echo "Server log:"; cat "$TMPDIR/server.log" 2>/dev/null || true' EXIT
 
-echo "==> Building release binaries..."
-cargo build --release -p u7s-apiserver
-cargo build --release -p u7s-scheduler
+if [ -z "${SKIP_BUILD:-}" ]; then
+    echo "==> Building release binaries..."
+    cargo build --release -p u7s-apiserver
+    cargo build --release -p u7s-scheduler
+else
+    echo "==> SKIP_BUILD set — using prebuilt binaries in target/release/"
+fi
 
 echo "==> Starting apiserver (logs -> $TMPDIR/server.log)..."
 BENCH_TOKEN="bench-token"
