@@ -1,0 +1,521 @@
+name: E2E focus
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build release binaries
+        run: cargo build --release -p u7s-apiserver -p u7s-scheduler
+      - name: Upload binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: u7s-e2e-focus-binaries
+          path: |
+            target/release/u7s-apiserver
+            target/release/u7s-scheduler
+          retention-days: 1
+
+  e2e-focus:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        k8s: ["1.34.9", "1.35.6", "1.36.2"]
+    name: e2e-focus ${{ matrix.k8s }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: u7s-e2e-focus-binaries
+          path: target/release
+      - name: Make binaries executable
+        run: chmod +x target/release/u7s-apiserver target/release/u7s-scheduler
+
+      - name: Add ~/bin to PATH
+        run: |
+          mkdir -p ~/bin
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Cache kubelet and kubectl ${{ matrix.k8s }}
+        id: cache-kubelet
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/bin/kubelet
+            ~/bin/kubectl
+          key: kubelet-kubectl-${{ matrix.k8s }}-${{ runner.arch }}
+
+      - name: Install kubelet and kubectl ${{ matrix.k8s }}
+        if: steps.cache-kubelet.outputs.cache-hit != 'true'
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
+        run: |
+          MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
+          curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/kubernetes.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades "kubelet=$K8S_VERSION-*" "kubectl=$K8S_VERSION-*"
+          sudo apt-mark hold kubelet kubectl
+          sudo systemctl disable --now kubelet
+          mkdir -p ~/bin
+          cp /usr/bin/kubelet ~/bin/kubelet
+          cp /usr/bin/kubectl ~/bin/kubectl
+
+      - name: Cache cri-o apt archives
+        id: cache-crio-apt
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: crio-apt-${{ matrix.k8s }}-${{ runner.arch }}
+
+      - name: Install cri-o and crun
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
+        run: |
+          MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
+          sudo apt-get update -qq
+          sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+          curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/cri-o.list
+          sudo apt-get update -qq
+          sudo apt-get install -y cri-o
+          sudo mkdir -p /etc/cni/net.d
+          sudo tee /etc/cni/net.d/10-bridge.conflist <<'CNIEOF'
+          {
+            "cniVersion": "0.4.0",
+            "name": "bridge",
+            "plugins": [
+              {
+                "type": "bridge",
+                "bridge": "cni0",
+                "isGateway": true,
+                "ipMasq": true,
+                "hairpinMode": true,
+                "ipam": {
+                  "type": "host-local",
+                  "ranges": [[{"subnet": "10.88.0.0/16"}]],
+                  "routes": [{"dst": "0.0.0.0/0"}]
+                }
+              }
+            ]
+          }
+          CNIEOF
+          sudo systemctl enable --now crio
+
+      - name: Install containernetworking-plugins
+        run: |
+          sudo apt-get install -y -o Dpkg::Options::="--force-overwrite" containernetworking-plugins
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.2"
+
+      - name: Cache konnectivity-server build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/u7s/konnectivity
+          key: konnectivity-v0.35.0-${{ runner.arch }}
+
+      - name: Cache sonobuoy CLI
+        id: cache-sonobuoy
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/bin/sonobuoy
+          key: sonobuoy-0.57.3-${{ runner.arch }}
+
+      - name: Install sonobuoy CLI
+        if: steps.cache-sonobuoy.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL "https://github.com/vmware-tanzu/sonobuoy/releases/download/v0.57.3/sonobuoy_0.57.3_linux_amd64.tar.gz" \
+            | tar -xz -C ~/bin sonobuoy
+          chmod +x ~/bin/sonobuoy
+
+      - name: Start apiserver and konnectivity-server
+        env:
+          RUST_LOG: info
+        run: scripts/u7s-start.sh --background
+
+      - name: Generate kubelet TLS
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          sudo cp "$WORKDIR/ca.pem" /etc/kubelet-ca.crt
+          sudo chmod 644 /etc/kubelet-ca.crt
+          openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/kubelet-tls.key"
+          openssl req -new -key "$WORKDIR/kubelet-tls.key" \
+            -subj "/CN=ci-node" -sha256 \
+            -out "$WORKDIR/kubelet-tls.csr"
+          openssl x509 -req -in "$WORKDIR/kubelet-tls.csr" \
+            -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
+            -CAcreateserial -days 365 -sha256 \
+            -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n') \
+            -out "$WORKDIR/kubelet-tls.crt"
+          sudo cp "$WORKDIR/kubelet-tls.crt" /etc/kubelet-tls.crt
+          sudo cp "$WORKDIR/kubelet-tls.key" /etc/kubelet-tls.key
+          sudo chmod 644 /etc/kubelet-tls.crt
+          sudo chmod 600 /etc/kubelet-tls.key
+
+      - name: Start kubelet
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          sudo mkdir -p /tmp/kubelet-pods
+          sudo cp "$WORKDIR/kubeconfig" /etc/kubelet-kubeconfig
+          sudo chmod 644 /etc/kubelet-kubeconfig
+          sudo tee /etc/kubelet-config.yaml <<'EOF'
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+          registerNode: true
+          failSwapOn: false
+          resolvConf: ""
+          staticPodPath: /tmp/kubelet-pods
+          authentication:
+            x509:
+              clientCAFile: /etc/kubelet-ca.crt
+            anonymous:
+              enabled: false
+          authorization:
+            mode: AlwaysAllow
+          EOF
+          sudo "$HOME/bin/kubelet" \
+            --config=/etc/kubelet-config.yaml \
+            --kubeconfig=/etc/kubelet-kubeconfig \
+            --hostname-override=ci-node \
+            --logging-format=text \
+            --v=2 \
+            --tls-cert-file=/etc/kubelet-tls.crt \
+            --tls-private-key-file=/etc/kubelet-tls.key \
+            >"$WORKDIR/kubelet.log" 2>&1 &
+
+      - name: Assert node registers
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          FOUND=0
+          for i in $(seq 1 90); do
+            if kubectl get nodes 2>/dev/null | grep -q "ci-node"; then
+              FOUND=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "ERROR: ci-node did not appear in kubectl get nodes within 90s"
+            echo "--- apiserver log ---"
+            cat "$PWD/temp/u7s/apiserver.log"
+            echo "--- kubelet log ---"
+            cat "$PWD/temp/u7s/kubelet.log"
+            exit 1
+          fi
+          echo "Node registered:"
+          kubectl get nodes
+
+      - name: Assert kubelet not crash-looping
+        run: |
+          sleep 5
+          pgrep -f "bin/kubelet --config=/etc/kubelet-config.yaml" >/dev/null || {
+            echo "ERROR: kubelet exited"
+            cat "$PWD/temp/u7s/kubelet.log"
+            exit 1
+          }
+
+      - name: Deploy konnectivity-agent
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-agent.key"
+          openssl req -new -key "$WORKDIR/konnectivity-agent.key" \
+            -subj "/CN=konnectivity-agent" -sha256 \
+            -out "$WORKDIR/konnectivity-agent.csr"
+          openssl x509 -req -in "$WORKDIR/konnectivity-agent.csr" \
+            -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
+            -CAcreateserial -days 365 -sha256 \
+            -out "$WORKDIR/konnectivity-agent.crt"
+
+          kubectl create secret generic konnectivity-agent-certs \
+            --from-file=ca.crt="$WORKDIR/ca.pem" \
+            --from-file=tls.crt="$WORKDIR/konnectivity-agent.crt" \
+            --from-file=tls.key="$WORKDIR/konnectivity-agent.key" \
+            -n kube-system \
+            --dry-run=client -o yaml | kubectl apply --validate=false -f -
+
+          # Agent uses hostNetwork so "127.0.0.1" reaches the konnectivity-server
+          # bound on this same runner (no separate VM to hop through, unlike the
+          # lima-based conformance path). Port 8132 is u7s-start.sh's fixed
+          # agent-port derivation for the default apiserver port 6443
+          # (server-port 8135, agent-port = server-port - 3).
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: konnectivity-agent
+            namespace: kube-system
+            labels:
+              app: konnectivity-agent
+          spec:
+            nodeName: ci-node
+            hostNetwork: true
+            dnsPolicy: Default
+            restartPolicy: Always
+            containers:
+              - name: konnectivity-agent
+                image: registry.k8s.io/kas-network-proxy/proxy-agent:v0.35.0
+                args:
+                  - --logtostderr=true
+                  - --proxy-server-host=127.0.0.1
+                  - --proxy-server-port=8132
+                  - --ca-cert=/certs/ca.crt
+                  - --agent-cert=/certs/tls.crt
+                  - --agent-key=/certs/tls.key
+                  - --agent-identifiers=default-route=true
+                  - --sync-interval=5s
+                  - --sync-interval-cap=30s
+                volumeMounts:
+                  - name: certs
+                    mountPath: /certs
+                    readOnly: true
+            volumes:
+              - name: certs
+                secret:
+                  secretName: konnectivity-agent-certs
+          EOF
+
+          PHASE=""
+          for i in $(seq 1 60); do
+            PHASE=$(kubectl get pod konnectivity-agent -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            [ "$PHASE" = "Running" ] && break
+            sleep 1
+          done
+          if [ "$PHASE" != "Running" ]; then
+            echo "ERROR: konnectivity-agent did not reach Running within 60s (phase: $PHASE)"
+            kubectl describe pod konnectivity-agent -n kube-system
+            exit 1
+          fi
+          echo "konnectivity-agent is Running"
+
+      - name: Download kube-controller-manager
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-controller-manager" \
+            -o "$WORKDIR/kube-controller-manager"
+          chmod +x "$WORKDIR/kube-controller-manager"
+
+      - name: Start kube-controller-manager
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          # The wildcard controller set (minus cloud-specific controllers u7s does
+          # not implement) matches scripts/conformance/04-start-kcm.sh's proven
+          # real-conformance configuration -- real upstream e2e specs depend on
+          # controllers this workflow's narrower smoke/perf-test peers never
+          # needed (e.g. the namespace controller finalizing each test's
+          # ephemeral namespace). kcm-supervisor.sh restarts kcm on crash instead
+          # of silently blacking out the control plane for the rest of the run.
+          setsid bash scripts/conformance/kcm-supervisor.sh \
+            "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
+            --kubeconfig="$WORKDIR/kubeconfig" \
+            --cluster-signing-cert-file="$WORKDIR/ca.pem" \
+            --cluster-signing-key-file="$WORKDIR/ca.key" \
+            --service-account-private-key-file="$WORKDIR/sa.key" \
+            --root-ca-file="$WORKDIR/ca.pem" \
+            --controllers='*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller' \
+            --use-service-account-credentials=false \
+            --leader-elect=false \
+            --bind-address=127.0.0.1 \
+            --kube-api-content-type=application/json \
+            >/tmp/kcm-supervisor.log 2>&1 &
+
+      - name: Wait for kube-controller-manager to be alive
+        run: |
+          for i in $(seq 1 30); do
+            pgrep -f "kube-controller-manager --kubeconfig=" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pgrep -f "kube-controller-manager --kubeconfig=" >/dev/null 2>&1 || {
+            echo "kube-controller-manager failed to start"
+            cat "$PWD/temp/u7s/kcm.log" 2>/dev/null || true
+            cat /tmp/kcm-supervisor.log
+            exit 1
+          }
+
+      - name: Start u7s-scheduler
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          ./target/release/u7s-scheduler \
+            --kubeconfig "$WORKDIR/kubeconfig" \
+            >"$WORKDIR/scheduler.log" 2>&1 &
+          echo "SCHEDULER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Assert scheduler alive
+        run: |
+          sleep 2
+          kill -0 "$SCHEDULER_PID" 2>/dev/null || {
+            echo "u7s-scheduler exited"
+            cat "$PWD/temp/u7s/scheduler.log"
+            exit 1
+          }
+
+      - name: Sample baseline RSS
+        run: |
+          sleep 5
+          APISERVER_PID=$(pgrep -f "target/release/u7s-apiserver --db" | head -1)
+          APISERVER_RSS=$(ps -o rss= -p "$APISERVER_PID" | tr -d ' ')
+          SCHEDULER_RSS=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
+          COMBINED_RSS=$(( APISERVER_RSS + SCHEDULER_RSS ))
+          echo "BASELINE_APISERVER_RSS_KB=$APISERVER_RSS" >> "$GITHUB_ENV"
+          echo "BASELINE_SCHEDULER_RSS_KB=$SCHEDULER_RSS" >> "$GITHUB_ENV"
+          read -r MEM_TOTAL MEM_USED MEM_FREE <<< "$(free -m | awk '/^Mem:/{print $2, $3, $4}')"
+          {
+            echo "### RSS baseline (k8s ${{ matrix.k8s }}, before sonobuoy)"
+            echo "- apiserver RSS: ${APISERVER_RSS} kB"
+            echo "- scheduler RSS: ${SCHEDULER_RSS} kB"
+            echo "- combined RSS: ${COMBINED_RSS} kB"
+            echo "- runner memory (free -m): total=${MEM_TOTAL}MB used=${MEM_USED}MB free=${MEM_FREE}MB"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Pre-seed sonobuoy namespace
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          kubectl create namespace sonobuoy --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f scripts/conformance/sonobuoy-namespace-limitrange.yaml
+
+      - name: Run sonobuoy (RollingUpdateDeployment + kubectl exec)
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          sonobuoy run \
+            -p scripts/conformance/sonobuoy-plugin-e2e.yaml \
+            --wait \
+            --skip-preflight=existingnamespace \
+            --kubeconfig "$KUBECONFIG" \
+            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones\$|Kubectl client Simple pod should support exec\$"
+
+      - name: Retrieve sonobuoy results
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          TARBALL_NAME=$(kubectl logs -n sonobuoy sonobuoy | grep "Results available at" | tail -1 | grep -oE '[^ /]+\.tar\.gz' || true)
+          if [ -z "$TARBALL_NAME" ]; then
+            echo "ERROR: could not find results tarball name in sonobuoy logs" >&2
+            exit 1
+          fi
+          POD_UID=$(kubectl get pod -n sonobuoy sonobuoy -o jsonpath='{.metadata.uid}')
+          # sonobuoy retrieve relies on the port-forward subresource, which
+          # 06-run-sonobuoy.sh's own comment notes u7s does not yet support
+          # reliably -- read the results tarball straight off the kubelet's
+          # emptyDir volume on disk instead, same as that script's lima
+          # workaround minus the VM hop (kubelet runs on this same runner).
+          HOST_PATH=$(sudo find "/var/lib/kubelet/pods/${POD_UID}/volumes/kubernetes.io~empty-dir" -name "$TARBALL_NAME" | head -1)
+          if [ -z "$HOST_PATH" ]; then
+            echo "ERROR: results tarball not found under kubelet pod volume for uid=${POD_UID}" >&2
+            exit 1
+          fi
+          sudo cp "$HOST_PATH" /tmp/sonobuoy-results.tar.gz
+          sudo chmod 644 /tmp/sonobuoy-results.tar.gz
+          mkdir -p /tmp/sonobuoy-results
+          tar xzf /tmp/sonobuoy-results.tar.gz -C /tmp/sonobuoy-results
+
+      - name: Assert sonobuoy PASS
+        run: |
+          E2E_TXT=$(find /tmp/sonobuoy-results/podlogs -name "e2e.txt" | head -1)
+          if [ -z "$E2E_TXT" ]; then
+            echo "ERROR: e2e.txt not found under podlogs/**/logs/ in the sonobuoy results" >&2
+            find /tmp/sonobuoy-results -maxdepth 4 >&2
+            exit 1
+          fi
+          echo "=== e2e.txt tail ==="
+          tail -40 "$E2E_TXT"
+
+          RAN_LINE=$(grep -E "^Ran [0-9]+ of [0-9]+ Specs" "$E2E_TXT" | tail -1 || true)
+          echo "Ginkgo ran-count: $RAN_LINE"
+          # Exactly 2 -- not zero (the focus regex silently matched nothing,
+          # e.g. a FeatureGate label filter or a typo) and not more than 2 (the
+          # focus regex over-matched a third, unrelated spec).
+          if ! echo "$RAN_LINE" | grep -qE "^Ran 2 of "; then
+            echo "ERROR: expected exactly 2 specs to run; got: $RAN_LINE" >&2
+            exit 1
+          fi
+
+          SUMMARY_LINE=$(grep -E "^SUCCESS!|^FAIL!" "$E2E_TXT" | tail -1 || true)
+          echo "Ginkgo summary: $SUMMARY_LINE"
+          if ! echo "$SUMMARY_LINE" | grep -q "^SUCCESS!"; then
+            echo "ERROR: sonobuoy did not report SUCCESS in e2e.txt (summary: $SUMMARY_LINE)" >&2
+            exit 1
+          fi
+          if ! echo "$SUMMARY_LINE" | grep -q "0 Failed"; then
+            echo "ERROR: sonobuoy reported failures in e2e.txt (summary: $SUMMARY_LINE)" >&2
+            exit 1
+          fi
+          echo "PASS: $RAN_LINE / $SUMMARY_LINE"
+
+      - name: Sample peak RSS
+        run: |
+          APISERVER_PID=$(pgrep -f "target/release/u7s-apiserver --db" | head -1)
+          APISERVER_RSS=$(ps -o rss= -p "$APISERVER_PID" | tr -d ' ')
+          SCHEDULER_RSS=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
+          COMBINED_RSS=$(( APISERVER_RSS + SCHEDULER_RSS ))
+          BASELINE_COMBINED=$(( BASELINE_APISERVER_RSS_KB + BASELINE_SCHEDULER_RSS_KB ))
+          DELTA=$(( COMBINED_RSS - BASELINE_COMBINED ))
+          read -r MEM_TOTAL MEM_USED MEM_FREE <<< "$(free -m | awk '/^Mem:/{print $2, $3, $4}')"
+          {
+            echo "### RSS peak (k8s ${{ matrix.k8s }}, after sonobuoy)"
+            echo "- apiserver RSS: ${APISERVER_RSS} kB (baseline ${BASELINE_APISERVER_RSS_KB} kB)"
+            echo "- scheduler RSS: ${SCHEDULER_RSS} kB (baseline ${BASELINE_SCHEDULER_RSS_KB} kB)"
+            echo "- combined RSS: ${COMBINED_RSS} kB (delta vs. baseline: ${DELTA} kB)"
+            echo "- runner memory (free -m): total=${MEM_TOTAL}MB used=${MEM_USED}MB free=${MEM_FREE}MB"
+            echo ""
+            echo "No threshold is enforced yet -- this run only collects baseline data."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop stack
+        if: always()
+        run: |
+          [ -n "${SCHEDULER_PID:-}" ] && kill "$SCHEDULER_PID" 2>/dev/null || true
+          pkill -f "kcm-supervisor.sh" 2>/dev/null || true
+          pkill -f "kube-controller-manager --kubeconfig=" 2>/dev/null || true
+          sudo pkill -f "bin/kubelet --config=/etc/kubelet-config.yaml" 2>/dev/null || true
+          pkill -f "target/release/u7s-apiserver --db" 2>/dev/null || true
+          pkill -f "proxy-server-linux-amd64" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-focus-logs-${{ matrix.k8s }}
+          path: |
+            temp/u7s/apiserver.log
+            temp/u7s/scheduler.log
+            temp/u7s/konnectivity-server.log
+            temp/u7s/kubelet.log
+            temp/u7s/kcm.log
+            /tmp/kcm-supervisor.log
+            /tmp/sonobuoy-results.tar.gz
