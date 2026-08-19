@@ -124,9 +124,9 @@ jobs:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
           MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-          curl -fsSL --max-time 30 "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+          curl -fsSL --max-time 30 "https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
+          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/cri-o.list
           # The action resolves package versions from apt's cached metadata
           # (/var/lib/apt/lists), not by hitting the network itself -- its own
