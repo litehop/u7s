@@ -38,7 +38,8 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
-  coverage:
+  # runs the whole suite _and_ checks coverage too
+  test-coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
