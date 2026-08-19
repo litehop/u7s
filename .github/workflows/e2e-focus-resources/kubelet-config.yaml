@@ -1,0 +1,14 @@
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+registerNode: true
+failSwapOn: false
+resolvConf: ""
+staticPodPath: /tmp/kubelet-pods
+authentication:
+  x509:
+    clientCAFile: /etc/kubelet-ca.crt
+  anonymous:
+    enabled: false
+authorization:
+  mode: AlwaysAllow
