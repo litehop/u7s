@@ -351,7 +351,14 @@ jobs:
           # (/var/lib/apt/lists), not by hitting the network itself — without this
           # update the newly-added repo's package list isn't loaded yet, so the
           # action can't resolve cri-o and treats the package list as empty.
-          sudo apt-get update -qq
+          # Scope the update to only the new source (skip re-fetching every other
+          # configured mirror) and bound it with `timeout` — a single fail-fast
+          # bound, not a retry loop — since the OpenSUSE OBS mirror is known to
+          # hang indefinitely rather than error out (observed: 10min+ with no cap).
+          sudo timeout 60 apt-get update -qq \
+            -o Dir::Etc::sourcelist="sources.list.d/cri-o.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
 
       - name: Cache and install cri-o
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
