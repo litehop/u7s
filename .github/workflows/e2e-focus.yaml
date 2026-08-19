@@ -138,7 +138,11 @@ jobs:
           # Without this update the newly-added repo's package list isn't
           # loaded yet, so the action can't resolve cri-o and treats the
           # package list as empty (confirmed live in run 32234489918).
-          sudo apt-get update -qq
+          # Acquire::http::Timeout=30 bounds each per-URL read at 30s;
+          # Acquire::Retries=3 tries each URL up to 3 times. Worst-case for
+          # an OpenSUSE hang: ~90s then step fails cleanly (vs the previous
+          # 15-min silent hang).
+          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
 
       - name: Install cri-o
         # actions/cache's own attempt at this (removed) never actually
