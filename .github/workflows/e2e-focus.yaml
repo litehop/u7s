@@ -358,6 +358,18 @@ jobs:
           # exactly how the sonobuoy aggregator reaches the apiserver.
           sudo modprobe br_netfilter
           sudo sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1
+          # GH Actions runners have Docker pre-installed and running, which
+          # sets the iptables FORWARD chain's default policy to DROP and only
+          # opens it for its own managed bridges (docker0 etc) -- our
+          # separately-created "cni0" bridge is left blocked. This breaks
+          # direct pod-to-pod traffic specifically (e.g. sonobuoy's own
+          # worker sidecar reporting results to the aggregator pod, confirmed
+          # live via "dial tcp <pod-ip>:8080: connect: connection timed out"),
+          # while pod-to-host traffic still works because kube-proxy's DNAT
+          # targets are local addresses delivered via INPUT, not FORWARD.
+          # Safe to open unconditionally here: this is a single-tenant,
+          # ephemeral CI runner with no other traffic to isolate.
+          sudo iptables -P FORWARD ACCEPT
           sudo tee /etc/systemd/system/kube-proxy.service >/dev/null <<SVCEOF
           [Unit]
           Description=Kubernetes Kube Proxy
@@ -523,7 +535,7 @@ jobs:
             --wait \
             --skip-preflight=existingnamespace \
             --kubeconfig "$KUBECONFIG" \
-            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones\$|Kubectl client Simple pod should support exec\$"
+            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl client Simple pod should support exec\$"
 
       - name: Diagnose sonobuoy on failure
         # cancelled() too: interrupting a hung run mid-debug (gh run cancel)
