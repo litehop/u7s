@@ -537,12 +537,33 @@ jobs:
           sonobuoy status --kubeconfig "$KUBECONFIG" || true
           echo "=== pods -n sonobuoy -o wide ==="
           kubectl get pods -n sonobuoy -o wide || true
+          echo "=== services -n sonobuoy -o wide ==="
+          kubectl get svc -n sonobuoy -o wide || true
           echo "=== describe pods -n sonobuoy ==="
           kubectl describe pods -n sonobuoy || true
           echo "=== events -n sonobuoy ==="
           kubectl get events -n sonobuoy --sort-by=.lastTimestamp || true
+
+          # The sonobuoy results tarball (what "Retrieve sonobuoy results"
+          # unpacks on the success path) is only written once the aggregator
+          # finishes assembling results from a worker report it never got in
+          # a hang like this -- it does not exist on disk yet, so these two
+          # containers' own logs are the only place to see what actually
+          # happened. Persisted to files (not just echoed) so they survive
+          # into the "Upload logs on failure" artifact for offline reading.
           echo "=== aggregator pod logs (sonobuoy/sonobuoy) ==="
-          kubectl logs -n sonobuoy sonobuoy || true
+          kubectl logs -n sonobuoy sonobuoy | tee /tmp/sonobuoy-aggregator.log || true
+
+          E2E_POD=$(kubectl get pods -n sonobuoy -l sonobuoy-component=plugin -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$E2E_POD" ]; then
+            echo "=== e2e-job pod ($E2E_POD) -- e2e container logs (the actual ginkgo run) ==="
+            kubectl logs -n sonobuoy "$E2E_POD" -c e2e | tee /tmp/sonobuoy-e2e-container.log || true
+            echo "=== e2e-job pod ($E2E_POD) -- sonobuoy-worker container logs (result reporting) ==="
+            kubectl logs -n sonobuoy "$E2E_POD" -c sonobuoy-worker | tee /tmp/sonobuoy-worker-container.log || true
+          else
+            echo "no e2e-job pod found (label sonobuoy-component=plugin)"
+          fi
+
           echo "=== kube-proxy systemd status ==="
           sudo systemctl status kube-proxy --no-pager || true
           echo "=== kube-proxy journal (last 50 lines) ==="
@@ -654,3 +675,6 @@ jobs:
             temp/u7s/kcm.log
             /tmp/kcm-supervisor.log
             /tmp/sonobuoy-results.tar.gz
+            /tmp/sonobuoy-aggregator.log
+            /tmp/sonobuoy-e2e-container.log
+            /tmp/sonobuoy-worker-container.log
