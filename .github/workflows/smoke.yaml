@@ -334,50 +334,51 @@ jobs:
           mkdir -p ~/bin
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Cache cri-o apt archives
-        id: cache-crio-apt
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /var/cache/apt/archives
-          key: crio-apt-${{ matrix.k8s }}-${{ runner.arch }}
-
-      - name: Install cri-o and crun
-        # UNCHANGED — no `if:` gate. On cache hit, apt-get install finds the
-        # .deb already in /var/cache/apt/archives and skips the network fetch
-        # from download.opensuse.org (the slow/flaky part). apt-get update
-        # still runs. systemctl enable + CNI conflist write always run.
-        # 2min = 2.4x observed p100 (~50s); OpenSUSE OBS metadata fetch hangs
-        # are the hazard. The retry loop below caps each attempt at 100s and
-        # retries (likely landing on a different mirror) instead of burning
-        # the whole 10-min job timeout on one hung apt-get update.
-        timeout-minutes: 2
+      - name: Install cri-o apt keyring + source list
+        # awalsh128/cache-apt-pkgs-action's `add-repository` input validates its
+        # value and rejects the `[...]`/space characters required for
+        # `deb [signed-by=...] <url> /`, so the OpenSUSE repo must be registered
+        # manually before the action's apt-get install can find the cri-o package.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
           MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-          export MINOR
+          curl -fsSL --max-time 30 "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/cri-o.list
+          # The action resolves package versions from apt's cached metadata
+          # (/var/lib/apt/lists), not by hitting the network itself — without this
+          # update the newly-added repo's package list isn't loaded yet, so the
+          # action can't resolve cri-o and treats the package list as empty.
+          # Scope the update to only the new source (skip re-fetching every other
+          # configured mirror) and bound it with `timeout` — a single fail-fast
+          # bound, not a retry loop — since the OpenSUSE OBS mirror is known to
+          # hang indefinitely rather than error out (observed: 10min+ with no cap).
+          sudo timeout 60 apt-get update -qq \
+            -o Dir::Etc::sourcelist="sources.list.d/cri-o.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
 
-          install_crio_and_crun() {
-            set -euo pipefail
-            sudo apt-get update -qq
-            sudo apt-get install -y apt-transport-https ca-certificates curl gpg
-            curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
-              | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-            echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
-              | sudo tee /etc/apt/sources.list.d/cri-o.list
-            sudo apt-get update -qq
-            sudo apt-get install -y cri-o
-            # CRI-O ships its own crun binary that is ABI-compatible with the OCI spec
-            # version it generates (1.2.x for CRI-O 1.34+). The Ubuntu system crun
-            # (1.4.5 on 22.04) only accepts OCI spec 1.0/1.1 and returns
-            # "unknown version specified" when CRI-O passes a 1.2 spec — do NOT
-            # install system crun or override CRI-O's bundled runtime path.
-            # Install a minimal bridge CNI config so CRI-O can find at least one
-            # conflist at startup (required even for hostNetwork pods).
-            # Use cniVersion 0.4.0 and only bridge+host-local to avoid depending on
-            # portmap/firewall/tuning which are not always in /opt/cni/bin.
-            sudo mkdir -p /etc/cni/net.d
-            sudo tee /etc/cni/net.d/10-bridge.conflist <<'CNIEOF'
+      - name: Cache and install cri-o
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: cri-o
+          version: ${{ matrix.k8s }}
+
+      - name: Configure and start cri-o
+        run: |
+          # CRI-O ships its own crun binary that is ABI-compatible with the OCI spec
+          # version it generates (1.2.x for CRI-O 1.34+). The Ubuntu system crun
+          # (1.4.5 on 22.04) only accepts OCI spec 1.0/1.1 and returns
+          # "unknown version specified" when CRI-O passes a 1.2 spec — do NOT
+          # install system crun or override CRI-O's bundled runtime path.
+          # Install a minimal bridge CNI config so CRI-O can find at least one
+          # conflist at startup (required even for hostNetwork pods).
+          # Use cniVersion 0.4.0 and only bridge+host-local to avoid depending on
+          # portmap/firewall/tuning which are not always in /opt/cni/bin.
+          sudo mkdir -p /etc/cni/net.d
+          sudo tee /etc/cni/net.d/10-bridge.conflist <<'CNIEOF'
           {
             "cniVersion": "0.4.0",
             "name": "bridge",
@@ -397,19 +398,7 @@ jobs:
             ]
           }
           CNIEOF
-            sudo systemctl enable --now crio
-          }
-          export -f install_crio_and_crun
-
-          # 3 attempts, no backoff — each capped at 100s so a hung apt-get
-          # update (OBS mirror flakiness) doesn't consume the whole 2min budget.
-          for i in 1 2 3; do
-            if timeout 100 bash -c install_crio_and_crun; then
-              exit 0
-            fi
-            echo "Install cri-o and crun: attempt $i failed, retrying..."
-          done
-          exit 1
+          sudo systemctl enable --now crio
 
       - name: Cache kubelet and kubectl ${{ matrix.k8s }}
         id: cache-kubelet
