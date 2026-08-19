@@ -410,8 +410,8 @@ pub fn pod_is_best_effort(pod: &Value) -> bool {
                 let requests = &container["resources"]["requests"];
                 let limits = &container["resources"]["limits"];
                 // Any non-null, non-empty requests or limits means not BestEffort.
-                if (requests.is_object() && !requests.as_object().unwrap().is_empty())
-                    || (limits.is_object() && !limits.as_object().unwrap().is_empty())
+                if requests.as_object().is_some_and(|m| !m.is_empty())
+                    || limits.as_object().is_some_and(|m| !m.is_empty())
                 {
                     return false;
                 }
