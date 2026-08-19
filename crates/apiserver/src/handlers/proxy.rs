@@ -354,6 +354,14 @@ pub struct AttachQuery {
 /// Kubernetes attach subprotocol negotiated with both kubectl and kubelet.
 const ATTACH_SUBPROTOCOL: &str = "v5.channel.k8s.io";
 
+/// Fallback attach subprotocol for kubelet versions that predate
+/// `ExtendWebSocketsToKubelet` (kubelet < 1.36 — see `EXEC_KUBELET_SUBPROTOCOL`'s doc
+/// comment for the feature-gate background). Kubelet's attach and exec websocket
+/// handlers share the same subprotocol registration, so a pre-1.36 kubelet rejects a
+/// v5.channel.k8s.io attach offer with a bare 403 Forbidden exactly like exec did —
+/// see `dial_kubelet_attach`.
+const ATTACH_KUBELET_FALLBACK_SUBPROTOCOL: &str = "v4.channel.k8s.io";
+
 /// Resolved kubelet attach target — returned by the pure lookup helper so the
 /// handler can be tested without a real WebSocket upgrade.
 pub struct AttachTarget {
@@ -503,7 +511,9 @@ pub async fn resolve_attach_target<S: Store>(
 /// Flow:
 ///   1. Look up pod → node → node_ip (via resolve_attach_target).
 ///   2. Upgrade inbound request to WebSocket (kubectl side), subprotocol v5.channel.k8s.io.
-///   3. Open outbound WebSocket to kubelet attach endpoint with the same subprotocol.
+///   3. Open outbound WebSocket to kubelet attach endpoint, preferring the same
+///      subprotocol but retrying with v4.channel.k8s.io if kubelet rejects v5 (see
+///      `run_attach_proxy`).
 ///   4. Splice the two connections bidirectionally via BiStream trait.
 ///
 /// The v5 channel protocol multiplexes stdin/stdout/stderr/resize over a single
@@ -698,29 +708,65 @@ fn build_insecure_tls_config() -> anyhow::Result<std::sync::Arc<rustls::ClientCo
     Ok(std::sync::Arc::new(config))
 }
 
-/// Open outbound WebSocket to kubelet and splice with inbound kubectl WebSocket.
-async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::Result<()> {
+/// Outbound socket type returned by `tokio_tungstenite::connect_async_tls_with_config`.
+type KubeletAttachWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Dial the kubelet attach WebSocket endpoint offering a single subprotocol.
+///
+/// Split out of `run_attach_proxy` so it can be retried with a different
+/// subprotocol without duplicating the request-building/connect boilerplate —
+/// see `ATTACH_SUBPROTOCOL`/`ATTACH_KUBELET_FALLBACK_SUBPROTOCOL`.
+async fn dial_kubelet_attach(
+    target: &AttachTarget,
+    subprotocol: &str,
+) -> anyhow::Result<KubeletAttachWs> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-    let connector = tokio_tungstenite::Connector::Rustls(target.tls_config);
-
-    // Build the request with the attach subprotocol header.
+    let connector = tokio_tungstenite::Connector::Rustls(target.tls_config.clone());
     let mut req = target
         .kubelet_ws_url
+        .as_str()
         .into_client_request()
         .map_err(|e| anyhow::anyhow!("invalid kubelet URL: {e}"))?;
     req.headers_mut().insert(
         "Sec-WebSocket-Protocol",
-        ATTACH_SUBPROTOCOL.parse().expect("valid header value"),
+        subprotocol.parse().expect("valid header value"),
     );
 
-    // Connect outbound WebSocket to the kubelet.
-    let (outbound_ws, _resp) =
+    let (ws, _resp) =
         tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
             .await
             .map_err(|e| anyhow::anyhow!("kubelet attach connect failed: {e}"))?;
+    Ok(ws)
+}
 
-    // Splice the two WebSocket connections bidirectionally.
+/// Open outbound WebSocket to kubelet and splice with inbound kubectl WebSocket.
+///
+/// Tries `ATTACH_SUBPROTOCOL` first; falls back to `ATTACH_KUBELET_FALLBACK_SUBPROTOCOL`
+/// when kubelet rejects it (pre-1.36 kubelet without `ExtendWebSocketsToKubelet`). If
+/// both attempts fail, `inbound` gets a real close frame via
+/// `close_inbound_on_dial_failure` instead of being dropped silently.
+async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::Result<()> {
+    let v5_err = match dial_kubelet_attach(&target, ATTACH_SUBPROTOCOL).await {
+        Ok(ws) => {
+            splice(AxumWs(inbound), TungsteniteWs(ws)).await;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    tracing::debug!(
+        "kubelet rejected {ATTACH_SUBPROTOCOL} ({v5_err}); retrying attach dial with {ATTACH_KUBELET_FALLBACK_SUBPROTOCOL} \
+         (pre-1.36 kubelet without ExtendWebSocketsToKubelet)"
+    );
+    let outbound_ws = match dial_kubelet_attach(&target, ATTACH_KUBELET_FALLBACK_SUBPROTOCOL).await
+    {
+        Ok(ws) => ws,
+        Err(_) => {
+            close_inbound_on_dial_failure(inbound, &v5_err.to_string()).await;
+            return Err(v5_err);
+        }
+    };
     splice(AxumWs(inbound), TungsteniteWs(outbound_ws)).await;
     Ok(())
 }
@@ -1138,12 +1184,12 @@ async fn dial_kubelet_exec(
 /// Send a close frame to kubectl before dropping an inbound connection that never got
 /// spliced to kubelet.
 ///
-/// Without this, any pre-splice failure (both dial attempts in `run_exec_proxy` failing,
-/// or the exec URL itself being malformed) drops `inbound` — already a live, fully
-/// upgraded connection from kubectl's point of view — with no close handshake at all.
-/// kubectl's websocket client reports that as "close 1006 (abnormal closure): unexpected
-/// EOF" (mayor-oxllp), which looks like a network glitch and hides the real cause
-/// (`reason`, already logged by the caller).
+/// Without this, any pre-splice failure (both dial attempts in `run_exec_proxy` or
+/// `run_attach_proxy` failing, or the exec/attach URL itself being malformed) drops
+/// `inbound` — already a live, fully upgraded connection from kubectl's point of
+/// view — with no close handshake at all. kubectl's websocket client reports that as
+/// "close 1006 (abnormal closure): unexpected EOF" (mayor-oxllp), which looks like a
+/// network glitch and hides the real cause (`reason`, already logged by the caller).
 async fn close_inbound_on_dial_failure(mut inbound: WebSocket, reason: &str) {
     use axum::extract::ws::{CloseFrame, Message};
 
@@ -6363,6 +6409,203 @@ mod tests {
             vec![vec![1u8, b'h', b'i']],
             "kubectl must still receive kubelet's stdout frame via the v4 fallback \
              when kubelet rejects v5 — without the fallback, kubectl exec against \
+             kubelet < 1.36 fails outright (close 1006) instead of degrading to v4"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v5->v4 attach fallback regression tests
+    //
+    // Real kubelet < 1.36 (no ExtendWebSocketsToKubelet — see
+    // ATTACH_KUBELET_FALLBACK_SUBPROTOCOL) never registers v5.channel.k8s.io on its
+    // attach websocket endpoint either, and rejects the handshake with a bare 403
+    // Forbidden exactly like exec. Before the fallback, that error propagated
+    // straight out of run_attach_proxy via `?` before `inbound` (kubectl's
+    // already-upgraded connection) was ever touched, so kubectl saw a raw TCP close
+    // with no WebSocket close frame at all — "close 1006 (abnormal closure):
+    // unexpected EOF" — instead of a working attach.
+    // -----------------------------------------------------------------------
+
+    /// Seed a schedulable pod and its node so `resolve_attach_target` succeeds —
+    /// shared setup for the real-server attach proxy test below.
+    async fn seed_attach_pod(store: &Arc<SqliteStore>) {
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "attach-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "attach-node", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "attach-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "attach-node", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]}
+        });
+        store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "attach-node"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+    }
+
+    /// Mock kubelet handshake callback that rejects a v5.channel.k8s.io attach offer
+    /// with a bare 403 Forbidden, mirroring real kubelet < 1.36's
+    /// `golang.org/x/net/websocket` attach handler (its protocol map never includes
+    /// v5 — see `ATTACH_KUBELET_FALLBACK_SUBPROTOCOL`'s doc comment). Any other
+    /// requested protocol is echoed back and accepted, matching a v4 client.
+    #[allow(clippy::result_large_err)]
+    fn reject_attach_v5_accept_v4_like_pre_1_36_kubelet(
+        req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        let requested = req
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if requested == ATTACH_SUBPROTOCOL {
+            return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN)
+                .body(None)
+                .unwrap());
+        }
+        response
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", requested.parse().unwrap());
+        Ok(response)
+    }
+
+    /// `run_attach_proxy` must fall back to v4.channel.k8s.io and still complete the
+    /// attach session when kubelet rejects the v5 offer with a 403 — exactly what real
+    /// kubelet < 1.36 does. This test fails (times out reading frames, or the
+    /// handshake with kubectl fails) if the v4 fallback in `run_attach_proxy` is
+    /// removed and the v5 rejection is left to propagate straight to `?`.
+    #[tokio::test]
+    async fn attach_proxy_falls_back_to_v4_when_kubelet_rejects_v5() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let kubelet_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = kubelet_listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            // First connection: the v5 offer, rejected with 403 — matches real
+            // kubelet < 1.36 (see ATTACH_KUBELET_FALLBACK_SUBPROTOCOL).
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.clone().accept(tcp).await.unwrap();
+            tokio_tungstenite::accept_hdr_async(
+                tls,
+                reject_attach_v5_accept_v4_like_pre_1_36_kubelet,
+            )
+            .await
+            .expect_err("mock kubelet must reject the v5 offer");
+
+            // Second connection: the v4 fallback, accepted — streams one stdout
+            // frame then closes.
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                tls,
+                reject_attach_v5_accept_v4_like_pre_1_36_kubelet,
+            )
+            .await
+            .unwrap();
+            ws.send(Message::Binary(vec![1u8, b'h', b'i'].into()))
+                .await
+                .unwrap();
+            let _ = ws.close(None).await;
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_attach_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+        let url = format!(
+            "ws://{addr}/api/v1/namespaces/default/pods/attach-pod/attach?stdout=1&stderr=1"
+        );
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            ATTACH_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (mut ws, _resp) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect(
+                    "attach websocket handshake with kubectl must succeed even though \
+                     kubelet rejects v5 — the v4 fallback must make this transparent \
+                     to the client",
+                );
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Binary(b)))) => received.push(b.to_vec()),
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => panic!("websocket error while reading attach frames: {e}"),
+                Err(_) => panic!(
+                    "attach proxy must complete via the v4 fallback within 2s, not hang \
+                     or leave kubectl waiting on a connection that was never spliced"
+                ),
+            }
+        }
+
+        assert_eq!(
+            received,
+            vec![vec![1u8, b'h', b'i']],
+            "kubectl must still receive kubelet's stdout frame via the v4 fallback \
+             when kubelet rejects v5 — without the fallback, kubectl attach against \
              kubelet < 1.36 fails outright (close 1006) instead of degrading to v4"
         );
     }
