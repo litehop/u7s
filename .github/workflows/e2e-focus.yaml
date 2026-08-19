@@ -115,51 +115,43 @@ jobs:
           cp /usr/bin/kubelet ~/bin/kubelet
           cp /usr/bin/kubectl ~/bin/kubectl
 
-      - name: Cache cri-o apt archives
-        id: cache-crio-apt
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /var/cache/apt/archives
-          key: crio-apt-${{ matrix.k8s }}-${{ runner.arch }}
-
-      - name: Install cri-o and crun
-        # 2min = 2.4x observed p100 (~50s); OpenSUSE OBS metadata fetch hangs
-        # are the hazard. The retry loop below caps each attempt at 100s and
-        # retries (likely landing on a different mirror) instead of burning
-        # the whole job timeout on one hung apt-get update. Mirrors
-        # smoke.yaml's identical fix for the same step.
-        timeout-minutes: 2
+      - name: Add cri-o apt repository
+        # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
+        # add-repository input -- its validation rejects the bracket/space
+        # characters required by `deb [signed-by=...] <url> /`. Just the key
+        # + source list, no apt-get here: cache-apt-pkgs-action runs its own
+        # apt-get update before installing, so it picks this repo up itself.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
           MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-          export MINOR
+          curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/cri-o.list
 
-          install_crio_and_crun() {
-            set -euo pipefail
-            sudo apt-get update -qq
-            sudo apt-get install -y apt-transport-https ca-certificates curl gpg
-            curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
-              | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-            echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
-              | sudo tee /etc/apt/sources.list.d/cri-o.list
-            sudo apt-get update -qq
-            sudo apt-get install -y cri-o
-            sudo mkdir -p /etc/cni/net.d
-            sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
-            sudo systemctl enable --now crio
-          }
-          export -f install_crio_and_crun
+      - name: Install cri-o
+        # actions/cache's own attempt at this (removed) never actually
+        # worked: /var/cache/apt/archives is root-owned, so actions/cache's
+        # tar can't read it as the runner user and every save silently
+        # failed with "Cannot open: Permission denied" -- every "cache not
+        # found" was a save failure, not a wrong key. This action caches to
+        # a runner-user-writable path instead. `version` only discriminates
+        # the cache key per matrix branch (the actual installed version
+        # comes from which per-minor repo was added above) -- it does not
+        # pin an apt package version string.
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: cri-o
+          version: ${{ matrix.k8s }}
 
-          # 3 attempts, no backoff -- each capped at 100s so a hung apt-get
-          # update (OBS mirror flakiness) doesn't consume the whole 2min budget.
-          for i in 1 2 3; do
-            if timeout 100 bash -c install_crio_and_crun; then
-              exit 0
-            fi
-            echo "Install cri-o and crun: attempt $i failed, retrying..."
-          done
-          exit 1
+      - name: Configure and start cri-o
+        # Always runs regardless of cache hit/miss -- CNI conflist and the
+        # systemd unit aren't part of what gets cached above.
+        run: |
+          sudo mkdir -p /etc/cni/net.d
+          sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
+          sudo systemctl enable --now crio
 
       - name: Install containernetworking-plugins
         run: |
