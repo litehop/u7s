@@ -233,16 +233,25 @@ POD_SUBNET="10.85.${POD_SUBNET_OCTET}.0/24"
 # a failure that leaves the VM in a broken state, only ever costs an extra (idempotent)
 # rewrite + crio restart on an already-correct subnet.
 CURRENT_POD_SUBNET=$(limactl shell "$VM_NAME" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
-if [ "$CURRENT_POD_SUBNET" != "$POD_SUBNET" ]; then
-  echo "Rewriting CNI bridge pod subnet: ${CURRENT_POD_SUBNET:-<unset>} -> ${POD_SUBNET}"
+# The bridge plugin's own `ipMasq` exemption is computed from each pod's OWN
+# allocated address (containernetworking-plugins' bridge.go feeds
+# result.IPs[].Address -- this node's /24, not the conflist's declared subnet
+# -- into SetupIPMasqForNetworks), so there is no conflist knob that widens
+# just the exemption without also widening the pod's own interface prefix,
+# which would break on-link ARP resolution for every OTHER node's /24 (see
+# the disjoint-/24 comment above). So per-pod ipMasq is disabled here and
+# replaced with one cluster-wide pair of rules below.
+CURRENT_IPMASQ=$(limactl shell "$VM_NAME" sudo jq -r '.plugins[0].ipMasq' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
+if [ "$CURRENT_POD_SUBNET" != "$POD_SUBNET" ] || [ "$CURRENT_IPMASQ" != "false" ]; then
+  echo "Rewriting CNI bridge pod subnet: ${CURRENT_POD_SUBNET:-<unset>} -> ${POD_SUBNET}, disabling per-node ipMasq"
   limactl shell "$VM_NAME" sudo bash -c "
-    jq --arg s '${POD_SUBNET}' '.plugins[0].ipam.ranges[0][0].subnet = \$s' /etc/cni/net.d/10-crio-bridge.conflist > /tmp/10-crio-bridge.conflist.new
+    jq --arg s '${POD_SUBNET}' '.plugins[0].ipam.ranges[0][0].subnet = \$s | .plugins[0].ipMasq = false' /etc/cni/net.d/10-crio-bridge.conflist > /tmp/10-crio-bridge.conflist.new
     mv /tmp/10-crio-bridge.conflist.new /etc/cni/net.d/10-crio-bridge.conflist
     systemctl restart crio
     rm -rf /var/lib/cni/networks/crio/*
   "
 else
-  echo "CNI bridge pod subnet already ${POD_SUBNET}, skipping rewrite."
+  echo "CNI bridge pod subnet already ${POD_SUBNET} with ipMasq disabled, skipping rewrite."
 fi
 
 # The bridge CNI plugin does not re-address an already-existing cni0 device when
@@ -256,6 +265,23 @@ if [ -n "$CNI0_LIVE" ] && [ "$CNI0_LIVE" != "10.85.${POD_SUBNET_OCTET}.1/24" ]; 
   echo "error: $VM_NAME's cni0 bridge is still ${CNI0_LIVE}, not this node's assigned ${POD_SUBNET}." >&2
   echo "  Fix: limactl delete $VM_NAME   (or re-run with --reset, which now recreates a named --extra-node too)" >&2
   exit 1
+fi
+
+# Cluster-wide replacement for the per-node ipMasq disabled above: ACCEPT (no
+# NAT) any traffic staying within the shared 10.85.0.0/16 pod CIDR, ahead of a
+# catch-all MASQUERADE for genuinely external destinations -- mirrors what the
+# bridge plugin used to do per-pod, but scoped to the whole cluster instead of
+# just this node's /24. Without this, cross-node pod traffic was silently
+# SNAT'd to the sending node's own address, since only same-node traffic ever
+# matched the old node-scoped ACCEPT exception. Checked via `-C` before
+# inserting so a re-run of this script never duplicates the rule.
+if ! limactl shell "$VM_NAME" sudo iptables -t nat -C POSTROUTING -s 10.85.0.0/16 -d 10.85.0.0/16 -j ACCEPT 2>/dev/null; then
+  echo "Adding cluster-wide no-SNAT rule for 10.85.0.0/16 pod-to-pod traffic"
+  limactl shell "$VM_NAME" sudo iptables -t nat -I POSTROUTING 1 -s 10.85.0.0/16 -d 10.85.0.0/16 -j ACCEPT
+fi
+if ! limactl shell "$VM_NAME" sudo iptables -t nat -C POSTROUTING -s 10.85.0.0/16 ! -d 224.0.0.0/4 -j MASQUERADE 2>/dev/null; then
+  echo "Adding cluster-wide MASQUERADE rule for pod traffic leaving 10.85.0.0/16"
+  limactl shell "$VM_NAME" sudo iptables -t nat -A POSTROUTING -s 10.85.0.0/16 ! -d 224.0.0.0/4 -j MASQUERADE
 fi
 
 # Toggle CRI-O debug logging via a crio.conf.d drop-in, controlled by --verbose. A
