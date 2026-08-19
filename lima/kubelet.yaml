@@ -53,6 +53,18 @@ mounts:
   - location: "/tmp/lima"
     writable: true
 
+# u7s uses cri-o exclusively. Lima's builtin default enables a per-USER
+# (rootless) containerd + its nerdctl-full bundle (buildkitd,
+# containerd-stargz-grpc, rootlesskit, slirp4netns) unconditionally on
+# x86_64/aarch64 — ~142 MB/VM of RSS never touched by anything in our
+# provision script below. Setting both keys false stops Lima from even
+# installing that stack, independent of (and in addition to) the
+# provision script's own `systemctl disable/mask` of the separate
+# system-wide containerd.service unit further down.
+containerd:
+  system: false
+  user: false
+
 provision:
   - mode: system
     script: |
