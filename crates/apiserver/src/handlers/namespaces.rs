@@ -1225,6 +1225,8 @@ pub(crate) async fn delete_namespace<S: Store>(
 mod tests {
     use super::*;
 
+    use crate::handlers::test_support::make_state;
+
     #[test]
     fn valid_namespace_names() {
         assert!(validate_namespace_name("default").is_ok());
@@ -1397,19 +1399,6 @@ mod tests {
              namespace and exclude the Active one — a client filtering for stuck-terminating \
              namespaces must not silently get back the full unfiltered list"
         );
-    }
-
-    fn make_state() -> AppState {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
@@ -5579,15 +5568,7 @@ mod status_tests {
     use std::sync::Arc;
     use u7s_store::SqliteStore;
 
-    fn make_state(store: Arc<SqliteStore>) -> crate::state::AppState {
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state_with_store as make_state;
 
     fn json_headers() -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
@@ -5739,15 +5720,7 @@ mod admission_tests {
 
     use super::*;
 
-    fn make_state(store: Arc<SqliteStore>) -> crate::state::AppState {
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state_with_store as make_state;
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
@@ -6039,15 +6012,7 @@ mod namespace_status_cas_tests {
     use std::sync::Arc;
     use u7s_store::{SqliteStore, Store};
 
-    fn make_state(store: Arc<SqliteStore>) -> crate::state::AppState {
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state_with_store as make_state;
 
     fn json_headers() -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();

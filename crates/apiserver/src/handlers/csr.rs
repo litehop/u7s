@@ -301,6 +301,8 @@ pub async fn delete_collection_csr<S: Store>(
 mod tests {
     use super::*;
 
+    use crate::handlers::test_support::make_state;
+
     /// Generate a minimal valid base64(PEM)-encoded PKCS#10 CSR using rcgen.
     ///
     /// rcgen is already a workspace dependency (used for TLS cert generation).
@@ -486,19 +488,6 @@ mod tests {
     // It will fail if the route is re-wired to a handler that extracts Path params
     // from a literal route.
     // -----------------------------------------------------------------------
-
-    fn make_state() -> AppState {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
 
     async fn seed_csr_for_get(state: &AppState, name: &str) {
         let b64 = valid_csr_b64();

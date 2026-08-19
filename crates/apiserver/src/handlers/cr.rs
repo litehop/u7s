@@ -3725,6 +3725,8 @@ mod tests {
     use std::sync::Arc;
     use u7s_store::SqliteStore;
 
+    use crate::handlers::test_support::make_state;
+
     fn no_watch_query() -> super::super::generic::CollectionQuery {
         super::super::generic::CollectionQuery {
             watch: None,
@@ -3737,17 +3739,6 @@ mod tests {
             allow_watch_bookmarks: None,
             timeout_seconds: None,
         }
-    }
-
-    fn make_state() -> AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {

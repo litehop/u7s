@@ -1162,18 +1162,7 @@ mod handler_tests {
     use super::*;
     use crate::{auth::UserInfo, state::AppState};
 
-    /// Build a minimal AppState with an empty RBAC index and no SA key.
-    fn make_state() -> AppState {
-        let store =
-            Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state;
 
     /// Build an AppState whose RBAC index has a ClusterRole + ClusterRoleBinding
     /// granting `username` the supplied `rules`.

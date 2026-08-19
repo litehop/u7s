@@ -20,5 +20,7 @@ pub mod scale;
 pub mod status;
 pub mod stream;
 pub mod table;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tokens;
 pub mod watch;

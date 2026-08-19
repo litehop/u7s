@@ -433,6 +433,8 @@ mod tests {
     use std::sync::Arc;
     use u7s_store::SqliteStore;
 
+    use crate::handlers::test_support::make_state;
+
     fn json_headers() -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
         h.insert(
@@ -449,17 +451,6 @@ mod tests {
             axum::http::HeaderValue::from_static("application/merge-patch+json"),
         );
         h
-    }
-
-    fn make_state() -> crate::state::AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     /// get_resource_status returns 404 when the cluster-scoped object does not exist.

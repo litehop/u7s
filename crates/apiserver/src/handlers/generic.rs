@@ -2368,8 +2368,8 @@ mod resolve_name_tests {
 #[cfg(test)]
 mod escalation_tests {
     use axum::http::StatusCode;
-    use std::sync::Arc;
-    use u7s_store::SqliteStore;
+
+    use crate::handlers::test_support::make_state;
 
     fn json_headers() -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
@@ -2378,17 +2378,6 @@ mod escalation_tests {
             axum::http::HeaderValue::from_static("application/json"),
         );
         h
-    }
-
-    fn make_state() -> crate::state::AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     /// A user who can create ClusterRoleBindings but does NOT hold cluster-admin

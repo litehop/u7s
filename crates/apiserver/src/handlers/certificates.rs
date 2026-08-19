@@ -437,21 +437,10 @@ pub(crate) async fn patch_collection_pod_certificate_requests<S: Store>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use axum::http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
-    use u7s_store::SqliteStore;
 
-    fn make_state() -> AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state;
 
     fn test_user() -> UserInfo {
         UserInfo {

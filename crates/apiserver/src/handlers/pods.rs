@@ -17569,17 +17569,8 @@ mod admission_tests {
     use u7s_store::{SqliteStore, Store};
 
     use super::*;
-    use crate::state::AppState;
 
-    fn make_state(store: Arc<SqliteStore>) -> AppState {
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state_with_store as make_state;
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
