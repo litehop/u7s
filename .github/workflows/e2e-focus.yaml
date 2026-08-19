@@ -123,21 +123,43 @@ jobs:
           key: crio-apt-${{ matrix.k8s }}-${{ runner.arch }}
 
       - name: Install cri-o and crun
+        # 2min = 2.4x observed p100 (~50s); OpenSUSE OBS metadata fetch hangs
+        # are the hazard. The retry loop below caps each attempt at 100s and
+        # retries (likely landing on a different mirror) instead of burning
+        # the whole job timeout on one hung apt-get update. Mirrors
+        # smoke.yaml's identical fix for the same step.
+        timeout-minutes: 2
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
           MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-          sudo apt-get update -qq
-          sudo apt-get install -y apt-transport-https ca-certificates curl gpg
-          curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
-            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
-            | sudo tee /etc/apt/sources.list.d/cri-o.list
-          sudo apt-get update -qq
-          sudo apt-get install -y cri-o
-          sudo mkdir -p /etc/cni/net.d
-          sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
-          sudo systemctl enable --now crio
+          export MINOR
+
+          install_crio_and_crun() {
+            set -euo pipefail
+            sudo apt-get update -qq
+            sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+            curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+              | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
+              | sudo tee /etc/apt/sources.list.d/cri-o.list
+            sudo apt-get update -qq
+            sudo apt-get install -y cri-o
+            sudo mkdir -p /etc/cni/net.d
+            sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
+            sudo systemctl enable --now crio
+          }
+          export -f install_crio_and_crun
+
+          # 3 attempts, no backoff -- each capped at 100s so a hung apt-get
+          # update (OBS mirror flakiness) doesn't consume the whole 2min budget.
+          for i in 1 2 3; do
+            if timeout 100 bash -c install_crio_and_crun; then
+              exit 0
+            fi
+            echo "Install cri-o and crun: attempt $i failed, retrying..."
+          done
+          exit 1
 
       - name: Install containernetworking-plugins
         run: |
