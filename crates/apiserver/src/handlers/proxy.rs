@@ -742,7 +742,7 @@ pub struct ExecQuery {
 
 /// Exec subprotocol for the kubelet-side connection.
 ///
-/// Must be v5.channel.k8s.io, not v4. `kubectl exec`'s real websocket executor
+/// Prefer v5.channel.k8s.io, not v4. `kubectl exec`'s real websocket executor
 /// (client-go's `NewWebSocketExecutor`) only ever offers v5 — v5 is the version
 /// that "adds support for a CLOSE signal" (a `[255, streamID]` control frame
 /// sent when the client's local stdin reaches EOF, so the remote process's
@@ -755,12 +755,28 @@ pub struct ExecQuery {
 /// xf -` when streaming a file via `kubectl exec -i`) receive all their data
 /// successfully but then hang forever waiting for a close that never comes,
 /// exactly like the real kube-apiserver's SPDY→websocket CLOSE-signal
-/// translation this project doesn't (and shouldn't need to) replicate: kubelet
-/// natively supports v5, so both legs can simply speak v5 directly. v4/v5
-/// framing for channels 0-4 is otherwise identical, so this is a strict
+/// translation this project doesn't (and shouldn't need to) replicate: v4/v5
+/// framing for channels 0-4 is otherwise identical, so v5 is a strict
 /// superset — safe even for the rare v4-only client (see
 /// `EXEC_KUBECTL_PROTOCOLS`), which will simply never emit a CLOSE frame.
+///
+/// Kubelet only speaks v5 natively starting the `ExtendWebSocketsToKubelet`
+/// feature gate (beta, default-on in 1.36 — see upstream `CHANGELOG-1.36.md`).
+/// Before that, kubelet's own exec websocket handler
+/// (`k8s.io/kubelet/pkg/cri/streaming/remotecommand/websocket.go`) registers only
+/// `""`, `channel.k8s.io`, `base64.channel.k8s.io`, `v4.channel.k8s.io` and
+/// `v4.base64.channel.k8s.io` as valid `Sec-WebSocket-Protocol` values, so a v5
+/// offer fails the handshake outright — `golang.org/x/net/websocket`'s
+/// `newServerConn` answers with a bare `403 Forbidden` when its `Handshake`
+/// callback rejects the protocol, before ever calling the connection handler.
+/// See `dial_kubelet_exec` for the v4 fallback this requires.
 const EXEC_KUBELET_SUBPROTOCOL: &str = "v5.channel.k8s.io";
+
+/// Fallback exec subprotocol for kubelet versions that predate
+/// `ExtendWebSocketsToKubelet` (kubelet < 1.36 — see `EXEC_KUBELET_SUBPROTOCOL`).
+/// Confirmed live against kubelet 1.34.9 (mayor-oxllp): dialing with v5 gets
+/// `kubelet exec connect failed: HTTP error: 403 Forbidden`; v4 succeeds.
+const EXEC_KUBELET_FALLBACK_SUBPROTOCOL: &str = "v4.channel.k8s.io";
 
 /// Exec subprotocols accepted from kubectl.
 ///
@@ -1086,6 +1102,63 @@ fn exec_status_frame_is_success(data: &bytes::Bytes) -> bool {
         .is_some_and(|status| status == "Success")
 }
 
+/// Outbound socket type returned by `tokio_tungstenite::connect_async_tls_with_config`.
+type KubeletExecWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Dial the kubelet exec WebSocket endpoint offering a single subprotocol.
+///
+/// Split out of `run_exec_proxy` so it can be retried with a different
+/// subprotocol without duplicating the request-building/connect boilerplate —
+/// see `EXEC_KUBELET_SUBPROTOCOL`/`EXEC_KUBELET_FALLBACK_SUBPROTOCOL`.
+async fn dial_kubelet_exec(
+    target: &ExecTarget,
+    subprotocol: &str,
+) -> anyhow::Result<KubeletExecWs> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let connector = tokio_tungstenite::Connector::Rustls(target.tls_config.clone());
+    let mut req = target
+        .kubelet_ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("invalid kubelet URL: {e}"))?;
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        subprotocol.parse().expect("valid header value"),
+    );
+
+    let (ws, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
+            .await
+            .map_err(|e| anyhow::anyhow!("kubelet exec connect failed: {e}"))?;
+    Ok(ws)
+}
+
+/// Send a close frame to kubectl before dropping an inbound connection that never got
+/// spliced to kubelet.
+///
+/// Without this, any pre-splice failure (both dial attempts in `run_exec_proxy` failing,
+/// or the exec URL itself being malformed) drops `inbound` — already a live, fully
+/// upgraded connection from kubectl's point of view — with no close handshake at all.
+/// kubectl's websocket client reports that as "close 1006 (abnormal closure): unexpected
+/// EOF" (mayor-oxllp), which looks like a network glitch and hides the real cause
+/// (`reason`, already logged by the caller).
+async fn close_inbound_on_dial_failure(mut inbound: WebSocket, reason: &str) {
+    use axum::extract::ws::{CloseFrame, Message};
+
+    // RFC 6455 caps a close frame's control payload at 125 bytes (2 for the code,
+    // leaving 123 for the UTF-8 reason); truncate defensively rather than risk a
+    // send error burying the close frame entirely.
+    let reason: String = reason.chars().take(120).collect();
+    let _ = inbound
+        .send(Message::Close(Some(CloseFrame {
+            code: axum::extract::ws::close_code::ERROR,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
 /// Open outbound WebSocket to kubelet exec endpoint and relay to inbound kubectl WebSocket.
 ///
 /// Unlike `splice`, this relay absorbs kubelet's genuine success status frame (channel
@@ -1096,28 +1169,37 @@ fn exec_status_frame_is_success(data: &bytes::Bytes) -> bool {
 ///
 /// The kubectl→kubelet direction is relayed unchanged.
 async fn run_exec_proxy(inbound: WebSocket, target: ExecTarget) -> anyhow::Result<()> {
-    use tokio::sync::mpsc;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-
-    let connector = tokio_tungstenite::Connector::Rustls(target.tls_config);
-
-    // Build the request with the exec subprotocol header.
-    let mut req = target
-        .kubelet_ws_url
-        .into_client_request()
-        .map_err(|e| anyhow::anyhow!("invalid kubelet URL: {e}"))?;
-    req.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        EXEC_KUBELET_SUBPROTOCOL
-            .parse()
-            .expect("valid header value"),
+    // Try v5 first (needed for the CLOSE signal on kubelet >= 1.36 — see
+    // EXEC_KUBELET_SUBPROTOCOL); fall back to v4 for older kubelets that reject v5
+    // outright. Only the v5 attempt's error is surfaced/closed-out on total failure —
+    // it's the one every kubelet will eventually support, so it's the more useful
+    // message to a caller than the fallback's.
+    let v5_err = match dial_kubelet_exec(&target, EXEC_KUBELET_SUBPROTOCOL).await {
+        Ok(ws) => return run_exec_proxy_spliced(inbound, ws).await,
+        Err(e) => e,
+    };
+    tracing::debug!(
+        "kubelet rejected {EXEC_KUBELET_SUBPROTOCOL} ({v5_err}); retrying exec dial with {EXEC_KUBELET_FALLBACK_SUBPROTOCOL} \
+         (pre-1.36 kubelet without ExtendWebSocketsToKubelet)"
     );
+    let outbound_ws = match dial_kubelet_exec(&target, EXEC_KUBELET_FALLBACK_SUBPROTOCOL).await {
+        Ok(ws) => ws,
+        Err(_) => {
+            close_inbound_on_dial_failure(inbound, &v5_err.to_string()).await;
+            return Err(v5_err);
+        }
+    };
+    run_exec_proxy_spliced(inbound, outbound_ws).await
+}
 
-    // Connect outbound WebSocket to the kubelet.
-    let (outbound_ws, _resp) =
-        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
-            .await
-            .map_err(|e| anyhow::anyhow!("kubelet exec connect failed: {e}"))?;
+/// Splice an already-upgraded kubectl WebSocket to an already-connected kubelet exec
+/// WebSocket. Extracted from `run_exec_proxy` so the v5/v4 dial retry above has a single
+/// place to hand off to once a working outbound connection exists.
+async fn run_exec_proxy_spliced(
+    inbound: WebSocket,
+    outbound_ws: KubeletExecWs,
+) -> anyhow::Result<()> {
+    use tokio::sync::mpsc;
 
     // Split both streams into independent read/write halves.
     let (mut kubectl_r, mut kubectl_w) = AxumWs(inbound).split();
@@ -6124,6 +6206,164 @@ mod tests {
             frames[0][0], 3,
             "the one frame kubectl receives must be the channel-3 status frame \
              carrying the real exit code, not something else"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v5->v4 exec fallback regression tests (mayor-oxllp)
+    //
+    // Real kubelet < 1.36 (no ExtendWebSocketsToKubelet — see
+    // EXEC_KUBELET_SUBPROTOCOL) never registers v5.channel.k8s.io on its exec
+    // websocket endpoint and rejects the handshake with a bare 403 Forbidden.
+    // Confirmed live against kubelet 1.34.9: "kubelet exec connect failed: HTTP
+    // error: 403 Forbidden". Before the fallback, that error propagated straight
+    // out of run_exec_proxy via `?` before `inbound` (kubectl's already-upgraded
+    // connection) was ever touched, so kubectl saw a raw TCP close with no
+    // WebSocket close frame at all — "close 1006 (abnormal closure): unexpected
+    // EOF" — instead of a working exec.
+    // -----------------------------------------------------------------------
+
+    /// Mock kubelet handshake callback that rejects a v5.channel.k8s.io offer with a
+    /// bare 403 Forbidden, mirroring real kubelet < 1.36's `golang.org/x/net/websocket`
+    /// exec handler (its protocol map never includes v5 — see
+    /// `EXEC_KUBELET_SUBPROTOCOL`'s doc comment). Any other requested protocol is
+    /// echoed back and accepted, matching a v4 client.
+    #[allow(clippy::result_large_err)]
+    fn reject_v5_accept_v4_like_pre_1_36_kubelet(
+        req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        let requested = req
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if requested == EXEC_KUBELET_SUBPROTOCOL {
+            return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN)
+                .body(None)
+                .unwrap());
+        }
+        response
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", requested.parse().unwrap());
+        Ok(response)
+    }
+
+    /// `run_exec_proxy` must fall back to v4.channel.k8s.io and still complete the exec
+    /// session when kubelet rejects the v5 offer with a 403 — exactly what real kubelet
+    /// < 1.36 does. This test fails (times out reading frames, or the handshake with
+    /// kubectl fails) if the v4 fallback in `run_exec_proxy` is removed and the v5
+    /// rejection is left to propagate straight to `?`.
+    #[tokio::test]
+    async fn exec_proxy_falls_back_to_v4_when_kubelet_rejects_v5() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let kubelet_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kubelet_port = kubelet_listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            // First connection: the v5 offer, rejected with 403 — matches real
+            // kubelet < 1.36 (see EXEC_KUBELET_SUBPROTOCOL).
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.clone().accept(tcp).await.unwrap();
+            tokio_tungstenite::accept_hdr_async(tls, reject_v5_accept_v4_like_pre_1_36_kubelet)
+                .await
+                .expect_err("mock kubelet must reject the v5 offer");
+
+            // Second connection: the v4 fallback, accepted — streams one stdout
+            // frame then closes.
+            let (tcp, _) = kubelet_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tls, reject_v5_accept_v4_like_pre_1_36_kubelet)
+                    .await
+                    .unwrap();
+            ws.send(Message::Binary(vec![1u8, b'h', b'i'].into()))
+                .await
+                .unwrap();
+            let _ = ws.close(None).await;
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_exec_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(cert_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        let addr = spawn_upgradeable_server(make_router(state));
+        let url =
+            format!("ws://{addr}/api/v1/namespaces/default/pods/exec-pod/exec?stdout=1&stderr=1");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            EXEC_KUBELET_SUBPROTOCOL.parse().unwrap(),
+        );
+
+        let (mut ws, _resp) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), connect_async(request))
+                .await
+                .expect("websocket connect must not time out")
+                .expect(
+                    "exec websocket handshake with kubectl must succeed even though \
+                     kubelet rejects v5 — the v4 fallback must make this transparent \
+                     to the client",
+                );
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Binary(b)))) => received.push(b.to_vec()),
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => panic!("websocket error while reading exec frames: {e}"),
+                Err(_) => panic!(
+                    "exec proxy must complete via the v4 fallback within 2s, not hang \
+                     or leave kubectl waiting on a connection that was never spliced"
+                ),
+            }
+        }
+
+        assert_eq!(
+            received,
+            vec![vec![1u8, b'h', b'i']],
+            "kubectl must still receive kubelet's stdout frame via the v4 fallback \
+             when kubelet rejects v5 — without the fallback, kubectl exec against \
+             kubelet < 1.36 fails outright (close 1006) instead of degrading to v4"
         );
     }
 
