@@ -564,6 +564,20 @@ jobs:
             echo "no e2e-job pod found (label sonobuoy-component=plugin)"
           fi
 
+          # u7s bootstraps metrics-server (kube-system) on every run regardless
+          # of this workflow. A prior run showed its readinessProbe failing
+          # with HTTP 500 the whole time -- that's metrics-server's own /readyz
+          # self-reporting a failed kubelet scrape, a different symptom of the
+          # same "pod trying to reach something over the network" class of
+          # problem this diagnose step already exists for, so capture its logs
+          # too rather than assuming it's unrelated noise.
+          echo "=== kube-system pods -o wide ==="
+          kubectl get pods -n kube-system -o wide || true
+          echo "=== metrics-server logs ==="
+          kubectl logs -n kube-system -l k8s-app=metrics-server --tail=200 | tee /tmp/metrics-server.log || true
+          echo "=== metrics-server describe ==="
+          kubectl describe pod -n kube-system -l k8s-app=metrics-server || true
+
           echo "=== kube-proxy systemd status ==="
           sudo systemctl status kube-proxy --no-pager || true
           echo "=== kube-proxy journal (last 50 lines) ==="
@@ -678,3 +692,4 @@ jobs:
             /tmp/sonobuoy-aggregator.log
             /tmp/sonobuoy-e2e-container.log
             /tmp/sonobuoy-worker-container.log
+            /tmp/metrics-server.log
