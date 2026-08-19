@@ -75,9 +75,9 @@ provision:
       apt-get install -y apt-transport-https ca-certificates curl gpg
 
       # Install cri-o 1.36 and crun
-      curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/Release.key \
+      curl -fsSL https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/Release.key \
         | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-      echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/ /' \
+      echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/ /' \
         > /etc/apt/sources.list.d/cri-o.list
       apt-get update -qq
       apt-get install -y cri-o crun conmon
