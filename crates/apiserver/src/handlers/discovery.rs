@@ -2658,6 +2658,7 @@ mod tests {
     use u7s_store::SqliteStore;
 
     use crate::handlers::crd::{create_crd, delete_crd};
+    use crate::handlers::test_support::make_state;
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
@@ -2666,17 +2667,6 @@ mod tests {
             groups: vec![],
             extra: Default::default(),
         })
-    }
-
-    fn make_state() -> AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     fn crd_bytes(

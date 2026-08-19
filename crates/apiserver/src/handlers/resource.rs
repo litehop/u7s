@@ -4789,6 +4789,8 @@ mod tests {
     use super::*;
     use axum::Extension;
 
+    use crate::handlers::test_support::make_state;
+
     fn json_headers() -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
         h.insert(
@@ -4818,19 +4820,6 @@ mod tests {
             }
         });
         bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
-    }
-
-    fn make_state() -> crate::state::AppState {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {

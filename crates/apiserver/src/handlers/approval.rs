@@ -267,6 +267,8 @@ mod tests {
     use std::sync::Arc;
     use u7s_store::SqliteStore;
 
+    use crate::handlers::test_support::make_state;
+
     fn json_headers() -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
         h.insert(
@@ -274,17 +276,6 @@ mod tests {
             axum::http::HeaderValue::from_static("application/json"),
         );
         h
-    }
-
-    fn make_state() -> AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
     }
 
     async fn seed_csr(store: &Arc<SqliteStore>, name: &str, certificate: Option<&str>) -> String {

@@ -1175,19 +1175,8 @@ pub async fn patch_crd_status<S: Store>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use u7s_store::SqliteStore;
 
-    fn make_state() -> AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state;
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {
@@ -3528,17 +3517,8 @@ mod admission_tests {
     use u7s_store::{SqliteStore, Store};
 
     use super::*;
-    use crate::state::AppState;
 
-    fn make_state(store: Arc<SqliteStore>) -> AppState {
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state_with_store as make_state;
 
     fn test_user() -> axum::Extension<crate::auth::UserInfo> {
         axum::Extension(crate::auth::UserInfo {

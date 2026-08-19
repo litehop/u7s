@@ -2746,16 +2746,7 @@ mod tests {
     use tower_service::Service as _;
     use u7s_store::SqliteStore;
 
-    fn make_state() -> AppState {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
-        AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        )
-    }
+    use crate::handlers::test_support::make_state;
 
     fn make_router(state: AppState) -> Router {
         Router::new()
