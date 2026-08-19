@@ -347,6 +347,11 @@ jobs:
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/cri-o.list
+          # The action resolves package versions from apt's cached metadata
+          # (/var/lib/apt/lists), not by hitting the network itself — without this
+          # update the newly-added repo's package list isn't loaded yet, so the
+          # action can't resolve cri-o and treats the package list as empty.
+          sudo apt-get update -qq
 
       - name: Cache and install cri-o
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
