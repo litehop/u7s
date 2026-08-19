@@ -39,9 +39,6 @@ jobs:
       - name: Build release binaries
         if: steps.release-bin-cache.outputs.cache-hit != 'true'
         run: cargo build --release -p u7s-apiserver -p u7s-scheduler
-      # actions/cache's combined action saves unconditionally on a cache miss in its
-      # Post step, even if the build step failed. Split restore/save lets us gate the
-      # save on build success so a partially-failed build is never cached as valid.
       - name: Save release binary cache
         if: steps.release-bin-cache.outputs.cache-hit != 'true' && success()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -62,9 +59,6 @@ jobs:
   e2e-focus:
     needs: build
     runs-on: ubuntu-latest
-    # Tight while the sonobuoy step below is unproven -- a hang anywhere in
-    # this job should fail fast instead of burning 20+ minutes per iteration.
-    # Raise once sonobuoy is confirmed reliably completing.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -119,10 +113,6 @@ jobs:
           cp /usr/bin/kubectl ~/bin/kubectl
 
       - name: Install cri-o apt keyring + source list
-        # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
-        # add-repository input -- its validation rejects the bracket/space
-        # characters required by `deb [signed-by=...] <url> /`. Mirrors
-        # smoke.yaml's identical pre-step for the same migration.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -131,37 +121,15 @@ jobs:
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/cri-o.list
-          # The action resolves package versions from apt's cached metadata
-          # (/var/lib/apt/lists), not by hitting the network itself -- its own
-          # update_apt_lists_if_stale is a no-op outside nektos/act, so on a
-          # real GitHub Actions runner it never refreshes this on its own.
-          # Without this update the newly-added repo's package list isn't
-          # loaded yet, so the action can't resolve cri-o and treats the
-          # package list as empty (confirmed live in run 32234489918).
-          # Acquire::http::Timeout=30 bounds each per-URL read at 30s;
-          # Acquire::Retries=3 tries each URL up to 3 times. Worst-case for
-          # an OpenSUSE hang: ~90s then step fails cleanly (vs the previous
-          # 15-min silent hang).
           sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
 
       - name: Install cri-o
-        # actions/cache's own attempt at this (removed) never actually
-        # worked: /var/cache/apt/archives is root-owned, so actions/cache's
-        # tar can't read it as the runner user and every save silently
-        # failed with "Cannot open: Permission denied" -- every "cache not
-        # found" was a save failure, not a wrong key. This action caches to
-        # a runner-user-writable path instead. `version` only discriminates
-        # the cache key per matrix branch (the actual installed version
-        # comes from which per-minor repo was added above) -- it does not
-        # pin an apt package version string.
         uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           packages: cri-o
           version: ${{ matrix.k8s }}
 
       - name: Configure and start cri-o
-        # Always runs regardless of cache hit/miss -- CNI conflist and the
-        # systemd unit aren't part of what gets cached above.
         run: |
           sudo mkdir -p /etc/cni/net.d
           sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
@@ -194,8 +162,6 @@ jobs:
           mkdir -p "$WORKDIR"
           E2E_TOKEN="e2e-focus-admin-token-$(date +%s)"
           echo "$E2E_TOKEN,e2e-focus-admin,uid0,system:masters" > "$WORKDIR/token-auth.csv"
-          # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
-          # this same runner
           ./target/release/u7s-apiserver \
             --db "$WORKDIR/state.db" \
             --kubeconfig "$WORKDIR/kubeconfig" \
@@ -214,8 +180,6 @@ jobs:
             sleep 1
           done
           nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$WORKDIR/apiserver.log"; exit 1; }
-          # Save the cert-based kubeconfig before overwriting with a token one
-          # below -- kube-controller-manager needs the cert-based identity.
           cp "$WORKDIR/kubeconfig" "$WORKDIR/kubeconfig-cert"
           CA_DATA=$(grep "certificate-authority-data" "$WORKDIR/kubeconfig" | awk '{print $2}')
           echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
@@ -300,8 +264,6 @@ jobs:
           kubectl get nodes
 
       - name: Assert kubelet not crash-looping
-        # Checks every second instead of one sleep-then-check: an immediate
-        # crash fails right away instead of waiting out the full window first.
         run: |
           for i in $(seq 1 5); do
             pgrep -f "bin/kubelet --config=/etc/kubelet-config.yaml" >/dev/null || {
@@ -313,10 +275,6 @@ jobs:
           done
 
       - name: Create kube-proxy RBAC and token
-        # The sonobuoy aggregator (and every in-cluster client using client-go's
-        # InClusterConfig, i.e. anything with a projected SA token) reaches the
-        # apiserver via the "kubernetes" Service ClusterIP (10.96.0.1:443),
-        # which needs a real Service dataplane to route -- see kube-proxy below.
         env:
           KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
         run: |
@@ -389,12 +347,6 @@ jobs:
             user:
               token: ${KUBE_PROXY_TOKEN}
           KUBEEOF
-          # iptables mode, not lima's ipvs -- GH Actions runners have the full
-          # iptables userspace extensions available (unlike the cut-down Lima
-          # VM image that forced ipvs mode there; see
-          # scripts/conformance/lima-start.sh's own comment on why), so the
-          # simpler mode needs no ipset/kernel-module dependencies beyond
-          # br_netfilter below.
           sudo tee /etc/kube-proxy/config.conf >/dev/null <<'CONFEOF'
           apiVersion: kubeproxy.config.k8s.io/v1alpha1
           kind: KubeProxyConfiguration
@@ -403,23 +355,8 @@ jobs:
           clientConnection:
             kubeconfig: /etc/kube-proxy/kubeconfig.conf
           CONFEOF
-          # Required so bridge (pod-to-pod / pod-to-host) traffic passes through
-          # netfilter hooks -- without it, kube-proxy's DNAT for ClusterIP
-          # services never fires for traffic originating from pods, which is
-          # exactly how the sonobuoy aggregator reaches the apiserver.
           sudo modprobe br_netfilter
           sudo sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1
-          # GH Actions runners have Docker pre-installed and running, which
-          # sets the iptables FORWARD chain's default policy to DROP and only
-          # opens it for its own managed bridges (docker0 etc) -- our
-          # separately-created "cni0" bridge is left blocked. This breaks
-          # direct pod-to-pod traffic specifically (e.g. sonobuoy's own
-          # worker sidecar reporting results to the aggregator pod, confirmed
-          # live via "dial tcp <pod-ip>:8080: connect: connection timed out"),
-          # while pod-to-host traffic still works because kube-proxy's DNAT
-          # targets are local addresses delivered via INPUT, not FORWARD.
-          # Safe to open unconditionally here: this is a single-tenant,
-          # ephemeral CI runner with no other traffic to isolate.
           sudo iptables -P FORWARD ACCEPT
           sudo tee /etc/systemd/system/kube-proxy.service >/dev/null <<SVCEOF
           [Unit]
@@ -454,12 +391,6 @@ jobs:
             sudo journalctl -u kube-proxy --no-pager -n 50
             exit 1
           fi
-          # systemd reporting "active" only means the process started -- it
-          # says nothing about whether kube-proxy's first watch-sync has
-          # actually programmed the DNAT rule anything dialing the
-          # "kubernetes" ClusterIP (10.96.0.1:443, incl. the sonobuoy
-          # aggregator) needs. Poll for that rule directly instead of a blind
-          # settle-time sleep.
           RULE_READY=0
           for i in $(seq 1 15); do
             if sudo iptables -t nat -S KUBE-SERVICES 2>/dev/null | grep -q "10\.96\.0\.1"; then
@@ -488,13 +419,6 @@ jobs:
       - name: Start kube-controller-manager
         run: |
           WORKDIR="$PWD/temp/u7s"
-          # The wildcard controller set (minus cloud-specific controllers u7s does
-          # not implement) matches scripts/conformance/04-start-kcm.sh's proven
-          # real-conformance configuration -- real upstream e2e specs depend on
-          # controllers this workflow's narrower smoke/perf-test peers never
-          # needed (e.g. the namespace controller finalizing each test's
-          # ephemeral namespace). kcm-supervisor.sh restarts kcm on crash instead
-          # of silently blacking out the control plane for the rest of the run.
           setsid bash scripts/conformance/kcm-supervisor.sh \
             "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
             --kubeconfig="$WORKDIR/kubeconfig-cert" \
@@ -512,11 +436,6 @@ jobs:
       - name: Start u7s-scheduler
         run: |
           WORKDIR="$PWD/temp/u7s"
-          # Launched right after kcm, before kcm's own alive-check below --
-          # kube-controller-manager and u7s-scheduler are independent apiserver
-          # clients with no startup-order dependency on each other (unscheduled
-          # pods just stay Pending until the scheduler is up), so there is
-          # nothing to gain from serializing their launches.
           ./target/release/u7s-scheduler \
             --kubeconfig "$WORKDIR/kubeconfig-cert" \
             >"$WORKDIR/scheduler.log" 2>&1 &
@@ -536,8 +455,6 @@ jobs:
           }
 
       - name: Assert scheduler alive
-        # Checks every second instead of one sleep-then-check: an immediate
-        # crash fails right away instead of waiting out the full window first.
         run: |
           for i in $(seq 1 2); do
             kill -0 "$SCHEDULER_PID" 2>/dev/null || {
@@ -581,20 +498,6 @@ jobs:
         env:
           KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
         run: |
-          # scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes the e2e
-          # plugin's image at v1.36.0 (it's a static manifest, not something
-          # `sonobuoy run` generates per-cluster the way its own --kubernetes-
-          # version=auto default does) -- so without this override every
-          # matrix branch ran the SAME v1.36-built e2e.test/kubectl against
-          # this branch's own matrix.k8s kubelet, regardless of version. That
-          # skew, not a setup bug, was why only k8s 1.36.2 passed: kubectl
-          # exec's abrupt websocket close on 1.34.9 is consistent with a
-          # newer test client's protocol assumptions meeting an older
-          # kubelet. --kube-conformance-image overrides just the image
-          # (shorthand for --plugin-image=e2e:<image>, applies regardless of
-          # how the plugin was defined) without touching that file; the exact
-          # per-patch tag (not just per-minor) exists on registry.k8s.io for
-          # all three matrix versions.
           sonobuoy run \
             -p scripts/conformance/sonobuoy-plugin-e2e.yaml \
             --kube-conformance-image="registry.k8s.io/conformance:v${{ matrix.k8s }}" \
@@ -604,9 +507,6 @@ jobs:
             --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl client Simple pod should support exec\$"
 
       - name: Diagnose sonobuoy on failure
-        # cancelled() too: interrupting a hung run mid-debug (gh run cancel)
-        # produces a "cancelled" conclusion, not "failure" -- without this,
-        # exactly the scenario this step exists for would skip it.
         if: failure() || cancelled()
         env:
           KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
@@ -622,13 +522,6 @@ jobs:
           echo "=== events -n sonobuoy ==="
           kubectl get events -n sonobuoy --sort-by=.lastTimestamp || true
 
-          # The sonobuoy results tarball (what "Retrieve sonobuoy results"
-          # unpacks on the success path) is only written once the aggregator
-          # finishes assembling results from a worker report it never got in
-          # a hang like this -- it does not exist on disk yet, so these two
-          # containers' own logs are the only place to see what actually
-          # happened. Persisted to files (not just echoed) so they survive
-          # into the "Upload logs on failure" artifact for offline reading.
           echo "=== aggregator pod logs (sonobuoy/sonobuoy) ==="
           kubectl logs -n sonobuoy sonobuoy | tee /tmp/sonobuoy-aggregator.log || true
 
@@ -673,11 +566,6 @@ jobs:
             exit 1
           fi
           POD_UID=$(kubectl get pod -n sonobuoy sonobuoy -o jsonpath='{.metadata.uid}')
-          # sonobuoy retrieve relies on the port-forward subresource, which
-          # 06-run-sonobuoy.sh's own comment notes u7s does not yet support
-          # reliably -- read the results tarball straight off the kubelet's
-          # emptyDir volume on disk instead, same as that script's lima
-          # workaround minus the VM hop (kubelet runs on this same runner).
           HOST_PATH=$(sudo find "/var/lib/kubelet/pods/${POD_UID}/volumes/kubernetes.io~empty-dir" -name "$TARBALL_NAME" | head -1)
           if [ -z "$HOST_PATH" ]; then
             echo "ERROR: results tarball not found under kubelet pod volume for uid=${POD_UID}" >&2
@@ -701,9 +589,6 @@ jobs:
 
           RAN_LINE=$(grep -E "^Ran [0-9]+ of [0-9]+ Specs" "$E2E_TXT" | tail -1 || true)
           echo "Ginkgo ran-count: $RAN_LINE"
-          # Exactly 2 -- not zero (the focus regex silently matched nothing,
-          # e.g. a FeatureGate label filter or a typo) and not more than 2 (the
-          # focus regex over-matched a third, unrelated spec).
           if ! echo "$RAN_LINE" | grep -qE "^Ran 2 of "; then
             echo "ERROR: expected exactly 2 specs to run; got: $RAN_LINE" >&2
             exit 1
@@ -751,11 +636,6 @@ jobs:
           pkill -f "target/release/u7s-apiserver --db" 2>/dev/null || true
 
       - name: Upload logs on failure
-        # cancelled() too -- confirmed live that a manual `gh run cancel`
-        # (used to interrupt a hang instead of waiting out the full job
-        # timeout) produces a "cancelled" job conclusion, which a bare
-        # if: failure() does not match, so this step silently skipped on
-        # exactly the runs it exists to capture logs for.
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
