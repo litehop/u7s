@@ -71,10 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Temporarily restricted to 1.36.2 while mayor-oxllp (kubectl exec
-        # compat gap with kubelet 1.34.x/1.35.x) is diagnosed. Restore via
-        # mayor-u8zqs.
-        k8s: ["1.36.2"]
+        k8s: ["1.34.9", "1.35.6", "1.36.2"]
     name: e2e-focus ${{ matrix.k8s }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -573,7 +570,7 @@ jobs:
           kubectl create namespace sonobuoy --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f scripts/conformance/sonobuoy-namespace-limitrange.yaml
 
-      - name: Run sonobuoy (RollingUpdateDeployment + kubectl exec)
+      - name: Run sonobuoy (RollingUpdateDeployment + kubectl logs)
         # Short step-level timeout while this is new and unproven: a hang here
         # should fail fast instead of burning the whole job's timeout-minutes
         # budget on every iteration.
@@ -581,27 +578,22 @@ jobs:
         env:
           KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
         run: |
-          # scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes the e2e
-          # plugin's image at v1.36.0 (it's a static manifest, not something
-          # `sonobuoy run` generates per-cluster the way its own --kubernetes-
-          # version=auto default does) -- so without this override every
-          # matrix branch ran the SAME v1.36-built e2e.test/kubectl against
-          # this branch's own matrix.k8s kubelet, regardless of version. That
-          # skew, not a setup bug, was why only k8s 1.36.2 passed: kubectl
-          # exec's abrupt websocket close on 1.34.9 is consistent with a
-          # newer test client's protocol assumptions meeting an older
-          # kubelet. --kube-conformance-image overrides just the image
-          # (shorthand for --plugin-image=e2e:<image>, applies regardless of
-          # how the plugin was defined) without touching that file; the exact
-          # per-patch tag (not just per-minor) exists on registry.k8s.io for
-          # all three matrix versions.
+          # scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes the
+          # plugin's image field at a specific v1.36.0 tag (it's a static
+          # manifest -- sonobuoy loads it verbatim, not per-cluster the way
+          # its own --kubernetes-version=auto default does). Without this
+          # CLI-level override every matrix branch would run the same fixed
+          # v1.36.0 e2e binaries against its own matrix-selected kubelet --
+          # burying real per-version issues. --kube-conformance-image
+          # overrides just the image tag on the plugin (shorthand for
+          # --plugin-image=e2e:<image>) without touching the manifest.
           sonobuoy run \
             -p scripts/conformance/sonobuoy-plugin-e2e.yaml \
             --kube-conformance-image="registry.k8s.io/conformance:v${{ matrix.k8s }}" \
             --wait \
             --skip-preflight=existingnamespace \
             --kubeconfig "$KUBECONFIG" \
-            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl client Simple pod should support exec\$"
+            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs"
 
       - name: Diagnose sonobuoy on failure
         # cancelled() too: interrupting a hung run mid-debug (gh run cancel)
