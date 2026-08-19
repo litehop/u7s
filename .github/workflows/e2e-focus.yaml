@@ -118,8 +118,7 @@ jobs:
       - name: Install cri-o apt keyring + source list
         # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
         # add-repository input -- its validation rejects the bracket/space
-        # characters required by `deb [signed-by=...] <url> /`. Mirrors
-        # smoke.yaml's identical pre-step for the same migration.
+        # characters required by `deb [signed-by=...] <url> /`.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -730,14 +729,12 @@ jobs:
             echo "### RSS peak (k8s ${{ matrix.k8s }}, after sonobuoy)"
             echo "- apiserver RSS: ${APISERVER_RSS} kB (baseline ${BASELINE_APISERVER_RSS_KB} kB)"
             echo "- scheduler RSS: ${SCHEDULER_RSS} kB (baseline ${BASELINE_SCHEDULER_RSS_KB} kB)"
-            echo "- combined RSS: ${COMBINED_RSS} kB (delta vs. baseline: ${DELTA} kB, observe-only threshold: 10240 kB)"
+            echo "- combined RSS: ${COMBINED_RSS} kB (delta vs. baseline: ${DELTA} kB, threshold: 10240 kB)"
             echo "- runner memory (free -m): total=${MEM_TOTAL}MB used=${MEM_USED}MB free=${MEM_FREE}MB"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # Observe-only: log a warning but do not fail the step. Flip to
-          # hard-fail (exit 1) once 3-5 clean runs on the extended --focus
-          # regex confirm the margin above this threshold holds.
           if [ "$DELTA" -gt 10240 ]; then
-            echo "[WARN] ⚠️ peak_rss_delta=${DELTA} kB exceeds observe-only threshold 10240 kB — collect baseline data then decide whether to flip to hard-fail" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "FAIL: peak RSS delta ${DELTA} kB exceeds 10240 kB (10 MB)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
       - name: Stop stack
