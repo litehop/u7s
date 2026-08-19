@@ -249,13 +249,169 @@ jobs:
           kubectl get nodes
 
       - name: Assert kubelet not crash-looping
+        # Checks every second instead of one sleep-then-check: an immediate
+        # crash fails right away instead of waiting out the full window first.
         run: |
-          sleep 5
-          pgrep -f "bin/kubelet --config=/etc/kubelet-config.yaml" >/dev/null || {
-            echo "ERROR: kubelet exited"
-            cat "$PWD/temp/u7s/kubelet.log"
+          for i in $(seq 1 5); do
+            pgrep -f "bin/kubelet --config=/etc/kubelet-config.yaml" >/dev/null || {
+              echo "ERROR: kubelet exited"
+              cat "$PWD/temp/u7s/kubelet.log"
+              exit 1
+            }
+            sleep 1
+          done
+
+      - name: Create kube-proxy RBAC and token
+        # The sonobuoy aggregator (and every in-cluster client using client-go's
+        # InClusterConfig, i.e. anything with a projected SA token) reaches the
+        # apiserver via the "kubernetes" Service ClusterIP (10.96.0.1:443),
+        # which needs a real Service dataplane to route -- see kube-proxy below.
+        env:
+          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
+        run: |
+          kubectl create serviceaccount kube-proxy -n kube-system \
+            --dry-run=client -o yaml | kubectl apply --validate=false -f -
+          kubectl apply --validate=false -f - <<'RBACEOF'
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: kube-proxy
+          rules:
+          - apiGroups: [""]
+            resources: [nodes, services, endpoints]
+            verbs: [get, list, watch]
+          - apiGroups: [""]
+            resources: [events]
+            verbs: [create, patch, update]
+          - apiGroups: [discovery.k8s.io]
+            resources: [endpointslices]
+            verbs: [get, list, watch]
+          - apiGroups: [networking.k8s.io]
+            resources: [servicecidrs]
+            verbs: [get, list, watch]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: kube-proxy
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: kube-proxy
+          subjects:
+          - kind: ServiceAccount
+            name: kube-proxy
+            namespace: kube-system
+          RBACEOF
+          KUBE_PROXY_TOKEN=$(kubectl create token kube-proxy -n kube-system --duration=8760h)
+          echo "KUBE_PROXY_TOKEN=$KUBE_PROXY_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Download kube-proxy
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-proxy" \
+            -o "$WORKDIR/kube-proxy"
+          chmod +x "$WORKDIR/kube-proxy"
+
+      - name: Start kube-proxy
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          sudo mkdir -p /etc/kube-proxy
+          sudo tee /etc/kube-proxy/kubeconfig.conf >/dev/null <<KUBEEOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              server: https://127.0.0.1:6443
+              certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
+            name: default
+          contexts:
+          - context:
+              cluster: default
+              user: default
+            name: default
+          current-context: default
+          users:
+          - name: default
+            user:
+              token: ${KUBE_PROXY_TOKEN}
+          KUBEEOF
+          # iptables mode, not lima's ipvs -- GH Actions runners have the full
+          # iptables userspace extensions available (unlike the cut-down Lima
+          # VM image that forced ipvs mode there; see
+          # scripts/conformance/lima-start.sh's own comment on why), so the
+          # simpler mode needs no ipset/kernel-module dependencies beyond
+          # br_netfilter below.
+          sudo tee /etc/kube-proxy/config.conf >/dev/null <<'CONFEOF'
+          apiVersion: kubeproxy.config.k8s.io/v1alpha1
+          kind: KubeProxyConfiguration
+          mode: iptables
+          clusterCIDR: 10.88.0.0/16
+          clientConnection:
+            kubeconfig: /etc/kube-proxy/kubeconfig.conf
+          CONFEOF
+          # Required so bridge (pod-to-pod / pod-to-host) traffic passes through
+          # netfilter hooks -- without it, kube-proxy's DNAT for ClusterIP
+          # services never fires for traffic originating from pods, which is
+          # exactly how the sonobuoy aggregator reaches the apiserver.
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1
+          sudo tee /etc/systemd/system/kube-proxy.service >/dev/null <<SVCEOF
+          [Unit]
+          Description=Kubernetes Kube Proxy
+          After=network.target
+
+          [Service]
+          ExecStart=$WORKDIR/kube-proxy \\
+            --config=/etc/kube-proxy/config.conf \\
+            --hostname-override=ci-node \\
+            --v=2
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=1048576
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now kube-proxy
+
+      - name: Assert kube-proxy active
+        run: |
+          STATUS=""
+          for i in $(seq 1 15); do
+            STATUS=$(systemctl is-active kube-proxy 2>&1 || true)
+            [ "$STATUS" = "active" ] && break
+            sleep 1
+          done
+          if [ "$STATUS" != "active" ]; then
+            echo "ERROR: kube-proxy failed to reach active state (last status: $STATUS)"
+            sudo journalctl -u kube-proxy --no-pager -n 50
             exit 1
-          }
+          fi
+          # systemd reporting "active" only means the process started -- it
+          # says nothing about whether kube-proxy's first watch-sync has
+          # actually programmed the DNAT rule anything dialing the
+          # "kubernetes" ClusterIP (10.96.0.1:443, incl. the sonobuoy
+          # aggregator) needs. Poll for that rule directly instead of a blind
+          # settle-time sleep.
+          RULE_READY=0
+          for i in $(seq 1 15); do
+            if sudo iptables -t nat -S KUBE-SERVICES 2>/dev/null | grep -q "10\.96\.0\.1"; then
+              RULE_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$RULE_READY" -eq 0 ]; then
+            echo "ERROR: kube-proxy did not program a DNAT rule for 10.96.0.1 within 15s"
+            sudo iptables -t nat -S KUBE-SERVICES 2>/dev/null || true
+            sudo journalctl -u kube-proxy --no-pager -n 50
+            exit 1
+          fi
+          echo "kube-proxy is active and has programmed the kubernetes Service rule"
 
       - name: Download kube-controller-manager
         env:
@@ -317,13 +473,17 @@ jobs:
           }
 
       - name: Assert scheduler alive
+        # Checks every second instead of one sleep-then-check: an immediate
+        # crash fails right away instead of waiting out the full window first.
         run: |
-          sleep 2
-          kill -0 "$SCHEDULER_PID" 2>/dev/null || {
-            echo "u7s-scheduler exited"
-            cat "$PWD/temp/u7s/scheduler.log"
-            exit 1
-          }
+          for i in $(seq 1 2); do
+            kill -0 "$SCHEDULER_PID" 2>/dev/null || {
+              echo "u7s-scheduler exited"
+              cat "$PWD/temp/u7s/scheduler.log"
+              exit 1
+            }
+            sleep 1
+          done
 
       - name: Sample baseline RSS
         run: |
@@ -383,6 +543,12 @@ jobs:
           kubectl get events -n sonobuoy --sort-by=.lastTimestamp || true
           echo "=== aggregator pod logs (sonobuoy/sonobuoy) ==="
           kubectl logs -n sonobuoy sonobuoy || true
+          echo "=== kube-proxy systemd status ==="
+          sudo systemctl status kube-proxy --no-pager || true
+          echo "=== kube-proxy journal (last 50 lines) ==="
+          sudo journalctl -u kube-proxy --no-pager -n 50 || true
+          echo "=== iptables nat rules (KUBE-SERVICES/KUBE-SVC chains) ==="
+          sudo iptables -t nat -S | grep -i "10.96.0.1\|KUBE-SERVICES\|KUBE-SVC" || true
 
       - name: Retrieve sonobuoy results
         env:
@@ -467,6 +633,7 @@ jobs:
           [ -n "${SCHEDULER_PID:-}" ] && kill "$SCHEDULER_PID" 2>/dev/null || true
           pkill -f "kcm-supervisor.sh" 2>/dev/null || true
           pkill -f "kube-controller-manager --kubeconfig=" 2>/dev/null || true
+          sudo systemctl stop kube-proxy 2>/dev/null || true
           sudo pkill -f "bin/kubelet --config=/etc/kubelet-config.yaml" 2>/dev/null || true
           pkill -f "target/release/u7s-apiserver --db" 2>/dev/null || true
 
