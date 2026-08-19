@@ -579,11 +579,11 @@ jobs:
           KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
         run: |
           # scripts/conformance/sonobuoy-plugin-e2e.yaml hardcodes the
-          # plugin's image field at a specific v1.36.0 tag (it's a static
+          # plugin's image field at a specific v1.36.2 tag (it's a static
           # manifest -- sonobuoy loads it verbatim, not per-cluster the way
           # its own --kubernetes-version=auto default does). Without this
           # CLI-level override every matrix branch would run the same fixed
-          # v1.36.0 e2e binaries against its own matrix-selected kubelet --
+          # v1.36.2 e2e binaries against its own matrix-selected kubelet --
           # burying real per-version issues. --kube-conformance-image
           # overrides just the image tag on the plugin (shorthand for
           # --plugin-image=e2e:<image>) without touching the manifest.
