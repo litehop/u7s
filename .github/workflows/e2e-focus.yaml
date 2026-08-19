@@ -118,9 +118,12 @@ jobs:
       - name: Add cri-o apt repository
         # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
         # add-repository input -- its validation rejects the bracket/space
-        # characters required by `deb [signed-by=...] <url> /`. Just the key
-        # + source list, no apt-get here: cache-apt-pkgs-action runs its own
-        # apt-get update before installing, so it picks this repo up itself.
+        # characters required by `deb [signed-by=...] <url> /`. Verified live
+        # (run 32234489918) that the action's own "normalize package list"
+        # step runs BEFORE any apt-get update of its own and resolves package
+        # names against apt's current index -- without refreshing that index
+        # here first, "cri-o" isn't found yet ("Packages argument is empty"),
+        # so apt-get update must happen in this step, not left to the action.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -129,6 +132,7 @@ jobs:
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/cri-o.list
+          sudo apt-get update -qq
 
       - name: Install cri-o
         # actions/cache's own attempt at this (removed) never actually
