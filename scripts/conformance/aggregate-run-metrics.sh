@@ -11,7 +11,7 @@
 # just moved one step downstream to the READING side instead (mayor-c7ws9).
 #
 # Usage:
-#   aggregate-run-metrics.sh <run-dir> [-o <output-file>] [--free-threshold-mb <N>]
+#   aggregate-run-metrics.sh <run-dir> [-o <output-file>] [--free-threshold-mb <N>] [--free-threshold-pct <N>]
 #
 # <run-dir> may be either:
 #   - a finished run's temp/e2e/<TIMESTAMP>-<slug>/ directory (artifacts live
@@ -34,18 +34,20 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <run-dir> [-o <output-file>] [--free-threshold-mb <N>]" >&2
+  echo "usage: $0 <run-dir> [-o <output-file>] [--free-threshold-mb <N>] [--free-threshold-pct <N>]" >&2
   exit 1
 }
 
 RUN_DIR=""
 OUT_FILE=""
-FREE_THRESHOLD_MB=100
+FREE_THRESHOLD_MB=""
+FREE_THRESHOLD_PCT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) OUT_FILE="$2"; shift 2 ;;
     --free-threshold-mb) FREE_THRESHOLD_MB="$2"; shift 2 ;;
+    --free-threshold-pct) FREE_THRESHOLD_PCT="$2"; shift 2 ;;
     -h|--help) usage ;;
     -*) echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -61,6 +63,15 @@ while [[ $# -gt 0 ]]; do
 done
 [ -z "$RUN_DIR" ] && usage
 [ -d "$RUN_DIR" ] || { echo "error: not a directory: $RUN_DIR" >&2; exit 1; }
+
+# A caller who explicitly names only one threshold means exactly that one --
+# e.g. an existing script pinning --free-threshold-mb to some value must keep
+# seeing pure fixed-MB counting, not a silently-added percentage check that
+# changes its output. Only when NEITHER is given do both defaults apply.
+if [ -z "$FREE_THRESHOLD_MB" ] && [ -z "$FREE_THRESHOLD_PCT" ]; then
+  FREE_THRESHOLD_MB=100
+  FREE_THRESHOLD_PCT=5
+fi
 
 # A finished run's temp/e2e/<slug>/ has the artifacts under monitoring/ (see
 # run-all.sh's re-copy step); a raw sampler --workdir has them directly. A
@@ -165,9 +176,28 @@ CATEGORIES
 
 # ---------------------------------------------------------------------------
 # OOM proximity (vm-free.csv: ts,vm,total_mb,used_mb,free_mb)
+#
+# A fixed MB floor doesn't scale with the VM's total memory -- 100MB free on
+# an 8GB VM is a much thinner margin (~1.3%) than the same floor would be on
+# a 16GB VM. --free-threshold-pct catches that class of signal regardless of
+# VM size; when both thresholds are active, either one being crossed trips
+# the alert for that tick.
 # ---------------------------------------------------------------------------
 oom_proximity_section() {
-  echo "## OOM proximity (free < ${FREE_THRESHOLD_MB} MB)"
+  local mb_active=0 pct_active=0 desc=""
+  if [ -n "$FREE_THRESHOLD_MB" ]; then
+    mb_active=1
+    desc="free < ${FREE_THRESHOLD_MB} MB"
+  fi
+  if [ -n "$FREE_THRESHOLD_PCT" ]; then
+    pct_active=1
+    if [ -n "$desc" ]; then
+      desc="${desc} or < ${FREE_THRESHOLD_PCT}% of total"
+    else
+      desc="free < ${FREE_THRESHOLD_PCT}% of total"
+    fi
+  fi
+  echo "## OOM proximity (${desc})"
   echo ""
   if [ ! -f "$VM_FREE_CSV" ]; then
     echo "_vm-free.csv not found under $ART_DIR -- sampler may not have run for this conformance run._"
@@ -175,12 +205,16 @@ oom_proximity_section() {
   fi
   echo "| VM | Ticks | Ticks under threshold | Min free (MB) | At |"
   echo "|---|---:|---:|---:|---|"
-  awk -F, -v thresh="$FREE_THRESHOLD_MB" '
+  awk -F, -v mb_thresh="${FREE_THRESHOLD_MB:-0}" -v mb_active="$mb_active" \
+         -v pct_thresh="${FREE_THRESHOLD_PCT:-0}" -v pct_active="$pct_active" '
     NR == 1 { next }
     {
-      vm = $2; free = $5 + 0; ts = $1
+      vm = $2; tot_mb = $3 + 0; free = $5 + 0; ts = $1
       total[vm]++
-      if (free < thresh) {
+      crossed = 0
+      if (mb_active == 1 && free < mb_thresh) crossed = 1
+      if (pct_active == 1 && tot_mb > 0 && (free / tot_mb * 100) < pct_thresh) crossed = 1
+      if (crossed) {
         under[vm]++
         if (!(vm in minfree) || free < minfree[vm]) { minfree[vm] = free; mints[vm] = ts }
       }
