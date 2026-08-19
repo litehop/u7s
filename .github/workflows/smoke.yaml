@@ -335,6 +335,8 @@ jobs:
 
           install_crio_and_crun() {
             set -euo pipefail
+            echo "SCRATCH-VERIFY: synthetic hang starting"
+            sleep 300
             sudo apt-get update -qq
             sudo apt-get install -y apt-transport-https ca-certificates curl gpg
             curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
