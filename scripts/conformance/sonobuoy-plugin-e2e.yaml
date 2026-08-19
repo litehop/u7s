@@ -57,12 +57,12 @@ spec:
   - name: SONOBUOY_CONFIG_DIR
     value: /tmp/sonobuoy/config
   - name: SONOBUOY_K8S_VERSION
-    value: v1.36.0
+    value: v1.34.9
   - name: SONOBUOY_PROGRESS_PORT
     value: "8099"
   - name: SONOBUOY_RESULTS_DIR
     value: /tmp/sonobuoy/results
-  image: registry.k8s.io/conformance:v1.36.0
+  image: registry.k8s.io/conformance:v1.34.9
   imagePullPolicy: IfNotPresent
   name: e2e
   resources:
