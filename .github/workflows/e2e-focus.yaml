@@ -105,42 +105,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y cri-o
           sudo mkdir -p /etc/cni/net.d
-          sudo tee /etc/cni/net.d/10-bridge.conflist <<'CNIEOF'
-          {
-            "cniVersion": "0.4.0",
-            "name": "bridge",
-            "plugins": [
-              {
-                "type": "bridge",
-                "bridge": "cni0",
-                "isGateway": true,
-                "ipMasq": true,
-                "hairpinMode": true,
-                "ipam": {
-                  "type": "host-local",
-                  "ranges": [[{"subnet": "10.88.0.0/16"}]],
-                  "routes": [{"dst": "0.0.0.0/0"}]
-                }
-              }
-            ]
-          }
-          CNIEOF
+          sudo cp .github/workflows/e2e-focus-resources/cni-bridge.conflist /etc/cni/net.d/10-bridge.conflist
           sudo systemctl enable --now crio
 
       - name: Install containernetworking-plugins
         run: |
           sudo apt-get install -y -o Dpkg::Options::="--force-overwrite" containernetworking-plugins
-
-      - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.26.2"
-
-      - name: Cache konnectivity-server build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/u7s/konnectivity
-          key: konnectivity-v0.35.0-${{ runner.arch }}
 
       - name: Cache sonobuoy CLI
         id: cache-sonobuoy
@@ -157,14 +127,68 @@ jobs:
             | tar -xz -C ~/bin sonobuoy
           chmod +x ~/bin/sonobuoy
 
-      - name: Start apiserver and konnectivity-server
+      - name: Start apiserver
         env:
           RUST_LOG: info
-        run: scripts/u7s-start.sh --background
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          mkdir -p "$WORKDIR"
+          E2E_TOKEN="e2e-focus-admin-token-$(date +%s)"
+          echo "$E2E_TOKEN,e2e-focus-admin,uid0,system:masters" > "$WORKDIR/token-auth.csv"
+          # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
+          # this same runner, and u7s's pods/log + pods/exec + pods/attach +
+          # pods/portforward handlers all dial the kubelet directly via
+          # --kubelet-preferred-address regardless of that flag -- konnectivity
+          # is only consulted on the pods/proxy and services/proxy paths, which
+          # neither of this workflow's two target specs exercises (see
+          # crates/apiserver/src/handlers/proxy.rs's resolve_kubelet_address).
+          ./target/release/u7s-apiserver \
+            --db "$WORKDIR/state.db" \
+            --kubeconfig "$WORKDIR/kubeconfig" \
+            --sa-key "$WORKDIR/sa.key" \
+            --sa-pub "$WORKDIR/sa.pub" \
+            --ca-key "$WORKDIR/ca.key" \
+            --ca-cert "$WORKDIR/ca.crt" \
+            --token-auth-file "$WORKDIR/token-auth.csv" \
+            --advertise-address https://127.0.0.1:6443 \
+            --service-cluster-ip-range "10.96.0.0/12" \
+            --kubelet-preferred-address 127.0.0.1 \
+            >"$WORKDIR/apiserver.log" 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 6443 2>/dev/null && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$WORKDIR/apiserver.log"; exit 1; }
+          # Save the cert-based kubeconfig before overwriting with a token one
+          # below -- kube-controller-manager needs the cert-based identity.
+          cp "$WORKDIR/kubeconfig" "$WORKDIR/kubeconfig-cert"
+          CA_DATA=$(grep "certificate-authority-data" "$WORKDIR/kubeconfig" | awk '{print $2}')
+          echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Config' \
+            'clusters:' \
+            '- cluster:' \
+            '    server: https://127.0.0.1:6443' \
+            "    certificate-authority-data: $CA_DATA" \
+            '  name: u7s' \
+            'contexts:' \
+            '- context:' \
+            '    cluster: u7s' \
+            '    user: e2e-focus-admin' \
+            '  name: u7s' \
+            'current-context: u7s' \
+            'users:' \
+            '- name: e2e-focus-admin' \
+            '  user:' \
+            "    token: $E2E_TOKEN" \
+            > "$WORKDIR/kubeconfig"
 
       - name: Generate kubelet TLS
         run: |
           WORKDIR="$PWD/temp/u7s"
+          openssl x509 -in "$WORKDIR/ca.crt" -inform DER -out "$WORKDIR/ca.pem" -outform PEM
           sudo cp "$WORKDIR/ca.pem" /etc/kubelet-ca.crt
           sudo chmod 644 /etc/kubelet-ca.crt
           openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/kubelet-tls.key"
@@ -187,22 +211,7 @@ jobs:
           sudo mkdir -p /tmp/kubelet-pods
           sudo cp "$WORKDIR/kubeconfig" /etc/kubelet-kubeconfig
           sudo chmod 644 /etc/kubelet-kubeconfig
-          sudo tee /etc/kubelet-config.yaml <<'EOF'
-          apiVersion: kubelet.config.k8s.io/v1beta1
-          kind: KubeletConfiguration
-          containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
-          registerNode: true
-          failSwapOn: false
-          resolvConf: ""
-          staticPodPath: /tmp/kubelet-pods
-          authentication:
-            x509:
-              clientCAFile: /etc/kubelet-ca.crt
-            anonymous:
-              enabled: false
-          authorization:
-            mode: AlwaysAllow
-          EOF
+          sudo cp .github/workflows/e2e-focus-resources/kubelet-config.yaml /etc/kubelet-config.yaml
           sudo "$HOME/bin/kubelet" \
             --config=/etc/kubelet-config.yaml \
             --kubeconfig=/etc/kubelet-kubeconfig \
@@ -245,81 +254,6 @@ jobs:
             exit 1
           }
 
-      - name: Deploy konnectivity-agent
-        env:
-          KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
-        run: |
-          WORKDIR="$PWD/temp/u7s"
-          openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-agent.key"
-          openssl req -new -key "$WORKDIR/konnectivity-agent.key" \
-            -subj "/CN=konnectivity-agent" -sha256 \
-            -out "$WORKDIR/konnectivity-agent.csr"
-          openssl x509 -req -in "$WORKDIR/konnectivity-agent.csr" \
-            -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
-            -CAcreateserial -days 365 -sha256 \
-            -out "$WORKDIR/konnectivity-agent.crt"
-
-          kubectl create secret generic konnectivity-agent-certs \
-            --from-file=ca.crt="$WORKDIR/ca.pem" \
-            --from-file=tls.crt="$WORKDIR/konnectivity-agent.crt" \
-            --from-file=tls.key="$WORKDIR/konnectivity-agent.key" \
-            -n kube-system \
-            --dry-run=client -o yaml | kubectl apply --validate=false -f -
-
-          # Agent uses hostNetwork so "127.0.0.1" reaches the konnectivity-server
-          # bound on this same runner (no separate VM to hop through, unlike the
-          # lima-based conformance path). Port 8132 is u7s-start.sh's fixed
-          # agent-port derivation for the default apiserver port 6443
-          # (server-port 8135, agent-port = server-port - 3).
-          kubectl apply --validate=false -f - <<'EOF'
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: konnectivity-agent
-            namespace: kube-system
-            labels:
-              app: konnectivity-agent
-          spec:
-            nodeName: ci-node
-            hostNetwork: true
-            dnsPolicy: Default
-            restartPolicy: Always
-            containers:
-              - name: konnectivity-agent
-                image: registry.k8s.io/kas-network-proxy/proxy-agent:v0.35.0
-                args:
-                  - --logtostderr=true
-                  - --proxy-server-host=127.0.0.1
-                  - --proxy-server-port=8132
-                  - --ca-cert=/certs/ca.crt
-                  - --agent-cert=/certs/tls.crt
-                  - --agent-key=/certs/tls.key
-                  - --agent-identifiers=default-route=true
-                  - --sync-interval=5s
-                  - --sync-interval-cap=30s
-                volumeMounts:
-                  - name: certs
-                    mountPath: /certs
-                    readOnly: true
-            volumes:
-              - name: certs
-                secret:
-                  secretName: konnectivity-agent-certs
-          EOF
-
-          PHASE=""
-          for i in $(seq 1 60); do
-            PHASE=$(kubectl get pod konnectivity-agent -n kube-system -o jsonpath='{.status.phase}' 2>/dev/null || true)
-            [ "$PHASE" = "Running" ] && break
-            sleep 1
-          done
-          if [ "$PHASE" != "Running" ]; then
-            echo "ERROR: konnectivity-agent did not reach Running within 60s (phase: $PHASE)"
-            kubectl describe pod konnectivity-agent -n kube-system
-            exit 1
-          fi
-          echo "konnectivity-agent is Running"
-
       - name: Download kube-controller-manager
         env:
           K8S_VERSION: ${{ matrix.k8s }}
@@ -341,7 +275,7 @@ jobs:
           # of silently blacking out the control plane for the rest of the run.
           setsid bash scripts/conformance/kcm-supervisor.sh \
             "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
-            --kubeconfig="$WORKDIR/kubeconfig" \
+            --kubeconfig="$WORKDIR/kubeconfig-cert" \
             --cluster-signing-cert-file="$WORKDIR/ca.pem" \
             --cluster-signing-key-file="$WORKDIR/ca.key" \
             --service-account-private-key-file="$WORKDIR/sa.key" \
@@ -352,6 +286,19 @@ jobs:
             --bind-address=127.0.0.1 \
             --kube-api-content-type=application/json \
             >/tmp/kcm-supervisor.log 2>&1 &
+
+      - name: Start u7s-scheduler
+        run: |
+          WORKDIR="$PWD/temp/u7s"
+          # Launched right after kcm, before kcm's own alive-check below --
+          # kube-controller-manager and u7s-scheduler are independent apiserver
+          # clients with no startup-order dependency on each other (unscheduled
+          # pods just stay Pending until the scheduler is up), so there is
+          # nothing to gain from serializing their launches.
+          ./target/release/u7s-scheduler \
+            --kubeconfig "$WORKDIR/kubeconfig-cert" \
+            >"$WORKDIR/scheduler.log" 2>&1 &
+          echo "SCHEDULER_PID=$!" >> "$GITHUB_ENV"
 
       - name: Wait for kube-controller-manager to be alive
         run: |
@@ -365,14 +312,6 @@ jobs:
             cat /tmp/kcm-supervisor.log
             exit 1
           }
-
-      - name: Start u7s-scheduler
-        run: |
-          WORKDIR="$PWD/temp/u7s"
-          ./target/release/u7s-scheduler \
-            --kubeconfig "$WORKDIR/kubeconfig" \
-            >"$WORKDIR/scheduler.log" 2>&1 &
-          echo "SCHEDULER_PID=$!" >> "$GITHUB_ENV"
 
       - name: Assert scheduler alive
         run: |
@@ -504,7 +443,6 @@ jobs:
           pkill -f "kube-controller-manager --kubeconfig=" 2>/dev/null || true
           sudo pkill -f "bin/kubelet --config=/etc/kubelet-config.yaml" 2>/dev/null || true
           pkill -f "target/release/u7s-apiserver --db" 2>/dev/null || true
-          pkill -f "proxy-server-linux-amd64" 2>/dev/null || true
 
       - name: Upload logs on failure
         if: failure()
@@ -514,7 +452,6 @@ jobs:
           path: |
             temp/u7s/apiserver.log
             temp/u7s/scheduler.log
-            temp/u7s/konnectivity-server.log
             temp/u7s/kubelet.log
             temp/u7s/kcm.log
             /tmp/kcm-supervisor.log
