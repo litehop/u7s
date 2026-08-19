@@ -117,9 +117,17 @@ cat <<'EOF'
 u7s_watch_ring_occupancy{shard="/registry/pods/"} 7
 u7s_watch_ring_occupancy{shard="/registry/configmaps/"} 3
 # HELP u7s_watch_ring_span_seconds stub
-# TYPE u7s_watch_ring_span_seconds gauge
-u7s_watch_ring_span_seconds{shard="/registry/pods/"} 42
-u7s_watch_ring_span_seconds{shard="/registry/configmaps/"} 5
+# TYPE u7s_watch_ring_span_seconds histogram
+u7s_watch_ring_span_seconds_bucket{shard="/registry/pods/",le="1"} 0
+u7s_watch_ring_span_seconds_bucket{shard="/registry/pods/",le="2"} 0
+u7s_watch_ring_span_seconds_bucket{shard="/registry/pods/",le="4"} 1
+u7s_watch_ring_span_seconds_bucket{shard="/registry/pods/",le="+Inf"} 1
+u7s_watch_ring_span_seconds_sum{shard="/registry/pods/"} 4
+u7s_watch_ring_span_seconds_count{shard="/registry/pods/"} 1
+u7s_watch_ring_span_seconds_bucket{shard="/registry/configmaps/",le="1"} 1
+u7s_watch_ring_span_seconds_bucket{shard="/registry/configmaps/",le="+Inf"} 1
+u7s_watch_ring_span_seconds_sum{shard="/registry/configmaps/"} 1
+u7s_watch_ring_span_seconds_count{shard="/registry/configmaps/"} 1
 EOF
 STUB
 chmod +x "$STUBDIR/kubectl"
@@ -157,11 +165,11 @@ else
   FAIL=$(( FAIL + 1 ))
 fi
 
-if grep -q "^[^,]*,/registry/pods/,7,42$" "$WORKDIR1/ring-age.csv" 2>/dev/null; then
-  echo "PASS: ring-age.csv joins occupancy+span onto one row per shard, matching the operator's ts,shard,events,span_secs shape"
+if grep -q "^[^,]*,/registry/pods/,7,4$" "$WORKDIR1/ring-age.csv" 2>/dev/null; then
+  echo "PASS: ring-age.csv joins occupancy with the span histogram's smallest nonzero-count bucket (4, skipping the empty le=1/le=2 buckets) — the reading that replaced a plain gauge value when u7s_watch_ring_span_seconds became a histogram (bd:ukbhp); a sampler still parsing it as a gauge would match nothing and silently emit zero rows, exactly the regression this test guards against"
   PASS=$(( PASS + 1 ))
 else
-  echo "FAIL: ring-age.csv missing expected joined row — got:"
+  echo "FAIL: ring-age.csv missing expected joined row (occupancy=7, span=4 from the smallest nonzero-count bucket) — got:"
   cat "$WORKDIR1/ring-age.csv" 2>/dev/null || echo "  (no file)"
   FAIL=$(( FAIL + 1 ))
 fi
@@ -265,11 +273,11 @@ else
 fi
 
 FIRST_LINES="$(wc -l < "$FIRST_FILE" 2>/dev/null | tr -d ' ')"
-if [ "$FIRST_LINES" = "8" ]; then
+if [ "$FIRST_LINES" = "16" ]; then
   echo "PASS: the first snapshot's file is untouched by the second snapshot (not appended-to — the exact bug in the operator's old by-hand loop)"
   PASS=$(( PASS + 1 ))
 else
-  echo "FAIL: first snapshot file has $FIRST_LINES lines, expected 8 (unchanged) — got:"
+  echo "FAIL: first snapshot file has $FIRST_LINES lines, expected 16 (unchanged) — got:"
   cat "$FIRST_FILE" 2>/dev/null
   FAIL=$(( FAIL + 1 ))
 fi
