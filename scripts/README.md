@@ -122,6 +122,8 @@ bash scripts/bench-rss.sh
 
 **Threshold:** 64 MB for the apiserver alone. The combined control-plane target is 128 MB on a 1 vCPU / 1 GB VPS. This is a hard correctness gate in CI, not an aspirational goal.
 
+**`SKIP_BUILD=1`:** skips step 1 and reuses whatever binaries already exist in `target/release/`. Used by CI (`perf.yaml`) so the three `bench-rss*` jobs share one upstream build instead of each rebuilding from scratch.
+
 ## bench-latency.sh — Request latency report
 
 Starts the server and fires 100 sequential GET /api requests, reporting p50 and p99 wall-clock latency. Results are saved to `ai/perf/` as a timestamped text file.
@@ -148,6 +150,8 @@ bash scripts/bench-rss-load.sh
 ```
 
 **Threshold:** 20 MB RSS delta. Guards against memory leaks under concurrent load.
+
+**`SKIP_BUILD=1`:** skips the build step and reuses whatever binaries already exist in `target/release/` (same rationale as `bench-rss.sh` above).
 
 ---
 
