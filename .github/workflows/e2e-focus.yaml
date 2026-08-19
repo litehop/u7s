@@ -118,8 +118,7 @@ jobs:
       - name: Install cri-o apt keyring + source list
         # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
         # add-repository input -- its validation rejects the bracket/space
-        # characters required by `deb [signed-by=...] <url> /`. Mirrors
-        # smoke.yaml's identical pre-step for the same migration.
+        # characters required by `deb [signed-by=...] <url> /`.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
