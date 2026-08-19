@@ -593,7 +593,7 @@ jobs:
             --wait \
             --skip-preflight=existingnamespace \
             --kubeconfig "$KUBECONFIG" \
-            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs"
+            --e2e-focus="RollingUpdateDeployment should delete old pods and create new ones|Kubectl logs logs should be able to retrieve and filter logs|Job should adopt matching orphans and release non-matching pods|ConfigMap should be consumable in multiple volumes in the same pod"
 
       - name: Diagnose sonobuoy on failure
         # cancelled() too: interrupting a hung run mid-debug (gh run cancel)
@@ -693,11 +693,11 @@ jobs:
 
           RAN_LINE=$(grep -E "^Ran [0-9]+ of [0-9]+ Specs" "$E2E_TXT" | tail -1 || true)
           echo "Ginkgo ran-count: $RAN_LINE"
-          # Exactly 2 -- not zero (the focus regex silently matched nothing,
-          # e.g. a FeatureGate label filter or a typo) and not more than 2 (the
-          # focus regex over-matched a third, unrelated spec).
-          if ! echo "$RAN_LINE" | grep -qE "^Ran 2 of "; then
-            echo "ERROR: expected exactly 2 specs to run; got: $RAN_LINE" >&2
+          # Exactly 4 -- not zero (the focus regex silently matched nothing,
+          # e.g. a FeatureGate label filter or a typo) and not more than 4 (the
+          # focus regex over-matched a fifth, unrelated spec).
+          if ! echo "$RAN_LINE" | grep -qE "^Ran 4 of "; then
+            echo "ERROR: expected exactly 4 specs to run; got: $RAN_LINE" >&2
             exit 1
           fi
 
