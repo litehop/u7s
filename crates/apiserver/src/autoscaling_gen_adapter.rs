@@ -15,9 +15,7 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
 fn gen_quantity_to_json(
     q: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity>,
 ) -> Option<serde_json::Value> {
-    q.and_then(|q| q.string)
-        .filter(|s| !s.is_empty())
-        .map(serde_json::Value::String)
+    crate::core_gen_adapter::gen_quantity_to_json(q)
 }
 
 fn gen_condition_common(
