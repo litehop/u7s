@@ -44,17 +44,22 @@
 #                 visible even when no single process is the culprit.
 #
 #   ring-age.csv  ts,shard,events,span_secs
-#                 u7s_watch_ring_occupancy and u7s_watch_ring_span_seconds
-#                 per shard, joined into one row — matches the shape the
-#                 operator's own by-hand CSV used, so existing eyeballing
-#                 scripts still work. CAVEAT: a polled gauge cannot report
-#                 its own minimum (bd:ukbhp) — at 30s cadence most of the
-#                 span's true minimum is missed between samples. Good for
-#                 trajectory and peak occupancy, not for "worst case span".
-#                 Deliberately does NOT include replay depth: that is a
-#                 cumulative histogram, not an instantaneous per-shard
-#                 value, and it is fully covered by the /metrics snapshots
-#                 below instead.
+#                 u7s_watch_ring_occupancy (still a plain gauge) joined with
+#                 u7s_watch_ring_span_seconds per shard, into one row —
+#                 matches the shape the operator's own by-hand CSV used, so
+#                 existing eyeballing scripts still work. u7s_watch_ring_span
+#                 _seconds became a HISTOGRAM in bd:ukbhp (a polled gauge
+#                 could not see this metric's own decision-relevant minimum),
+#                 so there is no single "current value" left to scrape —
+#                 span_secs here is the smallest bucket boundary with a
+#                 nonzero cumulative count, i.e. the tightest known upper
+#                 bound on the worst-case minimum span this shard has EVER
+#                 produced. Cumulative buckets only ever tighten, so this
+#                 column is a running worst-case trajectory across the run,
+#                 not a per-tick instantaneous reading.
+#                 Deliberately does NOT include replay depth: that is also a
+#                 cumulative histogram, and it is fully covered by the
+#                 /metrics snapshots below instead.
 #
 # Plus periodic full-text /metrics snapshots, one file per snapshot
 # (metrics-<seq>-<label>.prom) rather than one operator-appended file —
@@ -243,11 +248,18 @@ sample_vm_free() {
   echo "${ts},${vm},${total},${used},${free}" >> "$VM_FREE_CSV"
 }
 
-# Pulls both IntGaugeVec families out of one /metrics scrape and joins them
-# on the shard label into ts,shard,events,span_secs rows. Both gauges are set
+# Pulls u7s_watch_ring_occupancy (IntGaugeVec) and u7s_watch_ring_span_seconds
+# (HistogramVec since bd:ukbhp -- a polled gauge could not see this metric's
+# own decision-relevant minimum, so it was converted and there is no single
+# "current value" left to scrape) out of one /metrics scrape and joins them
+# on the shard label into ts,shard,events,span_secs rows. Both are set/observed
 # together at the same push_event_locked call site (crates/store/src/sqlite.rs),
 # so in steady state their shard sets match; join simply drops any shard that
 # (transiently) only has one side rather than emitting a half-populated row.
+# span_secs is read as the smallest bucket boundary (le) with a nonzero
+# cumulative count for that shard -- the tightest known upper bound on the
+# worst-case minimum span ever observed, i.e. exactly the reading the
+# histogram's own doc calls out as decision-relevant (crates/store/src/metrics.rs).
 sample_ring_gauges() {
   local ts="$1" raw
   raw="$(kubectl --kubeconfig "$KUBECONFIG_PATH" get --raw /metrics 2>/dev/null)" || raw=""
@@ -260,9 +272,20 @@ sample_ring_gauges() {
     | grep -E '^u7s_watch_ring_occupancy\{' \
     | sed -E 's/^u7s_watch_ring_occupancy\{shard="([^"]*)"\} ([0-9.eE+-]+)$/\1\t\2/' \
     | LC_ALL=C sort -t "$TAB" -k1,1 > "$occ_tmp" || true
+  # "le" values are plain finite numbers ("1", "2", ... "1024") for every
+  # bucket except the required "+Inf" sentinel -- excluding it is why the
+  # grep/sed character class below has no letters, rather than a separate
+  # grep -v step.
   echo "$raw" \
-    | grep -E '^u7s_watch_ring_span_seconds\{' \
-    | sed -E 's/^u7s_watch_ring_span_seconds\{shard="([^"]*)"\} ([0-9.eE+-]+)$/\1\t\2/' \
+    | grep -E '^u7s_watch_ring_span_seconds_bucket\{shard="[^"]*",le="[0-9.eE+-]+"\} ' \
+    | sed -E 's/^u7s_watch_ring_span_seconds_bucket\{shard="([^"]*)",le="([0-9.eE+-]+)"\} ([0-9.eE+-]+)$/\1\t\2\t\3/' \
+    | awk -F "$TAB" '
+        $3 + 0 > 0 {
+          le = $2 + 0
+          if (!(($1) in minle) || le < minle[$1]) minle[$1] = le
+        }
+        END { for (s in minle) print s "\t" minle[s] }
+      ' \
     | LC_ALL=C sort -t "$TAB" -k1,1 > "$span_tmp" || true
 
   local shard events span
