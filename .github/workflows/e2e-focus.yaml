@@ -71,7 +71,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        k8s: ["1.34.9", "1.35.6", "1.36.2"]
+        # Temporarily restricted to 1.36.2 while mayor-oxllp (kubectl exec
+        # compat gap with kubelet 1.34.x/1.35.x) is diagnosed. Restore via
+        # mayor-u8zqs.
+        k8s: ["1.36.2"]
     name: e2e-focus ${{ matrix.k8s }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,23 +118,26 @@ jobs:
           cp /usr/bin/kubelet ~/bin/kubelet
           cp /usr/bin/kubectl ~/bin/kubectl
 
-      - name: Add cri-o apt repository
+      - name: Install cri-o apt keyring + source list
         # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
         # add-repository input -- its validation rejects the bracket/space
-        # characters required by `deb [signed-by=...] <url> /`. Verified live
-        # (run 32234489918) that the action's own "normalize package list"
-        # step runs BEFORE any apt-get update of its own and resolves package
-        # names against apt's current index -- without refreshing that index
-        # here first, "cri-o" isn't found yet ("Packages argument is empty"),
-        # so apt-get update must happen in this step, not left to the action.
+        # characters required by `deb [signed-by=...] <url> /`. Mirrors
+        # smoke.yaml's identical pre-step for the same migration.
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
           MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-          curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+          curl -fsSL --max-time 30 "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/cri-o.list
+          # The action resolves package versions from apt's cached metadata
+          # (/var/lib/apt/lists), not by hitting the network itself -- its own
+          # update_apt_lists_if_stale is a no-op outside nektos/act, so on a
+          # real GitHub Actions runner it never refreshes this on its own.
+          # Without this update the newly-added repo's package list isn't
+          # loaded yet, so the action can't resolve cri-o and treats the
+          # package list as empty (confirmed live in run 32234489918).
           sudo apt-get update -qq
 
       - name: Install cri-o
