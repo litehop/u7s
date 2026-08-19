@@ -102,6 +102,11 @@ provision:
 
       systemctl enable --now crio
 
+      # Disable containerd — u7s uses cri-o exclusively; containerd on the same host
+      # risks cgroup/network/image-lock contention and wastes ~78 MB RSS per VM.
+      systemctl disable --now containerd containerd.service 2>/dev/null || true
+      systemctl mask containerd 2>/dev/null || true
+
       # Install kubelet 1.36 from pkgs.k8s.io
       curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key \
         | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
