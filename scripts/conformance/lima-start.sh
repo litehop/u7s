@@ -469,6 +469,16 @@ if [ -f "$CA_CERT" ]; then
 # klog has no --utc flag, so kubelet's embedded klog lines render whatever local
 # time the process inherits; force UTC so kubelet.log matches apiserver.log.
 Environment=TZ=UTC
+# Default GOGC=100 + unbounded heap let kubelet's RSS sawtooth up to 235MB on a
+# lima-node run (164.9->235.1MB single-tick step-up, classic GC-lag signature).
+# Measured on lima-node-2: 31-pod create/delete cycle post-cleanup RSS dropped
+# 167.5MB->104.6MB (and stayed flat, no delayed step-up) with this tuple vs.
+# unset; idle RSS -21.6MB, mid-load RSS -22.1MB. GOMEMLIMIT is a soft cap (GC
+# works harder as it's approached, never OOM-kills); pod-actuation timing for
+# 31 pods was unchanged (still fully Running within ~2min in both conditions).
+Environment=GOMEMLIMIT=200MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=2
 ExecStart=
 ExecStart=/usr/bin/kubelet \\\\
   --config=/etc/kubelet-config.yaml \\\\
