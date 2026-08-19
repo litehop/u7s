@@ -501,6 +501,38 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         });
     }
 
+    // 10f. Publish/reconcile kube-system/extension-apiserver-authentication for aggregated
+    // backends (see reconcile_extension_apiserver_authentication's doc for why this is a
+    // polling loop rather than a one-shot seed).
+    let (_authinfo_reconciler_shutdown_tx, mut authinfo_reconciler_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let reconcile_store = Arc::clone(&store);
+        let ca_cert_path = args.ca_cert.clone();
+        tokio::spawn(async move {
+            let mut consecutive_errors: u32 = 0;
+            loop {
+                let ok =
+                    reconcile_extension_apiserver_authentication(&reconcile_store, &ca_cert_path)
+                        .await;
+                if ok {
+                    consecutive_errors = 0;
+                } else {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                }
+                let delay_secs = if consecutive_errors == 0 {
+                    10
+                } else {
+                    (5u64 << consecutive_errors.min(6)).min(300)
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = authinfo_reconciler_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
@@ -2890,6 +2922,108 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
     }
 
     all_ok
+}
+
+/// Publish/reconcile `kube-system/extension-apiserver-authentication` so aggregated
+/// backends (e.g. metrics-server's `ConfigMapCAFileContent` informer) stop retrying
+/// against a missing ConfigMap. Mirrors upstream's `clusterauthenticationtrust`
+/// controller (`pkg/controlplane/controller/clusterauthenticationtrust`), which re-syncs
+/// this ConfigMap whenever its `dynamiccertificates.CAContentProvider` sees new CA
+/// content — implemented here as a polling reconcile loop, not a one-shot seed, so this
+/// doesn't need to be revisited if/when u7s ever adds CA rotation (the CA cert is read
+/// fresh from `ca_cert_path` on every tick).
+///
+/// Only `client-ca-file` is populated. u7s does not implement requestheader-based
+/// delegated auth for aggregated backends (see `handlers::aggregation`'s module doc —
+/// backends authenticate the original caller via delegated TokenReview instead), so the
+/// `requestheader-*` keys are omitted, matching upstream's own behavior when no
+/// requestheader authenticator is configured.
+///
+/// Returns `true` on success (including "already up to date"), `false` on any I/O or
+/// store error, so the caller's exponential-backoff loop can distinguish real failures
+/// from no-op ticks.
+pub async fn reconcile_extension_apiserver_authentication(
+    store: &SqliteStore,
+    ca_cert_path: &str,
+) -> bool {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let ca_cert_der = match std::fs::read(ca_cert_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "extension-apiserver-authentication reconciler: failed to read CA cert \
+                 {ca_cert_path}: {e}"
+            );
+            return false;
+        }
+    };
+    let ca_pem =
+        String::from_utf8_lossy(&tls::pem_encode("CERTIFICATE", &ca_cert_der)).into_owned();
+
+    let key = keys::object_key(
+        "configmaps",
+        "kube-system",
+        "extension-apiserver-authentication",
+    );
+    let (expected_revision, mut body) = match store.get(&key).await {
+        Ok(Some(obj)) => {
+            let existing: serde_json::Value = match serde_json::from_slice(&obj.value) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "extension-apiserver-authentication reconciler: failed to parse \
+                         existing ConfigMap: {e}"
+                    );
+                    return false;
+                }
+            };
+            if existing["data"]["client-ca-file"].as_str() == Some(ca_pem.as_str()) {
+                return true;
+            }
+            (obj.revision, existing)
+        }
+        Ok(None) => (
+            0,
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "extension-apiserver-authentication",
+                    "namespace": "kube-system",
+                    "creationTimestamp": "2024-01-01T00:00:00Z"
+                },
+                "data": {}
+            }),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "extension-apiserver-authentication reconciler: failed to read ConfigMap: {e}"
+            );
+            return false;
+        }
+    };
+    body["data"]["client-ca-file"] = serde_json::Value::String(ca_pem);
+
+    match store
+        .put(&key, Bytes::from(body.to_string()), Some(expected_revision))
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                "reconciled ConfigMap kube-system/extension-apiserver-authentication \
+                 (client-ca-file updated)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "extension-apiserver-authentication reconciler: failed to write ConfigMap: {e}"
+            );
+            false
+        }
+    }
 }
 
 async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
@@ -6219,6 +6353,157 @@ mod tests {
             "second reconcile must not write to the store when Endpoints already matches \
              EndpointSlice — spurious writes generate MODIFIED watch events every 5 seconds"
         );
+    }
+
+    /// Returns a unique temp file path for a test-local CA cert, writing `bytes` to it.
+    /// `reconcile_extension_apiserver_authentication` only reads the file's raw bytes and
+    /// PEM-wraps them — it never parses them as a real certificate — so arbitrary bytes are
+    /// sufficient to exercise the reconciler without paying for real cert generation.
+    fn write_temp_ca_cert(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let tid = std::thread::current().id();
+        let dir = std::env::temp_dir().join(format!("u7s-authinfo-test-{tag}-{nanos}-{tid:?}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
+        let path = dir.join("ca.crt");
+        std::fs::write(&path, bytes).expect("write temp CA cert"); // lgtm[rust/path-injection]
+        path
+    }
+
+    /// On a fresh cluster (no prior extension-apiserver-authentication ConfigMap),
+    /// the first reconcile tick must create it with client-ca-file set from the on-disk
+    /// CA cert. Without this, metrics-server's ConfigMapCAFileContent informer retries
+    /// against a 404 forever (the bug this reconciler exists to fix — see module-level
+    /// bead context), and any future aggregated backend that actually needs delegated
+    /// request-header auth (rather than tolerating its absence) would never see a CA to
+    /// trust.
+    #[tokio::test]
+    async fn reconcile_extension_apiserver_authentication_creates_configmap_on_fresh_cluster() {
+        let store = make_store();
+        let ca_path = write_temp_ca_cert("fresh", b"fake-ca-der-bytes-v1");
+
+        let ok =
+            reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        assert!(ok, "reconcile must succeed against a fresh, empty store");
+
+        let key = keys::object_key(
+            "configmaps",
+            "kube-system",
+            "extension-apiserver-authentication",
+        );
+        let obj = store.get(&key).await.expect("get must not fail").expect(
+            "extension-apiserver-authentication ConfigMap must exist after the first \
+                 reconcile tick",
+        );
+        let cm: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+        assert_eq!(cm["kind"].as_str(), Some("ConfigMap"));
+        assert_eq!(cm["metadata"]["namespace"].as_str(), Some("kube-system"));
+        let expected_pem =
+            String::from_utf8(tls::pem_encode("CERTIFICATE", b"fake-ca-der-bytes-v1")).unwrap();
+        assert_eq!(
+            cm["data"]["client-ca-file"].as_str(),
+            Some(expected_pem.as_str()),
+            "client-ca-file must contain the PEM-encoded bytes of the on-disk CA cert, or \
+             an aggregated backend's RequestHeaderAuthRequestController has nothing to trust"
+        );
+        assert!(
+            cm["data"]["requestheader-client-ca-file"].is_null(),
+            "u7s does not implement requestheader-based delegated auth for aggregated \
+             backends (see handlers::aggregation's module doc) — populating this key would \
+             falsely advertise a trust path that doesn't work"
+        );
+
+        let _ = std::fs::remove_dir_all(ca_path.parent().unwrap()); // lgtm[rust/path-injection]
+    }
+
+    /// A CA rotation (the on-disk CA cert file's content changes) must be picked up on the
+    /// NEXT reconcile tick and written into the ConfigMap. This is the entire reason the
+    /// operator chose a continuous reconcile loop (approach B) over a one-shot seed
+    /// (approach A): a one-shot seed would freeze the ConfigMap's client-ca-file at
+    /// whatever the CA was at boot, silently breaking every aggregated backend's trust
+    /// anchor the moment u7s ever rotates its CA — with no code path left to fix it short
+    /// of a full restart.
+    #[tokio::test]
+    async fn reconcile_extension_apiserver_authentication_updates_configmap_on_ca_rotation() {
+        let store = make_store();
+        let ca_path = write_temp_ca_cert("rotate", b"fake-ca-der-bytes-v1");
+
+        reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+
+        // Simulate CA rotation: the file's content changes on disk without a restart.
+        std::fs::write(&ca_path, b"fake-ca-der-bytes-v2-rotated").expect("rewrite CA cert"); // lgtm[rust/path-injection]
+
+        let ok =
+            reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        assert!(ok, "reconcile must succeed after CA rotation");
+
+        let key = keys::object_key(
+            "configmaps",
+            "kube-system",
+            "extension-apiserver-authentication",
+        );
+        let obj = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("ConfigMap must still exist after rotation");
+        let cm: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+        let expected_pem = String::from_utf8(tls::pem_encode(
+            "CERTIFICATE",
+            b"fake-ca-der-bytes-v2-rotated",
+        ))
+        .unwrap();
+        assert_eq!(
+            cm["data"]["client-ca-file"].as_str(),
+            Some(expected_pem.as_str()),
+            "client-ca-file must reflect the rotated CA content — a stale value here means \
+             every aggregated backend keeps trusting a retired CA after rotation"
+        );
+
+        let _ = std::fs::remove_dir_all(ca_path.parent().unwrap()); // lgtm[rust/path-injection]
+    }
+
+    /// When the on-disk CA cert is unchanged between ticks, the reconciler must not write
+    /// to the store. An unconditional write every tick would bump the ConfigMap's
+    /// resourceVersion and fire a spurious MODIFIED event on every poll interval,
+    /// flooding any watcher of this ConfigMap (mirrors the same concern already tested for
+    /// reconcile_kubernetes_endpointslice above).
+    #[tokio::test]
+    async fn reconcile_extension_apiserver_authentication_skips_write_when_ca_unchanged() {
+        let store = make_store();
+        let ca_path = write_temp_ca_cert("unchanged", b"fake-ca-der-bytes-stable");
+
+        reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        let key = keys::object_key(
+            "configmaps",
+            "kube-system",
+            "extension-apiserver-authentication",
+        );
+        let revision_after_first = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .unwrap()
+            .revision;
+
+        reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        let revision_after_second = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .unwrap()
+            .revision;
+
+        assert_eq!(
+            revision_after_first, revision_after_second,
+            "second reconcile must not write to the store when the CA content is unchanged \
+             — spurious writes would generate a MODIFIED watch event every poll interval"
+        );
+
+        let _ = std::fs::remove_dir_all(ca_path.parent().unwrap()); // lgtm[rust/path-injection]
     }
 
     #[tokio::test]
