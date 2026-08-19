@@ -1770,6 +1770,28 @@ const STATEFULSET_MUTABLE_SPEC_FIELDS: [&str; 7] = [
     "minReadySeconds",
 ];
 
+/// Returns whether `old` and `new` agree on every field except those in `mutable_fields` —
+/// the shared "whole-spec allowlist" tail used by immutability validators that reject an
+/// update touching any field outside an explicit mutable set. Stripping the excluded fields
+/// off both sides (rather than munging one side to match the other) means a field's presence,
+/// absence, or value never matters as long as it's in the allowlist.
+fn spec_immutable_except(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+    mutable_fields: &[&str],
+) -> bool {
+    let strip = |v: &serde_json::Value| {
+        let mut m = v.clone();
+        if let Some(obj) = m.as_object_mut() {
+            for field in mutable_fields {
+                obj.remove(*field);
+            }
+        }
+        m
+    };
+    strip(old) == strip(new)
+}
+
 /// Reject a StatefulSet spec update that changes any field outside
 /// `STATEFULSET_MUTABLE_SPEC_FIELDS`. Mirrors upstream's own `ValidateStatefulSetUpdate`
 /// exactly: it deep-copies the new spec, zeroes precisely this set of fields back to the old
@@ -1782,23 +1804,7 @@ fn validate_statefulset_spec_immutable(
     old_spec: &serde_json::Value,
     new_spec: &serde_json::Value,
 ) -> Result<(), String> {
-    if old_spec == new_spec {
-        return Ok(());
-    }
-    let mut munged = new_spec.clone();
-    if let Some(m) = munged.as_object_mut() {
-        for field in STATEFULSET_MUTABLE_SPEC_FIELDS {
-            match old_spec.get(field) {
-                Some(v) if !v.is_null() => {
-                    m.insert(field.to_string(), v.clone());
-                }
-                _ => {
-                    m.remove(field);
-                }
-            }
-        }
-    }
-    if munged == *old_spec {
+    if spec_immutable_except(old_spec, new_spec, &STATEFULSET_MUTABLE_SPEC_FIELDS) {
         return Ok(());
     }
     Err(
@@ -1844,17 +1850,10 @@ fn validate_pv_spec_immutable(
     if !old_spec["nodeAffinity"].is_null() && old_spec["nodeAffinity"] != new_spec["nodeAffinity"] {
         return Err("spec.nodeAffinity: Forbidden: spec.nodeAffinity is immutable once set".into());
     }
-    let strip_mutable = |spec: &serde_json::Value| {
-        let mut v = spec.clone();
-        if let Some(m) = v.as_object_mut() {
-            for field in PV_MUTABLE_SPEC_FIELDS {
-                m.remove(field);
-            }
-            m.remove("volumeMode");
-        }
-        v
-    };
-    if strip_mutable(old_spec) == strip_mutable(new_spec) {
+    // `volumeMode` isn't itself mutable (it's checked above), but it's excluded here too since
+    // it was already flagged with its own error message and shouldn't also trip the generic one.
+    let excluded: Vec<&str> = [PV_MUTABLE_SPEC_FIELDS.as_slice(), &["volumeMode"]].concat();
+    if spec_immutable_except(old_spec, new_spec, &excluded) {
         return Ok(());
     }
     Err(

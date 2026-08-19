@@ -14,7 +14,7 @@ pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> String {
     crate::util::secs_nanos_to_rfc3339_micro(secs, nanos)
 }
 
-fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
+pub(crate) fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
     if ios.r#type.unwrap_or(0) == 0 {
         serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
     } else {
@@ -22,7 +22,15 @@ fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
     }
 }
 
-fn gen_quantity_map_to_json(
+pub(crate) fn gen_quantity_to_json(
+    q: Option<super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity>,
+) -> Option<serde_json::Value> {
+    q.and_then(|q| q.string)
+        .filter(|s| !s.is_empty())
+        .map(serde_json::Value::String)
+}
+
+pub(crate) fn gen_quantity_map_to_json(
     map: std::collections::HashMap<
         String,
         super::apps_gen::k8s::io::apimachinery::pkg::api::resource::Quantity,
@@ -1005,7 +1013,7 @@ include!(concat!(env!("OUT_DIR"), "/container_gen.rs"));
 // exact same field set as `Container`.
 include!(concat!(env!("OUT_DIR"), "/ephemeral_container_gen.rs"));
 
-fn gen_node_selector_requirement_to_json(
+pub(crate) fn gen_node_selector_requirement_to_json(
     req: core_v1::NodeSelectorRequirement,
 ) -> serde_json::Value {
     let mut m = serde_json::Map::new();
@@ -1029,7 +1037,7 @@ fn gen_node_selector_requirement_to_json(
     serde_json::Value::Object(m)
 }
 
-fn gen_node_selector_term_to_json(term: core_v1::NodeSelectorTerm) -> serde_json::Value {
+pub(crate) fn gen_node_selector_term_to_json(term: core_v1::NodeSelectorTerm) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if !term.match_expressions.is_empty() {
         m.insert(

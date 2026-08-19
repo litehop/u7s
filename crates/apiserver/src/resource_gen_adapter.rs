@@ -11,9 +11,7 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
 fn gen_quantity_to_json(
     q: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity>,
 ) -> Option<serde_json::Value> {
-    q.and_then(|q| q.string)
-        .filter(|s| !s.is_empty())
-        .map(serde_json::Value::String)
+    crate::core_gen_adapter::gen_quantity_to_json(q)
 }
 
 fn gen_quantity_map_to_json(
@@ -22,13 +20,7 @@ fn gen_quantity_map_to_json(
         u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity,
     >,
 ) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for (k, v) in map {
-        if let Some(s) = v.string.filter(|s| !s.is_empty()) {
-            out.insert(k, serde_json::Value::String(s));
-        }
-    }
-    serde_json::Value::Object(out)
+    crate::core_gen_adapter::gen_quantity_map_to_json(map)
 }
 
 fn gen_raw_extension_to_json(
@@ -63,52 +55,8 @@ fn gen_meta_condition_to_json(c: meta_v1::Condition) -> serde_json::Value {
     m
 }
 
-fn gen_node_selector_requirement_to_json(
-    req: core_v1::NodeSelectorRequirement,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = req.key.filter(|s| !s.is_empty()) {
-        m.insert("key".to_string(), v.into());
-    }
-    if let Some(v) = req.operator.filter(|s| !s.is_empty()) {
-        m.insert("operator".to_string(), v.into());
-    }
-    if !req.values.is_empty() {
-        m.insert(
-            "values".to_string(),
-            req.values
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
 fn gen_node_selector_term_to_json(term: core_v1::NodeSelectorTerm) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !term.match_expressions.is_empty() {
-        m.insert(
-            "matchExpressions".to_string(),
-            term.match_expressions
-                .into_iter()
-                .map(gen_node_selector_requirement_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !term.match_fields.is_empty() {
-        m.insert(
-            "matchFields".to_string(),
-            term.match_fields
-                .into_iter()
-                .map(gen_node_selector_requirement_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    serde_json::Value::Object(m)
+    crate::core_gen_adapter::gen_node_selector_term_to_json(term)
 }
 
 fn gen_node_selector_to_json(ns: core_v1::NodeSelector) -> serde_json::Value {
