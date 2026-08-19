@@ -195,12 +195,7 @@ jobs:
           E2E_TOKEN="e2e-focus-admin-token-$(date +%s)"
           echo "$E2E_TOKEN,e2e-focus-admin,uid0,system:masters" > "$WORKDIR/token-auth.csv"
           # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
-          # this same runner, and u7s's pods/log + pods/exec + pods/attach +
-          # pods/portforward handlers all dial the kubelet directly via
-          # --kubelet-preferred-address regardless of that flag -- konnectivity
-          # is only consulted on the pods/proxy and services/proxy paths, which
-          # neither of this workflow's two target specs exercises (see
-          # crates/apiserver/src/handlers/proxy.rs's resolve_kubelet_address).
+          # this same runner
           ./target/release/u7s-apiserver \
             --db "$WORKDIR/state.db" \
             --kubeconfig "$WORKDIR/kubeconfig" \
