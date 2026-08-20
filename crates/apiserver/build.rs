@@ -698,6 +698,91 @@ fn main() {
     )
     .expect("failed to write generated MutatingAdmissionPolicyBinding codec");
 
+    std::fs::write(
+        out_dir.join("endpoint_gen.rs"),
+        codegen::generate_endpoint(descriptor_bytes),
+    )
+    .expect("failed to write generated Endpoint codec");
+    std::fs::write(
+        out_dir.join("endpointslice_gen.rs"),
+        codegen::generate_endpointslice(descriptor_bytes),
+    )
+    .expect("failed to write generated EndpointSlice codec");
+    std::fs::write(
+        out_dir.join("network_policy_spec_gen.rs"),
+        codegen::generate_network_policy_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated NetworkPolicySpec codec");
+    std::fs::write(
+        out_dir.join("networkpolicy_gen.rs"),
+        codegen::generate_networkpolicy(descriptor_bytes),
+    )
+    .expect("failed to write generated NetworkPolicy codec");
+    std::fs::write(
+        out_dir.join("ingressclass_gen.rs"),
+        codegen::generate_ingressclass(descriptor_bytes),
+    )
+    .expect("failed to write generated IngressClass codec");
+    std::fs::write(
+        out_dir.join("ipaddress_gen.rs"),
+        codegen::generate_ipaddress(descriptor_bytes),
+    )
+    .expect("failed to write generated IPAddress codec");
+    std::fs::write(
+        out_dir.join("servicecidr_status_gen.rs"),
+        codegen::generate_servicecidr_status(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceCIDRStatus codec");
+    std::fs::write(
+        out_dir.join("servicecidr_gen.rs"),
+        codegen::generate_servicecidr(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceCIDR codec");
+    std::fs::write(
+        out_dir.join("ingress_spec_gen.rs"),
+        codegen::generate_ingress_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated IngressSpec codec");
+    std::fs::write(
+        out_dir.join("ingress_gen.rs"),
+        codegen::generate_ingress(descriptor_bytes),
+    )
+    .expect("failed to write generated Ingress codec");
+    std::fs::write(
+        out_dir.join("csr_spec_gen.rs"),
+        codegen::generate_certificate_signing_request_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated CertificateSigningRequestSpec codec");
+    std::fs::write(
+        out_dir.join("csr_status_gen.rs"),
+        codegen::generate_certificate_signing_request_status(descriptor_bytes),
+    )
+    .expect("failed to write generated CertificateSigningRequestStatus codec");
+    std::fs::write(
+        out_dir.join("csr_gen.rs"),
+        codegen::generate_certificate_signing_request(descriptor_bytes),
+    )
+    .expect("failed to write generated CertificateSigningRequest codec");
+    std::fs::write(
+        out_dir.join("poddisruptionbudget_spec_gen.rs"),
+        codegen::generate_poddisruptionbudget_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated PodDisruptionBudgetSpec codec");
+    std::fs::write(
+        out_dir.join("poddisruptionbudget_status_gen.rs"),
+        codegen::generate_poddisruptionbudget_status(descriptor_bytes),
+    )
+    .expect("failed to write generated PodDisruptionBudgetStatus codec");
+    std::fs::write(
+        out_dir.join("poddisruptionbudget_gen.rs"),
+        codegen::generate_poddisruptionbudget(descriptor_bytes),
+    )
+    .expect("failed to write generated PodDisruptionBudget codec");
+    std::fs::write(
+        out_dir.join("events_v1_event_gen.rs"),
+        codegen::generate_events_v1_event(descriptor_bytes),
+    )
+    .expect("failed to write generated events.k8s.io/v1 Event codec");
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("build/codegen.rs").display()
