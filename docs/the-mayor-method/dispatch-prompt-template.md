@@ -309,6 +309,31 @@ of more — a `--focus` test takes 5-15 min and catches the exact class of bug
 that costs full days to root-cause when it lands on `main`. Exemptions: pure
 doc changes, script changes, dev-tooling scouts, and read-only investigations.
 
+**Escape `[sig-xxx]` brackets in the regex, or it silently matches nothing.**
+`--focus` is a regex; an unescaped `[sig-network]` is a character class (any
+ONE of those literal characters), not the literal bracketed prefix — since
+real spec text has a literal `]` right before the space, the char-class
+version never matches and reports "Will run 0 of N specs" with no error,
+indistinguishable from the spec genuinely not existing. Write
+`\[sig-network\] Some spec text` instead.
+
+**No Conformance-tagged spec exercises the codepath — check non-Conformance
+e2e specs before falling back to a hand-rolled verification.** Upstream's
+`[Conformance]` tag marks a curated subset; a real upstream e2e test body can
+exercise the exact field/codepath without being Conformance-tagged (see
+`test/e2e/` broadly, not just the Conformance-filtered subset). A worker
+who finds zero `[Conformance]` hits should search upstream for ANY `ginkgo.It`
+(tagged or not) touching the field before concluding a manual protobuf-wire
+test is the only option — a real upstream test body, even non-Conformance,
+exercises the actual client-go-negotiated request path in a way a hand-rolled
+script can't fully replicate (real client, real informer/watch semantics,
+real retry/backoff behavior). Only fall back to a manual wire-level test
+(building the protobuf envelope by hand, as `mayor-zbkq1`/`mayor-tppdt` did
+for `VolumeAttachment.inlineVolumeSpec`/`ServiceCIDR.observedGeneration`)
+when NEITHER a Conformance nor a non-Conformance upstream spec touches the
+field at all — confirmed via `gh api /search/code?q=<field>+repo:kubernetes/kubernetes`
+across `test/e2e/`, not just a Conformance-filtered grep.
+
 See bd memories `worker-brief-hypothesis-may-be-wrong-encourage-independent-diagnosis`
 and `content-type-dispatch-must-key-on-apiversion-plus-kind` for concrete cases
 where this gate caught (or would have caught) silent breakage.
