@@ -54,8 +54,11 @@ include!(concat!(env!("OUT_DIR"), "/json_schema_props_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/crd_names_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/printer_column_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/selectable_field_gen.rs"));
-include!(concat!(env!("OUT_DIR"), "/service_reference_gen.rs"));
-include!(concat!(env!("OUT_DIR"), "/webhook_client_config_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_service_reference_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/crd_webhook_client_config_gen.rs"
+));
 include!(concat!(env!("OUT_DIR"), "/webhook_conversion_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/crd_conversion_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/subresource_scale_gen.rs"));
