@@ -69,738 +69,86 @@ fn gen_node_selector_to_json(ns: core_v1::NodeSelector) -> serde_json::Value {
     })
 }
 
-// ---- Device building blocks -------------------------------------------------
-
-fn gen_device_taint_to_json(t: resource_v1::DeviceTaint) -> serde_json::Value {
-    let mut m = serde_json::json!({
-        "key": t.key.unwrap_or_default(),
-        "effect": t.effect.unwrap_or_default(),
-    });
-    if let Some(v) = t.value.filter(|s| !s.is_empty()) {
-        m["value"] = v.into();
-    }
-    if let Some(ta) = t.time_added {
-        if let Some(secs) = ta.seconds.filter(|&s| s > 0) {
-            m["timeAdded"] = crate::util::secs_to_rfc3339(secs).into();
-        }
-    }
-    m
-}
-
-fn gen_device_toleration_to_json(t: resource_v1::DeviceToleration) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = t.key.filter(|s| !s.is_empty()) {
-        m.insert("key".to_string(), v.into());
-    }
-    if let Some(v) = t.operator.filter(|s| !s.is_empty()) {
-        m.insert("operator".to_string(), v.into());
-    }
-    if let Some(v) = t.value.filter(|s| !s.is_empty()) {
-        m.insert("value".to_string(), v.into());
-    }
-    if let Some(v) = t.effect.filter(|s| !s.is_empty()) {
-        m.insert("effect".to_string(), v.into());
-    }
-    if let Some(v) = t.toleration_seconds {
-        m.insert("tolerationSeconds".to_string(), v.into());
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_capacity_request_policy_range_to_json(
-    r: resource_v1::CapacityRequestPolicyRange,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = gen_quantity_to_json(r.min) {
-        m.insert("min".to_string(), v);
-    }
-    if let Some(v) = gen_quantity_to_json(r.max) {
-        m.insert("max".to_string(), v);
-    }
-    if let Some(v) = gen_quantity_to_json(r.step) {
-        m.insert("step".to_string(), v);
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_capacity_request_policy_to_json(p: resource_v1::CapacityRequestPolicy) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = gen_quantity_to_json(p.default) {
-        m.insert("default".to_string(), v);
-    }
-    if !p.valid_values.is_empty() {
-        m.insert(
-            "validValues".to_string(),
-            p.valid_values
-                .into_iter()
-                .filter_map(|q| gen_quantity_to_json(Some(q)))
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(vr) = p.valid_range {
-        m.insert(
-            "validRange".to_string(),
-            gen_capacity_request_policy_range_to_json(vr),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_capacity_to_json(c: resource_v1::DeviceCapacity) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = gen_quantity_to_json(c.value) {
-        m.insert("value".to_string(), v);
-    }
-    if let Some(rp) = c.request_policy {
-        m.insert(
-            "requestPolicy".to_string(),
-            gen_capacity_request_policy_to_json(rp),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_attribute_to_json(attr: resource_v1::DeviceAttribute) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = attr.int {
-        m.insert("int".to_string(), v.into());
-    }
-    if let Some(v) = attr.bool {
-        m.insert("bool".to_string(), v.into());
-    }
-    if let Some(v) = attr.string.filter(|s| !s.is_empty()) {
-        m.insert("string".to_string(), v.into());
-    }
-    if let Some(v) = attr.version.filter(|s| !s.is_empty()) {
-        m.insert("version".to_string(), v.into());
-    }
-    if !attr.ints.is_empty() {
-        m.insert(
-            "ints".to_string(),
-            attr.ints
-                .into_iter()
-                .map(serde_json::Value::from)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !attr.bools.is_empty() {
-        m.insert(
-            "bools".to_string(),
-            attr.bools
-                .into_iter()
-                .map(serde_json::Value::from)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !attr.strings.is_empty() {
-        m.insert(
-            "strings".to_string(),
-            attr.strings
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !attr.versions.is_empty() {
-        m.insert(
-            "versions".to_string(),
-            attr.versions
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_counter_to_json(c: resource_v1::Counter) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = gen_quantity_to_json(c.value) {
-        m.insert("value".to_string(), v);
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_counter_map_to_json(
-    map: std::collections::HashMap<String, resource_v1::Counter>,
-) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for (k, v) in map {
-        out.insert(k, gen_counter_to_json(v));
-    }
-    serde_json::Value::Object(out)
-}
-
-fn gen_counter_set_to_json(cs: resource_v1::CounterSet) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = cs.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), v.into());
-    }
-    if !cs.counters.is_empty() {
-        m.insert("counters".to_string(), gen_counter_map_to_json(cs.counters));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_counter_consumption_to_json(
-    d: resource_v1::DeviceCounterConsumption,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = d.counter_set.filter(|s| !s.is_empty()) {
-        m.insert("counterSet".to_string(), v.into());
-    }
-    if !d.counters.is_empty() {
-        m.insert("counters".to_string(), gen_counter_map_to_json(d.counters));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_node_allocatable_resource_mapping_to_json(
-    n: resource_v1::NodeAllocatableResourceMapping,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = n.capacity_key.filter(|s| !s.is_empty()) {
-        m.insert("capacityKey".to_string(), v.into());
-    }
-    if let Some(v) = gen_quantity_to_json(n.allocation_multiplier) {
-        m.insert("allocationMultiplier".to_string(), v);
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_to_json(d: resource_v1::Device) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = d.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), v.into());
-    }
-    if !d.attributes.is_empty() {
-        let attrs: serde_json::Map<String, serde_json::Value> = d
-            .attributes
-            .into_iter()
-            .map(|(k, v)| (k, gen_device_attribute_to_json(v)))
-            .collect();
-        m.insert("attributes".to_string(), serde_json::Value::Object(attrs));
-    }
-    if !d.capacity.is_empty() {
-        let cap: serde_json::Map<String, serde_json::Value> = d
-            .capacity
-            .into_iter()
-            .map(|(k, v)| (k, gen_device_capacity_to_json(v)))
-            .collect();
-        m.insert("capacity".to_string(), serde_json::Value::Object(cap));
-    }
-    if !d.consumes_counters.is_empty() {
-        m.insert(
-            "consumesCounters".to_string(),
-            d.consumes_counters
-                .into_iter()
-                .map(gen_device_counter_consumption_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(v) = d.node_name.filter(|s| !s.is_empty()) {
-        m.insert("nodeName".to_string(), v.into());
-    }
-    if let Some(ns) = d.node_selector {
-        m.insert("nodeSelector".to_string(), gen_node_selector_to_json(ns));
-    }
-    if let Some(true) = d.all_nodes {
-        m.insert("allNodes".to_string(), true.into());
-    }
-    if !d.taints.is_empty() {
-        m.insert(
-            "taints".to_string(),
-            d.taints
-                .into_iter()
-                .map(gen_device_taint_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(true) = d.binds_to_node {
-        m.insert("bindsToNode".to_string(), true.into());
-    }
-    if !d.binding_conditions.is_empty() {
-        m.insert(
-            "bindingConditions".to_string(),
-            d.binding_conditions
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !d.binding_failure_conditions.is_empty() {
-        m.insert(
-            "bindingFailureConditions".to_string(),
-            d.binding_failure_conditions
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(true) = d.allow_multiple_allocations {
-        m.insert("allowMultipleAllocations".to_string(), true.into());
-    }
-    if !d.node_allocatable_resource_mappings.is_empty() {
-        let nam: serde_json::Map<String, serde_json::Value> = d
-            .node_allocatable_resource_mappings
-            .into_iter()
-            .map(|(k, v)| (k, gen_node_allocatable_resource_mapping_to_json(v)))
-            .collect();
-        m.insert(
-            "nodeAllocatableResourceMappings".to_string(),
-            serde_json::Value::Object(nam),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-// ---- Claim building blocks ---------------------------------------------------
-
-fn gen_device_selector_to_json(sel: resource_v1::DeviceSelector) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(cel) = sel.cel {
-        if let Some(v) = cel.expression.filter(|s| !s.is_empty()) {
-            m.insert("cel".to_string(), serde_json::json!({ "expression": v }));
-        }
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_configuration_to_json(c: resource_v1::DeviceConfiguration) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(o) = c.opaque {
-        let mut om = serde_json::Map::new();
-        if let Some(v) = o.driver.filter(|s| !s.is_empty()) {
-            om.insert("driver".to_string(), v.into());
-        }
-        if let Some(v) = gen_raw_extension_to_json(o.parameters) {
-            om.insert("parameters".to_string(), v);
-        }
-        m.insert("opaque".to_string(), serde_json::Value::Object(om));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_capacity_requirements_to_json(c: resource_v1::CapacityRequirements) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !c.requests.is_empty() {
-        m.insert("requests".to_string(), gen_quantity_map_to_json(c.requests));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_exact_device_request_to_json(r: resource_v1::ExactDeviceRequest) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = r.device_class_name.filter(|s| !s.is_empty()) {
-        m.insert("deviceClassName".to_string(), v.into());
-    }
-    if !r.selectors.is_empty() {
-        m.insert(
-            "selectors".to_string(),
-            r.selectors
-                .into_iter()
-                .map(gen_device_selector_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(v) = r.allocation_mode.filter(|s| !s.is_empty()) {
-        m.insert("allocationMode".to_string(), v.into());
-    }
-    if let Some(v) = r.count {
-        m.insert("count".to_string(), v.into());
-    }
-    if let Some(true) = r.admin_access {
-        m.insert("adminAccess".to_string(), true.into());
-    }
-    if !r.tolerations.is_empty() {
-        m.insert(
-            "tolerations".to_string(),
-            r.tolerations
-                .into_iter()
-                .map(gen_device_toleration_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(cap) = r.capacity {
-        m.insert(
-            "capacity".to_string(),
-            gen_capacity_requirements_to_json(cap),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_sub_request_to_json(r: resource_v1::DeviceSubRequest) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), v.into());
-    }
-    if let Some(v) = r.device_class_name.filter(|s| !s.is_empty()) {
-        m.insert("deviceClassName".to_string(), v.into());
-    }
-    if !r.selectors.is_empty() {
-        m.insert(
-            "selectors".to_string(),
-            r.selectors
-                .into_iter()
-                .map(gen_device_selector_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(v) = r.allocation_mode.filter(|s| !s.is_empty()) {
-        m.insert("allocationMode".to_string(), v.into());
-    }
-    if let Some(v) = r.count {
-        m.insert("count".to_string(), v.into());
-    }
-    if !r.tolerations.is_empty() {
-        m.insert(
-            "tolerations".to_string(),
-            r.tolerations
-                .into_iter()
-                .map(gen_device_toleration_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(cap) = r.capacity {
-        m.insert(
-            "capacity".to_string(),
-            gen_capacity_requirements_to_json(cap),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_request_to_json(r: resource_v1::DeviceRequest) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), v.into());
-    }
-    if let Some(e) = r.exactly {
-        m.insert("exactly".to_string(), gen_exact_device_request_to_json(e));
-    }
-    if !r.first_available.is_empty() {
-        m.insert(
-            "firstAvailable".to_string(),
-            r.first_available
-                .into_iter()
-                .map(gen_device_sub_request_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_constraint_to_json(c: resource_v1::DeviceConstraint) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !c.requests.is_empty() {
-        m.insert(
-            "requests".to_string(),
-            c.requests
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(v) = c.match_attribute.filter(|s| !s.is_empty()) {
-        m.insert("matchAttribute".to_string(), v.into());
-    }
-    if let Some(v) = c.distinct_attribute.filter(|s| !s.is_empty()) {
-        m.insert("distinctAttribute".to_string(), v.into());
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_claim_configuration_to_json(
-    c: resource_v1::DeviceClaimConfiguration,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !c.requests.is_empty() {
-        m.insert(
-            "requests".to_string(),
-            c.requests
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(dc) = c.device_configuration {
-        m.insert(
-            "deviceConfiguration".to_string(),
-            gen_device_configuration_to_json(dc),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_device_claim_to_json(dc: resource_v1::DeviceClaim) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !dc.requests.is_empty() {
-        m.insert(
-            "requests".to_string(),
-            dc.requests
-                .into_iter()
-                .map(gen_device_request_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !dc.constraints.is_empty() {
-        m.insert(
-            "constraints".to_string(),
-            dc.constraints
-                .into_iter()
-                .map(gen_device_constraint_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !dc.config.is_empty() {
-        m.insert(
-            "config".to_string(),
-            dc.config
-                .into_iter()
-                .map(gen_device_claim_configuration_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-// ---- Allocation building blocks ---------------------------------------------
-
-fn gen_device_request_allocation_result_to_json(
-    r: resource_v1::DeviceRequestAllocationResult,
-) -> serde_json::Value {
-    let mut m = serde_json::json!({
-        "request": r.request.unwrap_or_default(),
-        "driver": r.driver.unwrap_or_default(),
-        "pool": r.pool.unwrap_or_default(),
-        "device": r.device.unwrap_or_default(),
-    });
-    if let Some(true) = r.admin_access {
-        m["adminAccess"] = true.into();
-    }
-    if !r.tolerations.is_empty() {
-        m["tolerations"] = r
-            .tolerations
-            .into_iter()
-            .map(gen_device_toleration_to_json)
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if !r.binding_conditions.is_empty() {
-        m["bindingConditions"] = r
-            .binding_conditions
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if !r.binding_failure_conditions.is_empty() {
-        m["bindingFailureConditions"] = r
-            .binding_failure_conditions
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if let Some(v) = r.share_id.filter(|s| !s.is_empty()) {
-        m["shareID"] = v.into();
-    }
-    if !r.consumed_capacity.is_empty() {
-        m["consumedCapacity"] = gen_quantity_map_to_json(r.consumed_capacity);
-    }
-    m
-}
-
-fn gen_device_allocation_configuration_to_json(
-    c: resource_v1::DeviceAllocationConfiguration,
-) -> serde_json::Value {
-    let mut m = serde_json::json!({ "source": c.source.unwrap_or_default() });
-    if !c.requests.is_empty() {
-        m["requests"] = c
-            .requests
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if let Some(dc) = c.device_configuration {
-        m["deviceConfiguration"] = gen_device_configuration_to_json(dc);
-    }
-    m
-}
-
-fn gen_device_allocation_result_to_json(
-    r: resource_v1::DeviceAllocationResult,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !r.results.is_empty() {
-        m.insert(
-            "results".to_string(),
-            r.results
-                .into_iter()
-                .map(gen_device_request_allocation_result_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if !r.config.is_empty() {
-        m.insert(
-            "config".to_string(),
-            r.config
-                .into_iter()
-                .map(gen_device_allocation_configuration_to_json)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_allocation_result_to_json(a: resource_v1::AllocationResult) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(d) = a.devices {
-        m.insert(
-            "devices".to_string(),
-            gen_device_allocation_result_to_json(d),
-        );
-    }
-    if let Some(ns) = a.node_selector {
-        m.insert("nodeSelector".to_string(), gen_node_selector_to_json(ns));
-    }
-    if let Some(t) = a.allocation_timestamp {
-        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-            m.insert(
-                "allocationTimestamp".to_string(),
-                crate::util::secs_to_rfc3339(secs).into(),
-            );
-        }
-    }
-    serde_json::Value::Object(m)
-}
-
-// ---- Status building blocks --------------------------------------------------
-
-fn gen_resource_claim_consumer_reference_to_json(
-    r: resource_v1::ResourceClaimConsumerReference,
-) -> serde_json::Value {
-    let mut m = serde_json::json!({
-        "resource": r.resource.unwrap_or_default(),
-        "name": r.name.unwrap_or_default(),
-        "uid": r.uid.unwrap_or_default(),
-    });
-    if let Some(v) = r.api_group.filter(|s| !s.is_empty()) {
-        m["apiGroup"] = v.into();
-    }
-    m
-}
-
-fn gen_network_device_data_to_json(n: resource_v1::NetworkDeviceData) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = n.interface_name.filter(|s| !s.is_empty()) {
-        m.insert("interfaceName".to_string(), v.into());
-    }
-    if !n.ips.is_empty() {
-        m.insert(
-            "ips".to_string(),
-            n.ips
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-    if let Some(v) = n.hardware_address.filter(|s| !s.is_empty()) {
-        m.insert("hardwareAddress".to_string(), v.into());
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_allocated_device_status_to_json(s: resource_v1::AllocatedDeviceStatus) -> serde_json::Value {
-    let mut m = serde_json::json!({
-        "driver": s.driver.unwrap_or_default(),
-        "pool": s.pool.unwrap_or_default(),
-        "device": s.device.unwrap_or_default(),
-    });
-    if let Some(v) = s.share_id.filter(|s| !s.is_empty()) {
-        m["shareID"] = v.into();
-    }
-    if !s.conditions.is_empty() {
-        m["conditions"] = s
-            .conditions
-            .into_iter()
-            .map(gen_meta_condition_to_json)
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if let Some(v) = gen_raw_extension_to_json(s.data) {
-        m["data"] = v;
-    }
-    if let Some(nd) = s.network_data {
-        m["networkData"] = gen_network_device_data_to_json(nd);
-    }
-    m
-}
+// ---- resource.k8s.io/v1 (DRA) building blocks and Kind assemblies -----------
+//
+// `gen_*_to_json` for every DeviceClass/ResourceClaim/ResourceClaimTemplate/ResourceSlice
+// building block and top-level Kind is generated by `build/codegen.rs` from the
+// `.k8s.io.api.resource.v1.*` descriptors — see that file's "resource.k8s.io/v1 (DRA)" section
+// for the per-field delegate-vs-mechanical reasoning behind each one. Only the scalar helpers
+// above (`gen_object_meta_to_json`/`gen_quantity_to_json`/`gen_quantity_map_to_json`/
+// `gen_raw_extension_to_json`/`gen_meta_condition_to_json`/`gen_node_selector_to_json`) and the
+// four proto-decode + apiVersion/kind-stamping entry points below stay hand-written.
+include!(concat!(env!("OUT_DIR"), "/device_taint_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/capacity_request_policy_range_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/capacity_request_policy_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_capacity_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_attribute_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_counter_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_counter_set_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/device_counter_consumption_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/node_allocatable_resource_mapping_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/device_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_configuration_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/device_capacity_requirements_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/exact_device_request_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_sub_request_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_request_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/device_claim_configuration_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/device_claim_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/device_request_allocation_result_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/device_allocation_configuration_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/device_allocation_result_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/device_claim_allocation_result_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/resource_claim_consumer_reference_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/device_network_data_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/device_allocated_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/deviceclass_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/deviceclass_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/resourceclaim_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/resourceclaim_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/resourceclaim_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/resourceclaimtemplate_spec_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/resourceclaimtemplate_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/resourceslice_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/resourceslice_gen.rs"));
 
 // ---- Decoder A: DeviceClass -------------------------------------------------
 
 pub fn decode_deviceclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = resource_v1::DeviceClass::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "resource.k8s.io/v1",
-        "kind": "DeviceClass",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if !spec.selectors.is_empty() {
-            spec_json.insert(
-                "selectors".to_string(),
-                spec.selectors
-                    .into_iter()
-                    .map(gen_device_selector_to_json)
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
-        }
-        if !spec.config.is_empty() {
-            spec_json.insert(
-                "config".to_string(),
-                spec.config
-                    .into_iter()
-                    .filter_map(|c| c.device_configuration)
-                    .map(|dc| {
-                        serde_json::json!({ "deviceConfiguration": gen_device_configuration_to_json(dc) })
-                    })
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
-        }
-        if let Some(v) = spec.extended_resource_name.filter(|s| !s.is_empty()) {
-            spec_json.insert("extendedResourceName".to_string(), v.into());
-        }
-        out["spec"] = serde_json::Value::Object(spec_json);
-    }
+    let mut out = gen_deviceclass_to_json(obj);
+    out["apiVersion"] = "resource.k8s.io/v1".into();
+    out["kind"] = "DeviceClass".into();
     Some(out)
 }
 
@@ -808,50 +156,9 @@ pub fn decode_deviceclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 pub fn decode_resourceclaim_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = resource_v1::ResourceClaim::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "resource.k8s.io/v1",
-        "kind": "ResourceClaim",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if let Some(devices) = spec.devices {
-            spec_json.insert("devices".to_string(), gen_device_claim_to_json(devices));
-        }
-        out["spec"] = serde_json::Value::Object(spec_json);
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::Map::new();
-        if let Some(a) = status.allocation {
-            status_json.insert("allocation".to_string(), gen_allocation_result_to_json(a));
-        }
-        if !status.reserved_for.is_empty() {
-            status_json.insert(
-                "reservedFor".to_string(),
-                status
-                    .reserved_for
-                    .into_iter()
-                    .map(gen_resource_claim_consumer_reference_to_json)
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
-        }
-        if !status.devices.is_empty() {
-            status_json.insert(
-                "devices".to_string(),
-                status
-                    .devices
-                    .into_iter()
-                    .map(gen_allocated_device_status_to_json)
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
-        }
-        if !status_json.is_empty() {
-            out["status"] = serde_json::Value::Object(status_json);
-        }
-    }
+    let mut out = gen_resourceclaim_to_json(obj);
+    out["apiVersion"] = "resource.k8s.io/v1".into();
+    out["kind"] = "ResourceClaim".into();
     Some(out)
 }
 
@@ -859,28 +166,9 @@ pub fn decode_resourceclaim_proto_gen(data: &[u8]) -> Option<serde_json::Value> 
 
 pub fn decode_resourceclaimtemplate_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = resource_v1::ResourceClaimTemplate::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "resource.k8s.io/v1",
-        "kind": "ResourceClaimTemplate",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let tmpl_meta = spec
-            .metadata
-            .map(gen_object_meta_to_json)
-            .unwrap_or_else(|| serde_json::json!({"creationTimestamp": serde_json::Value::Null}));
-        let mut tmpl_spec = serde_json::Map::new();
-        if let Some(rc_spec) = spec.spec {
-            if let Some(devices) = rc_spec.devices {
-                tmpl_spec.insert("devices".to_string(), gen_device_claim_to_json(devices));
-            }
-        }
-        out["spec"] = serde_json::json!({
-            "metadata": tmpl_meta,
-            "spec": serde_json::Value::Object(tmpl_spec),
-        });
-    }
+    let mut out = gen_resourceclaimtemplate_to_json(obj);
+    out["apiVersion"] = "resource.k8s.io/v1".into();
+    out["kind"] = "ResourceClaimTemplate".into();
     Some(out)
 }
 
@@ -888,51 +176,9 @@ pub fn decode_resourceclaimtemplate_proto_gen(data: &[u8]) -> Option<serde_json:
 
 pub fn decode_resourceslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = resource_v1::ResourceSlice::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "resource.k8s.io/v1",
-        "kind": "ResourceSlice",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({ "driver": spec.driver.unwrap_or_default() });
-        if let Some(pool) = spec.pool {
-            spec_json["pool"] = serde_json::json!({
-                "name": pool.name.unwrap_or_default(),
-                "generation": pool.generation.unwrap_or(0),
-                "resourceSliceCount": pool.resource_slice_count.unwrap_or(0),
-            });
-        }
-        if let Some(v) = spec.node_name.filter(|s| !s.is_empty()) {
-            spec_json["nodeName"] = v.into();
-        }
-        if let Some(ns) = spec.node_selector {
-            spec_json["nodeSelector"] = gen_node_selector_to_json(ns);
-        }
-        if let Some(true) = spec.all_nodes {
-            spec_json["allNodes"] = true.into();
-        }
-        if !spec.devices.is_empty() {
-            spec_json["devices"] = spec
-                .devices
-                .into_iter()
-                .map(gen_device_to_json)
-                .collect::<Vec<_>>()
-                .into();
-        }
-        if let Some(true) = spec.per_device_node_selection {
-            spec_json["perDeviceNodeSelection"] = true.into();
-        }
-        if !spec.shared_counters.is_empty() {
-            spec_json["sharedCounters"] = spec
-                .shared_counters
-                .into_iter()
-                .map(gen_counter_set_to_json)
-                .collect::<Vec<_>>()
-                .into();
-        }
-        out["spec"] = spec_json;
-    }
+    let mut out = gen_resourceslice_to_json(obj);
+    out["apiVersion"] = "resource.k8s.io/v1".into();
+    out["kind"] = "ResourceSlice".into();
     Some(out)
 }
 
@@ -1685,5 +931,1066 @@ mod tests {
         ]);
         let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
         assert_fields_present(&paths, &expected);
+    }
+
+    // ---- Byte-identical audit: codegen migration -------------------------------
+    //
+    // Reconstructs every pre-migration hand-written `gen_*_to_json`/`decode_*_proto_gen`
+    // function in this file verbatim (under an `old_` prefix, calling only each other and the
+    // shared scalar helpers this migration left untouched: `gen_object_meta_to_json`/
+    // `gen_quantity_to_json`/`gen_quantity_map_to_json`/`gen_raw_extension_to_json`/
+    // `gen_meta_condition_to_json`/`gen_node_selector_to_json`) and diffs their output against
+    // the codegen-generated `decode_*_proto_gen` entry points this migration installed, using
+    // the same `Sentinel::sentinel()`-populated fixtures the sentinel-completeness tests above
+    // already build (every field set to a value no zero/empty-elision check could mistake for
+    // "unset"). A wrong field name, a dropped `DELIBERATE_OMISSIONS`-shaped guard (e.g. the
+    // `allNodes`/`bindsToNode`/`allowMultipleAllocations` true-only bools, or the
+    // `DeviceClassSpec.config` `filter_map` that drops entries with no `deviceConfiguration`), or
+    // a missing delegate-table entry in `build/codegen.rs` would show up here as a JSON
+    // mismatch — a scheduler or kubelet silently misreading allocated-device state is exactly the
+    // failure mode a byte-for-byte diff against the known-good pre-migration output catches.
+    #[test]
+    fn codegen_migration_resource_v1_matches_pre_migration_hand_written_output() {
+        fn old_gen_device_taint_to_json(t: resource_v1::DeviceTaint) -> serde_json::Value {
+            let mut m = serde_json::json!({
+                "key": t.key.unwrap_or_default(),
+                "effect": t.effect.unwrap_or_default(),
+            });
+            if let Some(v) = t.value.filter(|s| !s.is_empty()) {
+                m["value"] = v.into();
+            }
+            if let Some(ta) = t.time_added {
+                if let Some(secs) = ta.seconds.filter(|&s| s > 0) {
+                    m["timeAdded"] = crate::util::secs_to_rfc3339(secs).into();
+                }
+            }
+            m
+        }
+
+        fn old_gen_device_toleration_to_json(
+            t: resource_v1::DeviceToleration,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = t.key.filter(|s| !s.is_empty()) {
+                m.insert("key".to_string(), v.into());
+            }
+            if let Some(v) = t.operator.filter(|s| !s.is_empty()) {
+                m.insert("operator".to_string(), v.into());
+            }
+            if let Some(v) = t.value.filter(|s| !s.is_empty()) {
+                m.insert("value".to_string(), v.into());
+            }
+            if let Some(v) = t.effect.filter(|s| !s.is_empty()) {
+                m.insert("effect".to_string(), v.into());
+            }
+            if let Some(v) = t.toleration_seconds {
+                m.insert("tolerationSeconds".to_string(), v.into());
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_capacity_request_policy_range_to_json(
+            r: resource_v1::CapacityRequestPolicyRange,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = gen_quantity_to_json(r.min) {
+                m.insert("min".to_string(), v);
+            }
+            if let Some(v) = gen_quantity_to_json(r.max) {
+                m.insert("max".to_string(), v);
+            }
+            if let Some(v) = gen_quantity_to_json(r.step) {
+                m.insert("step".to_string(), v);
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_capacity_request_policy_to_json(
+            p: resource_v1::CapacityRequestPolicy,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = gen_quantity_to_json(p.default) {
+                m.insert("default".to_string(), v);
+            }
+            if !p.valid_values.is_empty() {
+                m.insert(
+                    "validValues".to_string(),
+                    p.valid_values
+                        .into_iter()
+                        .filter_map(|q| gen_quantity_to_json(Some(q)))
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(vr) = p.valid_range {
+                m.insert(
+                    "validRange".to_string(),
+                    old_gen_capacity_request_policy_range_to_json(vr),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_capacity_to_json(c: resource_v1::DeviceCapacity) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = gen_quantity_to_json(c.value) {
+                m.insert("value".to_string(), v);
+            }
+            if let Some(rp) = c.request_policy {
+                m.insert(
+                    "requestPolicy".to_string(),
+                    old_gen_capacity_request_policy_to_json(rp),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_attribute_to_json(
+            attr: resource_v1::DeviceAttribute,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = attr.int {
+                m.insert("int".to_string(), v.into());
+            }
+            if let Some(v) = attr.bool {
+                m.insert("bool".to_string(), v.into());
+            }
+            if let Some(v) = attr.string.filter(|s| !s.is_empty()) {
+                m.insert("string".to_string(), v.into());
+            }
+            if let Some(v) = attr.version.filter(|s| !s.is_empty()) {
+                m.insert("version".to_string(), v.into());
+            }
+            if !attr.ints.is_empty() {
+                m.insert(
+                    "ints".to_string(),
+                    attr.ints
+                        .into_iter()
+                        .map(serde_json::Value::from)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !attr.bools.is_empty() {
+                m.insert(
+                    "bools".to_string(),
+                    attr.bools
+                        .into_iter()
+                        .map(serde_json::Value::from)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !attr.strings.is_empty() {
+                m.insert(
+                    "strings".to_string(),
+                    attr.strings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !attr.versions.is_empty() {
+                m.insert(
+                    "versions".to_string(),
+                    attr.versions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_counter_to_json(c: resource_v1::Counter) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = gen_quantity_to_json(c.value) {
+                m.insert("value".to_string(), v);
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_counter_map_to_json(
+            map: std::collections::HashMap<String, resource_v1::Counter>,
+        ) -> serde_json::Value {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k, old_gen_counter_to_json(v));
+            }
+            serde_json::Value::Object(out)
+        }
+
+        fn old_gen_counter_set_to_json(cs: resource_v1::CounterSet) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = cs.name.filter(|s| !s.is_empty()) {
+                m.insert("name".to_string(), v.into());
+            }
+            if !cs.counters.is_empty() {
+                m.insert(
+                    "counters".to_string(),
+                    old_gen_counter_map_to_json(cs.counters),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_counter_consumption_to_json(
+            d: resource_v1::DeviceCounterConsumption,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = d.counter_set.filter(|s| !s.is_empty()) {
+                m.insert("counterSet".to_string(), v.into());
+            }
+            if !d.counters.is_empty() {
+                m.insert(
+                    "counters".to_string(),
+                    old_gen_counter_map_to_json(d.counters),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_node_allocatable_resource_mapping_to_json(
+            n: resource_v1::NodeAllocatableResourceMapping,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = n.capacity_key.filter(|s| !s.is_empty()) {
+                m.insert("capacityKey".to_string(), v.into());
+            }
+            if let Some(v) = gen_quantity_to_json(n.allocation_multiplier) {
+                m.insert("allocationMultiplier".to_string(), v);
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_to_json(d: resource_v1::Device) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = d.name.filter(|s| !s.is_empty()) {
+                m.insert("name".to_string(), v.into());
+            }
+            if !d.attributes.is_empty() {
+                let attrs: serde_json::Map<String, serde_json::Value> = d
+                    .attributes
+                    .into_iter()
+                    .map(|(k, v)| (k, old_gen_device_attribute_to_json(v)))
+                    .collect();
+                m.insert("attributes".to_string(), serde_json::Value::Object(attrs));
+            }
+            if !d.capacity.is_empty() {
+                let cap: serde_json::Map<String, serde_json::Value> = d
+                    .capacity
+                    .into_iter()
+                    .map(|(k, v)| (k, old_gen_device_capacity_to_json(v)))
+                    .collect();
+                m.insert("capacity".to_string(), serde_json::Value::Object(cap));
+            }
+            if !d.consumes_counters.is_empty() {
+                m.insert(
+                    "consumesCounters".to_string(),
+                    d.consumes_counters
+                        .into_iter()
+                        .map(old_gen_device_counter_consumption_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(v) = d.node_name.filter(|s| !s.is_empty()) {
+                m.insert("nodeName".to_string(), v.into());
+            }
+            if let Some(ns) = d.node_selector {
+                m.insert("nodeSelector".to_string(), gen_node_selector_to_json(ns));
+            }
+            if let Some(true) = d.all_nodes {
+                m.insert("allNodes".to_string(), true.into());
+            }
+            if !d.taints.is_empty() {
+                m.insert(
+                    "taints".to_string(),
+                    d.taints
+                        .into_iter()
+                        .map(old_gen_device_taint_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(true) = d.binds_to_node {
+                m.insert("bindsToNode".to_string(), true.into());
+            }
+            if !d.binding_conditions.is_empty() {
+                m.insert(
+                    "bindingConditions".to_string(),
+                    d.binding_conditions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !d.binding_failure_conditions.is_empty() {
+                m.insert(
+                    "bindingFailureConditions".to_string(),
+                    d.binding_failure_conditions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(true) = d.allow_multiple_allocations {
+                m.insert("allowMultipleAllocations".to_string(), true.into());
+            }
+            if !d.node_allocatable_resource_mappings.is_empty() {
+                let nam: serde_json::Map<String, serde_json::Value> = d
+                    .node_allocatable_resource_mappings
+                    .into_iter()
+                    .map(|(k, v)| (k, old_gen_node_allocatable_resource_mapping_to_json(v)))
+                    .collect();
+                m.insert(
+                    "nodeAllocatableResourceMappings".to_string(),
+                    serde_json::Value::Object(nam),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_selector_to_json(sel: resource_v1::DeviceSelector) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(cel) = sel.cel {
+                if let Some(v) = cel.expression.filter(|s| !s.is_empty()) {
+                    m.insert("cel".to_string(), serde_json::json!({ "expression": v }));
+                }
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_configuration_to_json(
+            c: resource_v1::DeviceConfiguration,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(o) = c.opaque {
+                let mut om = serde_json::Map::new();
+                if let Some(v) = o.driver.filter(|s| !s.is_empty()) {
+                    om.insert("driver".to_string(), v.into());
+                }
+                if let Some(v) = gen_raw_extension_to_json(o.parameters) {
+                    om.insert("parameters".to_string(), v);
+                }
+                m.insert("opaque".to_string(), serde_json::Value::Object(om));
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_capacity_requirements_to_json(
+            c: resource_v1::CapacityRequirements,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if !c.requests.is_empty() {
+                m.insert("requests".to_string(), gen_quantity_map_to_json(c.requests));
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_exact_device_request_to_json(
+            r: resource_v1::ExactDeviceRequest,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = r.device_class_name.filter(|s| !s.is_empty()) {
+                m.insert("deviceClassName".to_string(), v.into());
+            }
+            if !r.selectors.is_empty() {
+                m.insert(
+                    "selectors".to_string(),
+                    r.selectors
+                        .into_iter()
+                        .map(old_gen_device_selector_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(v) = r.allocation_mode.filter(|s| !s.is_empty()) {
+                m.insert("allocationMode".to_string(), v.into());
+            }
+            if let Some(v) = r.count {
+                m.insert("count".to_string(), v.into());
+            }
+            if let Some(true) = r.admin_access {
+                m.insert("adminAccess".to_string(), true.into());
+            }
+            if !r.tolerations.is_empty() {
+                m.insert(
+                    "tolerations".to_string(),
+                    r.tolerations
+                        .into_iter()
+                        .map(old_gen_device_toleration_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(cap) = r.capacity {
+                m.insert(
+                    "capacity".to_string(),
+                    old_gen_capacity_requirements_to_json(cap),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_sub_request_to_json(
+            r: resource_v1::DeviceSubRequest,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+                m.insert("name".to_string(), v.into());
+            }
+            if let Some(v) = r.device_class_name.filter(|s| !s.is_empty()) {
+                m.insert("deviceClassName".to_string(), v.into());
+            }
+            if !r.selectors.is_empty() {
+                m.insert(
+                    "selectors".to_string(),
+                    r.selectors
+                        .into_iter()
+                        .map(old_gen_device_selector_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(v) = r.allocation_mode.filter(|s| !s.is_empty()) {
+                m.insert("allocationMode".to_string(), v.into());
+            }
+            if let Some(v) = r.count {
+                m.insert("count".to_string(), v.into());
+            }
+            if !r.tolerations.is_empty() {
+                m.insert(
+                    "tolerations".to_string(),
+                    r.tolerations
+                        .into_iter()
+                        .map(old_gen_device_toleration_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(cap) = r.capacity {
+                m.insert(
+                    "capacity".to_string(),
+                    old_gen_capacity_requirements_to_json(cap),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_request_to_json(r: resource_v1::DeviceRequest) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+                m.insert("name".to_string(), v.into());
+            }
+            if let Some(e) = r.exactly {
+                m.insert(
+                    "exactly".to_string(),
+                    old_gen_exact_device_request_to_json(e),
+                );
+            }
+            if !r.first_available.is_empty() {
+                m.insert(
+                    "firstAvailable".to_string(),
+                    r.first_available
+                        .into_iter()
+                        .map(old_gen_device_sub_request_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_constraint_to_json(
+            c: resource_v1::DeviceConstraint,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if !c.requests.is_empty() {
+                m.insert(
+                    "requests".to_string(),
+                    c.requests
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(v) = c.match_attribute.filter(|s| !s.is_empty()) {
+                m.insert("matchAttribute".to_string(), v.into());
+            }
+            if let Some(v) = c.distinct_attribute.filter(|s| !s.is_empty()) {
+                m.insert("distinctAttribute".to_string(), v.into());
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_claim_configuration_to_json(
+            c: resource_v1::DeviceClaimConfiguration,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if !c.requests.is_empty() {
+                m.insert(
+                    "requests".to_string(),
+                    c.requests
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(dc) = c.device_configuration {
+                m.insert(
+                    "deviceConfiguration".to_string(),
+                    old_gen_device_configuration_to_json(dc),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_claim_to_json(dc: resource_v1::DeviceClaim) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if !dc.requests.is_empty() {
+                m.insert(
+                    "requests".to_string(),
+                    dc.requests
+                        .into_iter()
+                        .map(old_gen_device_request_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !dc.constraints.is_empty() {
+                m.insert(
+                    "constraints".to_string(),
+                    dc.constraints
+                        .into_iter()
+                        .map(old_gen_device_constraint_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !dc.config.is_empty() {
+                m.insert(
+                    "config".to_string(),
+                    dc.config
+                        .into_iter()
+                        .map(old_gen_device_claim_configuration_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_device_request_allocation_result_to_json(
+            r: resource_v1::DeviceRequestAllocationResult,
+        ) -> serde_json::Value {
+            let mut m = serde_json::json!({
+                "request": r.request.unwrap_or_default(),
+                "driver": r.driver.unwrap_or_default(),
+                "pool": r.pool.unwrap_or_default(),
+                "device": r.device.unwrap_or_default(),
+            });
+            if let Some(true) = r.admin_access {
+                m["adminAccess"] = true.into();
+            }
+            if !r.tolerations.is_empty() {
+                m["tolerations"] = r
+                    .tolerations
+                    .into_iter()
+                    .map(old_gen_device_toleration_to_json)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            if !r.binding_conditions.is_empty() {
+                m["bindingConditions"] = r
+                    .binding_conditions
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            if !r.binding_failure_conditions.is_empty() {
+                m["bindingFailureConditions"] = r
+                    .binding_failure_conditions
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            if let Some(v) = r.share_id.filter(|s| !s.is_empty()) {
+                m["shareID"] = v.into();
+            }
+            if !r.consumed_capacity.is_empty() {
+                m["consumedCapacity"] = gen_quantity_map_to_json(r.consumed_capacity);
+            }
+            m
+        }
+
+        fn old_gen_device_allocation_configuration_to_json(
+            c: resource_v1::DeviceAllocationConfiguration,
+        ) -> serde_json::Value {
+            let mut m = serde_json::json!({ "source": c.source.unwrap_or_default() });
+            if !c.requests.is_empty() {
+                m["requests"] = c
+                    .requests
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            if let Some(dc) = c.device_configuration {
+                m["deviceConfiguration"] = old_gen_device_configuration_to_json(dc);
+            }
+            m
+        }
+
+        fn old_gen_device_allocation_result_to_json(
+            r: resource_v1::DeviceAllocationResult,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if !r.results.is_empty() {
+                m.insert(
+                    "results".to_string(),
+                    r.results
+                        .into_iter()
+                        .map(old_gen_device_request_allocation_result_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if !r.config.is_empty() {
+                m.insert(
+                    "config".to_string(),
+                    r.config
+                        .into_iter()
+                        .map(old_gen_device_allocation_configuration_to_json)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_allocation_result_to_json(
+            a: resource_v1::AllocationResult,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(d) = a.devices {
+                m.insert(
+                    "devices".to_string(),
+                    old_gen_device_allocation_result_to_json(d),
+                );
+            }
+            if let Some(ns) = a.node_selector {
+                m.insert("nodeSelector".to_string(), gen_node_selector_to_json(ns));
+            }
+            if let Some(t) = a.allocation_timestamp {
+                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                    m.insert(
+                        "allocationTimestamp".to_string(),
+                        crate::util::secs_to_rfc3339(secs).into(),
+                    );
+                }
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_resource_claim_consumer_reference_to_json(
+            r: resource_v1::ResourceClaimConsumerReference,
+        ) -> serde_json::Value {
+            let mut m = serde_json::json!({
+                "resource": r.resource.unwrap_or_default(),
+                "name": r.name.unwrap_or_default(),
+                "uid": r.uid.unwrap_or_default(),
+            });
+            if let Some(v) = r.api_group.filter(|s| !s.is_empty()) {
+                m["apiGroup"] = v.into();
+            }
+            m
+        }
+
+        fn old_gen_network_device_data_to_json(
+            n: resource_v1::NetworkDeviceData,
+        ) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = n.interface_name.filter(|s| !s.is_empty()) {
+                m.insert("interfaceName".to_string(), v.into());
+            }
+            if !n.ips.is_empty() {
+                m.insert(
+                    "ips".to_string(),
+                    n.ips
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>()
+                        .into(),
+                );
+            }
+            if let Some(v) = n.hardware_address.filter(|s| !s.is_empty()) {
+                m.insert("hardwareAddress".to_string(), v.into());
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_gen_allocated_device_status_to_json(
+            s: resource_v1::AllocatedDeviceStatus,
+        ) -> serde_json::Value {
+            let mut m = serde_json::json!({
+                "driver": s.driver.unwrap_or_default(),
+                "pool": s.pool.unwrap_or_default(),
+                "device": s.device.unwrap_or_default(),
+            });
+            if let Some(v) = s.share_id.filter(|s| !s.is_empty()) {
+                m["shareID"] = v.into();
+            }
+            if !s.conditions.is_empty() {
+                m["conditions"] = s
+                    .conditions
+                    .into_iter()
+                    .map(gen_meta_condition_to_json)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            if let Some(v) = gen_raw_extension_to_json(s.data) {
+                m["data"] = v;
+            }
+            if let Some(nd) = s.network_data {
+                m["networkData"] = old_gen_network_device_data_to_json(nd);
+            }
+            m
+        }
+
+        fn old_decode_deviceclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = resource_v1::DeviceClass::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "DeviceClass",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if !spec.selectors.is_empty() {
+                    spec_json.insert(
+                        "selectors".to_string(),
+                        spec.selectors
+                            .into_iter()
+                            .map(old_gen_device_selector_to_json)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    );
+                }
+                if !spec.config.is_empty() {
+                    spec_json.insert(
+                        "config".to_string(),
+                        spec.config
+                            .into_iter()
+                            .filter_map(|c| c.device_configuration)
+                            .map(|dc| {
+                                serde_json::json!({ "deviceConfiguration": old_gen_device_configuration_to_json(dc) })
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                    );
+                }
+                if let Some(v) = spec.extended_resource_name.filter(|s| !s.is_empty()) {
+                    spec_json.insert("extendedResourceName".to_string(), v.into());
+                }
+                out["spec"] = serde_json::Value::Object(spec_json);
+            }
+            Some(out)
+        }
+
+        fn old_decode_resourceclaim_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = resource_v1::ResourceClaim::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceClaim",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if let Some(devices) = spec.devices {
+                    spec_json.insert("devices".to_string(), old_gen_device_claim_to_json(devices));
+                }
+                out["spec"] = serde_json::Value::Object(spec_json);
+            }
+            if let Some(status) = obj.status {
+                let mut status_json = serde_json::Map::new();
+                if let Some(a) = status.allocation {
+                    status_json.insert(
+                        "allocation".to_string(),
+                        old_gen_allocation_result_to_json(a),
+                    );
+                }
+                if !status.reserved_for.is_empty() {
+                    status_json.insert(
+                        "reservedFor".to_string(),
+                        status
+                            .reserved_for
+                            .into_iter()
+                            .map(old_gen_resource_claim_consumer_reference_to_json)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    );
+                }
+                if !status.devices.is_empty() {
+                    status_json.insert(
+                        "devices".to_string(),
+                        status
+                            .devices
+                            .into_iter()
+                            .map(old_gen_allocated_device_status_to_json)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    );
+                }
+                if !status_json.is_empty() {
+                    out["status"] = serde_json::Value::Object(status_json);
+                }
+            }
+            Some(out)
+        }
+
+        fn old_decode_resourceclaimtemplate_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = resource_v1::ResourceClaimTemplate::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceClaimTemplate",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let tmpl_meta = spec.metadata.map(gen_object_meta_to_json).unwrap_or_else(
+                    || serde_json::json!({"creationTimestamp": serde_json::Value::Null}),
+                );
+                let mut tmpl_spec = serde_json::Map::new();
+                if let Some(rc_spec) = spec.spec {
+                    if let Some(devices) = rc_spec.devices {
+                        tmpl_spec
+                            .insert("devices".to_string(), old_gen_device_claim_to_json(devices));
+                    }
+                }
+                out["spec"] = serde_json::json!({
+                    "metadata": tmpl_meta,
+                    "spec": serde_json::Value::Object(tmpl_spec),
+                });
+            }
+            Some(out)
+        }
+
+        fn old_decode_resourceslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = resource_v1::ResourceSlice::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json =
+                    serde_json::json!({ "driver": spec.driver.unwrap_or_default() });
+                if let Some(pool) = spec.pool {
+                    spec_json["pool"] = serde_json::json!({
+                        "name": pool.name.unwrap_or_default(),
+                        "generation": pool.generation.unwrap_or(0),
+                        "resourceSliceCount": pool.resource_slice_count.unwrap_or(0),
+                    });
+                }
+                if let Some(v) = spec.node_name.filter(|s| !s.is_empty()) {
+                    spec_json["nodeName"] = v.into();
+                }
+                if let Some(ns) = spec.node_selector {
+                    spec_json["nodeSelector"] = gen_node_selector_to_json(ns);
+                }
+                if let Some(true) = spec.all_nodes {
+                    spec_json["allNodes"] = true.into();
+                }
+                if !spec.devices.is_empty() {
+                    spec_json["devices"] = spec
+                        .devices
+                        .into_iter()
+                        .map(old_gen_device_to_json)
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                if let Some(true) = spec.per_device_node_selection {
+                    spec_json["perDeviceNodeSelection"] = true.into();
+                }
+                if !spec.shared_counters.is_empty() {
+                    spec_json["sharedCounters"] = spec
+                        .shared_counters
+                        .into_iter()
+                        .map(old_gen_counter_set_to_json)
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                out["spec"] = spec_json;
+            }
+            Some(out)
+        }
+
+        // Same sentinel-populated fixtures the sentinel-completeness tests above use, so this
+        // audit exercises every field (including the RawExtension-adjacent opaque-config chains)
+        // rather than just the plain-scalar happy path a thinner fixture would cover.
+        let dc = resource_v1::DeviceClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::DeviceClassSpec {
+                config: vec![resource_v1::DeviceClassConfiguration {
+                    device_configuration: Some(resource_v1::DeviceConfiguration {
+                        opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                            driver: Some("__sentinel__".to_string()),
+                            parameters: Some(
+                                u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                    raw: Some(br#"1"#.to_vec()),
+                                },
+                            ),
+                        }),
+                    }),
+                }],
+                ..resource_v1::DeviceClassSpec::sentinel()
+            }),
+        };
+        let mut dc_buf = Vec::new();
+        dc.encode(&mut dc_buf).unwrap();
+        assert_eq!(
+            old_decode_deviceclass_proto_gen(&dc_buf),
+            decode_deviceclass_proto_gen(&dc_buf),
+            "codegen-generated decode_deviceclass_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — any divergence here is a silent field drop \
+             introduced by this migration"
+        );
+
+        let rc = resource_v1::ResourceClaim {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceClaimSpec {
+                devices: Some(resource_v1::DeviceClaim {
+                    config: vec![resource_v1::DeviceClaimConfiguration {
+                        device_configuration: Some(resource_v1::DeviceConfiguration {
+                            opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                driver: Some("__sentinel__".to_string()),
+                                parameters: Some(
+                                    u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                        raw: Some(br#"1"#.to_vec()),
+                                    },
+                                ),
+                            }),
+                        }),
+                        ..resource_v1::DeviceClaimConfiguration::sentinel()
+                    }],
+                    ..resource_v1::DeviceClaim::sentinel()
+                }),
+            }),
+            status: Some(resource_v1::ResourceClaimStatus {
+                devices: vec![resource_v1::AllocatedDeviceStatus {
+                    data: Some(
+                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                            raw: Some(br#"2"#.to_vec()),
+                        },
+                    ),
+                    ..resource_v1::AllocatedDeviceStatus::sentinel()
+                }],
+                allocation: Some(resource_v1::AllocationResult {
+                    devices: Some(resource_v1::DeviceAllocationResult {
+                        config: vec![resource_v1::DeviceAllocationConfiguration {
+                            device_configuration: Some(resource_v1::DeviceConfiguration {
+                                opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                    driver: Some("__sentinel__".to_string()),
+                                    parameters: Some(
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                            raw: Some(br#"3"#.to_vec()),
+                                        },
+                                    ),
+                                }),
+                            }),
+                            ..resource_v1::DeviceAllocationConfiguration::sentinel()
+                        }],
+                        ..resource_v1::DeviceAllocationResult::sentinel()
+                    }),
+                    ..resource_v1::AllocationResult::sentinel()
+                }),
+                ..resource_v1::ResourceClaimStatus::sentinel()
+            }),
+        };
+        let mut rc_buf = Vec::new();
+        rc.encode(&mut rc_buf).unwrap();
+        assert_eq!(
+            old_decode_resourceclaim_proto_gen(&rc_buf),
+            decode_resourceclaim_proto_gen(&rc_buf),
+            "codegen-generated decode_resourceclaim_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — any divergence here is a silent \
+             spec.devices/status.allocation field drop introduced by this migration"
+        );
+
+        let rct = resource_v1::ResourceClaimTemplate {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceClaimTemplateSpec {
+                spec: Some(resource_v1::ResourceClaimSpec {
+                    devices: Some(resource_v1::DeviceClaim {
+                        config: vec![resource_v1::DeviceClaimConfiguration {
+                            device_configuration: Some(resource_v1::DeviceConfiguration {
+                                opaque: Some(resource_v1::OpaqueDeviceConfiguration {
+                                    driver: Some("__sentinel__".to_string()),
+                                    parameters: Some(
+                                        u7s_proto_generated::k8s::io::apimachinery::pkg::runtime::RawExtension {
+                                            raw: Some(br#"1"#.to_vec()),
+                                        },
+                                    ),
+                                }),
+                            }),
+                            ..resource_v1::DeviceClaimConfiguration::sentinel()
+                        }],
+                        ..resource_v1::DeviceClaim::sentinel()
+                    }),
+                }),
+                ..resource_v1::ResourceClaimTemplateSpec::sentinel()
+            }),
+        };
+        let mut rct_buf = Vec::new();
+        rct.encode(&mut rct_buf).unwrap();
+        assert_eq!(
+            old_decode_resourceclaimtemplate_proto_gen(&rct_buf),
+            decode_resourceclaimtemplate_proto_gen(&rct_buf),
+            "codegen-generated decode_resourceclaimtemplate_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field"
+        );
+
+        let rs = resource_v1::ResourceSlice {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(resource_v1::ResourceSliceSpec::sentinel()),
+        };
+        let mut rs_buf = Vec::new();
+        rs.encode(&mut rs_buf).unwrap();
+        assert_eq!(
+            old_decode_resourceslice_proto_gen(&rs_buf),
+            decode_resourceslice_proto_gen(&rs_buf),
+            "codegen-generated decode_resourceslice_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field"
+        );
+
+        // A present-but-all-default spec must still round-trip identically between old and new
+        // paths — this is the exact edge case where the hand-rolled "unconditional insert if
+        // Some" convention (DeviceClass/ResourceClaim.spec, ResourceSlice.spec) diverges from the
+        // mechanical walker's own "insert only if non-empty" default, so it must be covered by a
+        // delegate rather than left to fall through mechanically.
+        let empty_spec_dc = resource_v1::DeviceClass {
+            metadata: Some(meta_v1::ObjectMeta::default()),
+            spec: Some(resource_v1::DeviceClassSpec::default()),
+        };
+        let mut empty_spec_dc_buf = Vec::new();
+        empty_spec_dc.encode(&mut empty_spec_dc_buf).unwrap();
+        assert_eq!(
+            old_decode_deviceclass_proto_gen(&empty_spec_dc_buf),
+            decode_deviceclass_proto_gen(&empty_spec_dc_buf),
+            "a DeviceClass with a present-but-empty DeviceClassSpec must still emit `spec: {{}}`, \
+             matching the pre-migration decoder's unconditional-insert-if-Some convention exactly"
+        );
     }
 }
