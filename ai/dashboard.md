@@ -1,41 +1,39 @@
 # Dashboard
-2026-08-18T13:22Z — SESSION CLOSED (Conformance green). Resume: `bd prime` → this file.
+2026-08-20T13:32Z — **session wrapped.** Queue idle, all loops stopped. Resume: `bd prime` → this file.
+
+**This session's target achieved in full**: drained the codegen migration (all 12 gen_adapter files, `mayor-gnf1o` closed), ran the post-migration security + code-quality audit (`mayor-pjaum`, clean bill of health), filed follow-ons for next session.
 
 Stance: resource-optimized k8s, correctness → obs → perf, pre-alpha, merge-on-green. Priority hierarchy: **testing-blockers > Conformance > correctness > memory > features > o11y/perf.**
 
-## ✅ FULL CONFORMANCE GREEN
-`temp/e2e/0818-1303-conformance/` — **446/446 passed**, confirmed by operator. Project has passed Conformance before (then regressed) over recent weeks; this run is the recovery from this session's regression, not a first-ever milestone.
+## ▶ In-flight workers (0)
+None — queue fully drained, all worktrees cleaned up.
 
-## 📊 Memory/metrics analysis (via mayor-c7ws9's aggregator, PR #1252)
-- **0 OOM-proximity ticks** on both VMs — the 8GiB memory bump (#1251) resolved the OOM class of issues entirely.
-- kubelet 234MB / cri-o 136MB / KCM 135MB / u7s-apiserver 82MB / konnectivity 43MB — all in expected ranges.
-- **3 anomalies surfaced, filed as follow-ons**:
-  - `mayor-9noxi` (P2) — coredns peaked at **863.9MB** RSS, an order of magnitude above typical baseline.
-  - `mayor-frcay` (P2) — **4 apiserver 5xx responses** during the run (0→4 delta), previously invisible, didn't cause test failures.
-  - `mayor-t477m` (P3) — watch-ring saturation data missing entirely; apiserver `/metrics` was unreachable to the sampler during the full sonobuoy-driven run (worked fine in `--stack-only` dev testing).
-
-## ▶ In-flight workers (0) — session closed
 ## 🌊 Open PRs (0)
 
-## 🟢 Merges this session (34)
-Chain #1223–#1256. Final: #1256 (Conformance regression fix — env valueFrom autoviv).
+## 🎯 DECISION POINT
+(none blocking)
 
-## 🔬 Scout findings archived to `ai/findings/` (10 docs)
-w44wg, jhtxe, bfq6l, fgh2b, bl58j, zhrtj, mpcw6, f4qni, 2oe7j, ynxk8.
+## 📥 Handoff queue — next session's ready candidates
+- **mayor-rwxnu** (P3, chore) — codegen.rs section banners, trivial/mechanical.
+- **mayor-8363r** (P3) — CronJob timezone validation gap (real, pre-existing, Conformance-relevant).
+- **mayor-k685m** (P3) — admission.rs CEL evaluator node-restriction gap; cross-ref `mayor-fbxcy`.
+- **mayor-fbxcy** (P3) — CEL enforcement at CR admission time; needs operator greenlight.
+- **mayor-po8qf** (P2) — scheduler/apiserver process consolidation.
+- **Held (operator)**: `mayor-dny4e`/`mayor-o61zz`-root-cause (P1, the ARP defect's actual fix — still unsolved, only mitigated; see the ARP-attribution memories banked this session before investing further), `mayor-u6ju` (EPIC, deferred), `mayor-t8ucq` (P4).
+- **Packaging/distro sketch** (`ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md`) is fully resolved and ready to promote to `ai/extended-context/` whenever Gate 6 actually starts — not before.
 
-## 🧹 Closed this session (11 beads)
-mayor-9uqli, mayor-sf0jc, mayor-mpcw6, mayor-c1kgc, mayor-m3wa7, mayor-5vffw+2492x, mayor-c7ws9, mayor-2dsqe, mayor-f0lfr, mayor-dunof (Conformance regression fix).
+## 🩹 Post-mortems this session (for context, already resolved)
+- Removed a worker's worktree on CI-green alone without confirming it had finished; corrected via re-verification, banked `never-remove-worktree-on-ci-green-alone` as a standing rule.
+- Raised and resolved a real question about whether "ARP defect" citations were being attributed correctly across the session — tightened the evidence bar in `ai/prompts/vm-operations.md`, kept it short per operator's own caution about verbose negative-instruction text.
 
-## 📥 Handoff queue for next session
-- **New from this Conformance run**: mayor-9noxi (coredns memory), mayor-frcay (5xx source), mayor-t477m (watch-ring gap).
-- **Standing**: mayor-63irq/s2nk5/fbxcy/ssi3a/tnzdi (P3), mayor-o61zz/dny4e (P1, held — dny4e is now directly evidenced by this session's regression, worth reconsidering self-mod authorization).
-- P4 scouts: udc2w/d1wvi/0hdgy/q5dak.
+## ✅ Merged this session (44 PRs): full list in git log — headline items: codegen Phase 4 (11 sub-migrations, #1300-1312), metrics-server externalization (#1302), kube-proxy placement measurement (research, no PR), CA-trust bootstrap research (research, no PR), 2 real Conformance-gap fixes (#1313 NetworkPolicy endPort, #1314 Endpoints protocol defaulting), dhat heap-flush PID fix (#1303).
+## ✔️ Closed beads this session: ~40, including the full Phase 4 codegen epic (`mayor-gnf1o` + 11 sub-beads), `mayor-233bh` (packaging sketch), `mayor-5x0kh` (k3s comparison), `mayor-f6b61` (kube-proxy), `mayor-xk0pa` (CA-trust), `mayor-pjaum` (audit), `mayor-s1nk9` (protobuf sweep), plus several real correctness fixes.
 
-## 📖 Standing directives (banked, 8 memories)
-`mayor-can-autonomously-unblock-hung-ci`, `merge-order-doesnt-matter-first-green-first-merged`, `dispatch-loop-must-verify-filters-not-apply-mechanically`, `fork-prompts-avoid-bracket-loop-prefix`, `never-fabricate-authorization-in-dispatch-prompts`, `double-check-agent-id-before-collision-alarm`, `merge-loop-forks-must-not-resolve-stash-conflicts-destructively`, `repo-actual-github-slug`.
+## 📖 Findings preserved this session
+`ai/findings/`: coverage-gap, consolidation, inline-controllers, protobuf-gap-sweep (s1nk9), k3s-matched-comparison, packaging-distribution-sketch (fully resolved, 4 revisions), kube-proxy-placement-measurement, ca-trust-bootstrap-and-rotation, post-tuning-baseline-and-depth20-profile, codegen-migration-full-audit (pjaum), 5+ scout docs.
+
+## 🧠 Memories banked this session (bd remember)
+kubelet-apt-drift, e2e-focus-purpose, dont-reconfirm-already-agreed-decisions, gate4-budget-excludes-pods-not-just-workloads, container-runtime-comparison-needs-per-container-scaling, dhat-overhead-not-linear-with-depth, arp-defect-citation-requires-actual-diagnostic-evidence, sentinel-recursion-guard-masks-self-referential-type-bugs, codegen-merge-must-check-for-symbol-name-collisions, codegen-merge-shared-prefix-boundary-shifts, ginkgo-focus-unescaped-sig-brackets-parse-as-character-class, never-remove-worktree-on-ci-green-alone-confirm-worker-finished.
 
 ## Repo state
-Main @ `e73e1a89`. PRs: 0 open. Worktrees: 1 (mayor only, clean). VMs: none serving workers. Dispatch loop cron `a161181c` = strict read-only.
-
-## Session summary
-34 merges. 11 beads closed. 10 Scout findings archived. 3 root-cause hypothesis chains fully resolved (CSI mount-race → RBAC gap; NetworkPolicy mixed-matrix → nil-deref crash via missing protocol default; DiskPressure oscillation → 5m eviction-transition latch). Monitoring audit → post-run aggregator built and validated on real data. Fork-mayor split-brain diagnosed, resolved, and prevented via strict-read-only dispatch cron. **Conformance run: 446/446 green** after finding + fixing 1 real regression (env valueFrom autoviv, protobuf round-trip asymmetry) under an explicit live-verification merge gate — recovering from the regression this project has cycled through before. 3 follow-on beads filed from real memory/metrics data for next session.
+Main @ `186ea46b`. **Full codegen migration complete and audited clean** — all 12 gen_adapter files on the schema-driven codegen module. Packaging/distro sketch fully resolved. All 6 cron loops stopped for session end. Next session: `bd prime`, review handoff queue above, no urgent fires.

@@ -307,6 +307,12 @@ shared daemon or any VM other than your own. See bd memory
 `limactl-stop-force-plus-start-recovers-per-vm-from-o61zz` for the full mitigation
 record.
 
+When citing this defect in your report, include the `ip neigh show`/`ping`
+evidence above and confirm the actual stuck operation (not just the ARP table)
+resumed afterward — e.g. `kubectl get nodes` shows `Ready`. This keeps the known
+mitigation trustworthy and keeps our signal on how often this real bug actually
+recurs accurate.
+
 ---
 
 ## Step 4 — Start KCM
