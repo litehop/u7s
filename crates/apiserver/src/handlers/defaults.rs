@@ -35,6 +35,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
+    if let ("", "endpoints") = (group, plural) {
+        default_endpoints(obj);
+    }
     if plural == "events" && (group.is_empty() || group == "events.k8s.io") {
         translate_event_shape(obj);
         normalize_event_timestamps(obj);
@@ -463,6 +466,31 @@ fn default_networkpolicy(obj: &mut serde_json::Value) {
                 if port["protocol"].is_null() {
                     port["protocol"] = serde_json::Value::String("TCP".to_string());
                 }
+            }
+        }
+    }
+}
+
+/// Default `Endpoints.subsets[].ports[].protocol` to `"TCP"` when absent, matching real
+/// Kubernetes' `SetDefaults_Endpoints` (pkg/apis/core/v1/defaults.go). Never overwrites an
+/// explicit value.
+///
+/// Without this, a hand-created Endpoints object that omits `protocol` (a valid,
+/// upstream-legal shape) is mirrored by the KCM EndpointSlice mirroring controller into a
+/// discovery/v1 EndpointSlice with `ports[].protocol: ""` verbatim. kube-proxy's
+/// `endpointslicecache.go` does not recognize the empty string as TCP and silently
+/// programs no dataplane rule for that port.
+fn default_endpoints(obj: &mut serde_json::Value) {
+    let Some(subsets) = obj["subsets"].as_array_mut() else {
+        return;
+    };
+    for subset in subsets.iter_mut() {
+        let Some(ports) = subset["ports"].as_array_mut() else {
+            continue;
+        };
+        for port in ports.iter_mut() {
+            if port["protocol"].is_null() {
+                port["protocol"] = serde_json::Value::String("TCP".to_string());
             }
         }
     }
@@ -1739,6 +1767,71 @@ mod tests {
             obj["spec"]["ports"][0]["protocol"], "UDP",
             "existing spec.ports[].protocol must not be overwritten — changing UDP to TCP \
              breaks UDP services"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Endpoints subset port protocol defaulting
+    // ---------------------------------------------------------------------------
+
+    /// A hand-created Endpoints subset port with no protocol must have protocol
+    /// defaulted to TCP on the Endpoints object itself, at admission time.
+    ///
+    /// This asserts on the Endpoints object (not the mirrored EndpointSlice) because
+    /// the endpointslicemirroring controller is the real upstream kube-controller-manager
+    /// binary running against this apiserver, not code in this repo — the only layer we
+    /// control is defaulting the source Endpoints object before KCM ever reads it, exactly
+    /// matching upstream's own `SetDefaults_Endpoints`
+    /// (pkg/apis/core/v1/defaults.go), which runs at decode time in kube-apiserver itself.
+    /// Without this default, the mirroring controller copies `protocol: ""` verbatim into
+    /// the mirrored EndpointSlice, and kube-proxy's `endpointslicecache.go` does not treat
+    /// the empty string as TCP — it silently programs no dataplane rule for that port, so a
+    /// client-facing curl to the Service ClusterIP gets connection refused.
+    #[test]
+    fn endpoints_subset_port_protocol_defaults_to_tcp_when_omitted() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": { "name": "custom-endpoints", "namespace": "default" },
+            "subsets": [{
+                "addresses": [{ "ip": "10.0.0.1" }],
+                "ports": [{ "name": "http", "port": 80 }]
+            }]
+        });
+
+        apply_defaults("", "endpoints", &mut obj);
+
+        assert_eq!(
+            obj["subsets"][0]["ports"][0]["protocol"], "TCP",
+            "subsets[].ports[].protocol must default to TCP — absent protocol is mirrored \
+             verbatim as protocol:'' into the EndpointSlice, which kube-proxy silently \
+             drops instead of programming a dataplane rule for"
+        );
+    }
+
+    /// An Endpoints subset port with an explicit protocol must not be overwritten.
+    ///
+    /// A port with protocol: UDP must stay UDP; silently overwriting it to TCP would
+    /// break UDP services relying on a hand-created Endpoints object (e.g. headless
+    /// services fronting an external UDP backend).
+    #[test]
+    fn endpoints_subset_port_existing_protocol_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": { "name": "custom-endpoints", "namespace": "default" },
+            "subsets": [{
+                "addresses": [{ "ip": "10.0.0.1" }],
+                "ports": [{ "name": "dns", "port": 53, "protocol": "UDP" }]
+            }]
+        });
+
+        apply_defaults("", "endpoints", &mut obj);
+
+        assert_eq!(
+            obj["subsets"][0]["ports"][0]["protocol"], "UDP",
+            "existing subsets[].ports[].protocol must not be overwritten — changing UDP to \
+             TCP breaks UDP services"
         );
     }
 
