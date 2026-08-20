@@ -322,6 +322,151 @@ fn main() {
         codegen::generate_controllerrevision(descriptor_bytes),
     )
     .expect("failed to write generated ControllerRevision codec");
+    std::fs::write(
+        out_dir.join("csinode_driver_gen.rs"),
+        codegen::generate_csinode_driver(descriptor_bytes),
+    )
+    .expect("failed to write generated CSINodeDriver codec");
+    std::fs::write(
+        out_dir.join("csinode_gen.rs"),
+        codegen::generate_csinode(descriptor_bytes),
+    )
+    .expect("failed to write generated CSINode codec");
+    std::fs::write(
+        out_dir.join("token_request_gen.rs"),
+        codegen::generate_token_request(descriptor_bytes),
+    )
+    .expect("failed to write generated TokenRequest codec");
+    std::fs::write(
+        out_dir.join("csidriverspec_gen.rs"),
+        codegen::generate_csidriverspec(descriptor_bytes),
+    )
+    .expect("failed to write generated CSIDriverSpec codec");
+    std::fs::write(
+        out_dir.join("csidriver_gen.rs"),
+        codegen::generate_csidriver(descriptor_bytes),
+    )
+    .expect("failed to write generated CSIDriver codec");
+    std::fs::write(
+        out_dir.join("csistoragecapacity_gen.rs"),
+        codegen::generate_csistoragecapacity(descriptor_bytes),
+    )
+    .expect("failed to write generated CSIStorageCapacity codec");
+    std::fs::write(
+        out_dir.join("volume_error_gen.rs"),
+        codegen::generate_volume_error(descriptor_bytes),
+    )
+    .expect("failed to write generated VolumeError codec");
+    std::fs::write(
+        out_dir.join("volumeattachmentspec_gen.rs"),
+        codegen::generate_volumeattachmentspec(descriptor_bytes),
+    )
+    .expect("failed to write generated VolumeAttachmentSpec codec");
+    std::fs::write(
+        out_dir.join("volumeattachmentstatus_gen.rs"),
+        codegen::generate_volumeattachmentstatus(descriptor_bytes),
+    )
+    .expect("failed to write generated VolumeAttachmentStatus codec");
+    std::fs::write(
+        out_dir.join("volumeattachment_gen.rs"),
+        codegen::generate_volumeattachment(descriptor_bytes),
+    )
+    .expect("failed to write generated VolumeAttachment codec");
+    std::fs::write(
+        out_dir.join("storageclass_gen.rs"),
+        codegen::generate_storageclass(descriptor_bytes),
+    )
+    .expect("failed to write generated StorageClass codec");
+    std::fs::write(
+        out_dir.join("volumeattributesclass_gen.rs"),
+        codegen::generate_volumeattributesclass(descriptor_bytes),
+    )
+    .expect("failed to write generated VolumeAttributesClass codec");
+    std::fs::write(
+        out_dir.join("runtimeclass_gen.rs"),
+        codegen::generate_runtimeclass(descriptor_bytes),
+    )
+    .expect("failed to write generated RuntimeClass codec");
+    std::fs::write(
+        out_dir.join("priorityclass_gen.rs"),
+        codegen::generate_priorityclass(descriptor_bytes),
+    )
+    .expect("failed to write generated PriorityClass codec");
+    std::fs::write(
+        out_dir.join("flowcontrol_subject_gen.rs"),
+        codegen::generate_flowcontrol_subject(descriptor_bytes),
+    )
+    .expect("failed to write generated flowcontrol.v1 Subject codec");
+    std::fs::write(
+        out_dir.join("resource_policy_rule_gen.rs"),
+        codegen::generate_resource_policy_rule(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourcePolicyRule codec");
+    std::fs::write(
+        out_dir.join("policy_rules_with_subjects_gen.rs"),
+        codegen::generate_policy_rules_with_subjects(descriptor_bytes),
+    )
+    .expect("failed to write generated PolicyRulesWithSubjects codec");
+    std::fs::write(
+        out_dir.join("flowschema_condition_gen.rs"),
+        codegen::generate_flowschema_condition(descriptor_bytes),
+    )
+    .expect("failed to write generated FlowSchemaCondition codec");
+    std::fs::write(
+        out_dir.join("flowschemaspec_gen.rs"),
+        codegen::generate_flowschemaspec(descriptor_bytes),
+    )
+    .expect("failed to write generated FlowSchemaSpec codec");
+    std::fs::write(
+        out_dir.join("flowschemastatus_gen.rs"),
+        codegen::generate_flowschemastatus(descriptor_bytes),
+    )
+    .expect("failed to write generated FlowSchemaStatus codec");
+    std::fs::write(
+        out_dir.join("flowschema_gen.rs"),
+        codegen::generate_flowschema(descriptor_bytes),
+    )
+    .expect("failed to write generated FlowSchema codec");
+    std::fs::write(
+        out_dir.join("queuing_configuration_gen.rs"),
+        codegen::generate_queuing_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated QueuingConfiguration codec");
+    std::fs::write(
+        out_dir.join("limit_response_gen.rs"),
+        codegen::generate_limit_response(descriptor_bytes),
+    )
+    .expect("failed to write generated LimitResponse codec");
+    std::fs::write(
+        out_dir.join("limited_priority_level_configuration_gen.rs"),
+        codegen::generate_limited_priority_level_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated LimitedPriorityLevelConfiguration codec");
+    std::fs::write(
+        out_dir.join("exempt_priority_level_configuration_gen.rs"),
+        codegen::generate_exempt_priority_level_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated ExemptPriorityLevelConfiguration codec");
+    std::fs::write(
+        out_dir.join("priority_level_configuration_condition_gen.rs"),
+        codegen::generate_priority_level_configuration_condition(descriptor_bytes),
+    )
+    .expect("failed to write generated PriorityLevelConfigurationCondition codec");
+    std::fs::write(
+        out_dir.join("prioritylevelconfigurationspec_gen.rs"),
+        codegen::generate_prioritylevelconfigurationspec(descriptor_bytes),
+    )
+    .expect("failed to write generated PriorityLevelConfigurationSpec codec");
+    std::fs::write(
+        out_dir.join("prioritylevelconfigurationstatus_gen.rs"),
+        codegen::generate_prioritylevelconfigurationstatus(descriptor_bytes),
+    )
+    .expect("failed to write generated PriorityLevelConfigurationStatus codec");
+    std::fs::write(
+        out_dir.join("prioritylevelconfiguration_gen.rs"),
+        codegen::generate_prioritylevelconfiguration(descriptor_bytes),
+    )
+    .expect("failed to write generated PriorityLevelConfiguration codec");
 
     println!(
         "cargo:rerun-if-changed={}",
