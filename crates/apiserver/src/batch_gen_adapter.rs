@@ -17,377 +17,43 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
     crate::core_gen_adapter::gen_label_selector_to_json(sel)
 }
 
-fn gen_pod_failure_policy_to_json(pfp: batch_v1::PodFailurePolicy) -> serde_json::Value {
-    let rules: Vec<serde_json::Value> = pfp
-        .rules
-        .into_iter()
-        .map(|r| {
-            let mut rule = serde_json::json!({});
-            if let Some(v) = r.action.filter(|s| !s.is_empty()) {
-                rule["action"] = v.into();
-            }
-            if let Some(ec) = r.on_exit_codes {
-                let mut ec_json = serde_json::json!({});
-                if let Some(v) = ec.container_name.filter(|s| !s.is_empty()) {
-                    ec_json["containerName"] = v.into();
-                }
-                if let Some(v) = ec.operator.filter(|s| !s.is_empty()) {
-                    ec_json["operator"] = v.into();
-                }
-                if !ec.values.is_empty() {
-                    ec_json["values"] = ec
-                        .values
-                        .into_iter()
-                        .map(serde_json::Value::from)
-                        .collect::<Vec<_>>()
-                        .into();
-                }
-                rule["onExitCodes"] = ec_json;
-            }
-            if !r.on_pod_conditions.is_empty() {
-                rule["onPodConditions"] = r
-                    .on_pod_conditions
-                    .into_iter()
-                    .map(|c| {
-                        let mut cond = serde_json::json!({});
-                        if let Some(v) = c.r#type.filter(|s| !s.is_empty()) {
-                            cond["type"] = v.into();
-                        }
-                        if let Some(v) = c.status.filter(|s| !s.is_empty()) {
-                            cond["status"] = v.into();
-                        }
-                        cond
-                    })
-                    .collect::<Vec<_>>()
-                    .into();
-            }
-            rule
-        })
-        .collect();
-    serde_json::json!({ "rules": rules })
-}
-
-fn gen_success_policy_to_json(sp: batch_v1::SuccessPolicy) -> serde_json::Value {
-    let rules: Vec<serde_json::Value> = sp
-        .rules
-        .into_iter()
-        .map(|r| {
-            let mut rule = serde_json::json!({});
-            if let Some(v) = r.succeeded_indexes.filter(|s| !s.is_empty()) {
-                rule["succeededIndexes"] = v.into();
-            }
-            if let Some(v) = r.succeeded_count {
-                rule["succeededCount"] = v.into();
-            }
-            rule
-        })
-        .collect();
-    serde_json::json!({ "rules": rules })
-}
-
-fn gen_job_spec_to_json(spec: batch_v1::JobSpec) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    // parallelism/completions/activeDeadlineSeconds/backoffLimit/ttlSecondsAfterFinished are
-    // upstream *int32/*int64 (proto3 optional); Some(0) is a legitimate value (e.g. "run 0 pods
-    // in parallel", "retry 0 times") distinct from absent, so these must always be emitted
-    // when Some(_).
-    if let Some(v) = spec.parallelism {
-        m.insert("parallelism".to_string(), v.into());
-    }
-    if let Some(v) = spec.completions {
-        m.insert("completions".to_string(), v.into());
-    }
-    if let Some(v) = spec.active_deadline_seconds {
-        m.insert("activeDeadlineSeconds".to_string(), v.into());
-    }
-    if let Some(v) = spec.backoff_limit {
-        m.insert("backoffLimit".to_string(), v.into());
-    }
-    if let Some(v) = spec.ttl_seconds_after_finished {
-        m.insert("ttlSecondsAfterFinished".to_string(), v.into());
-    }
-    if let Some(v) = spec.completion_mode.filter(|s| !s.is_empty()) {
-        m.insert("completionMode".to_string(), v.into());
-    }
-    if let Some(true) = spec.suspend {
-        m.insert("suspend".to_string(), true.into());
-    }
-    if let Some(v) = spec.pod_replacement_policy.filter(|s| !s.is_empty()) {
-        m.insert("podReplacementPolicy".to_string(), v.into());
-    }
-    if let Some(v) = spec.backoff_limit_per_index {
-        m.insert("backoffLimitPerIndex".to_string(), v.into());
-    }
-    if let Some(v) = spec.max_failed_indexes {
-        m.insert("maxFailedIndexes".to_string(), v.into());
-    }
-    if let Some(v) = spec.managed_by.filter(|s| !s.is_empty()) {
-        m.insert("managedBy".to_string(), v.into());
-    }
-    if let Some(sel) = spec.selector {
-        m.insert("selector".to_string(), gen_label_selector_to_json(sel));
-    }
-    if let Some(true) = spec.manual_selector {
-        m.insert("manualSelector".to_string(), true.into());
-    }
-    if let Some(pfp) = spec.pod_failure_policy {
-        m.insert(
-            "podFailurePolicy".to_string(),
-            gen_pod_failure_policy_to_json(pfp),
-        );
-    }
-    if let Some(sp) = spec.success_policy {
-        m.insert("successPolicy".to_string(), gen_success_policy_to_json(sp));
-    }
-    let tmpl_json = if let Some(tmpl) = spec.template {
-        let t = gen_pod_template_spec_to_json(tmpl);
-        if t.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-            serde_json::Value::Object(serde_json::Map::new())
-        } else {
-            t
-        }
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
-    };
-    m.insert("template".to_string(), tmpl_json);
-    serde_json::Value::Object(m)
-}
+// `gen_pod_failure_policy_to_json`/`gen_success_policy_to_json`/`gen_job_spec_to_json`/
+// `gen_job_status_to_json`/`gen_job_to_json`/`gen_cronjob_spec_to_json`/
+// `gen_cronjob_status_to_json`/`gen_cronjob_to_json` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.batch.v1.*` descriptors — `metadata` delegates to `gen_object_meta_to_json`,
+// `selector`/`template` delegate to the existing hand-written `gen_label_selector_to_json`/
+// `gen_pod_template_spec_to_json`, and every `Time`-typed field delegates to a hand-written
+// RFC3339 conversion the mechanical walker has no rule for; see
+// `build/codegen.rs::job_spec_delegated_field`/`job_status_delegated_field`/
+// `job_delegated_field`/`cronjob_spec_delegated_field`/`cronjob_status_delegated_field`/
+// `cronjob_delegated_field` for the full per-field rationale.
+include!(concat!(env!("OUT_DIR"), "/pod_failure_policy_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/success_policy_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/job_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/job_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/job_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/cronjob_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/cronjob_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/cronjob_gen.rs"));
 
 // ---- Decoder A: Job --------------------------------------------------------
 
 pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let job = batch_v1::Job::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(job.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": meta
-    });
-    if let Some(spec) = job.spec {
-        out["spec"] = gen_job_spec_to_json(spec);
-    }
-    if let Some(status) = job.status {
-        let mut status_json = serde_json::json!({});
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type.clone().unwrap_or_default(),
-                        "status": c.status.clone().unwrap_or_default(),
-                    });
-                    if let Some(ref r) = c.reason {
-                        if !r.is_empty() {
-                            cond["reason"] = r.clone().into();
-                        }
-                    }
-                    if let Some(ref msg) = c.message {
-                        if !msg.is_empty() {
-                            cond["message"] = msg.clone().into();
-                        }
-                    }
-                    if let Some(t) = c.last_probe_time.as_ref() {
-                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cond["lastProbeTime"] = crate::util::secs_to_rfc3339(secs).into();
-                        }
-                    }
-                    if let Some(t) = c.last_transition_time.as_ref() {
-                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cond["lastTransitionTime"] = crate::util::secs_to_rfc3339(secs).into();
-                        }
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if let Some(t) = status.start_time.as_ref() {
-            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                status_json["startTime"] = crate::util::secs_to_rfc3339(secs).into();
-            }
-        }
-        if let Some(t) = status.completion_time.as_ref() {
-            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                status_json["completionTime"] = crate::util::secs_to_rfc3339(secs).into();
-            }
-        }
-        // active/succeeded/failed/ready/terminating are upstream *int32 (proto3
-        // optional); Some(0) is a legitimate value (e.g. 0 pods currently ready)
-        // distinct from absent, so these must always be emitted when Some(_).
-        if let Some(v) = status.active {
-            status_json["active"] = v.into();
-        }
-        if let Some(v) = status.succeeded {
-            status_json["succeeded"] = v.into();
-        }
-        if let Some(v) = status.failed {
-            status_json["failed"] = v.into();
-        }
-        if let Some(v) = status.completed_indexes.filter(|s| !s.is_empty()) {
-            status_json["completedIndexes"] = v.into();
-        }
-        if let Some(utp) = status.uncounted_terminated_pods {
-            let mut utp_map = serde_json::Map::new();
-            if !utp.succeeded.is_empty() {
-                utp_map.insert(
-                    "succeeded".to_string(),
-                    utp.succeeded
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect::<Vec<_>>()
-                        .into(),
-                );
-            }
-            if !utp.failed.is_empty() {
-                utp_map.insert(
-                    "failed".to_string(),
-                    utp.failed
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect::<Vec<_>>()
-                        .into(),
-                );
-            }
-            // Always emit the key when the proto field is Some, even if both lists are empty:
-            // upstream's Job controller treats non-nil-ness of this pointer as load-bearing
-            // state (JobTrackingWithFinalizers) and nil-derefs if a present-but-empty struct
-            // round-trips as absent (job_controller.go:1568).
-            status_json["uncountedTerminatedPods"] = serde_json::Value::Object(utp_map);
-        }
-        if let Some(v) = status.ready {
-            status_json["ready"] = v.into();
-        }
-        if let Some(v) = status.failed_indexes.filter(|s| !s.is_empty()) {
-            status_json["failedIndexes"] = v.into();
-        }
-        if let Some(v) = status.terminating {
-            status_json["terminating"] = v.into();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["status"] = status_json;
-        }
-    }
-    Some(out)
+    let mut obj = gen_job_to_json(job);
+    obj["apiVersion"] = "batch/v1".into();
+    obj["kind"] = "Job".into();
+    Some(obj)
 }
 
 // ---- Decoder A: CronJob ----------------------------------------------------
 
 pub fn decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let cj = batch_v1::CronJob::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(cj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "batch/v1",
-        "kind": "CronJob",
-        "metadata": meta
-    });
-    if let Some(spec) = cj.spec {
-        let mut spec_map = serde_json::Map::new();
-        if let Some(v) = spec.schedule.filter(|s| !s.is_empty()) {
-            spec_map.insert("schedule".to_string(), v.into());
-        }
-        // startingDeadlineSeconds/successfulJobsHistoryLimit/failedJobsHistoryLimit are
-        // upstream *int64/*int32 (proto3 optional); Some(0) is a legitimate value (e.g. "keep
-        // no history") distinct from absent, so these must always be emitted when Some(_).
-        if let Some(v) = spec.starting_deadline_seconds {
-            spec_map.insert("startingDeadlineSeconds".to_string(), v.into());
-        }
-        if let Some(v) = spec.concurrency_policy.filter(|s| !s.is_empty()) {
-            spec_map.insert("concurrencyPolicy".to_string(), v.into());
-        }
-        if let Some(true) = spec.suspend {
-            spec_map.insert("suspend".to_string(), true.into());
-        }
-        if let Some(v) = spec.successful_jobs_history_limit {
-            spec_map.insert("successfulJobsHistoryLimit".to_string(), v.into());
-        }
-        if let Some(v) = spec.failed_jobs_history_limit {
-            spec_map.insert("failedJobsHistoryLimit".to_string(), v.into());
-        }
-        if let Some(v) = spec.time_zone.filter(|s| !s.is_empty()) {
-            spec_map.insert("timeZone".to_string(), v.into());
-        }
-        let jt_meta = spec
-            .job_template
-            .as_ref()
-            .and_then(|jt| jt.metadata.clone())
-            .map(gen_object_meta_to_json)
-            .unwrap_or_else(|| serde_json::json!({"creationTimestamp": serde_json::Value::Null}));
-        let jt_spec = spec
-            .job_template
-            .and_then(|jt| jt.spec)
-            .map(gen_job_spec_to_json)
-            .unwrap_or_else(|| serde_json::json!({"template": {}}));
-        spec_map.insert(
-            "jobTemplate".to_string(),
-            serde_json::json!({
-                "metadata": jt_meta,
-                "spec": jt_spec
-            }),
-        );
-        out["spec"] = serde_json::Value::Object(spec_map);
-    }
-    if let Some(status) = cj.status {
-        let mut status_json = serde_json::json!({});
-        if !status.active.is_empty() {
-            status_json["active"] = status
-                .active
-                .iter()
-                .filter_map(|r| {
-                    let name = r.name.as_deref().unwrap_or("");
-                    let ns = r.namespace.as_deref().unwrap_or("");
-                    if name.is_empty() && ns.is_empty() {
-                        return None;
-                    }
-                    let mut entry = serde_json::json!({});
-                    if !name.is_empty() {
-                        entry["name"] = name.to_string().into();
-                    }
-                    if !ns.is_empty() {
-                        entry["namespace"] = ns.to_string().into();
-                    }
-                    if let Some(v) = r.kind.as_deref().filter(|s| !s.is_empty()) {
-                        entry["kind"] = v.to_string().into();
-                    }
-                    if let Some(v) = r.api_version.as_deref().filter(|s| !s.is_empty()) {
-                        entry["apiVersion"] = v.to_string().into();
-                    }
-                    if let Some(v) = r.uid.as_deref().filter(|s| !s.is_empty()) {
-                        entry["uid"] = v.to_string().into();
-                    }
-                    if let Some(v) = r.resource_version.as_deref().filter(|s| !s.is_empty()) {
-                        entry["resourceVersion"] = v.to_string().into();
-                    }
-                    if let Some(v) = r.field_path.as_deref().filter(|s| !s.is_empty()) {
-                        entry["fieldPath"] = v.to_string().into();
-                    }
-                    Some(entry)
-                })
-                .collect::<Vec<_>>()
-                .into();
-        }
-        if let Some(t) = status.last_schedule_time.as_ref() {
-            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                status_json["lastScheduleTime"] = crate::util::secs_to_rfc3339(secs).into();
-            }
-        }
-        if let Some(t) = status.last_successful_time.as_ref() {
-            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                status_json["lastSuccessfulTime"] = crate::util::secs_to_rfc3339(secs).into();
-            }
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["status"] = status_json;
-        }
-    }
-    Some(out)
+    let mut obj = gen_cronjob_to_json(cj);
+    obj["apiVersion"] = "batch/v1".into();
+    obj["kind"] = "CronJob".into();
+    Some(obj)
 }
 
 // ---- Tests -----------------------------------------------------------------
@@ -1378,5 +1044,453 @@ mod tests {
             "lastSuccessfulTime",
         ];
         assert_fields_present(&paths, &expected);
+    }
+
+    // ---- Byte-identical audit: codegen migration (Phase 4.7) ----
+    //
+    // Reconstructs the pre-migration hand-written `gen_pod_failure_policy_to_json`/
+    // `gen_success_policy_to_json`/`gen_job_spec_to_json`/`decode_job_proto_gen`/
+    // `decode_cronjob_proto_gen` verbatim (renamed `old_*` to avoid colliding with the
+    // codegen-generated functions of the same name this migration installed) and diffs their
+    // output, on `Sentinel::sentinel()`-populated Job/CronJob values, against the real
+    // `decode_job_proto_gen`/`decode_cronjob_proto_gen` entry points. A wrong field name, a
+    // missing `!= 0`/true-only guard, or a dropped `Time`/`onExitCodes`/`jobTemplate` default in
+    // `build/codegen.rs` would show up here as a JSON mismatch — the same class of silent field
+    // drop this codebase's Phase 4 migrations exist to make structurally unrepresentable.
+    #[test]
+    fn codegen_migration_batch_family_matches_pre_migration_hand_written_output() {
+        fn old_gen_pod_failure_policy_to_json(
+            pfp: batch_v1::PodFailurePolicy,
+        ) -> serde_json::Value {
+            let rules: Vec<serde_json::Value> = pfp
+                .rules
+                .into_iter()
+                .map(|r| {
+                    let mut rule = serde_json::json!({});
+                    if let Some(v) = r.action.filter(|s| !s.is_empty()) {
+                        rule["action"] = v.into();
+                    }
+                    if let Some(ec) = r.on_exit_codes {
+                        let mut ec_json = serde_json::json!({});
+                        if let Some(v) = ec.container_name.filter(|s| !s.is_empty()) {
+                            ec_json["containerName"] = v.into();
+                        }
+                        if let Some(v) = ec.operator.filter(|s| !s.is_empty()) {
+                            ec_json["operator"] = v.into();
+                        }
+                        if !ec.values.is_empty() {
+                            ec_json["values"] = ec
+                                .values
+                                .into_iter()
+                                .map(serde_json::Value::from)
+                                .collect::<Vec<_>>()
+                                .into();
+                        }
+                        rule["onExitCodes"] = ec_json;
+                    }
+                    if !r.on_pod_conditions.is_empty() {
+                        rule["onPodConditions"] = r
+                            .on_pod_conditions
+                            .into_iter()
+                            .map(|c| {
+                                let mut cond = serde_json::json!({});
+                                if let Some(v) = c.r#type.filter(|s| !s.is_empty()) {
+                                    cond["type"] = v.into();
+                                }
+                                if let Some(v) = c.status.filter(|s| !s.is_empty()) {
+                                    cond["status"] = v.into();
+                                }
+                                cond
+                            })
+                            .collect::<Vec<_>>()
+                            .into();
+                    }
+                    rule
+                })
+                .collect();
+            serde_json::json!({ "rules": rules })
+        }
+
+        fn old_gen_success_policy_to_json(sp: batch_v1::SuccessPolicy) -> serde_json::Value {
+            let rules: Vec<serde_json::Value> = sp
+                .rules
+                .into_iter()
+                .map(|r| {
+                    let mut rule = serde_json::json!({});
+                    if let Some(v) = r.succeeded_indexes.filter(|s| !s.is_empty()) {
+                        rule["succeededIndexes"] = v.into();
+                    }
+                    if let Some(v) = r.succeeded_count {
+                        rule["succeededCount"] = v.into();
+                    }
+                    rule
+                })
+                .collect();
+            serde_json::json!({ "rules": rules })
+        }
+
+        fn old_gen_job_spec_to_json(spec: batch_v1::JobSpec) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = spec.parallelism {
+                m.insert("parallelism".to_string(), v.into());
+            }
+            if let Some(v) = spec.completions {
+                m.insert("completions".to_string(), v.into());
+            }
+            if let Some(v) = spec.active_deadline_seconds {
+                m.insert("activeDeadlineSeconds".to_string(), v.into());
+            }
+            if let Some(v) = spec.backoff_limit {
+                m.insert("backoffLimit".to_string(), v.into());
+            }
+            if let Some(v) = spec.ttl_seconds_after_finished {
+                m.insert("ttlSecondsAfterFinished".to_string(), v.into());
+            }
+            if let Some(v) = spec.completion_mode.filter(|s| !s.is_empty()) {
+                m.insert("completionMode".to_string(), v.into());
+            }
+            if let Some(true) = spec.suspend {
+                m.insert("suspend".to_string(), true.into());
+            }
+            if let Some(v) = spec.pod_replacement_policy.filter(|s| !s.is_empty()) {
+                m.insert("podReplacementPolicy".to_string(), v.into());
+            }
+            if let Some(v) = spec.backoff_limit_per_index {
+                m.insert("backoffLimitPerIndex".to_string(), v.into());
+            }
+            if let Some(v) = spec.max_failed_indexes {
+                m.insert("maxFailedIndexes".to_string(), v.into());
+            }
+            if let Some(v) = spec.managed_by.filter(|s| !s.is_empty()) {
+                m.insert("managedBy".to_string(), v.into());
+            }
+            if let Some(sel) = spec.selector {
+                m.insert("selector".to_string(), gen_label_selector_to_json(sel));
+            }
+            if let Some(true) = spec.manual_selector {
+                m.insert("manualSelector".to_string(), true.into());
+            }
+            if let Some(pfp) = spec.pod_failure_policy {
+                m.insert(
+                    "podFailurePolicy".to_string(),
+                    old_gen_pod_failure_policy_to_json(pfp),
+                );
+            }
+            if let Some(sp) = spec.success_policy {
+                m.insert(
+                    "successPolicy".to_string(),
+                    old_gen_success_policy_to_json(sp),
+                );
+            }
+            let tmpl_json = if let Some(tmpl) = spec.template {
+                let t = gen_pod_template_spec_to_json(tmpl);
+                if t.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    serde_json::Value::Object(serde_json::Map::new())
+                } else {
+                    t
+                }
+            } else {
+                serde_json::Value::Object(serde_json::Map::new())
+            };
+            m.insert("template".to_string(), tmpl_json);
+            serde_json::Value::Object(m)
+        }
+
+        fn old_decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let job = batch_v1::Job::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(job.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": meta
+            });
+            if let Some(spec) = job.spec {
+                out["spec"] = old_gen_job_spec_to_json(spec);
+            }
+            if let Some(status) = job.status {
+                let mut status_json = serde_json::json!({});
+                if !status.conditions.is_empty() {
+                    status_json["conditions"] = status
+                        .conditions
+                        .iter()
+                        .map(|c| {
+                            let mut cond = serde_json::json!({
+                                "type": c.r#type.clone().unwrap_or_default(),
+                                "status": c.status.clone().unwrap_or_default(),
+                            });
+                            if let Some(ref r) = c.reason {
+                                if !r.is_empty() {
+                                    cond["reason"] = r.clone().into();
+                                }
+                            }
+                            if let Some(ref msg) = c.message {
+                                if !msg.is_empty() {
+                                    cond["message"] = msg.clone().into();
+                                }
+                            }
+                            if let Some(t) = c.last_probe_time.as_ref() {
+                                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                                    cond["lastProbeTime"] =
+                                        crate::util::secs_to_rfc3339(secs).into();
+                                }
+                            }
+                            if let Some(t) = c.last_transition_time.as_ref() {
+                                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                                    cond["lastTransitionTime"] =
+                                        crate::util::secs_to_rfc3339(secs).into();
+                                }
+                            }
+                            cond
+                        })
+                        .collect();
+                }
+                if let Some(t) = status.start_time.as_ref() {
+                    if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                        status_json["startTime"] = crate::util::secs_to_rfc3339(secs).into();
+                    }
+                }
+                if let Some(t) = status.completion_time.as_ref() {
+                    if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                        status_json["completionTime"] = crate::util::secs_to_rfc3339(secs).into();
+                    }
+                }
+                if let Some(v) = status.active {
+                    status_json["active"] = v.into();
+                }
+                if let Some(v) = status.succeeded {
+                    status_json["succeeded"] = v.into();
+                }
+                if let Some(v) = status.failed {
+                    status_json["failed"] = v.into();
+                }
+                if let Some(v) = status.completed_indexes.filter(|s| !s.is_empty()) {
+                    status_json["completedIndexes"] = v.into();
+                }
+                if let Some(utp) = status.uncounted_terminated_pods {
+                    let mut utp_map = serde_json::Map::new();
+                    if !utp.succeeded.is_empty() {
+                        utp_map.insert(
+                            "succeeded".to_string(),
+                            utp.succeeded
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect::<Vec<_>>()
+                                .into(),
+                        );
+                    }
+                    if !utp.failed.is_empty() {
+                        utp_map.insert(
+                            "failed".to_string(),
+                            utp.failed
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect::<Vec<_>>()
+                                .into(),
+                        );
+                    }
+                    status_json["uncountedTerminatedPods"] = serde_json::Value::Object(utp_map);
+                }
+                if let Some(v) = status.ready {
+                    status_json["ready"] = v.into();
+                }
+                if let Some(v) = status.failed_indexes.filter(|s| !s.is_empty()) {
+                    status_json["failedIndexes"] = v.into();
+                }
+                if let Some(v) = status.terminating {
+                    status_json["terminating"] = v.into();
+                }
+                if status_json
+                    .as_object()
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false)
+                {
+                    out["status"] = status_json;
+                }
+            }
+            Some(out)
+        }
+
+        fn old_decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let cj = batch_v1::CronJob::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(cj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": meta
+            });
+            if let Some(spec) = cj.spec {
+                let mut spec_map = serde_json::Map::new();
+                if let Some(v) = spec.schedule.filter(|s| !s.is_empty()) {
+                    spec_map.insert("schedule".to_string(), v.into());
+                }
+                if let Some(v) = spec.starting_deadline_seconds {
+                    spec_map.insert("startingDeadlineSeconds".to_string(), v.into());
+                }
+                if let Some(v) = spec.concurrency_policy.filter(|s| !s.is_empty()) {
+                    spec_map.insert("concurrencyPolicy".to_string(), v.into());
+                }
+                if let Some(true) = spec.suspend {
+                    spec_map.insert("suspend".to_string(), true.into());
+                }
+                if let Some(v) = spec.successful_jobs_history_limit {
+                    spec_map.insert("successfulJobsHistoryLimit".to_string(), v.into());
+                }
+                if let Some(v) = spec.failed_jobs_history_limit {
+                    spec_map.insert("failedJobsHistoryLimit".to_string(), v.into());
+                }
+                if let Some(v) = spec.time_zone.filter(|s| !s.is_empty()) {
+                    spec_map.insert("timeZone".to_string(), v.into());
+                }
+                let jt_meta = spec
+                    .job_template
+                    .as_ref()
+                    .and_then(|jt| jt.metadata.clone())
+                    .map(gen_object_meta_to_json)
+                    .unwrap_or_else(
+                        || serde_json::json!({"creationTimestamp": serde_json::Value::Null}),
+                    );
+                let jt_spec = spec
+                    .job_template
+                    .and_then(|jt| jt.spec)
+                    .map(old_gen_job_spec_to_json)
+                    .unwrap_or_else(|| serde_json::json!({"template": {}}));
+                spec_map.insert(
+                    "jobTemplate".to_string(),
+                    serde_json::json!({
+                        "metadata": jt_meta,
+                        "spec": jt_spec
+                    }),
+                );
+                out["spec"] = serde_json::Value::Object(spec_map);
+            }
+            if let Some(status) = cj.status {
+                let mut status_json = serde_json::json!({});
+                if !status.active.is_empty() {
+                    status_json["active"] = status
+                        .active
+                        .iter()
+                        .filter_map(|r| {
+                            let name = r.name.as_deref().unwrap_or("");
+                            let ns = r.namespace.as_deref().unwrap_or("");
+                            if name.is_empty() && ns.is_empty() {
+                                return None;
+                            }
+                            let mut entry = serde_json::json!({});
+                            if !name.is_empty() {
+                                entry["name"] = name.to_string().into();
+                            }
+                            if !ns.is_empty() {
+                                entry["namespace"] = ns.to_string().into();
+                            }
+                            if let Some(v) = r.kind.as_deref().filter(|s| !s.is_empty()) {
+                                entry["kind"] = v.to_string().into();
+                            }
+                            if let Some(v) = r.api_version.as_deref().filter(|s| !s.is_empty()) {
+                                entry["apiVersion"] = v.to_string().into();
+                            }
+                            if let Some(v) = r.uid.as_deref().filter(|s| !s.is_empty()) {
+                                entry["uid"] = v.to_string().into();
+                            }
+                            if let Some(v) = r.resource_version.as_deref().filter(|s| !s.is_empty())
+                            {
+                                entry["resourceVersion"] = v.to_string().into();
+                            }
+                            if let Some(v) = r.field_path.as_deref().filter(|s| !s.is_empty()) {
+                                entry["fieldPath"] = v.to_string().into();
+                            }
+                            Some(entry)
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                if let Some(t) = status.last_schedule_time.as_ref() {
+                    if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                        status_json["lastScheduleTime"] = crate::util::secs_to_rfc3339(secs).into();
+                    }
+                }
+                if let Some(t) = status.last_successful_time.as_ref() {
+                    if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                        status_json["lastSuccessfulTime"] =
+                            crate::util::secs_to_rfc3339(secs).into();
+                    }
+                }
+                if status_json
+                    .as_object()
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false)
+                {
+                    out["status"] = status_json;
+                }
+            }
+            Some(out)
+        }
+
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("audit-job".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(batch_v1::JobSpec::sentinel()),
+            status: Some(batch_v1::JobStatus::sentinel()),
+        };
+        let mut job_bytes = Vec::new();
+        job.encode(&mut job_bytes).unwrap();
+        assert_eq!(
+            old_decode_job_proto_gen(&job_bytes),
+            decode_job_proto_gen(&job_bytes),
+            "codegen-generated decode_job_proto_gen must match the pre-migration hand-written \
+             decoder field-for-field — any divergence here is a silent field drop introduced by \
+             the Phase 4.7 migration"
+        );
+
+        // A Job with a present-but-all-default spec/status must still match the pre-migration
+        // decoder's own emptiness guards (e.g. `status` entirely omitted, `template` defaulting
+        // to `{}`), not just the fully-populated sentinel case above.
+        let empty_job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta::default()),
+            spec: Some(batch_v1::JobSpec::default()),
+            status: Some(batch_v1::JobStatus::default()),
+        };
+        let mut empty_job_bytes = Vec::new();
+        empty_job.encode(&mut empty_job_bytes).unwrap();
+        assert_eq!(
+            old_decode_job_proto_gen(&empty_job_bytes),
+            decode_job_proto_gen(&empty_job_bytes),
+            "a Job with present-but-empty spec/status must match the pre-migration decoder \
+             exactly, including its `template: {{}}` default and its omit-if-empty `status` guard"
+        );
+
+        let cj = batch_v1::CronJob {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("audit-cj".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(batch_v1::CronJobSpec::sentinel()),
+            status: Some(batch_v1::CronJobStatus::sentinel()),
+        };
+        let mut cj_bytes = Vec::new();
+        cj.encode(&mut cj_bytes).unwrap();
+        assert_eq!(
+            old_decode_cronjob_proto_gen(&cj_bytes),
+            decode_cronjob_proto_gen(&cj_bytes),
+            "codegen-generated decode_cronjob_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field"
+        );
+
+        let empty_cj = batch_v1::CronJob {
+            metadata: Some(meta_v1::ObjectMeta::default()),
+            spec: Some(batch_v1::CronJobSpec::default()),
+            status: Some(batch_v1::CronJobStatus::default()),
+        };
+        let mut empty_cj_bytes = Vec::new();
+        empty_cj.encode(&mut empty_cj_bytes).unwrap();
+        assert_eq!(
+            old_decode_cronjob_proto_gen(&empty_cj_bytes),
+            decode_cronjob_proto_gen(&empty_cj_bytes),
+            "a CronJob with present-but-empty spec/status must match the pre-migration decoder \
+             exactly, including its `jobTemplate` defaults and its omit-if-empty `status` guard"
+        );
     }
 }
