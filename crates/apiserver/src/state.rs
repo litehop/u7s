@@ -2127,25 +2127,20 @@ mod tests {
         );
     }
 
-    /// Offsets .10 (kube-dns) and .11 (metrics-server) must never be handed to an
-    /// ordinary dynamic Service.
+    /// Offset .10 (kube-dns) must never be handed to an ordinary dynamic Service.
     ///
-    /// Both addon Services get their fixed clusterIPs written directly to the store,
-    /// bypassing `allocate_service_ip`. If the seed functions don't also write the
-    /// allocator's own sentinel key for those IPs, the allocator's hint (which starts
-    /// at offset 2 and advances by 1 per call) walks straight over them: the 9th
-    /// dynamic allocation collides with kube-dns's VIP and the 10th with
-    /// metrics-server's, so kube-proxy ends up programming two Services onto one VIP
-    /// and cluster DNS (or metrics-server) breaks unpredictably.
+    /// kube-dns's Service gets its fixed clusterIP written directly to the store,
+    /// bypassing `allocate_service_ip`. If `seed_services` didn't also write the
+    /// allocator's own sentinel key for that IP, the allocator's hint (which starts
+    /// at offset 2 and advances by 1 per call) would walk straight over it: the 9th
+    /// dynamic allocation would collide with kube-dns's VIP, so kube-proxy ends up
+    /// programming two Services onto one VIP and cluster DNS breaks unpredictably.
     #[tokio::test]
-    async fn dot_ten_reserved_for_kube_dns_and_dot_eleven_for_metrics_server() {
+    async fn dot_ten_reserved_for_kube_dns() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
         crate::seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
             .await
             .expect("seed_services must not fail");
-        crate::seed_metrics_server(&store, "10.96.0.0/12")
-            .await
-            .expect("seed_metrics_server must not fail");
 
         let alloc = ServiceIpAllocator::from_cidr("10.96.0.0/12").expect("valid CIDR");
         let state = AppState::new_with_config(AppStateConfig {
@@ -2166,11 +2161,10 @@ mod tests {
         });
 
         let kube_dns_ip: Ipv4Addr = "10.96.0.10".parse().unwrap();
-        let metrics_server_ip: Ipv4Addr = "10.96.0.11".parse().unwrap();
 
         // hint starts at offset 2 and .1 is skipped for non-kubernetes services, so
-        // 12 sequential allocations would walk offsets 2..=13 absent the sentinels —
-        // covering both offset 10 and offset 11.
+        // 12 sequential allocations would walk offsets 2..=13 absent the sentinel —
+        // covering offset 10.
         for _ in 0..12 {
             let ip = state
                 .allocate_service_ip(false)
@@ -2180,10 +2174,6 @@ mod tests {
             assert_ne!(
                 ip, kube_dns_ip,
                 "kube-dns's fixed clusterIP must never be handed to a dynamic Service"
-            );
-            assert_ne!(
-                ip, metrics_server_ip,
-                "metrics-server's fixed clusterIP must never be handed to a dynamic Service"
             );
         }
     }

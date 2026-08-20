@@ -403,6 +403,17 @@ if [ -z "${KUBECONFIG:-}" ]; then
 fi
 echo "Using KUBECONFIG=$KUBECONFIG"
 
+# metrics-server: the apiserver's own boot sequence no longer seeds this addon (it isn't
+# required for Conformance certification), but real HorizontalPodAutoscaler (Resource/CPU
+# memory) usage still needs it -- KCM's HPA controller polls metrics.k8s.io, and without a
+# backend registered there every Resource-type HPA target is permanently stuck. Applied
+# unconditionally, every run, straight after the apiserver is reachable -- convenient for
+# manual debugging and required by non-Conformance-tagged HPA/DRA e2e coverage. See
+# crates/apiserver/manifests/metrics-server.yaml for provenance and the deviations from
+# upstream's stock manifest.
+banner "Applying metrics-server manifest"
+kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/crates/apiserver/manifests/metrics-server.yaml"
+
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
