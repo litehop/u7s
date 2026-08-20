@@ -222,6 +222,71 @@ fn main() {
         codegen::generate_leasecandidate(descriptor_bytes),
     )
     .expect("failed to write generated LeaseCandidate codec");
+    std::fs::write(
+        out_dir.join("deployment_spec_gen.rs"),
+        codegen::generate_deployment_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated DeploymentSpec codec");
+    std::fs::write(
+        out_dir.join("deployment_status_gen.rs"),
+        codegen::generate_deployment_status(descriptor_bytes),
+    )
+    .expect("failed to write generated DeploymentStatus codec");
+    std::fs::write(
+        out_dir.join("deployment_gen.rs"),
+        codegen::generate_deployment(descriptor_bytes),
+    )
+    .expect("failed to write generated Deployment codec");
+    std::fs::write(
+        out_dir.join("statefulset_spec_gen.rs"),
+        codegen::generate_statefulset_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated StatefulSetSpec codec");
+    std::fs::write(
+        out_dir.join("statefulset_status_gen.rs"),
+        codegen::generate_statefulset_status(descriptor_bytes),
+    )
+    .expect("failed to write generated StatefulSetStatus codec");
+    std::fs::write(
+        out_dir.join("statefulset_gen.rs"),
+        codegen::generate_statefulset(descriptor_bytes),
+    )
+    .expect("failed to write generated StatefulSet codec");
+    std::fs::write(
+        out_dir.join("daemonset_spec_gen.rs"),
+        codegen::generate_daemonset_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated DaemonSetSpec codec");
+    std::fs::write(
+        out_dir.join("daemonset_status_gen.rs"),
+        codegen::generate_daemonset_status(descriptor_bytes),
+    )
+    .expect("failed to write generated DaemonSetStatus codec");
+    std::fs::write(
+        out_dir.join("daemonset_gen.rs"),
+        codegen::generate_daemonset(descriptor_bytes),
+    )
+    .expect("failed to write generated DaemonSet codec");
+    std::fs::write(
+        out_dir.join("replicaset_spec_gen.rs"),
+        codegen::generate_replicaset_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ReplicaSetSpec codec");
+    std::fs::write(
+        out_dir.join("replicaset_status_gen.rs"),
+        codegen::generate_replicaset_status(descriptor_bytes),
+    )
+    .expect("failed to write generated ReplicaSetStatus codec");
+    std::fs::write(
+        out_dir.join("replicaset_gen.rs"),
+        codegen::generate_replicaset(descriptor_bytes),
+    )
+    .expect("failed to write generated ReplicaSet codec");
+    std::fs::write(
+        out_dir.join("controllerrevision_gen.rs"),
+        codegen::generate_controllerrevision(descriptor_bytes),
+    )
+    .expect("failed to write generated ControllerRevision codec");
 
     println!(
         "cargo:rerun-if-changed={}",
