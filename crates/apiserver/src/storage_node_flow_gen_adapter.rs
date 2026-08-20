@@ -14,6 +14,12 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
     crate::core_gen_adapter::gen_label_selector_to_json(sel)
 }
 
+fn gen_persistentvolumespec_to_json(
+    spec: u7s_proto_generated::k8s::io::api::core::v1::PersistentVolumeSpec,
+) -> serde_json::Value {
+    crate::core_gen_adapter::gen_persistentvolumespec_to_json(spec)
+}
+
 fn gen_quantity_opt_to_json(
     q: Option<u7s_proto_generated::k8s::io::apimachinery::pkg::api::resource::Quantity>,
 ) -> Option<serde_json::Value> {
@@ -217,6 +223,12 @@ pub fn decode_volumeattachment_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                 source_map.insert(
                     "persistentVolumeName".to_string(),
                     serde_json::Value::String(v),
+                );
+            }
+            if let Some(v) = src.inline_volume_spec {
+                source_map.insert(
+                    "inlineVolumeSpec".to_string(),
+                    gen_persistentvolumespec_to_json(v),
                 );
             }
         }
@@ -1473,10 +1485,11 @@ mod tests {
     // (used by both attachError and detachError) were found missing from this file.
     //
     // VolumeAttachmentSource.inlineVolumeSpec (a full core/v1 PersistentVolumeSpec, used only by
-    // the legacy CSIMigration in-tree-plugin-translation path) is deliberately left unhandled
-    // and excluded from `expected` below: implementing it would mean duplicating a large
-    // fraction of PersistentVolumeSpec's own JSON translation for a feature u7s has no in-tree
-    // volume plugins to migrate from. Flagged here rather than guessed at.
+    // the legacy CSIMigration in-tree-plugin-translation path) is decoded via
+    // core_gen_adapter's shared `gen_persistentvolumespec_to_json` rather than re-deriving
+    // PersistentVolumeSpec's own JSON translation here; see
+    // `sentinel_completeness_decode_volumeattachment_proto_gen_inline_volume_spec` below for its
+    // own dedicated, schema-derived completeness check.
 
     use std::collections::BTreeSet;
     use u7s_sentinel::Sentinel;
@@ -1624,7 +1637,9 @@ mod tests {
             "attacher",
             "nodeName",
             "persistentVolumeName",
-            // inlineVolumeSpec deliberately excluded — see the module-level note above.
+            // inlineVolumeSpec is mutually exclusive with persistentVolumeName on a real
+            // VolumeAttachment (upstream: "Exactly one member can be set"), so it is left unset
+            // here and checked by its own dedicated test below instead.
             "attached",
             "attachmentMetadata.__sentinel__",
             "message",
@@ -1632,6 +1647,120 @@ mod tests {
             "errorCode",
         ]);
         assert_fields_present(&paths, &expected);
+    }
+
+    /// Sentinel completeness for the `inlineVolumeSpec` branch of
+    /// `decode_volumeattachment_proto_gen`, gated against the schema itself rather than a
+    /// hand-typed list.
+    ///
+    /// `inlineVolumeSpec` embeds a full `PersistentVolumeSpec` (~42 leaf fields) that CSI
+    /// migration populates to translate a pod's in-tree volume into an external-attacher's
+    /// attach call; before this fix `src.inline_volume_spec` was read nowhere in this file, so
+    /// every such attach request decoded with an empty `spec.source` and the attacher had
+    /// nothing to attach.
+    #[test]
+    fn sentinel_completeness_decode_volumeattachment_proto_gen_inline_volume_spec() {
+        let obj = storage_v1::VolumeAttachment {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(storage_v1::VolumeAttachmentSpec {
+                source: Some(storage_v1::VolumeAttachmentSource {
+                    persistent_volume_name: None,
+                    inline_volume_spec: Some(
+                        u7s_proto_generated::k8s::io::api::core::v1::PersistentVolumeSpec::sentinel(
+                        ),
+                    ),
+                }),
+                ..storage_v1::VolumeAttachmentSpec::sentinel()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_volumeattachment_proto_gen(&buf)
+            .expect("sentinel VolumeAttachment must decode via the generated path");
+
+        let mut paths = BTreeSet::new();
+        collect_leaf_paths(
+            &result["spec"]["source"]["inlineVolumeSpec"],
+            "",
+            &mut paths,
+        );
+
+        let expected = crate::proto_descriptor::expected_json_keys_for(&[
+            ".k8s.io.api.core.v1.PersistentVolumeSpec",
+        ]);
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_fields_present(&paths, &expected);
+    }
+
+    /// `decode_volumeattachment_proto_gen` must translate `spec.source.inlineVolumeSpec` — a
+    /// full `PersistentVolumeSpec` CSI migration attaches translated in-tree-plugin fields to —
+    /// rather than silently dropping it to `{}`. Without this, the external-attacher controller
+    /// reads a VolumeAttachment whose source names no volume at all and has nothing to attach.
+    #[test]
+    fn decode_volumeattachment_proto_gen_preserves_inline_volume_spec() {
+        let obj = storage_v1::VolumeAttachment {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("va-migrated".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(storage_v1::VolumeAttachmentSpec {
+                attacher: Some("pd.csi.storage.gke.io".to_string()),
+                node_name: Some("node-1".to_string()),
+                source: Some(storage_v1::VolumeAttachmentSource {
+                    persistent_volume_name: None,
+                    inline_volume_spec: Some(
+                        u7s_proto_generated::k8s::io::api::core::v1::PersistentVolumeSpec {
+                            capacity: [(
+                                "storage".to_string(),
+                                quantity("10Gi"),
+                            )]
+                            .into_iter()
+                            .collect(),
+                            persistent_volume_source: Some(
+                                u7s_proto_generated::k8s::io::api::core::v1::PersistentVolumeSource {
+                                    nfs: Some(
+                                        u7s_proto_generated::k8s::io::api::core::v1::NfsVolumeSource {
+                                            server: Some("nfs.example.com".to_string()),
+                                            path: Some("/exports/data".to_string()),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                }),
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let result = decode_volumeattachment_proto_gen(&buf).expect("VolumeAttachment must decode");
+        assert_eq!(
+            result["spec"]["source"]["inlineVolumeSpec"]["nfs"]["server"], "nfs.example.com",
+            "inlineVolumeSpec.nfs.server must survive — before this fix inline_volume_spec was \
+             read nowhere in this file, so a CSI-migration attach request decoded with an empty \
+             source object and the external-attacher had no volume to attach"
+        );
+        assert_eq!(
+            result["spec"]["source"]["inlineVolumeSpec"]["nfs"]["path"], "/exports/data",
+            "inlineVolumeSpec.nfs.path must survive — it is the actual export path the attacher \
+             mounts"
+        );
+        assert_eq!(
+            result["spec"]["source"]["inlineVolumeSpec"]["capacity"]["storage"], "10Gi",
+            "inlineVolumeSpec.capacity must survive — kube-controller-manager's PV/PVC matching \
+             compares it directly"
+        );
+        assert!(
+            result["spec"]["source"]["persistentVolumeName"].is_null(),
+            "persistentVolumeName must stay absent when inlineVolumeSpec is the populated \
+             variant — upstream documents source's two members as mutually exclusive"
+        );
     }
 
     #[test]

@@ -187,6 +187,41 @@ fn main() {
         codegen::generate_serviceaccount(descriptor_bytes),
     )
     .expect("failed to write generated ServiceAccount codec");
+    std::fs::write(
+        out_dir.join("apiservice_spec_gen.rs"),
+        codegen::generate_apiservice_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated APIServiceSpec codec");
+    std::fs::write(
+        out_dir.join("apiservice_status_gen.rs"),
+        codegen::generate_apiservice_status(descriptor_bytes),
+    )
+    .expect("failed to write generated APIServiceStatus codec");
+    std::fs::write(
+        out_dir.join("apiservice_gen.rs"),
+        codegen::generate_apiservice(descriptor_bytes),
+    )
+    .expect("failed to write generated APIService codec");
+    std::fs::write(
+        out_dir.join("lease_spec_gen.rs"),
+        codegen::generate_lease_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated LeaseSpec codec");
+    std::fs::write(
+        out_dir.join("lease_gen.rs"),
+        codegen::generate_lease(descriptor_bytes),
+    )
+    .expect("failed to write generated Lease codec");
+    std::fs::write(
+        out_dir.join("leasecandidate_spec_gen.rs"),
+        codegen::generate_leasecandidate_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated LeaseCandidateSpec codec");
+    std::fs::write(
+        out_dir.join("leasecandidate_gen.rs"),
+        codegen::generate_leasecandidate(descriptor_bytes),
+    )
+    .expect("failed to write generated LeaseCandidate codec");
 
     println!(
         "cargo:rerun-if-changed={}",
