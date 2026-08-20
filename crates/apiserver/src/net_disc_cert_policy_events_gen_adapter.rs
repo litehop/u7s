@@ -1,6 +1,7 @@
 use prost::Message;
 
 use u7s_proto_generated::k8s::io::api::certificates::v1 as certs_v1;
+use u7s_proto_generated::k8s::io::api::core::v1 as core_v1;
 use u7s_proto_generated::k8s::io::api::discovery::v1 as discovery_v1;
 use u7s_proto_generated::k8s::io::api::events::v1 as events_v1;
 use u7s_proto_generated::k8s::io::api::networking::v1 as networking_v1;
@@ -21,31 +22,86 @@ fn gen_int_or_string_to_json(
     crate::core_gen_adapter::gen_int_or_string_to_json(ios)
 }
 
-fn gen_object_reference_to_json(
-    r: u7s_proto_generated::k8s::io::api::core::v1::ObjectReference,
-) -> serde_json::Value {
+/// `meta/v1` `Condition`'s `type`/`status`/`reason`/`message` are plain optional strings and
+/// `lastTransitionTime` a bare `Time` needing RFC3339 conversion — shared verbatim across every
+/// `*_gen_adapter.rs` file that reaches this type (see e.g. `resource_gen_adapter.rs`'s own
+/// `gen_meta_condition_to_json`), since each keeps its own private copy rather than a shared
+/// `pub(crate)` helper. Used by `ServiceCIDRStatus.conditions`/`PodDisruptionBudgetStatus.conditions`.
+fn gen_meta_condition_to_json(c: meta_v1::Condition) -> serde_json::Value {
     let mut m = serde_json::Map::new();
-    if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
-        m.insert("kind".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.r#type.filter(|s| !s.is_empty()) {
+        m.insert("type".to_string(), serde_json::Value::String(v));
     }
-    if let Some(v) = r.namespace.filter(|s| !s.is_empty()) {
-        m.insert("namespace".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.status.filter(|s| !s.is_empty()) {
+        m.insert("status".to_string(), serde_json::Value::String(v));
     }
-    if let Some(v) = r.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+        m.insert(
+            "observedGeneration".to_string(),
+            serde_json::Value::Number(v.into()),
+        );
     }
-    if let Some(v) = r.uid.filter(|s| !s.is_empty()) {
-        m.insert("uid".to_string(), serde_json::Value::String(v));
+    if let Some(t) = c.last_transition_time {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            m.insert(
+                "lastTransitionTime".to_string(),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
+            );
+        }
     }
-    if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
-        m.insert("apiVersion".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+        m.insert("reason".to_string(), serde_json::Value::String(v));
     }
-    if let Some(v) = r.resource_version.filter(|s| !s.is_empty()) {
-        m.insert("resourceVersion".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+        m.insert("message".to_string(), serde_json::Value::String(v));
     }
-    if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
-        m.insert("fieldPath".to_string(), serde_json::Value::String(v));
+    serde_json::Value::Object(m)
+}
+
+/// `CertificateSigningRequestCondition` is its own type (not `meta/v1`'s shared `Condition`): it
+/// has both `lastUpdateTime` and `lastTransitionTime`, and no `observedGeneration`.
+fn gen_csr_condition_to_json(c: certs_v1::CertificateSigningRequestCondition) -> serde_json::Value {
+    let mut m = serde_json::json!({
+        "type": c.r#type.unwrap_or_default(),
+        "status": c.status.unwrap_or_default(),
+    });
+    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+        m["reason"] = v.into();
     }
+    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+        m["message"] = v.into();
+    }
+    if let Some(t) = c.last_update_time {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            m["lastUpdateTime"] = crate::util::secs_to_rfc3339(secs).into();
+        }
+    }
+    if let Some(t) = c.last_transition_time {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            m["lastTransitionTime"] = crate::util::secs_to_rfc3339(secs).into();
+        }
+    }
+    m
+}
+
+/// `PodDisruptionBudgetStatus.disruptedPods` is a `map<string, Time>` — a shape the mechanical
+/// codegen walker doesn't recognize (only `map<string, string>`/`map<string, Quantity>` have a
+/// generic branch), so this stays hand-written.
+fn gen_disrupted_pods_to_json(
+    pods: impl IntoIterator<Item = (String, meta_v1::Time)>,
+) -> serde_json::Value {
+    let m: serde_json::Map<String, serde_json::Value> = pods
+        .into_iter()
+        .map(|(pod_name, t)| {
+            let secs = t.seconds.unwrap_or(0);
+            let ts = if secs > 0 {
+                crate::util::secs_to_rfc3339(secs)
+            } else {
+                "1970-01-01T00:00:00Z".to_string()
+            };
+            (pod_name, serde_json::Value::String(ts))
+        })
+        .collect();
     serde_json::Value::Object(m)
 }
 
@@ -89,196 +145,117 @@ fn gen_ingress_backend_to_json(b: networking_v1::IngressBackend) -> serde_json::
     serde_json::Value::Object(out)
 }
 
+/// `IngressRule.ingressRuleValue` is a Go `json:",inline"` embed: `IngressRuleValue.http`'s own
+/// `paths` field lands directly on the rule's own JSON object, never nested under an
+/// `"ingressRuleValue"` key. This is the one piece of `IngressSpec` the mechanical codegen walker
+/// (`generate_ingress_spec` in `build/codegen.rs`) can't express, so `rules` delegates wholesale
+/// here — reusing the mechanically-safe `gen_ingress_backend_to_json` above for each path's own
+/// `backend`.
+fn gen_ingress_rules_to_json(rules: Vec<networking_v1::IngressRule>) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = rules
+        .into_iter()
+        .map(|r| {
+            let mut rj = serde_json::Map::new();
+            if let Some(h) = r.host.filter(|s| !s.is_empty()) {
+                rj.insert("host".to_string(), serde_json::Value::String(h));
+            }
+            if let Some(irv) = r.ingress_rule_value {
+                if let Some(http) = irv.http {
+                    let paths_arr: Vec<serde_json::Value> = http
+                        .paths
+                        .into_iter()
+                        .map(|p| {
+                            let mut pj = serde_json::Map::new();
+                            if let Some(path) = p.path.filter(|s| !s.is_empty()) {
+                                pj.insert("path".to_string(), serde_json::Value::String(path));
+                            }
+                            if let Some(pt) = p.path_type.filter(|s| !s.is_empty()) {
+                                pj.insert("pathType".to_string(), serde_json::Value::String(pt));
+                            }
+                            if let Some(b) = p.backend {
+                                pj.insert("backend".to_string(), gen_ingress_backend_to_json(b));
+                            }
+                            serde_json::Value::Object(pj)
+                        })
+                        .collect();
+                    rj.insert(
+                        "http".to_string(),
+                        serde_json::json!({ "paths": paths_arr }),
+                    );
+                }
+            }
+            serde_json::Value::Object(rj)
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+// `gen_ingress_spec_to_json`/`gen_ingress_to_json` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.networking.v1.IngressSpec`/`Ingress` descriptors — `metadata` delegates to
+// `gen_object_meta_to_json`, `IngressSpec.rules` delegates to `gen_ingress_rules_to_json` above,
+// and `spec` delegates wholesale to the separately generated `gen_ingress_spec_to_json`;
+// `defaultBackend`/`tls`/`status` are fully mechanical. See
+// `build/codegen.rs::ingress_spec_delegated_field`/`ingress_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/ingress_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/ingress_gen.rs"));
+
 pub fn decode_ingress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = networking_v1::Ingress::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if let Some(cn) = spec.ingress_class_name.filter(|s| !s.is_empty()) {
-            spec_json.insert(
-                "ingressClassName".to_string(),
-                serde_json::Value::String(cn),
-            );
-        }
-        if let Some(db) = spec.default_backend {
-            spec_json.insert(
-                "defaultBackend".to_string(),
-                gen_ingress_backend_to_json(db),
-            );
-        }
-        if !spec.tls.is_empty() {
-            let tls_arr: Vec<serde_json::Value> = spec
-                .tls
-                .into_iter()
-                .map(|t| {
-                    let mut tj = serde_json::Map::new();
-                    if !t.hosts.is_empty() {
-                        tj.insert(
-                            "hosts".to_string(),
-                            serde_json::Value::Array(
-                                t.hosts.into_iter().map(serde_json::Value::String).collect(),
-                            ),
-                        );
-                    }
-                    if let Some(sn) = t.secret_name.filter(|s| !s.is_empty()) {
-                        tj.insert("secretName".to_string(), serde_json::Value::String(sn));
-                    }
-                    serde_json::Value::Object(tj)
-                })
-                .collect();
-            spec_json.insert("tls".to_string(), serde_json::Value::Array(tls_arr));
-        }
-        if !spec.rules.is_empty() {
-            let rules_arr: Vec<serde_json::Value> = spec
-                .rules
-                .into_iter()
-                .map(|r| {
-                    let mut rj = serde_json::Map::new();
-                    if let Some(h) = r.host.filter(|s| !s.is_empty()) {
-                        rj.insert("host".to_string(), serde_json::Value::String(h));
-                    }
-                    if let Some(irv) = r.ingress_rule_value {
-                        if let Some(http) = irv.http {
-                            let paths_arr: Vec<serde_json::Value> = http
-                                .paths
-                                .into_iter()
-                                .map(|p| {
-                                    let mut pj = serde_json::Map::new();
-                                    if let Some(path) = p.path.filter(|s| !s.is_empty()) {
-                                        pj.insert(
-                                            "path".to_string(),
-                                            serde_json::Value::String(path),
-                                        );
-                                    }
-                                    if let Some(pt) = p.path_type.filter(|s| !s.is_empty()) {
-                                        pj.insert(
-                                            "pathType".to_string(),
-                                            serde_json::Value::String(pt),
-                                        );
-                                    }
-                                    if let Some(b) = p.backend {
-                                        pj.insert(
-                                            "backend".to_string(),
-                                            gen_ingress_backend_to_json(b),
-                                        );
-                                    }
-                                    serde_json::Value::Object(pj)
-                                })
-                                .collect();
-                            rj.insert(
-                                "http".to_string(),
-                                serde_json::json!({ "paths": paths_arr }),
-                            );
-                        }
-                    }
-                    serde_json::Value::Object(rj)
-                })
-                .collect();
-            spec_json.insert("rules".to_string(), serde_json::Value::Array(rules_arr));
-        }
-        if !spec_json.is_empty() {
-            out["spec"] = serde_json::Value::Object(spec_json);
-        }
-    }
-    if let Some(status) = obj.status {
-        if let Some(lb) = status.load_balancer {
-            if !lb.ingress.is_empty() {
-                let ingress: Vec<serde_json::Value> = lb
-                    .ingress
-                    .into_iter()
-                    .map(|i| {
-                        let mut im = serde_json::Map::new();
-                        if let Some(v) = i.ip.filter(|s| !s.is_empty()) {
-                            im.insert("ip".to_string(), serde_json::Value::String(v));
-                        }
-                        if let Some(v) = i.hostname.filter(|s| !s.is_empty()) {
-                            im.insert("hostname".to_string(), serde_json::Value::String(v));
-                        }
-                        if !i.ports.is_empty() {
-                            let ports: Vec<serde_json::Value> = i
-                                .ports
-                                .into_iter()
-                                .map(|p| {
-                                    let mut pm = serde_json::Map::new();
-                                    if let Some(v) = p.port.filter(|&n| n != 0) {
-                                        pm.insert(
-                                            "port".to_string(),
-                                            serde_json::Value::Number(v.into()),
-                                        );
-                                    }
-                                    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
-                                        pm.insert(
-                                            "protocol".to_string(),
-                                            serde_json::Value::String(v),
-                                        );
-                                    }
-                                    if let Some(v) = p.error.filter(|s| !s.is_empty()) {
-                                        pm.insert(
-                                            "error".to_string(),
-                                            serde_json::Value::String(v),
-                                        );
-                                    }
-                                    serde_json::Value::Object(pm)
-                                })
-                                .collect();
-                            im.insert("ports".to_string(), serde_json::Value::Array(ports));
-                        }
-                        serde_json::Value::Object(im)
-                    })
-                    .collect();
-                out["status"] = serde_json::json!({ "loadBalancer": { "ingress": ingress } });
-            }
-        }
-    }
+    let mut out = gen_ingress_to_json(obj);
+    out["apiVersion"] = "networking.k8s.io/v1".into();
+    out["kind"] = "Ingress".into();
     Some(out)
 }
 
 // ---- Decoder A: IngressClass (networking.k8s.io/v1) ---------------------------
 
+/// Kept hand-written rather than delegated to the mechanical walker's `parameters` field:
+/// `IngressClassParametersReference.aPIGroup` is declared with that exact (already-lowercase-first)
+/// capitalization upstream, so neither of `json_key`'s two mechanical rules (strip underscores,
+/// lowercase a *leading* capital) rewrites it to the desired `apiGroup` — see
+/// `ingressclass_delegated_field`'s own doc in `build/codegen.rs` for why a `RENAMES` table entry
+/// is out of this migration's touched-file scope.
+fn gen_ingressclass_spec_to_json(spec: networking_v1::IngressClassSpec) -> serde_json::Value {
+    let mut spec_json = serde_json::Map::new();
+    if let Some(ctrl) = spec.controller.filter(|s| !s.is_empty()) {
+        spec_json.insert("controller".to_string(), serde_json::Value::String(ctrl));
+    }
+    // parameters links this class to controller-specific config (e.g. an AWS ALB
+    // IngressClassParams CRD); dropping it silently strips that config from every
+    // Ingress routed through this class.
+    if let Some(p) = spec.parameters {
+        let mut pj = serde_json::Map::new();
+        if let Some(v) = p.a_pi_group.filter(|s| !s.is_empty()) {
+            pj.insert("apiGroup".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = p.kind.filter(|s| !s.is_empty()) {
+            pj.insert("kind".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = p.name.filter(|s| !s.is_empty()) {
+            pj.insert("name".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = p.scope.filter(|s| !s.is_empty()) {
+            pj.insert("scope".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = p.namespace.filter(|s| !s.is_empty()) {
+            pj.insert("namespace".to_string(), serde_json::Value::String(v));
+        }
+        spec_json.insert("parameters".to_string(), serde_json::Value::Object(pj));
+    }
+    serde_json::Value::Object(spec_json)
+}
+
+// `gen_ingressclass_to_json` is generated by `build/codegen.rs` from the
+// `.k8s.io.api.networking.v1.IngressClass` descriptor — `metadata` delegates to
+// `gen_object_meta_to_json` and `spec` delegates wholesale to `gen_ingressclass_spec_to_json`
+// above. See `build/codegen.rs::ingressclass_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/ingressclass_gen.rs"));
+
 pub fn decode_ingressclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = networking_v1::IngressClass::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "IngressClass",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if let Some(ctrl) = spec.controller.filter(|s| !s.is_empty()) {
-            spec_json.insert("controller".to_string(), serde_json::Value::String(ctrl));
-        }
-        // parameters links this class to controller-specific config (e.g. an AWS ALB
-        // IngressClassParams CRD); dropping it silently strips that config from every
-        // Ingress routed through this class.
-        if let Some(p) = spec.parameters {
-            let mut pj = serde_json::Map::new();
-            if let Some(v) = p.a_pi_group.filter(|s| !s.is_empty()) {
-                pj.insert("apiGroup".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = p.kind.filter(|s| !s.is_empty()) {
-                pj.insert("kind".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = p.name.filter(|s| !s.is_empty()) {
-                pj.insert("name".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = p.scope.filter(|s| !s.is_empty()) {
-                pj.insert("scope".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = p.namespace.filter(|s| !s.is_empty()) {
-                pj.insert("namespace".to_string(), serde_json::Value::String(v));
-            }
-            spec_json.insert("parameters".to_string(), serde_json::Value::Object(pj));
-        }
-        if !spec_json.is_empty() {
-            out["spec"] = serde_json::Value::Object(spec_json);
-        }
-    }
+    let mut out = gen_ingressclass_to_json(obj);
+    out["apiVersion"] = "networking.k8s.io/v1".into();
+    out["kind"] = "IngressClass".into();
     Some(out)
 }
 
@@ -341,99 +318,78 @@ fn gen_network_policy_peer_to_json(p: networking_v1::NetworkPolicyPeer) -> serde
     serde_json::Value::Object(m)
 }
 
+fn gen_network_policy_ingress_rule_to_json(
+    r: networking_v1::NetworkPolicyIngressRule,
+) -> serde_json::Value {
+    let mut rj = serde_json::Map::new();
+    if !r.ports.is_empty() {
+        rj.insert(
+            "ports".to_string(),
+            serde_json::Value::Array(
+                r.ports
+                    .into_iter()
+                    .map(gen_network_policy_port_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !r.from.is_empty() {
+        rj.insert(
+            "from".to_string(),
+            serde_json::Value::Array(
+                r.from
+                    .into_iter()
+                    .map(gen_network_policy_peer_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(rj)
+}
+
+fn gen_network_policy_egress_rule_to_json(
+    r: networking_v1::NetworkPolicyEgressRule,
+) -> serde_json::Value {
+    let mut rj = serde_json::Map::new();
+    if !r.ports.is_empty() {
+        rj.insert(
+            "ports".to_string(),
+            serde_json::Value::Array(
+                r.ports
+                    .into_iter()
+                    .map(gen_network_policy_port_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !r.to.is_empty() {
+        rj.insert(
+            "to".to_string(),
+            serde_json::Value::Array(
+                r.to.into_iter()
+                    .map(gen_network_policy_peer_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(rj)
+}
+
+// `gen_network_policy_spec_to_json`/`gen_networkpolicy_to_json` are generated by
+// `build/codegen.rs` from the `.k8s.io.api.networking.v1.NetworkPolicySpec`/`NetworkPolicy`
+// descriptors — `podSelector` delegates to `gen_label_selector_to_json`, `ingress`/`egress`
+// delegate to `gen_network_policy_ingress_rule_to_json`/`gen_network_policy_egress_rule_to_json`
+// above, and `metadata`/`spec` on `NetworkPolicy` itself follow the same pattern every other Kind
+// in this file uses. See `build/codegen.rs::network_policy_spec_delegated_field`/
+// `network_policy_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/network_policy_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/networkpolicy_gen.rs"));
+
 pub fn decode_networkpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = networking_v1::NetworkPolicy::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "NetworkPolicy",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if let Some(sel) = spec.pod_selector {
-            spec_json.insert("podSelector".to_string(), gen_label_selector_to_json(sel));
-        }
-        if !spec.ingress.is_empty() {
-            let rules: Vec<serde_json::Value> = spec
-                .ingress
-                .into_iter()
-                .map(|r| {
-                    let mut rj = serde_json::Map::new();
-                    if !r.ports.is_empty() {
-                        rj.insert(
-                            "ports".to_string(),
-                            serde_json::Value::Array(
-                                r.ports
-                                    .into_iter()
-                                    .map(gen_network_policy_port_to_json)
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    if !r.from.is_empty() {
-                        rj.insert(
-                            "from".to_string(),
-                            serde_json::Value::Array(
-                                r.from
-                                    .into_iter()
-                                    .map(gen_network_policy_peer_to_json)
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    serde_json::Value::Object(rj)
-                })
-                .collect();
-            spec_json.insert("ingress".to_string(), serde_json::Value::Array(rules));
-        }
-        if !spec.egress.is_empty() {
-            let rules: Vec<serde_json::Value> = spec
-                .egress
-                .into_iter()
-                .map(|r| {
-                    let mut rj = serde_json::Map::new();
-                    if !r.ports.is_empty() {
-                        rj.insert(
-                            "ports".to_string(),
-                            serde_json::Value::Array(
-                                r.ports
-                                    .into_iter()
-                                    .map(gen_network_policy_port_to_json)
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    if !r.to.is_empty() {
-                        rj.insert(
-                            "to".to_string(),
-                            serde_json::Value::Array(
-                                r.to.into_iter()
-                                    .map(gen_network_policy_peer_to_json)
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    serde_json::Value::Object(rj)
-                })
-                .collect();
-            spec_json.insert("egress".to_string(), serde_json::Value::Array(rules));
-        }
-        if !spec.policy_types.is_empty() {
-            spec_json.insert(
-                "policyTypes".to_string(),
-                serde_json::Value::Array(
-                    spec.policy_types
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if !spec_json.is_empty() {
-            out["spec"] = serde_json::Value::Object(spec_json);
-        }
-    }
+    let mut out = gen_networkpolicy_to_json(obj);
+    out["apiVersion"] = "networking.k8s.io/v1".into();
+    out["kind"] = "NetworkPolicy".into();
     Some(out)
 }
 
@@ -445,566 +401,177 @@ pub fn decode_networkpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> 
 // 400 instead of 201. client-go's typed clientsets (and the e2e suite) POST protobuf by
 // default, so this is a hard failure for every IPAddress/ServiceCIDR API operation.
 
+// `gen_ipaddress_to_json` is generated by `build/codegen.rs` from the
+// `.k8s.io.api.networking.v1.IPAddress` descriptor — `metadata` delegates to
+// `gen_object_meta_to_json`; `spec.parentRef` is fully mechanical. See
+// `build/codegen.rs::ipaddress_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/ipaddress_gen.rs"));
+
 pub fn decode_ipaddress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = networking_v1::IpAddress::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "IPAddress",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        if let Some(pr) = spec.parent_ref {
-            let mut pr_json = serde_json::Map::new();
-            if let Some(v) = pr.group.filter(|s| !s.is_empty()) {
-                pr_json.insert("group".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = pr.resource.filter(|s| !s.is_empty()) {
-                pr_json.insert("resource".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = pr.namespace.filter(|s| !s.is_empty()) {
-                pr_json.insert("namespace".to_string(), serde_json::Value::String(v));
-            }
-            if let Some(v) = pr.name.filter(|s| !s.is_empty()) {
-                pr_json.insert("name".to_string(), serde_json::Value::String(v));
-            }
-            out["spec"] = serde_json::json!({ "parentRef": serde_json::Value::Object(pr_json) });
-        }
-    }
+    let mut out = gen_ipaddress_to_json(obj);
+    out["apiVersion"] = "networking.k8s.io/v1".into();
+    out["kind"] = "IPAddress".into();
     Some(out)
 }
 
 // ---- Decoder A: ServiceCIDR (networking.k8s.io/v1) ---------------------------
 
+// `gen_servicecidr_status_to_json`/`gen_servicecidr_to_json` are generated by `build/codegen.rs`
+// from the `.k8s.io.api.networking.v1.ServiceCIDRStatus`/`ServiceCIDR` descriptors —
+// `status.conditions` delegates to the shared `gen_meta_condition_to_json`, `metadata`/`status`
+// on `ServiceCIDR` itself follow the same pattern every other Kind in this file uses, and
+// `spec.cidrs` is fully mechanical. See `build/codegen.rs::servicecidr_status_delegated_field`/
+// `servicecidr_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/servicecidr_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/servicecidr_gen.rs"));
+
 pub fn decode_servicecidr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = networking_v1::ServiceCidr::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "ServiceCIDR",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        if !spec.cidrs.is_empty() {
-            out["spec"] = serde_json::json!({
-                "cidrs": spec.cidrs,
-            });
-        }
-    }
-    if let Some(status) = obj.status {
-        if !status.conditions.is_empty() {
-            let conditions: Vec<serde_json::Value> = status
-                .conditions
-                .into_iter()
-                .map(|c| {
-                    let mut cm = serde_json::json!({
-                        "type": c.r#type.unwrap_or_default(),
-                        "status": c.status.unwrap_or_default(),
-                    });
-                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
-                        cm["reason"] = v.into();
-                    }
-                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
-                        cm["message"] = v.into();
-                    }
-                    if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
-                        cm["observedGeneration"] = v.into();
-                    }
-                    if let Some(t) = c.last_transition_time {
-                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] =
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                        }
-                    }
-                    cm
-                })
-                .collect();
-            out["status"] = serde_json::json!({ "conditions": conditions });
-        }
-    }
+    let mut out = gen_servicecidr_to_json(obj);
+    out["apiVersion"] = "networking.k8s.io/v1".into();
+    out["kind"] = "ServiceCIDR".into();
     Some(out)
 }
 
 // ---- Decoder A: EndpointSlice (discovery.k8s.io/v1) --------------------------
 
+/// Mirrors `json_to_endpointslice_port_proto`'s own doc (below, in the encoder section):
+/// `EndpointPort.name` is proto3 `optional string`, and an empty string is the valid, common
+/// "unnamed port" wire shape every single-port Service produces — emit the "name" key whenever
+/// the proto field is `Some(_)`, regardless of emptiness, unlike every other string field in this
+/// file (and the mechanical codegen walker's own default), which drop empty strings.
+fn gen_endpointslice_port_to_json(p: discovery_v1::EndpointPort) -> serde_json::Value {
+    let mut pj = serde_json::Map::new();
+    if let Some(n) = p.name {
+        pj.insert("name".to_string(), serde_json::Value::String(n));
+    }
+    if let Some(proto) = p.protocol.filter(|s| !s.is_empty()) {
+        pj.insert("protocol".to_string(), serde_json::Value::String(proto));
+    }
+    if let Some(port_num) = p.port {
+        pj.insert(
+            "port".to_string(),
+            serde_json::Value::Number(port_num.into()),
+        );
+    }
+    if let Some(ap) = p.app_protocol.filter(|s| !s.is_empty()) {
+        pj.insert("appProtocol".to_string(), serde_json::Value::String(ap));
+    }
+    serde_json::Value::Object(pj)
+}
+
+// `gen_endpoint_to_json`/`json_to_endpoint_proto` (from `generate_endpoint`) and
+// `gen_endpointslice_to_json`/`json_to_endpointslice_proto` (from `generate_endpointslice`) are
+// generated by `build/codegen.rs` from the `.k8s.io.api.discovery.v1.Endpoint`/`EndpointSlice`
+// descriptors — `metadata` delegates to `gen_object_meta_to_json`/`json_to_object_meta_proto`,
+// `endpoints`/`ports` on `EndpointSlice` itself delegate wholesale (upstream has no `omitempty`
+// on either, so both must round-trip as a present-even-if-empty JSON array — see
+// `decode_endpointslice_proto_gen_omits_no_nulls_on_all_default_input`), and everything else
+// (including `Endpoint`'s own `conditions`/`hints`/`targetRef`) is fully mechanical. See
+// `build/codegen.rs::endpoint_delegated_field`/`endpointslice_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/endpoint_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/endpointslice_gen.rs"));
+
 pub fn decode_endpointslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = discovery_v1::EndpointSlice::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "discovery.k8s.io/v1",
-        "kind": "EndpointSlice",
-        "metadata": meta,
-        "addressType": obj.address_type.unwrap_or_default()
-    });
-    let endpoints_arr: Vec<serde_json::Value> = obj
-        .endpoints
-        .into_iter()
-        .map(|ep| {
-            let mut ej = serde_json::Map::new();
-            ej.insert(
-                "addresses".to_string(),
-                serde_json::Value::Array(
-                    ep.addresses
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-            if let Some(c) = ep.conditions {
-                let mut cj = serde_json::Map::new();
-                if let Some(v) = c.ready {
-                    cj.insert("ready".to_string(), serde_json::Value::Bool(v));
-                }
-                if let Some(v) = c.serving {
-                    cj.insert("serving".to_string(), serde_json::Value::Bool(v));
-                }
-                if let Some(v) = c.terminating {
-                    cj.insert("terminating".to_string(), serde_json::Value::Bool(v));
-                }
-                if !cj.is_empty() {
-                    ej.insert("conditions".to_string(), serde_json::Value::Object(cj));
-                }
-            }
-            if let Some(h) = ep.hostname.filter(|s| !s.is_empty()) {
-                ej.insert("hostname".to_string(), serde_json::Value::String(h));
-            }
-            if let Some(r) = ep.target_ref {
-                let rj = gen_object_reference_to_json(r);
-                if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
-                    ej.insert("targetRef".to_string(), rj);
-                }
-            }
-            if let Some(nn) = ep.node_name.filter(|s| !s.is_empty()) {
-                ej.insert("nodeName".to_string(), serde_json::Value::String(nn));
-            }
-            if let Some(z) = ep.zone.filter(|s| !s.is_empty()) {
-                ej.insert("zone".to_string(), serde_json::Value::String(z));
-            }
-            if let Some(hints) = ep.hints {
-                let mut hj = serde_json::Map::new();
-                if !hints.for_zones.is_empty() {
-                    let fz: Vec<serde_json::Value> = hints
-                        .for_zones
-                        .into_iter()
-                        .filter_map(|fz| {
-                            fz.name
-                                .filter(|s| !s.is_empty())
-                                .map(|n| serde_json::json!({ "name": n }))
-                        })
-                        .collect();
-                    if !fz.is_empty() {
-                        hj.insert("forZones".to_string(), serde_json::Value::Array(fz));
-                    }
-                }
-                // forNodes is forZones' node-local counterpart for topology-aware routing;
-                // dropping it silently discarded the hint kube-proxy uses to prefer
-                // same-node endpoints.
-                if !hints.for_nodes.is_empty() {
-                    let fnodes: Vec<serde_json::Value> = hints
-                        .for_nodes
-                        .into_iter()
-                        .filter_map(|n| {
-                            n.name
-                                .filter(|s| !s.is_empty())
-                                .map(|n| serde_json::json!({ "name": n }))
-                        })
-                        .collect();
-                    if !fnodes.is_empty() {
-                        hj.insert("forNodes".to_string(), serde_json::Value::Array(fnodes));
-                    }
-                }
-                if !hj.is_empty() {
-                    ej.insert("hints".to_string(), serde_json::Value::Object(hj));
-                }
-            }
-            serde_json::Value::Object(ej)
-        })
-        .collect();
-    out["endpoints"] = serde_json::Value::Array(endpoints_arr);
-    let ports_arr: Vec<serde_json::Value> = obj
-        .ports
-        .into_iter()
-        .map(|p| {
-            let mut pj = serde_json::Map::new();
-            // EndpointPort.name is proto3 `optional string`: Some("") is the valid, common
-            // "unnamed port" wire shape every single-port Service produces (KCM marshals
-            // `Name: &""`, a non-nil pointer to an empty string). Filtering out the empty
-            // string here — as most other fields in this file correctly do for fields where
-            // empty and absent really are equivalent — collapses that into a missing "name"
-            // key, which kube-proxy's endpointslicecache.go treats as `nil` and skips the
-            // port entirely (zero backends registered, Connection refused). Emit the key
-            // whenever the field is present, regardless of emptiness.
-            if let Some(n) = p.name {
-                pj.insert("name".to_string(), serde_json::Value::String(n));
-            }
-            if let Some(proto) = p.protocol.filter(|s| !s.is_empty()) {
-                pj.insert("protocol".to_string(), serde_json::Value::String(proto));
-            }
-            if let Some(port_num) = p.port {
-                pj.insert(
-                    "port".to_string(),
-                    serde_json::Value::Number(port_num.into()),
-                );
-            }
-            if let Some(ap) = p.app_protocol.filter(|s| !s.is_empty()) {
-                pj.insert("appProtocol".to_string(), serde_json::Value::String(ap));
-            }
-            serde_json::Value::Object(pj)
-        })
-        .collect();
-    out["ports"] = serde_json::Value::Array(ports_arr);
+    let mut out = gen_endpointslice_to_json(obj);
+    out["apiVersion"] = "discovery.k8s.io/v1".into();
+    out["kind"] = "EndpointSlice".into();
     Some(out)
 }
 
 // ---- Decoder A: CertificateSigningRequest (certificates.k8s.io/v1) -----------
 
+// `gen_certificate_signing_request_spec_to_json`/`gen_certificate_signing_request_status_to_json`/
+// `gen_certificate_signing_request_to_json` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.certificates.v1.CertificateSigningRequestSpec`/`...Status`/
+// `CertificateSigningRequest` descriptors — `request`/`certificate` (both `bytes`) base64-encode,
+// `extra` (a `map<string, ExtraValue>`) delegates to a template matching `ExtraValue`'s own
+// `OPAQUE_MESSAGES`-documented bare-array JSON shape, `status.conditions` delegates to
+// `gen_csr_condition_to_json` above, and `metadata`/`spec`/`status` on the top-level Kind follow
+// the same pattern every other Kind in this file uses. See
+// `build/codegen.rs::csr_spec_delegated_field`/`csr_status_delegated_field`/
+// `csr_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/csr_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/csr_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/csr_gen.rs"));
+
 pub fn decode_csr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = certs_v1::CertificateSigningRequest::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "certificates.k8s.io/v1",
-        "kind": "CertificateSigningRequest",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if let Some(req) = spec.request.filter(|v| !v.is_empty()) {
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&req);
-            spec_json.insert("request".to_string(), serde_json::Value::String(b64));
-        }
-        if let Some(sn) = spec.signer_name.filter(|s| !s.is_empty()) {
-            spec_json.insert("signerName".to_string(), serde_json::Value::String(sn));
-        }
-        if let Some(exp) = spec.expiration_seconds.filter(|&v| v != 0) {
-            spec_json.insert(
-                "expirationSeconds".to_string(),
-                serde_json::Value::Number(exp.into()),
-            );
-        }
-        if !spec.usages.is_empty() {
-            spec_json.insert(
-                "usages".to_string(),
-                serde_json::Value::Array(
-                    spec.usages
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if let Some(u) = spec.username.filter(|s| !s.is_empty()) {
-            spec_json.insert("username".to_string(), serde_json::Value::String(u));
-        }
-        if let Some(uid) = spec.uid.filter(|s| !s.is_empty()) {
-            spec_json.insert("uid".to_string(), serde_json::Value::String(uid));
-        }
-        if !spec.groups.is_empty() {
-            spec_json.insert(
-                "groups".to_string(),
-                serde_json::Value::Array(
-                    spec.groups
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        // extra carries authenticator-supplied attributes about the CSR's creator (e.g.
-        // impersonation extras); dropping it silently strips that context from the request a
-        // signer or approval webhook may key its decision on.
-        if !spec.extra.is_empty() {
-            let extra: serde_json::Map<String, serde_json::Value> = spec
-                .extra
-                .into_iter()
-                .map(|(k, v)| {
-                    let items: Vec<serde_json::Value> =
-                        v.items.into_iter().map(serde_json::Value::String).collect();
-                    (k, serde_json::Value::Array(items))
-                })
-                .collect();
-            spec_json.insert("extra".to_string(), serde_json::Value::Object(extra));
-        }
-        if !spec_json.is_empty() {
-            out["spec"] = serde_json::Value::Object(spec_json);
-        }
-    }
-    // status must be decoded too: kubectl certificate approve/deny and the sig-auth
-    // "CSR API operations" conformance test PUT/PATCH the /approval and /status
-    // subresources using the protobuf content-type. Dropping status here silently
-    // discarded every condition and certificate written via those subresources.
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::Map::new();
-        if !status.conditions.is_empty() {
-            let conditions: Vec<serde_json::Value> = status
-                .conditions
-                .into_iter()
-                .map(|c| {
-                    let mut cm = serde_json::json!({
-                        "type": c.r#type.unwrap_or_default(),
-                        "status": c.status.unwrap_or_default(),
-                    });
-                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
-                        cm["reason"] = v.into();
-                    }
-                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
-                        cm["message"] = v.into();
-                    }
-                    if let Some(t) = c.last_update_time {
-                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastUpdateTime"] =
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                        }
-                    }
-                    if let Some(t) = c.last_transition_time {
-                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] =
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                        }
-                    }
-                    cm
-                })
-                .collect();
-            status_json.insert(
-                "conditions".to_string(),
-                serde_json::Value::Array(conditions),
-            );
-        }
-        if let Some(cert) = status.certificate.filter(|c| !c.is_empty()) {
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&cert);
-            status_json.insert("certificate".to_string(), serde_json::Value::String(b64));
-        }
-        if !status_json.is_empty() {
-            out["status"] = serde_json::Value::Object(status_json);
-        }
-    }
+    let mut out = gen_certificate_signing_request_to_json(obj);
+    out["apiVersion"] = "certificates.k8s.io/v1".into();
+    out["kind"] = "CertificateSigningRequest".into();
     Some(out)
 }
 
 // ---- Decoder A: PodDisruptionBudget (policy/v1) --------------------------------
 
+// `gen_poddisruptionbudget_spec_to_json`/`gen_poddisruptionbudget_status_to_json`/
+// `gen_poddisruptionbudget_to_json` are generated by `build/codegen.rs` from the
+// `.k8s.io.api.policy.v1.PodDisruptionBudgetSpec`/`...Status`/`PodDisruptionBudget` descriptors —
+// `minAvailable`/`maxUnavailable` delegate to `gen_int_or_string_to_json`, `selector` to
+// `gen_label_selector_to_json`, `disruptedPods` (a `map<string, Time>`) to
+// `gen_disrupted_pods_to_json` above, `status.conditions` to the shared
+// `gen_meta_condition_to_json`, and `metadata`/`spec`/`status` on the top-level Kind follow the
+// same pattern every other Kind in this file uses. See
+// `build/codegen.rs::poddisruptionbudget_spec_delegated_field`/
+// `poddisruptionbudget_status_delegated_field`/`poddisruptionbudget_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/poddisruptionbudget_spec_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/poddisruptionbudget_status_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/poddisruptionbudget_gen.rs"));
+
 pub fn decode_poddisruptionbudget_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = policy_v1::PodDisruptionBudget::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudget",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::Map::new();
-        if let Some(min_avail) = spec.min_available {
-            spec_json.insert(
-                "minAvailable".to_string(),
-                gen_int_or_string_to_json(&min_avail),
-            );
-        }
-        if let Some(sel) = spec.selector {
-            spec_json.insert("selector".to_string(), gen_label_selector_to_json(sel));
-        }
-        if let Some(max_unavail) = spec.max_unavailable {
-            spec_json.insert(
-                "maxUnavailable".to_string(),
-                gen_int_or_string_to_json(&max_unavail),
-            );
-        }
-        if let Some(policy) = spec.unhealthy_pod_eviction_policy.filter(|s| !s.is_empty()) {
-            spec_json.insert(
-                "unhealthyPodEvictionPolicy".to_string(),
-                serde_json::Value::String(policy),
-            );
-        }
-        result["spec"] = serde_json::Value::Object(spec_json);
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::Map::new();
-        if let Some(og) = status.observed_generation.filter(|&v| v != 0) {
-            status_json.insert(
-                "observedGeneration".to_string(),
-                serde_json::Value::Number(og.into()),
-            );
-        }
-        if !status.disrupted_pods.is_empty() {
-            let pods_map: serde_json::Map<String, serde_json::Value> = status
-                .disrupted_pods
-                .into_iter()
-                .map(|(pod_name, t)| {
-                    let secs = t.seconds.unwrap_or(0);
-                    let ts = if secs > 0 {
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs))
-                    } else {
-                        serde_json::Value::String("1970-01-01T00:00:00Z".into())
-                    };
-                    (pod_name, ts)
-                })
-                .collect();
-            status_json.insert(
-                "disruptedPods".to_string(),
-                serde_json::Value::Object(pods_map),
-            );
-        }
-        status_json.insert(
-            "disruptionsAllowed".to_string(),
-            serde_json::Value::Number(status.disruptions_allowed.unwrap_or(0).into()),
-        );
-        status_json.insert(
-            "currentHealthy".to_string(),
-            serde_json::Value::Number(status.current_healthy.unwrap_or(0).into()),
-        );
-        status_json.insert(
-            "desiredHealthy".to_string(),
-            serde_json::Value::Number(status.desired_healthy.unwrap_or(0).into()),
-        );
-        status_json.insert(
-            "expectedPods".to_string(),
-            serde_json::Value::Number(status.expected_pods.unwrap_or(0).into()),
-        );
-        if !status.conditions.is_empty() {
-            let conds: Vec<serde_json::Value> = status
-                .conditions
-                .into_iter()
-                .map(|c| {
-                    let mut cond = serde_json::Map::new();
-                    if let Some(t) = c.r#type.filter(|s| !s.is_empty()) {
-                        cond.insert("type".to_string(), serde_json::Value::String(t));
-                    }
-                    if let Some(s) = c.status.filter(|s| !s.is_empty()) {
-                        cond.insert("status".to_string(), serde_json::Value::String(s));
-                    }
-                    if let Some(og) = c.observed_generation.filter(|&v| v != 0) {
-                        cond.insert(
-                            "observedGeneration".to_string(),
-                            serde_json::Value::Number(og.into()),
-                        );
-                    }
-                    if let Some(ts) = c.last_transition_time {
-                        if let Some(secs) = ts.seconds.filter(|&s| s > 0) {
-                            cond.insert(
-                                "lastTransitionTime".to_string(),
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
-                            );
-                        }
-                    }
-                    if let Some(r) = c.reason.filter(|s| !s.is_empty()) {
-                        cond.insert("reason".to_string(), serde_json::Value::String(r));
-                    }
-                    if let Some(msg) = c.message.filter(|s| !s.is_empty()) {
-                        cond.insert("message".to_string(), serde_json::Value::String(msg));
-                    }
-                    serde_json::Value::Object(cond)
-                })
-                .collect();
-            status_json.insert("conditions".to_string(), serde_json::Value::Array(conds));
-        }
-        result["status"] = serde_json::Value::Object(status_json);
-    }
-    Some(result)
+    let mut out = gen_poddisruptionbudget_to_json(obj);
+    out["apiVersion"] = "policy/v1".into();
+    out["kind"] = "PodDisruptionBudget".into();
+    Some(out)
 }
 
 // ---- Decoder A: events.k8s.io/v1 Event ----------------------------------------
 
-pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let ev = events_v1::Event::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(ev.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "events.k8s.io/v1",
-        "kind": "Event",
-        "metadata": meta
-    });
-    if let Some(t) = ev.event_time {
-        // `seconds` must be explicitly present (not defaulted via unwrap_or(0)) — a MicroTime
-        // message with no seconds field on the wire is "not set", not the Unix epoch.
+/// `count` is zero-filtered (an explicit `0` is indistinguishable from "never set" on the wire)
+/// and `lastObservedTime` a bare `MicroTime` needing the same explicit-seconds-present RFC3339
+/// conversion `events_v1_event_delegated_field`'s own `eventTime` entry documents — one level
+/// below `Event` itself, past this mechanical walker's per-field override reach, so `series`
+/// delegates wholesale here.
+fn gen_event_series_to_json(s: events_v1::EventSeries) -> serde_json::Value {
+    let mut sj = serde_json::Map::new();
+    if let Some(count) = s.count.filter(|&v| v != 0) {
+        sj.insert("count".to_string(), serde_json::Value::Number(count.into()));
+    }
+    if let Some(t) = s.last_observed_time {
         if let Some(secs) = t.seconds {
             let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
                 secs,
                 t.nanos.unwrap_or(0),
             );
-            out["eventTime"] = serde_json::Value::String(ts);
+            sj.insert(
+                "lastObservedTime".to_string(),
+                serde_json::Value::String(ts),
+            );
         }
     }
-    if let Some(s) = ev.series {
-        let mut sj = serde_json::Map::new();
-        if let Some(count) = s.count.filter(|&v| v != 0) {
-            sj.insert("count".to_string(), serde_json::Value::Number(count.into()));
-        }
-        if let Some(t) = s.last_observed_time {
-            if let Some(secs) = t.seconds {
-                let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
-                    secs,
-                    t.nanos.unwrap_or(0),
-                );
-                sj.insert(
-                    "lastObservedTime".to_string(),
-                    serde_json::Value::String(ts),
-                );
-            }
-        }
-        if !sj.is_empty() {
-            out["series"] = serde_json::Value::Object(sj);
-        }
-    }
-    if let Some(rc) = ev.reporting_controller.filter(|s| !s.is_empty()) {
-        out["reportingController"] = serde_json::Value::String(rc);
-    }
-    if let Some(ri) = ev.reporting_instance.filter(|s| !s.is_empty()) {
-        out["reportingInstance"] = serde_json::Value::String(ri);
-    }
-    if let Some(a) = ev.action.filter(|s| !s.is_empty()) {
-        out["action"] = serde_json::Value::String(a);
-    }
-    if let Some(r) = ev.reason.filter(|s| !s.is_empty()) {
-        out["reason"] = serde_json::Value::String(r);
-    }
-    if let Some(r) = ev.regarding {
-        let rj = gen_object_reference_to_json(r);
-        if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
-            out["regarding"] = rj;
-        }
-    }
-    if let Some(r) = ev.related {
-        let rj = gen_object_reference_to_json(r);
-        if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
-            out["related"] = rj;
-        }
-    }
-    if let Some(n) = ev.note.filter(|s| !s.is_empty()) {
-        out["note"] = serde_json::Value::String(n);
-    }
-    if let Some(t) = ev.r#type.filter(|s| !s.is_empty()) {
-        out["type"] = serde_json::Value::String(t);
-    }
-    if let Some(count) = ev.deprecated_count.filter(|&v| v != 0) {
-        out["deprecatedCount"] = serde_json::Value::Number(count.into());
-    }
-    // deprecatedSource/deprecatedFirstTimestamp/deprecatedLastTimestamp back-fill the legacy
-    // core/v1 Event fields for clients still reading events.k8s.io/v1 Events the old way;
-    // deprecatedCount already got this treatment above, these three should not be dropped
-    // just because they share the "deprecated" name.
-    if let Some(src) = ev.deprecated_source {
-        let mut srcj = serde_json::Map::new();
-        if let Some(v) = src.component.filter(|s| !s.is_empty()) {
-            srcj.insert("component".to_string(), serde_json::Value::String(v));
-        }
-        if let Some(v) = src.host.filter(|s| !s.is_empty()) {
-            srcj.insert("host".to_string(), serde_json::Value::String(v));
-        }
-        if !srcj.is_empty() {
-            out["deprecatedSource"] = serde_json::Value::Object(srcj);
-        }
-    }
-    if let Some(t) = ev.deprecated_first_timestamp {
-        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-            out["deprecatedFirstTimestamp"] =
-                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-        }
-    }
-    if let Some(t) = ev.deprecated_last_timestamp {
-        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-            out["deprecatedLastTimestamp"] =
-                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-        }
-    }
+    serde_json::Value::Object(sj)
+}
+
+// `gen_events_v1_event_to_json` is generated by `build/codegen.rs` from the
+// `.k8s.io.api.events.v1.Event` descriptor — `metadata` delegates to `gen_object_meta_to_json`,
+// `eventTime`/`deprecatedFirstTimestamp`/`deprecatedLastTimestamp` delegate to opaque-`Time`
+// RFC3339 templates, `series` delegates to `gen_event_series_to_json` above, and
+// `regarding`/`related`/`deprecatedSource`/every plain scalar field is fully mechanical. See
+// `build/codegen.rs::events_v1_event_delegated_field`.
+include!(concat!(env!("OUT_DIR"), "/events_v1_event_gen.rs"));
+
+pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+    let ev = events_v1::Event::decode(data).ok()?;
+    let mut out = gen_events_v1_event_to_json(ev);
+    out["apiVersion"] = "events.k8s.io/v1".into();
+    out["kind"] = "Event".into();
     Some(out)
 }
 
@@ -1036,6 +603,19 @@ fn jstrs(v: &serde_json::Value, key: &str) -> Vec<String> {
         .map(|a| {
             a.iter()
                 .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Used by the mechanically-generated `json_to_endpoint_proto`'s `deprecatedTopology` field (a
+/// `map<string, string>`) — a field the pre-migration hand-written decoder never read at all.
+fn jstrmap(v: &serde_json::Value, key: &str) -> std::collections::HashMap<String, String> {
+    v.get(key)
+        .and_then(|m| m.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
         .unwrap_or_default()
@@ -1105,66 +685,6 @@ fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
     }
 }
 
-fn json_to_object_reference_proto(
-    v: &serde_json::Value,
-) -> u7s_proto_generated::k8s::io::api::core::v1::ObjectReference {
-    u7s_proto_generated::k8s::io::api::core::v1::ObjectReference {
-        kind: jstr(v, "kind"),
-        namespace: jstr(v, "namespace"),
-        name: jstr(v, "name"),
-        uid: jstr(v, "uid"),
-        api_version: jstr(v, "apiVersion"),
-        resource_version: jstr(v, "resourceVersion"),
-        field_path: jstr(v, "fieldPath"),
-    }
-}
-
-fn json_to_endpoint_conditions_proto(v: &serde_json::Value) -> discovery_v1::EndpointConditions {
-    discovery_v1::EndpointConditions {
-        ready: jbool(v, "ready"),
-        serving: jbool(v, "serving"),
-        terminating: jbool(v, "terminating"),
-    }
-}
-
-fn json_to_endpoint_hints_proto(v: &serde_json::Value) -> discovery_v1::EndpointHints {
-    discovery_v1::EndpointHints {
-        for_zones: v
-            .get("forZones")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|z| jstr(z, "name"))
-                    .map(|name| discovery_v1::ForZone { name: Some(name) })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        for_nodes: v
-            .get("forNodes")
-            .and_then(|a| a.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|n| jstr(n, "name"))
-                    .map(|name| discovery_v1::ForNode { name: Some(name) })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
-}
-
-fn json_to_endpoint_proto(v: &serde_json::Value) -> discovery_v1::Endpoint {
-    discovery_v1::Endpoint {
-        addresses: jstrs(v, "addresses"),
-        conditions: v.get("conditions").map(json_to_endpoint_conditions_proto),
-        hostname: jstr(v, "hostname"),
-        target_ref: v.get("targetRef").map(json_to_object_reference_proto),
-        node_name: jstr(v, "nodeName"),
-        zone: jstr(v, "zone"),
-        hints: v.get("hints").map(json_to_endpoint_hints_proto),
-        ..Default::default()
-    }
-}
-
 fn json_to_endpointslice_port_proto(v: &serde_json::Value) -> discovery_v1::EndpointPort {
     discovery_v1::EndpointPort {
         // EndpointPort.name is proto3 `optional string`: an empty string is a valid,
@@ -1175,23 +695,6 @@ fn json_to_endpointslice_port_proto(v: &serde_json::Value) -> discovery_v1::Endp
         protocol: jstr(v, "protocol"),
         port: ji32(v, "port"),
         app_protocol: jstr(v, "appProtocol"),
-    }
-}
-
-fn json_to_endpointslice_proto(v: &serde_json::Value) -> discovery_v1::EndpointSlice {
-    discovery_v1::EndpointSlice {
-        metadata: Some(json_to_object_meta_proto(v)),
-        address_type: jstr(v, "addressType"),
-        endpoints: v
-            .get("endpoints")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_endpoint_proto).collect())
-            .unwrap_or_default(),
-        ports: v
-            .get("ports")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().map(json_to_endpointslice_port_proto).collect())
-            .unwrap_or_default(),
     }
 }
 
@@ -2338,6 +1841,1218 @@ mod tests {
             decoded.items.len(),
             2,
             "both list items must survive the round trip"
+        );
+    }
+
+    // ---- Byte-identical audit: generated output vs. pre-migration hand-written output ----
+    //
+    // Each test below reconstructs the pre-migration hand-written decode_*_proto_gen (or, for
+    // EndpointSlice, encode_endpointslice_proto_gen) function verbatim from git history as a
+    // locally-scoped `old_*` function, decodes/encodes a `Sentinel::sentinel()`-populated message
+    // through both the old and the new (codegen-generated) path, and asserts the two outputs are
+    // identical. A wrong field name, a dropped delegate-table entry, or a mechanical-walker
+    // simplification this migration didn't intend would show up here as a JSON mismatch even if
+    // the more targeted tests above happen not to exercise the exact field it hit.
+
+    #[test]
+    fn codegen_migration_ingress_matches_pre_migration_hand_written_output() {
+        fn old_decode_ingress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = networking_v1::Ingress::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "Ingress",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if let Some(cn) = spec.ingress_class_name.filter(|s| !s.is_empty()) {
+                    spec_json.insert(
+                        "ingressClassName".to_string(),
+                        serde_json::Value::String(cn),
+                    );
+                }
+                if let Some(db) = spec.default_backend {
+                    spec_json.insert(
+                        "defaultBackend".to_string(),
+                        gen_ingress_backend_to_json(db),
+                    );
+                }
+                if !spec.tls.is_empty() {
+                    let tls_arr: Vec<serde_json::Value> = spec
+                        .tls
+                        .into_iter()
+                        .map(|t| {
+                            let mut tj = serde_json::Map::new();
+                            if !t.hosts.is_empty() {
+                                tj.insert(
+                                    "hosts".to_string(),
+                                    serde_json::Value::Array(
+                                        t.hosts
+                                            .into_iter()
+                                            .map(serde_json::Value::String)
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                            if let Some(sn) = t.secret_name.filter(|s| !s.is_empty()) {
+                                tj.insert("secretName".to_string(), serde_json::Value::String(sn));
+                            }
+                            serde_json::Value::Object(tj)
+                        })
+                        .collect();
+                    spec_json.insert("tls".to_string(), serde_json::Value::Array(tls_arr));
+                }
+                if !spec.rules.is_empty() {
+                    let rules_arr: Vec<serde_json::Value> = spec
+                        .rules
+                        .into_iter()
+                        .map(|r| {
+                            let mut rj = serde_json::Map::new();
+                            if let Some(h) = r.host.filter(|s| !s.is_empty()) {
+                                rj.insert("host".to_string(), serde_json::Value::String(h));
+                            }
+                            if let Some(irv) = r.ingress_rule_value {
+                                if let Some(http) = irv.http {
+                                    let paths_arr: Vec<serde_json::Value> = http
+                                        .paths
+                                        .into_iter()
+                                        .map(|p| {
+                                            let mut pj = serde_json::Map::new();
+                                            if let Some(path) = p.path.filter(|s| !s.is_empty()) {
+                                                pj.insert(
+                                                    "path".to_string(),
+                                                    serde_json::Value::String(path),
+                                                );
+                                            }
+                                            if let Some(pt) = p.path_type.filter(|s| !s.is_empty())
+                                            {
+                                                pj.insert(
+                                                    "pathType".to_string(),
+                                                    serde_json::Value::String(pt),
+                                                );
+                                            }
+                                            if let Some(b) = p.backend {
+                                                pj.insert(
+                                                    "backend".to_string(),
+                                                    gen_ingress_backend_to_json(b),
+                                                );
+                                            }
+                                            serde_json::Value::Object(pj)
+                                        })
+                                        .collect();
+                                    rj.insert(
+                                        "http".to_string(),
+                                        serde_json::json!({ "paths": paths_arr }),
+                                    );
+                                }
+                            }
+                            serde_json::Value::Object(rj)
+                        })
+                        .collect();
+                    spec_json.insert("rules".to_string(), serde_json::Value::Array(rules_arr));
+                }
+                if !spec_json.is_empty() {
+                    out["spec"] = serde_json::Value::Object(spec_json);
+                }
+            }
+            if let Some(status) = obj.status {
+                if let Some(lb) = status.load_balancer {
+                    if !lb.ingress.is_empty() {
+                        let ingress: Vec<serde_json::Value> = lb
+                            .ingress
+                            .into_iter()
+                            .map(|i| {
+                                let mut im = serde_json::Map::new();
+                                if let Some(v) = i.ip.filter(|s| !s.is_empty()) {
+                                    im.insert("ip".to_string(), serde_json::Value::String(v));
+                                }
+                                if let Some(v) = i.hostname.filter(|s| !s.is_empty()) {
+                                    im.insert("hostname".to_string(), serde_json::Value::String(v));
+                                }
+                                if !i.ports.is_empty() {
+                                    let ports: Vec<serde_json::Value> = i
+                                        .ports
+                                        .into_iter()
+                                        .map(|p| {
+                                            let mut pm = serde_json::Map::new();
+                                            if let Some(v) = p.port.filter(|&n| n != 0) {
+                                                pm.insert(
+                                                    "port".to_string(),
+                                                    serde_json::Value::Number(v.into()),
+                                                );
+                                            }
+                                            if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+                                                pm.insert(
+                                                    "protocol".to_string(),
+                                                    serde_json::Value::String(v),
+                                                );
+                                            }
+                                            if let Some(v) = p.error.filter(|s| !s.is_empty()) {
+                                                pm.insert(
+                                                    "error".to_string(),
+                                                    serde_json::Value::String(v),
+                                                );
+                                            }
+                                            serde_json::Value::Object(pm)
+                                        })
+                                        .collect();
+                                    im.insert("ports".to_string(), serde_json::Value::Array(ports));
+                                }
+                                serde_json::Value::Object(im)
+                            })
+                            .collect();
+                        out["status"] =
+                            serde_json::json!({ "loadBalancer": { "ingress": ingress } });
+                    }
+                }
+            }
+            Some(out)
+        }
+
+        let obj = networking_v1::Ingress {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::IngressSpec::sentinel()),
+            status: Some(networking_v1::IngressStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_ingress_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_ingress_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_ingress_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — a divergence here (e.g. in the \
+             ingressRuleValue http-paths embed, or a dropped rule/backend field) would silently \
+             misroute or drop ingress traffic"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_ingressclass_matches_pre_migration_hand_written_output() {
+        fn old_decode_ingressclass_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = networking_v1::IngressClass::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "IngressClass",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if let Some(ctrl) = spec.controller.filter(|s| !s.is_empty()) {
+                    spec_json.insert("controller".to_string(), serde_json::Value::String(ctrl));
+                }
+                if let Some(p) = spec.parameters {
+                    let mut pj = serde_json::Map::new();
+                    if let Some(v) = p.a_pi_group.filter(|s| !s.is_empty()) {
+                        pj.insert("apiGroup".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = p.kind.filter(|s| !s.is_empty()) {
+                        pj.insert("kind".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = p.name.filter(|s| !s.is_empty()) {
+                        pj.insert("name".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = p.scope.filter(|s| !s.is_empty()) {
+                        pj.insert("scope".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = p.namespace.filter(|s| !s.is_empty()) {
+                        pj.insert("namespace".to_string(), serde_json::Value::String(v));
+                    }
+                    spec_json.insert("parameters".to_string(), serde_json::Value::Object(pj));
+                }
+                if !spec_json.is_empty() {
+                    out["spec"] = serde_json::Value::Object(spec_json);
+                }
+            }
+            Some(out)
+        }
+
+        let ic = networking_v1::IngressClass {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::IngressClassSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        ic.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_ingressclass_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_ingressclass_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_ingressclass_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — the aPIGroup rename carve-out is exactly the \
+             kind of thing a codegen refactor could silently regress"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_networkpolicy_matches_pre_migration_hand_written_output() {
+        fn old_decode_networkpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = networking_v1::NetworkPolicy::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if let Some(sel) = spec.pod_selector {
+                    spec_json.insert("podSelector".to_string(), gen_label_selector_to_json(sel));
+                }
+                if !spec.ingress.is_empty() {
+                    let rules: Vec<serde_json::Value> = spec
+                        .ingress
+                        .into_iter()
+                        .map(|r| {
+                            let mut rj = serde_json::Map::new();
+                            if !r.ports.is_empty() {
+                                rj.insert(
+                                    "ports".to_string(),
+                                    serde_json::Value::Array(
+                                        r.ports
+                                            .into_iter()
+                                            .map(gen_network_policy_port_to_json)
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                            if !r.from.is_empty() {
+                                rj.insert(
+                                    "from".to_string(),
+                                    serde_json::Value::Array(
+                                        r.from
+                                            .into_iter()
+                                            .map(gen_network_policy_peer_to_json)
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                            serde_json::Value::Object(rj)
+                        })
+                        .collect();
+                    spec_json.insert("ingress".to_string(), serde_json::Value::Array(rules));
+                }
+                if !spec.egress.is_empty() {
+                    let rules: Vec<serde_json::Value> = spec
+                        .egress
+                        .into_iter()
+                        .map(|r| {
+                            let mut rj = serde_json::Map::new();
+                            if !r.ports.is_empty() {
+                                rj.insert(
+                                    "ports".to_string(),
+                                    serde_json::Value::Array(
+                                        r.ports
+                                            .into_iter()
+                                            .map(gen_network_policy_port_to_json)
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                            if !r.to.is_empty() {
+                                rj.insert(
+                                    "to".to_string(),
+                                    serde_json::Value::Array(
+                                        r.to.into_iter()
+                                            .map(gen_network_policy_peer_to_json)
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                            serde_json::Value::Object(rj)
+                        })
+                        .collect();
+                    spec_json.insert("egress".to_string(), serde_json::Value::Array(rules));
+                }
+                if !spec.policy_types.is_empty() {
+                    spec_json.insert(
+                        "policyTypes".to_string(),
+                        serde_json::Value::Array(
+                            spec.policy_types
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                if !spec_json.is_empty() {
+                    out["spec"] = serde_json::Value::Object(spec_json);
+                }
+            }
+            Some(out)
+        }
+
+        let np = networking_v1::NetworkPolicy {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::NetworkPolicySpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        np.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_networkpolicy_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_networkpolicy_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_networkpolicy_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — NetworkPolicy is one of this bead's own \
+             highest-traffic conformance targets, and a mismatch here means a firewall rule is \
+             silently mis-specified"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_ipaddress_matches_pre_migration_hand_written_output() {
+        fn old_decode_ipaddress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = networking_v1::IpAddress::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "IPAddress",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                if let Some(pr) = spec.parent_ref {
+                    let mut pr_json = serde_json::Map::new();
+                    if let Some(v) = pr.group.filter(|s| !s.is_empty()) {
+                        pr_json.insert("group".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pr.resource.filter(|s| !s.is_empty()) {
+                        pr_json.insert("resource".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pr.namespace.filter(|s| !s.is_empty()) {
+                        pr_json.insert("namespace".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = pr.name.filter(|s| !s.is_empty()) {
+                        pr_json.insert("name".to_string(), serde_json::Value::String(v));
+                    }
+                    out["spec"] =
+                        serde_json::json!({ "parentRef": serde_json::Value::Object(pr_json) });
+                }
+            }
+            Some(out)
+        }
+
+        let obj = networking_v1::IpAddress {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::IpAddressSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_ipaddress_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_ipaddress_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_ipaddress_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_servicecidr_matches_pre_migration_hand_written_output() {
+        fn old_decode_servicecidr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = networking_v1::ServiceCidr::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "ServiceCIDR",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                if !spec.cidrs.is_empty() {
+                    out["spec"] = serde_json::json!({
+                        "cidrs": spec.cidrs,
+                    });
+                }
+            }
+            if let Some(status) = obj.status {
+                if !status.conditions.is_empty() {
+                    let conditions: Vec<serde_json::Value> = status
+                        .conditions
+                        .into_iter()
+                        .map(|c| {
+                            let mut cm = serde_json::json!({
+                                "type": c.r#type.unwrap_or_default(),
+                                "status": c.status.unwrap_or_default(),
+                            });
+                            if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                                cm["reason"] = v.into();
+                            }
+                            if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                                cm["message"] = v.into();
+                            }
+                            if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+                                cm["observedGeneration"] = v.into();
+                            }
+                            if let Some(t) = c.last_transition_time {
+                                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                                    cm["lastTransitionTime"] = serde_json::Value::String(
+                                        crate::util::secs_to_rfc3339(secs),
+                                    );
+                                }
+                            }
+                            cm
+                        })
+                        .collect();
+                    out["status"] = serde_json::json!({ "conditions": conditions });
+                }
+            }
+            Some(out)
+        }
+
+        let obj = networking_v1::ServiceCidr {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(networking_v1::ServiceCidrSpec::sentinel()),
+            status: Some(networking_v1::ServiceCidrStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_servicecidr_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_servicecidr_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_servicecidr_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — the pre-migration condition builder used a \
+             `.filter(|&v| v != 0)` zero-guard the mechanical walker's own `gen_meta_condition_to_json` \
+             equivalent must still reproduce"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_endpointslice_decode_matches_pre_migration_hand_written_output() {
+        fn old_gen_object_reference_to_json(r: core_v1::ObjectReference) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+                m.insert("kind".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.namespace.filter(|s| !s.is_empty()) {
+                m.insert("namespace".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+                m.insert("name".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.uid.filter(|s| !s.is_empty()) {
+                m.insert("uid".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
+                m.insert("apiVersion".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.resource_version.filter(|s| !s.is_empty()) {
+                m.insert("resourceVersion".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
+                m.insert("fieldPath".to_string(), serde_json::Value::String(v));
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_decode_endpointslice_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = discovery_v1::EndpointSlice::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": meta,
+                "addressType": obj.address_type.unwrap_or_default()
+            });
+            let endpoints_arr: Vec<serde_json::Value> = obj
+                .endpoints
+                .into_iter()
+                .map(|ep| {
+                    let mut ej = serde_json::Map::new();
+                    ej.insert(
+                        "addresses".to_string(),
+                        serde_json::Value::Array(
+                            ep.addresses
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                    if let Some(c) = ep.conditions {
+                        let mut cj = serde_json::Map::new();
+                        if let Some(v) = c.ready {
+                            cj.insert("ready".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(v) = c.serving {
+                            cj.insert("serving".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if let Some(v) = c.terminating {
+                            cj.insert("terminating".to_string(), serde_json::Value::Bool(v));
+                        }
+                        if !cj.is_empty() {
+                            ej.insert("conditions".to_string(), serde_json::Value::Object(cj));
+                        }
+                    }
+                    if let Some(h) = ep.hostname.filter(|s| !s.is_empty()) {
+                        ej.insert("hostname".to_string(), serde_json::Value::String(h));
+                    }
+                    if let Some(r) = ep.target_ref {
+                        let rj = old_gen_object_reference_to_json(r);
+                        if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                            ej.insert("targetRef".to_string(), rj);
+                        }
+                    }
+                    if let Some(nn) = ep.node_name.filter(|s| !s.is_empty()) {
+                        ej.insert("nodeName".to_string(), serde_json::Value::String(nn));
+                    }
+                    if let Some(z) = ep.zone.filter(|s| !s.is_empty()) {
+                        ej.insert("zone".to_string(), serde_json::Value::String(z));
+                    }
+                    if let Some(hints) = ep.hints {
+                        let mut hj = serde_json::Map::new();
+                        if !hints.for_zones.is_empty() {
+                            let fz: Vec<serde_json::Value> = hints
+                                .for_zones
+                                .into_iter()
+                                .filter_map(|fz| {
+                                    fz.name
+                                        .filter(|s| !s.is_empty())
+                                        .map(|n| serde_json::json!({ "name": n }))
+                                })
+                                .collect();
+                            if !fz.is_empty() {
+                                hj.insert("forZones".to_string(), serde_json::Value::Array(fz));
+                            }
+                        }
+                        if !hints.for_nodes.is_empty() {
+                            let fnodes: Vec<serde_json::Value> = hints
+                                .for_nodes
+                                .into_iter()
+                                .filter_map(|n| {
+                                    n.name
+                                        .filter(|s| !s.is_empty())
+                                        .map(|n| serde_json::json!({ "name": n }))
+                                })
+                                .collect();
+                            if !fnodes.is_empty() {
+                                hj.insert("forNodes".to_string(), serde_json::Value::Array(fnodes));
+                            }
+                        }
+                        if !hj.is_empty() {
+                            ej.insert("hints".to_string(), serde_json::Value::Object(hj));
+                        }
+                    }
+                    serde_json::Value::Object(ej)
+                })
+                .collect();
+            out["endpoints"] = serde_json::Value::Array(endpoints_arr);
+            let ports_arr: Vec<serde_json::Value> = obj
+                .ports
+                .into_iter()
+                .map(|p| {
+                    let mut pj = serde_json::Map::new();
+                    if let Some(n) = p.name {
+                        pj.insert("name".to_string(), serde_json::Value::String(n));
+                    }
+                    if let Some(proto) = p.protocol.filter(|s| !s.is_empty()) {
+                        pj.insert("protocol".to_string(), serde_json::Value::String(proto));
+                    }
+                    if let Some(port_num) = p.port {
+                        pj.insert(
+                            "port".to_string(),
+                            serde_json::Value::Number(port_num.into()),
+                        );
+                    }
+                    if let Some(ap) = p.app_protocol.filter(|s| !s.is_empty()) {
+                        pj.insert("appProtocol".to_string(), serde_json::Value::String(ap));
+                    }
+                    serde_json::Value::Object(pj)
+                })
+                .collect();
+            out["ports"] = serde_json::Value::Array(ports_arr);
+            Some(out)
+        }
+
+        // Note: `hints.forZones`/`forNodes` are deliberately populated with real names (not left
+        // to `Sentinel`'s own bare-struct default) because the pre-migration decoder filters out
+        // entries with an empty/missing `name` — a `ForZone::sentinel()` in isolation still sets
+        // `name`, so this doesn't mask anything, but is called out since it's exactly the kind of
+        // filter the mechanical codegen migration's own doc (`endpoint_delegated_field`) notes it
+        // no longer reproduces for a genuinely-nameless entry.
+        let es = discovery_v1::EndpointSlice {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            address_type: Some("IPv4".to_string()),
+            endpoints: vec![discovery_v1::Endpoint::sentinel()],
+            ports: vec![discovery_v1::EndpointPort::sentinel()],
+        };
+        let mut buf = Vec::new();
+        es.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_endpointslice_proto_gen(&buf).expect("old path must decode");
+        let mut new_decoded = decode_endpointslice_proto_gen(&buf).expect("new path must decode");
+        // `deprecatedTopology` (a `map<string, string>`) is a genuinely new field this migration
+        // adds: the pre-migration hand-written `json_to_endpoint_proto` never read it at all (not
+        // a regression to guard against — the opposite, a previously-silent field drop the
+        // mechanical walker now closes for free). Strip it before the equality check so this test
+        // stays focused on catching regressions in the fields both paths implement.
+        if let Some(ep) = new_decoded["endpoints"][0].as_object_mut() {
+            ep.remove("deprecatedTopology");
+        }
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_endpointslice_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field (modulo the newly-closed deprecatedTopology \
+             gap stripped above) — EndpointSlice is this bead's own highest-traffic conformance \
+             target on the read path, and kube-proxy programs its entire dataplane from exactly \
+             this JSON"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_endpointslice_encode_matches_pre_migration_hand_written_output() {
+        fn old_json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
+            json_to_object_meta_proto(obj)
+        }
+
+        fn old_json_to_object_reference_proto(v: &serde_json::Value) -> core_v1::ObjectReference {
+            core_v1::ObjectReference {
+                kind: jstr(v, "kind"),
+                namespace: jstr(v, "namespace"),
+                name: jstr(v, "name"),
+                uid: jstr(v, "uid"),
+                api_version: jstr(v, "apiVersion"),
+                resource_version: jstr(v, "resourceVersion"),
+                field_path: jstr(v, "fieldPath"),
+            }
+        }
+
+        fn old_json_to_endpoint_conditions_proto(
+            v: &serde_json::Value,
+        ) -> discovery_v1::EndpointConditions {
+            discovery_v1::EndpointConditions {
+                ready: jbool(v, "ready"),
+                serving: jbool(v, "serving"),
+                terminating: jbool(v, "terminating"),
+            }
+        }
+
+        fn old_json_to_endpoint_hints_proto(v: &serde_json::Value) -> discovery_v1::EndpointHints {
+            discovery_v1::EndpointHints {
+                for_zones: v
+                    .get("forZones")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|z| jstr(z, "name"))
+                            .map(|name| discovery_v1::ForZone { name: Some(name) })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                for_nodes: v
+                    .get("forNodes")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|n| jstr(n, "name"))
+                            .map(|name| discovery_v1::ForNode { name: Some(name) })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }
+
+        fn old_json_to_endpoint_proto(v: &serde_json::Value) -> discovery_v1::Endpoint {
+            discovery_v1::Endpoint {
+                addresses: jstrs(v, "addresses"),
+                conditions: v
+                    .get("conditions")
+                    .map(old_json_to_endpoint_conditions_proto),
+                hostname: jstr(v, "hostname"),
+                target_ref: v.get("targetRef").map(old_json_to_object_reference_proto),
+                node_name: jstr(v, "nodeName"),
+                zone: jstr(v, "zone"),
+                hints: v.get("hints").map(old_json_to_endpoint_hints_proto),
+                ..Default::default()
+            }
+        }
+
+        fn old_json_to_endpointslice_proto(v: &serde_json::Value) -> discovery_v1::EndpointSlice {
+            discovery_v1::EndpointSlice {
+                metadata: Some(old_json_to_object_meta_proto(v)),
+                address_type: jstr(v, "addressType"),
+                endpoints: v
+                    .get("endpoints")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().map(old_json_to_endpoint_proto).collect())
+                    .unwrap_or_default(),
+                ports: v
+                    .get("ports")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().map(json_to_endpointslice_port_proto).collect())
+                    .unwrap_or_default(),
+            }
+        }
+
+        let slice = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": { "name": "web-abcde", "namespace": "default" },
+            "addressType": "IPv4",
+            "endpoints": [{
+                "addresses": ["10.244.0.5"],
+                "conditions": { "ready": true },
+                "hostname": "pod-a",
+                "targetRef": { "kind": "Pod", "name": "web-abcde-xyz" },
+                "nodeName": "worker-1",
+                "zone": "us-east-1a",
+                "hints": { "forZones": [{ "name": "us-east-1a" }], "forNodes": [{ "name": "worker-1" }] }
+            }],
+            "ports": [{ "name": "", "port": 8080, "protocol": "TCP", "appProtocol": "http" }]
+        });
+
+        let old_bytes = old_json_to_endpointslice_proto(&slice).encode_to_vec();
+        let new_bytes = json_to_endpointslice_proto(&slice).encode_to_vec();
+        assert_eq!(
+            old_bytes, new_bytes,
+            "codegen-generated json_to_endpointslice_proto must produce byte-identical protobuf \
+             to the pre-migration hand-written encoder — a divergence here means the GET/LIST \
+             protobuf response kube-proxy consumes no longer matches what it did before this \
+             migration"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_csr_matches_pre_migration_hand_written_output() {
+        fn old_decode_csr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = certs_v1::CertificateSigningRequest::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "CertificateSigningRequest",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if let Some(req) = spec.request.filter(|v| !v.is_empty()) {
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&req);
+                    spec_json.insert("request".to_string(), serde_json::Value::String(b64));
+                }
+                if let Some(sn) = spec.signer_name.filter(|s| !s.is_empty()) {
+                    spec_json.insert("signerName".to_string(), serde_json::Value::String(sn));
+                }
+                if let Some(exp) = spec.expiration_seconds.filter(|&v| v != 0) {
+                    spec_json.insert(
+                        "expirationSeconds".to_string(),
+                        serde_json::Value::Number(exp.into()),
+                    );
+                }
+                if !spec.usages.is_empty() {
+                    spec_json.insert(
+                        "usages".to_string(),
+                        serde_json::Value::Array(
+                            spec.usages
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(u) = spec.username.filter(|s| !s.is_empty()) {
+                    spec_json.insert("username".to_string(), serde_json::Value::String(u));
+                }
+                if let Some(uid) = spec.uid.filter(|s| !s.is_empty()) {
+                    spec_json.insert("uid".to_string(), serde_json::Value::String(uid));
+                }
+                if !spec.groups.is_empty() {
+                    spec_json.insert(
+                        "groups".to_string(),
+                        serde_json::Value::Array(
+                            spec.groups
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                if !spec.extra.is_empty() {
+                    let extra: serde_json::Map<String, serde_json::Value> = spec
+                        .extra
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let items: Vec<serde_json::Value> =
+                                v.items.into_iter().map(serde_json::Value::String).collect();
+                            (k, serde_json::Value::Array(items))
+                        })
+                        .collect();
+                    spec_json.insert("extra".to_string(), serde_json::Value::Object(extra));
+                }
+                if !spec_json.is_empty() {
+                    out["spec"] = serde_json::Value::Object(spec_json);
+                }
+            }
+            if let Some(status) = obj.status {
+                let mut status_json = serde_json::Map::new();
+                if !status.conditions.is_empty() {
+                    let conditions: Vec<serde_json::Value> = status
+                        .conditions
+                        .into_iter()
+                        .map(|c| {
+                            let mut cm = serde_json::json!({
+                                "type": c.r#type.unwrap_or_default(),
+                                "status": c.status.unwrap_or_default(),
+                            });
+                            if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                                cm["reason"] = v.into();
+                            }
+                            if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                                cm["message"] = v.into();
+                            }
+                            if let Some(t) = c.last_update_time {
+                                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                                    cm["lastUpdateTime"] = serde_json::Value::String(
+                                        crate::util::secs_to_rfc3339(secs),
+                                    );
+                                }
+                            }
+                            if let Some(t) = c.last_transition_time {
+                                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                                    cm["lastTransitionTime"] = serde_json::Value::String(
+                                        crate::util::secs_to_rfc3339(secs),
+                                    );
+                                }
+                            }
+                            cm
+                        })
+                        .collect();
+                    status_json.insert(
+                        "conditions".to_string(),
+                        serde_json::Value::Array(conditions),
+                    );
+                }
+                if let Some(cert) = status.certificate.filter(|c| !c.is_empty()) {
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&cert);
+                    status_json.insert("certificate".to_string(), serde_json::Value::String(b64));
+                }
+                if !status_json.is_empty() {
+                    out["status"] = serde_json::Value::Object(status_json);
+                }
+            }
+            Some(out)
+        }
+
+        let csr = certs_v1::CertificateSigningRequest {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(certs_v1::CertificateSigningRequestSpec::sentinel()),
+            status: Some(certs_v1::CertificateSigningRequestStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        csr.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_csr_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_csr_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_csr_proto_gen must match the pre-migration hand-written \
+             decoder field-for-field — a divergence in `request`/`certificate` (both base64 \
+             `bytes`) or `extra` (a `map<string, ExtraValue>` the mechanical walker would \
+             otherwise misclassify as a string map) would silently corrupt a certificate request \
+             or issuance"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_poddisruptionbudget_matches_pre_migration_hand_written_output() {
+        fn old_decode_poddisruptionbudget_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let obj = policy_v1::PodDisruptionBudget::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+            let mut result = serde_json::json!({
+                "apiVersion": "policy/v1",
+                "kind": "PodDisruptionBudget",
+                "metadata": meta
+            });
+            if let Some(spec) = obj.spec {
+                let mut spec_json = serde_json::Map::new();
+                if let Some(min_avail) = spec.min_available {
+                    spec_json.insert(
+                        "minAvailable".to_string(),
+                        gen_int_or_string_to_json(&min_avail),
+                    );
+                }
+                if let Some(sel) = spec.selector {
+                    spec_json.insert("selector".to_string(), gen_label_selector_to_json(sel));
+                }
+                if let Some(max_unavail) = spec.max_unavailable {
+                    spec_json.insert(
+                        "maxUnavailable".to_string(),
+                        gen_int_or_string_to_json(&max_unavail),
+                    );
+                }
+                if let Some(policy) = spec.unhealthy_pod_eviction_policy.filter(|s| !s.is_empty()) {
+                    spec_json.insert(
+                        "unhealthyPodEvictionPolicy".to_string(),
+                        serde_json::Value::String(policy),
+                    );
+                }
+                result["spec"] = serde_json::Value::Object(spec_json);
+            }
+            if let Some(status) = obj.status {
+                let mut status_json = serde_json::Map::new();
+                if let Some(og) = status.observed_generation.filter(|&v| v != 0) {
+                    status_json.insert(
+                        "observedGeneration".to_string(),
+                        serde_json::Value::Number(og.into()),
+                    );
+                }
+                if !status.disrupted_pods.is_empty() {
+                    let pods_map: serde_json::Map<String, serde_json::Value> = status
+                        .disrupted_pods
+                        .into_iter()
+                        .map(|(pod_name, t)| {
+                            let secs = t.seconds.unwrap_or(0);
+                            let ts = if secs > 0 {
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs))
+                            } else {
+                                serde_json::Value::String("1970-01-01T00:00:00Z".into())
+                            };
+                            (pod_name, ts)
+                        })
+                        .collect();
+                    status_json.insert(
+                        "disruptedPods".to_string(),
+                        serde_json::Value::Object(pods_map),
+                    );
+                }
+                status_json.insert(
+                    "disruptionsAllowed".to_string(),
+                    serde_json::Value::Number(status.disruptions_allowed.unwrap_or(0).into()),
+                );
+                status_json.insert(
+                    "currentHealthy".to_string(),
+                    serde_json::Value::Number(status.current_healthy.unwrap_or(0).into()),
+                );
+                status_json.insert(
+                    "desiredHealthy".to_string(),
+                    serde_json::Value::Number(status.desired_healthy.unwrap_or(0).into()),
+                );
+                status_json.insert(
+                    "expectedPods".to_string(),
+                    serde_json::Value::Number(status.expected_pods.unwrap_or(0).into()),
+                );
+                if !status.conditions.is_empty() {
+                    let conds: Vec<serde_json::Value> = status
+                        .conditions
+                        .into_iter()
+                        .map(|c| {
+                            let mut cond = serde_json::Map::new();
+                            if let Some(t) = c.r#type.filter(|s| !s.is_empty()) {
+                                cond.insert("type".to_string(), serde_json::Value::String(t));
+                            }
+                            if let Some(s) = c.status.filter(|s| !s.is_empty()) {
+                                cond.insert("status".to_string(), serde_json::Value::String(s));
+                            }
+                            if let Some(og) = c.observed_generation.filter(|&v| v != 0) {
+                                cond.insert(
+                                    "observedGeneration".to_string(),
+                                    serde_json::Value::Number(og.into()),
+                                );
+                            }
+                            if let Some(ts) = c.last_transition_time {
+                                if let Some(secs) = ts.seconds.filter(|&s| s > 0) {
+                                    cond.insert(
+                                        "lastTransitionTime".to_string(),
+                                        serde_json::Value::String(crate::util::secs_to_rfc3339(
+                                            secs,
+                                        )),
+                                    );
+                                }
+                            }
+                            if let Some(r) = c.reason.filter(|s| !s.is_empty()) {
+                                cond.insert("reason".to_string(), serde_json::Value::String(r));
+                            }
+                            if let Some(msg) = c.message.filter(|s| !s.is_empty()) {
+                                cond.insert("message".to_string(), serde_json::Value::String(msg));
+                            }
+                            serde_json::Value::Object(cond)
+                        })
+                        .collect();
+                    status_json.insert("conditions".to_string(), serde_json::Value::Array(conds));
+                }
+                result["status"] = serde_json::Value::Object(status_json);
+            }
+            Some(result)
+        }
+
+        let pdb = policy_v1::PodDisruptionBudget {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(policy_v1::PodDisruptionBudgetSpec::sentinel()),
+            status: Some(policy_v1::PodDisruptionBudgetStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        pdb.encode(&mut buf).unwrap();
+
+        let old_decoded =
+            old_decode_poddisruptionbudget_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_poddisruptionbudget_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_poddisruptionbudget_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — PodDisruptionBudget is one of this bead's \
+             own highest-traffic conformance targets, and the eviction API reads this exact JSON \
+             to decide whether a voluntary disruption is currently allowed"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_events_v1_event_matches_pre_migration_hand_written_output() {
+        fn old_gen_object_reference_to_json(r: core_v1::ObjectReference) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+                m.insert("kind".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.namespace.filter(|s| !s.is_empty()) {
+                m.insert("namespace".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+                m.insert("name".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.uid.filter(|s| !s.is_empty()) {
+                m.insert("uid".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
+                m.insert("apiVersion".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.resource_version.filter(|s| !s.is_empty()) {
+                m.insert("resourceVersion".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
+                m.insert("fieldPath".to_string(), serde_json::Value::String(v));
+            }
+            serde_json::Value::Object(m)
+        }
+
+        fn old_decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+            let ev = events_v1::Event::decode(data).ok()?;
+            let meta = gen_object_meta_to_json(ev.metadata.unwrap_or_default());
+            let mut out = serde_json::json!({
+                "apiVersion": "events.k8s.io/v1",
+                "kind": "Event",
+                "metadata": meta
+            });
+            if let Some(t) = ev.event_time {
+                if let Some(secs) = t.seconds {
+                    let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                        secs,
+                        t.nanos.unwrap_or(0),
+                    );
+                    out["eventTime"] = serde_json::Value::String(ts);
+                }
+            }
+            if let Some(s) = ev.series {
+                let mut sj = serde_json::Map::new();
+                if let Some(count) = s.count.filter(|&v| v != 0) {
+                    sj.insert("count".to_string(), serde_json::Value::Number(count.into()));
+                }
+                if let Some(t) = s.last_observed_time {
+                    if let Some(secs) = t.seconds {
+                        let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                            secs,
+                            t.nanos.unwrap_or(0),
+                        );
+                        sj.insert(
+                            "lastObservedTime".to_string(),
+                            serde_json::Value::String(ts),
+                        );
+                    }
+                }
+                if !sj.is_empty() {
+                    out["series"] = serde_json::Value::Object(sj);
+                }
+            }
+            if let Some(rc) = ev.reporting_controller.filter(|s| !s.is_empty()) {
+                out["reportingController"] = serde_json::Value::String(rc);
+            }
+            if let Some(ri) = ev.reporting_instance.filter(|s| !s.is_empty()) {
+                out["reportingInstance"] = serde_json::Value::String(ri);
+            }
+            if let Some(a) = ev.action.filter(|s| !s.is_empty()) {
+                out["action"] = serde_json::Value::String(a);
+            }
+            if let Some(r) = ev.reason.filter(|s| !s.is_empty()) {
+                out["reason"] = serde_json::Value::String(r);
+            }
+            if let Some(r) = ev.regarding {
+                let rj = old_gen_object_reference_to_json(r);
+                if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                    out["regarding"] = rj;
+                }
+            }
+            if let Some(r) = ev.related {
+                let rj = old_gen_object_reference_to_json(r);
+                if rj.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                    out["related"] = rj;
+                }
+            }
+            if let Some(n) = ev.note.filter(|s| !s.is_empty()) {
+                out["note"] = serde_json::Value::String(n);
+            }
+            if let Some(t) = ev.r#type.filter(|s| !s.is_empty()) {
+                out["type"] = serde_json::Value::String(t);
+            }
+            if let Some(count) = ev.deprecated_count.filter(|&v| v != 0) {
+                out["deprecatedCount"] = serde_json::Value::Number(count.into());
+            }
+            if let Some(src) = ev.deprecated_source {
+                let mut srcj = serde_json::Map::new();
+                if let Some(v) = src.component.filter(|s| !s.is_empty()) {
+                    srcj.insert("component".to_string(), serde_json::Value::String(v));
+                }
+                if let Some(v) = src.host.filter(|s| !s.is_empty()) {
+                    srcj.insert("host".to_string(), serde_json::Value::String(v));
+                }
+                if !srcj.is_empty() {
+                    out["deprecatedSource"] = serde_json::Value::Object(srcj);
+                }
+            }
+            if let Some(t) = ev.deprecated_first_timestamp {
+                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                    out["deprecatedFirstTimestamp"] =
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                }
+            }
+            if let Some(t) = ev.deprecated_last_timestamp {
+                if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                    out["deprecatedLastTimestamp"] =
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                }
+            }
+            Some(out)
+        }
+
+        let ev = events_v1::Event {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            event_time: Some(meta_v1::MicroTime::sentinel()),
+            series: Some(events_v1::EventSeries::sentinel()),
+            reporting_controller: Some("kubernetes.io/kubelet".to_string()),
+            reporting_instance: Some("kubelet-abc".to_string()),
+            action: Some("Started".to_string()),
+            reason: Some("Started".to_string()),
+            regarding: Some(core_v1::ObjectReference::sentinel()),
+            related: Some(core_v1::ObjectReference::sentinel()),
+            note: Some("a note".to_string()),
+            r#type: Some("Normal".to_string()),
+            deprecated_source: Some(core_v1::EventSource::sentinel()),
+            deprecated_first_timestamp: Some(meta_v1::Time::sentinel()),
+            deprecated_last_timestamp: Some(meta_v1::Time::sentinel()),
+            deprecated_count: Some(3),
+        };
+        let mut buf = Vec::new();
+        ev.encode(&mut buf).unwrap();
+
+        let old_decoded = old_decode_events_v1_event_proto_gen(&buf).expect("old path must decode");
+        let new_decoded = decode_events_v1_event_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old_decoded, new_decoded,
+            "codegen-generated decode_events_v1_event_proto_gen must match the pre-migration \
+             hand-written decoder field-for-field — a divergence in the eventTime/lastObservedTime \
+             explicit-seconds-present handling would misrepresent whether an event ever actually \
+             occurred"
         );
     }
 }

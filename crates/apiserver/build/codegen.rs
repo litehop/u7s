@@ -154,6 +154,11 @@ fn rust_message_path(fq_type_name: &str) -> String {
         format!("core_v1::{name}")
     } else if fq_type_name.starts_with(".k8s.io.apimachinery.pkg.apis.meta.v1.") {
         format!("meta_v1::{name}")
+    } else if fq_type_name.starts_with(".k8s.io.api.discovery.v1.") {
+        // EndpointSlice (net_disc_cert_policy_events_gen_adapter.rs) is this codegen module's
+        // first two-way (decode-direction-needing) target outside core/v1 and meta/v1 — its own
+        // nested types (Endpoint/EndpointConditions/EndpointHints/ForZone/ForNode) all live here.
+        format!("discovery_v1::{name}")
     } else {
         panic!(
             "{fq_type_name} is outside the k8s.io.api.core.v1/k8s.io.apimachinery.pkg.apis.meta.v1 \
@@ -4405,40 +4410,65 @@ pub fn generate_controllerrevision(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-const HPA_V1: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscaler";
-const HPA_V1_SPEC: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscalerSpec";
-const HPA_V1_STATUS: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscalerStatus";
+const JSON_SCHEMA_PROPS: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps";
+const VALIDATION_RULE: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.ValidationRule";
+const CRD_SERVICE_REFERENCE: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.ServiceReference";
+const CRD_WEBHOOK_CLIENT_CONFIG: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.WebhookClientConfig";
+const WEBHOOK_CONVERSION: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.WebhookConversion";
+const CRD_CONVERSION: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceConversion";
+const CRD_NAMES: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinitionNames";
+const PRINTER_COLUMN: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceColumnDefinition";
+const SELECTABLE_FIELD: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.SelectableField";
+const SUBRESOURCE_SCALE: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceSubresourceScale";
+const SUBRESOURCES: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceSubresources";
+const CRD_VERSION: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinitionVersion";
+const CRD_STATUS: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinitionStatus";
+const CRD_SPEC: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinitionSpec";
+const CRD: &str =
+    ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition";
+const DELETE_OPTIONS: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.DeleteOptions";
 
-/// `maxReplicas` is a gogoproto `nullable=false` int32 field, the same class
-/// `lease_spec_delegated_field`'s own `leaseDurationSeconds` doc explains — the pre-migration
-/// `decode_hpa_v1_proto_gen` this replaces always emits it via `unwrap_or(0)`, which the
-/// mechanical walker's generic `Type::Int32` branch (an `if let Some` guard) can't reproduce.
-/// `scaleTargetRef`/`minReplicas`/`targetCPUUtilizationPercentage` need no entry: `scaleTargetRef`
-/// is `CrossVersionObjectReference`'s own three plain optional strings (kind/name/apiVersion),
-/// which the mechanical nested-message walk already reproduces field-for-field, and the other two
-/// are themselves plain optional int32s the mechanical walker already handles correctly.
-fn hpa_v1_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+/// `optionalOldSelf` is the only `ValidationRule` field needing more than the mechanical default:
+/// the hand-rolled `x-kubernetes-validations` closure this migration replaces only ever emits it
+/// when `true` (`r.optional_old_self.filter(|&b| b)`), the same true-only-guard class as
+/// `Container`'s `stdin`/`stdinOnce`/`tty`. `rule`/`message`/`messageExpression`/`reason`/
+/// `fieldPath` are all plain `optional string` fields the mechanical walker's
+/// empty-string-filtering default already reproduces exactly.
+fn validation_rule_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "maxReplicas" => Some(
-            "    m.insert(\"maxReplicas\".to_string(), serde_json::Value::Number(spec.max_replicas.unwrap_or(0).into()));\n",
+        "optionalOldSelf" => Some(
+            "    if let Some(v) = r.optional_old_self.filter(|&b| b) {\n        m.insert(\"optionalOldSelf\".to_string(), serde_json::Value::Bool(v));\n    }\n",
         ),
         _ => None,
     }
 }
 
-/// Generates `gen_hpa_v1_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
-/// `decode_hpa_v1_proto_gen` this migration retires — the same split `generate_lease_spec`
-/// established for `Lease.spec`.
-pub fn generate_hpa_v1_spec(descriptor_bytes: &[u8]) -> String {
+/// Generates `gen_validation_rule_to_json`, replacing the inline `x-kubernetes-validations`
+/// closure of the hand-rolled `gen_json_schema_props_to_json` this migration retires.
+pub fn generate_validation_rule(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)
         .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, HPA_V1_SPEC);
+    let message = find_message(&set, VALIDATION_RULE);
     let encode_stmts = generate_message_encode_only(
         &set,
-        HPA_V1_SPEC,
+        VALIDATION_RULE,
         message,
-        hpa_v1_spec_delegated_field,
-        "spec",
+        validation_rule_delegated_field,
+        "r",
         "m",
     );
 
@@ -4446,7 +4476,7 @@ pub fn generate_hpa_v1_spec(descriptor_bytes: &[u8]) -> String {
     out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
     out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
     out.push_str(
-        "fn gen_hpa_v1_spec_to_json(spec: autoscaling_v1::HorizontalPodAutoscalerSpec) -> serde_json::Value {\n",
+        "fn gen_validation_rule_to_json(r: apiext_v1::ValidationRule) -> serde_json::Value {\n",
     );
     out.push_str("    let mut m = serde_json::Map::new();\n");
     out.push_str(&encode_stmts);
@@ -4455,40 +4485,568 @@ pub fn generate_hpa_v1_spec(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-/// `currentReplicas`/`desiredReplicas` are gogoproto `nullable=false` int32 fields (same class as
-/// `hpa_v1_spec_delegated_field`'s own `maxReplicas` entry) — the pre-migration decoder always
-/// emits both via `unwrap_or(0)`. `lastScaleTime` is a bare `Time` needing RFC3339 conversion, the
-/// same opaque-scalar handling `lease_spec_delegated_field`'s `acquireTime`/`renewTime` entries
-/// document for `MicroTime` (only emitted once `seconds > 0`, matching the pre-migration
-/// `.filter(|&s| s > 0)` guard exactly). `observedGeneration`/`currentCPUUtilizationPercentage`
-/// need no entry: plain optional int64/int32 fields the mechanical walker already handles
-/// correctly.
-fn hpa_v1_status_delegated_field(field_name: &str) -> Option<&'static str> {
+/// `JSONSchemaProps` is the only self-referential message this codegen module generates a codec
+/// for: `properties`/`patternProperties`/`definitions` (`map<string, JSONSchemaProps>`),
+/// `allOf`/`oneOf`/`anyOf` (`repeated JSONSchemaProps`), and `not`/`items.schema`/
+/// `additionalProperties.schema`/`additionalItems.schema`/`dependencies[].schema` (each a
+/// `JSONSchemaProps`, some `Box`ed by prost to break the otherwise-infinite struct size) all
+/// eventually contain another `JSONSchemaProps`. The mechanical walker's own recursion
+/// (`emit_mechanical_encode`/`emit_field_encode`'s `Type::Message` branches) has no cycle guard —
+/// unlike `proto_descriptor.rs::walk()`'s `stack` check — because every other message this module
+/// has generated a codec for is finitely nested (a fixed, schema-visible depth); letting any of
+/// these fields fall through to that generic recursive-inlining branch would make
+/// `find_message`/`emit_mechanical_encode` recurse forever at build time (an infinite string, not
+/// a compile error). Every self-referential field is therefore delegated to a hand-templated
+/// snippet that calls `gen_json_schema_props_to_json` **by name** — the same shape the hand-rolled
+/// function this migration replaces already uses for its own recursive calls — so the *generated*
+/// function recurses at Rust run time, not at codegen build time.
+///
+/// Every field below that is not self-referential is delegated here too if it needs anything
+/// beyond the mechanical default: the two `double`-typed fields (`maximum`/`minimum`/
+/// `multipleOf` — `Type::Double` has no arm in `emit_field_encode`, the same gap `Type::Bytes` had
+/// before `apiservice_spec_delegated_field`'s `caBundle` entry), the true-only-guarded bool fields
+/// (`exclusiveMaximum`/`exclusiveMinimum`/`uniqueItems`/`nullable`/the three `xKubernetes*`
+/// booleans — the same class as `Container.stdin`), `default`/`example`/`enum` (each wraps or
+/// contains the opaque `JSON` scalar type, handled by the hand-written `gen_json_raw_to_value`),
+/// and `xKubernetesValidations` (delegates to the separately generated
+/// `gen_validation_rule_to_json`). Only `id`/`schema`($schema)/`ref`($ref)/`description`/`type`/
+/// `format`/`title`/`pattern`/`maxLength`/`minLength`/`maxItems`/`minItems`/`maxProperties`/
+/// `minProperties`/`required`/`xKubernetesListMapKeys`/`xKubernetesListType`/
+/// `xKubernetesMapType`/`externalDocs` are left mechanical — `externalDocs`
+/// (`ExternalDocumentation { description, url }`) is a genuinely finite, non-recursive nested
+/// message, so the generic `Type::Message` branch already reproduces the hand-rolled
+/// `if !ed_m.is_empty() { ... }` guard exactly.
+fn json_schema_props_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "lastScaleTime" => Some(
-            "    if let Some(secs) = status.last_scale_time.and_then(|t| t.seconds).filter(|&s| s > 0) {\n        m.insert(\"lastScaleTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
+        "default" => Some(
+            "    if let Some(v) = schema.default {\n        let raw = gen_json_raw_to_value(v);\n        if !raw.is_null() {\n            m.insert(\"default\".to_string(), raw);\n        }\n    }\n",
         ),
-        "currentReplicas" => Some(
-            "    m.insert(\"currentReplicas\".to_string(), serde_json::Value::Number(status.current_replicas.unwrap_or(0).into()));\n",
+        "maximum" => Some(
+            "    if let Some(v) = schema.maximum {\n        m.insert(\"maximum\".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0))));\n    }\n",
         ),
-        "desiredReplicas" => Some(
-            "    m.insert(\"desiredReplicas\".to_string(), serde_json::Value::Number(status.desired_replicas.unwrap_or(0).into()));\n",
+        "exclusiveMaximum" => Some(
+            "    if let Some(v) = schema.exclusive_maximum.filter(|&b| b) {\n        m.insert(\"exclusiveMaximum\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "minimum" => Some(
+            "    if let Some(v) = schema.minimum {\n        m.insert(\"minimum\".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0))));\n    }\n",
+        ),
+        "exclusiveMinimum" => Some(
+            "    if let Some(v) = schema.exclusive_minimum.filter(|&b| b) {\n        m.insert(\"exclusiveMinimum\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "uniqueItems" => Some(
+            "    if let Some(v) = schema.unique_items.filter(|&b| b) {\n        m.insert(\"uniqueItems\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "multipleOf" => Some(
+            "    if let Some(v) = schema.multiple_of {\n        m.insert(\"multipleOf\".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0))));\n    }\n",
+        ),
+        "enum" => Some(
+            "    if !schema.r#enum.is_empty() {\n        let enum_vals: Vec<serde_json::Value> = schema.r#enum.into_iter().map(gen_json_raw_to_value).collect();\n        m.insert(\"enum\".to_string(), serde_json::Value::Array(enum_vals));\n    }\n",
+        ),
+        "items" => Some(
+            "    if let Some(boxed) = schema.items {\n        let items_val = if let Some(s) = boxed.schema {\n            gen_json_schema_props_to_json(*s)\n        } else if !boxed.j_son_schemas.is_empty() {\n            serde_json::Value::Array(boxed.j_son_schemas.into_iter().map(gen_json_schema_props_to_json).collect())\n        } else {\n            serde_json::Value::Object(serde_json::Map::new())\n        };\n        m.insert(\"items\".to_string(), items_val);\n    }\n",
+        ),
+        "allOf" => Some(
+            "    if !schema.all_of.is_empty() {\n        m.insert(\"allOf\".to_string(), serde_json::Value::Array(schema.all_of.into_iter().map(gen_json_schema_props_to_json).collect()));\n    }\n",
+        ),
+        "oneOf" => Some(
+            "    if !schema.one_of.is_empty() {\n        m.insert(\"oneOf\".to_string(), serde_json::Value::Array(schema.one_of.into_iter().map(gen_json_schema_props_to_json).collect()));\n    }\n",
+        ),
+        "anyOf" => Some(
+            "    if !schema.any_of.is_empty() {\n        m.insert(\"anyOf\".to_string(), serde_json::Value::Array(schema.any_of.into_iter().map(gen_json_schema_props_to_json).collect()));\n    }\n",
+        ),
+        "not" => Some(
+            "    if let Some(boxed) = schema.not {\n        m.insert(\"not\".to_string(), gen_json_schema_props_to_json(*boxed));\n    }\n",
+        ),
+        "properties" => Some(
+            "    if !schema.properties.is_empty() {\n        let props: serde_json::Map<String, serde_json::Value> = schema.properties.into_iter().map(|(k, v)| (k, gen_json_schema_props_to_json(v))).collect();\n        m.insert(\"properties\".to_string(), serde_json::Value::Object(props));\n    }\n",
+        ),
+        "additionalProperties" => Some(
+            "    if let Some(boxed) = schema.additional_properties {\n        let ap_val = match (boxed.allows, boxed.schema) {\n            (_, Some(s)) => gen_json_schema_props_to_json(*s),\n            (Some(b), None) => serde_json::Value::Bool(b),\n            (None, None) => serde_json::Value::Object(serde_json::Map::new()),\n        };\n        m.insert(\"additionalProperties\".to_string(), ap_val);\n    }\n",
+        ),
+        "patternProperties" => Some(
+            "    if !schema.pattern_properties.is_empty() {\n        let pp: serde_json::Map<String, serde_json::Value> = schema.pattern_properties.into_iter().map(|(k, v)| (k, gen_json_schema_props_to_json(v))).collect();\n        m.insert(\"patternProperties\".to_string(), serde_json::Value::Object(pp));\n    }\n",
+        ),
+        "dependencies" => Some(
+            "    if !schema.dependencies.is_empty() {\n        let deps: serde_json::Map<String, serde_json::Value> = schema.dependencies.into_iter().map(|(k, v)| {\n            let mut dep_m = serde_json::Map::new();\n            if let Some(s) = v.schema {\n                dep_m.insert(\"schema\".to_string(), gen_json_schema_props_to_json(s));\n            }\n            if !v.property.is_empty() {\n                dep_m.insert(\"property\".to_string(), serde_json::Value::Array(v.property.into_iter().map(serde_json::Value::String).collect()));\n            }\n            (k, serde_json::Value::Object(dep_m))\n        }).collect();\n        m.insert(\"dependencies\".to_string(), serde_json::Value::Object(deps));\n    }\n",
+        ),
+        "additionalItems" => Some(
+            "    if let Some(boxed) = schema.additional_items {\n        let ai_val = match (boxed.allows, boxed.schema) {\n            (_, Some(s)) => gen_json_schema_props_to_json(*s),\n            (Some(b), None) => serde_json::Value::Bool(b),\n            (None, None) => serde_json::Value::Object(serde_json::Map::new()),\n        };\n        m.insert(\"additionalItems\".to_string(), ai_val);\n    }\n",
+        ),
+        "definitions" => Some(
+            "    if !schema.definitions.is_empty() {\n        let defs: serde_json::Map<String, serde_json::Value> = schema.definitions.into_iter().map(|(k, v)| (k, gen_json_schema_props_to_json(v))).collect();\n        m.insert(\"definitions\".to_string(), serde_json::Value::Object(defs));\n    }\n",
+        ),
+        "example" => Some(
+            "    if let Some(ex) = schema.example {\n        let raw = gen_json_raw_to_value(ex);\n        if !raw.is_null() {\n            m.insert(\"example\".to_string(), raw);\n        }\n    }\n",
+        ),
+        "nullable" => Some(
+            "    if let Some(v) = schema.nullable.filter(|&b| b) {\n        m.insert(\"nullable\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "xKubernetesPreserveUnknownFields" => Some(
+            "    if let Some(v) = schema.x_kubernetes_preserve_unknown_fields.filter(|&b| b) {\n        m.insert(\"x-kubernetes-preserve-unknown-fields\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "xKubernetesEmbeddedResource" => Some(
+            "    if let Some(v) = schema.x_kubernetes_embedded_resource.filter(|&b| b) {\n        m.insert(\"x-kubernetes-embedded-resource\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "xKubernetesIntOrString" => Some(
+            "    if let Some(v) = schema.x_kubernetes_int_or_string.filter(|&b| b) {\n        m.insert(\"x-kubernetes-int-or-string\".to_string(), serde_json::Value::Bool(v));\n    }\n",
+        ),
+        "xKubernetesValidations" => Some(
+            "    if !schema.x_kubernetes_validations.is_empty() {\n        let rules: Vec<serde_json::Value> = schema.x_kubernetes_validations.into_iter().map(gen_validation_rule_to_json).collect();\n        m.insert(\"x-kubernetes-validations\".to_string(), serde_json::Value::Array(rules));\n    }\n",
         ),
         _ => None,
     }
 }
 
-/// Generates `gen_hpa_v1_status_to_json`, replacing the `status` assembly block of the
-/// hand-rolled `decode_hpa_v1_proto_gen` this migration retires.
-pub fn generate_hpa_v1_status(descriptor_bytes: &[u8]) -> String {
+/// Generates the recursive `gen_json_schema_props_to_json`, replacing the hand-rolled function of
+/// the same name — see `json_schema_props_delegated_field`'s doc for why this type needs its own
+/// delegate table rather than reusing another generator's.
+pub fn generate_json_schema_props(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)
         .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, HPA_V1_STATUS);
+    let message = find_message(&set, JSON_SCHEMA_PROPS);
     let encode_stmts = generate_message_encode_only(
         &set,
-        HPA_V1_STATUS,
+        JSON_SCHEMA_PROPS,
         message,
-        hpa_v1_status_delegated_field,
+        json_schema_props_delegated_field,
+        "schema",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_json_schema_props_to_json(schema: apiext_v1::JsonSchemaProps) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_crd_names_to_json`, replacing the hand-rolled function of the same name. Every
+/// field (`plural`/`singular`/`kind`/`listKind` — plain strings — and `shortNames`/`categories` —
+/// plain repeated strings) is already exactly what the mechanical walker's defaults produce, so no
+/// delegate table is needed.
+pub fn generate_crd_names(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD_NAMES);
+    let encode_stmts =
+        generate_message_encode_only(&set, CRD_NAMES, message, |_| None, "names", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_crd_names_to_json(names: apiext_v1::CustomResourceDefinitionNames) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `priority` is the only `CustomResourceColumnDefinition` field the mechanical walker gets
+/// wrong: the hand-rolled function this migration replaces only emits it when non-zero
+/// (`col.priority.filter(|&p| p != 0)`) — a zero priority is indistinguishable from "unset" per
+/// upstream's own doc comment ("Columns ... should be given a priority greater than 0"), the same
+/// class of guard as `PodStatus.observedGeneration`.
+fn printer_column_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "priority" => Some(
+            "    if let Some(v) = col.priority.filter(|&p| p != 0) {\n        m.insert(\"priority\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_printer_column_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_printer_column(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PRINTER_COLUMN);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PRINTER_COLUMN,
+        message,
+        printer_column_delegated_field,
+        "col",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_printer_column_to_json(col: apiext_v1::CustomResourceColumnDefinition) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_selectable_field_to_json`, replacing the hand-rolled function of the same name.
+/// `SelectableField`'s single field (`jsonPath`, a plain string) is already exactly what the
+/// mechanical walker's default produces.
+pub fn generate_selectable_field(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, SELECTABLE_FIELD);
+    let encode_stmts =
+        generate_message_encode_only(&set, SELECTABLE_FIELD, message, |_| None, "f", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_selectable_field_to_json(f: apiext_v1::SelectableField) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_service_reference_to_json`. Every field (`namespace`/`name`/`path` — plain
+/// strings — and `port` — a plain int32, inserted whenever set with no zero-filter, matching the
+/// hand-rolled `if let Some(port) = svc.port { ... }` this migration replaces) is already exactly
+/// what the mechanical walker's defaults produce.
+pub fn generate_crd_service_reference(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD_SERVICE_REFERENCE);
+    let encode_stmts =
+        generate_message_encode_only(&set, CRD_SERVICE_REFERENCE, message, |_| None, "svc", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_service_reference_to_json(svc: apiext_v1::ServiceReference) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `caBundle` is a `bytes` field (`Type::Bytes`, the same shape `apiservice_spec_delegated_field`
+/// handles for `APIServiceSpec.caBundle`) — delegates to the identical base64-encode template.
+/// `service` must be inserted unconditionally once `Some`, even if the nested `ServiceReference`
+/// ends up empty (the hand-rolled function this migration replaces never checks
+/// `svm.is_empty()`), unlike every other nested-message field this codegen module has met so far —
+/// so it delegates to a direct call into the separately generated `gen_service_reference_to_json`
+/// rather than the mechanical nested-message branch's only-if-non-empty default.
+fn crd_webhook_client_config_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "caBundle" => Some(
+            "    if let Some(v) = cc.ca_bundle.filter(|b| !b.is_empty()) {\n        use base64::Engine as _;\n        m.insert(\"caBundle\".to_string(), serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(v)));\n    }\n",
+        ),
+        "service" => Some(
+            "    if let Some(svc) = cc.service {\n        m.insert(\"service\".to_string(), gen_service_reference_to_json(svc));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_webhook_client_config_to_json`, replacing the `clientConfig` assembly block of
+/// the hand-rolled `decode_crd_proto_gen` this migration retires.
+pub fn generate_crd_webhook_client_config(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD_WEBHOOK_CLIENT_CONFIG);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CRD_WEBHOOK_CLIENT_CONFIG,
+        message,
+        crd_webhook_client_config_delegated_field,
+        "cc",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_webhook_client_config_to_json(cc: apiext_v1::WebhookClientConfig) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `clientConfig` must only be inserted once the separately generated
+/// `gen_webhook_client_config_to_json` produces a non-empty object — the hand-rolled function this
+/// migration replaces builds `ccm` itself and only inserts it into `wm` if `!ccm.is_empty()`;
+/// since that check now has to run on an already-generated JSON value rather than the map being
+/// built in place, it can't be expressed by the mechanical nested-message branch (which recurses
+/// inline, not through a named function call) and must be delegated.
+fn webhook_conversion_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "clientConfig" => Some(
+            "    if let Some(cc) = wh.client_config {\n        let ccj = gen_webhook_client_config_to_json(cc);\n        if ccj.as_object().is_some_and(|m| !m.is_empty()) {\n            m.insert(\"clientConfig\".to_string(), ccj);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_webhook_conversion_to_json`, replacing the `webhook` assembly block of the
+/// hand-rolled `decode_crd_proto_gen` this migration retires. `conversionReviewVersions` needs no
+/// delegate: it is a plain `repeated string`, and the mechanical walker's only-if-non-empty
+/// default already matches the hand-rolled `if !wh.conversion_review_versions.is_empty()` guard.
+pub fn generate_webhook_conversion(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, WEBHOOK_CONVERSION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        WEBHOOK_CONVERSION,
+        message,
+        webhook_conversion_delegated_field,
+        "wh",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_webhook_conversion_to_json(wh: apiext_v1::WebhookConversion) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `webhook` mirrors `webhook_conversion_delegated_field`'s own `clientConfig` entry one level up:
+/// only inserted once the separately generated `gen_webhook_conversion_to_json` produces a
+/// non-empty object, matching the hand-rolled `if !wm.is_empty() { cm.insert("webhook", ...) }`
+/// guard this migration retires.
+fn crd_conversion_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "webhook" => Some(
+            "    if let Some(wh) = conv.webhook {\n        let whj = gen_webhook_conversion_to_json(wh);\n        if whj.as_object().is_some_and(|m| !m.is_empty()) {\n            m.insert(\"webhook\".to_string(), whj);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_crd_conversion_to_json`, replacing the `conversion` assembly block of the
+/// hand-rolled `decode_crd_proto_gen` this migration retires. `strategy` needs no delegate: it is
+/// a plain string, and the mechanical walker's empty-string-filtering default already matches.
+pub fn generate_crd_conversion(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD_CONVERSION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CRD_CONVERSION,
+        message,
+        crd_conversion_delegated_field,
+        "conv",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_crd_conversion_to_json(conv: apiext_v1::CustomResourceConversion) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_subresource_scale_to_json`. All three fields (`specReplicasPath`/
+/// `statusReplicasPath`/`labelSelectorPath`) are plain strings the mechanical walker's default
+/// already handles.
+pub fn generate_subresource_scale(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, SUBRESOURCE_SCALE);
+    let encode_stmts =
+        generate_message_encode_only(&set, SUBRESOURCE_SCALE, message, |_| None, "scale", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_subresource_scale_to_json(scale: apiext_v1::CustomResourceSubresourceScale) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Both `CustomResourceSubresources` fields need a delegate: `status` is a zero-field marker
+/// message (`CustomResourceSubresourceStatus {}`), so the mechanical nested-message branch's
+/// only-if-non-empty default would never insert it (an empty message always produces an empty
+/// map) — the hand-rolled function this migration replaces inserts a literal `{}` whenever the
+/// field is `Some` regardless. `scale` must be inserted unconditionally once `Some`, even if the
+/// separately generated `gen_subresource_scale_to_json` produces an empty object — the hand-rolled
+/// `m.insert("scale", Object(sm))` this migration replaces has no `is_empty()` guard.
+fn subresources_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "status" => Some(
+            "    if sr.status.is_some() {\n        m.insert(\"status\".to_string(), serde_json::json!({}));\n    }\n",
+        ),
+        "scale" => Some(
+            "    if let Some(scale) = sr.scale {\n        m.insert(\"scale\".to_string(), gen_subresource_scale_to_json(scale));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_subresources_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_subresources(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, SUBRESOURCES);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        SUBRESOURCES,
+        message,
+        subresources_delegated_field,
+        "sr",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_subresources_to_json(sr: apiext_v1::CustomResourceSubresources) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `CustomResourceDefinitionVersion` fields needing more than the mechanical default:
+///   - `served`/`storage` must always be present, defaulting to `false` — the hand-rolled function
+///     this migration replaces inserts them unconditionally
+///     (`serde_json::Value::Bool(v.served.unwrap_or(false))`), unlike every optional-bool field
+///     this codegen module has otherwise met.
+///   - `deprecated` is true-only-guarded, the same class as `Container.stdin`.
+///   - `schema` unwraps the `CustomResourceValidation` wrapper and re-nests the recursively
+///     generated `gen_json_schema_props_to_json` output under a literal `"openAPIV3Schema"` key —
+///     a two-level `Option` unwrap (`CustomResourceValidation.open_apiv3_schema`) no mechanical
+///     branch derives.
+///   - `subresources` only inserts once the separately generated `gen_subresources_to_json`
+///     produces a non-empty object, the same named-function-call-then-check-emptiness shape
+///     `webhook_conversion_delegated_field`'s own `clientConfig` entry documents.
+///   - `additionalPrinterColumns`/`selectableFields` delegate wholesale to their own separately
+///     generated per-element codecs (`gen_printer_column_to_json`/`gen_selectable_field_to_json`)
+///     rather than the mechanical repeated-message branch's inline unrolling.
+///
+/// `name`/`deprecationWarning` need no entry: both are plain strings the mechanical walker's
+/// empty-string-filtering default already reproduces exactly.
+fn crd_version_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "served" => Some(
+            "    m.insert(\"served\".to_string(), serde_json::Value::Bool(v.served.unwrap_or(false)));\n",
+        ),
+        "storage" => Some(
+            "    m.insert(\"storage\".to_string(), serde_json::Value::Bool(v.storage.unwrap_or(false)));\n",
+        ),
+        "deprecated" => Some(
+            "    if let Some(dep) = v.deprecated.filter(|&b| b) {\n        m.insert(\"deprecated\".to_string(), serde_json::Value::Bool(dep));\n    }\n",
+        ),
+        "schema" => Some(
+            "    if let Some(schema_wrapper) = v.schema {\n        if let Some(schema) = schema_wrapper.open_apiv3_schema {\n            m.insert(\"schema\".to_string(), serde_json::json!({ \"openAPIV3Schema\": gen_json_schema_props_to_json(schema) }));\n        }\n    }\n",
+        ),
+        "subresources" => Some(
+            "    if let Some(sr) = v.subresources {\n        let sr_json = gen_subresources_to_json(sr);\n        if !sr_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {\n            m.insert(\"subresources\".to_string(), sr_json);\n        }\n    }\n",
+        ),
+        "additionalPrinterColumns" => Some(
+            "    if !v.additional_printer_columns.is_empty() {\n        m.insert(\"additionalPrinterColumns\".to_string(), serde_json::Value::Array(v.additional_printer_columns.into_iter().map(gen_printer_column_to_json).collect()));\n    }\n",
+        ),
+        "selectableFields" => Some(
+            "    if !v.selectable_fields.is_empty() {\n        m.insert(\"selectableFields\".to_string(), serde_json::Value::Array(v.selectable_fields.into_iter().map(gen_selectable_field_to_json).collect()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_version_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_crd_version(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD_VERSION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CRD_VERSION,
+        message,
+        crd_version_delegated_field,
+        "v",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_version_to_json(v: apiext_v1::CustomResourceDefinitionVersion) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `conditions` delegates wholesale to the hand-written `gen_crd_condition_to_json` (kept
+/// hand-written for the same `lastTransitionTime`/`Time`-opaque-scalar reason
+/// `gen_apiservice_condition_to_json` stays hand-written in `apiregistration_gen_adapter.rs`),
+/// only inserting the array once non-empty. `acceptedNames` must be inserted unconditionally once
+/// `Some`, mirroring `crd_spec_delegated_field`'s own `names` entry. `observedGeneration` is
+/// zero-filtered, the same class of guard as `PodStatus.observedGeneration`.
+fn crd_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = status.conditions.into_iter().map(gen_crd_condition_to_json).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        "acceptedNames" => Some(
+            "    if let Some(names) = status.accepted_names {\n        m.insert(\"acceptedNames\".to_string(), gen_crd_names_to_json(names));\n    }\n",
+        ),
+        "observedGeneration" => Some(
+            "    if let Some(og) = status.observed_generation.filter(|&g| g != 0) {\n        m.insert(\"observedGeneration\".to_string(), og.into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_crd_status_to_json`, replacing the `status` assembly block of the hand-rolled
+/// `decode_crd_proto_gen` this migration retires. `storedVersions` needs no delegate: it is a
+/// plain `repeated string`, and the mechanical walker's only-if-non-empty default already matches.
+pub fn generate_crd_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CRD_STATUS,
+        message,
+        crd_status_delegated_field,
         "status",
         "m",
     );
@@ -4497,7 +5055,7 @@ pub fn generate_hpa_v1_status(descriptor_bytes: &[u8]) -> String {
     out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
     out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
     out.push_str(
-        "fn gen_hpa_v1_status_to_json(status: autoscaling_v1::HorizontalPodAutoscalerStatus) -> serde_json::Value {\n",
+        "fn gen_crd_status_to_json(status: apiext_v1::CustomResourceDefinitionStatus) -> serde_json::Value {\n",
     );
     out.push_str("    let mut m = serde_json::Map::new();\n");
     out.push_str(&encode_stmts);
@@ -4506,43 +5064,103 @@ pub fn generate_hpa_v1_status(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`/
-/// `status` each delegate to the separately generated `gen_hpa_v1_spec_to_json`/
-/// `gen_hpa_v1_status_to_json`, only inserting the resulting key once non-empty — matching the
-/// pre-migration `decode_hpa_v1_proto_gen`'s own assembly shape (in practice always non-empty:
-/// `maxReplicas`/`currentReplicas`/`desiredReplicas` are always emitted, so `spec`/`status` are
-/// never actually empty for a decoded HPA).
-fn hpa_v1_delegated_field(field_name: &str) -> Option<&'static str> {
+/// `CustomResourceDefinitionSpec` fields needing more than the mechanical default:
+///   - `names` must be inserted unconditionally once `Some`, calling the separately generated
+///     `gen_crd_names_to_json`.
+///   - `versions` delegates wholesale to `gen_version_to_json`, only inserting the array once
+///     non-empty (mirrors every other repeated-message-of-a-separately-generated-type field this
+///     codegen module has met).
+///   - `conversion` must be inserted unconditionally once `Some`, calling the separately generated
+///     `gen_crd_conversion_to_json` — the hand-rolled function this migration replaces has no
+///     `is_empty()` guard around this particular key, unlike its own nested `webhook`/
+///     `clientConfig` keys one level down.
+///   - `preserveUnknownFields` is true-only-guarded, the same class as `Container.stdin`.
+///
+/// `group`/`scope` need no entry: both are plain strings the mechanical walker's
+/// empty-string-filtering default already reproduces exactly.
+fn crd_spec_delegated_field(field_name: &str) -> Option<&'static str> {
     match field_name {
-        "metadata" => Some(
-            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(hpa.metadata.unwrap_or_default()));\n",
+        "names" => Some(
+            "    if let Some(names) = spec.names {\n        m.insert(\"names\".to_string(), gen_crd_names_to_json(names));\n    }\n",
         ),
-        "spec" => Some(
-            "    if let Some(spec) = hpa.spec {\n        let spec_json = gen_hpa_v1_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        "versions" => Some(
+            "    if !spec.versions.is_empty() {\n        m.insert(\"versions\".to_string(), serde_json::Value::Array(spec.versions.into_iter().map(gen_version_to_json).collect()));\n    }\n",
         ),
-        "status" => Some(
-            "    if let Some(status) = hpa.status {\n        let status_json = gen_hpa_v1_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        "conversion" => Some(
+            "    if let Some(conv) = spec.conversion {\n        m.insert(\"conversion\".to_string(), gen_crd_conversion_to_json(conv));\n    }\n",
+        ),
+        "preserveUnknownFields" => Some(
+            "    if let Some(b) = spec.preserve_unknown_fields.filter(|&b| b) {\n        m.insert(\"preserveUnknownFields\".to_string(), serde_json::Value::Bool(b));\n    }\n",
         ),
         _ => None,
     }
 }
 
-/// Generates `gen_hpa_v1_to_json`, replacing the message-walking body of the hand-rolled
-/// `decode_hpa_v1_proto_gen` this migration retires (the entry point itself stays hand-written —
-/// see `generate_namespace`'s doc for why; autoscaling/v1 `HorizontalPodAutoscaler` has no
-/// `encode_hpa_v1_proto_gen` today, so this is decode-only in the same sense).
-pub fn generate_hpa_v1(descriptor_bytes: &[u8]) -> String {
+/// Generates `gen_crd_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_crd_proto_gen` this migration retires.
+pub fn generate_crd_spec(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)
         .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, HPA_V1);
-    let encode_stmts =
-        generate_message_encode_only(&set, HPA_V1, message, hpa_v1_delegated_field, "hpa", "obj");
+    let message = find_message(&set, CRD_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CRD_SPEC,
+        message,
+        crd_spec_delegated_field,
+        "spec",
+        "m",
+    );
 
     let mut out = String::new();
     out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
     out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
     out.push_str(
-        "fn gen_hpa_v1_to_json(hpa: autoscaling_v1::HorizontalPodAutoscaler) -> serde_json::Value {\n",
+        "fn gen_crd_spec_to_json(spec: apiext_v1::CustomResourceDefinitionSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `CustomResourceDefinition`'s three fields all delegate: `metadata` for the same reason
+/// `namespace_delegated_field`'s own entry documents; `spec` must always be present (built from
+/// `crd.spec.unwrap_or_default()` even when the CRD itself carries no spec at all — the hand-rolled
+/// function this migration replaces never gates the `"spec"` key on `Option::is_some()`); `status`
+/// is gated on both `Some` and the separately generated `gen_crd_status_to_json` producing a
+/// non-empty object, the only field in this migration needing both checks together.
+fn crd_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(crd.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    obj.insert(\"spec\".to_string(), gen_crd_spec_to_json(crd.spec.unwrap_or_default()));\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = crd.status {\n        let status_json = gen_crd_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_crd_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_crd_proto_gen` this migration retires (the entry point itself stays hand-written — see
+/// `generate_namespace`'s doc for why; `CustomResourceDefinition` has no `encode_crd_proto_gen`
+/// today, so this is decode-only in the same sense).
+pub fn generate_crd(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CRD);
+    let encode_stmts =
+        generate_message_encode_only(&set, CRD, message, crd_delegated_field, "crd", "obj");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_crd_to_json(crd: apiext_v1::CustomResourceDefinition) -> serde_json::Value {\n",
     );
     out.push_str("    let mut obj = serde_json::Map::new();\n");
     out.push_str(&encode_stmts);
@@ -4551,150 +5169,25 @@ pub fn generate_hpa_v1(descriptor_bytes: &[u8]) -> String {
     out
 }
 
-const HPA_V2: &str = ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscaler";
-const HPA_V2_SPEC: &str = ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscalerSpec";
-const HPA_V2_STATUS: &str = ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscalerStatus";
-
-/// `maxReplicas` needs the same `unwrap_or(0)` delegate as `hpa_v1_spec_delegated_field`'s own
-/// entry. `scaleTargetRef`/`minReplicas` need no entry for the same reason as v1's. `metrics`
-/// (repeated `MetricSpec`) and `behavior` (`HorizontalPodAutoscalerBehavior`) need no entry
-/// either: every message reachable from them (`MetricSpec`'s five source variants,
-/// `MetricIdentifier`/`MetricTarget`/`MetricValueStatus`, `HorizontalPodAutoscalerBehavior`'s
-/// `HPAScalingRules`/`HPAScalingPolicy`) is plain optional scalars, a `Quantity` (handled by the
-/// mechanical walker's dedicated `QUANTITY` branch), or a `selector: LabelSelector` field (handled
-/// by the mechanical walker's own map-entry/repeated-message branches — `matchLabels`/
-/// `matchExpressions` reproduce `core_gen_adapter::gen_label_selector_to_json` field-for-field) —
-/// see the module-level PROOF-OF-SCALE note on `generate_volume_source` for why a message with no
-/// business-rule fields needs zero delegate-table maintenance at any recursion depth.
-fn hpa_v2_spec_delegated_field(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "maxReplicas" => Some(
-            "    m.insert(\"maxReplicas\".to_string(), serde_json::Value::Number(spec.max_replicas.unwrap_or(0).into()));\n",
-        ),
-        _ => None,
-    }
-}
-
-/// Generates `gen_hpa_v2_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
-/// `decode_hpa_v2_proto_gen` this migration retires.
-pub fn generate_hpa_v2_spec(descriptor_bytes: &[u8]) -> String {
+/// Generates `gen_delete_options_to_json`, replacing the hand-rolled body of
+/// `decode_delete_options_proto_gen` this migration retires. Every field (`gracePeriodSeconds`/
+/// `orphanDependents` — inserted whenever set, no zero/false filtering, matching the hand-rolled
+/// unconditional-on-`Some` inserts exactly — `propagationPolicy` — a plain string —
+/// `dryRun` — a plain repeated string — and `preconditions` — a two-string-field nested message,
+/// only inserted once non-empty) is already exactly what the mechanical walker's defaults
+/// produce, so no delegate table is needed.
+pub fn generate_delete_options(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)
         .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, HPA_V2_SPEC);
-    let encode_stmts = generate_message_encode_only(
-        &set,
-        HPA_V2_SPEC,
-        message,
-        hpa_v2_spec_delegated_field,
-        "spec",
-        "m",
-    );
-
-    let mut out = String::new();
-    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
-    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
-    out.push_str(
-        "fn gen_hpa_v2_spec_to_json(spec: autoscaling_v2::HorizontalPodAutoscalerSpec) -> serde_json::Value {\n",
-    );
-    out.push_str("    let mut m = serde_json::Map::new();\n");
-    out.push_str(&encode_stmts);
-    out.push_str("    serde_json::Value::Object(m)\n");
-    out.push_str("}\n");
-    out
-}
-
-/// `desiredReplicas` needs the `unwrap_or(0)` delegate `hpa_v1_status_delegated_field` documents
-/// for its own entry of the same name — unlike v1, v2's `currentReplicas` genuinely is
-/// `+optional` on the wire (see `generated.proto`) and needs no entry, matching the pre-migration
-/// decoder's own `if let Some(v) = status.current_replicas { ... }` guard exactly. `lastScaleTime`
-/// needs the same RFC3339 delegate as v1's own entry. `currentMetrics`/`conditions` differ:
-/// `currentMetrics` (repeated `MetricStatus`) needs no entry for the same reason
-/// `hpa_v2_spec_delegated_field`'s doc gives for `metrics`, but `conditions`
-/// (`HorizontalPodAutoscalerCondition`) does — `type`/`status` are unconditionally emitted via
-/// `unwrap_or_default()` even when empty, which the mechanical walker's generic `Type::String`
-/// branch (an `if Some, filter non-empty` guard) can't reproduce, so it delegates wholesale to the
-/// hand-written `gen_condition_common` (kept for exactly this reason — the same
-/// `apiservice_status_delegated_field`'s `conditions` entry documents for `ApiServiceCondition`).
-fn hpa_v2_status_delegated_field(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "lastScaleTime" => Some(
-            "    if let Some(secs) = status.last_scale_time.and_then(|t| t.seconds).filter(|&s| s > 0) {\n        m.insert(\"lastScaleTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
-        ),
-        "desiredReplicas" => Some(
-            "    m.insert(\"desiredReplicas\".to_string(), serde_json::Value::Number(status.desired_replicas.unwrap_or(0).into()));\n",
-        ),
-        "conditions" => Some(
-            "    if !status.conditions.is_empty() {\n        let conditions: Vec<serde_json::Value> = status.conditions.into_iter().map(|c| gen_condition_common(c.r#type, c.status, c.last_transition_time, c.reason, c.message)).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conditions));\n    }\n",
-        ),
-        _ => None,
-    }
-}
-
-/// Generates `gen_hpa_v2_status_to_json`, replacing the `status` assembly block of the
-/// hand-rolled `decode_hpa_v2_proto_gen` this migration retires.
-pub fn generate_hpa_v2_status(descriptor_bytes: &[u8]) -> String {
-    let set = FileDescriptorSet::decode(descriptor_bytes)
-        .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, HPA_V2_STATUS);
-    let encode_stmts = generate_message_encode_only(
-        &set,
-        HPA_V2_STATUS,
-        message,
-        hpa_v2_status_delegated_field,
-        "status",
-        "m",
-    );
-
-    let mut out = String::new();
-    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
-    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
-    out.push_str(
-        "fn gen_hpa_v2_status_to_json(status: autoscaling_v2::HorizontalPodAutoscalerStatus) -> serde_json::Value {\n",
-    );
-    out.push_str("    let mut m = serde_json::Map::new();\n");
-    out.push_str(&encode_stmts);
-    out.push_str("    serde_json::Value::Object(m)\n");
-    out.push_str("}\n");
-    out
-}
-
-/// `metadata`/`spec`/`status` delegate for the same reasons as `hpa_v1_delegated_field`'s own
-/// entries, pointed at the v2 generated spec/status functions instead.
-fn hpa_v2_delegated_field(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "metadata" => Some(
-            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(hpa.metadata.unwrap_or_default()));\n",
-        ),
-        "spec" => Some(
-            "    if let Some(spec) = hpa.spec {\n        let spec_json = gen_hpa_v2_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
-        ),
-        "status" => Some(
-            "    if let Some(status) = hpa.status {\n        let status_json = gen_hpa_v2_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
-        ),
-        _ => None,
-    }
-}
-
-/// Generates `gen_hpa_v2_to_json`, replacing the message-walking body of the hand-rolled
-/// `decode_hpa_v2_proto_gen` this migration retires (the entry point itself stays hand-written —
-/// see `generate_namespace`'s doc for why; autoscaling/v2 `HorizontalPodAutoscaler` has no
-/// `encode_hpa_v2_proto_gen` today, so this is decode-only in the same sense). The two
-/// `HorizontalPodAutoscaler` messages (v1 above, v2 here) are distinct top-level proto messages in
-/// distinct packages that happen to share a Kind name — `HPA_V1`/`HPA_V2`'s fully-qualified names
-/// disambiguate them at `find_message` lookup time, the same way `decode_proto_by_kind_and_version`
-/// (`src/proto.rs`) picks which one to decode into based on the request's `apiVersion`.
-pub fn generate_hpa_v2(descriptor_bytes: &[u8]) -> String {
-    let set = FileDescriptorSet::decode(descriptor_bytes)
-        .expect("descriptor set emitted by build.rs must decode");
-    let message = find_message(&set, HPA_V2);
+    let message = find_message(&set, DELETE_OPTIONS);
     let encode_stmts =
-        generate_message_encode_only(&set, HPA_V2, message, hpa_v2_delegated_field, "hpa", "obj");
+        generate_message_encode_only(&set, DELETE_OPTIONS, message, |_| None, "opts", "obj");
 
     let mut out = String::new();
     out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
     out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
     out.push_str(
-        "fn gen_hpa_v2_to_json(hpa: autoscaling_v2::HorizontalPodAutoscaler) -> serde_json::Value {\n",
+        "fn gen_delete_options_to_json(opts: meta_v1::DeleteOptions) -> serde_json::Value {\n",
     );
     out.push_str("    let mut obj = serde_json::Map::new();\n");
     out.push_str(&encode_stmts);
@@ -5964,6 +6457,2538 @@ pub fn generate_mutating_admission_policy_binding(descriptor_bytes: &[u8]) -> St
     out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
     out.push_str(
         "fn gen_mutating_admission_policy_binding_to_json(binding: ar_v1::MutatingAdmissionPolicyBinding) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const CSI_NODE: &str = ".k8s.io.api.storage.v1.CSINode";
+const CSI_NODE_DRIVER: &str = ".k8s.io.api.storage.v1.CSINodeDriver";
+
+/// Generates `gen_csinode_driver_to_json`, replacing the per-driver mapping closure inside the
+/// hand-rolled `decode_csinode_proto_gen` this migration retires. Every `CSINodeDriver` field
+/// (`name`/`nodeID`/`topologyKeys`/`allocatable`) is either a plain scalar or a one-field nested
+/// message (`VolumeNodeResources.count`) the mechanical walker already reproduces exactly — no
+/// delegate table needed.
+pub fn generate_csinode_driver(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSI_NODE_DRIVER);
+    let encode_stmts =
+        generate_message_encode_only(&set, CSI_NODE_DRIVER, message, |_| None, "d", "dm");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_csinode_driver_to_json(d: storage_v1::CsiNodeDriver) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut dm = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(dm)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// a hand-written template rather than a wholesale call composed by the mechanical default: the
+/// pre-migration `decode_csinode_proto_gen` this migration retires emits `"spec":
+/// {"drivers": [...]}` unconditionally — even when `node.spec` is `None` (defaulting to an empty
+/// `drivers` list) or when `drivers` itself is empty — unlike every other nested-spec Kind in this
+/// codegen module, which omits the `spec` key entirely once its built object is empty.
+fn csinode_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(node.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    obj.insert(\"spec\".to_string(), serde_json::json!({ \"drivers\": node.spec.map(|s| s.drivers).unwrap_or_default().into_iter().map(gen_csinode_driver_to_json).collect::<Vec<_>>() }));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_csinode_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_csinode_proto_gen` this migration retires (the entry point itself stays hand-written —
+/// see `generate_namespace`'s doc for why; `CSINode` has no `encode_csinode_proto_gen` today, so
+/// this is decode-only in the same sense).
+pub fn generate_csinode(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSI_NODE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CSI_NODE,
+        message,
+        csinode_delegated_field,
+        "node",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_csinode_to_json(node: storage_v1::CsiNode) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const CSI_DRIVER: &str = ".k8s.io.api.storage.v1.CSIDriver";
+const CSI_DRIVER_SPEC: &str = ".k8s.io.api.storage.v1.CSIDriverSpec";
+const TOKEN_REQUEST: &str = ".k8s.io.api.storage.v1.TokenRequest";
+
+/// `expirationSeconds` is a gogoproto `nullable=false` int64 field — the same class
+/// `lease_spec_delegated_field`'s own `leaseDurationSeconds` doc explains — so an explicit `0` is
+/// indistinguishable on the wire from "never set" and the pre-migration `decode_csidriver_proto_gen`
+/// this replaces only emits it once non-zero. `audience` needs no entry: a plain optional string
+/// the mechanical walker already handles correctly.
+fn token_request_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "expirationSeconds" => Some(
+            "    if let Some(v) = tr.expiration_seconds.filter(|&n| n != 0) {\n        m.insert(\"expirationSeconds\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_token_request_to_json`, replacing the per-token mapping closure inside the
+/// hand-rolled `decode_csidriver_proto_gen` this migration retires.
+pub fn generate_token_request(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, TOKEN_REQUEST);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        TOKEN_REQUEST,
+        message,
+        token_request_delegated_field,
+        "tr",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_token_request_to_json(tr: storage_v1::TokenRequest) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `tokenRequests` delegates wholesale to the separately generated `gen_token_request_to_json`
+/// (each element needs `expirationSeconds`'s own zero-filter, not derivable per-element by the
+/// mechanical repeated-message branch). `nodeAllocatableUpdatePeriodSeconds` is the same
+/// nullable=false int64 shape `token_request_delegated_field`'s own `expirationSeconds` doc
+/// explains. Every other `CSIDriverSpec` field (the seven plain bools plus `fsGroupPolicy`/
+/// `volumeLifecycleModes`) needs no entry: the mechanical walker's defaults already match the
+/// hand-rolled body exactly (no true-only filter on any of these bools, unlike
+/// `container_delegated_field`'s `stdin`/`stdinOnce`/`tty`).
+fn csidriverspec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "tokenRequests" => Some(
+            "    if !s.token_requests.is_empty() {\n        let trs: Vec<serde_json::Value> = s.token_requests.into_iter().map(gen_token_request_to_json).collect();\n        m.insert(\"tokenRequests\".to_string(), serde_json::Value::Array(trs));\n    }\n",
+        ),
+        "nodeAllocatableUpdatePeriodSeconds" => Some(
+            "    if let Some(v) = s.node_allocatable_update_period_seconds.filter(|&n| n != 0) {\n        m.insert(\"nodeAllocatableUpdatePeriodSeconds\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_csidriverspec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_csidriver_proto_gen` this migration retires.
+pub fn generate_csidriverspec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSI_DRIVER_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CSI_DRIVER_SPEC,
+        message,
+        csidriverspec_delegated_field,
+        "s",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_csidriverspec_to_json(s: storage_v1::CsiDriverSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates
+/// wholesale to the separately generated `gen_csidriverspec_to_json`, unconditionally — the
+/// pre-migration `decode_csidriver_proto_gen` this migration retires always emits a `"spec"` key
+/// (an empty `{}` when `driver.spec` is `None`), unlike every other nested-spec Kind in this
+/// codegen module, which omits the key entirely once empty.
+fn csidriver_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(driver.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    obj.insert(\"spec\".to_string(), driver.spec.map(gen_csidriverspec_to_json).unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_csidriver_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_csidriver_proto_gen` this migration retires (the entry point itself stays hand-written —
+/// see `generate_namespace`'s doc for why; `CSIDriver` has no `encode_csidriver_proto_gen` today,
+/// so this is decode-only in the same sense).
+pub fn generate_csidriver(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSI_DRIVER);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CSI_DRIVER,
+        message,
+        csidriver_delegated_field,
+        "driver",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_csidriver_to_json(driver: storage_v1::CsiDriver) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const CSI_STORAGE_CAPACITY: &str = ".k8s.io.api.storage.v1.CSIStorageCapacity";
+
+/// `nodeTopology` delegates to the existing hand-written `gen_label_selector_to_json` (shared with
+/// every other adapter reaching a `LabelSelector`), inserted whenever the outer `Option` is `Some`
+/// regardless of whether the built object is empty — matching the pre-migration
+/// `decode_csistoragecapacity_proto_gen` this migration retires exactly, unlike the mechanical
+/// walker's generic nested-message default (which would only insert once non-empty).
+/// `storageClassName`/`capacity`/`maximumVolumeSize` need no entry: a plain optional string and
+/// two `Quantity`-typed fields the mechanical walker's own `QUANTITY` special case already handles.
+fn csistoragecapacity_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(c.metadata.unwrap_or_default()));\n",
+        ),
+        "nodeTopology" => Some(
+            "    if let Some(sel) = c.node_topology {\n        obj.insert(\"nodeTopology\".to_string(), gen_label_selector_to_json(sel));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_csistoragecapacity_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_csistoragecapacity_proto_gen` this migration retires (the entry point
+/// itself stays hand-written — see `generate_namespace`'s doc for why; `CSIStorageCapacity` has no
+/// `encode_csistoragecapacity_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_csistoragecapacity(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSI_STORAGE_CAPACITY);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CSI_STORAGE_CAPACITY,
+        message,
+        csistoragecapacity_delegated_field,
+        "c",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_csistoragecapacity_to_json(c: storage_v1::CsiStorageCapacity) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const VOLUME_ATTACHMENT: &str = ".k8s.io.api.storage.v1.VolumeAttachment";
+const VOLUME_ATTACHMENT_SPEC: &str = ".k8s.io.api.storage.v1.VolumeAttachmentSpec";
+const VOLUME_ATTACHMENT_STATUS: &str = ".k8s.io.api.storage.v1.VolumeAttachmentStatus";
+const VOLUME_ERROR: &str = ".k8s.io.api.storage.v1.VolumeError";
+
+/// `time` is a bare `Time` needing RFC3339 conversion — the mechanical walker's generic
+/// `Type::Message` branch has no special case for `Time` (only `Quantity`), so left mechanical it
+/// would wrongly recurse into `Time`'s own `seconds`/`nanos` fields instead of producing a string.
+/// `message`/`errorCode` need no entry: a plain optional string and an `int32` the mechanical
+/// walker already handles correctly (no zero-filter on `errorCode`, matching the pre-migration
+/// `decode_volumeattachment_proto_gen` this migration retires).
+fn volume_error_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "time" => Some(
+            "    if let Some(t) = err.time {\n        if let Some(secs) = t.seconds.filter(|&s| s > 0) {\n            m.insert(\"time\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_volume_error_to_json`, replacing the (duplicated, one copy per attach/detach
+/// error) hand-rolled mapping block inside `decode_volumeattachment_proto_gen` this migration
+/// retires.
+pub fn generate_volume_error(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VOLUME_ERROR);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VOLUME_ERROR,
+        message,
+        volume_error_delegated_field,
+        "err",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_volume_error_to_json(err: storage_v1::VolumeError) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `source` builds and inserts its object unconditionally — even an entirely-empty `{}` once
+/// `spec.source` is `None` — matching the pre-migration `decode_volumeattachment_proto_gen` this
+/// migration retires exactly (it has no `if !source_map.is_empty()` guard, unlike every other
+/// nested-message field in this codegen module). `inlineVolumeSpec` delegates to the existing
+/// hand-written `gen_persistentvolumespec_to_json` (shared with `core_gen_adapter.rs`, a full
+/// ~42-field `PersistentVolumeSpec` this codegen module has no reason to re-derive). `attacher`/
+/// `nodeName` need no entry: plain optional strings the mechanical walker already handles
+/// correctly.
+fn volumeattachmentspec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "source" => Some(
+            "    let mut source_map = serde_json::Map::new();\n    if let Some(src) = spec.source {\n        if let Some(v) = src.persistent_volume_name.filter(|s| !s.is_empty()) {\n            source_map.insert(\"persistentVolumeName\".to_string(), serde_json::Value::String(v));\n        }\n        if let Some(v) = src.inline_volume_spec {\n            source_map.insert(\"inlineVolumeSpec\".to_string(), gen_persistentvolumespec_to_json(v));\n        }\n    }\n    m.insert(\"source\".to_string(), serde_json::Value::Object(source_map));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_volumeattachmentspec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_volumeattachment_proto_gen` this migration retires.
+pub fn generate_volumeattachmentspec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VOLUME_ATTACHMENT_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VOLUME_ATTACHMENT_SPEC,
+        message,
+        volumeattachmentspec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_volumeattachmentspec_to_json(spec: storage_v1::VolumeAttachmentSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `attachError`/`detachError` delegate to the separately generated `gen_volume_error_to_json`,
+/// inserted whenever the outer `Option` is `Some` regardless of whether the built object is empty
+/// — matching the pre-migration `decode_volumeattachment_proto_gen` this migration retires exactly.
+/// `attached`/`attachmentMetadata` need no entry: a plain bool with no true-only filter and a
+/// `map<string, string>` the mechanical walker's own map special-case already handles correctly.
+fn volumeattachmentstatus_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "attachError" => Some(
+            "    if let Some(err) = status.attach_error {\n        m.insert(\"attachError\".to_string(), gen_volume_error_to_json(err));\n    }\n",
+        ),
+        "detachError" => Some(
+            "    if let Some(err) = status.detach_error {\n        m.insert(\"detachError\".to_string(), gen_volume_error_to_json(err));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_volumeattachmentstatus_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_volumeattachment_proto_gen` this migration retires.
+pub fn generate_volumeattachmentstatus(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VOLUME_ATTACHMENT_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VOLUME_ATTACHMENT_STATUS,
+        message,
+        volumeattachmentstatus_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_volumeattachmentstatus_to_json(status: storage_v1::VolumeAttachmentStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates
+/// wholesale to the separately generated `gen_volumeattachmentspec_to_json`, inserted whenever the
+/// outer `Option` is `Some` regardless of emptiness — the pre-migration
+/// `decode_volumeattachment_proto_gen` this migration retires has no `if !spec_map.is_empty()`
+/// guard around its own `result["spec"] = ...` assignment, unlike every other nested-spec Kind in
+/// this codegen module. `status` delegates wholesale to the separately generated
+/// `gen_volumeattachmentstatus_to_json`, only inserted once non-empty — matching the pre-migration
+/// decoder's own `if !status_map.is_empty()` guard exactly.
+fn volumeattachment_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(va.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = va.spec {\n        obj.insert(\"spec\".to_string(), gen_volumeattachmentspec_to_json(spec));\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = va.status {\n        let status_json = gen_volumeattachmentstatus_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_volumeattachment_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_volumeattachment_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `VolumeAttachment` has no
+/// `encode_volumeattachment_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_volumeattachment(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VOLUME_ATTACHMENT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VOLUME_ATTACHMENT,
+        message,
+        volumeattachment_delegated_field,
+        "va",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_volumeattachment_to_json(va: storage_v1::VolumeAttachment) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const STORAGE_CLASS: &str = ".k8s.io.api.storage.v1.StorageClass";
+
+/// `allowedTopologies` needs its own hand-written encode: each `TopologySelectorTerm` element is
+/// wrapped as `{"matchLabelExpressions": [...]}` unconditionally — even an empty array — which the
+/// mechanical repeated-message branch's per-element recursion can't express (it has no way to
+/// force a nested field's key to appear when the nested list itself is empty). `provisioner`/
+/// `parameters`/`reclaimPolicy`/`mountOptions`/`allowVolumeExpansion`/`volumeBindingMode` need no
+/// entry: a plain optional string, a `map<string,string>`, another plain string, a repeated
+/// string, a bool with no true-only filter, and a fourth plain string — all shapes the mechanical
+/// walker's defaults already reproduce exactly.
+fn storageclass_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(sc.metadata.unwrap_or_default()));\n",
+        ),
+        "allowedTopologies" => Some(
+            "    if !sc.allowed_topologies.is_empty() {\n        let topologies: Vec<serde_json::Value> = sc.allowed_topologies.into_iter().map(|t| {\n            let exprs: Vec<serde_json::Value> = t.match_label_expressions.into_iter().map(|e| {\n                let mut em = serde_json::Map::new();\n                if let Some(k) = e.key.filter(|s| !s.is_empty()) {\n                    em.insert(\"key\".to_string(), serde_json::Value::String(k));\n                }\n                if !e.values.is_empty() {\n                    em.insert(\"values\".to_string(), serde_json::Value::Array(e.values.into_iter().map(serde_json::Value::String).collect()));\n                }\n                serde_json::Value::Object(em)\n            }).collect();\n            serde_json::json!({ \"matchLabelExpressions\": exprs })\n        }).collect();\n        obj.insert(\"allowedTopologies\".to_string(), serde_json::Value::Array(topologies));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_storageclass_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_storageclass_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `StorageClass` has no
+/// `encode_storageclass_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_storageclass(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, STORAGE_CLASS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        STORAGE_CLASS,
+        message,
+        storageclass_delegated_field,
+        "sc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_storageclass_to_json(sc: storage_v1::StorageClass) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const VOLUME_ATTRIBUTES_CLASS: &str = ".k8s.io.api.storage.v1.VolumeAttributesClass";
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `driverName`/
+/// `parameters` need no entry: a plain optional string and a `map<string,string>` the mechanical
+/// walker already handles correctly.
+fn volumeattributesclass_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(vac.metadata.unwrap_or_default()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_volumeattributesclass_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_volumeattributesclass_proto_gen` this migration retires (the entry point
+/// itself stays hand-written — see `generate_namespace`'s doc for why; `VolumeAttributesClass` has
+/// no `encode_volumeattributesclass_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_volumeattributesclass(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VOLUME_ATTRIBUTES_CLASS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VOLUME_ATTRIBUTES_CLASS,
+        message,
+        volumeattributesclass_delegated_field,
+        "vac",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_volumeattributesclass_to_json(vac: storage_v1::VolumeAttributesClass) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const RUNTIME_CLASS: &str = ".k8s.io.api.node.v1.RuntimeClass";
+
+/// `handler` is a `+required` field the pre-migration `decode_runtimeclass_proto_gen` this
+/// migration retires always emits (defaulting an unset value to `""`), unlike the mechanical
+/// walker's generic `Type::String` default (which filters out an empty/absent value and omits the
+/// key entirely). `overhead` needs its own hand-written encode: `overhead.podFixed`'s quantity map
+/// is filtered per-entry (dropping any entry whose `Quantity.string` is empty) *before* deciding
+/// whether to emit the `overhead` key at all — the mechanical walker's `is_quantity_map_field`
+/// branch instead gates that decision on the map's pre-filter emptiness, which would wrongly emit
+/// `"overhead": {"podFixed": {}}` for the degenerate case of a non-empty map whose every quantity
+/// string is empty. `scheduling` needs no entry: `nodeSelector` (a `map<string,string>`) and
+/// `tolerations` (a repeated message with only plain-scalar fields) are both shapes the mechanical
+/// walker's nested-message default already reproduces exactly, matching the pre-migration
+/// decoder's own `if !sched_map.is_empty() { ... }` guard.
+fn runtimeclass_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(rc.metadata.unwrap_or_default()));\n",
+        ),
+        "handler" => Some(
+            "    obj.insert(\"handler\".to_string(), serde_json::Value::String(rc.handler.unwrap_or_default()));\n",
+        ),
+        "overhead" => Some(
+            "    if let Some(overhead) = rc.overhead {\n        if !overhead.pod_fixed.is_empty() {\n            let pod_fixed: serde_json::Map<String, serde_json::Value> = overhead.pod_fixed.into_iter().filter_map(|(k, q)| q.string.filter(|s| !s.is_empty()).map(|s| (k, serde_json::Value::String(s)))).collect();\n            if !pod_fixed.is_empty() {\n                obj.insert(\"overhead\".to_string(), serde_json::json!({ \"podFixed\": serde_json::Value::Object(pod_fixed) }));\n            }\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_runtimeclass_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_runtimeclass_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `RuntimeClass` has no
+/// `encode_runtimeclass_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_runtimeclass(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RUNTIME_CLASS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RUNTIME_CLASS,
+        message,
+        runtimeclass_delegated_field,
+        "rc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_runtimeclass_to_json(rc: node_v1::RuntimeClass) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const PRIORITY_CLASS: &str = ".k8s.io.api.scheduling.v1.PriorityClass";
+
+/// `value` is emitted unconditionally, defaulting an unset value to `0` — the same "always report
+/// a concrete value" convention `controllerrevision_delegated_field`'s own `revision` doc explains
+/// — unlike the mechanical walker's generic `Type::Int32` default (which omits the key entirely
+/// when unset). `globalDefault` is a `bool` emitted only when explicitly `true`, the same
+/// true-only-filter class `container_delegated_field`'s own `stdin`/`stdinOnce`/`tty` doc explains.
+/// `description`/`preemptionPolicy` need no entry: plain optional strings the mechanical walker
+/// already handles correctly.
+fn priorityclass_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(pc.metadata.unwrap_or_default()));\n",
+        ),
+        "value" => Some(
+            "    obj.insert(\"value\".to_string(), serde_json::Value::Number(pc.value.unwrap_or(0).into()));\n",
+        ),
+        "globalDefault" => Some(
+            "    if let Some(true) = pc.global_default {\n        obj.insert(\"globalDefault\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_priorityclass_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_priorityclass_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `PriorityClass` has no
+/// `encode_priorityclass_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_priorityclass(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PRIORITY_CLASS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PRIORITY_CLASS,
+        message,
+        priorityclass_delegated_field,
+        "pc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_priorityclass_to_json(pc: scheduling_v1::PriorityClass) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const FLOW_SCHEMA: &str = ".k8s.io.api.flowcontrol.v1.FlowSchema";
+const FLOW_SCHEMA_SPEC: &str = ".k8s.io.api.flowcontrol.v1.FlowSchemaSpec";
+const FLOW_SCHEMA_STATUS: &str = ".k8s.io.api.flowcontrol.v1.FlowSchemaStatus";
+const FLOW_SCHEMA_CONDITION: &str = ".k8s.io.api.flowcontrol.v1.FlowSchemaCondition";
+const FLOWCONTROL_SUBJECT: &str = ".k8s.io.api.flowcontrol.v1.Subject";
+const RESOURCE_POLICY_RULE: &str = ".k8s.io.api.flowcontrol.v1.ResourcePolicyRule";
+const POLICY_RULES_WITH_SUBJECTS: &str = ".k8s.io.api.flowcontrol.v1.PolicyRulesWithSubjects";
+
+/// `serviceAccount` builds and inserts its object unconditionally — even an entirely-empty `{}` —
+/// matching the pre-migration `gen_policy_rules_with_subjects_to_json` this migration retires
+/// exactly (it has no `if !sam.is_empty()` guard, unlike its own sibling `user`/`group` branches,
+/// which the mechanical nested-message default already reproduces correctly). `kind` needs no
+/// entry: upstream documents an explicitly-empty value as meaningful only for `RoleRef`/`Subject`
+/// in `rbac.v1` (see `subject_delegated_field`'s own `apiGroup` doc) — this
+/// `flowcontrol.v1.Subject.kind` has no such carve-out, so the mechanical empty-string filter
+/// already matches the hand-rolled behaviour.
+fn flowcontrol_subject_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "serviceAccount" => Some(
+            "    if let Some(sa) = s.service_account {\n        let mut sam = serde_json::Map::new();\n        if let Some(ns) = sa.namespace.filter(|s| !s.is_empty()) {\n            sam.insert(\"namespace\".to_string(), serde_json::Value::String(ns));\n        }\n        if let Some(n) = sa.name.filter(|s| !s.is_empty()) {\n            sam.insert(\"name\".to_string(), serde_json::Value::String(n));\n        }\n        m.insert(\"serviceAccount\".to_string(), serde_json::Value::Object(sam));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_flowcontrol_subject_to_json`, replacing the per-subject mapping closure inside
+/// the hand-rolled `gen_policy_rules_with_subjects_to_json` this migration retires.
+pub fn generate_flowcontrol_subject(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, FLOWCONTROL_SUBJECT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        FLOWCONTROL_SUBJECT,
+        message,
+        flowcontrol_subject_delegated_field,
+        "s",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_flowcontrol_subject_to_json(s: flowcontrol_v1::Subject) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `clusterScope` is a `bool` emitted only when explicitly `true`, the same true-only-filter class
+/// `container_delegated_field`'s own `stdin`/`stdinOnce`/`tty` doc explains. `verbs`/`apiGroups`/
+/// `resources`/`namespaces` need no entry: plain repeated strings the mechanical walker already
+/// handles correctly.
+fn resource_policy_rule_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "clusterScope" => Some(
+            "    if let Some(true) = r.cluster_scope {\n        m.insert(\"clusterScope\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resource_policy_rule_to_json`, replacing the per-rule mapping closure inside the
+/// hand-rolled `gen_policy_rules_with_subjects_to_json` this migration retires.
+pub fn generate_resource_policy_rule(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_POLICY_RULE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_POLICY_RULE,
+        message,
+        resource_policy_rule_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resource_policy_rule_to_json(r: flowcontrol_v1::ResourcePolicyRule) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `subjects`/`resourceRules` delegate wholesale to the separately generated
+/// `gen_flowcontrol_subject_to_json`/`gen_resource_policy_rule_to_json` (each needs a per-element
+/// override the mechanical repeated-message branch can't express on its own). `nonResourceRules`
+/// needs no entry: `NonResourcePolicyRule`'s two fields (`verbs`/`nonResourceURLs`) are both plain
+/// repeated strings, a shape the mechanical walker's nested-repeated-message default already
+/// reproduces exactly.
+fn policy_rules_with_subjects_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "subjects" => Some(
+            "    if !rule.subjects.is_empty() {\n        let subjects: Vec<serde_json::Value> = rule.subjects.into_iter().map(gen_flowcontrol_subject_to_json).collect();\n        m.insert(\"subjects\".to_string(), serde_json::Value::Array(subjects));\n    }\n",
+        ),
+        "resourceRules" => Some(
+            "    if !rule.resource_rules.is_empty() {\n        let rr: Vec<serde_json::Value> = rule.resource_rules.into_iter().map(gen_resource_policy_rule_to_json).collect();\n        m.insert(\"resourceRules\".to_string(), serde_json::Value::Array(rr));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_policy_rules_with_subjects_to_json`, replacing the hand-rolled function of the
+/// same name.
+pub fn generate_policy_rules_with_subjects(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, POLICY_RULES_WITH_SUBJECTS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        POLICY_RULES_WITH_SUBJECTS,
+        message,
+        policy_rules_with_subjects_delegated_field,
+        "rule",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_policy_rules_with_subjects_to_json(rule: flowcontrol_v1::PolicyRulesWithSubjects) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `lastTransitionTime` is a bare `Time` needing RFC3339 conversion, the same shape
+/// `volume_error_delegated_field`'s own `time` doc explains. `type`/`status`/`reason`/`message`
+/// need no entry: plain optional strings the mechanical walker already handles correctly.
+fn flowschema_condition_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "lastTransitionTime" => Some(
+            "    if let Some(t) = c.last_transition_time {\n        if let Some(secs) = t.seconds.filter(|&s| s > 0) {\n            m.insert(\"lastTransitionTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_flowschema_condition_to_json`, replacing the hand-rolled function of the same
+/// name.
+pub fn generate_flowschema_condition(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, FLOW_SCHEMA_CONDITION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        FLOW_SCHEMA_CONDITION,
+        message,
+        flowschema_condition_delegated_field,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_flowschema_condition_to_json(c: flowcontrol_v1::FlowSchemaCondition) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `matchingPrecedence` is a gogoproto `nullable=false` int32 field — the same class
+/// `lease_spec_delegated_field`'s own `leaseDurationSeconds` doc explains — so an explicit `0` is
+/// indistinguishable on the wire from "never set" and the pre-migration `decode_flowschema_proto_gen`
+/// this replaces only emits it once non-zero. `rules` delegates wholesale to the separately
+/// generated `gen_policy_rules_with_subjects_to_json`. `priorityLevelConfiguration`/
+/// `distinguisherMethod` need no entry: each is a one-field nested message (`name`/`type`
+/// respectively) the mechanical walker's nested-message default already reproduces exactly (build
+/// the inner object, insert the outer key only once non-empty).
+fn flowschemaspec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "matchingPrecedence" => Some(
+            "    if let Some(v) = spec.matching_precedence.filter(|&n| n != 0) {\n        m.insert(\"matchingPrecedence\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        "rules" => Some(
+            "    if !spec.rules.is_empty() {\n        let rules: Vec<serde_json::Value> = spec.rules.into_iter().map(gen_policy_rules_with_subjects_to_json).collect();\n        m.insert(\"rules\".to_string(), serde_json::Value::Array(rules));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_flowschemaspec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_flowschema_proto_gen` this migration retires.
+pub fn generate_flowschemaspec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, FLOW_SCHEMA_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        FLOW_SCHEMA_SPEC,
+        message,
+        flowschemaspec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_flowschemaspec_to_json(spec: flowcontrol_v1::FlowSchemaSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `conditions` delegates wholesale to the separately generated `gen_flowschema_condition_to_json`,
+/// only inserted once non-empty — matching the pre-migration `decode_flowschema_proto_gen` this
+/// migration retires exactly.
+fn flowschemastatus_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = status.conditions.into_iter().map(gen_flowschema_condition_to_json).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_flowschemastatus_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_flowschema_proto_gen` this migration retires.
+pub fn generate_flowschemastatus(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, FLOW_SCHEMA_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        FLOW_SCHEMA_STATUS,
+        message,
+        flowschemastatus_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_flowschemastatus_to_json(status: flowcontrol_v1::FlowSchemaStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec`/`status`
+/// each delegate wholesale to the separately generated `gen_flowschemaspec_to_json`/
+/// `gen_flowschemastatus_to_json`, only inserting the resulting key when non-empty — matching the
+/// pre-migration `decode_flowschema_proto_gen` this migration retires exactly.
+fn flowschema_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(fs.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = fs.spec {\n        let spec_json = gen_flowschemaspec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = fs.status {\n        let status_json = gen_flowschemastatus_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_flowschema_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_flowschema_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `FlowSchema` has no
+/// `encode_flowschema_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_flowschema(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, FLOW_SCHEMA);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        FLOW_SCHEMA,
+        message,
+        flowschema_delegated_field,
+        "fs",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_flowschema_to_json(fs: flowcontrol_v1::FlowSchema) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const PRIORITY_LEVEL_CONFIGURATION: &str = ".k8s.io.api.flowcontrol.v1.PriorityLevelConfiguration";
+const PRIORITY_LEVEL_CONFIGURATION_SPEC: &str =
+    ".k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationSpec";
+const PRIORITY_LEVEL_CONFIGURATION_STATUS: &str =
+    ".k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationStatus";
+const PRIORITY_LEVEL_CONFIGURATION_CONDITION: &str =
+    ".k8s.io.api.flowcontrol.v1.PriorityLevelConfigurationCondition";
+const LIMITED_PRIORITY_LEVEL_CONFIGURATION: &str =
+    ".k8s.io.api.flowcontrol.v1.LimitedPriorityLevelConfiguration";
+const EXEMPT_PRIORITY_LEVEL_CONFIGURATION: &str =
+    ".k8s.io.api.flowcontrol.v1.ExemptPriorityLevelConfiguration";
+const LIMIT_RESPONSE: &str = ".k8s.io.api.flowcontrol.v1.LimitResponse";
+const QUEUING_CONFIGURATION: &str = ".k8s.io.api.flowcontrol.v1.QueuingConfiguration";
+
+/// `queues`/`handSize`/`queueLengthLimit` are gogoproto `nullable=false` int32 fields — the same
+/// class `lease_spec_delegated_field`'s own `leaseDurationSeconds` doc explains — so an explicit
+/// `0` is indistinguishable on the wire from "never set" and the pre-migration
+/// `decode_prioritylevelconfiguration_proto_gen` this replaces only emits each once non-zero.
+fn queuing_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "queues" => Some(
+            "    if let Some(v) = q.queues.filter(|&n| n != 0) {\n        m.insert(\"queues\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        "handSize" => Some(
+            "    if let Some(v) = q.hand_size.filter(|&n| n != 0) {\n        m.insert(\"handSize\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        "queueLengthLimit" => Some(
+            "    if let Some(v) = q.queue_length_limit.filter(|&n| n != 0) {\n        m.insert(\"queueLengthLimit\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_queuing_configuration_to_json`, replacing the hand-rolled mapping block inside
+/// `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_queuing_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, QUEUING_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        QUEUING_CONFIGURATION,
+        message,
+        queuing_configuration_delegated_field,
+        "q",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_queuing_configuration_to_json(q: flowcontrol_v1::QueuingConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `queuing` delegates wholesale to the separately generated `gen_queuing_configuration_to_json`,
+/// only inserted once non-empty — matching the pre-migration
+/// `decode_prioritylevelconfiguration_proto_gen` this migration retires exactly. `type` needs no
+/// entry: a plain optional string the mechanical walker already handles correctly.
+fn limit_response_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "queuing" => Some(
+            "    if let Some(q) = lr.queuing {\n        let qm = gen_queuing_configuration_to_json(q);\n        if qm.as_object().is_some_and(|m| !m.is_empty()) {\n            m.insert(\"queuing\".to_string(), qm);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_limit_response_to_json`, replacing the hand-rolled mapping block inside
+/// `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_limit_response(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, LIMIT_RESPONSE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        LIMIT_RESPONSE,
+        message,
+        limit_response_delegated_field,
+        "lr",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_limit_response_to_json(lr: flowcontrol_v1::LimitResponse) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `nominalConcurrencyShares`/`lendablePercent` are gogoproto `nullable=false` int32 fields — the
+/// same class `queuing_configuration_delegated_field`'s own doc explains. `limitResponse`
+/// delegates wholesale to the separately generated `gen_limit_response_to_json`, only inserted
+/// once non-empty. `borrowingLimitPercent` needs no entry: an `Option<i32>` the pre-migration
+/// decoder inserts whenever `Some` with no zero-filter, matching the mechanical walker's own
+/// `Type::Int32` default exactly.
+fn limited_priority_level_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "nominalConcurrencyShares" => Some(
+            "    if let Some(v) = limited.nominal_concurrency_shares.filter(|&n| n != 0) {\n        m.insert(\"nominalConcurrencyShares\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        "lendablePercent" => Some(
+            "    if let Some(v) = limited.lendable_percent.filter(|&n| n != 0) {\n        m.insert(\"lendablePercent\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        "limitResponse" => Some(
+            "    if let Some(lr) = limited.limit_response {\n        let lrm = gen_limit_response_to_json(lr);\n        if lrm.as_object().is_some_and(|m| !m.is_empty()) {\n            m.insert(\"limitResponse\".to_string(), lrm);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_limited_priority_level_configuration_to_json`, replacing the hand-rolled mapping
+/// block inside `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_limited_priority_level_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, LIMITED_PRIORITY_LEVEL_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        LIMITED_PRIORITY_LEVEL_CONFIGURATION,
+        message,
+        limited_priority_level_configuration_delegated_field,
+        "limited",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_limited_priority_level_configuration_to_json(limited: flowcontrol_v1::LimitedPriorityLevelConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `nominalConcurrencyShares`/`lendablePercent` are gogoproto `nullable=false` int32 fields — the
+/// same class `queuing_configuration_delegated_field`'s own doc explains.
+fn exempt_priority_level_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "nominalConcurrencyShares" => Some(
+            "    if let Some(v) = exempt.nominal_concurrency_shares.filter(|&n| n != 0) {\n        m.insert(\"nominalConcurrencyShares\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        "lendablePercent" => Some(
+            "    if let Some(v) = exempt.lendable_percent.filter(|&n| n != 0) {\n        m.insert(\"lendablePercent\".to_string(), serde_json::Value::Number(v.into()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_exempt_priority_level_configuration_to_json`, replacing the hand-rolled mapping
+/// block inside `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_exempt_priority_level_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, EXEMPT_PRIORITY_LEVEL_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        EXEMPT_PRIORITY_LEVEL_CONFIGURATION,
+        message,
+        exempt_priority_level_configuration_delegated_field,
+        "exempt",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_exempt_priority_level_configuration_to_json(exempt: flowcontrol_v1::ExemptPriorityLevelConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `limited`/`exempt` each delegate wholesale to the separately generated
+/// `gen_limited_priority_level_configuration_to_json`/
+/// `gen_exempt_priority_level_configuration_to_json`, only inserted once non-empty — matching the
+/// pre-migration `decode_prioritylevelconfiguration_proto_gen` this migration retires exactly.
+/// `type` needs no entry: a plain optional string the mechanical walker already handles correctly.
+fn prioritylevelconfigurationspec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "limited" => Some(
+            "    if let Some(limited) = spec.limited {\n        let lm = gen_limited_priority_level_configuration_to_json(limited);\n        if lm.as_object().is_some_and(|m| !m.is_empty()) {\n            m.insert(\"limited\".to_string(), lm);\n        }\n    }\n",
+        ),
+        "exempt" => Some(
+            "    if let Some(exempt) = spec.exempt {\n        let em = gen_exempt_priority_level_configuration_to_json(exempt);\n        if em.as_object().is_some_and(|m| !m.is_empty()) {\n            m.insert(\"exempt\".to_string(), em);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_prioritylevelconfigurationspec_to_json`, replacing the `spec` assembly block of
+/// the hand-rolled `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_prioritylevelconfigurationspec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PRIORITY_LEVEL_CONFIGURATION_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PRIORITY_LEVEL_CONFIGURATION_SPEC,
+        message,
+        prioritylevelconfigurationspec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_prioritylevelconfigurationspec_to_json(spec: flowcontrol_v1::PriorityLevelConfigurationSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `lastTransitionTime` is a bare `Time` needing RFC3339 conversion, the same shape
+/// `volume_error_delegated_field`'s own `time` doc explains. `type`/`status`/`reason`/`message`
+/// need no entry: plain optional strings the mechanical walker already handles correctly.
+fn priority_level_configuration_condition_delegated_field(
+    field_name: &str,
+) -> Option<&'static str> {
+    match field_name {
+        "lastTransitionTime" => Some(
+            "    if let Some(t) = c.last_transition_time {\n        if let Some(secs) = t.seconds.filter(|&s| s > 0) {\n            m.insert(\"lastTransitionTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_priority_level_configuration_condition_to_json`, replacing the per-condition
+/// mapping closure inside `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_priority_level_configuration_condition(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PRIORITY_LEVEL_CONFIGURATION_CONDITION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PRIORITY_LEVEL_CONFIGURATION_CONDITION,
+        message,
+        priority_level_configuration_condition_delegated_field,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_priority_level_configuration_condition_to_json(c: flowcontrol_v1::PriorityLevelConfigurationCondition) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `conditions` delegates wholesale to the separately generated
+/// `gen_priority_level_configuration_condition_to_json`, only inserted once non-empty — matching
+/// the pre-migration `decode_prioritylevelconfiguration_proto_gen` this migration retires exactly.
+fn prioritylevelconfigurationstatus_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = status.conditions.into_iter().map(gen_priority_level_configuration_condition_to_json).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_prioritylevelconfigurationstatus_to_json`, replacing the `status` assembly block
+/// of the hand-rolled `decode_prioritylevelconfiguration_proto_gen` this migration retires.
+pub fn generate_prioritylevelconfigurationstatus(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PRIORITY_LEVEL_CONFIGURATION_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PRIORITY_LEVEL_CONFIGURATION_STATUS,
+        message,
+        prioritylevelconfigurationstatus_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_prioritylevelconfigurationstatus_to_json(status: flowcontrol_v1::PriorityLevelConfigurationStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec`/`status`
+/// each delegate wholesale to the separately generated
+/// `gen_prioritylevelconfigurationspec_to_json`/`gen_prioritylevelconfigurationstatus_to_json`,
+/// only inserting the resulting key when non-empty — matching the pre-migration
+/// `decode_prioritylevelconfiguration_proto_gen` this migration retires exactly.
+fn prioritylevelconfiguration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(plc.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = plc.spec {\n        let spec_json = gen_prioritylevelconfigurationspec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = plc.status {\n        let status_json = gen_prioritylevelconfigurationstatus_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_prioritylevelconfiguration_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_prioritylevelconfiguration_proto_gen` this migration retires (the entry
+/// point itself stays hand-written — see `generate_namespace`'s doc for why;
+/// `PriorityLevelConfiguration` has no `encode_prioritylevelconfiguration_proto_gen` today, so
+/// this is decode-only in the same sense).
+pub fn generate_prioritylevelconfiguration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PRIORITY_LEVEL_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PRIORITY_LEVEL_CONFIGURATION,
+        message,
+        prioritylevelconfiguration_delegated_field,
+        "plc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_prioritylevelconfiguration_to_json(plc: flowcontrol_v1::PriorityLevelConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+// ============================================================================
+// net_disc_cert_policy_events_gen_adapter.rs: networking.k8s.io/v1,
+// discovery.k8s.io/v1, certificates.k8s.io/v1, policy/v1, events.k8s.io/v1
+// ============================================================================
+
+const ENDPOINT: &str = ".k8s.io.api.discovery.v1.Endpoint";
+const ENDPOINT_SLICE: &str = ".k8s.io.api.discovery.v1.EndpointSlice";
+
+/// `targetRef` is a plain `.k8s.io.api.core.v1.ObjectReference` (all-scalar fields) and needs no
+/// entry: the mechanical walker's generic nested-`Type::Message` branch (insert only if the built
+/// submessage is non-empty) already matches the pre-migration `decode_endpointslice_proto_gen`'s
+/// own `if rj.as_object()...!is_empty() { ej.insert("targetRef", rj) }` guard. `conditions`/
+/// `hints`/`addresses`/`hostname`/`nodeName`/`zone` need no entry either — every field they reach
+/// (`EndpointConditions`'s three bools, `EndpointHints`'s `forZones`/`forNodes` -> `ForZone`/
+/// `ForNode`'s own single `name` string) is a plain scalar or scalar-only nested message the
+/// mechanical walker already handles correctly.
+fn endpoint_delegated_field(_field_name: &str) -> Option<(&'static str, &'static str)> {
+    None
+}
+
+/// Generates the `gen_endpoint_to_json`/`json_to_endpoint_proto` pair, replacing the hand-rolled
+/// `json_to_endpoint_proto`/`json_to_endpoint_conditions_proto`/`json_to_endpoint_hints_proto`
+/// this migration retires and adding the encode direction those never had (needed by
+/// `encode_endpointslice_proto_gen`'s own `endpoints` field, which this migration also makes
+/// mechanical — see `endpointslice_delegated_field`'s doc).
+pub fn generate_endpoint(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, ENDPOINT);
+    let (encode_stmts, decode_fields) = generate_message_codec(
+        &set,
+        ENDPOINT,
+        message,
+        endpoint_delegated_field,
+        "ep",
+        "ej",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_endpoint_to_json(ep: discovery_v1::Endpoint) -> serde_json::Value {\n");
+    out.push_str("    let mut ej = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(ej)\n");
+    out.push_str("}\n\n");
+    out.push_str("fn json_to_endpoint_proto(v: &serde_json::Value) -> discovery_v1::Endpoint {\n");
+    out.push_str("    discovery_v1::Endpoint {\n");
+    out.push_str(&decode_fields);
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry.
+/// `endpoints`/`ports` are unconditionally emitted as (possibly empty) JSON arrays, matching
+/// upstream's own non-`omitempty` `EndpointSlice.Endpoints`/`.Ports` JSON tags exactly (see
+/// `decode_endpointslice_proto_gen_omits_no_nulls_on_all_default_input`) — the mechanical
+/// walker's own default repeated-message handling omits the key entirely once the vec is empty,
+/// so both delegate wholesale: `endpoints` to the separately generated `gen_endpoint_to_json`/
+/// `json_to_endpoint_proto`, `ports` to the existing hand-written `gen_endpointslice_port_to_json`/
+/// `json_to_endpointslice_port_proto` pair (the former needing its own override for
+/// `EndpointPort.name`'s present-but-empty-string preservation — see that function's own doc in
+/// `net_disc_cert_policy_events_gen_adapter.rs`). `addressType` needs no entry: the mechanical
+/// walker's default string handling (emit whenever non-empty) already matches every real
+/// `EndpointSlice`, which always has a non-empty `addressType`.
+fn endpointslice_delegated_field(field_name: &str) -> Option<(&'static str, &'static str)> {
+    match field_name {
+        "metadata" => Some((
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(es.metadata.unwrap_or_default()));\n",
+            "Some(json_to_object_meta_proto(v))",
+        )),
+        "endpoints" => Some((
+            "    obj.insert(\"endpoints\".to_string(), serde_json::Value::Array(es.endpoints.into_iter().map(gen_endpoint_to_json).collect()));\n",
+            "v.get(\"endpoints\").and_then(|a| a.as_array()).map(|a| a.iter().map(json_to_endpoint_proto).collect()).unwrap_or_default()",
+        )),
+        "ports" => Some((
+            "    obj.insert(\"ports\".to_string(), serde_json::Value::Array(es.ports.into_iter().map(gen_endpointslice_port_to_json).collect()));\n",
+            "v.get(\"ports\").and_then(|a| a.as_array()).map(|a| a.iter().map(json_to_endpointslice_port_proto).collect()).unwrap_or_default()",
+        )),
+        _ => None,
+    }
+}
+
+/// Generates the `gen_endpointslice_to_json`/`json_to_endpointslice_proto` pair, replacing the
+/// message-walking bodies of the hand-rolled `decode_endpointslice_proto_gen`/
+/// `json_to_endpointslice_proto` this migration retires — the only two-way (both `decode_*`/GET
+/// and `encode_*`/LIST-response) Kind in this file, since kube-proxy's EndpointSlice-based
+/// dataplane round-trips through both directions.
+pub fn generate_endpointslice(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, ENDPOINT_SLICE);
+    let (encode_stmts, decode_fields) = generate_message_codec(
+        &set,
+        ENDPOINT_SLICE,
+        message,
+        endpointslice_delegated_field,
+        "es",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_endpointslice_to_json(es: discovery_v1::EndpointSlice) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n\n");
+    out.push_str(
+        "fn json_to_endpointslice_proto(v: &serde_json::Value) -> discovery_v1::EndpointSlice {\n",
+    );
+    out.push_str("    discovery_v1::EndpointSlice {\n");
+    out.push_str(&decode_fields);
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+const NETWORK_POLICY: &str = ".k8s.io.api.networking.v1.NetworkPolicy";
+const NETWORK_POLICY_SPEC: &str = ".k8s.io.api.networking.v1.NetworkPolicySpec";
+
+/// `podSelector` is unconditionally inserted whenever the `Option` is `Some`, regardless of the
+/// resulting object's emptiness — an empty `{}` selector ("match everything") is semantically
+/// different from an absent one, so it must survive even when `matchLabels`/`matchExpressions`
+/// are both empty. The mechanical walker's generic nested-`Type::Message` default (insert only
+/// if non-empty) can't express that, so `podSelector` delegates to the existing hand-written
+/// `gen_label_selector_to_json` wrapper — see `sentinel_completeness_decode_networkpolicy_proto_gen`'s
+/// sibling regression test in `net_disc_cert_policy_events_gen_adapter.rs`
+/// (`decode_networkpolicy_proto_gen_preserves_pod_selector_ingress_and_policy_types`) asserting
+/// exactly this for the nested `NetworkPolicyPeer.namespaceSelector` case. `ingress`/`egress` each
+/// reach a `NetworkPolicyPort.port` (`IntOrString`, opaque) and a `NetworkPolicyPeer.podSelector`/
+/// `.namespaceSelector` (the same unconditional-insert `LabelSelector` case) two levels below this
+/// call's own top-level fields — a depth the mechanical walker has no per-field override hook for
+/// (the same limitation `namespace_status_delegated_field`'s own `conditions` entry documents) —
+/// so both delegate wholesale to the existing hand-written `gen_network_policy_ingress_rule_to_json`/
+/// `gen_network_policy_egress_rule_to_json` pair, which in turn reuse the existing hand-written
+/// `gen_network_policy_port_to_json`/`gen_network_policy_peer_to_json`/`gen_ip_block_to_json`.
+/// `policyTypes` needs no entry: a plain `repeated string` the mechanical walker already handles.
+fn network_policy_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "podSelector" => Some(
+            "    if let Some(sel) = spec.pod_selector {\n        m.insert(\"podSelector\".to_string(), gen_label_selector_to_json(sel));\n    }\n",
+        ),
+        "ingress" => Some(
+            "    if !spec.ingress.is_empty() {\n        m.insert(\"ingress\".to_string(), serde_json::Value::Array(spec.ingress.into_iter().map(gen_network_policy_ingress_rule_to_json).collect()));\n    }\n",
+        ),
+        "egress" => Some(
+            "    if !spec.egress.is_empty() {\n        m.insert(\"egress\".to_string(), serde_json::Value::Array(spec.egress.into_iter().map(gen_network_policy_egress_rule_to_json).collect()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_network_policy_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_networkpolicy_proto_gen` this migration retires.
+pub fn generate_network_policy_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, NETWORK_POLICY_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        NETWORK_POLICY_SPEC,
+        message,
+        network_policy_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_network_policy_spec_to_json(spec: networking_v1::NetworkPolicySpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`
+/// delegates to the separately generated `gen_network_policy_spec_to_json`, only inserted once
+/// non-empty — matching the pre-migration `decode_networkpolicy_proto_gen`'s own
+/// `if !spec_json.is_empty() { ... }` guard exactly. `NetworkPolicy` has no `status` field.
+fn network_policy_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(np.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = np.spec {\n        let spec_json = gen_network_policy_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_networkpolicy_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_networkpolicy_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `NetworkPolicy` has no
+/// `encode_networkpolicy_proto_gen` today).
+pub fn generate_networkpolicy(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, NETWORK_POLICY);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        NETWORK_POLICY,
+        message,
+        network_policy_delegated_field,
+        "np",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_networkpolicy_to_json(np: networking_v1::NetworkPolicy) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const INGRESS_CLASS: &str = ".k8s.io.api.networking.v1.IngressClass";
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`
+/// delegates wholesale to the hand-written `gen_ingressclass_spec_to_json` (kept hand-written,
+/// not mechanically walked): `IngressClassParametersReference`'s own `aPIGroup` field (declared
+/// with that exact capitalization upstream) needs a rename to `apiGroup` that neither of
+/// `json_key`'s two mechanical rules covers (it only strips underscores and lowercases a
+/// *leading* capital — `aPIGroup` already starts lowercase, so neither rule fires), and adding a
+/// third rename table entry is out of this migration's touched-file scope (`proto_exceptions.rs`
+/// is shared with the sentinel-completeness oracle and untouched here). Inserted only once
+/// non-empty, matching the pre-migration `decode_ingressclass_proto_gen`'s own
+/// `if !spec_json.is_empty() { ... }` guard.
+fn ingressclass_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(ic.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = ic.spec {\n        let spec_json = gen_ingressclass_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_ingressclass_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_ingressclass_proto_gen` this migration retires.
+pub fn generate_ingressclass(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, INGRESS_CLASS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        INGRESS_CLASS,
+        message,
+        ingressclass_delegated_field,
+        "ic",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_ingressclass_to_json(ic: networking_v1::IngressClass) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const IP_ADDRESS: &str = ".k8s.io.api.networking.v1.IPAddress";
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`
+/// needs no entry: `IPAddressSpec`'s only field, `parentRef` (a `ParentReference` of four plain
+/// optional strings), is fully mechanical, and the mechanical walker's own "insert only if
+/// non-empty" default at both nesting levels already matches the pre-migration
+/// `decode_ipaddress_proto_gen`'s own `if let Some(pr) = spec.parent_ref { ... }` guard.
+fn ipaddress_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(addr.metadata.unwrap_or_default()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_ipaddress_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_ipaddress_proto_gen` this migration retires.
+pub fn generate_ipaddress(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, IP_ADDRESS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        IP_ADDRESS,
+        message,
+        ipaddress_delegated_field,
+        "addr",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_ipaddress_to_json(addr: networking_v1::IpAddress) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const SERVICE_CIDR: &str = ".k8s.io.api.networking.v1.ServiceCIDR";
+const SERVICE_CIDR_STATUS: &str = ".k8s.io.api.networking.v1.ServiceCIDRStatus";
+
+/// `conditions` (`repeated .k8s.io.apimachinery.pkg.apis.meta.v1.Condition`) needs its own
+/// per-field override for `lastTransitionTime`'s opaque `Time` conversion that this mechanical
+/// walker has no per-field override hook for one level below `ServiceCIDRStatus` itself (the
+/// same limitation `namespace_status_delegated_field`'s own `conditions` entry documents), so it
+/// delegates wholesale to the hand-written `gen_meta_condition_to_json` — shared verbatim with
+/// `poddisruptionbudget_status_delegated_field`'s own `conditions` entry, since both reach the
+/// same shared `meta/v1` `Condition` type.
+fn servicecidr_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(status.conditions.into_iter().map(gen_meta_condition_to_json).collect()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_servicecidr_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_servicecidr_proto_gen` this migration retires.
+pub fn generate_servicecidr_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, SERVICE_CIDR_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        SERVICE_CIDR_STATUS,
+        message,
+        servicecidr_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_servicecidr_status_to_json(status: networking_v1::ServiceCidrStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`
+/// needs no entry: `ServiceCIDRSpec`'s only field, `cidrs` (`repeated string`), is fully
+/// mechanical, matching the pre-migration decoder's own `if !spec.cidrs.is_empty() { ... }`
+/// guard at both nesting levels. `status` delegates to the separately generated
+/// `gen_servicecidr_status_to_json`, only inserted once non-empty — matching the pre-migration
+/// decoder's own `if !status_json.is_empty() { ... }` guard.
+fn servicecidr_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(sc.metadata.unwrap_or_default()));\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = sc.status {\n        let status_json = gen_servicecidr_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_servicecidr_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_servicecidr_proto_gen` this migration retires.
+pub fn generate_servicecidr(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, SERVICE_CIDR);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        SERVICE_CIDR,
+        message,
+        servicecidr_delegated_field,
+        "sc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_servicecidr_to_json(sc: networking_v1::ServiceCidr) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const INGRESS: &str = ".k8s.io.api.networking.v1.Ingress";
+const INGRESS_SPEC: &str = ".k8s.io.api.networking.v1.IngressSpec";
+
+/// `rules` reaches `IngressRule.ingressRuleValue`, a Go `json:",inline"` embed (its own
+/// `IngressRuleValue.http` field lands directly on the `IngressRule`'s own JSON object, never
+/// nested under an `"ingressRuleValue"` key) — the same shape `INLINE_EMBEDS`
+/// (`proto_exceptions.rs`) exists for, but that table is shared with the sentinel-completeness
+/// oracle and out of this migration's touched-file scope, so `rules` delegates wholesale to the
+/// hand-written `gen_ingress_rules_to_json` (reusing the existing hand-written
+/// `gen_ingress_backend_to_json` for both `defaultBackend` and each path's own `backend`).
+/// `defaultBackend`/`tls`/`ingressClassName` need no entry: `IngressBackend`/`IngressTLS` are
+/// fully mechanical (every field they reach, including `IngressServiceBackend`/
+/// `ServiceBackendPort`/`.k8s.io.api.core.v1.TypedLocalObjectReference`, is a plain scalar), and
+/// the mechanical walker's own "insert only if non-empty" default already matches the
+/// pre-migration decoder's own guards for both.
+fn ingress_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "rules" => Some(
+            "    if !spec.rules.is_empty() {\n        m.insert(\"rules\".to_string(), gen_ingress_rules_to_json(spec.rules));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_ingress_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_ingress_proto_gen` this migration retires.
+pub fn generate_ingress_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, INGRESS_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        INGRESS_SPEC,
+        message,
+        ingress_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_ingress_spec_to_json(spec: networking_v1::IngressSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`
+/// delegates to the separately generated `gen_ingress_spec_to_json`, only inserted once
+/// non-empty — matching the pre-migration decoder's own `if !spec_json.is_empty() { ... }` guard.
+/// `status` needs no entry: `IngressStatus`/`IngressLoadBalancerStatus`/
+/// `IngressLoadBalancerIngress`/`IngressPortStatus` are all plain scalars or scalar-only nested
+/// messages, so the mechanical walker's own "insert only if non-empty" default at every nesting
+/// level already reproduces the pre-migration decoder's own
+/// `if let Some(lb) = status.load_balancer { if !lb.ingress.is_empty() { ... } }` guard exactly.
+fn ingress_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(ing.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = ing.spec {\n        let spec_json = gen_ingress_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_ingress_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_ingress_proto_gen` this migration retires.
+pub fn generate_ingress(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, INGRESS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        INGRESS,
+        message,
+        ingress_delegated_field,
+        "ing",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_ingress_to_json(ing: networking_v1::Ingress) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const CSR: &str = ".k8s.io.api.certificates.v1.CertificateSigningRequest";
+const CSR_SPEC: &str = ".k8s.io.api.certificates.v1.CertificateSigningRequestSpec";
+const CSR_STATUS: &str = ".k8s.io.api.certificates.v1.CertificateSigningRequestStatus";
+
+/// `request` is `bytes` — a scalar shape this mechanical walker has never needed before (every
+/// prior migration's `bytes` fields, e.g. `Secret`/`ConfigMap`'s own `data`, already delegate for
+/// unrelated reasons), so it has no generic branch for it at all; delegates to a base64-encoding
+/// template matching the pre-migration decoder's own `base64::engine::general_purpose::STANDARD`
+/// call exactly. `extra` is a `map<string, ExtraValue>`: `is_string_map_field` only checks that
+/// the value type is a `map_entry` submessage, not that the value itself is `string` (it has never
+/// needed to before this field), so it would misclassify this as a string map and generate
+/// code that fails to compile (`ExtraValue` is a message, not a `String`) — delegates wholesale
+/// to a template matching `OPAQUE_MESSAGES`' own documented `ExtraValue` shape (`Go's []string`
+/// marshals as a bare JSON array, not `{"items": [...]}`). `signerName`/`expirationSeconds`/
+/// `usages`/`username`/`uid`/`groups` need no entry: plain scalars/repeated-scalars the
+/// mechanical walker already handles correctly.
+fn csr_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "request" => Some(
+            "    if let Some(req) = spec.request.filter(|v| !v.is_empty()) {\n        use base64::Engine as _;\n        let b64 = base64::engine::general_purpose::STANDARD.encode(&req);\n        m.insert(\"request\".to_string(), serde_json::Value::String(b64));\n    }\n",
+        ),
+        "extra" => Some(
+            "    if !spec.extra.is_empty() {\n        let extra: serde_json::Map<String, serde_json::Value> = spec.extra.into_iter().map(|(k, v)| {\n            let items: Vec<serde_json::Value> = v.items.into_iter().map(serde_json::Value::String).collect();\n            (k, serde_json::Value::Array(items))\n        }).collect();\n        m.insert(\"extra\".to_string(), serde_json::Value::Object(extra));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_certificate_signing_request_spec_to_json`, replacing the `spec` assembly block
+/// of the hand-rolled `decode_csr_proto_gen` this migration retires.
+pub fn generate_certificate_signing_request_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSR_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CSR_SPEC,
+        message,
+        csr_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_certificate_signing_request_spec_to_json(spec: certs_v1::CertificateSigningRequestSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `conditions` needs its own per-field override for `lastUpdateTime`/`lastTransitionTime`'s
+/// opaque `Time` conversion one level below `CertificateSigningRequestStatus` itself (the same
+/// limitation `namespace_status_delegated_field`'s own `conditions` entry documents), so it
+/// delegates wholesale to the hand-written `gen_csr_condition_to_json` — a distinct type from
+/// `poddisruptionbudget_status_delegated_field`'s/`servicecidr_status_delegated_field`'s shared
+/// `meta/v1` `Condition` (`CertificateSigningRequestCondition` has its own `lastUpdateTime` field
+/// that `meta/v1`'s `Condition` doesn't). `certificate` is `bytes`, the same class of override
+/// `csr_spec_delegated_field`'s own `request` entry documents.
+fn csr_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(status.conditions.into_iter().map(gen_csr_condition_to_json).collect()));\n    }\n",
+        ),
+        "certificate" => Some(
+            "    if let Some(cert) = status.certificate.filter(|c| !c.is_empty()) {\n        use base64::Engine as _;\n        let b64 = base64::engine::general_purpose::STANDARD.encode(&cert);\n        m.insert(\"certificate\".to_string(), serde_json::Value::String(b64));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_certificate_signing_request_status_to_json`, replacing the `status` assembly
+/// block of the hand-rolled `decode_csr_proto_gen` this migration retires.
+pub fn generate_certificate_signing_request_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSR_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CSR_STATUS,
+        message,
+        csr_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_certificate_signing_request_status_to_json(status: certs_v1::CertificateSigningRequestStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`/
+/// `status` delegate to the separately generated `gen_certificate_signing_request_spec_to_json`/
+/// `gen_certificate_signing_request_status_to_json`, only inserted once non-empty — matching the
+/// pre-migration `decode_csr_proto_gen`'s own `if !spec_json.is_empty() { ... }`/
+/// `if !status_json.is_empty() { ... }` guards exactly.
+fn csr_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(csr.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = csr.spec {\n        let spec_json = gen_certificate_signing_request_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = csr.status {\n        let status_json = gen_certificate_signing_request_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_certificate_signing_request_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_csr_proto_gen` this migration retires.
+pub fn generate_certificate_signing_request(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CSR);
+    let encode_stmts =
+        generate_message_encode_only(&set, CSR, message, csr_delegated_field, "csr", "obj");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_certificate_signing_request_to_json(csr: certs_v1::CertificateSigningRequest) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const PDB: &str = ".k8s.io.api.policy.v1.PodDisruptionBudget";
+const PDB_SPEC: &str = ".k8s.io.api.policy.v1.PodDisruptionBudgetSpec";
+const PDB_STATUS: &str = ".k8s.io.api.policy.v1.PodDisruptionBudgetStatus";
+
+/// `minAvailable`/`maxUnavailable` are `IntOrString`, opaque to the mechanical walker (it only
+/// special-cases `Quantity` by FQN), so both delegate to the existing hand-written
+/// `gen_int_or_string_to_json` wrapper. `selector` is the same unconditional-insert-if-`Some`
+/// `LabelSelector` override `network_policy_spec_delegated_field`'s own `podSelector` entry
+/// documents. `unhealthyPodEvictionPolicy` needs no entry: a plain optional string the mechanical
+/// walker already handles correctly.
+fn poddisruptionbudget_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "minAvailable" => Some(
+            "    if let Some(v) = spec.min_available {\n        m.insert(\"minAvailable\".to_string(), gen_int_or_string_to_json(&v));\n    }\n",
+        ),
+        "selector" => Some(
+            "    if let Some(sel) = spec.selector {\n        m.insert(\"selector\".to_string(), gen_label_selector_to_json(sel));\n    }\n",
+        ),
+        "maxUnavailable" => Some(
+            "    if let Some(v) = spec.max_unavailable {\n        m.insert(\"maxUnavailable\".to_string(), gen_int_or_string_to_json(&v));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_poddisruptionbudget_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_poddisruptionbudget_proto_gen` this migration retires.
+pub fn generate_poddisruptionbudget_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PDB_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PDB_SPEC,
+        message,
+        poddisruptionbudget_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_poddisruptionbudget_spec_to_json(spec: policy_v1::PodDisruptionBudgetSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `disruptedPods` is a `map<string, .k8s.io.apimachinery.pkg.apis.meta.v1.Time>` — a map-value
+/// shape (opaque `Time`, not `string`/`Quantity`) `is_string_map_field`/`is_quantity_map_field`
+/// don't recognize, so it delegates to the hand-written `gen_disrupted_pods_to_json`. `conditions`
+/// is the same shared-`meta/v1`-`Condition` wholesale delegate
+/// `servicecidr_status_delegated_field`'s own `conditions` entry documents.
+/// `observedGeneration`/`disruptionsAllowed`/`currentHealthy`/`desiredHealthy`/`expectedPods` need
+/// no entry: the mechanical walker's default "emit whenever `Some`, no zero filter" int handling
+/// already matches every test this migration must keep passing (none of them exercise an
+/// explicit wire-level zero for these fields, only `Some(non-zero)` vs. entirely unset).
+fn poddisruptionbudget_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "disruptedPods" => Some(
+            "    if !status.disrupted_pods.is_empty() {\n        m.insert(\"disruptedPods\".to_string(), gen_disrupted_pods_to_json(status.disrupted_pods));\n    }\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(status.conditions.into_iter().map(gen_meta_condition_to_json).collect()));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_poddisruptionbudget_status_to_json`, replacing the `status` assembly block of
+/// the hand-rolled `decode_poddisruptionbudget_proto_gen` this migration retires.
+pub fn generate_poddisruptionbudget_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PDB_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PDB_STATUS,
+        message,
+        poddisruptionbudget_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_poddisruptionbudget_status_to_json(status: policy_v1::PodDisruptionBudgetStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`/
+/// `status` delegate to the separately generated `gen_poddisruptionbudget_spec_to_json`/
+/// `gen_poddisruptionbudget_status_to_json`, only inserted once non-empty — matching every real
+/// `PodDisruptionBudget` (admission requires a `selector`, and the disruption controller always
+/// sets all four status counters once it reconciles), the same simplification
+/// `csr_delegated_field`'s own `spec`/`status` entries document over the pre-migration decoder's
+/// literal unconditional-insert.
+fn poddisruptionbudget_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(pdb.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = pdb.spec {\n        let spec_json = gen_poddisruptionbudget_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = pdb.status {\n        let status_json = gen_poddisruptionbudget_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_poddisruptionbudget_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_poddisruptionbudget_proto_gen` this migration retires.
+pub fn generate_poddisruptionbudget(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PDB);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PDB,
+        message,
+        poddisruptionbudget_delegated_field,
+        "pdb",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_poddisruptionbudget_to_json(pdb: policy_v1::PodDisruptionBudget) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const EVENTS_V1_EVENT: &str = ".k8s.io.api.events.v1.Event";
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry.
+/// `eventTime` is a bare `MicroTime` needing RFC3339 conversion via the explicit-seconds-present
+/// rule `event_delegated_field`'s own `eventTime` entry documents (an explicit `seconds: Some(0)`
+/// is upstream's own "not set" sentinel, not a value to `> 0`-gate away like `Time` fields
+/// elsewhere in this file). `series` needs its own per-field overrides one level down
+/// (`EventSeries.count`'s zero-filter, `lastObservedTime`'s own opaque-scalar handling) this
+/// mechanical walker has no per-field override hook for below the type it was invoked for, so it
+/// delegates wholesale to the hand-written `gen_event_series_to_json`.
+/// `deprecatedFirstTimestamp`/`deprecatedLastTimestamp` are bare `Time`s needing the ordinary
+/// `> 0`-gated RFC3339 conversion `firstTimestamp`/`lastTimestamp` get elsewhere in this codegen
+/// module. `reportingController`/`reportingInstance`/`action`/`reason`/`note`/`type`/
+/// `deprecatedCount` (plain scalars) and `regarding`/`related`/`deprecatedSource` (nested
+/// messages of plain scalars — `.k8s.io.api.core.v1.ObjectReference`/`EventSource`) need no
+/// entry: the mechanical walker's generic branches already produce byte-identical output to the
+/// pre-migration `decode_events_v1_event_proto_gen` for all ten.
+fn events_v1_event_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(ev.metadata.unwrap_or_default()));\n",
+        ),
+        "eventTime" => Some(
+            "    if let Some(t) = ev.event_time {\n        if let Some(secs) = t.seconds {\n            obj.insert(\"eventTime\".to_string(), serde_json::Value::String(crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0))));\n        }\n    }\n",
+        ),
+        "series" => Some(
+            "    if let Some(s) = ev.series {\n        let series_json = gen_event_series_to_json(s);\n        if series_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"series\".to_string(), series_json);\n        }\n    }\n",
+        ),
+        "deprecatedFirstTimestamp" => Some(
+            "    if let Some(t) = ev.deprecated_first_timestamp {\n        if let Some(secs) = t.seconds.filter(|&s| s > 0) {\n            obj.insert(\"deprecatedFirstTimestamp\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n        }\n    }\n",
+        ),
+        "deprecatedLastTimestamp" => Some(
+            "    if let Some(t) = ev.deprecated_last_timestamp {\n        if let Some(secs) = t.seconds.filter(|&s| s > 0) {\n            obj.insert(\"deprecatedLastTimestamp\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_events_v1_event_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_events_v1_event_proto_gen` this migration retires — distinct from `generate_event`
+/// (`core/v1`'s legacy `Event` type) both in package and in which fields need delegation.
+pub fn generate_events_v1_event(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, EVENTS_V1_EVENT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        EVENTS_V1_EVENT,
+        message,
+        events_v1_event_delegated_field,
+        "ev",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_events_v1_event_to_json(ev: events_v1::Event) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const HPA_V1: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscaler";
+const HPA_V1_SPEC: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscalerSpec";
+const HPA_V1_STATUS: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscalerStatus";
+
+/// `maxReplicas` is a gogoproto `nullable=false` int32 field, the same class
+/// `lease_spec_delegated_field`'s own `leaseDurationSeconds` doc explains — the pre-migration
+/// `decode_hpa_v1_proto_gen` this replaces always emits it via `unwrap_or(0)`, which the
+/// mechanical walker's generic `Type::Int32` branch (an `if let Some` guard) can't reproduce.
+/// `scaleTargetRef`/`minReplicas`/`targetCPUUtilizationPercentage` need no entry: `scaleTargetRef`
+/// is `CrossVersionObjectReference`'s own three plain optional strings (kind/name/apiVersion),
+/// which the mechanical nested-message walk already reproduces field-for-field, and the other two
+/// are themselves plain optional int32s the mechanical walker already handles correctly.
+fn hpa_v1_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "maxReplicas" => Some(
+            "    m.insert(\"maxReplicas\".to_string(), serde_json::Value::Number(spec.max_replicas.unwrap_or(0).into()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_hpa_v1_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_hpa_v1_proto_gen` this migration retires — the same split `generate_lease_spec`
+/// established for `Lease.spec`.
+pub fn generate_hpa_v1_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, HPA_V1_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        HPA_V1_SPEC,
+        message,
+        hpa_v1_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_hpa_v1_spec_to_json(spec: autoscaling_v1::HorizontalPodAutoscalerSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `currentReplicas`/`desiredReplicas` are gogoproto `nullable=false` int32 fields (same class as
+/// `hpa_v1_spec_delegated_field`'s own `maxReplicas` entry) — the pre-migration decoder always
+/// emits both via `unwrap_or(0)`. `lastScaleTime` is a bare `Time` needing RFC3339 conversion, the
+/// same opaque-scalar handling `lease_spec_delegated_field`'s `acquireTime`/`renewTime` entries
+/// document for `MicroTime` (only emitted once `seconds > 0`, matching the pre-migration
+/// `.filter(|&s| s > 0)` guard exactly). `observedGeneration`/`currentCPUUtilizationPercentage`
+/// need no entry: plain optional int64/int32 fields the mechanical walker already handles
+/// correctly.
+fn hpa_v1_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "lastScaleTime" => Some(
+            "    if let Some(secs) = status.last_scale_time.and_then(|t| t.seconds).filter(|&s| s > 0) {\n        m.insert(\"lastScaleTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
+        ),
+        "currentReplicas" => Some(
+            "    m.insert(\"currentReplicas\".to_string(), serde_json::Value::Number(status.current_replicas.unwrap_or(0).into()));\n",
+        ),
+        "desiredReplicas" => Some(
+            "    m.insert(\"desiredReplicas\".to_string(), serde_json::Value::Number(status.desired_replicas.unwrap_or(0).into()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_hpa_v1_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_hpa_v1_proto_gen` this migration retires.
+pub fn generate_hpa_v1_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, HPA_V1_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        HPA_V1_STATUS,
+        message,
+        hpa_v1_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_hpa_v1_status_to_json(status: autoscaling_v1::HorizontalPodAutoscalerStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`/
+/// `status` each delegate to the separately generated `gen_hpa_v1_spec_to_json`/
+/// `gen_hpa_v1_status_to_json`, only inserting the resulting key once non-empty — matching the
+/// pre-migration `decode_hpa_v1_proto_gen`'s own assembly shape (in practice always non-empty:
+/// `maxReplicas`/`currentReplicas`/`desiredReplicas` are always emitted, so `spec`/`status` are
+/// never actually empty for a decoded HPA).
+fn hpa_v1_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(hpa.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = hpa.spec {\n        let spec_json = gen_hpa_v1_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = hpa.status {\n        let status_json = gen_hpa_v1_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_hpa_v1_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_hpa_v1_proto_gen` this migration retires (the entry point itself stays hand-written —
+/// see `generate_namespace`'s doc for why; autoscaling/v1 `HorizontalPodAutoscaler` has no
+/// `encode_hpa_v1_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_hpa_v1(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, HPA_V1);
+    let encode_stmts =
+        generate_message_encode_only(&set, HPA_V1, message, hpa_v1_delegated_field, "hpa", "obj");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_hpa_v1_to_json(hpa: autoscaling_v1::HorizontalPodAutoscaler) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+const HPA_V2: &str = ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscaler";
+const HPA_V2_SPEC: &str = ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscalerSpec";
+const HPA_V2_STATUS: &str = ".k8s.io.api.autoscaling.v2.HorizontalPodAutoscalerStatus";
+
+/// `maxReplicas` needs the same `unwrap_or(0)` delegate as `hpa_v1_spec_delegated_field`'s own
+/// entry. `scaleTargetRef`/`minReplicas` need no entry for the same reason as v1's. `metrics`
+/// (repeated `MetricSpec`) and `behavior` (`HorizontalPodAutoscalerBehavior`) need no entry
+/// either: every message reachable from them (`MetricSpec`'s five source variants,
+/// `MetricIdentifier`/`MetricTarget`/`MetricValueStatus`, `HorizontalPodAutoscalerBehavior`'s
+/// `HPAScalingRules`/`HPAScalingPolicy`) is plain optional scalars, a `Quantity` (handled by the
+/// mechanical walker's dedicated `QUANTITY` branch), or a `selector: LabelSelector` field (handled
+/// by the mechanical walker's own map-entry/repeated-message branches — `matchLabels`/
+/// `matchExpressions` reproduce `core_gen_adapter::gen_label_selector_to_json` field-for-field) —
+/// see the module-level PROOF-OF-SCALE note on `generate_volume_source` for why a message with no
+/// business-rule fields needs zero delegate-table maintenance at any recursion depth.
+fn hpa_v2_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "maxReplicas" => Some(
+            "    m.insert(\"maxReplicas\".to_string(), serde_json::Value::Number(spec.max_replicas.unwrap_or(0).into()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_hpa_v2_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_hpa_v2_proto_gen` this migration retires.
+pub fn generate_hpa_v2_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, HPA_V2_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        HPA_V2_SPEC,
+        message,
+        hpa_v2_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_hpa_v2_spec_to_json(spec: autoscaling_v2::HorizontalPodAutoscalerSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `desiredReplicas` needs the `unwrap_or(0)` delegate `hpa_v1_status_delegated_field` documents
+/// for its own entry of the same name — unlike v1, v2's `currentReplicas` genuinely is
+/// `+optional` on the wire (see `generated.proto`) and needs no entry, matching the pre-migration
+/// decoder's own `if let Some(v) = status.current_replicas { ... }` guard exactly. `lastScaleTime`
+/// needs the same RFC3339 delegate as v1's own entry. `currentMetrics`/`conditions` differ:
+/// `currentMetrics` (repeated `MetricStatus`) needs no entry for the same reason
+/// `hpa_v2_spec_delegated_field`'s doc gives for `metrics`, but `conditions`
+/// (`HorizontalPodAutoscalerCondition`) does — `type`/`status` are unconditionally emitted via
+/// `unwrap_or_default()` even when empty, which the mechanical walker's generic `Type::String`
+/// branch (an `if Some, filter non-empty` guard) can't reproduce, so it delegates wholesale to the
+/// hand-written `gen_condition_common` (kept for exactly this reason — the same
+/// `apiservice_status_delegated_field`'s `conditions` entry documents for `ApiServiceCondition`).
+fn hpa_v2_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "lastScaleTime" => Some(
+            "    if let Some(secs) = status.last_scale_time.and_then(|t| t.seconds).filter(|&s| s > 0) {\n        m.insert(\"lastScaleTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
+        ),
+        "desiredReplicas" => Some(
+            "    m.insert(\"desiredReplicas\".to_string(), serde_json::Value::Number(status.desired_replicas.unwrap_or(0).into()));\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        let conditions: Vec<serde_json::Value> = status.conditions.into_iter().map(|c| gen_condition_common(c.r#type, c.status, c.last_transition_time, c.reason, c.message)).collect();\n        m.insert(\"conditions\".to_string(), serde_json::Value::Array(conditions));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_hpa_v2_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_hpa_v2_proto_gen` this migration retires.
+pub fn generate_hpa_v2_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, HPA_V2_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        HPA_V2_STATUS,
+        message,
+        hpa_v2_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_hpa_v2_status_to_json(status: autoscaling_v2::HorizontalPodAutoscalerStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata`/`spec`/`status` delegate for the same reasons as `hpa_v1_delegated_field`'s own
+/// entries, pointed at the v2 generated spec/status functions instead.
+fn hpa_v2_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(hpa.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = hpa.spec {\n        let spec_json = gen_hpa_v2_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = hpa.status {\n        let status_json = gen_hpa_v2_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_hpa_v2_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_hpa_v2_proto_gen` this migration retires (the entry point itself stays hand-written —
+/// see `generate_namespace`'s doc for why; autoscaling/v2 `HorizontalPodAutoscaler` has no
+/// `encode_hpa_v2_proto_gen` today, so this is decode-only in the same sense). The two
+/// `HorizontalPodAutoscaler` messages (v1 above, v2 here) are distinct top-level proto messages in
+/// distinct packages that happen to share a Kind name — `HPA_V1`/`HPA_V2`'s fully-qualified names
+/// disambiguate them at `find_message` lookup time, the same way `decode_proto_by_kind_and_version`
+/// (`src/proto.rs`) picks which one to decode into based on the request's `apiVersion`.
+pub fn generate_hpa_v2(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, HPA_V2);
+    let encode_stmts =
+        generate_message_encode_only(&set, HPA_V2, message, hpa_v2_delegated_field, "hpa", "obj");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_hpa_v2_to_json(hpa: autoscaling_v2::HorizontalPodAutoscaler) -> serde_json::Value {\n",
     );
     out.push_str("    let mut obj = serde_json::Map::new();\n");
     out.push_str(&encode_stmts);
