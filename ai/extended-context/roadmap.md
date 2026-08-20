@@ -44,36 +44,19 @@ Decision legend: **KEEP** (decision made, no revisit expected) · **MEASURED**
 | **metrics-server** | UPSTREAM | Yes | KEEP | Standard component; no rewrite plan. |
 | **Sentinel / sentinel-derive** | NATIVE (test infra) | n/a | KEEP | Proto-descriptor oracle framework, closed the silent-decode-drop bug class. |
 
-**On the k3s/k0s comparison:** resolved with a real, executed,
-matched-methodology measurement (`mayor-5x0kh`, 2026-08-20 — see
-`ai/findings/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`). Real k3s
-(v1.36.3+k3s1, native containerd, traefik/servicelb disabled) was installed
-on a dedicated Lima VM, run through the same sonobuoy conformance harness
-u7s uses on itself, and measured with the same component-boundary
-accounting (control-plane processes + container runtime + CoreDNS +
-metrics-server, matching u7s's own KEEP/MEASURED rows above). Single-node
-idle matched-boundary total: **~813 MB** (`k3s-server` folding
-apiserver+scheduler+controller-manager+kubelet+kube-proxy into one process
-+ containerd + CoreDNS + local-path-provisioner + metrics-server) — **~8-11x**
-the old illustrative "~70-100MB" bare-binary estimate, confirming that
-estimate undercounted by missing containerd and every default addon.
-Against u7s's own Gate-4 *target* (128 MiB = 134.2MB), the real gap is
-**~6.1x** (a conservative floor, since it compares k3s's actual measurement
-against u7s's target rather than u7s's current actual total — see the
-findings doc's "Limitations" section). This does not change Gate 4's target
-or urgency; it replaces a hand-wavy caveat with a real number that confirms
-the roadmap's caution was justified. One sub-question remains open by
-design, not overlooked: the container runtime's (CRI-O vs containerd)
-behavior under real container load (each spawns one supervisor process per
-running container — `conmon`/`containerd-shim` — a marginal cost invisible
-at low counts but real at scale) was only partially measured (k3s side, up
-to ~20 concurrent containers, host-resource-capped; u7s/CRI-O side verified
-via config only, not measured live) — see the findings doc's
-"Container-runtime scaling" section for a concrete follow-on bead
-recommendation. The separate upstream configuration/tuning audit for
-kubelet and KCM (the two dominant u7s-side components) remains open and
-un-touched by this bead — still cheap to check, and still required before
-any rewrite cost-benefit estimate per north-star.md's decision process.
+**On the k3s/k0s comparison:** resolved — real k3s (v1.36.3+k3s1, native
+containerd) was installed, run through the same sonobuoy harness, and
+measured with the same component-boundary accounting u7s uses on itself.
+Single-node idle matched-boundary total: **~813 MB**, ~8-11x the old
+illustrative "~70-100MB" bare-binary estimate, and ~6.1x above u7s's own
+128 MiB Gate-4 target (a conservative floor against the target, not u7s's
+current actual total). This doesn't change Gate 4's target or urgency; it
+replaces a hand-wavy caveat with a real number, though the container
+runtime's (CRI-O vs containerd) behavior under real load remains only
+partially resolved. Full methodology, deviations, and per-process tables:
+`ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`. The separate
+upstream configuration/tuning audit for kubelet and KCM remains open and
+untouched by this work.
 
 ---
 
