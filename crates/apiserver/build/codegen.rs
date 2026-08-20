@@ -3659,3 +3659,748 @@ pub fn generate_rolebinding(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+const DEPLOYMENT: &str = ".k8s.io.api.apps.v1.Deployment";
+const DEPLOYMENT_SPEC: &str = ".k8s.io.api.apps.v1.DeploymentSpec";
+const DEPLOYMENT_STATUS: &str = ".k8s.io.api.apps.v1.DeploymentStatus";
+const STATEFULSET: &str = ".k8s.io.api.apps.v1.StatefulSet";
+const STATEFULSET_SPEC: &str = ".k8s.io.api.apps.v1.StatefulSetSpec";
+const STATEFULSET_STATUS: &str = ".k8s.io.api.apps.v1.StatefulSetStatus";
+const DAEMONSET: &str = ".k8s.io.api.apps.v1.DaemonSet";
+const DAEMONSET_SPEC: &str = ".k8s.io.api.apps.v1.DaemonSetSpec";
+const DAEMONSET_STATUS: &str = ".k8s.io.api.apps.v1.DaemonSetStatus";
+const REPLICASET: &str = ".k8s.io.api.apps.v1.ReplicaSet";
+const REPLICASET_SPEC: &str = ".k8s.io.api.apps.v1.ReplicaSetSpec";
+const REPLICASET_STATUS: &str = ".k8s.io.api.apps.v1.ReplicaSetStatus";
+const CONTROLLER_REVISION: &str = ".k8s.io.api.apps.v1.ControllerRevision";
+
+/// `replicas` is unconditionally emitted, defaulting an unset field to `0` rather than omitting
+/// the key — matching every apps/v1 workload spec's own "the API always reports a concrete
+/// replica count" convention, the same shape `lease_spec_delegated_field`'s own zero-default
+/// fields document but inverted (always-emit instead of only-emit-if-nonzero). `selector`
+/// delegates wholesale to the hand-written `gen_apps_spec_to_json` (shared verbatim across all
+/// four apps/v1 workload kinds this migration touches) and, in the same statement, consumes
+/// `template` too — the mechanical walker has no per-field hook that lets two sibling proto
+/// fields merge into one JSON object, so `template`'s own entry below is a deliberate no-op.
+/// `strategy`'s own `rollingUpdate.maxUnavailable`/`.maxSurge` are `IntOrString`, opaque to the
+/// mechanical walker (it only special-cases `Quantity` by FQN), so the whole field delegates to
+/// the hand-written `gen_apps_int_or_string_to_json`. `minReadySeconds` is zero-filtered, unlike
+/// the mechanical walker's default no-filter int32 handling. `paused` is only ever emitted when
+/// `true`, never `false` — matching `kubectl rollout pause`/`resume`'s own asymmetric JSON patch,
+/// which only ever sets `paused: true` and unsets the field entirely to resume, never sends
+/// `paused: false`. `revisionHistoryLimit`/`progressDeadlineSeconds` need no entry: the
+/// mechanical walker's default "emit whenever `Some`, no zero filter" int32 handling already
+/// matches the pre-migration decoder exactly.
+fn deployment_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "replicas" => Some(
+            "    m.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
+        ),
+        "selector" => Some(
+            "    if let Some(serde_json::Value::Object(sm)) = gen_apps_spec_to_json(spec.selector, spec.template) {\n        m.extend(sm);\n    }\n",
+        ),
+        "template" => Some(""),
+        "strategy" => Some(
+            "    if let Some(strategy) = spec.strategy {\n        let mut strategy_json = serde_json::json!({});\n        if let Some(t) = strategy.r#type.filter(|s| !s.is_empty()) {\n            strategy_json[\"type\"] = t.into();\n        }\n        if let Some(ru) = strategy.rolling_update {\n            let mut ru_json = serde_json::json!({});\n            if let Some(mu) = ru.max_unavailable {\n                ru_json[\"maxUnavailable\"] = gen_apps_int_or_string_to_json(mu);\n            }\n            if let Some(ms) = ru.max_surge {\n                ru_json[\"maxSurge\"] = gen_apps_int_or_string_to_json(ms);\n            }\n            if !ru_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {\n                strategy_json[\"rollingUpdate\"] = ru_json;\n            }\n        }\n        if !strategy_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {\n            m.insert(\"strategy\".to_string(), strategy_json);\n        }\n    }\n",
+        ),
+        "minReadySeconds" => Some(
+            "    if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {\n        m.insert(\"minReadySeconds\".to_string(), v.into());\n    }\n",
+        ),
+        "paused" => Some(
+            "    if let Some(true) = spec.paused {\n        m.insert(\"paused\".to_string(), true.into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_deployment_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_deployment_proto_gen` this migration retires.
+pub fn generate_deployment_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEPLOYMENT_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEPLOYMENT_SPEC,
+        message,
+        deployment_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_deployment_spec_to_json(spec: apps_v1::DeploymentSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Every numeric field here is zero-filtered (unlike the mechanical walker's default no-filter
+/// int32/int64 handling) — an explicit `0` is indistinguishable on the wire from "never set" for
+/// every one of these gauges, the same reasoning `pod_status_delegated_field`'s own
+/// `observedGeneration` entry documents. `conditions` needs the shared `apps_condition_to_json!`
+/// macro (defined in `src/apps_gen_adapter.rs`, in scope for this `include!`d code) plus
+/// `DeploymentCondition`'s own extra `lastUpdateTime` field, which the other three apps/v1
+/// condition types don't have — the deployment controller's `progressDeadlineSeconds` check
+/// depends on this timestamp to tell whether a rollout has actually stalled.
+fn deployment_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "observedGeneration" => Some(
+            "    if let Some(v) = status.observed_generation.filter(|&v| v != 0) {\n        m.insert(\"observedGeneration\".to_string(), v.into());\n    }\n",
+        ),
+        "replicas" => Some(
+            "    if let Some(v) = status.replicas.filter(|&v| v != 0) {\n        m.insert(\"replicas\".to_string(), v.into());\n    }\n",
+        ),
+        "updatedReplicas" => Some(
+            "    if let Some(v) = status.updated_replicas.filter(|&v| v != 0) {\n        m.insert(\"updatedReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "readyReplicas" => Some(
+            "    if let Some(v) = status.ready_replicas.filter(|&v| v != 0) {\n        m.insert(\"readyReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "availableReplicas" => Some(
+            "    if let Some(v) = status.available_replicas.filter(|&v| v != 0) {\n        m.insert(\"availableReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "unavailableReplicas" => Some(
+            "    if let Some(v) = status.unavailable_replicas.filter(|&v| v != 0) {\n        m.insert(\"unavailableReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "terminatingReplicas" => Some(
+            "    if let Some(v) = status.terminating_replicas.filter(|&v| v != 0) {\n        m.insert(\"terminatingReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "collisionCount" => Some(
+            "    if let Some(v) = status.collision_count.filter(|&v| v != 0) {\n        m.insert(\"collisionCount\".to_string(), v.into());\n    }\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), status.conditions.iter().map(|c| {\n            let mut cond = apps_condition_to_json!(c);\n            if let Some(t) = c.last_update_time.as_ref() {\n                if let Some(secs) = t.seconds.filter(|&s| s > 0) {\n                    cond[\"lastUpdateTime\"] = crate::util::secs_to_rfc3339(secs).into();\n                }\n            }\n            cond\n        }).collect());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_deployment_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_deployment_proto_gen` this migration retires.
+pub fn generate_deployment_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEPLOYMENT_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEPLOYMENT_STATUS,
+        message,
+        deployment_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_deployment_status_to_json(status: apps_v1::DeploymentStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as `namespace_delegated_field`'s own entry. `spec`/
+/// `status` delegate to the separately generated `gen_deployment_spec_to_json`/
+/// `gen_deployment_status_to_json`, only inserted once non-empty — matching the pre-migration
+/// `decode_deployment_proto_gen`'s own `if !spec_json.is_empty() { ... }`/`if !status_json.is_empty()
+/// { ... }` guards exactly.
+fn deployment_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(deploy.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = deploy.spec {\n        let spec_json = gen_deployment_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = deploy.status {\n        let status_json = gen_deployment_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_deployment_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_deployment_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `Deployment` has no
+/// `encode_deployment_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_deployment(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEPLOYMENT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEPLOYMENT,
+        message,
+        deployment_delegated_field,
+        "deploy",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_deployment_to_json(deploy: apps_v1::Deployment) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `replicas`/`selector`+`template` mirror `deployment_spec_delegated_field`'s own entries
+/// exactly (StatefulSet shares the same "always report a concrete replica count" and
+/// selector/template merge trick). `volumeClaimTemplates` delegates wholesale to the hand-written
+/// `gen_persistent_volume_claim_to_json` (already covers `PersistentVolumeClaim`'s own
+/// completeness, tested separately in `core_gen_adapter.rs`) — this is the field StatefulSet
+/// exists for, per the type's own doc comment. `updateStrategy`'s own
+/// `rollingUpdate.maxUnavailable` is `IntOrString` (same reasoning as Deployment's `strategy`)
+/// and `rollingUpdate.partition` is unconditionally emitted (defaulting to `0`), so the whole
+/// field delegates. `minReadySeconds` is zero-filtered. `persistentVolumeClaimRetentionPolicy`
+/// only inserts once its own `whenDeleted`/`whenScaled` sub-fields produce a non-empty object —
+/// past this mechanical walker's one-level override hook, the same limitation
+/// `service_spec_delegated_field`'s own `sessionAffinityConfig` entry documents. `ordinals` is
+/// unconditionally `{"start": ord.start.unwrap_or(0)}` whenever the outer `Option` is `Some`,
+/// regardless of whether `start` itself was ever set — unlike every other nested-message field in
+/// this file, which only inserts once genuinely non-empty. `serviceName`/`podManagementPolicy`/
+/// `revisionHistoryLimit` need no entry: the mechanical walker's defaults already match the
+/// pre-migration decoder exactly.
+fn statefulset_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "replicas" => Some(
+            "    m.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
+        ),
+        "selector" => Some(
+            "    if let Some(serde_json::Value::Object(sm)) = gen_apps_spec_to_json(spec.selector, spec.template) {\n        m.extend(sm);\n    }\n",
+        ),
+        "template" => Some(""),
+        "volumeClaimTemplates" => Some(
+            "    if !spec.volume_claim_templates.is_empty() {\n        m.insert(\"volumeClaimTemplates\".to_string(), spec.volume_claim_templates.into_iter().map(gen_persistent_volume_claim_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "updateStrategy" => Some(
+            "    if let Some(us) = spec.update_strategy {\n        let mut us_json = serde_json::json!({});\n        if let Some(t) = us.r#type.filter(|s| !s.is_empty()) {\n            us_json[\"type\"] = t.into();\n        }\n        if let Some(ru) = us.rolling_update {\n            let mut ru_json = serde_json::json!({ \"partition\": ru.partition.unwrap_or(0) });\n            if let Some(mu) = ru.max_unavailable {\n                ru_json[\"maxUnavailable\"] = gen_apps_int_or_string_to_json(mu);\n            }\n            us_json[\"rollingUpdate\"] = ru_json;\n        }\n        if !us_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {\n            m.insert(\"updateStrategy\".to_string(), us_json);\n        }\n    }\n",
+        ),
+        "minReadySeconds" => Some(
+            "    if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {\n        m.insert(\"minReadySeconds\".to_string(), v.into());\n    }\n",
+        ),
+        "persistentVolumeClaimRetentionPolicy" => Some(
+            "    if let Some(rp) = spec.persistent_volume_claim_retention_policy {\n        let mut rp_json = serde_json::json!({});\n        if let Some(v) = rp.when_deleted.filter(|s| !s.is_empty()) {\n            rp_json[\"whenDeleted\"] = v.into();\n        }\n        if let Some(v) = rp.when_scaled.filter(|s| !s.is_empty()) {\n            rp_json[\"whenScaled\"] = v.into();\n        }\n        if !rp_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {\n            m.insert(\"persistentVolumeClaimRetentionPolicy\".to_string(), rp_json);\n        }\n    }\n",
+        ),
+        "ordinals" => Some(
+            "    if let Some(ord) = spec.ordinals {\n        m.insert(\"ordinals\".to_string(), serde_json::json!({ \"start\": ord.start.unwrap_or(0) }));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_statefulset_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_statefulset_proto_gen` this migration retires.
+pub fn generate_statefulset_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, STATEFULSET_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        STATEFULSET_SPEC,
+        message,
+        statefulset_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_statefulset_spec_to_json(spec: apps_v1::StatefulSetSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Every numeric field here is zero-filtered, the same reasoning
+/// `deployment_status_delegated_field` documents. `conditions` uses the shared
+/// `apps_condition_to_json!` macro with no extra field (only `DeploymentCondition` has
+/// `lastUpdateTime`). `currentRevision`/`updateRevision` need no entry: plain optional strings
+/// the mechanical walker already handles correctly.
+fn statefulset_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "observedGeneration" => Some(
+            "    if let Some(v) = status.observed_generation.filter(|&v| v != 0) {\n        m.insert(\"observedGeneration\".to_string(), v.into());\n    }\n",
+        ),
+        "replicas" => Some(
+            "    if let Some(v) = status.replicas.filter(|&v| v != 0) {\n        m.insert(\"replicas\".to_string(), v.into());\n    }\n",
+        ),
+        "readyReplicas" => Some(
+            "    if let Some(v) = status.ready_replicas.filter(|&v| v != 0) {\n        m.insert(\"readyReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "currentReplicas" => Some(
+            "    if let Some(v) = status.current_replicas.filter(|&v| v != 0) {\n        m.insert(\"currentReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "updatedReplicas" => Some(
+            "    if let Some(v) = status.updated_replicas.filter(|&v| v != 0) {\n        m.insert(\"updatedReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "collisionCount" => Some(
+            "    if let Some(v) = status.collision_count.filter(|&v| v != 0) {\n        m.insert(\"collisionCount\".to_string(), v.into());\n    }\n",
+        ),
+        "availableReplicas" => Some(
+            "    if let Some(v) = status.available_replicas.filter(|&v| v != 0) {\n        m.insert(\"availableReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), status.conditions.iter().map(|c| apps_condition_to_json!(c)).collect());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_statefulset_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_statefulset_proto_gen` this migration retires.
+pub fn generate_statefulset_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, STATEFULSET_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        STATEFULSET_STATUS,
+        message,
+        statefulset_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_statefulset_status_to_json(status: apps_v1::StatefulSetStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Mirrors `deployment_delegated_field` exactly, delegating `spec`/`status` to the separately
+/// generated `gen_statefulset_spec_to_json`/`gen_statefulset_status_to_json`.
+fn statefulset_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(sts.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = sts.spec {\n        let spec_json = gen_statefulset_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = sts.status {\n        let status_json = gen_statefulset_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_statefulset_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_statefulset_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `StatefulSet` has no
+/// `encode_statefulset_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_statefulset(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, STATEFULSET);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        STATEFULSET,
+        message,
+        statefulset_delegated_field,
+        "sts",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_statefulset_to_json(sts: apps_v1::StatefulSet) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `selector`+`template` merge the same way `deployment_spec_delegated_field`'s own entries do.
+/// `updateStrategy`'s own `rollingUpdate.maxUnavailable`/`.maxSurge` are `IntOrString`, so the
+/// whole field delegates (DaemonSet's `RollingUpdateDaemonSet` has no `partition`, unlike
+/// StatefulSet's own rolling-update strategy). `minReadySeconds` is zero-filtered.
+/// `revisionHistoryLimit` needs no entry: the mechanical walker's default already matches.
+/// DaemonSet has no `replicas` field (node-count is implicit in the node selector/taints match),
+/// unlike the other three apps/v1 workload kinds.
+fn daemonset_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "selector" => Some(
+            "    if let Some(serde_json::Value::Object(sm)) = gen_apps_spec_to_json(spec.selector, spec.template) {\n        m.extend(sm);\n    }\n",
+        ),
+        "template" => Some(""),
+        "updateStrategy" => Some(
+            "    if let Some(us) = spec.update_strategy {\n        let mut us_json = serde_json::json!({});\n        if let Some(t) = us.r#type.filter(|s| !s.is_empty()) {\n            us_json[\"type\"] = t.into();\n        }\n        if let Some(ru) = us.rolling_update {\n            let mut ru_json = serde_json::json!({});\n            if let Some(mu) = ru.max_unavailable {\n                ru_json[\"maxUnavailable\"] = gen_apps_int_or_string_to_json(mu);\n            }\n            if let Some(ms) = ru.max_surge {\n                ru_json[\"maxSurge\"] = gen_apps_int_or_string_to_json(ms);\n            }\n            if !ru_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {\n                us_json[\"rollingUpdate\"] = ru_json;\n            }\n        }\n        if !us_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {\n            m.insert(\"updateStrategy\".to_string(), us_json);\n        }\n    }\n",
+        ),
+        "minReadySeconds" => Some(
+            "    if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {\n        m.insert(\"minReadySeconds\".to_string(), v.into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_daemonset_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_daemonset_proto_gen` this migration retires.
+pub fn generate_daemonset_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DAEMONSET_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DAEMONSET_SPEC,
+        message,
+        daemonset_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_daemonset_spec_to_json(spec: apps_v1::DaemonSetSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Every numeric field here is zero-filtered, the same reasoning
+/// `deployment_status_delegated_field` documents. `conditions` uses the shared
+/// `apps_condition_to_json!` macro with no extra field.
+fn daemonset_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "currentNumberScheduled" => Some(
+            "    if let Some(v) = status.current_number_scheduled.filter(|&v| v != 0) {\n        m.insert(\"currentNumberScheduled\".to_string(), v.into());\n    }\n",
+        ),
+        "numberMisscheduled" => Some(
+            "    if let Some(v) = status.number_misscheduled.filter(|&v| v != 0) {\n        m.insert(\"numberMisscheduled\".to_string(), v.into());\n    }\n",
+        ),
+        "desiredNumberScheduled" => Some(
+            "    if let Some(v) = status.desired_number_scheduled.filter(|&v| v != 0) {\n        m.insert(\"desiredNumberScheduled\".to_string(), v.into());\n    }\n",
+        ),
+        "numberReady" => Some(
+            "    if let Some(v) = status.number_ready.filter(|&v| v != 0) {\n        m.insert(\"numberReady\".to_string(), v.into());\n    }\n",
+        ),
+        "observedGeneration" => Some(
+            "    if let Some(v) = status.observed_generation.filter(|&v| v != 0) {\n        m.insert(\"observedGeneration\".to_string(), v.into());\n    }\n",
+        ),
+        "updatedNumberScheduled" => Some(
+            "    if let Some(v) = status.updated_number_scheduled.filter(|&v| v != 0) {\n        m.insert(\"updatedNumberScheduled\".to_string(), v.into());\n    }\n",
+        ),
+        "numberAvailable" => Some(
+            "    if let Some(v) = status.number_available.filter(|&v| v != 0) {\n        m.insert(\"numberAvailable\".to_string(), v.into());\n    }\n",
+        ),
+        "numberUnavailable" => Some(
+            "    if let Some(v) = status.number_unavailable.filter(|&v| v != 0) {\n        m.insert(\"numberUnavailable\".to_string(), v.into());\n    }\n",
+        ),
+        "collisionCount" => Some(
+            "    if let Some(v) = status.collision_count.filter(|&v| v != 0) {\n        m.insert(\"collisionCount\".to_string(), v.into());\n    }\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), status.conditions.iter().map(|c| apps_condition_to_json!(c)).collect());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_daemonset_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_daemonset_proto_gen` this migration retires.
+pub fn generate_daemonset_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DAEMONSET_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DAEMONSET_STATUS,
+        message,
+        daemonset_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_daemonset_status_to_json(status: apps_v1::DaemonSetStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Mirrors `deployment_delegated_field` exactly, delegating `spec`/`status` to the separately
+/// generated `gen_daemonset_spec_to_json`/`gen_daemonset_status_to_json`.
+fn daemonset_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(ds.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = ds.spec {\n        let spec_json = gen_daemonset_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = ds.status {\n        let status_json = gen_daemonset_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_daemonset_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_daemonset_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `DaemonSet` has no
+/// `encode_daemonset_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_daemonset(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DAEMONSET);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DAEMONSET,
+        message,
+        daemonset_delegated_field,
+        "ds",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_daemonset_to_json(ds: apps_v1::DaemonSet) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `replicas`/`selector`+`template` mirror `deployment_spec_delegated_field`'s own entries.
+/// `minReadySeconds` is zero-filtered.
+fn replicaset_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "replicas" => Some(
+            "    m.insert(\"replicas\".to_string(), serde_json::Value::Number(spec.replicas.unwrap_or(0).into()));\n",
+        ),
+        "minReadySeconds" => Some(
+            "    if let Some(v) = spec.min_ready_seconds.filter(|&v| v != 0) {\n        m.insert(\"minReadySeconds\".to_string(), v.into());\n    }\n",
+        ),
+        "selector" => Some(
+            "    if let Some(serde_json::Value::Object(sm)) = gen_apps_spec_to_json(spec.selector, spec.template) {\n        m.extend(sm);\n    }\n",
+        ),
+        "template" => Some(""),
+        _ => None,
+    }
+}
+
+/// Generates `gen_replicaset_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_replicaset_proto_gen` this migration retires.
+pub fn generate_replicaset_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, REPLICASET_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        REPLICASET_SPEC,
+        message,
+        replicaset_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_replicaset_spec_to_json(spec: apps_v1::ReplicaSetSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Every numeric field here is zero-filtered, the same reasoning
+/// `deployment_status_delegated_field` documents. `conditions` uses the shared
+/// `apps_condition_to_json!` macro with no extra field.
+fn replicaset_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "replicas" => Some(
+            "    if let Some(v) = status.replicas.filter(|&v| v != 0) {\n        m.insert(\"replicas\".to_string(), v.into());\n    }\n",
+        ),
+        "fullyLabeledReplicas" => Some(
+            "    if let Some(v) = status.fully_labeled_replicas.filter(|&v| v != 0) {\n        m.insert(\"fullyLabeledReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "observedGeneration" => Some(
+            "    if let Some(v) = status.observed_generation.filter(|&v| v != 0) {\n        m.insert(\"observedGeneration\".to_string(), v.into());\n    }\n",
+        ),
+        "readyReplicas" => Some(
+            "    if let Some(v) = status.ready_replicas.filter(|&v| v != 0) {\n        m.insert(\"readyReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "availableReplicas" => Some(
+            "    if let Some(v) = status.available_replicas.filter(|&v| v != 0) {\n        m.insert(\"availableReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "terminatingReplicas" => Some(
+            "    if let Some(v) = status.terminating_replicas.filter(|&v| v != 0) {\n        m.insert(\"terminatingReplicas\".to_string(), v.into());\n    }\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), status.conditions.iter().map(|c| apps_condition_to_json!(c)).collect());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_replicaset_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_replicaset_proto_gen` this migration retires.
+pub fn generate_replicaset_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, REPLICASET_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        REPLICASET_STATUS,
+        message,
+        replicaset_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_replicaset_status_to_json(status: apps_v1::ReplicaSetStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Mirrors `deployment_delegated_field` exactly, delegating `spec`/`status` to the separately
+/// generated `gen_replicaset_spec_to_json`/`gen_replicaset_status_to_json`.
+fn replicaset_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(rs.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = rs.spec {\n        let spec_json = gen_replicaset_spec_to_json(spec);\n        if spec_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"spec\".to_string(), spec_json);\n        }\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = rs.status {\n        let status_json = gen_replicaset_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_replicaset_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_replicaset_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why; `ReplicaSet` has no
+/// `encode_replicaset_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_replicaset(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, REPLICASET);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        REPLICASET,
+        message,
+        replicaset_delegated_field,
+        "rs",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_replicaset_to_json(rs: apps_v1::ReplicaSet) -> serde_json::Value {\n");
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `revision` is
+/// unconditionally emitted, defaulting an unset field to `0` — matching every other apps/v1
+/// workload's own "always report a concrete value" convention for this class of int field.
+/// `data` is a `RawExtension`: the same opaque-scalar handling every other `RawExtension` field in
+/// this codebase gets (inline the embedded document as JSON), except this one is silently dropped
+/// entirely if the raw bytes fail to parse as JSON, matching the pre-migration decoder's own
+/// `if let Ok(parsed) = ... { out["data"] = parsed; }` (no fallback, no error surfaced) exactly —
+/// the StatefulSet/DaemonSet history controllers roll back by matching on `revision` and
+/// replaying `data`; losing either makes a rollback silently replay the wrong (or no) state.
+fn controllerrevision_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(cr.metadata.unwrap_or_default()));\n",
+        ),
+        "data" => Some(
+            "    if let Some(raw_ext) = cr.data {\n        if let Some(raw) = raw_ext.raw {\n            if !raw.is_empty() {\n                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&raw) {\n                    obj.insert(\"data\".to_string(), parsed);\n                }\n            }\n        }\n    }\n",
+        ),
+        "revision" => Some(
+            "    obj.insert(\"revision\".to_string(), serde_json::Value::Number(cr.revision.unwrap_or(0).into()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_controllerrevision_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_controllerrevision_proto_gen` this migration retires (the entry point
+/// itself stays hand-written — see `generate_namespace`'s doc for why; `ControllerRevision` has
+/// no `encode_controllerrevision_proto_gen` today, so this is decode-only in the same sense).
+pub fn generate_controllerrevision(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CONTROLLER_REVISION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CONTROLLER_REVISION,
+        message,
+        controllerrevision_delegated_field,
+        "cr",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_controllerrevision_to_json(cr: apps_v1::ControllerRevision) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
