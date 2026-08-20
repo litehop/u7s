@@ -465,10 +465,30 @@ mod tests {
             }};
         }
 
+        use crate::apps_gen::k8s::io::api::admissionregistration::v1 as ar_v1;
+        use crate::apps_gen::k8s::io::api::apps::v1 as apps_v1;
+        use crate::apps_gen::k8s::io::api::authentication::v1 as authn_v1;
+        use crate::apps_gen::k8s::io::api::authorization::v1 as authz_v1;
         use crate::apps_gen::k8s::io::api::autoscaling::v1 as as_v1;
         use crate::apps_gen::k8s::io::api::autoscaling::v2 as as_v2;
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::api::certificates::v1 as certs_v1;
+        use crate::apps_gen::k8s::io::api::coordination::v1 as coord_v1;
+        use crate::apps_gen::k8s::io::api::coordination::v1alpha2 as coord_v1alpha2;
         use crate::apps_gen::k8s::io::api::core::v1 as cv1;
+        use crate::apps_gen::k8s::io::api::discovery::v1 as discovery_v1;
+        use crate::apps_gen::k8s::io::api::events::v1 as events_v1;
+        use crate::apps_gen::k8s::io::api::flowcontrol::v1 as flowcontrol_v1;
+        use crate::apps_gen::k8s::io::api::networking::v1 as networking_v1;
+        use crate::apps_gen::k8s::io::api::node::v1 as node_v1;
+        use crate::apps_gen::k8s::io::api::policy::v1 as policy_v1;
+        use crate::apps_gen::k8s::io::api::rbac::v1 as rbac_v1;
         use crate::apps_gen::k8s::io::api::resource::v1 as rv1;
+        use crate::apps_gen::k8s::io::api::scheduling::v1 as scheduling_v1;
+        use crate::apps_gen::k8s::io::api::storage::v1 as storage_v1;
+        use crate::apps_gen::k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiext_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
+        use crate::apps_gen::k8s::io::kube_aggregator::pkg::apis::apiregistration::v1 as apiregistration_v1;
 
         survey!(
             "core/Namespace",
@@ -595,6 +615,287 @@ mod tests {
             rv1::ResourceSlice,
             ".k8s.io.api.resource.v1.ResourceSlice",
             crate::resource_gen_adapter::decode_resourceslice_proto_gen
+        );
+
+        // The 9 groups below (mayor-s1nk9) had never been run through this oracle before —
+        // only core/autoscaling/resource had survey! entries. Each row is one *_gen_adapter.rs
+        // decoder; the (label, sentinel type, proto FQN, decoder fn) shape matches the rows
+        // above exactly, just pointed at a different crate module per api group.
+        survey!(
+            "apps/StatefulSet",
+            apps_v1::StatefulSet,
+            ".k8s.io.api.apps.v1.StatefulSet",
+            crate::apps_gen_adapter::decode_statefulset_proto_gen
+        );
+        survey!(
+            "apps/Deployment",
+            apps_v1::Deployment,
+            ".k8s.io.api.apps.v1.Deployment",
+            crate::apps_gen_adapter::decode_deployment_proto_gen
+        );
+        survey!(
+            "apps/DaemonSet",
+            apps_v1::DaemonSet,
+            ".k8s.io.api.apps.v1.DaemonSet",
+            crate::apps_gen_adapter::decode_daemonset_proto_gen
+        );
+        survey!(
+            "apps/ReplicaSet",
+            apps_v1::ReplicaSet,
+            ".k8s.io.api.apps.v1.ReplicaSet",
+            crate::apps_gen_adapter::decode_replicaset_proto_gen
+        );
+        survey!(
+            "apps/ControllerRevision",
+            apps_v1::ControllerRevision,
+            ".k8s.io.api.apps.v1.ControllerRevision",
+            crate::apps_gen_adapter::decode_controllerrevision_proto_gen
+        );
+        survey!(
+            "rbac/ClusterRole",
+            rbac_v1::ClusterRole,
+            ".k8s.io.api.rbac.v1.ClusterRole",
+            crate::rbac_gen_adapter::decode_clusterrole_proto_gen
+        );
+        survey!(
+            "rbac/ClusterRoleBinding",
+            rbac_v1::ClusterRoleBinding,
+            ".k8s.io.api.rbac.v1.ClusterRoleBinding",
+            crate::rbac_gen_adapter::decode_clusterrolebinding_proto_gen
+        );
+        survey!(
+            "rbac/Role",
+            rbac_v1::Role,
+            ".k8s.io.api.rbac.v1.Role",
+            crate::rbac_gen_adapter::decode_role_proto_gen
+        );
+        survey!(
+            "rbac/RoleBinding",
+            rbac_v1::RoleBinding,
+            ".k8s.io.api.rbac.v1.RoleBinding",
+            crate::rbac_gen_adapter::decode_rolebinding_proto_gen
+        );
+        survey!(
+            "rbac/SubjectAccessReview",
+            authz_v1::SubjectAccessReview,
+            ".k8s.io.api.authorization.v1.SubjectAccessReview",
+            crate::rbac_gen_adapter::decode_subject_access_review_proto_gen
+        );
+        survey!(
+            "rbac/LocalSubjectAccessReview",
+            authz_v1::LocalSubjectAccessReview,
+            ".k8s.io.api.authorization.v1.LocalSubjectAccessReview",
+            crate::rbac_gen_adapter::decode_local_subject_access_review_proto_gen
+        );
+        survey!(
+            "rbac/SelfSubjectAccessReview",
+            authz_v1::SelfSubjectAccessReview,
+            ".k8s.io.api.authorization.v1.SelfSubjectAccessReview",
+            crate::rbac_gen_adapter::decode_selfsubjectaccessreview_proto_gen
+        );
+        survey!(
+            "rbac/SelfSubjectRulesReview",
+            authz_v1::SelfSubjectRulesReview,
+            ".k8s.io.api.authorization.v1.SelfSubjectRulesReview",
+            crate::rbac_gen_adapter::decode_selfsubjectrulesreview_proto_gen
+        );
+        survey!(
+            "rbac/TokenReview",
+            authn_v1::TokenReview,
+            ".k8s.io.api.authentication.v1.TokenReview",
+            crate::rbac_gen_adapter::decode_token_review_proto_gen
+        );
+        survey!(
+            "apiextensions/CustomResourceDefinition",
+            apiext_v1::CustomResourceDefinition,
+            ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.CustomResourceDefinition",
+            crate::apiextensions_gen_adapter::decode_crd_proto_gen
+        );
+        survey!(
+            "apiextensions/DeleteOptions",
+            meta_v1::DeleteOptions,
+            ".k8s.io.apimachinery.pkg.apis.meta.v1.DeleteOptions",
+            crate::apiextensions_gen_adapter::decode_delete_options_proto_gen
+        );
+        survey!(
+            "admissionreg/ValidatingWebhookConfiguration",
+            ar_v1::ValidatingWebhookConfiguration,
+            ".k8s.io.api.admissionregistration.v1.ValidatingWebhookConfiguration",
+            crate::admissionreg_gen_adapter::decode_validatingwebhookconfiguration_proto_gen
+        );
+        survey!(
+            "admissionreg/MutatingWebhookConfiguration",
+            ar_v1::MutatingWebhookConfiguration,
+            ".k8s.io.api.admissionregistration.v1.MutatingWebhookConfiguration",
+            crate::admissionreg_gen_adapter::decode_mutatingwebhookconfiguration_proto_gen
+        );
+        survey!(
+            "admissionreg/ValidatingAdmissionPolicy",
+            ar_v1::ValidatingAdmissionPolicy,
+            ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicy",
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicy_proto_gen
+        );
+        survey!(
+            "admissionreg/ValidatingAdmissionPolicyBinding",
+            ar_v1::ValidatingAdmissionPolicyBinding,
+            ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicyBinding",
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen
+        );
+        survey!(
+            "admissionreg/MutatingAdmissionPolicy",
+            ar_v1::MutatingAdmissionPolicy,
+            ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicy",
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicy_proto_gen
+        );
+        survey!(
+            "admissionreg/MutatingAdmissionPolicyBinding",
+            ar_v1::MutatingAdmissionPolicyBinding,
+            ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicyBinding",
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicybinding_proto_gen
+        );
+        survey!(
+            "net_disc/Ingress",
+            networking_v1::Ingress,
+            ".k8s.io.api.networking.v1.Ingress",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen
+        );
+        survey!(
+            "net_disc/IngressClass",
+            networking_v1::IngressClass,
+            ".k8s.io.api.networking.v1.IngressClass",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingressclass_proto_gen
+        );
+        survey!(
+            "net_disc/NetworkPolicy",
+            networking_v1::NetworkPolicy,
+            ".k8s.io.api.networking.v1.NetworkPolicy",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_networkpolicy_proto_gen
+        );
+        survey!(
+            "net_disc/IPAddress",
+            networking_v1::IpAddress,
+            ".k8s.io.api.networking.v1.IPAddress",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ipaddress_proto_gen
+        );
+        survey!(
+            "net_disc/ServiceCIDR",
+            networking_v1::ServiceCidr,
+            ".k8s.io.api.networking.v1.ServiceCIDR",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_servicecidr_proto_gen
+        );
+        survey!(
+            "net_disc/EndpointSlice",
+            discovery_v1::EndpointSlice,
+            ".k8s.io.api.discovery.v1.EndpointSlice",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen
+        );
+        survey!(
+            "net_disc/CertificateSigningRequest",
+            certs_v1::CertificateSigningRequest,
+            ".k8s.io.api.certificates.v1.CertificateSigningRequest",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen
+        );
+        survey!(
+            "net_disc/PodDisruptionBudget",
+            policy_v1::PodDisruptionBudget,
+            ".k8s.io.api.policy.v1.PodDisruptionBudget",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen
+        );
+        survey!(
+            "net_disc/events.k8s.io Event",
+            events_v1::Event,
+            ".k8s.io.api.events.v1.Event",
+            crate::net_disc_cert_policy_events_gen_adapter::decode_events_v1_event_proto_gen
+        );
+        survey!(
+            "storage/CSINode",
+            storage_v1::CsiNode,
+            ".k8s.io.api.storage.v1.CSINode",
+            crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen
+        );
+        survey!(
+            "storage/CSIDriver",
+            storage_v1::CsiDriver,
+            ".k8s.io.api.storage.v1.CSIDriver",
+            crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen
+        );
+        survey!(
+            "storage/CSIStorageCapacity",
+            storage_v1::CsiStorageCapacity,
+            ".k8s.io.api.storage.v1.CSIStorageCapacity",
+            crate::storage_node_flow_gen_adapter::decode_csistoragecapacity_proto_gen
+        );
+        survey!(
+            "storage/VolumeAttachment",
+            storage_v1::VolumeAttachment,
+            ".k8s.io.api.storage.v1.VolumeAttachment",
+            crate::storage_node_flow_gen_adapter::decode_volumeattachment_proto_gen
+        );
+        survey!(
+            "storage/StorageClass",
+            storage_v1::StorageClass,
+            ".k8s.io.api.storage.v1.StorageClass",
+            crate::storage_node_flow_gen_adapter::decode_storageclass_proto_gen
+        );
+        survey!(
+            "storage/VolumeAttributesClass",
+            storage_v1::VolumeAttributesClass,
+            ".k8s.io.api.storage.v1.VolumeAttributesClass",
+            crate::storage_node_flow_gen_adapter::decode_volumeattributesclass_proto_gen
+        );
+        survey!(
+            "storage/RuntimeClass",
+            node_v1::RuntimeClass,
+            ".k8s.io.api.node.v1.RuntimeClass",
+            crate::storage_node_flow_gen_adapter::decode_runtimeclass_proto_gen
+        );
+        survey!(
+            "storage/PriorityClass",
+            scheduling_v1::PriorityClass,
+            ".k8s.io.api.scheduling.v1.PriorityClass",
+            crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen
+        );
+        survey!(
+            "storage/FlowSchema",
+            flowcontrol_v1::FlowSchema,
+            ".k8s.io.api.flowcontrol.v1.FlowSchema",
+            crate::storage_node_flow_gen_adapter::decode_flowschema_proto_gen
+        );
+        survey!(
+            "storage/PriorityLevelConfiguration",
+            flowcontrol_v1::PriorityLevelConfiguration,
+            ".k8s.io.api.flowcontrol.v1.PriorityLevelConfiguration",
+            crate::storage_node_flow_gen_adapter::decode_prioritylevelconfiguration_proto_gen
+        );
+        survey!(
+            "batch/Job",
+            batch_v1::Job,
+            ".k8s.io.api.batch.v1.Job",
+            crate::batch_gen_adapter::decode_job_proto_gen
+        );
+        survey!(
+            "batch/CronJob",
+            batch_v1::CronJob,
+            ".k8s.io.api.batch.v1.CronJob",
+            crate::batch_gen_adapter::decode_cronjob_proto_gen
+        );
+        survey!(
+            "coord/Lease",
+            coord_v1::Lease,
+            ".k8s.io.api.coordination.v1.Lease",
+            crate::coord_gen_adapter::decode_lease_proto_gen_a
+        );
+        survey!(
+            "coord/LeaseCandidate",
+            coord_v1alpha2::LeaseCandidate,
+            ".k8s.io.api.coordination.v1alpha2.LeaseCandidate",
+            crate::coord_gen_adapter::decode_leasecandidate_proto_gen
+        );
+        survey!(
+            "apiregistration/APIService",
+            apiregistration_v1::ApiService,
+            ".k8s.io.kube_aggregator.pkg.apis.apiregistration.v1.APIService",
+            crate::apiregistration_gen_adapter::decode_apiservice_proto_gen
         );
 
         let total_expected: usize = rows.iter().map(|r| r.1).sum();
