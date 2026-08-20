@@ -546,14 +546,20 @@ needs a slot for their own use, they will communicate it explicitly and it
 will be dispatched only after that — do NOT preemptively reserve any slot as
 "the operator's."
 
-| VM name | Host port | Kubelet port | Companion kubelet port | Konnectivity | Notes |
-|---|---|---|---|---|---|
-| `lima-node` | `6443` | `10250` | `10260` | `8135` | assignable to workers; the operator will communicate if they need this slot |
-| slot 1 = `lima-node-2` | `6444` | `10251`* | `10261` | `8235` | *currently live on `10252` — see caveat below |
-| slot 2 = `lima-node-3` | `6445` | `10252` | `10262` | `8335` | workers may pair this slot with any other via `--extra-node <vm>` when a bead needs a 2-node topology — check `limactl list` / the dashboard before assuming it's free |
-| slot 3 = `lima-node-4` | `6446` | `10253` | `10263` | `8435` | |
-| slot 4 = `lima-node-5` | `6447` | `10254` | `10264` | `8535` | |
-| slot 5 = `lima-node-smoke` | `6448` | `10255` | `10265` | `8635` | fixed 2026-07-23 (mayor-1rlwt) — was misconfigured at `10251`, colliding with slot 1 |
+| VM name | Host port | Kubelet port | Companion kubelet port | Konnectivity | Network | Notes |
+|---|---|---|---|---|---|---|
+| `lima-node` | `6443` | `10250` | `10260` | `8135` | `user-v2-mayor` | assignable to workers; the operator will communicate if they need this slot |
+| slot 1 = `lima-node-2` | `6444` | `10251`* | `10261` | `8235` | `user-v2-workers-a` | *currently live on `10252` — see caveat below |
+| slot 2 = `lima-node-3` | `6445` | `10252` | `10262` | `8335` | `user-v2-workers-a` | workers may pair this slot with any other via `--extra-node <vm>` when a bead needs a 2-node topology — check `limactl list` / the dashboard before assuming it's free |
+| slot 3 = `lima-node-4` | `6446` | `10253` | `10263` | `8435` | `user-v2-workers-a` | |
+| slot 4 = `lima-node-5` | `6447` | `10254` | `10264` | `8535` | `user-v2-workers-b` | |
+| slot 5 = `lima-node-smoke` | `6448` | `10255` | `10265` | `8635` | `user-v2-workers-b` | fixed 2026-07-23 (mayor-1rlwt) — was misconfigured at `10251`, colliding with slot 1 |
+
+Pairing two slots via `--extra-node` for a 2-node topology requires the same
+Network value — `lima-start.sh`'s inter-node route loop compares each VM's
+recorded network and now fails loud on a mismatch instead of silently
+programming a route with no L2 path behind it. Pick two slots from the same
+column above (e.g. `lima-node-2` + `lima-node-3`, both `user-v2-workers-a`).
 
 **Before assigning a slot, verify the LIVE port, not just this table**: run
 `grep -A1 guestPort ~/.lima/<vm-name>/lima.yaml` for the VM you're about to assign —
