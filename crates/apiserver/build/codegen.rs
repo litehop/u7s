@@ -9398,3 +9398,1524 @@ pub fn generate_hpa_v2(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ---- resource.k8s.io/v1 (DRA) -----------------------------------------------
+//
+// Unlike every group above, this file has no `json_to_*_proto` (JSON->proto) direction at all —
+// DRA objects are never decoded from a JSON body back into protobuf by this codebase, only
+// proto->JSON (`decode_*_proto_gen`) — so every generator below calls `generate_message_encode_only`
+// and none needs a `rust_message_path`/decode-direction entry.
+//
+// `proto_exceptions.rs` has zero RENAMES/INLINE_EMBEDS/DELIBERATE_OMISSIONS entries for
+// `.k8s.io.api.resource.v1.*` — every field below is either mechanical or delegated for a purely
+// structural reason (an "always emitted" required field, a `map<string, Message>` the mechanical
+// walker's map detectors don't know how to iterate, a nested type needing its own delegate table,
+// or a bool that's only ever emitted when `true`), never a naming quirk. Every symbol in this
+// section is prefixed `resource_v1_dra`-flavored (`RESOURCE_*`/`DEVICE_*`/... FQN consts,
+// `gen_device_*`/`gen_resourceclaim*`/`gen_resourceslice*` function names) rather than the bare
+// short type name — this group's own leaf types (`DeviceCapacity`, `DeviceConfiguration`, ...) are
+// unique across the whole descriptor set today, but the short-name-collision class other Phase 4
+// migrations hit (two unrelated API groups both declaring e.g. `ServiceReference`) means a bare
+// `capacity`/`configuration`-style const or fn name here could collide with a future migration
+// naming its own leaf type the same way; the `device_`/`resourceclaim_`/`resourceslice_` prefixes
+// already used throughout this section are what keeps it collision-safe without needing a
+// package-qualifying rename later.
+
+const DEVICE_TAINT: &str = ".k8s.io.api.resource.v1.DeviceTaint";
+const CAPACITY_REQUEST_POLICY_RANGE: &str = ".k8s.io.api.resource.v1.CapacityRequestPolicyRange";
+const CAPACITY_REQUEST_POLICY: &str = ".k8s.io.api.resource.v1.CapacityRequestPolicy";
+const DEVICE_CAPACITY: &str = ".k8s.io.api.resource.v1.DeviceCapacity";
+const DEVICE_ATTRIBUTE: &str = ".k8s.io.api.resource.v1.DeviceAttribute";
+const DEVICE_COUNTER: &str = ".k8s.io.api.resource.v1.Counter";
+const DEVICE_COUNTER_SET: &str = ".k8s.io.api.resource.v1.CounterSet";
+const DEVICE_COUNTER_CONSUMPTION: &str = ".k8s.io.api.resource.v1.DeviceCounterConsumption";
+const NODE_ALLOCATABLE_RESOURCE_MAPPING: &str =
+    ".k8s.io.api.resource.v1.NodeAllocatableResourceMapping";
+const DEVICE: &str = ".k8s.io.api.resource.v1.Device";
+const DEVICE_CONFIGURATION: &str = ".k8s.io.api.resource.v1.DeviceConfiguration";
+const DEVICE_CAPACITY_REQUIREMENTS: &str = ".k8s.io.api.resource.v1.CapacityRequirements";
+const EXACT_DEVICE_REQUEST: &str = ".k8s.io.api.resource.v1.ExactDeviceRequest";
+const DEVICE_SUB_REQUEST: &str = ".k8s.io.api.resource.v1.DeviceSubRequest";
+const DEVICE_REQUEST: &str = ".k8s.io.api.resource.v1.DeviceRequest";
+const DEVICE_CLAIM_CONFIGURATION: &str = ".k8s.io.api.resource.v1.DeviceClaimConfiguration";
+const DEVICE_CLAIM: &str = ".k8s.io.api.resource.v1.DeviceClaim";
+const DEVICE_REQUEST_ALLOCATION_RESULT: &str =
+    ".k8s.io.api.resource.v1.DeviceRequestAllocationResult";
+const DEVICE_ALLOCATION_CONFIGURATION: &str =
+    ".k8s.io.api.resource.v1.DeviceAllocationConfiguration";
+const DEVICE_ALLOCATION_RESULT: &str = ".k8s.io.api.resource.v1.DeviceAllocationResult";
+const DEVICE_CLAIM_ALLOCATION_RESULT: &str = ".k8s.io.api.resource.v1.AllocationResult";
+const RESOURCE_CLAIM_CONSUMER_REFERENCE: &str =
+    ".k8s.io.api.resource.v1.ResourceClaimConsumerReference";
+const DEVICE_NETWORK_DATA: &str = ".k8s.io.api.resource.v1.NetworkDeviceData";
+const DEVICE_ALLOCATED_STATUS: &str = ".k8s.io.api.resource.v1.AllocatedDeviceStatus";
+const DEVICE_CLASS_SPEC: &str = ".k8s.io.api.resource.v1.DeviceClassSpec";
+const DEVICE_CLASS: &str = ".k8s.io.api.resource.v1.DeviceClass";
+const RESOURCE_CLAIM_SPEC: &str = ".k8s.io.api.resource.v1.ResourceClaimSpec";
+const RESOURCE_CLAIM_STATUS: &str = ".k8s.io.api.resource.v1.ResourceClaimStatus";
+const RESOURCE_CLAIM: &str = ".k8s.io.api.resource.v1.ResourceClaim";
+const RESOURCE_CLAIM_TEMPLATE_SPEC: &str = ".k8s.io.api.resource.v1.ResourceClaimTemplateSpec";
+const RESOURCE_CLAIM_TEMPLATE: &str = ".k8s.io.api.resource.v1.ResourceClaimTemplate";
+const RESOURCE_SLICE_SPEC: &str = ".k8s.io.api.resource.v1.ResourceSliceSpec";
+const RESOURCE_SLICE: &str = ".k8s.io.api.resource.v1.ResourceSlice";
+
+/// `key`/`effect` are `+required` fields the hand-rolled `gen_device_taint_to_json` this migration
+/// replaces always emits via `.unwrap_or_default()` (a `json!({...})` literal), unlike the
+/// mechanical walker's generic `Type::String` default of filtering out an empty/unset value.
+/// `timeAdded` is a bare `Time` needing RFC3339 conversion the mechanical walker can't derive from
+/// the schema alone. `value` needs no entry: a plain optional string the mechanical walker already
+/// handles correctly.
+fn device_taint_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "key" => Some(
+            "    m.insert(\"key\".to_string(), serde_json::Value::String(t.key.unwrap_or_default()));\n",
+        ),
+        "effect" => Some(
+            "    m.insert(\"effect\".to_string(), serde_json::Value::String(t.effect.unwrap_or_default()));\n",
+        ),
+        "timeAdded" => Some(
+            "    if let Some(secs) = t.time_added.and_then(|ts| ts.seconds).filter(|&s| s > 0) {\n        m.insert(\"timeAdded\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_taint_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device_taint(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_TAINT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_TAINT,
+        message,
+        device_taint_delegated_field,
+        "t",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_taint_to_json(t: resource_v1::DeviceTaint) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_capacity_request_policy_range_to_json`. `min`/`max`/`step` are all bare
+/// `Quantity` fields, which the mechanical walker's `Type::Message` + `field.type_name() ==
+/// QUANTITY` branch already reproduces exactly (`gen_quantity_to_json`'s own
+/// `.and_then(|q| q.string).filter(|s| !s.is_empty())` shape) — no delegate table needed.
+pub fn generate_capacity_request_policy_range(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CAPACITY_REQUEST_POLICY_RANGE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CAPACITY_REQUEST_POLICY_RANGE,
+        message,
+        |_| None,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_capacity_request_policy_range_to_json(r: resource_v1::CapacityRequestPolicyRange) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `validValues` is a `repeated Quantity` (not a `map<string, Quantity>`), which the mechanical
+/// walker's `field.type_name() == QUANTITY` branch would wrongly treat as a singular `Option<
+/// Quantity>` (a build-time type error against `Vec<Quantity>`, not a silent bug) — the hand-rolled
+/// `gen_capacity_request_policy_to_json` this migration replaces filters+maps each entry through
+/// `gen_quantity_to_json` instead. `validRange` delegates to the separately generated
+/// `gen_capacity_request_policy_range_to_json`, inserted unconditionally whenever the `Option` is
+/// `Some` (the hand-rolled version never checks the nested object for emptiness, unlike the
+/// mechanical walker's generic `Type::Message` default). `default` needs no entry: a bare
+/// `Quantity` the mechanical walker already handles correctly.
+fn capacity_request_policy_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "validValues" => Some(
+            "    if !p.valid_values.is_empty() {\n        m.insert(\"validValues\".to_string(), p.valid_values.into_iter().filter_map(|q| gen_quantity_to_json(Some(q))).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "validRange" => Some(
+            "    if let Some(vr) = p.valid_range {\n        m.insert(\"validRange\".to_string(), gen_capacity_request_policy_range_to_json(vr));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_capacity_request_policy_to_json`, replacing the hand-rolled function of the same
+/// name.
+pub fn generate_capacity_request_policy(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, CAPACITY_REQUEST_POLICY);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        CAPACITY_REQUEST_POLICY,
+        message,
+        capacity_request_policy_delegated_field,
+        "p",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_capacity_request_policy_to_json(p: resource_v1::CapacityRequestPolicy) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `requestPolicy` delegates to the separately generated `gen_capacity_request_policy_to_json`,
+/// inserted unconditionally whenever `Some` — the hand-rolled `gen_device_capacity_to_json` this
+/// migration replaces never checks the nested object for emptiness, unlike the mechanical walker's
+/// generic `Type::Message` default. `value` needs no entry: a bare `Quantity` the mechanical walker
+/// already handles correctly.
+fn device_capacity_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "requestPolicy" => Some(
+            "    if let Some(rp) = c.request_policy {\n        m.insert(\"requestPolicy\".to_string(), gen_capacity_request_policy_to_json(rp));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_capacity_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device_capacity(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CAPACITY);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CAPACITY,
+        message,
+        device_capacity_delegated_field,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_capacity_to_json(c: resource_v1::DeviceCapacity) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `bools` is a `repeated bool` — the mechanical walker's `Type::Bool` branch has no `if repeated`
+/// variant (unlike `String`/`Int32`/`Int64`, which all do), so it would generate an
+/// `if let Some(v) = attr.bools { ... }` against a `Vec<bool>` field (a build-time type error, not
+/// a silent bug). Every other field (`int`/`bool`/`string`/`version`/`ints`/`strings`/`versions`)
+/// is already reproduced exactly by the mechanical walker's generic defaults.
+fn device_attribute_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "bools" => Some(
+            "    if !attr.bools.is_empty() {\n        m.insert(\"bools\".to_string(), attr.bools.into_iter().map(serde_json::Value::from).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_attribute_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device_attribute(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_ATTRIBUTE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_ATTRIBUTE,
+        message,
+        device_attribute_delegated_field,
+        "attr",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_attribute_to_json(attr: resource_v1::DeviceAttribute) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_device_counter_to_json`. Its one field (`value`, a bare `Quantity`) is already
+/// reproduced exactly by the mechanical walker's generic default — no delegate table needed.
+pub fn generate_device_counter(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_COUNTER);
+    let encode_stmts =
+        generate_message_encode_only(&set, DEVICE_COUNTER, message, |_| None, "c", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_device_counter_to_json(c: resource_v1::Counter) -> serde_json::Value {\n");
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `counters` is a `map<string, Counter>` — the mechanical walker's `is_string_map_field` detector
+/// only checks for a `map_entry` submessage, not that the map's value is actually `String` (unlike
+/// `is_quantity_map_field`, which does check), so it would wrongly treat this as `map<string,
+/// string>` and generate a build-time type error against `Counter`. `name` needs no entry: a plain
+/// optional string the mechanical walker already handles correctly.
+fn device_counter_set_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "counters" => Some(
+            "    if !cs.counters.is_empty() {\n        let counters: serde_json::Map<String, serde_json::Value> = cs.counters.into_iter().map(|(k, v)| (k, gen_device_counter_to_json(v))).collect();\n        m.insert(\"counters\".to_string(), serde_json::Value::Object(counters));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_counter_set_to_json`, replacing the hand-rolled `gen_counter_set_to_json`
+/// function (and the hand-rolled `gen_counter_map_to_json` helper it used, now inlined into the
+/// delegate above).
+pub fn generate_device_counter_set(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_COUNTER_SET);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_COUNTER_SET,
+        message,
+        device_counter_set_delegated_field,
+        "cs",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_counter_set_to_json(cs: resource_v1::CounterSet) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `counters` needs the same `map<string, Counter>` delegate as
+/// `device_counter_set_delegated_field`'s own entry, for the same `is_string_map_field`
+/// false-positive reason. `counterSet` needs no entry: a plain optional string the mechanical
+/// walker already handles correctly.
+fn device_counter_consumption_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "counters" => Some(
+            "    if !d.counters.is_empty() {\n        let counters: serde_json::Map<String, serde_json::Value> = d.counters.into_iter().map(|(k, v)| (k, gen_device_counter_to_json(v))).collect();\n        m.insert(\"counters\".to_string(), serde_json::Value::Object(counters));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_counter_consumption_to_json`, replacing the hand-rolled function of the
+/// same name.
+pub fn generate_device_counter_consumption(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_COUNTER_CONSUMPTION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_COUNTER_CONSUMPTION,
+        message,
+        device_counter_consumption_delegated_field,
+        "d",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_counter_consumption_to_json(d: resource_v1::DeviceCounterConsumption) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_node_allocatable_resource_mapping_to_json`. `capacityKey` (a plain optional
+/// string) and `allocationMultiplier` (a bare `Quantity`) are already reproduced exactly by the
+/// mechanical walker's generic defaults — no delegate table needed.
+pub fn generate_node_allocatable_resource_mapping(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, NODE_ALLOCATABLE_RESOURCE_MAPPING);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        NODE_ALLOCATABLE_RESOURCE_MAPPING,
+        message,
+        |_| None,
+        "n",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_node_allocatable_resource_mapping_to_json(n: resource_v1::NodeAllocatableResourceMapping) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `attributes`/`capacity`/`nodeAllocatableResourceMappings` are `map<string, Message>` fields
+/// needing the same delegate `device_counter_set_delegated_field`'s own `counters` entry
+/// documents (the mechanical walker's `is_string_map_field` detector would otherwise mis-treat
+/// them as `map<string, string>`). `consumesCounters`/`taints` delegate to the separately
+/// generated `gen_device_counter_consumption_to_json`/`gen_device_taint_to_json` — both nested
+/// types need their own per-field overrides (a `map<string, Counter>`, an always-emitted
+/// `key`/`effect` pair plus a `Time` conversion respectively) that the mechanical walker's inline
+/// recursive encoder has no hook to apply one level down. `nodeSelector` delegates to the
+/// hand-written `gen_node_selector_to_json` (already used by every other Kind in this file that
+/// embeds a `NodeSelector`), inserted unconditionally whenever `Some` — the hand-rolled
+/// `gen_device_to_json` this migration replaces never checks the nested object for emptiness.
+/// `allNodes`/`bindsToNode`/`allowMultipleAllocations` are gogoproto `nullable=false` bools only
+/// ever emitted when `true` (the same class `container_delegated_field`'s `stdin`/`stdinOnce`/
+/// `tty` doc explains), unlike the mechanical walker's generic `Type::Bool` default of emitting on
+/// any `Some`. `name`/`nodeName`/`bindingConditions`/`bindingFailureConditions` need no entry:
+/// plain optional/repeated strings the mechanical walker already handles correctly.
+fn device_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "attributes" => Some(
+            "    if !d.attributes.is_empty() {\n        let attrs: serde_json::Map<String, serde_json::Value> = d.attributes.into_iter().map(|(k, v)| (k, gen_device_attribute_to_json(v))).collect();\n        m.insert(\"attributes\".to_string(), serde_json::Value::Object(attrs));\n    }\n",
+        ),
+        "capacity" => Some(
+            "    if !d.capacity.is_empty() {\n        let cap: serde_json::Map<String, serde_json::Value> = d.capacity.into_iter().map(|(k, v)| (k, gen_device_capacity_to_json(v))).collect();\n        m.insert(\"capacity\".to_string(), serde_json::Value::Object(cap));\n    }\n",
+        ),
+        "consumesCounters" => Some(
+            "    if !d.consumes_counters.is_empty() {\n        m.insert(\"consumesCounters\".to_string(), d.consumes_counters.into_iter().map(gen_device_counter_consumption_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "nodeSelector" => Some(
+            "    if let Some(ns) = d.node_selector {\n        m.insert(\"nodeSelector\".to_string(), gen_node_selector_to_json(ns));\n    }\n",
+        ),
+        "allNodes" => Some(
+            "    if let Some(true) = d.all_nodes {\n        m.insert(\"allNodes\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        "taints" => Some(
+            "    if !d.taints.is_empty() {\n        m.insert(\"taints\".to_string(), d.taints.into_iter().map(gen_device_taint_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "bindsToNode" => Some(
+            "    if let Some(true) = d.binds_to_node {\n        m.insert(\"bindsToNode\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        "allowMultipleAllocations" => Some(
+            "    if let Some(true) = d.allow_multiple_allocations {\n        m.insert(\"allowMultipleAllocations\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        "nodeAllocatableResourceMappings" => Some(
+            "    if !d.node_allocatable_resource_mappings.is_empty() {\n        let nam: serde_json::Map<String, serde_json::Value> = d.node_allocatable_resource_mappings.into_iter().map(|(k, v)| (k, gen_node_allocatable_resource_mapping_to_json(v))).collect();\n        m.insert(\"nodeAllocatableResourceMappings\".to_string(), serde_json::Value::Object(nam));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE);
+    let encode_stmts =
+        generate_message_encode_only(&set, DEVICE, message, device_delegated_field, "d", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_device_to_json(d: resource_v1::Device) -> serde_json::Value {\n");
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `opaque` is `DeviceConfiguration`'s only field, and needs a delegate for two reasons at once:
+/// its `parameters` sub-field is a `RawExtension` (an `OPAQUE_MESSAGES` scalar the mechanical
+/// walker has no schema-derivable JSON shape for — it stays hand-written, via the existing
+/// `gen_raw_extension_to_json`), and the hand-rolled `gen_device_configuration_to_json` this
+/// migration replaces inserts `opaque` unconditionally whenever `Some` even if the resulting object
+/// ends up empty, unlike the mechanical walker's generic `Type::Message` default.
+fn device_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "opaque" => Some(
+            "    if let Some(o) = c.opaque {\n        let mut om = serde_json::Map::new();\n        if let Some(v) = o.driver.filter(|s| !s.is_empty()) {\n            om.insert(\"driver\".to_string(), serde_json::Value::String(v));\n        }\n        if let Some(v) = gen_raw_extension_to_json(o.parameters) {\n            om.insert(\"parameters\".to_string(), v);\n        }\n        m.insert(\"opaque\".to_string(), serde_json::Value::Object(om));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_configuration_to_json`, replacing the hand-rolled function of the same
+/// name.
+pub fn generate_device_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CONFIGURATION,
+        message,
+        device_configuration_delegated_field,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_configuration_to_json(c: resource_v1::DeviceConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_device_capacity_requirements_to_json`. Its one field (`requests`, a
+/// `map<string, Quantity>`) is already reproduced exactly by the mechanical walker's
+/// `is_quantity_map_field` branch — no delegate table needed.
+pub fn generate_device_capacity_requirements(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CAPACITY_REQUIREMENTS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CAPACITY_REQUIREMENTS,
+        message,
+        |_| None,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_capacity_requirements_to_json(c: resource_v1::CapacityRequirements) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `adminAccess` is a gogoproto `nullable=false` bool only ever emitted when `true` (see
+/// `device_delegated_field`'s own `allNodes` doc). `capacity` delegates to the separately generated
+/// `gen_device_capacity_requirements_to_json`, inserted unconditionally whenever `Some` — the
+/// hand-rolled `gen_exact_device_request_to_json` this migration replaces never checks the nested
+/// object for emptiness. `deviceClassName`/`selectors`/`allocationMode`/`count`/`tolerations` need
+/// no entry: already reproduced exactly by the mechanical walker's generic defaults (including
+/// `selectors`/`tolerations`, whose element types `DeviceSelector`/`DeviceToleration` need no
+/// delegate of their own, so the mechanical walker's inline recursion into them is safe).
+fn exact_device_request_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "adminAccess" => Some(
+            "    if let Some(true) = r.admin_access {\n        m.insert(\"adminAccess\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        "capacity" => Some(
+            "    if let Some(cap) = r.capacity {\n        m.insert(\"capacity\".to_string(), gen_device_capacity_requirements_to_json(cap));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_exact_device_request_to_json`, replacing the hand-rolled function of the same
+/// name.
+pub fn generate_exact_device_request(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, EXACT_DEVICE_REQUEST);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        EXACT_DEVICE_REQUEST,
+        message,
+        exact_device_request_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_exact_device_request_to_json(r: resource_v1::ExactDeviceRequest) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `capacity` needs the same delegate as `exact_device_request_delegated_field`'s own entry (no
+/// `adminAccess` field on this message). `name`/`deviceClassName`/`selectors`/`allocationMode`/
+/// `count`/`tolerations` need no entry: already reproduced exactly by the mechanical walker's
+/// generic defaults.
+fn device_sub_request_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "capacity" => Some(
+            "    if let Some(cap) = r.capacity {\n        m.insert(\"capacity\".to_string(), gen_device_capacity_requirements_to_json(cap));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_sub_request_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device_sub_request(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_SUB_REQUEST);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_SUB_REQUEST,
+        message,
+        device_sub_request_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_sub_request_to_json(r: resource_v1::DeviceSubRequest) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `exactly` delegates to the separately generated `gen_exact_device_request_to_json`, inserted
+/// unconditionally whenever `Some` (that nested type needs its own `adminAccess`/`capacity`
+/// overrides, so the mechanical walker's inline recursion can't reach it correctly). `firstAvailable`
+/// delegates to the separately generated `gen_device_sub_request_to_json` for the same reason
+/// (`DeviceSubRequest.capacity`). `name` needs no entry: a plain optional string the mechanical
+/// walker already handles correctly.
+fn device_request_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "exactly" => Some(
+            "    if let Some(e) = r.exactly {\n        m.insert(\"exactly\".to_string(), gen_exact_device_request_to_json(e));\n    }\n",
+        ),
+        "firstAvailable" => Some(
+            "    if !r.first_available.is_empty() {\n        m.insert(\"firstAvailable\".to_string(), r.first_available.into_iter().map(gen_device_sub_request_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_request_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device_request(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_REQUEST);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_REQUEST,
+        message,
+        device_request_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_request_to_json(r: resource_v1::DeviceRequest) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `deviceConfiguration` delegates to the separately generated `gen_device_configuration_to_json`,
+/// inserted unconditionally whenever `Some` — same reasoning as every other
+/// `DeviceConfiguration`-typed field in this file. `requests` needs no entry: a plain repeated
+/// string the mechanical walker already handles correctly.
+fn device_claim_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "deviceConfiguration" => Some(
+            "    if let Some(dc) = c.device_configuration {\n        m.insert(\"deviceConfiguration\".to_string(), gen_device_configuration_to_json(dc));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_claim_configuration_to_json`, replacing the hand-rolled function of the
+/// same name.
+pub fn generate_device_claim_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CLAIM_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CLAIM_CONFIGURATION,
+        message,
+        device_claim_configuration_delegated_field,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_claim_configuration_to_json(c: resource_v1::DeviceClaimConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `requests`/`config` delegate to the separately generated `gen_device_request_to_json`/
+/// `gen_device_claim_configuration_to_json` — both element types need their own per-field
+/// overrides, so the mechanical walker's inline recursion can't reach them correctly.
+/// `constraints` needs no entry: its element type `DeviceConstraint` needs no delegate of its own,
+/// so the mechanical walker's generic `Type::Message if repeated` recursion into it is safe.
+fn device_claim_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "requests" => Some(
+            "    if !dc.requests.is_empty() {\n        m.insert(\"requests\".to_string(), dc.requests.into_iter().map(gen_device_request_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "config" => Some(
+            "    if !dc.config.is_empty() {\n        m.insert(\"config\".to_string(), dc.config.into_iter().map(gen_device_claim_configuration_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_claim_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_device_claim(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CLAIM);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CLAIM,
+        message,
+        device_claim_delegated_field,
+        "dc",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_claim_to_json(dc: resource_v1::DeviceClaim) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `request`/`driver`/`pool`/`device` are `+required` fields the hand-rolled
+/// `gen_device_request_allocation_result_to_json` this migration replaces always emits via
+/// `.unwrap_or_default()` (a `json!({...})` literal), unlike the mechanical walker's generic
+/// `Type::String` default of filtering out an empty/unset value. `adminAccess` is a gogoproto
+/// `nullable=false` bool only ever emitted when `true`. `tolerations`/`bindingConditions`/
+/// `bindingFailureConditions`/`shareID`/`consumedCapacity` need no entry: already reproduced
+/// exactly by the mechanical walker's generic defaults (`tolerations`'s element type
+/// `DeviceToleration` needs no delegate of its own).
+fn device_request_allocation_result_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "request" => Some(
+            "    m.insert(\"request\".to_string(), serde_json::Value::String(r.request.unwrap_or_default()));\n",
+        ),
+        "driver" => Some(
+            "    m.insert(\"driver\".to_string(), serde_json::Value::String(r.driver.unwrap_or_default()));\n",
+        ),
+        "pool" => Some(
+            "    m.insert(\"pool\".to_string(), serde_json::Value::String(r.pool.unwrap_or_default()));\n",
+        ),
+        "device" => Some(
+            "    m.insert(\"device\".to_string(), serde_json::Value::String(r.device.unwrap_or_default()));\n",
+        ),
+        "adminAccess" => Some(
+            "    if let Some(true) = r.admin_access {\n        m.insert(\"adminAccess\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_request_allocation_result_to_json`, replacing the hand-rolled function of
+/// the same name.
+pub fn generate_device_request_allocation_result(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_REQUEST_ALLOCATION_RESULT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_REQUEST_ALLOCATION_RESULT,
+        message,
+        device_request_allocation_result_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_request_allocation_result_to_json(r: resource_v1::DeviceRequestAllocationResult) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `source` is a `+required` field always emitted via `.unwrap_or_default()`, matching the
+/// hand-rolled `gen_device_allocation_configuration_to_json` this migration replaces.
+/// `deviceConfiguration` delegates to the separately generated `gen_device_configuration_to_json`,
+/// inserted unconditionally whenever `Some`. `requests` needs no entry: a plain repeated string the
+/// mechanical walker already handles correctly.
+fn device_allocation_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "source" => Some(
+            "    m.insert(\"source\".to_string(), serde_json::Value::String(c.source.unwrap_or_default()));\n",
+        ),
+        "deviceConfiguration" => Some(
+            "    if let Some(dc) = c.device_configuration {\n        m.insert(\"deviceConfiguration\".to_string(), gen_device_configuration_to_json(dc));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_allocation_configuration_to_json`, replacing the hand-rolled function of
+/// the same name.
+pub fn generate_device_allocation_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_ALLOCATION_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_ALLOCATION_CONFIGURATION,
+        message,
+        device_allocation_configuration_delegated_field,
+        "c",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_allocation_configuration_to_json(c: resource_v1::DeviceAllocationConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Both fields delegate to their own separately generated encoders (`results` needs
+/// `gen_device_request_allocation_result_to_json`'s `request`/`driver`/`pool`/`device`/
+/// `adminAccess` overrides, `config` needs `gen_device_allocation_configuration_to_json`'s
+/// `source`/`deviceConfiguration` overrides), so the mechanical walker's inline recursion can't
+/// reach either correctly.
+fn device_allocation_result_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "results" => Some(
+            "    if !r.results.is_empty() {\n        m.insert(\"results\".to_string(), r.results.into_iter().map(gen_device_request_allocation_result_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "config" => Some(
+            "    if !r.config.is_empty() {\n        m.insert(\"config\".to_string(), r.config.into_iter().map(gen_device_allocation_configuration_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_allocation_result_to_json`, replacing the hand-rolled function of the
+/// same name.
+pub fn generate_device_allocation_result(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_ALLOCATION_RESULT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_ALLOCATION_RESULT,
+        message,
+        device_allocation_result_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_allocation_result_to_json(r: resource_v1::DeviceAllocationResult) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `devices` delegates to the separately generated `gen_device_allocation_result_to_json`,
+/// inserted unconditionally whenever `Some`. `nodeSelector` delegates to the hand-written
+/// `gen_node_selector_to_json`, same as `device_delegated_field`'s own entry.
+/// `allocationTimestamp` is a bare `Time` needing RFC3339 conversion the mechanical walker can't
+/// derive from the schema alone. All three fields need a delegate (the hand-rolled
+/// `gen_allocation_result_to_json` this migration replaces never checks any of them for nested
+/// emptiness).
+fn device_claim_allocation_result_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "devices" => Some(
+            "    if let Some(d) = a.devices {\n        m.insert(\"devices\".to_string(), gen_device_allocation_result_to_json(d));\n    }\n",
+        ),
+        "nodeSelector" => Some(
+            "    if let Some(ns) = a.node_selector {\n        m.insert(\"nodeSelector\".to_string(), gen_node_selector_to_json(ns));\n    }\n",
+        ),
+        "allocationTimestamp" => Some(
+            "    if let Some(secs) = a.allocation_timestamp.and_then(|t| t.seconds).filter(|&s| s > 0) {\n        m.insert(\"allocationTimestamp\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_claim_allocation_result_to_json`, replacing the hand-rolled
+/// `gen_allocation_result_to_json` function.
+pub fn generate_device_claim_allocation_result(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CLAIM_ALLOCATION_RESULT);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CLAIM_ALLOCATION_RESULT,
+        message,
+        device_claim_allocation_result_delegated_field,
+        "a",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_claim_allocation_result_to_json(a: resource_v1::AllocationResult) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `resource`/`name`/`uid` are `+required` fields always emitted via `.unwrap_or_default()`,
+/// matching the hand-rolled `gen_resource_claim_consumer_reference_to_json` this migration
+/// replaces. `apiGroup` needs no entry: a plain optional string the mechanical walker already
+/// handles correctly.
+fn resource_claim_consumer_reference_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "resource" => Some(
+            "    m.insert(\"resource\".to_string(), serde_json::Value::String(r.resource.unwrap_or_default()));\n",
+        ),
+        "name" => Some(
+            "    m.insert(\"name\".to_string(), serde_json::Value::String(r.name.unwrap_or_default()));\n",
+        ),
+        "uid" => Some(
+            "    m.insert(\"uid\".to_string(), serde_json::Value::String(r.uid.unwrap_or_default()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resource_claim_consumer_reference_to_json`, replacing the hand-rolled function
+/// of the same name.
+pub fn generate_resource_claim_consumer_reference(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_CLAIM_CONSUMER_REFERENCE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_CLAIM_CONSUMER_REFERENCE,
+        message,
+        resource_claim_consumer_reference_delegated_field,
+        "r",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resource_claim_consumer_reference_to_json(r: resource_v1::ResourceClaimConsumerReference) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_device_network_data_to_json`, replacing the hand-rolled
+/// `gen_network_device_data_to_json` function. Every field (`interfaceName`/`hardwareAddress`
+/// filtered-if-empty strings, `ips` a repeated string) is already reproduced exactly by the
+/// mechanical walker's generic defaults — no delegate table needed.
+pub fn generate_device_network_data(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_NETWORK_DATA);
+    let encode_stmts =
+        generate_message_encode_only(&set, DEVICE_NETWORK_DATA, message, |_| None, "n", "m");
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_network_data_to_json(n: resource_v1::NetworkDeviceData) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `driver`/`pool`/`device` are `+required` fields always emitted via `.unwrap_or_default()`,
+/// matching the hand-rolled `gen_allocated_device_status_to_json` this migration replaces.
+/// `conditions` delegates to the hand-written `gen_meta_condition_to_json` (a `Condition`'s
+/// `lastTransitionTime` needs RFC3339 conversion the mechanical walker can't derive from the schema
+/// alone). `data` is a `RawExtension` delegating to the hand-written `gen_raw_extension_to_json`.
+/// `networkData` delegates to the separately generated `gen_device_network_data_to_json`, inserted
+/// unconditionally whenever `Some` (the hand-rolled function never checks it for nested emptiness).
+/// `shareID` needs no entry: a plain optional string the mechanical walker already handles
+/// correctly.
+fn device_allocated_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "driver" => Some(
+            "    m.insert(\"driver\".to_string(), serde_json::Value::String(s.driver.unwrap_or_default()));\n",
+        ),
+        "pool" => Some(
+            "    m.insert(\"pool\".to_string(), serde_json::Value::String(s.pool.unwrap_or_default()));\n",
+        ),
+        "device" => Some(
+            "    m.insert(\"device\".to_string(), serde_json::Value::String(s.device.unwrap_or_default()));\n",
+        ),
+        "conditions" => Some(
+            "    if !s.conditions.is_empty() {\n        m.insert(\"conditions\".to_string(), s.conditions.into_iter().map(gen_meta_condition_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "data" => Some(
+            "    if let Some(v) = gen_raw_extension_to_json(s.data) {\n        m.insert(\"data\".to_string(), v);\n    }\n",
+        ),
+        "networkData" => Some(
+            "    if let Some(nd) = s.network_data {\n        m.insert(\"networkData\".to_string(), gen_device_network_data_to_json(nd));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_device_allocated_status_to_json`, replacing the hand-rolled
+/// `gen_allocated_device_status_to_json` function.
+pub fn generate_device_allocated_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_ALLOCATED_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_ALLOCATED_STATUS,
+        message,
+        device_allocated_status_delegated_field,
+        "s",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_device_allocated_status_to_json(s: resource_v1::AllocatedDeviceStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `config` needs a delegate reproducing the hand-rolled `decode_deviceclass_proto_gen`'s
+/// `.filter_map(|c| c.device_configuration)` — an entry with no `deviceConfiguration` set is
+/// dropped from the array entirely, unlike the mechanical walker's generic `Type::Message if
+/// repeated` default of always pushing every element. `selectors`/`extendedResourceName` need no
+/// entry: already reproduced exactly by the mechanical walker's generic defaults (`selectors`'s
+/// element type `DeviceSelector` needs no delegate of its own).
+fn deviceclass_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "config" => Some(
+            "    if !spec.config.is_empty() {\n        m.insert(\"config\".to_string(), spec.config.into_iter().filter_map(|c| c.device_configuration).map(|dc| serde_json::json!({ \"deviceConfiguration\": gen_device_configuration_to_json(dc) })).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_deviceclass_spec_to_json`, replacing the `spec` assembly block of the hand-rolled
+/// `decode_deviceclass_proto_gen` this migration retires.
+pub fn generate_deviceclass_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CLASS_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CLASS_SPEC,
+        message,
+        deviceclass_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_deviceclass_spec_to_json(spec: resource_v1::DeviceClassSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_deviceclass_spec_to_json`, inserted unconditionally whenever
+/// `Some` — matching the hand-rolled `decode_deviceclass_proto_gen` this migration retires exactly
+/// (it never checks the assembled `spec_json` for emptiness before assigning it).
+fn deviceclass_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(dc.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = dc.spec {\n        obj.insert(\"spec\".to_string(), gen_deviceclass_spec_to_json(spec));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_deviceclass_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_deviceclass_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why).
+pub fn generate_deviceclass(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, DEVICE_CLASS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        DEVICE_CLASS,
+        message,
+        deviceclass_delegated_field,
+        "dc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_deviceclass_to_json(dc: resource_v1::DeviceClass) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `devices` delegates to the separately generated `gen_device_claim_to_json`, inserted
+/// unconditionally whenever `Some` — matching the hand-rolled `decode_resourceclaim_proto_gen`
+/// this migration retires exactly (it never checks the assembled `DeviceClaim`'s JSON for
+/// emptiness before assigning it).
+fn resourceclaim_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "devices" => Some(
+            "    if let Some(devices) = spec.devices {\n        m.insert(\"devices\".to_string(), gen_device_claim_to_json(devices));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceclaim_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_resourceclaim_proto_gen` this migration retires.
+pub fn generate_resourceclaim_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_CLAIM_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_CLAIM_SPEC,
+        message,
+        resourceclaim_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceclaim_spec_to_json(spec: resource_v1::ResourceClaimSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `allocation`/`reservedFor`/`devices` all delegate to their own separately generated encoders
+/// (each element/nested type needs its own per-field overrides the mechanical walker's inline
+/// recursion can't reach), matching the hand-rolled `decode_resourceclaim_proto_gen` this migration
+/// retires field-for-field.
+fn resourceclaim_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "allocation" => Some(
+            "    if let Some(a) = status.allocation {\n        m.insert(\"allocation\".to_string(), gen_device_claim_allocation_result_to_json(a));\n    }\n",
+        ),
+        "reservedFor" => Some(
+            "    if !status.reserved_for.is_empty() {\n        m.insert(\"reservedFor\".to_string(), status.reserved_for.into_iter().map(gen_resource_claim_consumer_reference_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "devices" => Some(
+            "    if !status.devices.is_empty() {\n        m.insert(\"devices\".to_string(), status.devices.into_iter().map(gen_device_allocated_status_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceclaim_status_to_json`, replacing the `status` assembly block of the
+/// hand-rolled `decode_resourceclaim_proto_gen` this migration retires.
+pub fn generate_resourceclaim_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_CLAIM_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_CLAIM_STATUS,
+        message,
+        resourceclaim_status_delegated_field,
+        "status",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceclaim_status_to_json(status: resource_v1::ResourceClaimStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// `gen_resourceclaim_spec_to_json`, inserted unconditionally whenever `Some`. `status` delegates
+/// to `gen_resourceclaim_status_to_json`, but only inserted once the result is non-empty — matching
+/// the hand-rolled `decode_resourceclaim_proto_gen` this migration retires exactly (its own
+/// `if !status_json.is_empty()` guard, unlike `spec`'s unconditional assignment two lines above it
+/// in the same function).
+fn resourceclaim_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(rc.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = rc.spec {\n        obj.insert(\"spec\".to_string(), gen_resourceclaim_spec_to_json(spec));\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = rc.status {\n        let status_json = gen_resourceclaim_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceclaim_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_resourceclaim_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why).
+pub fn generate_resourceclaim(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_CLAIM);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_CLAIM,
+        message,
+        resourceclaim_delegated_field,
+        "rc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceclaim_to_json(rc: resource_v1::ResourceClaim) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Both fields need a delegate, for two different reasons. `metadata` uses the same
+/// `gen_object_meta_to_json(...unwrap_or_default())` shape every other Kind's `metadata` field
+/// uses — functionally identical to the hand-rolled `decode_resourceclaimtemplate_proto_gen`'s own
+/// `spec.metadata.map(gen_object_meta_to_json).unwrap_or_else(|| json!({"creationTimestamp":
+/// null}))`, since `gen_object_meta_to_json(ObjectMeta::default())` already produces exactly
+/// `{"creationTimestamp": null}`. `spec` (the embedded `ResourceClaimSpec`) is unlike every other
+/// `spec`-shaped field in this file: the hand-rolled decoder always emits it as a JSON object (even
+/// `{}`) via a `json!({"metadata": ..., "spec": Object(tmpl_spec)})` literal, never omitting the key
+/// even when the embedded spec is entirely absent or empty — because every `ResourceClaim` the
+/// control plane generates from this template copies `spec.spec` verbatim, an omitted-vs-empty
+/// distinction here would be lost anyway.
+fn resourceclaimtemplate_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(spec.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    let mut inner_spec = serde_json::Map::new();\n    if let Some(rc_spec) = spec.spec {\n        if let Some(devices) = rc_spec.devices {\n            inner_spec.insert(\"devices\".to_string(), gen_device_claim_to_json(devices));\n        }\n    }\n    obj.insert(\"spec\".to_string(), serde_json::Value::Object(inner_spec));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceclaimtemplate_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_resourceclaimtemplate_proto_gen` this migration retires.
+pub fn generate_resourceclaimtemplate_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_CLAIM_TEMPLATE_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_CLAIM_TEMPLATE_SPEC,
+        message,
+        resourceclaimtemplate_spec_delegated_field,
+        "spec",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceclaimtemplate_spec_to_json(spec: resource_v1::ResourceClaimTemplateSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_resourceclaimtemplate_spec_to_json`, inserted unconditionally
+/// whenever `Some` — matching the hand-rolled `decode_resourceclaimtemplate_proto_gen` this
+/// migration retires exactly.
+fn resourceclaimtemplate_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(rct.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = rct.spec {\n        obj.insert(\"spec\".to_string(), gen_resourceclaimtemplate_spec_to_json(spec));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceclaimtemplate_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_resourceclaimtemplate_proto_gen` this migration retires (the entry point
+/// itself stays hand-written — see `generate_namespace`'s doc for why).
+pub fn generate_resourceclaimtemplate(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_CLAIM_TEMPLATE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_CLAIM_TEMPLATE,
+        message,
+        resourceclaimtemplate_delegated_field,
+        "rct",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceclaimtemplate_to_json(rct: resource_v1::ResourceClaimTemplate) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `driver` is a `+required` field always emitted via `.unwrap_or_default()`. `pool` is assembled
+/// as a `json!({...})` literal whose own `name`/`generation`/`resourceSliceCount` are each always
+/// emitted via `.unwrap_or_default()`/`.unwrap_or(0)` — the mechanical walker's generic
+/// `Type::Message` recursion would filter each of those on empty/zero instead, and would only
+/// insert `pool` itself once non-empty rather than unconditionally whenever `Some`.
+/// `nodeSelector`/`devices`/`sharedCounters` delegate to the hand-written `gen_node_selector_to_json`
+/// or the separately generated `gen_device_to_json`/`gen_device_counter_set_to_json` (both element
+/// types need their own per-field overrides). `allNodes`/`perDeviceNodeSelection` are gogoproto
+/// `nullable=false` bools only ever emitted when `true`. `nodeName` needs no entry: a plain
+/// optional string the mechanical walker already handles correctly.
+fn resourceslice_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "driver" => Some(
+            "    m.insert(\"driver\".to_string(), serde_json::Value::String(spec.driver.unwrap_or_default()));\n",
+        ),
+        "pool" => Some(
+            "    if let Some(pool) = spec.pool {\n        m.insert(\"pool\".to_string(), serde_json::json!({\n            \"name\": pool.name.unwrap_or_default(),\n            \"generation\": pool.generation.unwrap_or(0),\n            \"resourceSliceCount\": pool.resource_slice_count.unwrap_or(0),\n        }));\n    }\n",
+        ),
+        "nodeSelector" => Some(
+            "    if let Some(ns) = spec.node_selector {\n        m.insert(\"nodeSelector\".to_string(), gen_node_selector_to_json(ns));\n    }\n",
+        ),
+        "allNodes" => Some(
+            "    if let Some(true) = spec.all_nodes {\n        m.insert(\"allNodes\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        "devices" => Some(
+            "    if !spec.devices.is_empty() {\n        m.insert(\"devices\".to_string(), spec.devices.into_iter().map(gen_device_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        "perDeviceNodeSelection" => Some(
+            "    if let Some(true) = spec.per_device_node_selection {\n        m.insert(\"perDeviceNodeSelection\".to_string(), serde_json::Value::Bool(true));\n    }\n",
+        ),
+        "sharedCounters" => Some(
+            "    if !spec.shared_counters.is_empty() {\n        m.insert(\"sharedCounters\".to_string(), spec.shared_counters.into_iter().map(gen_device_counter_set_to_json).collect::<Vec<_>>().into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceslice_spec_to_json`, replacing the `spec` assembly block of the
+/// hand-rolled `decode_resourceslice_proto_gen` this migration retires.
+pub fn generate_resourceslice_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_SLICE_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_SLICE_SPEC,
+        message,
+        resourceslice_spec_delegated_field,
+        "spec",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceslice_spec_to_json(spec: resource_v1::ResourceSliceSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_resourceslice_spec_to_json`, inserted unconditionally whenever
+/// `Some` — matching the hand-rolled `decode_resourceslice_proto_gen` this migration retires
+/// exactly.
+fn resourceslice_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(rs.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = rs.spec {\n        obj.insert(\"spec\".to_string(), gen_resourceslice_spec_to_json(spec));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_resourceslice_to_json`, replacing the message-walking body of the hand-rolled
+/// `decode_resourceslice_proto_gen` this migration retires (the entry point itself stays
+/// hand-written — see `generate_namespace`'s doc for why).
+pub fn generate_resourceslice(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, RESOURCE_SLICE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        RESOURCE_SLICE,
+        message,
+        resourceslice_delegated_field,
+        "rs",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_resourceslice_to_json(rs: resource_v1::ResourceSlice) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}

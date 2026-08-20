@@ -697,6 +697,171 @@ fn main() {
         codegen::generate_mutating_admission_policy_binding(descriptor_bytes),
     )
     .expect("failed to write generated MutatingAdmissionPolicyBinding codec");
+    std::fs::write(
+        out_dir.join("device_taint_gen.rs"),
+        codegen::generate_device_taint(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceTaint codec");
+    std::fs::write(
+        out_dir.join("capacity_request_policy_range_gen.rs"),
+        codegen::generate_capacity_request_policy_range(descriptor_bytes),
+    )
+    .expect("failed to write generated CapacityRequestPolicyRange codec");
+    std::fs::write(
+        out_dir.join("capacity_request_policy_gen.rs"),
+        codegen::generate_capacity_request_policy(descriptor_bytes),
+    )
+    .expect("failed to write generated CapacityRequestPolicy codec");
+    std::fs::write(
+        out_dir.join("device_capacity_gen.rs"),
+        codegen::generate_device_capacity(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceCapacity codec");
+    std::fs::write(
+        out_dir.join("device_attribute_gen.rs"),
+        codegen::generate_device_attribute(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceAttribute codec");
+    std::fs::write(
+        out_dir.join("device_counter_gen.rs"),
+        codegen::generate_device_counter(descriptor_bytes),
+    )
+    .expect("failed to write generated Counter codec");
+    std::fs::write(
+        out_dir.join("device_counter_set_gen.rs"),
+        codegen::generate_device_counter_set(descriptor_bytes),
+    )
+    .expect("failed to write generated CounterSet codec");
+    std::fs::write(
+        out_dir.join("device_counter_consumption_gen.rs"),
+        codegen::generate_device_counter_consumption(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceCounterConsumption codec");
+    std::fs::write(
+        out_dir.join("node_allocatable_resource_mapping_gen.rs"),
+        codegen::generate_node_allocatable_resource_mapping(descriptor_bytes),
+    )
+    .expect("failed to write generated NodeAllocatableResourceMapping codec");
+    std::fs::write(
+        out_dir.join("device_gen.rs"),
+        codegen::generate_device(descriptor_bytes),
+    )
+    .expect("failed to write generated Device codec");
+    std::fs::write(
+        out_dir.join("device_configuration_gen.rs"),
+        codegen::generate_device_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceConfiguration codec");
+    std::fs::write(
+        out_dir.join("device_capacity_requirements_gen.rs"),
+        codegen::generate_device_capacity_requirements(descriptor_bytes),
+    )
+    .expect("failed to write generated CapacityRequirements codec");
+    std::fs::write(
+        out_dir.join("exact_device_request_gen.rs"),
+        codegen::generate_exact_device_request(descriptor_bytes),
+    )
+    .expect("failed to write generated ExactDeviceRequest codec");
+    std::fs::write(
+        out_dir.join("device_sub_request_gen.rs"),
+        codegen::generate_device_sub_request(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceSubRequest codec");
+    std::fs::write(
+        out_dir.join("device_request_gen.rs"),
+        codegen::generate_device_request(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceRequest codec");
+    std::fs::write(
+        out_dir.join("device_claim_configuration_gen.rs"),
+        codegen::generate_device_claim_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceClaimConfiguration codec");
+    std::fs::write(
+        out_dir.join("device_claim_gen.rs"),
+        codegen::generate_device_claim(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceClaim codec");
+    std::fs::write(
+        out_dir.join("device_request_allocation_result_gen.rs"),
+        codegen::generate_device_request_allocation_result(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceRequestAllocationResult codec");
+    std::fs::write(
+        out_dir.join("device_allocation_configuration_gen.rs"),
+        codegen::generate_device_allocation_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceAllocationConfiguration codec");
+    std::fs::write(
+        out_dir.join("device_allocation_result_gen.rs"),
+        codegen::generate_device_allocation_result(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceAllocationResult codec");
+    std::fs::write(
+        out_dir.join("device_claim_allocation_result_gen.rs"),
+        codegen::generate_device_claim_allocation_result(descriptor_bytes),
+    )
+    .expect("failed to write generated AllocationResult codec");
+    std::fs::write(
+        out_dir.join("resource_claim_consumer_reference_gen.rs"),
+        codegen::generate_resource_claim_consumer_reference(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceClaimConsumerReference codec");
+    std::fs::write(
+        out_dir.join("device_network_data_gen.rs"),
+        codegen::generate_device_network_data(descriptor_bytes),
+    )
+    .expect("failed to write generated NetworkDeviceData codec");
+    std::fs::write(
+        out_dir.join("device_allocated_status_gen.rs"),
+        codegen::generate_device_allocated_status(descriptor_bytes),
+    )
+    .expect("failed to write generated AllocatedDeviceStatus codec");
+    std::fs::write(
+        out_dir.join("deviceclass_spec_gen.rs"),
+        codegen::generate_deviceclass_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceClassSpec codec");
+    std::fs::write(
+        out_dir.join("deviceclass_gen.rs"),
+        codegen::generate_deviceclass(descriptor_bytes),
+    )
+    .expect("failed to write generated DeviceClass codec");
+    std::fs::write(
+        out_dir.join("resourceclaim_spec_gen.rs"),
+        codegen::generate_resourceclaim_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceClaimSpec codec");
+    std::fs::write(
+        out_dir.join("resourceclaim_status_gen.rs"),
+        codegen::generate_resourceclaim_status(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceClaimStatus codec");
+    std::fs::write(
+        out_dir.join("resourceclaim_gen.rs"),
+        codegen::generate_resourceclaim(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceClaim codec");
+    std::fs::write(
+        out_dir.join("resourceclaimtemplate_spec_gen.rs"),
+        codegen::generate_resourceclaimtemplate_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceClaimTemplateSpec codec");
+    std::fs::write(
+        out_dir.join("resourceclaimtemplate_gen.rs"),
+        codegen::generate_resourceclaimtemplate(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceClaimTemplate codec");
+    std::fs::write(
+        out_dir.join("resourceslice_spec_gen.rs"),
+        codegen::generate_resourceslice_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceSliceSpec codec");
+    std::fs::write(
+        out_dir.join("resourceslice_gen.rs"),
+        codegen::generate_resourceslice(descriptor_bytes),
+    )
+    .expect("failed to write generated ResourceSlice codec");
 
     std::fs::write(
         out_dir.join("pod_failure_policy_gen.rs"),
