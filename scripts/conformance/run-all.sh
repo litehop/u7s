@@ -368,6 +368,7 @@ else
 fi
 
 DHAT_HEAP_FILE=""
+DHAT_HEAP_MISMATCH=0
 if [ "$PROFILE" -eq 1 ]; then
   banner "Profile: rebuilding u7s-apiserver with --features dhat"
   # 01-build.sh builds u7s-apiserver and u7s-scheduler together with no
@@ -551,7 +552,13 @@ else
       # JSON) keeps the process itself alive for measurably longer.
       # Confirmed live: a port-based check on a 1-minute --focus run raced
       # ahead of a 928,953-block/4.27MB heap file that hadn't finished
-      # writing yet, even though the port had already closed.
+      # writing yet, even though the port had already closed. A full-suite
+      # depth-20 run's ~92MB/134k-program-point heap took measurably longer
+      # than 10s to serialize -- wait up to 5 minutes instead of giving up
+      # after 10s. This is a quality-of-life bound, not the correctness
+      # mechanism: even if it's still alive when this loop times out, the
+      # pid check below refuses to move any file that isn't genuinely this
+      # PID's, so a slow flush can never be silently mistaken for a stale one.
       any_alive() {
         local pid
         for pid in "${API_PIDS[@]}"; do
@@ -559,12 +566,12 @@ else
         done
         return 1
       }
-      for _ in 1 2 3 4 5 6 7 8 9 10; do
+      for _ in $(seq 1 300); do
         any_alive || break
         sleep 1
       done
       if any_alive; then
-        echo "warning: apiserver (PID(s): ${API_PIDS[*]}) still running 10s after SIGTERM — dhat heap may not have flushed" >&2
+        echo "warning: apiserver (PID(s): ${API_PIDS[*]}) still running 5 minutes after SIGTERM — dhat heap may not have flushed" >&2
       fi
     else
       echo "warning: no apiserver found listening on port ${PORT:-6443} — dhat heap may already be stale" >&2
@@ -592,15 +599,37 @@ else
     if [ -f "$DHAT_HEAP_FILE" ] && [ -n "$RUN_DIR" ]; then
       TIMESTAMP=$(basename "$RUN_DIR" | cut -d- -f1,2)
       DEST="$RUN_DIR/dhat-heap-apiserver-${TIMESTAMP}.json"
-      if mv "$DHAT_HEAP_FILE" "$DEST" 2>/dev/null; then
-        echo "Allocation profile: $DEST"
+      # dhat's own JSON always embeds the writing process's pid as a
+      # top-level "pid" field. dhat only overwrites $DHAT_HEAP_FILE on a
+      # graceful exit and never cleans it up on its own, so a leftover from
+      # an earlier, separately-crashed/replaced --profile invocation can
+      # still be sitting at this same fixed path -- confirm the file here
+      # actually belongs to the apiserver PID(s) just SIGTERM'd above before
+      # trusting it, instead of grabbing whatever happens to be at the fixed
+      # path. Observed live: a stale 14.5MB heap from an aborted early
+      # attempt got silently moved in as a 47-minute run's "result" with no
+      # error, only an easy-to-miss warning, because the real 91.8MB heap
+      # took longer than the wait above to finish serializing.
+      HEAP_PID=$(grep -o '"pid":[0-9]*' "$DHAT_HEAP_FILE" | head -1 | grep -o '[0-9]*' || true)
+      HEAP_PID_OK=0
+      for _expected_pid in "${API_PIDS[@]:-}"; do
+        [ -n "$_expected_pid" ] && [ "$HEAP_PID" = "$_expected_pid" ] && HEAP_PID_OK=1 && break
+      done
+      if [ "$HEAP_PID_OK" -eq 1 ]; then
+        if mv "$DHAT_HEAP_FILE" "$DEST" 2>/dev/null; then
+          echo "Allocation profile: $DEST"
+        else
+          echo "warning: failed to move dhat heap to $DEST — left at $DHAT_HEAP_FILE" >&2
+        fi
       else
-        echo "warning: failed to move dhat heap to $DEST — left at $DHAT_HEAP_FILE" >&2
+        echo "ERROR: $DHAT_HEAP_FILE's embedded pid (${HEAP_PID:-<none>}) does not match the SIGTERM'd apiserver PID(s) (${API_PIDS[*]:-<none>}) -- this is almost certainly a STALE heap left over from an earlier --profile attempt, not this run's data. Refusing to move it — left in place at $DHAT_HEAP_FILE for manual inspection. This run has NO allocation profile recorded." >&2
+        DHAT_HEAP_MISMATCH=1
       fi
     elif [ -f "$DHAT_HEAP_FILE" ]; then
       echo "warning: could not resolve this run's temp/e2e/ output dir — dhat heap left at $DHAT_HEAP_FILE" >&2
     else
-      echo "warning: $DHAT_HEAP_FILE was not produced — apiserver may not have exited cleanly" >&2
+      echo "ERROR: $DHAT_HEAP_FILE was not produced — apiserver may not have exited cleanly. This run has NO allocation profile recorded." >&2
+      DHAT_HEAP_MISMATCH=1
     fi
   fi
 fi
@@ -645,3 +674,14 @@ if [ -n "${RUN_DIR:-}" ]; then
 fi
 
 banner "Done"
+
+# Fail the whole invocation's exit code (after all cleanup above has already
+# run) if a --profile run's dhat heap couldn't be verified as belonging to
+# this run's own apiserver PID — sonobuoy's own pass/fail is unaffected, but
+# an operator or CI relying on this script's exit code must be able to tell
+# that this run's allocation profile is missing or untrustworthy without
+# having to notice one ERROR line buried in a long log.
+if [ "$DHAT_HEAP_MISMATCH" -eq 1 ]; then
+  echo "ERROR: this run's dhat allocation profile is missing or could not be verified — see the ERROR above" >&2
+  exit 1
+fi
