@@ -507,6 +507,9 @@ pub fn decode_servicecidr_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     if let Some(v) = c.message.filter(|s| !s.is_empty()) {
                         cm["message"] = v.into();
                     }
+                    if let Some(v) = c.observed_generation.filter(|&v| v != 0) {
+                        cm["observedGeneration"] = v.into();
+                    }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
                             cm["lastTransitionTime"] =
@@ -1338,6 +1341,52 @@ mod tests {
             "condition.reason must stay absent when unset — a spurious empty-string reason \
              would make clients that check for reason's presence misread an unexplained condition \
              as an explained one"
+        );
+    }
+
+    /// decode_servicecidr_proto_gen must preserve status.conditions[].observedGeneration.
+    ///
+    /// Without it, a controller/client cannot tell whether a ServiceCIDR condition is stale
+    /// relative to the object's current .metadata.generation — the exact staleness check the
+    /// field exists for — so every protobuf-encoded status update would silently look
+    /// up-to-date even when it is not.
+    #[test]
+    fn decode_servicecidr_proto_gen_preserves_status_condition_observed_generation() {
+        let obj = networking_v1::ServiceCidr {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-cidr".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(networking_v1::ServiceCidrStatus {
+                conditions: vec![
+                    meta_v1::Condition {
+                        r#type: Some("Ready".to_string()),
+                        status: Some("True".to_string()),
+                        observed_generation: Some(3),
+                        ..Default::default()
+                    },
+                    meta_v1::Condition {
+                        r#type: Some("Accepted".to_string()),
+                        status: Some("True".to_string()),
+                        ..Default::default()
+                    },
+                ],
+            }),
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_servicecidr_proto_gen(&buf).expect("ServiceCIDR must decode via proto");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["observedGeneration"], 3,
+            "condition.observedGeneration must survive decode — without it a client can't tell \
+             a condition is stale relative to .metadata.generation"
+        );
+        assert!(
+            result["status"]["conditions"][1]["observedGeneration"].is_null(),
+            "condition.observedGeneration must stay absent when unset (not emitted as 0) — a \
+             spurious 0 would look like a real, very-stale generation instead of \"unknown\""
         );
     }
 

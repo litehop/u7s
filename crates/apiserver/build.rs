@@ -167,6 +167,26 @@ fn main() {
         codegen::generate_endpoints(descriptor_bytes),
     )
     .expect("failed to write generated Endpoints codec");
+    std::fs::write(
+        out_dir.join("pod_gen.rs"),
+        codegen::generate_pod(descriptor_bytes),
+    )
+    .expect("failed to write generated Pod codec");
+    std::fs::write(
+        out_dir.join("pod_template_spec_gen.rs"),
+        codegen::generate_pod_template_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated PodTemplateSpec codec");
+    std::fs::write(
+        out_dir.join("podtemplate_gen.rs"),
+        codegen::generate_podtemplate(descriptor_bytes),
+    )
+    .expect("failed to write generated PodTemplate codec");
+    std::fs::write(
+        out_dir.join("serviceaccount_gen.rs"),
+        codegen::generate_serviceaccount(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceAccount codec");
 
     println!(
         "cargo:rerun-if-changed={}",
