@@ -223,6 +223,41 @@ fn main() {
     )
     .expect("failed to write generated LeaseCandidate codec");
     std::fs::write(
+        out_dir.join("policy_rule_gen.rs"),
+        codegen::generate_policy_rule(descriptor_bytes),
+    )
+    .expect("failed to write generated PolicyRule codec");
+    std::fs::write(
+        out_dir.join("subject_gen.rs"),
+        codegen::generate_subject(descriptor_bytes),
+    )
+    .expect("failed to write generated Subject codec");
+    std::fs::write(
+        out_dir.join("role_ref_gen.rs"),
+        codegen::generate_role_ref(descriptor_bytes),
+    )
+    .expect("failed to write generated RoleRef codec");
+    std::fs::write(
+        out_dir.join("clusterrole_gen.rs"),
+        codegen::generate_clusterrole(descriptor_bytes),
+    )
+    .expect("failed to write generated ClusterRole codec");
+    std::fs::write(
+        out_dir.join("clusterrolebinding_gen.rs"),
+        codegen::generate_clusterrolebinding(descriptor_bytes),
+    )
+    .expect("failed to write generated ClusterRoleBinding codec");
+    std::fs::write(
+        out_dir.join("role_gen.rs"),
+        codegen::generate_role(descriptor_bytes),
+    )
+    .expect("failed to write generated Role codec");
+    std::fs::write(
+        out_dir.join("rolebinding_gen.rs"),
+        codegen::generate_rolebinding(descriptor_bytes),
+    )
+    .expect("failed to write generated RoleBinding codec");
+    std::fs::write(
         out_dir.join("deployment_spec_gen.rs"),
         codegen::generate_deployment_spec(descriptor_bytes),
     )
