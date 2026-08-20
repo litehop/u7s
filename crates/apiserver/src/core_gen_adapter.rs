@@ -236,6 +236,21 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                             serde_json::Value::String(v),
                         );
                     }
+                    // userAnnotations: copied verbatim into the PodCertificateRequest the
+                    // kubelet creates for this projection (spec.unverifiedUserAnnotations), so a
+                    // signer relying on them to authorize/deny a request would silently see none
+                    // if this map vanished on decode.
+                    if !pc.user_annotations.is_empty() {
+                        let annotations: serde_json::Map<String, serde_json::Value> = pc
+                            .user_annotations
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect();
+                        pc_map.insert(
+                            "userAnnotations".to_string(),
+                            serde_json::Value::Object(annotations),
+                        );
+                    }
                     sm.insert(
                         "podCertificate".to_string(),
                         serde_json::Value::Object(pc_map),
@@ -500,6 +515,18 @@ fn gen_probe_to_json(p: core_v1::Probe) -> serde_json::Value {
     if let Some(v) = p.failure_threshold.filter(|&v| v != 0) {
         m.insert(
             "failureThreshold".to_string(),
+            serde_json::Value::Number(v.into()),
+        );
+    }
+    // A real `*int64` upstream: 0 ("kill immediately") and unset ("inherit the pod-level
+    // value") are distinct, so this must not be zero-filtered like the plain int32 fields
+    // above. Without this, a probe-level override sent via protobuf (client-go's default
+    // wire format for built-in types, e.g. the e2e test framework) is silently dropped on
+    // decode, and kubelet falls back to the pod-level terminationGracePeriodSeconds when the
+    // probe fails.
+    if let Some(v) = p.termination_grace_period_seconds {
+        m.insert(
+            "terminationGracePeriodSeconds".to_string(),
             serde_json::Value::Number(v.into()),
         );
     }
@@ -4583,7 +4610,10 @@ mod tests {
                                     credential_bundle_path: Some("bundle.pem".to_string()),
                                     key_path: Some("key.pem".to_string()),
                                     certificate_chain_path: Some("chain.pem".to_string()),
-                                    ..Default::default()
+                                    user_annotations: std::collections::HashMap::from([(
+                                        "example.com/rotation-reason".to_string(),
+                                        "scheduled".to_string(),
+                                    )]),
                                 }),
                                 ..Default::default()
                             }],
@@ -4622,6 +4652,12 @@ mod tests {
         assert_eq!(
             pc["keyPath"], "key.pem",
             "podCertificate.keyPath must survive decode"
+        );
+        assert_eq!(
+            pc["userAnnotations"]["example.com/rotation-reason"], "scheduled",
+            "podCertificate.userAnnotations must survive decode — kubelet copies these \
+             verbatim into the PodCertificateRequest's spec.unverifiedUserAnnotations, so a \
+             signer relying on them to authorize a request would silently see none"
         );
         assert_eq!(
             pc["certificateChainPath"], "chain.pem",
@@ -5955,6 +5991,72 @@ mod tests {
             "an explicit terminationGracePeriodSeconds of 0 (kill immediately) must survive \
              decode — treating it like activeDeadlineSeconds's unset-vs-zero-is-noise case \
              would silently give the pod the kubelet's default grace period instead"
+        );
+    }
+
+    /// A restartable init container's `startupProbe`/`livenessProbe` can override
+    /// `terminationGracePeriodSeconds` with a value shorter than the pod-level one (upstream
+    /// `[FeatureGate:SidecarContainers]` conformance: pod-level 500s, probe-level 5s, so the
+    /// probe's own override should win on failure). `gen_probe_to_json` dropped
+    /// `Probe.terminationGracePeriodSeconds` entirely, so any pod created via a protobuf-encoding
+    /// client (client-go's default wire format for built-in types, e.g. the e2e test framework
+    /// or any real clientset) had the override silently discarded on decode — kubelet then had
+    /// no way to see it and fell back to the pod-level grace period, so the sidecar was never
+    /// killed within the test's observation window.
+    #[test]
+    fn generated_pod_spec_preserves_init_container_probe_termination_grace_period_seconds() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("sidecar-probe-grace-period-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                init_containers: vec![core_v1::Container {
+                    name: Some("sidecar".to_string()),
+                    image: Some("busybox".to_string()),
+                    restart_policy: Some("Always".to_string()),
+                    startup_probe: Some(core_v1::Probe {
+                        termination_grace_period_seconds: Some(5),
+                        ..Default::default()
+                    }),
+                    liveness_probe: Some(core_v1::Probe {
+                        termination_grace_period_seconds: Some(5),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                termination_grace_period_seconds: Some(500),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result =
+            decode_pod_proto_gen(&buf).expect("Pod with init container probes must decode");
+
+        let ic = &result["spec"]["initContainers"][0];
+        assert_eq!(
+            ic["startupProbe"]["terminationGracePeriodSeconds"], 5,
+            "initContainers[].startupProbe.terminationGracePeriodSeconds must survive decode — \
+             if dropped, kubelet has no probe-level override to read and kills the sidecar with \
+             the pod-level grace period (500s) instead of the probe's own (5s)"
+        );
+        assert_eq!(
+            ic["livenessProbe"]["terminationGracePeriodSeconds"], 5,
+            "initContainers[].livenessProbe.terminationGracePeriodSeconds must survive decode — \
+             same failure mode as startupProbe above"
+        );
+        assert_eq!(
+            result["spec"]["terminationGracePeriodSeconds"], 500,
+            "the pod-level grace period must be untouched by the probe-level override"
         );
     }
 
