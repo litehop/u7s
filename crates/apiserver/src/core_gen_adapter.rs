@@ -236,6 +236,21 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                             serde_json::Value::String(v),
                         );
                     }
+                    // userAnnotations: copied verbatim into the PodCertificateRequest the
+                    // kubelet creates for this projection (spec.unverifiedUserAnnotations), so a
+                    // signer relying on them to authorize/deny a request would silently see none
+                    // if this map vanished on decode.
+                    if !pc.user_annotations.is_empty() {
+                        let annotations: serde_json::Map<String, serde_json::Value> = pc
+                            .user_annotations
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect();
+                        pc_map.insert(
+                            "userAnnotations".to_string(),
+                            serde_json::Value::Object(annotations),
+                        );
+                    }
                     sm.insert(
                         "podCertificate".to_string(),
                         serde_json::Value::Object(pc_map),
@@ -4642,7 +4657,10 @@ mod tests {
                                     credential_bundle_path: Some("bundle.pem".to_string()),
                                     key_path: Some("key.pem".to_string()),
                                     certificate_chain_path: Some("chain.pem".to_string()),
-                                    ..Default::default()
+                                    user_annotations: std::collections::HashMap::from([(
+                                        "example.com/rotation-reason".to_string(),
+                                        "scheduled".to_string(),
+                                    )]),
                                 }),
                                 ..Default::default()
                             }],
@@ -4681,6 +4699,12 @@ mod tests {
         assert_eq!(
             pc["keyPath"], "key.pem",
             "podCertificate.keyPath must survive decode"
+        );
+        assert_eq!(
+            pc["userAnnotations"]["example.com/rotation-reason"], "scheduled",
+            "podCertificate.userAnnotations must survive decode — kubelet copies these \
+             verbatim into the PodCertificateRequest's spec.unverifiedUserAnnotations, so a \
+             signer relying on them to authorize a request would silently see none"
         );
         assert_eq!(
             pc["certificateChainPath"], "chain.pem",
