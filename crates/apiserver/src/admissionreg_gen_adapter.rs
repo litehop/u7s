@@ -11,510 +11,125 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
     crate::core_gen_adapter::gen_label_selector_to_json(sel)
 }
 
-fn gen_rule_with_operations_to_json(r: ar_v1::RuleWithOperations) -> serde_json::Value {
-    let rule = r.rule.unwrap_or_default();
-    serde_json::json!({
-        "operations": r.operations,
-        "apiGroups": rule.api_groups,
-        "apiVersions": rule.api_versions,
-        "resources": rule.resources,
-        "scope": rule.scope.filter(|s| !s.is_empty()).unwrap_or_else(|| "*".to_string()),
-    })
-}
-
-fn gen_named_rule_with_operations_to_json(r: ar_v1::NamedRuleWithOperations) -> serde_json::Value {
-    let rwo = r.rule_with_operations.unwrap_or_default();
-    let inner = rwo.rule.unwrap_or_default();
-    let mut rule = serde_json::json!({
-        "apiGroups": inner.api_groups,
-        "apiVersions": inner.api_versions,
-        "resources": inner.resources,
-        "operations": rwo.operations,
-    });
-    if let Some(scope) = inner.scope.filter(|s| !s.is_empty()) {
-        rule["scope"] = serde_json::Value::String(scope);
-    }
-    if !r.resource_names.is_empty() {
-        rule["resourceNames"] = serde_json::Value::Array(
-            r.resource_names
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-    }
-    rule
-}
-
-fn gen_match_resources_to_json(mc: ar_v1::MatchResources) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    let resource_rules: Vec<serde_json::Value> = mc
-        .resource_rules
-        .into_iter()
-        .map(gen_named_rule_with_operations_to_json)
-        .collect();
-    if !resource_rules.is_empty() {
-        obj["resourceRules"] = serde_json::Value::Array(resource_rules);
-    }
-    let exclude_rules: Vec<serde_json::Value> = mc
-        .exclude_resource_rules
-        .into_iter()
-        .map(gen_named_rule_with_operations_to_json)
-        .collect();
-    if !exclude_rules.is_empty() {
-        obj["excludeResourceRules"] = serde_json::Value::Array(exclude_rules);
-    }
-    if let Some(ns) = mc.namespace_selector {
-        obj["namespaceSelector"] = gen_label_selector_to_json(ns);
-    }
-    if let Some(os) = mc.object_selector {
-        obj["objectSelector"] = gen_label_selector_to_json(os);
-    }
-    if let Some(mp) = mc.match_policy.filter(|s| !s.is_empty()) {
-        obj["matchPolicy"] = serde_json::Value::String(mp);
-    }
-    obj
-}
-
-fn gen_param_ref_to_json(pr: ar_v1::ParamRef) -> serde_json::Value {
-    let mut m = serde_json::json!({});
-    if let Some(v) = pr.name.filter(|s| !s.is_empty()) {
-        m["name"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = pr.namespace.filter(|s| !s.is_empty()) {
-        m["namespace"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = pr.parameter_not_found_action.filter(|s| !s.is_empty()) {
-        m["parameterNotFoundAction"] = serde_json::Value::String(v);
-    }
-    if let Some(sel) = pr.selector {
-        m["selector"] = gen_label_selector_to_json(sel);
-    }
-    m
-}
-
-fn gen_match_conditions_to_json(conds: Vec<ar_v1::MatchCondition>) -> serde_json::Value {
-    serde_json::Value::Array(
-        conds
-            .into_iter()
-            .map(|c| {
-                serde_json::json!({
-                    "name": c.name.unwrap_or_default(),
-                    "expression": c.expression.unwrap_or_default(),
-                })
-            })
-            .collect(),
-    )
-}
-
-fn gen_webhook_client_config_to_json(cc: ar_v1::WebhookClientConfig) -> serde_json::Value {
-    let mut cfg = serde_json::json!({});
-    if let Some(ca) = cc.ca_bundle.filter(|b| !b.is_empty()) {
-        cfg["caBundle"] = serde_json::Value::String(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &ca,
-        ));
-    }
-    if let Some(svc) = cc.service {
-        let mut s = serde_json::json!({
-            "namespace": svc.namespace.unwrap_or_default(),
-            "name": svc.name.unwrap_or_default(),
-        });
-        if let Some(path) = svc.path.filter(|s| !s.is_empty()) {
-            s["path"] = serde_json::Value::String(path);
-        }
-        if let Some(port) = svc.port.filter(|&v| v != 0) {
-            s["port"] = serde_json::Value::Number(serde_json::Number::from(port));
-        }
-        cfg["service"] = s;
-    }
-    if let Some(url) = cc.url.filter(|s| !s.is_empty()) {
-        cfg["url"] = serde_json::Value::String(url);
-    }
-    cfg
-}
-
-fn gen_validating_webhook_to_json(w: ar_v1::ValidatingWebhook) -> serde_json::Value {
-    let rules: Vec<serde_json::Value> = w
-        .rules
-        .into_iter()
-        .map(gen_rule_with_operations_to_json)
-        .collect();
-    let client_config = w
-        .client_config
-        .map(gen_webhook_client_config_to_json)
-        .unwrap_or(serde_json::json!({}));
-    let mut entry = serde_json::json!({
-        "name": w.name.unwrap_or_default(),
-        "clientConfig": client_config,
-        "rules": rules,
-        "admissionReviewVersions": w.admission_review_versions,
-    });
-    if let Some(v) = w.failure_policy.filter(|s| !s.is_empty()) {
-        entry["failurePolicy"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = w.match_policy.filter(|s| !s.is_empty()) {
-        entry["matchPolicy"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = w.side_effects.filter(|s| !s.is_empty()) {
-        entry["sideEffects"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = w.timeout_seconds.filter(|&v| v != 0) {
-        entry["timeoutSeconds"] = serde_json::Value::Number(serde_json::Number::from(v));
-    }
-    if let Some(ns) = w.namespace_selector {
-        entry["namespaceSelector"] = gen_label_selector_to_json(ns);
-    }
-    if let Some(os) = w.object_selector {
-        entry["objectSelector"] = gen_label_selector_to_json(os);
-    }
-    if !w.match_conditions.is_empty() {
-        entry["matchConditions"] = gen_match_conditions_to_json(w.match_conditions);
-    }
-    entry
-}
-
-fn gen_mutating_webhook_to_json(w: ar_v1::MutatingWebhook) -> serde_json::Value {
-    let rules: Vec<serde_json::Value> = w
-        .rules
-        .into_iter()
-        .map(gen_rule_with_operations_to_json)
-        .collect();
-    let client_config = w
-        .client_config
-        .map(gen_webhook_client_config_to_json)
-        .unwrap_or(serde_json::json!({}));
-    let mut entry = serde_json::json!({
-        "name": w.name.unwrap_or_default(),
-        "clientConfig": client_config,
-        "rules": rules,
-        "admissionReviewVersions": w.admission_review_versions,
-    });
-    if let Some(v) = w.failure_policy.filter(|s| !s.is_empty()) {
-        entry["failurePolicy"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = w.match_policy.filter(|s| !s.is_empty()) {
-        entry["matchPolicy"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = w.side_effects.filter(|s| !s.is_empty()) {
-        entry["sideEffects"] = serde_json::Value::String(v);
-    }
-    if let Some(v) = w.timeout_seconds.filter(|&v| v != 0) {
-        entry["timeoutSeconds"] = serde_json::Value::Number(serde_json::Number::from(v));
-    }
-    if let Some(v) = w.reinvocation_policy.filter(|s| !s.is_empty()) {
-        entry["reinvocationPolicy"] = serde_json::Value::String(v);
-    }
-    if let Some(ns) = w.namespace_selector {
-        entry["namespaceSelector"] = gen_label_selector_to_json(ns);
-    }
-    if let Some(os) = w.object_selector {
-        entry["objectSelector"] = gen_label_selector_to_json(os);
-    }
-    if !w.match_conditions.is_empty() {
-        entry["matchConditions"] = gen_match_conditions_to_json(w.match_conditions);
-    }
-    entry
-}
+// Every `gen_*_to_json` for a message type reachable from the six Kinds this file decodes is
+// generated by `build/codegen.rs` from the vendored `.k8s.io.api.admissionregistration.v1`
+// descriptor — see that file's `generate_apply_configuration` through
+// `generate_mutating_admission_policy_binding` for the per-type delegate tables (base64 caBundle,
+// LabelSelector reuse, RuleWithOperations'/NamedRuleWithOperations' inline-embed flattening with
+// their differing `scope` defaults, the CEL expression fields' unconditional-emit semantics, ...).
+include!(concat!(env!("OUT_DIR"), "/apply_configuration_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/json_patch_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/audit_annotation_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/expression_warning_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/variable_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/match_condition_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/param_kind_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/service_reference_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/webhook_client_config_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/rule_with_operations_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/named_rule_with_operations_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/match_resources_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/param_ref_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/validating_webhook_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/mutating_webhook_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/validating_webhook_configuration_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/mutating_webhook_configuration_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/validation_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/type_checking_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/vap_condition_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/validating_admission_policy_spec_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/validating_admission_policy_status_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/validating_admission_policy_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/validating_admission_policy_binding_spec_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/validating_admission_policy_binding_gen.rs"
+));
+include!(concat!(env!("OUT_DIR"), "/mutation_gen.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/mutating_admission_policy_spec_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/mutating_admission_policy_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/mutating_admission_policy_binding_spec_gen.rs"
+));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/mutating_admission_policy_binding_gen.rs"
+));
 
 pub fn decode_validatingwebhookconfiguration_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ar_v1::ValidatingWebhookConfiguration::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let webhooks: Vec<serde_json::Value> = obj
-        .webhooks
-        .into_iter()
-        .map(gen_validating_webhook_to_json)
-        .collect();
-    Some(serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingWebhookConfiguration",
-        "metadata": meta,
-        "webhooks": webhooks,
-    }))
+    let vwc = ar_v1::ValidatingWebhookConfiguration::decode(data).ok()?;
+    let mut obj = gen_validating_webhook_configuration_to_json(vwc);
+    obj["apiVersion"] = "admissionregistration.k8s.io/v1".into();
+    obj["kind"] = "ValidatingWebhookConfiguration".into();
+    Some(obj)
 }
 
 pub fn decode_mutatingwebhookconfiguration_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ar_v1::MutatingWebhookConfiguration::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let webhooks: Vec<serde_json::Value> = obj
-        .webhooks
-        .into_iter()
-        .map(gen_mutating_webhook_to_json)
-        .collect();
-    Some(serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": meta,
-        "webhooks": webhooks,
-    }))
-}
-
-fn gen_vap_spec_to_json(spec: ar_v1::ValidatingAdmissionPolicySpec) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    if let Some(mc) = spec.match_constraints {
-        obj["matchConstraints"] = gen_match_resources_to_json(mc);
-    }
-    if let Some(fp) = spec.failure_policy.filter(|s| !s.is_empty()) {
-        obj["failurePolicy"] = serde_json::Value::String(fp);
-    }
-    if let Some(pk) = spec.param_kind {
-        obj["paramKind"] = serde_json::json!({
-            "apiVersion": pk.api_version.unwrap_or_default(),
-            "kind": pk.kind.unwrap_or_default(),
-        });
-    }
-    if !spec.validations.is_empty() {
-        let vals: Vec<serde_json::Value> = spec
-            .validations
-            .into_iter()
-            .map(|v| {
-                let mut entry = serde_json::json!({"expression": v.expression.unwrap_or_default()});
-                if let Some(msg) = v.message.filter(|s| !s.is_empty()) {
-                    entry["message"] = serde_json::Value::String(msg);
-                }
-                if let Some(r) = v.reason.filter(|s| !s.is_empty()) {
-                    entry["reason"] = serde_json::Value::String(r);
-                }
-                if let Some(me) = v.message_expression.filter(|s| !s.is_empty()) {
-                    entry["messageExpression"] = serde_json::Value::String(me);
-                }
-                entry
-            })
-            .collect();
-        obj["validations"] = serde_json::Value::Array(vals);
-    }
-    if !spec.audit_annotations.is_empty() {
-        let anns: Vec<serde_json::Value> = spec
-            .audit_annotations
-            .into_iter()
-            .map(|a| {
-                serde_json::json!({
-                    "key": a.key.unwrap_or_default(),
-                    "valueExpression": a.value_expression.unwrap_or_default(),
-                })
-            })
-            .collect();
-        obj["auditAnnotations"] = serde_json::Value::Array(anns);
-    }
-    if !spec.match_conditions.is_empty() {
-        obj["matchConditions"] = gen_match_conditions_to_json(spec.match_conditions);
-    }
-    if !spec.variables.is_empty() {
-        let vars: Vec<serde_json::Value> = spec
-            .variables
-            .into_iter()
-            .map(|v| {
-                serde_json::json!({
-                    "name": v.name.unwrap_or_default(),
-                    "expression": v.expression.unwrap_or_default(),
-                })
-            })
-            .collect();
-        obj["variables"] = serde_json::Value::Array(vars);
-    }
-    obj
-}
-
-fn gen_vap_status_to_json(status: ar_v1::ValidatingAdmissionPolicyStatus) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    if let Some(og) = status.observed_generation.filter(|&v| v != 0) {
-        obj["observedGeneration"] = serde_json::Value::Number(og.into());
-    }
-    if let Some(tc) = status.type_checking {
-        if !tc.expression_warnings.is_empty() {
-            let warns: Vec<serde_json::Value> = tc
-                .expression_warnings
-                .into_iter()
-                .map(|w| {
-                    serde_json::json!({
-                        "fieldRef": w.field_ref.unwrap_or_default(),
-                        "warning": w.warning.unwrap_or_default(),
-                    })
-                })
-                .collect();
-            obj["typeChecking"] = serde_json::json!({ "expressionWarnings": warns });
-        }
-    }
-    if !status.conditions.is_empty() {
-        let conds: Vec<serde_json::Value> = status
-            .conditions
-            .into_iter()
-            .map(|c| {
-                let mut cm = serde_json::json!({
-                    "type": c.r#type.unwrap_or_default(),
-                    "status": c.status.unwrap_or_default(),
-                });
-                if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
-                    cm["reason"] = v.into();
-                }
-                if let Some(v) = c.message.filter(|s| !s.is_empty()) {
-                    cm["message"] = v.into();
-                }
-                if let Some(t) = c.last_transition_time {
-                    if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                        cm["lastTransitionTime"] =
-                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                    }
-                }
-                if let Some(og) = c.observed_generation.filter(|&g| g != 0) {
-                    cm["observedGeneration"] = og.into();
-                }
-                cm
-            })
-            .collect();
-        obj["conditions"] = serde_json::Value::Array(conds);
-    }
-    obj
+    let mwc = ar_v1::MutatingWebhookConfiguration::decode(data).ok()?;
+    let mut obj = gen_mutating_webhook_configuration_to_json(mwc);
+    obj["apiVersion"] = "admissionregistration.k8s.io/v1".into();
+    obj["kind"] = "MutatingWebhookConfiguration".into();
+    Some(obj)
 }
 
 pub fn decode_validatingadmissionpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ar_v1::ValidatingAdmissionPolicy::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingAdmissionPolicy",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        result["spec"] = gen_vap_spec_to_json(spec);
-    }
-    if let Some(status) = obj.status {
-        let status_json = gen_vap_status_to_json(status);
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            result["status"] = status_json;
-        }
-    }
-    Some(result)
+    let vap = ar_v1::ValidatingAdmissionPolicy::decode(data).ok()?;
+    let mut obj = gen_validating_admission_policy_to_json(vap);
+    obj["apiVersion"] = "admissionregistration.k8s.io/v1".into();
+    obj["kind"] = "ValidatingAdmissionPolicy".into();
+    Some(obj)
 }
 
 pub fn decode_validatingadmissionpolicybinding_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ar_v1::ValidatingAdmissionPolicyBinding::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingAdmissionPolicyBinding",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if let Some(v) = spec.policy_name.filter(|s| !s.is_empty()) {
-            spec_json["policyName"] = serde_json::Value::String(v);
-        }
-        if let Some(pr) = spec.param_ref {
-            spec_json["paramRef"] = gen_param_ref_to_json(pr);
-        }
-        if let Some(mr) = spec.match_resources {
-            spec_json["matchResources"] = gen_match_resources_to_json(mr);
-        }
-        if !spec.validation_actions.is_empty() {
-            spec_json["validationActions"] = serde_json::Value::Array(
-                spec.validation_actions
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-        }
-        result["spec"] = spec_json;
-    }
-    Some(result)
-}
-
-fn gen_map_spec_to_json(spec: ar_v1::MutatingAdmissionPolicySpec) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    if let Some(mc) = spec.match_constraints {
-        obj["matchConstraints"] = gen_match_resources_to_json(mc);
-    }
-    if let Some(fp) = spec.failure_policy.filter(|s| !s.is_empty()) {
-        obj["failurePolicy"] = serde_json::Value::String(fp);
-    }
-    if let Some(rp) = spec.reinvocation_policy.filter(|s| !s.is_empty()) {
-        obj["reinvocationPolicy"] = serde_json::Value::String(rp);
-    }
-    if let Some(pk) = spec.param_kind {
-        obj["paramKind"] = serde_json::json!({
-            "apiVersion": pk.api_version.unwrap_or_default(),
-            "kind": pk.kind.unwrap_or_default(),
-        });
-    }
-    if !spec.variables.is_empty() {
-        let vars: Vec<serde_json::Value> = spec
-            .variables
-            .into_iter()
-            .map(|v| {
-                serde_json::json!({
-                    "name": v.name.unwrap_or_default(),
-                    "expression": v.expression.unwrap_or_default(),
-                })
-            })
-            .collect();
-        obj["variables"] = serde_json::Value::Array(vars);
-    }
-    if !spec.mutations.is_empty() {
-        let mutations: Vec<serde_json::Value> = spec
-            .mutations
-            .into_iter()
-            .map(|m| {
-                let mut entry = serde_json::json!({"patchType": m.patch_type.unwrap_or_default()});
-                if let Some(ac) = m.apply_configuration {
-                    entry["applyConfiguration"] = serde_json::json!({
-                        "expression": ac.expression.unwrap_or_default(),
-                    });
-                }
-                if let Some(jp) = m.json_patch {
-                    entry["jsonPatch"] = serde_json::json!({
-                        "expression": jp.expression.unwrap_or_default(),
-                    });
-                }
-                entry
-            })
-            .collect();
-        obj["mutations"] = serde_json::Value::Array(mutations);
-    }
-    if !spec.match_conditions.is_empty() {
-        obj["matchConditions"] = gen_match_conditions_to_json(spec.match_conditions);
-    }
-    obj
+    let binding = ar_v1::ValidatingAdmissionPolicyBinding::decode(data).ok()?;
+    let mut obj = gen_validating_admission_policy_binding_to_json(binding);
+    obj["apiVersion"] = "admissionregistration.k8s.io/v1".into();
+    obj["kind"] = "ValidatingAdmissionPolicyBinding".into();
+    Some(obj)
 }
 
 pub fn decode_mutatingadmissionpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ar_v1::MutatingAdmissionPolicy::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingAdmissionPolicy",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        result["spec"] = gen_map_spec_to_json(spec);
-    }
-    Some(result)
+    let map_obj = ar_v1::MutatingAdmissionPolicy::decode(data).ok()?;
+    let mut obj = gen_mutating_admission_policy_to_json(map_obj);
+    obj["apiVersion"] = "admissionregistration.k8s.io/v1".into();
+    obj["kind"] = "MutatingAdmissionPolicy".into();
+    Some(obj)
 }
 
 pub fn decode_mutatingadmissionpolicybinding_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ar_v1::MutatingAdmissionPolicyBinding::decode(data).ok()?;
-    let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingAdmissionPolicyBinding",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if let Some(v) = spec.policy_name.filter(|s| !s.is_empty()) {
-            spec_json["policyName"] = serde_json::Value::String(v);
-        }
-        if let Some(pr) = spec.param_ref {
-            spec_json["paramRef"] = gen_param_ref_to_json(pr);
-        }
-        if let Some(mr) = spec.match_resources {
-            spec_json["matchResources"] = gen_match_resources_to_json(mr);
-        }
-        result["spec"] = spec_json;
-    }
-    Some(result)
+    let binding = ar_v1::MutatingAdmissionPolicyBinding::decode(data).ok()?;
+    let mut obj = gen_mutating_admission_policy_binding_to_json(binding);
+    obj["apiVersion"] = "admissionregistration.k8s.io/v1".into();
+    obj["kind"] = "MutatingAdmissionPolicyBinding".into();
+    Some(obj)
 }
 
 #[cfg(test)]
@@ -1174,6 +789,713 @@ mod tests {
         assert!(
             decoded.get("spec").is_none(),
             "an unset MutatingAdmissionPolicyBindingSpec must be absent, not null"
+        );
+    }
+
+    // ---- Byte-identical audit: codegen migration (mayor-sljuy) ----
+    //
+    // Each `old_*` function below is a verbatim copy (only renamed, to avoid clashing with the
+    // codegen-generated function of the same name now spliced into this module) of the
+    // hand-rolled function this migration deleted. Each test builds a `Sentinel::sentinel()`
+    // top-level struct — every field set to a value no zero/empty-elision check could mistake for
+    // "unset" — and diffs the old hand-written decode path against the real (generated)
+    // `decode_*_proto_gen` entry point. A wrong field name, a dropped delegate-table entry, or an
+    // accidentally-changed omit-empty rule in `build/codegen.rs` would show up here as a JSON
+    // mismatch even if the other decode tests above happen to avoid the exact field it hit.
+
+    fn old_gen_rule_with_operations_to_json(r: ar_v1::RuleWithOperations) -> serde_json::Value {
+        let rule = r.rule.unwrap_or_default();
+        serde_json::json!({
+            "operations": r.operations,
+            "apiGroups": rule.api_groups,
+            "apiVersions": rule.api_versions,
+            "resources": rule.resources,
+            "scope": rule.scope.filter(|s| !s.is_empty()).unwrap_or_else(|| "*".to_string()),
+        })
+    }
+
+    fn old_gen_named_rule_with_operations_to_json(
+        r: ar_v1::NamedRuleWithOperations,
+    ) -> serde_json::Value {
+        let rwo = r.rule_with_operations.unwrap_or_default();
+        let inner = rwo.rule.unwrap_or_default();
+        let mut rule = serde_json::json!({
+            "apiGroups": inner.api_groups,
+            "apiVersions": inner.api_versions,
+            "resources": inner.resources,
+            "operations": rwo.operations,
+        });
+        if let Some(scope) = inner.scope.filter(|s| !s.is_empty()) {
+            rule["scope"] = serde_json::Value::String(scope);
+        }
+        if !r.resource_names.is_empty() {
+            rule["resourceNames"] = serde_json::Value::Array(
+                r.resource_names
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
+        rule
+    }
+
+    fn old_gen_match_resources_to_json(mc: ar_v1::MatchResources) -> serde_json::Value {
+        let mut obj = serde_json::json!({});
+        let resource_rules: Vec<serde_json::Value> = mc
+            .resource_rules
+            .into_iter()
+            .map(old_gen_named_rule_with_operations_to_json)
+            .collect();
+        if !resource_rules.is_empty() {
+            obj["resourceRules"] = serde_json::Value::Array(resource_rules);
+        }
+        let exclude_rules: Vec<serde_json::Value> = mc
+            .exclude_resource_rules
+            .into_iter()
+            .map(old_gen_named_rule_with_operations_to_json)
+            .collect();
+        if !exclude_rules.is_empty() {
+            obj["excludeResourceRules"] = serde_json::Value::Array(exclude_rules);
+        }
+        if let Some(ns) = mc.namespace_selector {
+            obj["namespaceSelector"] = gen_label_selector_to_json(ns);
+        }
+        if let Some(os) = mc.object_selector {
+            obj["objectSelector"] = gen_label_selector_to_json(os);
+        }
+        if let Some(mp) = mc.match_policy.filter(|s| !s.is_empty()) {
+            obj["matchPolicy"] = serde_json::Value::String(mp);
+        }
+        obj
+    }
+
+    fn old_gen_param_ref_to_json(pr: ar_v1::ParamRef) -> serde_json::Value {
+        let mut m = serde_json::json!({});
+        if let Some(v) = pr.name.filter(|s| !s.is_empty()) {
+            m["name"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = pr.namespace.filter(|s| !s.is_empty()) {
+            m["namespace"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = pr.parameter_not_found_action.filter(|s| !s.is_empty()) {
+            m["parameterNotFoundAction"] = serde_json::Value::String(v);
+        }
+        if let Some(sel) = pr.selector {
+            m["selector"] = gen_label_selector_to_json(sel);
+        }
+        m
+    }
+
+    fn old_gen_match_conditions_to_json(conds: Vec<ar_v1::MatchCondition>) -> serde_json::Value {
+        serde_json::Value::Array(
+            conds
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name.unwrap_or_default(),
+                        "expression": c.expression.unwrap_or_default(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn old_gen_webhook_client_config_to_json(cc: ar_v1::WebhookClientConfig) -> serde_json::Value {
+        let mut cfg = serde_json::json!({});
+        if let Some(ca) = cc.ca_bundle.filter(|b| !b.is_empty()) {
+            cfg["caBundle"] = serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &ca,
+            ));
+        }
+        if let Some(svc) = cc.service {
+            let mut s = serde_json::json!({
+                "namespace": svc.namespace.unwrap_or_default(),
+                "name": svc.name.unwrap_or_default(),
+            });
+            if let Some(path) = svc.path.filter(|s| !s.is_empty()) {
+                s["path"] = serde_json::Value::String(path);
+            }
+            if let Some(port) = svc.port.filter(|&v| v != 0) {
+                s["port"] = serde_json::Value::Number(serde_json::Number::from(port));
+            }
+            cfg["service"] = s;
+        }
+        if let Some(url) = cc.url.filter(|s| !s.is_empty()) {
+            cfg["url"] = serde_json::Value::String(url);
+        }
+        cfg
+    }
+
+    fn old_gen_validating_webhook_to_json(w: ar_v1::ValidatingWebhook) -> serde_json::Value {
+        let rules: Vec<serde_json::Value> = w
+            .rules
+            .into_iter()
+            .map(old_gen_rule_with_operations_to_json)
+            .collect();
+        let client_config = w
+            .client_config
+            .map(old_gen_webhook_client_config_to_json)
+            .unwrap_or(serde_json::json!({}));
+        let mut entry = serde_json::json!({
+            "name": w.name.unwrap_or_default(),
+            "clientConfig": client_config,
+            "rules": rules,
+            "admissionReviewVersions": w.admission_review_versions,
+        });
+        if let Some(v) = w.failure_policy.filter(|s| !s.is_empty()) {
+            entry["failurePolicy"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = w.match_policy.filter(|s| !s.is_empty()) {
+            entry["matchPolicy"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = w.side_effects.filter(|s| !s.is_empty()) {
+            entry["sideEffects"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = w.timeout_seconds.filter(|&v| v != 0) {
+            entry["timeoutSeconds"] = serde_json::Value::Number(serde_json::Number::from(v));
+        }
+        if let Some(ns) = w.namespace_selector {
+            entry["namespaceSelector"] = gen_label_selector_to_json(ns);
+        }
+        if let Some(os) = w.object_selector {
+            entry["objectSelector"] = gen_label_selector_to_json(os);
+        }
+        if !w.match_conditions.is_empty() {
+            entry["matchConditions"] = old_gen_match_conditions_to_json(w.match_conditions);
+        }
+        entry
+    }
+
+    fn old_gen_mutating_webhook_to_json(w: ar_v1::MutatingWebhook) -> serde_json::Value {
+        let rules: Vec<serde_json::Value> = w
+            .rules
+            .into_iter()
+            .map(old_gen_rule_with_operations_to_json)
+            .collect();
+        let client_config = w
+            .client_config
+            .map(old_gen_webhook_client_config_to_json)
+            .unwrap_or(serde_json::json!({}));
+        let mut entry = serde_json::json!({
+            "name": w.name.unwrap_or_default(),
+            "clientConfig": client_config,
+            "rules": rules,
+            "admissionReviewVersions": w.admission_review_versions,
+        });
+        if let Some(v) = w.failure_policy.filter(|s| !s.is_empty()) {
+            entry["failurePolicy"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = w.match_policy.filter(|s| !s.is_empty()) {
+            entry["matchPolicy"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = w.side_effects.filter(|s| !s.is_empty()) {
+            entry["sideEffects"] = serde_json::Value::String(v);
+        }
+        if let Some(v) = w.timeout_seconds.filter(|&v| v != 0) {
+            entry["timeoutSeconds"] = serde_json::Value::Number(serde_json::Number::from(v));
+        }
+        if let Some(v) = w.reinvocation_policy.filter(|s| !s.is_empty()) {
+            entry["reinvocationPolicy"] = serde_json::Value::String(v);
+        }
+        if let Some(ns) = w.namespace_selector {
+            entry["namespaceSelector"] = gen_label_selector_to_json(ns);
+        }
+        if let Some(os) = w.object_selector {
+            entry["objectSelector"] = gen_label_selector_to_json(os);
+        }
+        if !w.match_conditions.is_empty() {
+            entry["matchConditions"] = old_gen_match_conditions_to_json(w.match_conditions);
+        }
+        entry
+    }
+
+    fn old_decode_validatingwebhookconfiguration_proto_gen(
+        data: &[u8],
+    ) -> Option<serde_json::Value> {
+        let obj = ar_v1::ValidatingWebhookConfiguration::decode(data).ok()?;
+        let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+        let webhooks: Vec<serde_json::Value> = obj
+            .webhooks
+            .into_iter()
+            .map(old_gen_validating_webhook_to_json)
+            .collect();
+        Some(serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": meta,
+            "webhooks": webhooks,
+        }))
+    }
+
+    fn old_decode_mutatingwebhookconfiguration_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+        let obj = ar_v1::MutatingWebhookConfiguration::decode(data).ok()?;
+        let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+        let webhooks: Vec<serde_json::Value> = obj
+            .webhooks
+            .into_iter()
+            .map(old_gen_mutating_webhook_to_json)
+            .collect();
+        Some(serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": meta,
+            "webhooks": webhooks,
+        }))
+    }
+
+    fn old_gen_vap_spec_to_json(spec: ar_v1::ValidatingAdmissionPolicySpec) -> serde_json::Value {
+        let mut obj = serde_json::json!({});
+        if let Some(mc) = spec.match_constraints {
+            obj["matchConstraints"] = old_gen_match_resources_to_json(mc);
+        }
+        if let Some(fp) = spec.failure_policy.filter(|s| !s.is_empty()) {
+            obj["failurePolicy"] = serde_json::Value::String(fp);
+        }
+        if let Some(pk) = spec.param_kind {
+            obj["paramKind"] = serde_json::json!({
+                "apiVersion": pk.api_version.unwrap_or_default(),
+                "kind": pk.kind.unwrap_or_default(),
+            });
+        }
+        if !spec.validations.is_empty() {
+            let vals: Vec<serde_json::Value> = spec
+                .validations
+                .into_iter()
+                .map(|v| {
+                    let mut entry =
+                        serde_json::json!({"expression": v.expression.unwrap_or_default()});
+                    if let Some(msg) = v.message.filter(|s| !s.is_empty()) {
+                        entry["message"] = serde_json::Value::String(msg);
+                    }
+                    if let Some(r) = v.reason.filter(|s| !s.is_empty()) {
+                        entry["reason"] = serde_json::Value::String(r);
+                    }
+                    if let Some(me) = v.message_expression.filter(|s| !s.is_empty()) {
+                        entry["messageExpression"] = serde_json::Value::String(me);
+                    }
+                    entry
+                })
+                .collect();
+            obj["validations"] = serde_json::Value::Array(vals);
+        }
+        if !spec.audit_annotations.is_empty() {
+            let anns: Vec<serde_json::Value> = spec
+                .audit_annotations
+                .into_iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "key": a.key.unwrap_or_default(),
+                        "valueExpression": a.value_expression.unwrap_or_default(),
+                    })
+                })
+                .collect();
+            obj["auditAnnotations"] = serde_json::Value::Array(anns);
+        }
+        if !spec.match_conditions.is_empty() {
+            obj["matchConditions"] = old_gen_match_conditions_to_json(spec.match_conditions);
+        }
+        if !spec.variables.is_empty() {
+            let vars: Vec<serde_json::Value> = spec
+                .variables
+                .into_iter()
+                .map(|v| {
+                    serde_json::json!({
+                        "name": v.name.unwrap_or_default(),
+                        "expression": v.expression.unwrap_or_default(),
+                    })
+                })
+                .collect();
+            obj["variables"] = serde_json::Value::Array(vars);
+        }
+        obj
+    }
+
+    fn old_gen_vap_status_to_json(
+        status: ar_v1::ValidatingAdmissionPolicyStatus,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::json!({});
+        if let Some(og) = status.observed_generation.filter(|&v| v != 0) {
+            obj["observedGeneration"] = serde_json::Value::Number(og.into());
+        }
+        if let Some(tc) = status.type_checking {
+            if !tc.expression_warnings.is_empty() {
+                let warns: Vec<serde_json::Value> = tc
+                    .expression_warnings
+                    .into_iter()
+                    .map(|w| {
+                        serde_json::json!({
+                            "fieldRef": w.field_ref.unwrap_or_default(),
+                            "warning": w.warning.unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                obj["typeChecking"] = serde_json::json!({ "expressionWarnings": warns });
+            }
+        }
+        if !status.conditions.is_empty() {
+            let conds: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cm = serde_json::json!({
+                        "type": c.r#type.unwrap_or_default(),
+                        "status": c.status.unwrap_or_default(),
+                    });
+                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                        cm["reason"] = v.into();
+                    }
+                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                        cm["message"] = v.into();
+                    }
+                    if let Some(t) = c.last_transition_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
+                        }
+                    }
+                    if let Some(og) = c.observed_generation.filter(|&g| g != 0) {
+                        cm["observedGeneration"] = og.into();
+                    }
+                    cm
+                })
+                .collect();
+            obj["conditions"] = serde_json::Value::Array(conds);
+        }
+        obj
+    }
+
+    fn old_decode_validatingadmissionpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+        let obj = ar_v1::ValidatingAdmissionPolicy::decode(data).ok()?;
+        let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+        let mut result = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": meta
+        });
+        if let Some(spec) = obj.spec {
+            result["spec"] = old_gen_vap_spec_to_json(spec);
+        }
+        if let Some(status) = obj.status {
+            let status_json = old_gen_vap_status_to_json(status);
+            if status_json
+                .as_object()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)
+            {
+                result["status"] = status_json;
+            }
+        }
+        Some(result)
+    }
+
+    fn old_decode_validatingadmissionpolicybinding_proto_gen(
+        data: &[u8],
+    ) -> Option<serde_json::Value> {
+        let obj = ar_v1::ValidatingAdmissionPolicyBinding::decode(data).ok()?;
+        let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+        let mut result = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": meta
+        });
+        if let Some(spec) = obj.spec {
+            let mut spec_json = serde_json::json!({});
+            if let Some(v) = spec.policy_name.filter(|s| !s.is_empty()) {
+                spec_json["policyName"] = serde_json::Value::String(v);
+            }
+            if let Some(pr) = spec.param_ref {
+                spec_json["paramRef"] = old_gen_param_ref_to_json(pr);
+            }
+            if let Some(mr) = spec.match_resources {
+                spec_json["matchResources"] = old_gen_match_resources_to_json(mr);
+            }
+            if !spec.validation_actions.is_empty() {
+                spec_json["validationActions"] = serde_json::Value::Array(
+                    spec.validation_actions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                );
+            }
+            result["spec"] = spec_json;
+        }
+        Some(result)
+    }
+
+    fn old_gen_map_spec_to_json(spec: ar_v1::MutatingAdmissionPolicySpec) -> serde_json::Value {
+        let mut obj = serde_json::json!({});
+        if let Some(mc) = spec.match_constraints {
+            obj["matchConstraints"] = old_gen_match_resources_to_json(mc);
+        }
+        if let Some(fp) = spec.failure_policy.filter(|s| !s.is_empty()) {
+            obj["failurePolicy"] = serde_json::Value::String(fp);
+        }
+        if let Some(rp) = spec.reinvocation_policy.filter(|s| !s.is_empty()) {
+            obj["reinvocationPolicy"] = serde_json::Value::String(rp);
+        }
+        if let Some(pk) = spec.param_kind {
+            obj["paramKind"] = serde_json::json!({
+                "apiVersion": pk.api_version.unwrap_or_default(),
+                "kind": pk.kind.unwrap_or_default(),
+            });
+        }
+        if !spec.variables.is_empty() {
+            let vars: Vec<serde_json::Value> = spec
+                .variables
+                .into_iter()
+                .map(|v| {
+                    serde_json::json!({
+                        "name": v.name.unwrap_or_default(),
+                        "expression": v.expression.unwrap_or_default(),
+                    })
+                })
+                .collect();
+            obj["variables"] = serde_json::Value::Array(vars);
+        }
+        if !spec.mutations.is_empty() {
+            let mutations: Vec<serde_json::Value> = spec
+                .mutations
+                .into_iter()
+                .map(|m| {
+                    let mut entry =
+                        serde_json::json!({"patchType": m.patch_type.unwrap_or_default()});
+                    if let Some(ac) = m.apply_configuration {
+                        entry["applyConfiguration"] = serde_json::json!({
+                            "expression": ac.expression.unwrap_or_default(),
+                        });
+                    }
+                    if let Some(jp) = m.json_patch {
+                        entry["jsonPatch"] = serde_json::json!({
+                            "expression": jp.expression.unwrap_or_default(),
+                        });
+                    }
+                    entry
+                })
+                .collect();
+            obj["mutations"] = serde_json::Value::Array(mutations);
+        }
+        if !spec.match_conditions.is_empty() {
+            obj["matchConditions"] = old_gen_match_conditions_to_json(spec.match_conditions);
+        }
+        obj
+    }
+
+    fn old_decode_mutatingadmissionpolicy_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+        let obj = ar_v1::MutatingAdmissionPolicy::decode(data).ok()?;
+        let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+        let mut result = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicy",
+            "metadata": meta
+        });
+        if let Some(spec) = obj.spec {
+            result["spec"] = old_gen_map_spec_to_json(spec);
+        }
+        Some(result)
+    }
+
+    fn old_decode_mutatingadmissionpolicybinding_proto_gen(
+        data: &[u8],
+    ) -> Option<serde_json::Value> {
+        let obj = ar_v1::MutatingAdmissionPolicyBinding::decode(data).ok()?;
+        let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
+        let mut result = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingAdmissionPolicyBinding",
+            "metadata": meta
+        });
+        if let Some(spec) = obj.spec {
+            let mut spec_json = serde_json::json!({});
+            if let Some(v) = spec.policy_name.filter(|s| !s.is_empty()) {
+                spec_json["policyName"] = serde_json::Value::String(v);
+            }
+            if let Some(pr) = spec.param_ref {
+                spec_json["paramRef"] = old_gen_param_ref_to_json(pr);
+            }
+            if let Some(mr) = spec.match_resources {
+                spec_json["matchResources"] = old_gen_match_resources_to_json(mr);
+            }
+            result["spec"] = spec_json;
+        }
+        Some(result)
+    }
+
+    #[test]
+    fn codegen_migration_validatingwebhookconfiguration_matches_pre_migration_hand_written_output()
+    {
+        let vwc = ar_v1::ValidatingWebhookConfiguration {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            webhooks: vec![ar_v1::ValidatingWebhook::sentinel()],
+        };
+        let mut buf = Vec::new();
+        vwc.encode(&mut buf).unwrap();
+
+        let old = old_decode_validatingwebhookconfiguration_proto_gen(&buf)
+            .expect("old path must decode");
+        let new =
+            decode_validatingwebhookconfiguration_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_validatingwebhookconfiguration_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field — any divergence here is a \
+             silent admission-control field drop (e.g. a webhook's rules, matchConditions CEL \
+             expression, or clientConfig)"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_mutatingwebhookconfiguration_matches_pre_migration_hand_written_output() {
+        let mwc = ar_v1::MutatingWebhookConfiguration {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            webhooks: vec![ar_v1::MutatingWebhook::sentinel()],
+        };
+        let mut buf = Vec::new();
+        mwc.encode(&mut buf).unwrap();
+
+        let old =
+            old_decode_mutatingwebhookconfiguration_proto_gen(&buf).expect("old path must decode");
+        let new =
+            decode_mutatingwebhookconfiguration_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_mutatingwebhookconfiguration_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_validatingadmissionpolicy_matches_pre_migration_hand_written_output() {
+        let vap = ar_v1::ValidatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::ValidatingAdmissionPolicySpec::sentinel()),
+            status: Some(ar_v1::ValidatingAdmissionPolicyStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        vap.encode(&mut buf).unwrap();
+
+        let old =
+            old_decode_validatingadmissionpolicy_proto_gen(&buf).expect("old path must decode");
+        let new = decode_validatingadmissionpolicy_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_validatingadmissionpolicy_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field — any divergence here could \
+             silently change which CEL expressions admission.rs's evaluator sees for \
+             spec.validations/spec.matchConditions/spec.variables"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_validatingadmissionpolicybinding_matches_pre_migration_hand_written_output(
+    ) {
+        let binding = ar_v1::ValidatingAdmissionPolicyBinding {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::ValidatingAdmissionPolicyBindingSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        binding.encode(&mut buf).unwrap();
+
+        let old = old_decode_validatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("old path must decode");
+        let new =
+            decode_validatingadmissionpolicybinding_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_validatingadmissionpolicybinding_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_mutatingadmissionpolicy_matches_pre_migration_hand_written_output() {
+        let map_obj = ar_v1::MutatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::MutatingAdmissionPolicySpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        map_obj.encode(&mut buf).unwrap();
+
+        let old = old_decode_mutatingadmissionpolicy_proto_gen(&buf).expect("old path must decode");
+        let new = decode_mutatingadmissionpolicy_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_mutatingadmissionpolicy_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field — any divergence here could \
+             silently change the CEL expressions admission.rs sees for spec.mutations"
+        );
+    }
+
+    #[test]
+    fn codegen_migration_mutatingadmissionpolicybinding_matches_pre_migration_hand_written_output()
+    {
+        let binding = ar_v1::MutatingAdmissionPolicyBinding {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(ar_v1::MutatingAdmissionPolicyBindingSpec::sentinel()),
+        };
+        let mut buf = Vec::new();
+        binding.encode(&mut buf).unwrap();
+
+        let old = old_decode_mutatingadmissionpolicybinding_proto_gen(&buf)
+            .expect("old path must decode");
+        let new =
+            decode_mutatingadmissionpolicybinding_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_mutatingadmissionpolicybinding_proto_gen must match the \
+             pre-migration hand-written decoder field-for-field"
+        );
+    }
+
+    // ---- CEL expression round-trip: the real correctness dependency this migration must not
+    // regress. `admission.rs`'s hand-rolled CEL evaluator (`eval_cel_bool_expr`/
+    // `eval_cel_vap_value`, mayor-sz59/PR #481) reads `spec.validations[].expression` and
+    // `spec.matchConditions[].expression` directly off the JSON this file decodes — if the
+    // migration mis-escaped, truncated, or altered the expression string in any way, VAP policy
+    // enforcement would silently evaluate the wrong CEL expression (or fail to compile one that
+    // used to work) with no other symptom until an admission request actually hit it.
+
+    #[test]
+    fn validating_admission_policy_cel_expression_round_trips_byte_identically() {
+        let expression = "object.spec.replicas % 2 == 1";
+        let match_condition_expression = "object.metadata.name != \"skip-me\"";
+        let vap = ar_v1::ValidatingAdmissionPolicy {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("odd-replicas.example.com".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(ar_v1::ValidatingAdmissionPolicySpec {
+                validations: vec![ar_v1::Validation {
+                    expression: Some(expression.to_string()),
+                    message: Some("replicas must be odd".to_string()),
+                    ..Default::default()
+                }],
+                match_conditions: vec![ar_v1::MatchCondition {
+                    name: Some("skip-marked".to_string()),
+                    expression: Some(match_condition_expression.to_string()),
+                }],
+                ..Default::default()
+            }),
+            status: None,
+        };
+        let mut buf = Vec::new();
+        vap.encode(&mut buf).unwrap();
+
+        let decoded = decode_validatingadmissionpolicy_proto_gen(&buf)
+            .expect("ValidatingAdmissionPolicy with a real CEL expression must decode");
+
+        assert_eq!(
+            decoded["spec"]["validations"][0]["expression"], expression,
+            "spec.validations[].expression must survive proto decode byte-for-byte — \
+             admission.rs's eval_cel_bool_expr/eval_cel_vap_value evaluator reads this exact \
+             string; any alteration (escaping, truncation, or a wrong field mapping) changes \
+             which CEL expression actually gets compiled and evaluated at admission time"
+        );
+        assert_eq!(
+            decoded["spec"]["matchConditions"][0]["expression"], match_condition_expression,
+            "spec.matchConditions[].expression must also survive byte-for-byte — a mismatch \
+             here would make the policy's match-gating CEL expression silently wrong, either \
+             skipping requests it should validate or validating ones it should skip"
         );
     }
 }

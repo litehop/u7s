@@ -407,6 +407,156 @@ fn main() {
         codegen::generate_events_v1_event(descriptor_bytes),
     )
     .expect("failed to write generated events.k8s.io/v1 Event codec");
+    std::fs::write(
+        out_dir.join("apply_configuration_gen.rs"),
+        codegen::generate_apply_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated ApplyConfiguration codec");
+    std::fs::write(
+        out_dir.join("json_patch_gen.rs"),
+        codegen::generate_json_patch(descriptor_bytes),
+    )
+    .expect("failed to write generated JSONPatch codec");
+    std::fs::write(
+        out_dir.join("audit_annotation_gen.rs"),
+        codegen::generate_audit_annotation(descriptor_bytes),
+    )
+    .expect("failed to write generated AuditAnnotation codec");
+    std::fs::write(
+        out_dir.join("expression_warning_gen.rs"),
+        codegen::generate_expression_warning(descriptor_bytes),
+    )
+    .expect("failed to write generated ExpressionWarning codec");
+    std::fs::write(
+        out_dir.join("variable_gen.rs"),
+        codegen::generate_variable(descriptor_bytes),
+    )
+    .expect("failed to write generated Variable codec");
+    std::fs::write(
+        out_dir.join("match_condition_gen.rs"),
+        codegen::generate_match_condition(descriptor_bytes),
+    )
+    .expect("failed to write generated MatchCondition codec");
+    std::fs::write(
+        out_dir.join("param_kind_gen.rs"),
+        codegen::generate_param_kind(descriptor_bytes),
+    )
+    .expect("failed to write generated ParamKind codec");
+    std::fs::write(
+        out_dir.join("service_reference_gen.rs"),
+        codegen::generate_service_reference(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceReference codec");
+    std::fs::write(
+        out_dir.join("webhook_client_config_gen.rs"),
+        codegen::generate_webhook_client_config(descriptor_bytes),
+    )
+    .expect("failed to write generated WebhookClientConfig codec");
+    std::fs::write(
+        out_dir.join("rule_with_operations_gen.rs"),
+        codegen::generate_rule_with_operations(descriptor_bytes),
+    )
+    .expect("failed to write generated RuleWithOperations codec");
+    std::fs::write(
+        out_dir.join("named_rule_with_operations_gen.rs"),
+        codegen::generate_named_rule_with_operations(descriptor_bytes),
+    )
+    .expect("failed to write generated NamedRuleWithOperations codec");
+    std::fs::write(
+        out_dir.join("match_resources_gen.rs"),
+        codegen::generate_match_resources(descriptor_bytes),
+    )
+    .expect("failed to write generated MatchResources codec");
+    std::fs::write(
+        out_dir.join("param_ref_gen.rs"),
+        codegen::generate_param_ref(descriptor_bytes),
+    )
+    .expect("failed to write generated ParamRef codec");
+    std::fs::write(
+        out_dir.join("validating_webhook_gen.rs"),
+        codegen::generate_validating_webhook(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingWebhook codec");
+    std::fs::write(
+        out_dir.join("mutating_webhook_gen.rs"),
+        codegen::generate_mutating_webhook(descriptor_bytes),
+    )
+    .expect("failed to write generated MutatingWebhook codec");
+    std::fs::write(
+        out_dir.join("validating_webhook_configuration_gen.rs"),
+        codegen::generate_validating_webhook_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingWebhookConfiguration codec");
+    std::fs::write(
+        out_dir.join("mutating_webhook_configuration_gen.rs"),
+        codegen::generate_mutating_webhook_configuration(descriptor_bytes),
+    )
+    .expect("failed to write generated MutatingWebhookConfiguration codec");
+    std::fs::write(
+        out_dir.join("validation_gen.rs"),
+        codegen::generate_validation(descriptor_bytes),
+    )
+    .expect("failed to write generated Validation codec");
+    std::fs::write(
+        out_dir.join("type_checking_gen.rs"),
+        codegen::generate_type_checking(descriptor_bytes),
+    )
+    .expect("failed to write generated TypeChecking codec");
+    std::fs::write(
+        out_dir.join("vap_condition_gen.rs"),
+        codegen::generate_vap_condition(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingAdmissionPolicyStatus Condition codec");
+    std::fs::write(
+        out_dir.join("validating_admission_policy_spec_gen.rs"),
+        codegen::generate_validating_admission_policy_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingAdmissionPolicySpec codec");
+    std::fs::write(
+        out_dir.join("validating_admission_policy_status_gen.rs"),
+        codegen::generate_validating_admission_policy_status(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingAdmissionPolicyStatus codec");
+    std::fs::write(
+        out_dir.join("validating_admission_policy_gen.rs"),
+        codegen::generate_validating_admission_policy(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingAdmissionPolicy codec");
+    std::fs::write(
+        out_dir.join("validating_admission_policy_binding_spec_gen.rs"),
+        codegen::generate_validating_admission_policy_binding_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingAdmissionPolicyBindingSpec codec");
+    std::fs::write(
+        out_dir.join("validating_admission_policy_binding_gen.rs"),
+        codegen::generate_validating_admission_policy_binding(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidatingAdmissionPolicyBinding codec");
+    std::fs::write(
+        out_dir.join("mutation_gen.rs"),
+        codegen::generate_mutation(descriptor_bytes),
+    )
+    .expect("failed to write generated Mutation codec");
+    std::fs::write(
+        out_dir.join("mutating_admission_policy_spec_gen.rs"),
+        codegen::generate_mutating_admission_policy_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated MutatingAdmissionPolicySpec codec");
+    std::fs::write(
+        out_dir.join("mutating_admission_policy_gen.rs"),
+        codegen::generate_mutating_admission_policy(descriptor_bytes),
+    )
+    .expect("failed to write generated MutatingAdmissionPolicy codec");
+    std::fs::write(
+        out_dir.join("mutating_admission_policy_binding_spec_gen.rs"),
+        codegen::generate_mutating_admission_policy_binding_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated MutatingAdmissionPolicyBindingSpec codec");
+    std::fs::write(
+        out_dir.join("mutating_admission_policy_binding_gen.rs"),
+        codegen::generate_mutating_admission_policy_binding(descriptor_bytes),
+    )
+    .expect("failed to write generated MutatingAdmissionPolicyBinding codec");
 
     println!(
         "cargo:rerun-if-changed={}",
