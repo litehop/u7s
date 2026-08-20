@@ -187,6 +187,21 @@ fn main() {
         codegen::generate_serviceaccount(descriptor_bytes),
     )
     .expect("failed to write generated ServiceAccount codec");
+    std::fs::write(
+        out_dir.join("apiservice_spec_gen.rs"),
+        codegen::generate_apiservice_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated APIServiceSpec codec");
+    std::fs::write(
+        out_dir.join("apiservice_status_gen.rs"),
+        codegen::generate_apiservice_status(descriptor_bytes),
+    )
+    .expect("failed to write generated APIServiceStatus codec");
+    std::fs::write(
+        out_dir.join("apiservice_gen.rs"),
+        codegen::generate_apiservice(descriptor_bytes),
+    )
+    .expect("failed to write generated APIService codec");
 
     println!(
         "cargo:rerun-if-changed={}",
