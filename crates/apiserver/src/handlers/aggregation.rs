@@ -846,6 +846,50 @@ mod tests {
         );
     }
 
+    /// Regression test for the aggregation layer's actual protobuf ingestion path (codegen
+    /// migration of `apiregistration_gen_adapter.rs`, mayor-bgmro): client-go's aggregator
+    /// clientset creates `APIService` objects via native protobuf (see
+    /// `apiregistration_gen_adapter::decode_apiservice_proto_gen`'s own doc), and the resulting
+    /// JSON is exactly what `reconcile_apiservice_availability`/`backend_base_url` read back out
+    /// of the store on every sweep. No prior test exercised that full path end to end — every
+    /// other `backend_base_url` test above starts from hand-typed JSON, never from
+    /// `decode_apiservice_proto_gen`'s real output. If the codegen-generated decoder ever
+    /// renamed or dropped `spec.service.namespace`/`name`/`port`, `backend_base_url` would
+    /// silently resolve to `None` (routing to nowhere) instead of the real backend.
+    #[test]
+    fn decode_apiservice_proto_gen_output_is_readable_by_backend_base_url() {
+        use prost::Message;
+        use u7s_proto_generated::k8s::io::kube_aggregator::pkg::apis::apiregistration::v1 as apiregistration_v1;
+
+        let svc = apiregistration_v1::ApiService {
+            spec: Some(apiregistration_v1::ApiServiceSpec {
+                service: Some(apiregistration_v1::ServiceReference {
+                    namespace: Some("wardle".to_string()),
+                    name: Some("sample-api".to_string()),
+                    port: Some(7443),
+                }),
+                group: Some("wardle.example.com".to_string()),
+                version: Some("v1alpha1".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        svc.encode(&mut buf).expect("prost encode must succeed");
+
+        let decoded = crate::apiregistration_gen_adapter::decode_apiservice_proto_gen(&buf)
+            .expect("protobuf-encoded APIService must decode");
+
+        assert_eq!(
+            backend_base_url(&decoded),
+            Ok(Some("https://sample-api.wardle.svc:7443".to_string())),
+            "backend_base_url must be able to read spec.service straight out of \
+             decode_apiservice_proto_gen's JSON output — a field-name mismatch here would \
+             silently break health checks and proxy routing for every protobuf-registered \
+             APIService"
+        );
+    }
+
     // ---- discovery_request_headers ---------------------------------------------------
 
     /// Regression test: a live sample-apiserver backend authenticates callers via delegated
