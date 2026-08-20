@@ -322,6 +322,36 @@ fn main() {
         codegen::generate_controllerrevision(descriptor_bytes),
     )
     .expect("failed to write generated ControllerRevision codec");
+    std::fs::write(
+        out_dir.join("hpa_v1_spec_gen.rs"),
+        codegen::generate_hpa_v1_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated autoscaling/v1 HorizontalPodAutoscalerSpec codec");
+    std::fs::write(
+        out_dir.join("hpa_v1_status_gen.rs"),
+        codegen::generate_hpa_v1_status(descriptor_bytes),
+    )
+    .expect("failed to write generated autoscaling/v1 HorizontalPodAutoscalerStatus codec");
+    std::fs::write(
+        out_dir.join("hpa_v1_gen.rs"),
+        codegen::generate_hpa_v1(descriptor_bytes),
+    )
+    .expect("failed to write generated autoscaling/v1 HorizontalPodAutoscaler codec");
+    std::fs::write(
+        out_dir.join("hpa_v2_spec_gen.rs"),
+        codegen::generate_hpa_v2_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated autoscaling/v2 HorizontalPodAutoscalerSpec codec");
+    std::fs::write(
+        out_dir.join("hpa_v2_status_gen.rs"),
+        codegen::generate_hpa_v2_status(descriptor_bytes),
+    )
+    .expect("failed to write generated autoscaling/v2 HorizontalPodAutoscalerStatus codec");
+    std::fs::write(
+        out_dir.join("hpa_v2_gen.rs"),
+        codegen::generate_hpa_v2(descriptor_bytes),
+    )
+    .expect("failed to write generated autoscaling/v2 HorizontalPodAutoscaler codec");
 
     println!(
         "cargo:rerun-if-changed={}",
