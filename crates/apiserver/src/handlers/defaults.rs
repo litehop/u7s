@@ -868,11 +868,13 @@ pub(crate) fn validate_pod_certificate_projections(obj: &serde_json::Value) -> R
 /// Validates NetworkPolicy `spec.{ingress,egress}[].ports[].endPort` at admission.
 ///
 /// Upstream (`pkg/apis/networking/validation/validation.go`'s
-/// `ValidateNetworkPolicyPort`) rejects `endPort` set without `port`: `endPort` names
-/// a range's upper bound, so it is meaningless without a starting `port`. Conformance
-/// test `[sig-network] Netpol API should support creating NetworkPolicy API with
-/// endport field` posts exactly this shape and expects 422. Without this check u7s
-/// silently stores an invalid NetworkPolicy that specifies no actual port restriction,
+/// `ValidateNetworkPolicyPort`) treats `endPort` as the upper bound of a numeric port
+/// range and rejects it in three cases: `port` absent, `port` a named (string) port
+/// (a range only makes sense for numeric ports), and `endPort` numerically less than
+/// `port`. Conformance test `[sig-network] Netpol API should support creating
+/// NetworkPolicy API with endport field` posts all three shapes in turn and expects
+/// each to be rejected. Without these checks u7s silently stores an invalid
+/// NetworkPolicy that specifies no actual port restriction (or an inverted range),
 /// masking a user's misconfiguration instead of rejecting it up front.
 fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> {
     for direction in ["ingress", "egress"] {
@@ -884,12 +886,29 @@ fn validate_network_policy_ports(obj: &serde_json::Value) -> Result<(), String> 
                 continue;
             };
             for (j, port) in ports.iter().enumerate() {
-                if !port["endPort"].is_null() && port["port"].is_null() {
-                    let end_port = &port["endPort"];
+                let end_port = &port["endPort"];
+                if end_port.is_null() {
+                    continue;
+                }
+                if port["port"].is_null() {
                     return Err(format!(
                         "spec.{direction}[{i}].ports[{j}].endPort: Invalid value: {end_port}: \
                          may not be specified when `port` is not specified"
                     ));
+                }
+                if port["port"].is_string() {
+                    return Err(format!(
+                        "spec.{direction}[{i}].ports[{j}].endPort: Invalid value: {end_port}: \
+                         may not be specified when `port` is non-numeric"
+                    ));
+                }
+                if let (Some(p), Some(ep)) = (port["port"].as_i64(), end_port.as_i64()) {
+                    if ep < p {
+                        return Err(format!(
+                            "spec.{direction}[{i}].ports[{j}].endPort: Invalid value: {end_port}: \
+                             must be greater than or equal to `port`"
+                        ));
+                    }
                 }
             }
         }
@@ -4089,6 +4108,72 @@ mod tests {
         assert!(
             validate_resource("networking.k8s.io", "networkpolicies", &obj).is_ok(),
             "NetworkPolicy with both port and endPort set must pass validation"
+        );
+    }
+
+    /// A NetworkPolicy port with `endPort` set alongside a named (string) `port` must
+    /// be rejected.
+    ///
+    /// Upstream `ValidateNetworkPolicyPort` only allows `endPort` to widen a numeric
+    /// port into a range; a named port (e.g. `serve-80`) has no numeric successor for
+    /// `endPort` to bound. Conformance test [sig-network] Netpol API should support
+    /// creating NetworkPolicy API with endport field posts exactly this shape as its
+    /// second assertion and expects it rejected. This test fails on revert since
+    /// validate_resource would then silently accept `endPort` on a named port.
+    #[test]
+    fn network_policy_endport_with_named_port_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "egress": [{"ports": [{"port": "serve-80", "endPort": 20000}]}]
+            }
+        });
+        let result = validate_resource("networking.k8s.io", "networkpolicies", &obj);
+        assert!(
+            result.is_err(),
+            "NetworkPolicy with endPort set alongside a named port must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("spec.egress[0].ports[0].endPort") && msg.contains("non-numeric"),
+            "error must point at the offending port and explain why: {msg}"
+        );
+    }
+
+    /// A NetworkPolicy port with a numeric `endPort` smaller than `port` must be
+    /// rejected.
+    ///
+    /// `endPort` names the upper bound of a range starting at `port`; an `endPort`
+    /// below `port` describes an empty (inverted) range, which upstream treats as a
+    /// user error rather than silently accepting a rule that matches nothing.
+    /// Conformance test [sig-network] Netpol API should support creating
+    /// NetworkPolicy API with endport field posts exactly this shape as its third
+    /// assertion and expects it rejected. This test fails on revert since
+    /// validate_resource would then silently accept the inverted range.
+    #[test]
+    fn network_policy_endport_less_than_port_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "spec": {
+                "podSelector": {},
+                "egress": [{"ports": [{"port": 30000, "endPort": 20000}]}]
+            }
+        });
+        let result = validate_resource("networking.k8s.io", "networkpolicies", &obj);
+        assert!(
+            result.is_err(),
+            "NetworkPolicy with endPort less than port must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("spec.egress[0].ports[0].endPort")
+                && msg.contains("greater than or equal to"),
+            "error must point at the offending port and explain why: {msg}"
         );
     }
 
