@@ -698,6 +698,47 @@ fn main() {
     )
     .expect("failed to write generated MutatingAdmissionPolicyBinding codec");
 
+    std::fs::write(
+        out_dir.join("pod_failure_policy_gen.rs"),
+        codegen::generate_pod_failure_policy(descriptor_bytes),
+    )
+    .expect("failed to write generated PodFailurePolicy codec");
+    std::fs::write(
+        out_dir.join("success_policy_gen.rs"),
+        codegen::generate_success_policy(descriptor_bytes),
+    )
+    .expect("failed to write generated SuccessPolicy codec");
+    std::fs::write(
+        out_dir.join("job_spec_gen.rs"),
+        codegen::generate_job_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated JobSpec codec");
+    std::fs::write(
+        out_dir.join("job_status_gen.rs"),
+        codegen::generate_job_status(descriptor_bytes),
+    )
+    .expect("failed to write generated JobStatus codec");
+    std::fs::write(
+        out_dir.join("job_gen.rs"),
+        codegen::generate_job(descriptor_bytes),
+    )
+    .expect("failed to write generated Job codec");
+    std::fs::write(
+        out_dir.join("cronjob_spec_gen.rs"),
+        codegen::generate_cronjob_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated CronJobSpec codec");
+    std::fs::write(
+        out_dir.join("cronjob_status_gen.rs"),
+        codegen::generate_cronjob_status(descriptor_bytes),
+    )
+    .expect("failed to write generated CronJobStatus codec");
+    std::fs::write(
+        out_dir.join("cronjob_gen.rs"),
+        codegen::generate_cronjob(descriptor_bytes),
+    )
+    .expect("failed to write generated CronJob codec");
+
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("build/codegen.rs").display()
