@@ -131,6 +131,26 @@ unresolved k3s-ratio question above: it's far enough below even the
 illustrative k3s figure that hitting it settles the comparison on any
 reasonable accounting.
 
+**Post-tuning baseline, verified (`mayor-3a0et`, 2026-08-20):** this session
+landed a cluster of memory/correctness fixes (kubelet + KCM Go-runtime
+tuning, codegen migration, protobuf-decode fixes, Lima network partition)
+with no full Conformance run verifying their combined effect until now —
+prior Gate-4 checks this session used a stale pre-tuning run. A fresh
+2-node run (`lima-node-2`+`lima-node-4`, full `--reset`, 483/483 passed,
+same primary-node-only accounting as the pre-tuning baseline) gives:
+**idle 358,456 KB (350.1 MiB, 2.74x target) vs pre-tuning 350,036 KB (2.67x)
+— +2.4%, entirely attributable to CRI-O's idle footprint (+22.0%), not any
+of this session's fixes; peak 460,468 KB (449.7 MiB, 3.51x target) vs
+pre-tuning 492,124 KB (3.76x) — a real -6.4% improvement, driven mostly by
+KCM (-17.7% peak) and the apiserver (-10.4% peak).** This baseline
+deliberately excludes two still-open PRs (`mayor-zbkq1` protobuf fix,
+`mayor-pjtkz` KCM tuning) — neither expected to move these numbers
+materially, but this is not a complete-fixes baseline. A depth-20 dhat
+profile of the same 2-node topology ran immediately after; see
+`ai/findings/mayor-3a0et-post-tuning-baseline-and-depth20-profile-2026-08-20.md`
+for the full per-process table, the 2nd-node cost (not previously reported),
+and the profiling depth/overhead data point.
+
 ### Gate 5 — Correctness baseline beyond Conformance (ongoing, opportunistic)
 Conformance is necessary but not sufficient (Gate 1's caveat). This gate
 exists to keep finding what it misses, using two complementary approaches:
