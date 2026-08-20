@@ -4702,3 +4702,1272 @@ pub fn generate_hpa_v2(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+const APPLY_CONFIGURATION: &str = ".k8s.io.api.admissionregistration.v1.ApplyConfiguration";
+const JSON_PATCH: &str = ".k8s.io.api.admissionregistration.v1.JSONPatch";
+const AUDIT_ANNOTATION: &str = ".k8s.io.api.admissionregistration.v1.AuditAnnotation";
+const EXPRESSION_WARNING: &str = ".k8s.io.api.admissionregistration.v1.ExpressionWarning";
+const VARIABLE: &str = ".k8s.io.api.admissionregistration.v1.Variable";
+const MATCH_CONDITION: &str = ".k8s.io.api.admissionregistration.v1.MatchCondition";
+const PARAM_KIND: &str = ".k8s.io.api.admissionregistration.v1.ParamKind";
+const SERVICE_REFERENCE: &str = ".k8s.io.api.admissionregistration.v1.ServiceReference";
+const WEBHOOK_CLIENT_CONFIG: &str = ".k8s.io.api.admissionregistration.v1.WebhookClientConfig";
+const RULE: &str = ".k8s.io.api.admissionregistration.v1.Rule";
+const RULE_WITH_OPERATIONS: &str = ".k8s.io.api.admissionregistration.v1.RuleWithOperations";
+const NAMED_RULE_WITH_OPERATIONS: &str =
+    ".k8s.io.api.admissionregistration.v1.NamedRuleWithOperations";
+const MATCH_RESOURCES: &str = ".k8s.io.api.admissionregistration.v1.MatchResources";
+const PARAM_REF: &str = ".k8s.io.api.admissionregistration.v1.ParamRef";
+const VALIDATING_WEBHOOK: &str = ".k8s.io.api.admissionregistration.v1.ValidatingWebhook";
+const MUTATING_WEBHOOK: &str = ".k8s.io.api.admissionregistration.v1.MutatingWebhook";
+const VALIDATING_WEBHOOK_CONFIGURATION: &str =
+    ".k8s.io.api.admissionregistration.v1.ValidatingWebhookConfiguration";
+const MUTATING_WEBHOOK_CONFIGURATION: &str =
+    ".k8s.io.api.admissionregistration.v1.MutatingWebhookConfiguration";
+const VALIDATION: &str = ".k8s.io.api.admissionregistration.v1.Validation";
+const TYPE_CHECKING: &str = ".k8s.io.api.admissionregistration.v1.TypeChecking";
+const META_CONDITION: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.Condition";
+const VALIDATING_ADMISSION_POLICY_SPEC: &str =
+    ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicySpec";
+const VALIDATING_ADMISSION_POLICY_STATUS: &str =
+    ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicyStatus";
+const VALIDATING_ADMISSION_POLICY: &str =
+    ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicy";
+const VALIDATING_ADMISSION_POLICY_BINDING_SPEC: &str =
+    ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicyBindingSpec";
+const VALIDATING_ADMISSION_POLICY_BINDING: &str =
+    ".k8s.io.api.admissionregistration.v1.ValidatingAdmissionPolicyBinding";
+const MUTATION: &str = ".k8s.io.api.admissionregistration.v1.Mutation";
+const MUTATING_ADMISSION_POLICY_SPEC: &str =
+    ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicySpec";
+const MUTATING_ADMISSION_POLICY: &str =
+    ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicy";
+const MUTATING_ADMISSION_POLICY_BINDING_SPEC: &str =
+    ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicyBindingSpec";
+const MUTATING_ADMISSION_POLICY_BINDING: &str =
+    ".k8s.io.api.admissionregistration.v1.MutatingAdmissionPolicyBinding";
+
+/// Emits a `gen_<fn_name>_to_json` for a message whose JSON form is exactly its own declared
+/// fields, in field order, each an `optional string` inserted unconditionally — matching every
+/// hand-rolled admissionregistration/v1 leaf message this migration replaces
+/// (`ApplyConfiguration`/`JSONPatch`/`AuditAnnotation`/`ExpressionWarning`/`Variable`/
+/// `MatchCondition`/`ParamKind`), which build their JSON via a `serde_json::json!({...})` literal
+/// assigning `.unwrap_or_default()` directly rather than the mechanical walker's own
+/// omit-if-empty/unset default. Several of these are exactly the CEL expression strings
+/// `admission.rs`'s evaluator reads (`Validation.Expression` inside
+/// `ValidatingAdmissionPolicySpec.validations`, `Variable.Expression`, `MatchCondition.expression`
+/// on both webhooks and policies) — preserving unconditional emission (not the mechanical
+/// omit-if-empty default) matters here specifically so an explicitly-set-but-empty expression
+/// stays distinguishable from "field absent", not just for the common non-empty case.
+fn generate_always_string_fields(
+    set: &FileDescriptorSet,
+    owner: &str,
+    fn_name: &str,
+    rust_type: &str,
+    arg_name: &str,
+) -> String {
+    let message = find_message(set, owner);
+    let fields: Vec<(String, String)> = message
+        .field
+        .iter()
+        .map(|field| {
+            assert_eq!(
+                field.r#type(),
+                Type::String,
+                "{owner}.{} is not a string field — generate_always_string_fields only handles \
+                 the all-scalar-string shape this message had when this codegen was written",
+                field.name()
+            );
+            (
+                rust_field_name(field.name()),
+                json_key(owner, field.name(), field.json_name()),
+            )
+        })
+        .collect();
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    writeln!(
+        out,
+        "fn gen_{fn_name}_to_json({arg_name}: {rust_type}) -> serde_json::Value {{"
+    )
+    .unwrap();
+    out.push_str("    serde_json::json!({\n");
+    for (rust_field, key) in &fields {
+        writeln!(
+            out,
+            "        \"{key}\": {arg_name}.{rust_field}.unwrap_or_default(),"
+        )
+        .unwrap();
+    }
+    out.push_str("    })\n");
+    out.push_str("}\n");
+    out
+}
+
+pub fn generate_apply_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(
+        &set,
+        APPLY_CONFIGURATION,
+        "apply_configuration",
+        "ar_v1::ApplyConfiguration",
+        "ac",
+    )
+}
+
+pub fn generate_json_patch(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(&set, JSON_PATCH, "json_patch", "ar_v1::JsonPatch", "jp")
+}
+
+pub fn generate_audit_annotation(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(
+        &set,
+        AUDIT_ANNOTATION,
+        "audit_annotation",
+        "ar_v1::AuditAnnotation",
+        "a",
+    )
+}
+
+pub fn generate_expression_warning(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(
+        &set,
+        EXPRESSION_WARNING,
+        "expression_warning",
+        "ar_v1::ExpressionWarning",
+        "w",
+    )
+}
+
+pub fn generate_variable(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(&set, VARIABLE, "variable", "ar_v1::Variable", "v")
+}
+
+pub fn generate_match_condition(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(
+        &set,
+        MATCH_CONDITION,
+        "match_condition",
+        "ar_v1::MatchCondition",
+        "c",
+    )
+}
+
+pub fn generate_param_kind(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    generate_always_string_fields(&set, PARAM_KIND, "param_kind", "ar_v1::ParamKind", "pk")
+}
+
+/// `namespace`/`name` are unconditionally emitted (even `Some("")`), matching the hand-rolled
+/// `gen_webhook_client_config_to_json`'s inline `ServiceReference` mapping this replaces; `port`
+/// needs its zero-filter spelled out because the mechanical `Type::Int32` branch has no such
+/// filter by default. `path` needs no entry: a plain optional string the mechanical walker already
+/// handles correctly.
+fn service_reference_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "namespace" => Some(
+            "    m.insert(\"namespace\".to_string(), serde_json::Value::String(svc.namespace.unwrap_or_default()));\n",
+        ),
+        "name" => Some(
+            "    m.insert(\"name\".to_string(), serde_json::Value::String(svc.name.unwrap_or_default()));\n",
+        ),
+        "port" => Some(
+            "    if let Some(port) = svc.port.filter(|&v| v != 0) {\n        m.insert(\"port\".to_string(), serde_json::Value::Number(serde_json::Number::from(port)));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_service_reference_to_json`, replacing the inline `ServiceReference` mapping the
+/// hand-rolled `gen_webhook_client_config_to_json` built directly.
+pub fn generate_service_reference(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, SERVICE_REFERENCE);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        SERVICE_REFERENCE,
+        message,
+        service_reference_delegated_field,
+        "svc",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_service_reference_to_json(svc: ar_v1::ServiceReference) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `caBundle` is a `bytes` field, a shape `emit_field_encode` has no match arm for (the same
+/// reason `apiservice_spec_delegated_field`'s own `caBundle` entry needs one); `service` delegates
+/// to the separately generated `gen_service_reference_to_json`, inserted unconditionally whenever
+/// the `Option` is `Some` — matching the hand-rolled `gen_webhook_client_config_to_json`'s
+/// `cfg["service"] = s;` exactly. `url` needs no entry: a plain optional string the mechanical
+/// walker already handles correctly.
+fn webhook_client_config_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "caBundle" => Some(
+            "    if let Some(ca) = cc.ca_bundle.filter(|b| !b.is_empty()) {\n        cfg.insert(\"caBundle\".to_string(), serde_json::Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca)));\n    }\n",
+        ),
+        "service" => Some(
+            "    if let Some(svc) = cc.service {\n        cfg.insert(\"service\".to_string(), gen_service_reference_to_json(svc));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_webhook_client_config_to_json`, replacing the hand-rolled function of the same
+/// name.
+pub fn generate_webhook_client_config(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, WEBHOOK_CLIENT_CONFIG);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        WEBHOOK_CLIENT_CONFIG,
+        message,
+        webhook_client_config_delegated_field,
+        "cc",
+        "cfg",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_webhook_client_config_to_json(cc: ar_v1::WebhookClientConfig) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut cfg = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(cfg)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `RuleWithOperations.rule` is a Go inline embed (`INLINE_EMBEDS`-listed in
+/// `proto_exceptions.rs`, asserted below): `Rule`'s `apiGroups`/`apiVersions`/`resources`/`scope`
+/// land directly on the same JSON object as `operations`, never nested under a `"rule"` key.
+/// Unlike every mechanically-walked message field, `operations`/`apiGroups`/`apiVersions`/
+/// `resources` are unconditionally emitted (even as `[]`) and `scope` defaults to `"*"` rather than
+/// being omitted when unset — matching upstream's own documented default ("Default is `\"*\"`.")
+/// and the hand-rolled `gen_rule_with_operations_to_json` this replaces exactly. Because this
+/// shape (always-emit + a non-absent default) has no mechanical walker branch, this generator is
+/// bespoke rather than built on `generate_message_encode_only`, asserting the exact field lists it
+/// assumes so a future proto vendor-bump that changes either message's shape fails the build
+/// instead of silently mis-generating.
+pub fn generate_rule_with_operations(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    assert!(
+        is_inline_embed(RULE_WITH_OPERATIONS, "rule"),
+        "generate_rule_with_operations assumes RuleWithOperations.rule is an INLINE_EMBEDS entry"
+    );
+    let rwo = find_message(&set, RULE_WITH_OPERATIONS);
+    let rwo_fields: Vec<&str> = rwo.field.iter().map(|f| f.name()).collect();
+    assert_eq!(
+        rwo_fields,
+        vec!["operations", "rule"],
+        "RuleWithOperations field shape changed — update generate_rule_with_operations"
+    );
+    let rule = find_message(&set, RULE);
+    let rule_fields: Vec<&str> = rule.field.iter().map(|f| f.name()).collect();
+    assert_eq!(
+        rule_fields,
+        vec!["apiGroups", "apiVersions", "resources", "scope"],
+        "Rule field shape changed — update generate_rule_with_operations"
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_rule_with_operations_to_json(r: ar_v1::RuleWithOperations) -> serde_json::Value {\n",
+    );
+    out.push_str("    let rule = r.rule.unwrap_or_default();\n");
+    out.push_str("    serde_json::json!({\n");
+    out.push_str("        \"operations\": r.operations,\n");
+    out.push_str("        \"apiGroups\": rule.api_groups,\n");
+    out.push_str("        \"apiVersions\": rule.api_versions,\n");
+    out.push_str("        \"resources\": rule.resources,\n");
+    out.push_str(
+        "        \"scope\": rule.scope.filter(|s| !s.is_empty()).unwrap_or_else(|| \"*\".to_string()),\n",
+    );
+    out.push_str("    })\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `NamedRuleWithOperations.ruleWithOperations` is a Go inline embed (`INLINE_EMBEDS`-listed,
+/// asserted below), one level deeper than `generate_rule_with_operations`'s own embed: its fields
+/// land directly on the `NamedRuleWithOperations` JSON object alongside `resourceNames`. Unlike
+/// `RuleWithOperations`'s own JSON form, `scope` here is omitted (not defaulted to `"*"`) when
+/// unset — matching the hand-rolled `gen_named_rule_with_operations_to_json` this replaces exactly
+/// (an intentional asymmetry in the pre-migration code, preserved rather than "fixed" here).
+pub fn generate_named_rule_with_operations(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    assert!(
+        is_inline_embed(NAMED_RULE_WITH_OPERATIONS, "ruleWithOperations"),
+        "generate_named_rule_with_operations assumes NamedRuleWithOperations.ruleWithOperations \
+         is an INLINE_EMBEDS entry"
+    );
+    let nrwo = find_message(&set, NAMED_RULE_WITH_OPERATIONS);
+    let nrwo_fields: Vec<&str> = nrwo.field.iter().map(|f| f.name()).collect();
+    assert_eq!(
+        nrwo_fields,
+        vec!["resourceNames", "ruleWithOperations"],
+        "NamedRuleWithOperations field shape changed — update generate_named_rule_with_operations"
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_named_rule_with_operations_to_json(r: ar_v1::NamedRuleWithOperations) -> serde_json::Value {\n",
+    );
+    out.push_str("    let rwo = r.rule_with_operations.unwrap_or_default();\n");
+    out.push_str("    let inner = rwo.rule.unwrap_or_default();\n");
+    out.push_str("    let mut rule = serde_json::json!({\n");
+    out.push_str("        \"apiGroups\": inner.api_groups,\n");
+    out.push_str("        \"apiVersions\": inner.api_versions,\n");
+    out.push_str("        \"resources\": inner.resources,\n");
+    out.push_str("        \"operations\": rwo.operations,\n");
+    out.push_str("    });\n");
+    out.push_str("    if let Some(scope) = inner.scope.filter(|s| !s.is_empty()) {\n");
+    out.push_str("        rule[\"scope\"] = serde_json::Value::String(scope);\n");
+    out.push_str("    }\n");
+    out.push_str("    if !r.resource_names.is_empty() {\n");
+    out.push_str(
+        "        rule[\"resourceNames\"] = serde_json::Value::Array(r.resource_names.into_iter().map(serde_json::Value::String).collect());\n",
+    );
+    out.push_str("    }\n");
+    out.push_str("    rule\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `resourceRules`/`excludeResourceRules` delegate wholesale to the separately generated
+/// `gen_named_rule_with_operations_to_json` (the mechanical walker cannot express its embedded
+/// shape); `namespaceSelector`/`objectSelector` delegate to the hand-written
+/// `gen_label_selector_to_json`, inserted unconditionally whenever the `Option` is `Some` —
+/// matching the hand-rolled `gen_match_resources_to_json` this replaces exactly. `matchPolicy`
+/// needs no entry: a plain optional string the mechanical walker already handles correctly.
+fn match_resources_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "namespaceSelector" => Some(
+            "    if let Some(ns) = mc.namespace_selector {\n        obj.insert(\"namespaceSelector\".to_string(), gen_label_selector_to_json(ns));\n    }\n",
+        ),
+        "objectSelector" => Some(
+            "    if let Some(os) = mc.object_selector {\n        obj.insert(\"objectSelector\".to_string(), gen_label_selector_to_json(os));\n    }\n",
+        ),
+        "resourceRules" => Some(
+            "    if !mc.resource_rules.is_empty() {\n        let resource_rules: Vec<serde_json::Value> = mc.resource_rules.into_iter().map(gen_named_rule_with_operations_to_json).collect();\n        obj.insert(\"resourceRules\".to_string(), serde_json::Value::Array(resource_rules));\n    }\n",
+        ),
+        "excludeResourceRules" => Some(
+            "    if !mc.exclude_resource_rules.is_empty() {\n        let exclude_rules: Vec<serde_json::Value> = mc.exclude_resource_rules.into_iter().map(gen_named_rule_with_operations_to_json).collect();\n        obj.insert(\"excludeResourceRules\".to_string(), serde_json::Value::Array(exclude_rules));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_match_resources_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_match_resources(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MATCH_RESOURCES);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MATCH_RESOURCES,
+        message,
+        match_resources_delegated_field,
+        "mc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_match_resources_to_json(mc: ar_v1::MatchResources) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `selector` delegates to the hand-written `gen_label_selector_to_json`, inserted unconditionally
+/// whenever the `Option` is `Some` — matching the hand-rolled `gen_param_ref_to_json` this
+/// replaces exactly. `name`/`namespace`/`parameterNotFoundAction` need no entry: plain optional
+/// strings the mechanical walker already handles correctly.
+fn param_ref_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "selector" => Some(
+            "    if let Some(sel) = pr.selector {\n        m.insert(\"selector\".to_string(), gen_label_selector_to_json(sel));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_param_ref_to_json`, replacing the hand-rolled function of the same name.
+pub fn generate_param_ref(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, PARAM_REF);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        PARAM_REF,
+        message,
+        param_ref_delegated_field,
+        "pr",
+        "m",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_param_ref_to_json(pr: ar_v1::ParamRef) -> serde_json::Value {\n");
+    out.push_str("    let mut m = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(m)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Shared delegate table for `ValidatingWebhook`/`MutatingWebhook`, which declare the identical
+/// field set for everything this table overrides (`MutatingWebhook`'s one extra field,
+/// `reinvocationPolicy`, is a plain optional string the mechanical walker's own omit-if-empty
+/// default already reproduces correctly, so it needs no entry here). `name` is unconditionally
+/// emitted; `clientConfig` always inserts (defaulting to `{}` when unset); `rules`/
+/// `admissionReviewVersions` are unconditionally emitted arrays (upstream has no `omitempty` on
+/// either); `timeoutSeconds` needs its zero-filter spelled out; `namespaceSelector`/
+/// `objectSelector` delegate to the hand-written `gen_label_selector_to_json`; `matchConditions`
+/// delegates to the separately generated `gen_match_condition_to_json` — matching the hand-rolled
+/// `gen_validating_webhook_to_json`/`gen_mutating_webhook_to_json` this replaces exactly.
+fn admission_webhook_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "name" => Some(
+            "    entry.insert(\"name\".to_string(), serde_json::Value::String(w.name.unwrap_or_default()));\n",
+        ),
+        "clientConfig" => Some(
+            "    entry.insert(\"clientConfig\".to_string(), w.client_config.map(gen_webhook_client_config_to_json).unwrap_or(serde_json::json!({})));\n",
+        ),
+        "rules" => Some(
+            "    {\n        let rules: Vec<serde_json::Value> = w.rules.into_iter().map(gen_rule_with_operations_to_json).collect();\n        entry.insert(\"rules\".to_string(), serde_json::Value::Array(rules));\n    }\n",
+        ),
+        "timeoutSeconds" => Some(
+            "    if let Some(v) = w.timeout_seconds.filter(|&v| v != 0) {\n        entry.insert(\"timeoutSeconds\".to_string(), serde_json::Value::Number(serde_json::Number::from(v)));\n    }\n",
+        ),
+        "admissionReviewVersions" => Some(
+            "    entry.insert(\"admissionReviewVersions\".to_string(), serde_json::Value::Array(w.admission_review_versions.into_iter().map(serde_json::Value::String).collect()));\n",
+        ),
+        "namespaceSelector" => Some(
+            "    if let Some(ns) = w.namespace_selector {\n        entry.insert(\"namespaceSelector\".to_string(), gen_label_selector_to_json(ns));\n    }\n",
+        ),
+        "objectSelector" => Some(
+            "    if let Some(os) = w.object_selector {\n        entry.insert(\"objectSelector\".to_string(), gen_label_selector_to_json(os));\n    }\n",
+        ),
+        "matchConditions" => Some(
+            "    if !w.match_conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = w.match_conditions.into_iter().map(gen_match_condition_to_json).collect();\n        entry.insert(\"matchConditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_webhook_to_json`, replacing the hand-rolled function of the same
+/// name.
+pub fn generate_validating_webhook(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_WEBHOOK);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_WEBHOOK,
+        message,
+        admission_webhook_delegated_field,
+        "w",
+        "entry",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_webhook_to_json(w: ar_v1::ValidatingWebhook) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut entry = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(entry)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_mutating_webhook_to_json`, replacing the hand-rolled function of the same name —
+/// shares `admission_webhook_delegated_field` with `generate_validating_webhook` (see that
+/// function's doc for why `reinvocationPolicy` needs no entry of its own here).
+pub fn generate_mutating_webhook(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATING_WEBHOOK);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATING_WEBHOOK,
+        message,
+        admission_webhook_delegated_field,
+        "w",
+        "entry",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_mutating_webhook_to_json(w: ar_v1::MutatingWebhook) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut entry = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(entry)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `Webhooks` (declared
+/// capitalised in the vendored proto — see `json_key`'s leading-capital-lowering rule) is
+/// unconditionally emitted (upstream has no `omitempty` on it — matches the existing
+/// `..._omits_no_nulls_on_all_default_input` test's expectation of `"webhooks": []`, never an
+/// absent key), delegating to the separately generated `gen_validating_webhook_to_json`.
+fn validating_webhook_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(vwc.metadata.unwrap_or_default()));\n",
+        ),
+        "Webhooks" => Some(
+            "    {\n        let webhooks: Vec<serde_json::Value> = vwc.webhooks.into_iter().map(gen_validating_webhook_to_json).collect();\n        obj.insert(\"webhooks\".to_string(), serde_json::Value::Array(webhooks));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_webhook_configuration_to_json`, replacing the message-walking body of
+/// the hand-rolled `decode_validatingwebhookconfiguration_proto_gen` this migration retires (the
+/// entry point itself stays hand-written — see `generate_namespace`'s doc for why;
+/// `ValidatingWebhookConfiguration` has no `encode_validatingwebhookconfiguration_proto_gen` today,
+/// so this is decode-only in the same sense).
+pub fn generate_validating_webhook_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_WEBHOOK_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_WEBHOOK_CONFIGURATION,
+        message,
+        validating_webhook_configuration_delegated_field,
+        "vwc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_webhook_configuration_to_json(vwc: ar_v1::ValidatingWebhookConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata`/`Webhooks` delegate for the same reasons `validating_webhook_configuration_delegated_field`'s
+/// own entries document — `MutatingWebhookConfiguration` shares the identical shape one level down
+/// (`MutatingWebhook` instead of `ValidatingWebhook`).
+fn mutating_webhook_configuration_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(mwc.metadata.unwrap_or_default()));\n",
+        ),
+        "Webhooks" => Some(
+            "    {\n        let webhooks: Vec<serde_json::Value> = mwc.webhooks.into_iter().map(gen_mutating_webhook_to_json).collect();\n        obj.insert(\"webhooks\".to_string(), serde_json::Value::Array(webhooks));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_mutating_webhook_configuration_to_json`, replacing the message-walking body of
+/// the hand-rolled `decode_mutatingwebhookconfiguration_proto_gen` this migration retires (the
+/// entry point itself stays hand-written — see `generate_namespace`'s doc for why;
+/// `MutatingWebhookConfiguration` has no `encode_mutatingwebhookconfiguration_proto_gen` today, so
+/// this is decode-only in the same sense).
+pub fn generate_mutating_webhook_configuration(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATING_WEBHOOK_CONFIGURATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATING_WEBHOOK_CONFIGURATION,
+        message,
+        mutating_webhook_configuration_delegated_field,
+        "mwc",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_mutating_webhook_configuration_to_json(mwc: ar_v1::MutatingWebhookConfiguration) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `Expression` (declared capitalised in the vendored proto — see `json_key`'s leading-capital
+/// -lowering rule) is unconditionally emitted, matching the hand-rolled `gen_vap_spec_to_json`'s
+/// inline `validations` mapping this replaces — this is one of the two CEL expression fields
+/// `admission.rs`'s evaluator reads directly (`spec.validations[].expression`). `message`/`reason`/
+/// `messageExpression` need no entry: plain optional strings the mechanical walker already handles
+/// correctly.
+fn validation_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "Expression" => Some(
+            "    entry.insert(\"expression\".to_string(), serde_json::Value::String(v.expression.unwrap_or_default()));\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validation_to_json`, replacing the inline `validations` mapping the hand-rolled
+/// `gen_vap_spec_to_json` built directly.
+pub fn generate_validation(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATION,
+        message,
+        validation_delegated_field,
+        "v",
+        "entry",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_validation_to_json(v: ar_v1::Validation) -> serde_json::Value {\n");
+    out.push_str("    let mut entry = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(entry)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Generates `gen_type_checking_to_json`, replacing the inline `typeChecking` handling the
+/// hand-rolled `gen_vap_status_to_json` built directly. Returns `Option` (not a bare `Value`) —
+/// the same "drop entirely rather than emit an empty wrapper" shape `delegated_field_templates`'s
+/// VolumeSource entries use — because the hand-rolled status builder only ever inserts the
+/// `typeChecking` key when `expressionWarnings` is non-empty, even though `TypeChecking` itself is
+/// present as soon as the *outer* `Option<TypeChecking>` is `Some`; the mechanical walker has no
+/// way to express "conditionally drop based on an inner field", so `type_checking`'s own delegate
+/// entry in `vap_status_delegated_field` calls this and only inserts on `Some`.
+pub fn generate_type_checking(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, TYPE_CHECKING);
+    let fields: Vec<&str> = message.field.iter().map(|f| f.name()).collect();
+    assert_eq!(
+        fields,
+        vec!["expressionWarnings"],
+        "TypeChecking field shape changed — update generate_type_checking"
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_type_checking_to_json(tc: ar_v1::TypeChecking) -> Option<serde_json::Value> {\n",
+    );
+    out.push_str("    if tc.expression_warnings.is_empty() {\n");
+    out.push_str("        return None;\n");
+    out.push_str("    }\n");
+    out.push_str(
+        "    let warns: Vec<serde_json::Value> = tc.expression_warnings.into_iter().map(gen_expression_warning_to_json).collect();\n",
+    );
+    out.push_str("    Some(serde_json::json!({ \"expressionWarnings\": warns }))\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `type`/`status` are unconditionally emitted; `lastTransitionTime` only when its seconds are
+/// positive; `observedGeneration` only when non-zero — matching the hand-rolled
+/// `gen_vap_status_to_json`'s inline `conditions` mapping this replaces exactly (a different
+/// convention than `apiservice_status_delegated_field`'s own `meta_v1::Condition` mapping, which
+/// omits `type`/`status` when empty — the two Kinds' pre-migration hand-written code genuinely
+/// disagreed here, and this migration preserves each one's own behaviour rather than unifying
+/// them). `reason`/`message` need no entry: plain optional strings the mechanical walker already
+/// handles correctly.
+fn vap_condition_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "type" => Some(
+            "    cm.insert(\"type\".to_string(), serde_json::Value::String(c.r#type.unwrap_or_default()));\n",
+        ),
+        "status" => Some(
+            "    cm.insert(\"status\".to_string(), serde_json::Value::String(c.status.unwrap_or_default()));\n",
+        ),
+        "lastTransitionTime" => Some(
+            "    if let Some(secs) = c.last_transition_time.and_then(|t| t.seconds).filter(|&s| s > 0) {\n        cm.insert(\"lastTransitionTime\".to_string(), serde_json::Value::String(crate::util::secs_to_rfc3339(secs)));\n    }\n",
+        ),
+        "observedGeneration" => Some(
+            "    if let Some(og) = c.observed_generation.filter(|&g| g != 0) {\n        cm.insert(\"observedGeneration\".to_string(), og.into());\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_vap_condition_to_json`, replacing the inline `conditions` mapping the hand-rolled
+/// `gen_vap_status_to_json` built directly.
+pub fn generate_vap_condition(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, META_CONDITION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        META_CONDITION,
+        message,
+        vap_condition_delegated_field,
+        "c",
+        "cm",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_vap_condition_to_json(c: meta_v1::Condition) -> serde_json::Value {\n");
+    out.push_str("    let mut cm = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(cm)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `matchConstraints`/`paramKind` delegate to their own separately generated converters, inserted
+/// unconditionally whenever the `Option` is `Some`; `validations`/`auditAnnotations`/
+/// `matchConditions`/`variables` are arrays only emitted when non-empty, each delegating to its
+/// own per-element generated converter — matching the hand-rolled `gen_vap_spec_to_json` this
+/// replaces exactly. `failurePolicy` needs no entry: a plain optional string the mechanical walker
+/// already handles correctly.
+fn vap_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "matchConstraints" => Some(
+            "    if let Some(mc) = spec.match_constraints {\n        obj.insert(\"matchConstraints\".to_string(), gen_match_resources_to_json(mc));\n    }\n",
+        ),
+        "paramKind" => Some(
+            "    if let Some(pk) = spec.param_kind {\n        obj.insert(\"paramKind\".to_string(), gen_param_kind_to_json(pk));\n    }\n",
+        ),
+        "validations" => Some(
+            "    if !spec.validations.is_empty() {\n        let vals: Vec<serde_json::Value> = spec.validations.into_iter().map(gen_validation_to_json).collect();\n        obj.insert(\"validations\".to_string(), serde_json::Value::Array(vals));\n    }\n",
+        ),
+        "auditAnnotations" => Some(
+            "    if !spec.audit_annotations.is_empty() {\n        let anns: Vec<serde_json::Value> = spec.audit_annotations.into_iter().map(gen_audit_annotation_to_json).collect();\n        obj.insert(\"auditAnnotations\".to_string(), serde_json::Value::Array(anns));\n    }\n",
+        ),
+        "matchConditions" => Some(
+            "    if !spec.match_conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = spec.match_conditions.into_iter().map(gen_match_condition_to_json).collect();\n        obj.insert(\"matchConditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        "variables" => Some(
+            "    if !spec.variables.is_empty() {\n        let vars: Vec<serde_json::Value> = spec.variables.into_iter().map(gen_variable_to_json).collect();\n        obj.insert(\"variables\".to_string(), serde_json::Value::Array(vars));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_admission_policy_spec_to_json`, replacing the hand-rolled
+/// `gen_vap_spec_to_json`.
+pub fn generate_validating_admission_policy_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_ADMISSION_POLICY_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_ADMISSION_POLICY_SPEC,
+        message,
+        vap_spec_delegated_field,
+        "spec",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_admission_policy_spec_to_json(spec: ar_v1::ValidatingAdmissionPolicySpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `observedGeneration` needs its zero-filter spelled out; `typeChecking` delegates to the
+/// separately generated (`Option`-returning) `gen_type_checking_to_json`, only inserting on
+/// `Some`; `conditions` is an array only emitted when non-empty, delegating to the separately
+/// generated `gen_vap_condition_to_json` — matching the hand-rolled `gen_vap_status_to_json` this
+/// replaces exactly.
+fn vap_status_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "observedGeneration" => Some(
+            "    if let Some(og) = status.observed_generation.filter(|&v| v != 0) {\n        obj.insert(\"observedGeneration\".to_string(), serde_json::Value::Number(og.into()));\n    }\n",
+        ),
+        "typeChecking" => Some(
+            "    if let Some(tc) = status.type_checking {\n        if let Some(j) = gen_type_checking_to_json(tc) {\n            obj.insert(\"typeChecking\".to_string(), j);\n        }\n    }\n",
+        ),
+        "conditions" => Some(
+            "    if !status.conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = status.conditions.into_iter().map(gen_vap_condition_to_json).collect();\n        obj.insert(\"conditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_admission_policy_status_to_json`, replacing the hand-rolled
+/// `gen_vap_status_to_json`.
+pub fn generate_validating_admission_policy_status(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_ADMISSION_POLICY_STATUS);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_ADMISSION_POLICY_STATUS,
+        message,
+        vap_status_delegated_field,
+        "status",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_admission_policy_status_to_json(status: ar_v1::ValidatingAdmissionPolicyStatus) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_validating_admission_policy_spec_to_json`, inserted
+/// unconditionally whenever the `Option` is `Some` (never gated on the resulting object's
+/// emptiness). `status` delegates to `gen_validating_admission_policy_status_to_json`, but —
+/// unlike `spec` — only inserts the key when the resulting object is also non-empty: matching the
+/// hand-rolled `decode_validatingadmissionpolicy_proto_gen` this migration retires exactly, which
+/// treats `spec`/`status` differently from each other on purpose (an empty `status: {}` on a
+/// brand-new policy would otherwise look like "already reconciled" to a controller checking
+/// `status != null`).
+fn validating_admission_policy_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(vap.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = vap.spec {\n        obj.insert(\"spec\".to_string(), gen_validating_admission_policy_spec_to_json(spec));\n    }\n",
+        ),
+        "status" => Some(
+            "    if let Some(status) = vap.status {\n        let status_json = gen_validating_admission_policy_status_to_json(status);\n        if status_json.as_object().is_some_and(|m| !m.is_empty()) {\n            obj.insert(\"status\".to_string(), status_json);\n        }\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_admission_policy_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_validatingadmissionpolicy_proto_gen` this migration retires (the entry
+/// point itself stays hand-written — see `generate_namespace`'s doc for why;
+/// `ValidatingAdmissionPolicy` has no `encode_validatingadmissionpolicy_proto_gen` today, so this
+/// is decode-only in the same sense).
+pub fn generate_validating_admission_policy(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_ADMISSION_POLICY);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_ADMISSION_POLICY,
+        message,
+        validating_admission_policy_delegated_field,
+        "vap",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_admission_policy_to_json(vap: ar_v1::ValidatingAdmissionPolicy) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `paramRef`/`matchResources` delegate to their own separately generated converters, inserted
+/// unconditionally whenever the `Option` is `Some` — matching the hand-rolled
+/// `decode_validatingadmissionpolicybinding_proto_gen` this migration retires exactly.
+/// `policyName` needs no entry (a plain optional string); `validationActions` needs no entry
+/// either — a `repeated string` with no per-element structure, so the mechanical walker's own
+/// omit-if-empty default already reproduces the hand-rolled `if !empty { ... }` guard exactly.
+fn vap_binding_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "paramRef" => Some(
+            "    if let Some(pr) = spec.param_ref {\n        obj.insert(\"paramRef\".to_string(), gen_param_ref_to_json(pr));\n    }\n",
+        ),
+        "matchResources" => Some(
+            "    if let Some(mr) = spec.match_resources {\n        obj.insert(\"matchResources\".to_string(), gen_match_resources_to_json(mr));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_admission_policy_binding_spec_to_json`, replacing the inline `spec`
+/// assembly block the hand-rolled `decode_validatingadmissionpolicybinding_proto_gen` built
+/// directly.
+pub fn generate_validating_admission_policy_binding_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_ADMISSION_POLICY_BINDING_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_ADMISSION_POLICY_BINDING_SPEC,
+        message,
+        vap_binding_spec_delegated_field,
+        "spec",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_admission_policy_binding_spec_to_json(spec: ar_v1::ValidatingAdmissionPolicyBindingSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_validating_admission_policy_binding_spec_to_json`, inserted
+/// unconditionally whenever the `Option` is `Some` — matching the hand-rolled
+/// `decode_validatingadmissionpolicybinding_proto_gen` this migration retires exactly.
+fn validating_admission_policy_binding_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(binding.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = binding.spec {\n        obj.insert(\"spec\".to_string(), gen_validating_admission_policy_binding_spec_to_json(spec));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_validating_admission_policy_binding_to_json`, replacing the message-walking body
+/// of the hand-rolled `decode_validatingadmissionpolicybinding_proto_gen` this migration retires
+/// (the entry point itself stays hand-written — see `generate_namespace`'s doc for why;
+/// `ValidatingAdmissionPolicyBinding` has no `encode_validatingadmissionpolicybinding_proto_gen`
+/// today, so this is decode-only in the same sense).
+pub fn generate_validating_admission_policy_binding(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, VALIDATING_ADMISSION_POLICY_BINDING);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        VALIDATING_ADMISSION_POLICY_BINDING,
+        message,
+        validating_admission_policy_binding_delegated_field,
+        "binding",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_validating_admission_policy_binding_to_json(binding: ar_v1::ValidatingAdmissionPolicyBinding) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `patchType` is unconditionally emitted; `applyConfiguration`/`jsonPatch` delegate to their own
+/// separately generated converters, inserted unconditionally whenever the `Option` is `Some` —
+/// matching the hand-rolled `gen_map_spec_to_json`'s inline `mutations` mapping this replaces
+/// exactly. `applyConfiguration.expression`/`jsonPatch.expression` are the other two CEL
+/// expression fields `admission.rs`'s mutation-evaluation path reads.
+fn mutation_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "patchType" => Some(
+            "    entry.insert(\"patchType\".to_string(), serde_json::Value::String(m.patch_type.unwrap_or_default()));\n",
+        ),
+        "applyConfiguration" => Some(
+            "    if let Some(ac) = m.apply_configuration {\n        entry.insert(\"applyConfiguration\".to_string(), gen_apply_configuration_to_json(ac));\n    }\n",
+        ),
+        "jsonPatch" => Some(
+            "    if let Some(jp) = m.json_patch {\n        entry.insert(\"jsonPatch\".to_string(), gen_json_patch_to_json(jp));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_mutation_to_json`, replacing the inline `mutations` mapping the hand-rolled
+/// `gen_map_spec_to_json` built directly.
+pub fn generate_mutation(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATION);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATION,
+        message,
+        mutation_delegated_field,
+        "m",
+        "entry",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str("fn gen_mutation_to_json(m: ar_v1::Mutation) -> serde_json::Value {\n");
+    out.push_str("    let mut entry = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(entry)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `matchConstraints`/`paramKind` delegate to their own separately generated converters, inserted
+/// unconditionally whenever the `Option` is `Some`; `variables`/`mutations`/`matchConditions` are
+/// arrays only emitted when non-empty, each delegating to its own per-element generated converter
+/// — matching the hand-rolled `gen_map_spec_to_json` this replaces exactly. `failurePolicy`/
+/// `reinvocationPolicy` need no entry: plain optional strings the mechanical walker already
+/// handles correctly.
+fn map_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "matchConstraints" => Some(
+            "    if let Some(mc) = spec.match_constraints {\n        obj.insert(\"matchConstraints\".to_string(), gen_match_resources_to_json(mc));\n    }\n",
+        ),
+        "paramKind" => Some(
+            "    if let Some(pk) = spec.param_kind {\n        obj.insert(\"paramKind\".to_string(), gen_param_kind_to_json(pk));\n    }\n",
+        ),
+        "variables" => Some(
+            "    if !spec.variables.is_empty() {\n        let vars: Vec<serde_json::Value> = spec.variables.into_iter().map(gen_variable_to_json).collect();\n        obj.insert(\"variables\".to_string(), serde_json::Value::Array(vars));\n    }\n",
+        ),
+        "mutations" => Some(
+            "    if !spec.mutations.is_empty() {\n        let muts: Vec<serde_json::Value> = spec.mutations.into_iter().map(gen_mutation_to_json).collect();\n        obj.insert(\"mutations\".to_string(), serde_json::Value::Array(muts));\n    }\n",
+        ),
+        "matchConditions" => Some(
+            "    if !spec.match_conditions.is_empty() {\n        let conds: Vec<serde_json::Value> = spec.match_conditions.into_iter().map(gen_match_condition_to_json).collect();\n        obj.insert(\"matchConditions\".to_string(), serde_json::Value::Array(conds));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_mutating_admission_policy_spec_to_json`, replacing the hand-rolled
+/// `gen_map_spec_to_json`.
+pub fn generate_mutating_admission_policy_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATING_ADMISSION_POLICY_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATING_ADMISSION_POLICY_SPEC,
+        message,
+        map_spec_delegated_field,
+        "spec",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_mutating_admission_policy_spec_to_json(spec: ar_v1::MutatingAdmissionPolicySpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_mutating_admission_policy_spec_to_json`, inserted unconditionally
+/// whenever the `Option` is `Some` — matching the hand-rolled `decode_mutatingadmissionpolicy_proto_gen`
+/// this migration retires exactly.
+fn mutating_admission_policy_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(map_obj.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = map_obj.spec {\n        obj.insert(\"spec\".to_string(), gen_mutating_admission_policy_spec_to_json(spec));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_mutating_admission_policy_to_json`, replacing the message-walking body of the
+/// hand-rolled `decode_mutatingadmissionpolicy_proto_gen` this migration retires (the entry point
+/// itself stays hand-written — see `generate_namespace`'s doc for why; `MutatingAdmissionPolicy`
+/// has no `encode_mutatingadmissionpolicy_proto_gen` today, so this is decode-only in the same
+/// sense).
+pub fn generate_mutating_admission_policy(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATING_ADMISSION_POLICY);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATING_ADMISSION_POLICY,
+        message,
+        mutating_admission_policy_delegated_field,
+        "map_obj",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_mutating_admission_policy_to_json(map_obj: ar_v1::MutatingAdmissionPolicy) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `paramRef`/`matchResources` delegate to their own separately generated converters, inserted
+/// unconditionally whenever the `Option` is `Some` — matching the hand-rolled
+/// `decode_mutatingadmissionpolicybinding_proto_gen` this migration retires exactly. `policyName`
+/// needs no entry: a plain optional string the mechanical walker already handles correctly. Unlike
+/// `ValidatingAdmissionPolicyBindingSpec`, this message has no `validationActions` field.
+fn map_binding_spec_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "paramRef" => Some(
+            "    if let Some(pr) = spec.param_ref {\n        obj.insert(\"paramRef\".to_string(), gen_param_ref_to_json(pr));\n    }\n",
+        ),
+        "matchResources" => Some(
+            "    if let Some(mr) = spec.match_resources {\n        obj.insert(\"matchResources\".to_string(), gen_match_resources_to_json(mr));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_mutating_admission_policy_binding_spec_to_json`, replacing the inline `spec`
+/// assembly block the hand-rolled `decode_mutatingadmissionpolicybinding_proto_gen` built directly.
+pub fn generate_mutating_admission_policy_binding_spec(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATING_ADMISSION_POLICY_BINDING_SPEC);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATING_ADMISSION_POLICY_BINDING_SPEC,
+        message,
+        map_binding_spec_delegated_field,
+        "spec",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_mutating_admission_policy_binding_spec_to_json(spec: ar_v1::MutatingAdmissionPolicyBindingSpec) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// `metadata` delegates for the same reason as every other Kind in this file. `spec` delegates to
+/// the separately generated `gen_mutating_admission_policy_binding_spec_to_json`, inserted
+/// unconditionally whenever the `Option` is `Some` — matching the hand-rolled
+/// `decode_mutatingadmissionpolicybinding_proto_gen` this migration retires exactly.
+fn mutating_admission_policy_binding_delegated_field(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "metadata" => Some(
+            "    obj.insert(\"metadata\".to_string(), gen_object_meta_to_json(binding.metadata.unwrap_or_default()));\n",
+        ),
+        "spec" => Some(
+            "    if let Some(spec) = binding.spec {\n        obj.insert(\"spec\".to_string(), gen_mutating_admission_policy_binding_spec_to_json(spec));\n    }\n",
+        ),
+        _ => None,
+    }
+}
+
+/// Generates `gen_mutating_admission_policy_binding_to_json`, replacing the message-walking body
+/// of the hand-rolled `decode_mutatingadmissionpolicybinding_proto_gen` this migration retires
+/// (the entry point itself stays hand-written — see `generate_namespace`'s doc for why;
+/// `MutatingAdmissionPolicyBinding` has no `encode_mutatingadmissionpolicybinding_proto_gen` today,
+/// so this is decode-only in the same sense).
+pub fn generate_mutating_admission_policy_binding(descriptor_bytes: &[u8]) -> String {
+    let set = FileDescriptorSet::decode(descriptor_bytes)
+        .expect("descriptor set emitted by build.rs must decode");
+    let message = find_message(&set, MUTATING_ADMISSION_POLICY_BINDING);
+    let encode_stmts = generate_message_encode_only(
+        &set,
+        MUTATING_ADMISSION_POLICY_BINDING,
+        message,
+        mutating_admission_policy_binding_delegated_field,
+        "binding",
+        "obj",
+    );
+
+    let mut out = String::new();
+    out.push_str("// @generated by crates/apiserver/build/codegen.rs — do not hand-edit.\n");
+    out.push_str("// Regenerated on every `cargo build -p u7s-apiserver`.\n\n");
+    out.push_str(
+        "fn gen_mutating_admission_policy_binding_to_json(binding: ar_v1::MutatingAdmissionPolicyBinding) -> serde_json::Value {\n",
+    );
+    out.push_str("    let mut obj = serde_json::Map::new();\n");
+    out.push_str(&encode_stmts);
+    out.push_str("    serde_json::Value::Object(obj)\n");
+    out.push_str("}\n");
+    out
+}
