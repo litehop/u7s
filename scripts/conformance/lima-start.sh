@@ -195,9 +195,13 @@ if [ -d "$VM_DIR" ]; then
   # OWN recorded config (not a hardcoded address — the user-v2 subnet is
   # DHCP-assigned) and fail loud instead of silently reusing a VM that can never
   # reach another node, which otherwise surfaces as a cryptic `ip route` failure
-  # much later in this script.
-  if grep -q '^networks:' "$LIMA_YAML" && ! grep -q '^networks:' "$VM_DIR/lima.yaml" 2>/dev/null; then
-    echo "error: $VM_NAME predates the current lima/kubelet.yaml network config (no 'networks:' recorded at its creation)." >&2
+  # much later in this script. Compares the recorded network *name*, not just
+  # presence of the key — a VM created with `--network user-v2-workers-a` and
+  # later re-run without that flag would otherwise pass a presence-only check
+  # while silently staying partitioned differently than this invocation wants.
+  RECORDED_NETWORK=$(awk '/^networks:/{f=1;next} f&&/lima:/{print $NF;exit}' "$VM_DIR/lima.yaml" 2>/dev/null || true)
+  if grep -q '^networks:' "$LIMA_YAML" && [ "$RECORDED_NETWORK" != "$NETWORK" ]; then
+    echo "error: $VM_NAME predates the current lima/kubelet.yaml network config (recorded network: '${RECORDED_NETWORK:-none}', requested: '$NETWORK')." >&2
     echo "  Fix: limactl delete $VM_NAME   (or re-run with --reset, which now recreates a named --extra-node too)" >&2
     exit 1
   fi
@@ -920,6 +924,18 @@ PEERS=$(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*
 THIS_NODE_IP=$(limactl shell "$VM_NAME" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
 for PEER in $PEERS; do
   [ "$PEER" = "$VM_NAME" ] && continue
+  # Separate Lima networks are separate L2 segments with no path between them —
+  # a route programmed across a network boundary can never actually deliver a
+  # packet, it just fails silently later as "Host is unreachable". Compare each
+  # VM's OWN recorded network (not the current invocation's $NETWORK, which only
+  # describes $VM_NAME) so a cross-network pairing fails loud here instead of
+  # producing that unreachable route.
+  THIS_NET=$(awk '/^networks:/{f=1;next} f&&/lima:/{print $NF;exit}' "${HOME}/.lima/${VM_NAME}/lima.yaml")
+  PEER_NET=$(awk '/^networks:/{f=1;next} f&&/lima:/{print $NF;exit}' "${HOME}/.lima/${PEER}/lima.yaml")
+  if [ "$THIS_NET" != "$PEER_NET" ]; then
+    echo "error: ${VM_NAME} is on network '${THIS_NET}' but peer '${PEER}' is on '${PEER_NET}' — no L2 path exists between separate Lima networks, refusing to program an unreachable route" >&2
+    exit 1
+  fi
   PEER_IP=$(limactl shell "$PEER" ip -4 addr show scope global 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
   PEER_SUBNET=$(limactl shell "$PEER" sudo jq -r '.plugins[0].ipam.ranges[0][0].subnet' /etc/cni/net.d/10-crio-bridge.conflist 2>/dev/null || true)
   if [ -z "$PEER_IP" ] || [ -z "$PEER_SUBNET" ] || [ -z "$THIS_NODE_IP" ]; then
