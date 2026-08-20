@@ -322,6 +322,86 @@ fn main() {
         codegen::generate_controllerrevision(descriptor_bytes),
     )
     .expect("failed to write generated ControllerRevision codec");
+    std::fs::write(
+        out_dir.join("validation_rule_gen.rs"),
+        codegen::generate_validation_rule(descriptor_bytes),
+    )
+    .expect("failed to write generated ValidationRule codec");
+    std::fs::write(
+        out_dir.join("json_schema_props_gen.rs"),
+        codegen::generate_json_schema_props(descriptor_bytes),
+    )
+    .expect("failed to write generated JSONSchemaProps codec");
+    std::fs::write(
+        out_dir.join("crd_names_gen.rs"),
+        codegen::generate_crd_names(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceDefinitionNames codec");
+    std::fs::write(
+        out_dir.join("printer_column_gen.rs"),
+        codegen::generate_printer_column(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceColumnDefinition codec");
+    std::fs::write(
+        out_dir.join("selectable_field_gen.rs"),
+        codegen::generate_selectable_field(descriptor_bytes),
+    )
+    .expect("failed to write generated SelectableField codec");
+    std::fs::write(
+        out_dir.join("service_reference_gen.rs"),
+        codegen::generate_service_reference(descriptor_bytes),
+    )
+    .expect("failed to write generated ServiceReference codec");
+    std::fs::write(
+        out_dir.join("webhook_client_config_gen.rs"),
+        codegen::generate_webhook_client_config(descriptor_bytes),
+    )
+    .expect("failed to write generated WebhookClientConfig codec");
+    std::fs::write(
+        out_dir.join("webhook_conversion_gen.rs"),
+        codegen::generate_webhook_conversion(descriptor_bytes),
+    )
+    .expect("failed to write generated WebhookConversion codec");
+    std::fs::write(
+        out_dir.join("crd_conversion_gen.rs"),
+        codegen::generate_crd_conversion(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceConversion codec");
+    std::fs::write(
+        out_dir.join("subresource_scale_gen.rs"),
+        codegen::generate_subresource_scale(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceSubresourceScale codec");
+    std::fs::write(
+        out_dir.join("subresources_gen.rs"),
+        codegen::generate_subresources(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceSubresources codec");
+    std::fs::write(
+        out_dir.join("crd_version_gen.rs"),
+        codegen::generate_crd_version(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceDefinitionVersion codec");
+    std::fs::write(
+        out_dir.join("crd_status_gen.rs"),
+        codegen::generate_crd_status(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceDefinitionStatus codec");
+    std::fs::write(
+        out_dir.join("crd_spec_gen.rs"),
+        codegen::generate_crd_spec(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceDefinitionSpec codec");
+    std::fs::write(
+        out_dir.join("crd_gen.rs"),
+        codegen::generate_crd(descriptor_bytes),
+    )
+    .expect("failed to write generated CustomResourceDefinition codec");
+    std::fs::write(
+        out_dir.join("delete_options_gen.rs"),
+        codegen::generate_delete_options(descriptor_bytes),
+    )
+    .expect("failed to write generated DeleteOptions codec");
 
     println!(
         "cargo:rerun-if-changed={}",

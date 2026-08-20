@@ -13,708 +13,75 @@ fn gen_json_raw_to_value(j: apiext_v1::Json) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn gen_json_schema_props_to_json(schema: apiext_v1::JsonSchemaProps) -> serde_json::Value {
-    let mut m = serde_json::Map::with_capacity(32);
-
-    if let Some(v) = schema.r#type.filter(|s| !s.is_empty()) {
-        m.insert("type".to_string(), serde_json::Value::String(v));
+/// `lastTransitionTime` needs the same `Time`-opaque-scalar RFC3339 conversion
+/// `gen_apiservice_condition_to_json` (apiregistration_gen_adapter.rs) keeps hand-written for —
+/// no descriptor-derivable shape can express "seconds since epoch -> RFC3339 string", so this one
+/// small function stays hand-written rather than generated, by the same design as every other
+/// `OPAQUE_MESSAGES`-adjacent scalar helper in this codegen effort.
+fn gen_crd_condition_to_json(c: apiext_v1::CustomResourceDefinitionCondition) -> serde_json::Value {
+    let mut cm = serde_json::json!({
+        "type": c.r#type.unwrap_or_default(),
+        "status": c.status.unwrap_or_default(),
+    });
+    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+        cm["reason"] = v.into();
     }
-    if let Some(v) = schema.description.filter(|s| !s.is_empty()) {
-        m.insert("description".to_string(), serde_json::Value::String(v));
+    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+        cm["message"] = v.into();
     }
-    if let Some(v) = schema.format.filter(|s| !s.is_empty()) {
-        m.insert("format".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = schema.title.filter(|s| !s.is_empty()) {
-        m.insert("title".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = schema.r#ref.filter(|s| !s.is_empty()) {
-        m.insert("$ref".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = schema.id.filter(|s| !s.is_empty()) {
-        m.insert("id".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = schema.schema.filter(|s| !s.is_empty()) {
-        m.insert("$schema".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = schema.pattern.filter(|s| !s.is_empty()) {
-        m.insert("pattern".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = schema.default {
-        let raw = gen_json_raw_to_value(v);
-        if !raw.is_null() {
-            m.insert("default".to_string(), raw);
+    if let Some(t) = c.last_transition_time {
+        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+            cm["lastTransitionTime"] =
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
         }
     }
-    if let Some(v) = schema.maximum {
-        m.insert(
-            "maximum".to_string(),
-            serde_json::Value::Number(
-                serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-        );
+    if let Some(og) = c.observed_generation.filter(|&g| g != 0) {
+        cm["observedGeneration"] = og.into();
     }
-    if let Some(v) = schema.exclusive_maximum.filter(|&b| b) {
-        m.insert("exclusiveMaximum".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = schema.minimum {
-        m.insert(
-            "minimum".to_string(),
-            serde_json::Value::Number(
-                serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-        );
-    }
-    if let Some(v) = schema.exclusive_minimum.filter(|&b| b) {
-        m.insert("exclusiveMinimum".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = schema.max_length {
-        m.insert("maxLength".to_string(), serde_json::Value::Number(v.into()));
-    }
-    if let Some(v) = schema.min_length {
-        m.insert("minLength".to_string(), serde_json::Value::Number(v.into()));
-    }
-    if let Some(v) = schema.max_items {
-        m.insert("maxItems".to_string(), serde_json::Value::Number(v.into()));
-    }
-    if let Some(v) = schema.min_items {
-        m.insert("minItems".to_string(), serde_json::Value::Number(v.into()));
-    }
-    if let Some(v) = schema.unique_items.filter(|&b| b) {
-        m.insert("uniqueItems".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = schema.multiple_of {
-        m.insert(
-            "multipleOf".to_string(),
-            serde_json::Value::Number(
-                serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-        );
-    }
-    if let Some(v) = schema.max_properties {
-        m.insert(
-            "maxProperties".to_string(),
-            serde_json::Value::Number(v.into()),
-        );
-    }
-    if let Some(v) = schema.min_properties {
-        m.insert(
-            "minProperties".to_string(),
-            serde_json::Value::Number(v.into()),
-        );
-    }
-    if let Some(v) = schema.nullable.filter(|&b| b) {
-        m.insert("nullable".to_string(), serde_json::Value::Bool(v));
-    }
-    if let Some(v) = schema.x_kubernetes_preserve_unknown_fields.filter(|&b| b) {
-        m.insert(
-            "x-kubernetes-preserve-unknown-fields".to_string(),
-            serde_json::Value::Bool(v),
-        );
-    }
-    if let Some(v) = schema.x_kubernetes_embedded_resource.filter(|&b| b) {
-        m.insert(
-            "x-kubernetes-embedded-resource".to_string(),
-            serde_json::Value::Bool(v),
-        );
-    }
-    if let Some(v) = schema.x_kubernetes_int_or_string.filter(|&b| b) {
-        m.insert(
-            "x-kubernetes-int-or-string".to_string(),
-            serde_json::Value::Bool(v),
-        );
-    }
-    if let Some(v) = schema.x_kubernetes_list_type.filter(|s| !s.is_empty()) {
-        m.insert(
-            "x-kubernetes-list-type".to_string(),
-            serde_json::Value::String(v),
-        );
-    }
-    if let Some(v) = schema.x_kubernetes_map_type.filter(|s| !s.is_empty()) {
-        m.insert(
-            "x-kubernetes-map-type".to_string(),
-            serde_json::Value::String(v),
-        );
-    }
-    if !schema.x_kubernetes_list_map_keys.is_empty() {
-        m.insert(
-            "x-kubernetes-list-map-keys".to_string(),
-            serde_json::Value::Array(
-                schema
-                    .x_kubernetes_list_map_keys
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !schema.required.is_empty() {
-        m.insert(
-            "required".to_string(),
-            serde_json::Value::Array(
-                schema
-                    .required
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !schema.r#enum.is_empty() {
-        let enum_vals: Vec<serde_json::Value> = schema
-            .r#enum
-            .into_iter()
-            .map(gen_json_raw_to_value)
-            .collect();
-        m.insert("enum".to_string(), serde_json::Value::Array(enum_vals));
-    }
-    if !schema.properties.is_empty() {
-        let props: serde_json::Map<String, serde_json::Value> = schema
-            .properties
-            .into_iter()
-            .map(|(k, v)| (k, gen_json_schema_props_to_json(v)))
-            .collect();
-        m.insert("properties".to_string(), serde_json::Value::Object(props));
-    }
-    if !schema.pattern_properties.is_empty() {
-        let pp: serde_json::Map<String, serde_json::Value> = schema
-            .pattern_properties
-            .into_iter()
-            .map(|(k, v)| (k, gen_json_schema_props_to_json(v)))
-            .collect();
-        m.insert(
-            "patternProperties".to_string(),
-            serde_json::Value::Object(pp),
-        );
-    }
-    if !schema.definitions.is_empty() {
-        let defs: serde_json::Map<String, serde_json::Value> = schema
-            .definitions
-            .into_iter()
-            .map(|(k, v)| (k, gen_json_schema_props_to_json(v)))
-            .collect();
-        m.insert("definitions".to_string(), serde_json::Value::Object(defs));
-    }
-    if !schema.dependencies.is_empty() {
-        let deps: serde_json::Map<String, serde_json::Value> = schema
-            .dependencies
-            .into_iter()
-            .map(|(k, v)| {
-                let mut dep_m = serde_json::Map::new();
-                if let Some(s) = v.schema {
-                    dep_m.insert("schema".to_string(), gen_json_schema_props_to_json(s));
-                }
-                if !v.property.is_empty() {
-                    dep_m.insert(
-                        "property".to_string(),
-                        serde_json::Value::Array(
-                            v.property
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        ),
-                    );
-                }
-                (k, serde_json::Value::Object(dep_m))
-            })
-            .collect();
-        m.insert("dependencies".to_string(), serde_json::Value::Object(deps));
-    }
-    if let Some(boxed) = schema.items {
-        let items_val = if let Some(s) = boxed.schema {
-            gen_json_schema_props_to_json(*s)
-        } else if !boxed.j_son_schemas.is_empty() {
-            serde_json::Value::Array(
-                boxed
-                    .j_son_schemas
-                    .into_iter()
-                    .map(gen_json_schema_props_to_json)
-                    .collect(),
-            )
-        } else {
-            serde_json::Value::Object(serde_json::Map::new())
-        };
-        m.insert("items".to_string(), items_val);
-    }
-    if let Some(boxed) = schema.additional_properties {
-        let ap_val = match (boxed.allows, boxed.schema) {
-            (_, Some(s)) => gen_json_schema_props_to_json(*s),
-            (Some(b), None) => serde_json::Value::Bool(b),
-            (None, None) => serde_json::Value::Object(serde_json::Map::new()),
-        };
-        m.insert("additionalProperties".to_string(), ap_val);
-    }
-    if let Some(boxed) = schema.additional_items {
-        let ai_val = match (boxed.allows, boxed.schema) {
-            (_, Some(s)) => gen_json_schema_props_to_json(*s),
-            (Some(b), None) => serde_json::Value::Bool(b),
-            (None, None) => serde_json::Value::Object(serde_json::Map::new()),
-        };
-        m.insert("additionalItems".to_string(), ai_val);
-    }
-    if !schema.all_of.is_empty() {
-        m.insert(
-            "allOf".to_string(),
-            serde_json::Value::Array(
-                schema
-                    .all_of
-                    .into_iter()
-                    .map(gen_json_schema_props_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if !schema.one_of.is_empty() {
-        m.insert(
-            "oneOf".to_string(),
-            serde_json::Value::Array(
-                schema
-                    .one_of
-                    .into_iter()
-                    .map(gen_json_schema_props_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if !schema.any_of.is_empty() {
-        m.insert(
-            "anyOf".to_string(),
-            serde_json::Value::Array(
-                schema
-                    .any_of
-                    .into_iter()
-                    .map(gen_json_schema_props_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(boxed) = schema.not {
-        m.insert("not".to_string(), gen_json_schema_props_to_json(*boxed));
-    }
-    if let Some(ed) = schema.external_docs {
-        let mut ed_m = serde_json::Map::new();
-        if let Some(d) = ed.description.filter(|s| !s.is_empty()) {
-            ed_m.insert("description".to_string(), serde_json::Value::String(d));
-        }
-        if let Some(u) = ed.url.filter(|s| !s.is_empty()) {
-            ed_m.insert("url".to_string(), serde_json::Value::String(u));
-        }
-        if !ed_m.is_empty() {
-            m.insert("externalDocs".to_string(), serde_json::Value::Object(ed_m));
-        }
-    }
-    if let Some(ex) = schema.example {
-        let raw = gen_json_raw_to_value(ex);
-        if !raw.is_null() {
-            m.insert("example".to_string(), raw);
-        }
-    }
-    if !schema.x_kubernetes_validations.is_empty() {
-        let rules: Vec<serde_json::Value> = schema
-            .x_kubernetes_validations
-            .into_iter()
-            .map(|r| {
-                let mut rm = serde_json::Map::new();
-                if let Some(v) = r.rule.filter(|s| !s.is_empty()) {
-                    rm.insert("rule".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = r.message.filter(|s| !s.is_empty()) {
-                    rm.insert("message".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = r.message_expression.filter(|s| !s.is_empty()) {
-                    rm.insert(
-                        "messageExpression".to_string(),
-                        serde_json::Value::String(v),
-                    );
-                }
-                if let Some(v) = r.reason.filter(|s| !s.is_empty()) {
-                    rm.insert("reason".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
-                    rm.insert("fieldPath".to_string(), serde_json::Value::String(v));
-                }
-                if let Some(v) = r.optional_old_self.filter(|&b| b) {
-                    rm.insert("optionalOldSelf".to_string(), serde_json::Value::Bool(v));
-                }
-                serde_json::Value::Object(rm)
-            })
-            .collect();
-        m.insert(
-            "x-kubernetes-validations".to_string(),
-            serde_json::Value::Array(rules),
-        );
-    }
-
-    serde_json::Value::Object(m)
+    cm
 }
 
-fn gen_crd_names_to_json(names: apiext_v1::CustomResourceDefinitionNames) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = names.plural.filter(|s| !s.is_empty()) {
-        m.insert("plural".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = names.singular.filter(|s| !s.is_empty()) {
-        m.insert("singular".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = names.kind.filter(|s| !s.is_empty()) {
-        m.insert("kind".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = names.list_kind.filter(|s| !s.is_empty()) {
-        m.insert("listKind".to_string(), serde_json::Value::String(v));
-    }
-    if !names.short_names.is_empty() {
-        m.insert(
-            "shortNames".to_string(),
-            serde_json::Value::Array(
-                names
-                    .short_names
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !names.categories.is_empty() {
-        m.insert(
-            "categories".to_string(),
-            serde_json::Value::Array(
-                names
-                    .categories
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_printer_column_to_json(col: apiext_v1::CustomResourceColumnDefinition) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = col.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = col.r#type.filter(|s| !s.is_empty()) {
-        m.insert("type".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = col.json_path.filter(|s| !s.is_empty()) {
-        m.insert("jsonPath".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = col.format.filter(|s| !s.is_empty()) {
-        m.insert("format".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = col.description.filter(|s| !s.is_empty()) {
-        m.insert("description".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = col.priority.filter(|&p| p != 0) {
-        m.insert("priority".to_string(), serde_json::Value::Number(v.into()));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_selectable_field_to_json(f: apiext_v1::SelectableField) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(v) = f.json_path.filter(|s| !s.is_empty()) {
-        m.insert("jsonPath".to_string(), serde_json::Value::String(v));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_subresources_to_json(sr: apiext_v1::CustomResourceSubresources) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if sr.status.is_some() {
-        m.insert("status".to_string(), serde_json::json!({}));
-    }
-    if let Some(scale) = sr.scale {
-        let mut sm = serde_json::Map::new();
-        if let Some(v) = scale.spec_replicas_path.filter(|s| !s.is_empty()) {
-            sm.insert("specReplicasPath".to_string(), serde_json::Value::String(v));
-        }
-        if let Some(v) = scale.status_replicas_path.filter(|s| !s.is_empty()) {
-            sm.insert(
-                "statusReplicasPath".to_string(),
-                serde_json::Value::String(v),
-            );
-        }
-        if let Some(v) = scale.label_selector_path.filter(|s| !s.is_empty()) {
-            sm.insert(
-                "labelSelectorPath".to_string(),
-                serde_json::Value::String(v),
-            );
-        }
-        m.insert("scale".to_string(), serde_json::Value::Object(sm));
-    }
-    serde_json::Value::Object(m)
-}
-
-fn gen_version_to_json(v: apiext_v1::CustomResourceDefinitionVersion) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(name) = v.name.filter(|s| !s.is_empty()) {
-        m.insert("name".to_string(), serde_json::Value::String(name));
-    }
-    m.insert(
-        "served".to_string(),
-        serde_json::Value::Bool(v.served.unwrap_or(false)),
-    );
-    m.insert(
-        "storage".to_string(),
-        serde_json::Value::Bool(v.storage.unwrap_or(false)),
-    );
-    if let Some(dep) = v.deprecated.filter(|&b| b) {
-        m.insert("deprecated".to_string(), serde_json::Value::Bool(dep));
-    }
-    if let Some(dw) = v.deprecation_warning.filter(|s| !s.is_empty()) {
-        m.insert(
-            "deprecationWarning".to_string(),
-            serde_json::Value::String(dw),
-        );
-    }
-    if let Some(schema_wrapper) = v.schema {
-        if let Some(schema) = schema_wrapper.open_apiv3_schema {
-            m.insert(
-                "schema".to_string(),
-                serde_json::json!({
-                    "openAPIV3Schema": gen_json_schema_props_to_json(schema)
-                }),
-            );
-        }
-    }
-    if let Some(sr) = v.subresources {
-        let sr_json = gen_subresources_to_json(sr);
-        if !sr_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-            m.insert("subresources".to_string(), sr_json);
-        }
-    }
-    if !v.additional_printer_columns.is_empty() {
-        m.insert(
-            "additionalPrinterColumns".to_string(),
-            serde_json::Value::Array(
-                v.additional_printer_columns
-                    .into_iter()
-                    .map(gen_printer_column_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    // selectableFields backs the CustomResourceFieldSelectors feature (`kubectl get widgets
-    // --field-selector ...`); dropping it silently strips a client's field-selector
-    // configuration on every protobuf-encoded CRD create/update.
-    if !v.selectable_fields.is_empty() {
-        m.insert(
-            "selectableFields".to_string(),
-            serde_json::Value::Array(
-                v.selectable_fields
-                    .into_iter()
-                    .map(gen_selectable_field_to_json)
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(m)
-}
+// `gen_validation_rule_to_json` through `gen_crd_to_json` below are generated by
+// `build/codegen.rs` from the `.k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1`
+// descriptors — `gen_json_schema_props_to_json` is the one recursive generated function in this
+// codebase (see its `json_schema_props_delegated_field` doc in build/codegen.rs for why
+// `properties`/`allOf`/`oneOf`/`anyOf`/`not`/`items`/`additionalProperties`/`additionalItems`/
+// `dependencies`/`definitions` all delegate to a named recursive call rather than the mechanical
+// walker's inline unrolling). `gen_crd_to_json`'s own `status`/`conditions` fields delegate to the
+// hand-written `gen_crd_condition_to_json` above for the same `Time`-opaque-scalar reason.
+include!(concat!(env!("OUT_DIR"), "/validation_rule_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/json_schema_props_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_names_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/printer_column_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/selectable_field_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/service_reference_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/webhook_client_config_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/webhook_conversion_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_conversion_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/subresource_scale_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/subresources_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_version_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_status_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_spec_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/crd_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/delete_options_gen.rs"));
 
 pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let crd = apiext_v1::CustomResourceDefinition::decode(data).ok()?;
-    let mut meta = gen_object_meta_to_json(crd.metadata.unwrap_or_default());
-    if meta["creationTimestamp"].is_null() {
-        meta["creationTimestamp"] = serde_json::Value::String(String::new());
+    let mut obj = gen_crd_to_json(crd);
+    obj["apiVersion"] = "apiextensions.k8s.io/v1".into();
+    obj["kind"] = "CustomResourceDefinition".into();
+    if obj["metadata"]["creationTimestamp"].is_null() {
+        obj["metadata"]["creationTimestamp"] = serde_json::Value::String(String::new());
     }
-
-    let spec = crd.spec.unwrap_or_default();
-    let mut spec_m = serde_json::Map::with_capacity(7);
-
-    if let Some(g) = spec.group.filter(|s| !s.is_empty()) {
-        spec_m.insert("group".to_string(), serde_json::Value::String(g));
-    }
-    if let Some(s) = spec.scope.filter(|s| !s.is_empty()) {
-        spec_m.insert("scope".to_string(), serde_json::Value::String(s));
-    }
-    if let Some(names) = spec.names {
-        spec_m.insert("names".to_string(), gen_crd_names_to_json(names));
-    }
-    if !spec.versions.is_empty() {
-        spec_m.insert(
-            "versions".to_string(),
-            serde_json::Value::Array(spec.versions.into_iter().map(gen_version_to_json).collect()),
-        );
-    }
-    if let Some(b) = spec.preserve_unknown_fields.filter(|&b| b) {
-        spec_m.insert(
-            "preserveUnknownFields".to_string(),
-            serde_json::Value::Bool(b),
-        );
-    }
-    if let Some(conv) = spec.conversion {
-        let mut cm = serde_json::Map::new();
-        if let Some(strategy) = conv.strategy.filter(|s| !s.is_empty()) {
-            cm.insert("strategy".to_string(), serde_json::Value::String(strategy));
-        }
-        if let Some(wh) = conv.webhook {
-            let mut wm = serde_json::Map::new();
-            if !wh.conversion_review_versions.is_empty() {
-                wm.insert(
-                    "conversionReviewVersions".to_string(),
-                    serde_json::Value::Array(
-                        wh.conversion_review_versions
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            }
-            if let Some(cc) = wh.client_config {
-                let mut ccm = serde_json::Map::new();
-                if let Some(ca) = cc.ca_bundle.filter(|b| !b.is_empty()) {
-                    ccm.insert(
-                        "caBundle".to_string(),
-                        serde_json::Value::String(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &ca,
-                        )),
-                    );
-                }
-                if let Some(url) = cc.url.filter(|s| !s.is_empty()) {
-                    ccm.insert("url".to_string(), serde_json::Value::String(url));
-                }
-                if let Some(svc) = cc.service {
-                    let mut svm = serde_json::Map::new();
-                    if let Some(ns) = svc.namespace.filter(|s| !s.is_empty()) {
-                        svm.insert("namespace".to_string(), serde_json::Value::String(ns));
-                    }
-                    if let Some(name) = svc.name.filter(|s| !s.is_empty()) {
-                        svm.insert("name".to_string(), serde_json::Value::String(name));
-                    }
-                    if let Some(path) = svc.path.filter(|s| !s.is_empty()) {
-                        svm.insert("path".to_string(), serde_json::Value::String(path));
-                    }
-                    if let Some(port) = svc.port {
-                        svm.insert("port".to_string(), serde_json::Value::Number(port.into()));
-                    }
-                    ccm.insert("service".to_string(), serde_json::Value::Object(svm));
-                }
-                if !ccm.is_empty() {
-                    wm.insert("clientConfig".to_string(), serde_json::Value::Object(ccm));
-                }
-            }
-            if !wm.is_empty() {
-                cm.insert("webhook".to_string(), serde_json::Value::Object(wm));
-            }
-        }
-        spec_m.insert("conversion".to_string(), serde_json::Value::Object(cm));
-    }
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "apiextensions.k8s.io/v1",
-        "kind": "CustomResourceDefinition",
-        "metadata": meta,
-        "spec": serde_json::Value::Object(spec_m)
-    });
-
-    // status carries Established/NamesAccepted conditions (and acceptedNames,
-    // storedVersions). Without decoding it, a protobuf status subresource PUT/PATCH
-    // (the typed clientset's default content type for this built-in-shaped resource)
-    // silently drops the client's status entirely — the status subresource conformance
-    // test then reads back an empty conditions list.
-    if let Some(status) = crd.status {
-        let mut status_m = serde_json::Map::new();
-        if !status.conditions.is_empty() {
-            let conds: Vec<serde_json::Value> = status
-                .conditions
-                .into_iter()
-                .map(|c| {
-                    let mut cm = serde_json::json!({
-                        "type": c.r#type.unwrap_or_default(),
-                        "status": c.status.unwrap_or_default(),
-                    });
-                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
-                        cm["reason"] = v.into();
-                    }
-                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
-                        cm["message"] = v.into();
-                    }
-                    if let Some(t) = c.last_transition_time {
-                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] =
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
-                        }
-                    }
-                    if let Some(og) = c.observed_generation.filter(|&g| g != 0) {
-                        cm["observedGeneration"] = og.into();
-                    }
-                    cm
-                })
-                .collect();
-            status_m.insert("conditions".to_string(), serde_json::Value::Array(conds));
-        }
-        if let Some(names) = status.accepted_names {
-            status_m.insert("acceptedNames".to_string(), gen_crd_names_to_json(names));
-        }
-        if !status.stored_versions.is_empty() {
-            status_m.insert(
-                "storedVersions".to_string(),
-                serde_json::Value::Array(
-                    status
-                        .stored_versions
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        // observedGeneration lets the CRDEstablishedController-style reconciler (and clients
-        // polling for spec.versions[].schema changes to take effect) detect a status update is
-        // stale; dropping it made every protobuf-written CRD status look permanently
-        // up-to-date.
-        if let Some(og) = status.observed_generation.filter(|&g| g != 0) {
-            status_m.insert("observedGeneration".to_string(), og.into());
-        }
-        if !status_m.is_empty() {
-            obj["status"] = serde_json::Value::Object(status_m);
-        }
-    }
-
     Some(obj)
 }
 
 pub fn decode_delete_options_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let opts = meta_v1::DeleteOptions::decode(data).ok()?;
-    let mut obj = serde_json::json!({
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "DeleteOptions"
-    });
-    if let Some(policy) = opts.propagation_policy.filter(|s| !s.is_empty()) {
-        obj["propagationPolicy"] = serde_json::Value::String(policy);
-    }
-    if let Some(orphan) = opts.orphan_dependents {
-        obj["orphanDependents"] = serde_json::Value::Bool(orphan);
-    }
-    if let Some(grace) = opts.grace_period_seconds {
-        obj["gracePeriodSeconds"] = serde_json::Value::Number(grace.into());
-    }
-    if !opts.dry_run.is_empty() {
-        obj["dryRun"] = serde_json::Value::Array(
-            opts.dry_run
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-    }
-    // preconditions carries the UID/resourceVersion a client expects the target to still have;
-    // dropping it silently turned every protobuf-encoded conditional delete (client-go's
-    // DeleteOptions{Preconditions: ...}, used by the GC controller to avoid racing a recreate)
-    // into an unconditional one.
-    if let Some(pre) = opts.preconditions {
-        let mut pm = serde_json::Map::new();
-        if let Some(uid) = pre.uid.filter(|s| !s.is_empty()) {
-            pm.insert("uid".to_string(), serde_json::Value::String(uid));
-        }
-        if let Some(rv) = pre.resource_version.filter(|s| !s.is_empty()) {
-            pm.insert("resourceVersion".to_string(), serde_json::Value::String(rv));
-        }
-        if !pm.is_empty() {
-            obj["preconditions"] = serde_json::Value::Object(pm);
-        }
-    }
+    let mut obj = gen_delete_options_to_json(opts);
+    obj["apiVersion"] = "meta.k8s.io/v1".into();
+    obj["kind"] = "DeleteOptions".into();
     Some(obj)
 }
 
@@ -863,7 +230,7 @@ mod tests {
         );
         assert_eq!(
             result["spec"]["versions"][0]["additionalPrinterColumns"][0]["name"], "Size",
-            "printer columns must survive — kubectl get output depends on them"
+            "additionalPrinterColumns[0].name must survive — kubectl get output depends on them"
         );
         assert_eq!(
             result["spec"]["conversion"]["webhook"]["clientConfig"]["service"]["name"],
@@ -1231,6 +598,834 @@ mod tests {
              spurious `orphanDependents: false` or `gracePeriodSeconds: 0` key would be \
              indistinguishable from a client's explicit request to disable orphaning or force \
              immediate deletion"
+        );
+    }
+
+    // ---- Byte-identical audit: codegen migration (apiextensions/v1) ----
+    //
+    // Every function below prefixed `old_` is a verbatim reconstruction of the hand-written
+    // function of the same (unprefixed) name that build/codegen.rs's generated equivalent
+    // replaced — copied here, not deleted, specifically so these tests keep diffing "what the
+    // hand-rolled decoder used to produce" against "what the generated decoder produces today"
+    // forever, even after nobody remembers the hand-rolled version ever existed. A wrong JSON
+    // key, a missing zero/empty-elision guard, or (given this file's recursive JSONSchemaProps)
+    // a broken recursive call would show up here as a JSON mismatch.
+
+    fn old_gen_crd_names_to_json(
+        names: apiext_v1::CustomResourceDefinitionNames,
+    ) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if let Some(v) = names.plural.filter(|s| !s.is_empty()) {
+            m.insert("plural".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = names.singular.filter(|s| !s.is_empty()) {
+            m.insert("singular".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = names.kind.filter(|s| !s.is_empty()) {
+            m.insert("kind".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = names.list_kind.filter(|s| !s.is_empty()) {
+            m.insert("listKind".to_string(), serde_json::Value::String(v));
+        }
+        if !names.short_names.is_empty() {
+            m.insert(
+                "shortNames".to_string(),
+                serde_json::Value::Array(
+                    names
+                        .short_names
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !names.categories.is_empty() {
+            m.insert(
+                "categories".to_string(),
+                serde_json::Value::Array(
+                    names
+                        .categories
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        serde_json::Value::Object(m)
+    }
+
+    fn old_gen_printer_column_to_json(
+        col: apiext_v1::CustomResourceColumnDefinition,
+    ) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if let Some(v) = col.name.filter(|s| !s.is_empty()) {
+            m.insert("name".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = col.r#type.filter(|s| !s.is_empty()) {
+            m.insert("type".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = col.json_path.filter(|s| !s.is_empty()) {
+            m.insert("jsonPath".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = col.format.filter(|s| !s.is_empty()) {
+            m.insert("format".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = col.description.filter(|s| !s.is_empty()) {
+            m.insert("description".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = col.priority.filter(|&p| p != 0) {
+            m.insert("priority".to_string(), serde_json::Value::Number(v.into()));
+        }
+        serde_json::Value::Object(m)
+    }
+
+    fn old_gen_selectable_field_to_json(f: apiext_v1::SelectableField) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if let Some(v) = f.json_path.filter(|s| !s.is_empty()) {
+            m.insert("jsonPath".to_string(), serde_json::Value::String(v));
+        }
+        serde_json::Value::Object(m)
+    }
+
+    fn old_gen_subresources_to_json(
+        sr: apiext_v1::CustomResourceSubresources,
+    ) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if sr.status.is_some() {
+            m.insert("status".to_string(), serde_json::json!({}));
+        }
+        if let Some(scale) = sr.scale {
+            let mut sm = serde_json::Map::new();
+            if let Some(v) = scale.spec_replicas_path.filter(|s| !s.is_empty()) {
+                sm.insert("specReplicasPath".to_string(), serde_json::Value::String(v));
+            }
+            if let Some(v) = scale.status_replicas_path.filter(|s| !s.is_empty()) {
+                sm.insert(
+                    "statusReplicasPath".to_string(),
+                    serde_json::Value::String(v),
+                );
+            }
+            if let Some(v) = scale.label_selector_path.filter(|s| !s.is_empty()) {
+                sm.insert(
+                    "labelSelectorPath".to_string(),
+                    serde_json::Value::String(v),
+                );
+            }
+            m.insert("scale".to_string(), serde_json::Value::Object(sm));
+        }
+        serde_json::Value::Object(m)
+    }
+
+    fn old_gen_json_schema_props_to_json(schema: apiext_v1::JsonSchemaProps) -> serde_json::Value {
+        let mut m = serde_json::Map::with_capacity(32);
+
+        if let Some(v) = schema.r#type.filter(|s| !s.is_empty()) {
+            m.insert("type".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.description.filter(|s| !s.is_empty()) {
+            m.insert("description".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.format.filter(|s| !s.is_empty()) {
+            m.insert("format".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.title.filter(|s| !s.is_empty()) {
+            m.insert("title".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.r#ref.filter(|s| !s.is_empty()) {
+            m.insert("$ref".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.id.filter(|s| !s.is_empty()) {
+            m.insert("id".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.schema.filter(|s| !s.is_empty()) {
+            m.insert("$schema".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.pattern.filter(|s| !s.is_empty()) {
+            m.insert("pattern".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = schema.default {
+            let raw = gen_json_raw_to_value(v);
+            if !raw.is_null() {
+                m.insert("default".to_string(), raw);
+            }
+        }
+        if let Some(v) = schema.maximum {
+            m.insert(
+                "maximum".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+        }
+        if let Some(v) = schema.exclusive_maximum.filter(|&b| b) {
+            m.insert("exclusiveMaximum".to_string(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = schema.minimum {
+            m.insert(
+                "minimum".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+        }
+        if let Some(v) = schema.exclusive_minimum.filter(|&b| b) {
+            m.insert("exclusiveMinimum".to_string(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = schema.max_length {
+            m.insert("maxLength".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = schema.min_length {
+            m.insert("minLength".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = schema.max_items {
+            m.insert("maxItems".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = schema.min_items {
+            m.insert("minItems".to_string(), serde_json::Value::Number(v.into()));
+        }
+        if let Some(v) = schema.unique_items.filter(|&b| b) {
+            m.insert("uniqueItems".to_string(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = schema.multiple_of {
+            m.insert(
+                "multipleOf".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+        }
+        if let Some(v) = schema.max_properties {
+            m.insert(
+                "maxProperties".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        if let Some(v) = schema.min_properties {
+            m.insert(
+                "minProperties".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        if let Some(v) = schema.nullable.filter(|&b| b) {
+            m.insert("nullable".to_string(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = schema.x_kubernetes_preserve_unknown_fields.filter(|&b| b) {
+            m.insert(
+                "x-kubernetes-preserve-unknown-fields".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = schema.x_kubernetes_embedded_resource.filter(|&b| b) {
+            m.insert(
+                "x-kubernetes-embedded-resource".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = schema.x_kubernetes_int_or_string.filter(|&b| b) {
+            m.insert(
+                "x-kubernetes-int-or-string".to_string(),
+                serde_json::Value::Bool(v),
+            );
+        }
+        if let Some(v) = schema.x_kubernetes_list_type.filter(|s| !s.is_empty()) {
+            m.insert(
+                "x-kubernetes-list-type".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        if let Some(v) = schema.x_kubernetes_map_type.filter(|s| !s.is_empty()) {
+            m.insert(
+                "x-kubernetes-map-type".to_string(),
+                serde_json::Value::String(v),
+            );
+        }
+        if !schema.x_kubernetes_list_map_keys.is_empty() {
+            m.insert(
+                "x-kubernetes-list-map-keys".to_string(),
+                serde_json::Value::Array(
+                    schema
+                        .x_kubernetes_list_map_keys
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !schema.required.is_empty() {
+            m.insert(
+                "required".to_string(),
+                serde_json::Value::Array(
+                    schema
+                        .required
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !schema.r#enum.is_empty() {
+            let enum_vals: Vec<serde_json::Value> = schema
+                .r#enum
+                .into_iter()
+                .map(gen_json_raw_to_value)
+                .collect();
+            m.insert("enum".to_string(), serde_json::Value::Array(enum_vals));
+        }
+        if !schema.properties.is_empty() {
+            let props: serde_json::Map<String, serde_json::Value> = schema
+                .properties
+                .into_iter()
+                .map(|(k, v)| (k, old_gen_json_schema_props_to_json(v)))
+                .collect();
+            m.insert("properties".to_string(), serde_json::Value::Object(props));
+        }
+        if !schema.pattern_properties.is_empty() {
+            let pp: serde_json::Map<String, serde_json::Value> = schema
+                .pattern_properties
+                .into_iter()
+                .map(|(k, v)| (k, old_gen_json_schema_props_to_json(v)))
+                .collect();
+            m.insert(
+                "patternProperties".to_string(),
+                serde_json::Value::Object(pp),
+            );
+        }
+        if !schema.definitions.is_empty() {
+            let defs: serde_json::Map<String, serde_json::Value> = schema
+                .definitions
+                .into_iter()
+                .map(|(k, v)| (k, old_gen_json_schema_props_to_json(v)))
+                .collect();
+            m.insert("definitions".to_string(), serde_json::Value::Object(defs));
+        }
+        if !schema.dependencies.is_empty() {
+            let deps: serde_json::Map<String, serde_json::Value> = schema
+                .dependencies
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut dep_m = serde_json::Map::new();
+                    if let Some(s) = v.schema {
+                        dep_m.insert("schema".to_string(), old_gen_json_schema_props_to_json(s));
+                    }
+                    if !v.property.is_empty() {
+                        dep_m.insert(
+                            "property".to_string(),
+                            serde_json::Value::Array(
+                                v.property
+                                    .into_iter()
+                                    .map(serde_json::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    (k, serde_json::Value::Object(dep_m))
+                })
+                .collect();
+            m.insert("dependencies".to_string(), serde_json::Value::Object(deps));
+        }
+        if let Some(boxed) = schema.items {
+            let items_val = if let Some(s) = boxed.schema {
+                old_gen_json_schema_props_to_json(*s)
+            } else if !boxed.j_son_schemas.is_empty() {
+                serde_json::Value::Array(
+                    boxed
+                        .j_son_schemas
+                        .into_iter()
+                        .map(old_gen_json_schema_props_to_json)
+                        .collect(),
+                )
+            } else {
+                serde_json::Value::Object(serde_json::Map::new())
+            };
+            m.insert("items".to_string(), items_val);
+        }
+        if let Some(boxed) = schema.additional_properties {
+            let ap_val = match (boxed.allows, boxed.schema) {
+                (_, Some(s)) => old_gen_json_schema_props_to_json(*s),
+                (Some(b), None) => serde_json::Value::Bool(b),
+                (None, None) => serde_json::Value::Object(serde_json::Map::new()),
+            };
+            m.insert("additionalProperties".to_string(), ap_val);
+        }
+        if let Some(boxed) = schema.additional_items {
+            let ai_val = match (boxed.allows, boxed.schema) {
+                (_, Some(s)) => old_gen_json_schema_props_to_json(*s),
+                (Some(b), None) => serde_json::Value::Bool(b),
+                (None, None) => serde_json::Value::Object(serde_json::Map::new()),
+            };
+            m.insert("additionalItems".to_string(), ai_val);
+        }
+        if !schema.all_of.is_empty() {
+            m.insert(
+                "allOf".to_string(),
+                serde_json::Value::Array(
+                    schema
+                        .all_of
+                        .into_iter()
+                        .map(old_gen_json_schema_props_to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !schema.one_of.is_empty() {
+            m.insert(
+                "oneOf".to_string(),
+                serde_json::Value::Array(
+                    schema
+                        .one_of
+                        .into_iter()
+                        .map(old_gen_json_schema_props_to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !schema.any_of.is_empty() {
+            m.insert(
+                "anyOf".to_string(),
+                serde_json::Value::Array(
+                    schema
+                        .any_of
+                        .into_iter()
+                        .map(old_gen_json_schema_props_to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(boxed) = schema.not {
+            m.insert("not".to_string(), old_gen_json_schema_props_to_json(*boxed));
+        }
+        if let Some(ed) = schema.external_docs {
+            let mut ed_m = serde_json::Map::new();
+            if let Some(d) = ed.description.filter(|s| !s.is_empty()) {
+                ed_m.insert("description".to_string(), serde_json::Value::String(d));
+            }
+            if let Some(u) = ed.url.filter(|s| !s.is_empty()) {
+                ed_m.insert("url".to_string(), serde_json::Value::String(u));
+            }
+            if !ed_m.is_empty() {
+                m.insert("externalDocs".to_string(), serde_json::Value::Object(ed_m));
+            }
+        }
+        if let Some(ex) = schema.example {
+            let raw = gen_json_raw_to_value(ex);
+            if !raw.is_null() {
+                m.insert("example".to_string(), raw);
+            }
+        }
+        if !schema.x_kubernetes_validations.is_empty() {
+            let rules: Vec<serde_json::Value> = schema
+                .x_kubernetes_validations
+                .into_iter()
+                .map(|r| {
+                    let mut rm = serde_json::Map::new();
+                    if let Some(v) = r.rule.filter(|s| !s.is_empty()) {
+                        rm.insert("rule".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = r.message.filter(|s| !s.is_empty()) {
+                        rm.insert("message".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = r.message_expression.filter(|s| !s.is_empty()) {
+                        rm.insert(
+                            "messageExpression".to_string(),
+                            serde_json::Value::String(v),
+                        );
+                    }
+                    if let Some(v) = r.reason.filter(|s| !s.is_empty()) {
+                        rm.insert("reason".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = r.field_path.filter(|s| !s.is_empty()) {
+                        rm.insert("fieldPath".to_string(), serde_json::Value::String(v));
+                    }
+                    if let Some(v) = r.optional_old_self.filter(|&b| b) {
+                        rm.insert("optionalOldSelf".to_string(), serde_json::Value::Bool(v));
+                    }
+                    serde_json::Value::Object(rm)
+                })
+                .collect();
+            m.insert(
+                "x-kubernetes-validations".to_string(),
+                serde_json::Value::Array(rules),
+            );
+        }
+
+        serde_json::Value::Object(m)
+    }
+
+    fn old_gen_version_to_json(v: apiext_v1::CustomResourceDefinitionVersion) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        if let Some(name) = v.name.filter(|s| !s.is_empty()) {
+            m.insert("name".to_string(), serde_json::Value::String(name));
+        }
+        m.insert(
+            "served".to_string(),
+            serde_json::Value::Bool(v.served.unwrap_or(false)),
+        );
+        m.insert(
+            "storage".to_string(),
+            serde_json::Value::Bool(v.storage.unwrap_or(false)),
+        );
+        if let Some(dep) = v.deprecated.filter(|&b| b) {
+            m.insert("deprecated".to_string(), serde_json::Value::Bool(dep));
+        }
+        if let Some(dw) = v.deprecation_warning.filter(|s| !s.is_empty()) {
+            m.insert(
+                "deprecationWarning".to_string(),
+                serde_json::Value::String(dw),
+            );
+        }
+        if let Some(schema_wrapper) = v.schema {
+            if let Some(schema) = schema_wrapper.open_apiv3_schema {
+                m.insert(
+                    "schema".to_string(),
+                    serde_json::json!({
+                        "openAPIV3Schema": old_gen_json_schema_props_to_json(schema)
+                    }),
+                );
+            }
+        }
+        if let Some(sr) = v.subresources {
+            let sr_json = old_gen_subresources_to_json(sr);
+            if !sr_json.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                m.insert("subresources".to_string(), sr_json);
+            }
+        }
+        if !v.additional_printer_columns.is_empty() {
+            m.insert(
+                "additionalPrinterColumns".to_string(),
+                serde_json::Value::Array(
+                    v.additional_printer_columns
+                        .into_iter()
+                        .map(old_gen_printer_column_to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if !v.selectable_fields.is_empty() {
+            m.insert(
+                "selectableFields".to_string(),
+                serde_json::Value::Array(
+                    v.selectable_fields
+                        .into_iter()
+                        .map(old_gen_selectable_field_to_json)
+                        .collect(),
+                ),
+            );
+        }
+        serde_json::Value::Object(m)
+    }
+
+    fn old_decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
+        let crd = apiext_v1::CustomResourceDefinition::decode(data).ok()?;
+        let mut meta = gen_object_meta_to_json(crd.metadata.unwrap_or_default());
+        if meta["creationTimestamp"].is_null() {
+            meta["creationTimestamp"] = serde_json::Value::String(String::new());
+        }
+
+        let spec = crd.spec.unwrap_or_default();
+        let mut spec_m = serde_json::Map::with_capacity(7);
+
+        if let Some(g) = spec.group.filter(|s| !s.is_empty()) {
+            spec_m.insert("group".to_string(), serde_json::Value::String(g));
+        }
+        if let Some(s) = spec.scope.filter(|s| !s.is_empty()) {
+            spec_m.insert("scope".to_string(), serde_json::Value::String(s));
+        }
+        if let Some(names) = spec.names {
+            spec_m.insert("names".to_string(), old_gen_crd_names_to_json(names));
+        }
+        if !spec.versions.is_empty() {
+            spec_m.insert(
+                "versions".to_string(),
+                serde_json::Value::Array(
+                    spec.versions
+                        .into_iter()
+                        .map(old_gen_version_to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(b) = spec.preserve_unknown_fields.filter(|&b| b) {
+            spec_m.insert(
+                "preserveUnknownFields".to_string(),
+                serde_json::Value::Bool(b),
+            );
+        }
+        if let Some(conv) = spec.conversion {
+            let mut cm = serde_json::Map::new();
+            if let Some(strategy) = conv.strategy.filter(|s| !s.is_empty()) {
+                cm.insert("strategy".to_string(), serde_json::Value::String(strategy));
+            }
+            if let Some(wh) = conv.webhook {
+                let mut wm = serde_json::Map::new();
+                if !wh.conversion_review_versions.is_empty() {
+                    wm.insert(
+                        "conversionReviewVersions".to_string(),
+                        serde_json::Value::Array(
+                            wh.conversion_review_versions
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(cc) = wh.client_config {
+                    let mut ccm = serde_json::Map::new();
+                    if let Some(ca) = cc.ca_bundle.filter(|b| !b.is_empty()) {
+                        ccm.insert(
+                            "caBundle".to_string(),
+                            serde_json::Value::String(base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &ca,
+                            )),
+                        );
+                    }
+                    if let Some(url) = cc.url.filter(|s| !s.is_empty()) {
+                        ccm.insert("url".to_string(), serde_json::Value::String(url));
+                    }
+                    if let Some(svc) = cc.service {
+                        let mut svm = serde_json::Map::new();
+                        if let Some(ns) = svc.namespace.filter(|s| !s.is_empty()) {
+                            svm.insert("namespace".to_string(), serde_json::Value::String(ns));
+                        }
+                        if let Some(name) = svc.name.filter(|s| !s.is_empty()) {
+                            svm.insert("name".to_string(), serde_json::Value::String(name));
+                        }
+                        if let Some(path) = svc.path.filter(|s| !s.is_empty()) {
+                            svm.insert("path".to_string(), serde_json::Value::String(path));
+                        }
+                        if let Some(port) = svc.port {
+                            svm.insert("port".to_string(), serde_json::Value::Number(port.into()));
+                        }
+                        ccm.insert("service".to_string(), serde_json::Value::Object(svm));
+                    }
+                    if !ccm.is_empty() {
+                        wm.insert("clientConfig".to_string(), serde_json::Value::Object(ccm));
+                    }
+                }
+                if !wm.is_empty() {
+                    cm.insert("webhook".to_string(), serde_json::Value::Object(wm));
+                }
+            }
+            spec_m.insert("conversion".to_string(), serde_json::Value::Object(cm));
+        }
+
+        let mut obj = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": meta,
+            "spec": serde_json::Value::Object(spec_m)
+        });
+
+        if let Some(status) = crd.status {
+            let mut status_m = serde_json::Map::new();
+            if !status.conditions.is_empty() {
+                let conds: Vec<serde_json::Value> = status
+                    .conditions
+                    .into_iter()
+                    .map(gen_crd_condition_to_json)
+                    .collect();
+                status_m.insert("conditions".to_string(), serde_json::Value::Array(conds));
+            }
+            if let Some(names) = status.accepted_names {
+                status_m.insert(
+                    "acceptedNames".to_string(),
+                    old_gen_crd_names_to_json(names),
+                );
+            }
+            if !status.stored_versions.is_empty() {
+                status_m.insert(
+                    "storedVersions".to_string(),
+                    serde_json::Value::Array(
+                        status
+                            .stored_versions
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(og) = status.observed_generation.filter(|&g| g != 0) {
+                status_m.insert("observedGeneration".to_string(), og.into());
+            }
+            if !status_m.is_empty() {
+                obj["status"] = serde_json::Value::Object(status_m);
+            }
+        }
+
+        Some(obj)
+    }
+
+    #[test]
+    fn codegen_migration_crd_matches_pre_migration_hand_written_output() {
+        let crd = apiext_v1::CustomResourceDefinition {
+            metadata: Some(meta_v1::ObjectMeta::sentinel()),
+            spec: Some(apiext_v1::CustomResourceDefinitionSpec::sentinel()),
+            status: Some(apiext_v1::CustomResourceDefinitionStatus::sentinel()),
+        };
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).unwrap();
+
+        let old = old_decode_crd_proto_gen(&buf).expect("old path must decode");
+        let new = decode_crd_proto_gen(&buf).expect("new path must decode");
+        assert_eq!(
+            old, new,
+            "codegen-generated decode_crd_proto_gen must match the pre-migration hand-written \
+             decoder field-for-field — any divergence here is a silent CRD spec/status field \
+             drop (e.g. a missing selectableFields entry, a wrong x-kubernetes-* JSON key, or a \
+             broken openAPIV3Schema recursion) introduced by this migration"
+        );
+    }
+
+    /// `Sentinel::sentinel()` guards against infinite recursion on a self-referential message
+    /// (`JsonSchemaProps`) by short-circuiting at the *first* re-entrant construction — see
+    /// `sentinel_completeness_gen_json_schema_props_to_json`'s own doc comment above, and
+    /// `crates/sentinel/tests/recursion.rs` for the guard's own regression test. That means the
+    /// sentinel-based test above never actually nests a real `properties.foo.properties.bar`
+    /// two levels deep, or an `x-kubernetes-validations` rule at more than one nesting level —
+    /// exactly the shape a broken recursive call in `json_schema_props_delegated_field` (e.g. one
+    /// that accidentally called the *old* single-level function on a nested field, or dropped the
+    /// `*s`/`*boxed` deref and only recursed one level) would need to be caught. This test builds
+    /// that nesting by hand instead of relying on `.sentinel()`'s depth.
+    #[test]
+    fn codegen_migration_json_schema_props_matches_pre_migration_hand_written_output_for_deeply_nested_schema(
+    ) {
+        let deepest = apiext_v1::JsonSchemaProps {
+            r#type: Some("object".to_string()),
+            one_of: vec![
+                apiext_v1::JsonSchemaProps {
+                    r#type: Some("string".to_string()),
+                    ..Default::default()
+                },
+                apiext_v1::JsonSchemaProps {
+                    r#type: Some("integer".to_string()),
+                    ..Default::default()
+                },
+            ],
+            x_kubernetes_preserve_unknown_fields: Some(true),
+            x_kubernetes_validations: vec![apiext_v1::ValidationRule {
+                rule: Some("self.size > 0".to_string()),
+                message: Some("size must be positive".to_string()),
+                optional_old_self: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mid = apiext_v1::JsonSchemaProps {
+            r#type: Some("object".to_string()),
+            properties: [("bar".to_string(), deepest)].into_iter().collect(),
+            required: vec!["bar".to_string()],
+            all_of: vec![apiext_v1::JsonSchemaProps {
+                min_properties: Some(1),
+                ..Default::default()
+            }],
+            not: Some(Box::new(apiext_v1::JsonSchemaProps {
+                r#type: Some("null".to_string()),
+                ..Default::default()
+            })),
+            additional_properties: Some(Box::new(apiext_v1::JsonSchemaPropsOrBool {
+                allows: None,
+                schema: Some(Box::new(apiext_v1::JsonSchemaProps {
+                    r#type: Some("string".to_string()),
+                    ..Default::default()
+                })),
+            })),
+            items: Some(Box::new(apiext_v1::JsonSchemaPropsOrArray {
+                schema: None,
+                j_son_schemas: vec![
+                    apiext_v1::JsonSchemaProps {
+                        r#type: Some("string".to_string()),
+                        ..Default::default()
+                    },
+                    apiext_v1::JsonSchemaProps {
+                        r#type: Some("number".to_string()),
+                        ..Default::default()
+                    },
+                ],
+            })),
+            ..Default::default()
+        };
+
+        let top = apiext_v1::JsonSchemaProps {
+            r#type: Some("object".to_string()),
+            properties: [("foo".to_string(), mid)].into_iter().collect(),
+            any_of: vec![apiext_v1::JsonSchemaProps {
+                r#type: Some("object".to_string()),
+                ..Default::default()
+            }],
+            x_kubernetes_validations: vec![apiext_v1::ValidationRule {
+                rule: Some("self.foo.bar != null".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let old = old_gen_json_schema_props_to_json(top.clone());
+        let new = gen_json_schema_props_to_json(top);
+        assert_eq!(
+            old, new,
+            "codegen-generated gen_json_schema_props_to_json must match the pre-migration \
+             hand-written recursive function on a genuinely multi-level-nested schema — a flat, \
+             one-level fixture would pass even if the generated recursive call only worked one \
+             level deep"
+        );
+
+        // Assert the actual structure directly too, not just old == new — both could be wrong
+        // in the same way (e.g. both silently truncating recursion) and still agree with each
+        // other.
+        assert_eq!(
+            new["properties"]["foo"]["properties"]["bar"]["oneOf"][0]["type"], "string",
+            "oneOf nested two properties-levels deep must survive recursion"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["properties"]["bar"]["oneOf"][1]["type"], "integer",
+            "every oneOf branch at the deepest nesting level must survive, not just the first"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["properties"]["bar"]["x-kubernetes-validations"][0]["rule"],
+            "self.size > 0",
+            "x-kubernetes-validations CEL rules nested two properties-levels deep must survive — \
+             admission validation for deeply-nested CRD schema fields depends on this"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["properties"]["bar"]["x-kubernetes-validations"][0]
+                ["optionalOldSelf"],
+            true,
+            "optionalOldSelf must survive alongside a nested x-kubernetes-validations rule"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["properties"]["bar"]["x-kubernetes-preserve-unknown-fields"],
+            true,
+            "x-kubernetes-preserve-unknown-fields must survive at the deepest nesting level"
+        );
+        assert_eq!(
+            new["x-kubernetes-validations"][0]["rule"], "self.foo.bar != null",
+            "a top-level x-kubernetes-validations rule must survive alongside nested ones, not \
+             be shadowed by them"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["allOf"][0]["minProperties"], 1,
+            "allOf nested one properties-level deep must survive recursion"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["not"]["type"], "null",
+            "not nested one properties-level deep must survive recursion"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["additionalProperties"]["type"], "string",
+            "additionalProperties as a nested schema (not a bare bool) must survive recursion"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["items"][0]["type"], "string",
+            "items as an array-of-schemas (JSONSchemaPropsOrArray.jSONSchemas) must survive"
+        );
+        assert_eq!(
+            new["properties"]["foo"]["items"][1]["type"], "number",
+            "every element of an items array-of-schemas must survive, not just the first"
+        );
+        assert_eq!(
+            new["anyOf"][0]["type"], "object",
+            "top-level anyOf must survive alongside nested oneOf/allOf/not"
         );
     }
 }
