@@ -44,22 +44,19 @@ Decision legend: **KEEP** (decision made, no revisit expected) · **MEASURED**
 | **metrics-server** | UPSTREAM | Yes | KEEP | Standard component; no rewrite plan. |
 | **Sentinel / sentinel-derive** | NATIVE (test infra) | n/a | KEEP | Proto-descriptor oracle framework, closed the silent-decode-drop bug class. |
 
-**On the k3s/k0s comparison:** the north star cites k3s's control-plane/agent
-RSS as illustrative scale, not a verified target (see north-star.md). u7s's
-own absolute per-component numbers above are real and measured
-(`mayor-jnk90`, 2026-08-12 — see
-`ai/findings/upstream-component-rss-cpu-baseline-2026-08-12.md`). The
-*ratio* between u7s and k3s is **not** trustworthy yet: k3s's figure covers
-only the `k3s`/`k3s-agent` binary itself, while u7s's figure sums every
-control-plane and data-plane process (including crio and CoreDNS, which have
-no confirmed counterpart inside the k3s number). Two concrete follow-ons,
-independent of each other:
-1. A matched-methodology comparison — verify what's actually inside the
-   k3s/k3s-agent binaries against k3s source, then measure both sides at the
-   same scope.
-2. An upstream configuration/tuning audit for kubelet and KCM specifically
-   (the two dominant components) — cheap to check, and must happen before
-   any rewrite cost-benefit estimate, per north-star.md's decision process.
+**On the k3s/k0s comparison:** resolved — real k3s (v1.36.3+k3s1, native
+containerd) was installed, run through the same sonobuoy harness, and
+measured with the same component-boundary accounting u7s uses on itself.
+Single-node idle matched-boundary total: **~813 MB**, ~8-11x the old
+illustrative "~70-100MB" bare-binary estimate, and ~6.1x above u7s's own
+128 MiB Gate-4 target (a conservative floor against the target, not u7s's
+current actual total). This doesn't change Gate 4's target or urgency; it
+replaces a hand-wavy caveat with a real number, though the container
+runtime's (CRI-O vs containerd) behavior under real load remains only
+partially resolved. Full methodology, deviations, and per-process tables:
+`ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`. The separate
+upstream configuration/tuning audit for kubelet and KCM remains open and
+untouched by this work.
 
 ---
 
@@ -82,17 +79,21 @@ un-defer trigger.
 - Any test regression triggers immediate correctness work (higher priority
   than perf work) — see north-star.md's correctness-first principle.
 
-### Gate 2 — Measurement baseline — first pass complete, comparison unresolved
+### Gate 2 — Measurement baseline — u7s-side pass complete, k3s comparison resolved
 - `mayor-jnk90` closed 2026-08-12: one full 2-node conformance run with the
   `mayor-zpvp2` sampler, producing per-process RSS for every component in the
-  matrix above. See the matrix's "On the k3s/k0s comparison" note for what
-  this does and doesn't establish yet.
-- Follow-ons filed from that run, all since resolved: CPU trajectory
-  instrumentation added (`mayor-aozrt`), the CoreDNS RSS anomaly root-caused
-  and fixed (`mayor-b1gz2`), and the `run-all.sh` monitoring-artifact gap
-  fixed 2026-08-14 (`mayor-xzkqw`, PR #1158).
-- Re-measure after every non-trivial component-level perf change, and once
-  the matched k3s-comparison methodology exists.
+  matrix above.
+- `mayor-5x0kh` closed 2026-08-20: real k3s measured with the same harness
+  and the same component-boundary accounting, replacing the old illustrative
+  k3s figure. See the matrix's "On the k3s/k0s comparison" note for the
+  result and its remaining open sub-question (container-runtime behavior
+  under real load).
+- Follow-ons filed from the `mayor-jnk90` run, all since resolved: CPU
+  trajectory instrumentation added (`mayor-aozrt`), the CoreDNS RSS anomaly
+  root-caused and fixed (`mayor-b1gz2`), and the `run-all.sh`
+  monitoring-artifact gap fixed 2026-08-14 (`mayor-xzkqw`, PR #1158).
+- Re-measure u7s's own side after every non-trivial component-level perf
+  change.
 
 ### Gate 3 — Correctness infrastructure ✓ SUBSTANTIALLY DONE
 - Proto-descriptor oracle: sentinel-completeness expected-key lists derived
