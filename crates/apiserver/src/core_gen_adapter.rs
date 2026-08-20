@@ -2341,6 +2341,16 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
     Some(obj)
 }
 
+/// Exposes the generated `gen_persistentvolume_spec_to_json` (module-private by default) to
+/// sibling `*_gen_adapter.rs` modules that embed a `PersistentVolumeSpec` inside another message
+/// — e.g. `VolumeAttachmentSource.inlineVolumeSpec` — so they reuse this translation instead of
+/// re-deriving PersistentVolumeSpec's ~42 leaf fields by hand.
+pub(crate) fn gen_persistentvolumespec_to_json(
+    spec: core_v1::PersistentVolumeSpec,
+) -> serde_json::Value {
+    gen_persistentvolume_spec_to_json(spec)
+}
+
 // ---- Decoder A: ServiceAccount ---------------------------------------------
 
 pub fn decode_serviceaccount_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
