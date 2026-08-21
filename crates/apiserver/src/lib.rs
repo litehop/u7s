@@ -1688,12 +1688,11 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // covers the arbitrary HTTP methods `pods/proxy`+`services/proxy` forward to the
             // target pod/service and the POST retry leg exec/attach fall back to.
             { "apiGroups": [""], "resources": ["pods/attach","pods/exec","pods/portforward","pods/proxy","services/proxy"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            // Upstream also grants `impersonate` on serviceaccounts to edit/admin, but this
-            // codebase's Impersonate-User handling (auth.rs) always authorizes against
-            // resource "users" and never branches on SA-shaped usernames, so that RBAC rule
-            // would be inert here — omitted rather than shipping a permission the code doesn't
-            // back up. Re-add once auth.rs is wired to check "serviceaccounts" for
-            // system:serviceaccount:<ns>:<name>-shaped Impersonate-User values.
+            // Upstream grants `impersonate` on serviceaccounts to edit/admin so a namespace
+            // editor can act as one of "their" ServiceAccounts (e.g. to debug a workload
+            // identity) without cluster-admin. auth.rs's Impersonate-User handling branches on
+            // SA-shaped usernames to authorize against this namespaced resource.
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] },
             { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
             // kubectl drain / voluntary disruption POSTs an Eviction rather than deleting the
             // Pod directly — without this a namespace editor could delete Pods but not evict
@@ -1730,9 +1729,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            // See the identical block in "admin" above for why each of these exists (and why
-            // there's no `impersonate` rule on serviceaccounts here).
+            // See the identical block in "admin" above for why each of these exists.
             { "apiGroups": [""], "resources": ["pods/attach","pods/exec","pods/portforward","pods/proxy","services/proxy"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] },
             { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
@@ -5186,19 +5185,19 @@ mod tests {
     }
 
     /// Regression test: RoleBindings to the built-in "edit" AND "admin" ClusterRoles must
-    /// authorize the escalating pod/service subresources, SA token creation, pod eviction, and
-    /// replicationcontrollers/scale that upstream's default "edit"/"admin" ClusterRoles grant
-    /// but this codebase's flat copies never split out any subresource for at all — before this
-    /// fix, a ServiceAccount bound only to "edit" got a plain RBAC 403 running `kubectl
-    /// exec`/`attach`/`port-forward` against a Pod, requesting a token for one of its own
-    /// ServiceAccounts, draining a Pod via Eviction, or reading/writing an RC's scale, even
-    /// though `kubectl create`/`delete` on the underlying resources already worked. Also asserts
-    /// "view" was NOT granted the escalating subresources (pods/exec etc): upstream's
-    /// viewRules() deliberately excludes them because "view" is documented to grant read access
-    /// to non-escalating resources only. (Upstream's editRules() also grants `impersonate` on
-    /// serviceaccounts, but that RBAC rule is deliberately NOT added here — see the comment in
-    /// seed_rbac's "edit"/"admin" blocks — because auth.rs's impersonation check doesn't yet
-    /// branch on SA-shaped usernames, so the rule would be inert.)
+    /// authorize the escalating pod/service subresources, SA token creation, SA impersonation,
+    /// pod eviction, and replicationcontrollers/scale that upstream's default "edit"/"admin"
+    /// ClusterRoles grant but this codebase's flat copies never split out any subresource for
+    /// at all — before this fix, a ServiceAccount bound only to "edit" got a plain RBAC 403
+    /// running `kubectl exec`/`attach`/`port-forward` against a Pod, requesting a token for one
+    /// of its own ServiceAccounts, impersonating another of its own ServiceAccounts, draining a
+    /// Pod via Eviction, or reading/writing an RC's scale, even though `kubectl create`/`delete`
+    /// on the underlying resources already worked. Also asserts "view" was NOT granted the
+    /// escalating subresources or serviceaccount impersonation: upstream's viewRules()
+    /// deliberately excludes them because "view" is documented to grant read access to
+    /// non-escalating resources only. (This test only exercises `rbac_index` directly; the
+    /// SA-shaped-Impersonate-User branching that makes the `impersonate`/`serviceaccounts` rule
+    /// non-inert lives in auth.rs's `AuthLayer` middleware and is covered there.)
     #[tokio::test]
     async fn edit_and_admin_rolebindings_can_use_escalating_pod_subresources_and_scale() {
         const GROUP: &str = "rbac.authorization.k8s.io";
@@ -5253,6 +5252,7 @@ mod tests {
                 ("create", "pods", "proxy"),
                 ("create", "services", "proxy"),
                 ("create", "serviceaccounts", "token"),
+                ("impersonate", "serviceaccounts", ""),
                 ("create", "pods", "eviction"),
                 ("get", "replicationcontrollers", "scale"),
                 ("update", "replicationcontrollers", "scale"),
@@ -5285,6 +5285,7 @@ mod tests {
             ("get", "pods", "exec"),
             ("get", "pods", "attach"),
             ("create", "serviceaccounts", "token"),
+            ("impersonate", "serviceaccounts", ""),
             ("create", "pods", "eviction"),
         ] {
             let req = rbac::AuthzRequest {
