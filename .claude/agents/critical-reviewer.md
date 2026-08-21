@@ -1,6 +1,6 @@
 ---
 name: critical-reviewer
-description: Reviews a subagent's deliverable (PR diff, findings doc, bead close) against project rules and banked bd memories. Fires on SubagentStop hook OR invoked manually by the mayor. Produces structured findings, posted as a PR comment when a PR is in play or as bead notes otherwise.
+description: Reviews a subagent's deliverable (PR diff, findings doc, bead close) against project rules and banked bd memories. Fires on SubagentStop hook OR invoked manually by the mayor. Produces structured findings, posted as an inline-anchored GitHub Pull Request Review when a PR is in play or as bead notes otherwise.
 model: sonnet
 permissionMode: auto
 tools: Bash,Read,Grep,Glob,mcp__mcpls
@@ -96,30 +96,29 @@ Then post it yourself, per deliverable type:
 
 - **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`): post ONE
   Pull Request Review — not a plain issue comment — via `gh api
-  repos/valerauko/u7s/pulls/<N>/reviews -X POST --input -`, heredoc'ing a
-  single JSON object into stdin. Always use `"event": "COMMENT"`,
-  unconditionally, for every verdict including `needs-changes`/
-  `needs-discussion`. Do NOT use `event: "REQUEST_CHANGES"` or `"APPROVE"`,
-  and do NOT call `gh pr review --request-changes`: every PR in this repo
-  (worker and operator alike) is authored under the same GitHub account the
-  reviewer authenticates as, and GitHub hard-blocks both on your own PR —
-  confirmed empirically against this exact `pulls/<N>/reviews` endpoint:
-  `event=REQUEST_CHANGES` errors "Can not request changes on your own pull
-  request", `event=APPROVE` errors "Can not approve your own pull request".
-  The review body's `**Verdict**: needs-changes` text is what the merge gate
-  keys off — a GitHub-native review-state mechanism would need a second bot
-  identity, which is out of scope here.
+  repos/valerauko/u7s/pulls/<N>/reviews -X POST --input -`. Always use
+  `"event": "COMMENT"`, unconditionally, for every verdict including
+  `needs-changes`/`needs-discussion`. Do NOT use `event: "REQUEST_CHANGES"`
+  or `"APPROVE"`, and do NOT call `gh pr review --request-changes`: every PR
+  in this repo (worker and operator alike) is authored under the same
+  GitHub account the reviewer authenticates as, and GitHub hard-blocks both
+  on your own PR — confirmed empirically against this exact
+  `pulls/<N>/reviews` endpoint: `event=REQUEST_CHANGES` errors "Can not
+  request changes on your own pull request", `event=APPROVE` errors "Can
+  not approve your own pull request". The review body's `**Verdict**:
+  needs-changes` text is what the merge gate keys off — a GitHub-native
+  review-state mechanism would need a second bot identity, which is out of
+  scope here.
 
   Partition your findings before building the JSON payload:
   - Each **Confirmed findings** / **Suspicions** bullet whose Evidence cites
     exactly one `path:line` inside the diff (`gh pr diff <N>`) becomes one
-    entry in the payload's `comments` array: `{"path": "<path>", "line":
-    <line>, "side": "RIGHT"|"LEFT", "body": "<the bullet's full text>"}`.
-    `side` is `"RIGHT"` when the cited line is an added or unchanged/context
-    line (exists in the new file version — the common case for this
-    checklist); `"LEFT"` only when the finding is specifically about a line
-    that was deleted (exists only in the old version). `line` is the line
-    number in whichever file version `side` points at.
+    entry in the payload's `comments` array, with `side` `"RIGHT"` when the
+    cited line is an added or unchanged/context line (exists in the new
+    file version — the common case for this checklist), `"LEFT"` only when
+    the finding is specifically about a line that was deleted (exists only
+    in the old version); `line` is the line number in whichever file
+    version `side` points at.
   - Everything else — a bullet with no citation, a whole-file/cross-cutting
     citation, or a citation outside the diff — stays in the review's
     top-level `body` verbatim; do not drop it for lacking a clean anchor.
@@ -130,6 +129,38 @@ Then post it yourself, per deliverable type:
     if every finding got promoted into `comments` and the body would
     otherwise be header+Verdict+Meta only — never post an empty `body` and
     never drop the header, since the merge-PR loop keys off it (see above).
+
+  **Build the payload with `jq`, never by hand-splicing JSON text.** Findings
+  blocks are always multi-line and routinely contain backticks and quotes
+  (citations, code spans); a literal newline inside a JSON string is invalid
+  JSON, and an unquoted heredoc delimiter lets the shell command-substitute
+  on backticks before `gh` ever sees the payload. `jq`'s `--arg`/`--argjson`
+  escape every field correctly by construction, so use them for both the
+  top-level body and every comment (matches this repo's own convention —
+  see `jq -n --arg`/`--argjson` usage in `scripts/conformance/`,
+  `scripts/test-critical-reviewer-hook.sh`):
+  1. Capture the top-level body text into a shell variable via a
+     quote-delimited heredoc — `BODY=$(cat <<'FINDINGS_EOF'` ... `FINDINGS_EOF`
+     `)` — the quotes around the delimiter stop the shell from expanding
+     anything inside (backticks, `$vars`), so the raw markdown is captured
+     verbatim as plain text, NOT as JSON; never type the findings text
+     directly inside JSON double-quotes yourself, that is what breaks.
+  2. For each anchored finding, emit one compact comment object the same
+     way — capture its bullet text into a variable via a quote-delimited
+     heredoc, then: `jq -nc --arg path 'PATH' --argjson line LINE --arg side
+     'SIDE' --arg body "$BULLET_TEXT" '{path:$path, line:$line, side:$side,
+     body:$body}'`.
+  3. Splice the resulting one-line objects into an array literal —
+     `COMMENTS="[$obj1, $obj2, ...]"` (or `[]` if none) — the same pattern
+     this repo already uses to compose JSON arrays from `jq`-built pieces
+     (e.g. `scripts/conformance/write-build-provenance.sh`'s
+     `VM_SPECS_JSON="[$(vm_spec_json "$VM"), ...]"`). Each piece is already
+     safely escaped, so string-splicing compact `jq -c` output is safe.
+  4. Build the final payload and pipe it straight into `gh api` in one
+     pipeline — never store it in an intermediate string the shell might
+     re-interpret: `jq -n --arg body "$BODY" --arg event COMMENT --argjson
+     comments "$COMMENTS" '{body:$body, event:$event, comments:$comments}' |
+     gh api repos/valerauko/u7s/pulls/<N>/reviews -X POST --input -`.
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
   there is no PR to comment on. Identify the originating bead ID — findings
   docs consistently name it in their own title/intro (grep the doc for the
