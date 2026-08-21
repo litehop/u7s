@@ -213,10 +213,20 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f scripts/conformance/sonobuoy-namespa
 # rationale as VolumeAttributesClass above.
 FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass, SidecarContainers}'
 
+# Ginkgo v2's --json-report writes a JSON report containing
+# SpecReports[].StartTime/EndTime -- real per-spec wall-clock windows, unlike
+# junit_01.xml (durations only) and e2e.txt (a bare progress-dot stream with
+# no timestamps at all). Path is inside RESULTS_DIR (see
+# sonobuoy-plugin-e2e.yaml's RESULTS_DIR/SONOBUOY_RESULTS_DIR env vars,
+# /tmp/sonobuoy/results) so sonobuoy's own results-tarball packaging step
+# picks it up alongside e2e.txt/junit_01.xml.
+JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
+
 # build_filter_args populates the FILTER_ARGS array with the sonobuoy argv
 # elements for this invocation. apply=1 wires in the FeatureGate allow-set
 # above plus the existing [Flaky] skip; apply=0 (the --unsafe-focus escape
-# hatch) omits both, carrying only --procs=16.
+# hatch) omits both, carrying only --procs=16. --json-report is carried in
+# BOTH shapes -- it isn't a filter, so it always applies.
 #
 # The label-filter value needs an internal space ("FeatureGate: isSubsetOf
 # {...}" -- ginkgo's own tokenizer requires it), so it must survive as ONE
@@ -226,17 +236,20 @@ FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass, Sideca
 # Separately, go-runner (the conformance image's entrypoint) space-splits
 # E2E_EXTRA_GINKGO_ARGS by default before re-assembling ginkgo's own argv,
 # which would tear the label-filter value apart at its internal space --
-# E2E_EXTRA_ARGS_SEP repoints that split character to '|' instead.
+# E2E_EXTRA_ARGS_SEP repoints that split character to '|' instead, so
+# --json-report is appended with '|' too in the apply=1 shape (plain space
+# would vanish under that repointed split character) and with a plain space
+# in the apply=0 shape (which never overrides the default space-splitting).
 build_filter_args() {
   local apply="$1"
   if [ "$apply" -eq 1 ]; then
     FILTER_ARGS=(
-      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${FEATUREGATE_LABEL_FILTER}"
+      "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${FEATUREGATE_LABEL_FILTER}|--json-report=${JSON_REPORT_PATH}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
       "--e2e-skip=\[Flaky\]"
     )
   else
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}")
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}")
   fi
 }
 
