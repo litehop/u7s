@@ -17755,6 +17755,148 @@ mod admission_tests {
         );
     }
 
+    /// create_pod's admission context must carry the authenticated user's `extra` claims
+    /// (e.g. a bound-service-account-token's node-name claim) into VAP CEL evaluation via
+    /// `request.userInfo.extra` — not just username/uid/groups. Without this, a VAP that
+    /// gates on `request.userInfo.extra` (like upstream's by-node node-restriction
+    /// pattern, mayor-k685m) silently sees an empty map and denies every request
+    /// regardless of the caller's real claims.
+    ///
+    /// Goes through the real `create_pod` handler (not a hand-constructed
+    /// AdmissionContext) so it exercises the actual `"extra": user.extra` threading at
+    /// the call site, not just the CEL evaluator in isolation.
+    ///
+    /// Fails on revert: reverting `"extra": user.extra` in create_pod's admission_ctx
+    /// construction makes `request.userInfo.extra.testClaim` resolve to null either way,
+    /// so the claim-bearing user (which must be admitted) would instead be denied by the
+    /// same VAP as the claim-less user.
+    #[tokio::test]
+    async fn create_pod_admission_sees_authenticated_user_extra_claims() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        // VAP that only admits the request if request.userInfo.extra.testClaim carries
+        // the expected value — mirrors upstream's node-restriction pattern of gating on
+        // a caller's `extra` claim (e.g. authentication.kubernetes.io/node-name).
+        let policy = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "require-extra-claim"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE"],
+                        "resources": ["pods"]
+                    }]
+                },
+                "validations": [{
+                    "expression": "request.userInfo.extra.testClaim == [\"present\"]",
+                    "message": "request.userInfo.extra.testClaim must equal ['present']"
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/require-extra-claim",
+                Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "require-extra-claim-binding"},
+            "spec": {
+                "policyName": "require-extra-claim",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/require-extra-claim-binding",
+                Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        // A user whose UserInfo.extra carries the required claim must be admitted.
+        let mut extra_with_claim = std::collections::HashMap::new();
+        extra_with_claim.insert("testClaim".to_string(), vec!["present".to_string()]);
+        let user_with_claim = axum::Extension(crate::auth::UserInfo {
+            username: "claim-bearer".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: extra_with_claim,
+        });
+        let claim_present_pod_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "claim-pod", "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            })
+            .to_string(),
+        );
+        let claim_present_result = create_pod(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            user_with_claim,
+            headers.clone(),
+            claim_present_pod_body,
+        )
+        .await;
+        assert!(
+            claim_present_result.is_ok(),
+            "a user whose UserInfo.extra carries the required claim must be admitted — \
+             if extra never reaches request.userInfo.extra, this is incorrectly denied"
+        );
+
+        // A user with no extra claims at all must be denied — proves the VAP is actually
+        // evaluated against real extra data, not bypassed or always-permissive.
+        let user_without_claim = axum::Extension(crate::auth::UserInfo {
+            username: "claim-less".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+        let claim_missing_pod_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "claim-less-pod", "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            })
+            .to_string(),
+        );
+        let claim_missing_result = create_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            user_without_claim,
+            headers,
+            claim_missing_pod_body,
+        )
+        .await;
+        assert!(
+            claim_missing_result.is_err(),
+            "a user with no matching extra claim must be denied by the VAP"
+        );
+    }
+
     /// create_pod must default a container a mutating webhook injects, not just the
     /// containers the client supplied.
     ///
