@@ -101,6 +101,70 @@ assert "all three apiserver-dependent units (u7s-scheduler, u7s-kcm, kubelet) de
 assert_true "tarball binary staging rejects a found-but-non-executable match instead of installing it" \
   grep -qF 'if [ ! -x "$found" ]; then' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# iface_filter() -- mirrors install.sh's own default-interface regex. The
+# first version of this logic was a BLACKLIST of virtual-interface names
+# (docker0/veth*/cni*/br-*/virbr*/flannel*/cali*), which can only ever cover
+# the names its author happened to think of. This proves the whitelist that
+# replaced it actually discriminates real physical-NIC names from virtual
+# ones -- not just that some filter exists (a purely structural grep check
+# can't tell "discriminates correctly" from "matches nothing" or "matches
+# everything"). Physical-NIC names cover both systemd predictable naming
+# (en*/wl*/ww*: eno1, ens33, enp0s3, enp2s0f1, enx<mac>, wlo1, wlp2s0,
+# wlx<mac>, wwan0, wwp0s20u4i6) and the legacy eth0 kernel fallback --
+# checking our own 5-VM Ubuntu 26.04 Lima fleet (identical template) found
+# it split 2/5 enp0s1 vs 3/5 eth0, so eth0 is a real, live case, not just a
+# theoretical old-kernel one.
+# ---------------------------------------------------------------------------
+iface_filter() {
+  grep -E '^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$'
+}
+
+PHYSICAL_NAMES="eno1
+ens33
+enp0s3
+enp2s0f1
+enx78e7d1ea46da
+wlo1
+wlp2s0
+wlx0013eff01234
+wwan0
+wwp0s20u4i6
+eth0
+eth1
+enp0s1"
+
+VIRTUAL_NAMES="lo
+docker0
+veth9cbe0b5c
+cni0
+br-abcdef123456
+virbr0
+flannel.1
+cali1234abcd
+kube-ipvs0
+tun0
+tailscale0"
+
+# `|| true` on each: iface_filter (grep) legitimately exits non-zero when it
+# finds zero matches (the whole point of the "leaked" case below), and that
+# would otherwise trip this script's own `set -e`/pipefail before the
+# assertion even runs.
+matched="$(printf '%s\n' "$PHYSICAL_NAMES" | iface_filter | wc -l | tr -d ' ')" || true
+expected="$(printf '%s\n' "$PHYSICAL_NAMES" | wc -l | tr -d ' ')"
+assert "default --iface whitelist matches every real physical-NIC naming variant (systemd predictable en*/wl*/ww* plus the eth0 legacy fallback observed live on our own Lima fleet)" \
+  "$([ "$matched" = "$expected" ] && echo 1 || echo 0)"
+
+leaked="$(printf '%s\n' "$VIRTUAL_NAMES" | iface_filter | wc -l | tr -d ' ')" || true
+assert "default --iface whitelist excludes every virtual/container-runtime/VPN interface (docker0, veth*, cni*, br-*, virbr*, flannel*, cali*, tun*, tailscale*) -- picking one of these as the cluster-traffic interface would be wrong" \
+  "$([ "$leaked" = "0" ] && echo 1 || echo 0)"
+
+assert_true "install.sh's actual --iface default is wired to this exact whitelist regex, not a hand-duplicated copy that could silently drift out of sync" \
+  grep -qF "grep -E '^(en|wl|ww)[a-zA-Z0-9]+\$|^eth[0-9]+\$'" "$INSTALL"
+
+assert_false "(regression guard) install.sh's default --iface no longer relies on the naive 'exclude only lo' blacklist that let any unrecognized virtual interface slip through" \
+  grep -qF "grep -v '^lo\$'" "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

@@ -66,7 +66,7 @@ fi
 # exists when systemd is genuinely running as PID 1 -- the standard,
 # widely-used detection check (e.g. systemd-detect-virt uses the same test).
 if [ ! -d /run/systemd/system ]; then
-  echo "error: systemd not detected (no /run/systemd/system) -- u7s requires systemd (Ubuntu LTS only, see docs/decisions/systemd-install-contract.md)" >&2
+  echo "error: systemd not detected (no /run/systemd/system) -- u7s requires systemd" >&2
   exit 1
 fi
 
@@ -87,18 +87,27 @@ if [ -z "$NODE_NAME" ]; then
 fi
 
 if [ -z "$IFACE" ]; then
-  # First non-loopback interface, in kernel ifindex order (the order `ip link
-  # show` lists them) -- matches install-script-ux.md's literal default. Also
-  # excludes common virtual/container-runtime interfaces (docker0, veth*,
-  # cni*, br-*, virbr*, flannel*, cali*): a genuinely fresh box won't have
-  # any of these, but a box that already has some other container runtime
-  # installed (or a re-run of this script) would, and picking one of those
-  # as "the" cluster-traffic interface would be wrong regardless.
+  # Whitelist of real physical-NIC name patterns, not a blacklist of virtual
+  # ones. A blacklist can only ever cover the virtual-interface names its
+  # author happened to think of (docker0/veth*/cni*/... today, something
+  # else tomorrow); the physical-NIC vocabulary is small, finite, and
+  # documented (systemd.net-naming-scheme(7)): predictable names are always
+  # en<x>/wl<x>/ww<x> (Ethernet/WLAN/WWAN) followed by an o/s/p/x-prefixed
+  # location suffix -- eno1, ens33, enp0s3, enp2s0f1, enx<mac>, wlo1, wlp2s0,
+  # wlx<mac>, wwp0s20u4i6 -- so "en"/"wl"/"ww" is the right level of
+  # abstraction, not literally "eno"/"wlo" (which are just two instances of
+  # the "en"/"wl" prefix, specific to onboard-device naming). The legacy
+  # pre-predictable-naming kernel names (eth0, wlan0 -- wlan0 already matches
+  # the "wl" prefix, so only eth0/ethN needs its own branch) are also
+  # whitelisted: this is not just a theoretical old-kernel fallback -- a live
+  # check across this project's own 5-VM Ubuntu 26.04 Lima fleet (identical
+  # VM template) found it split 2/5 enp0s1 (predictable) vs 3/5 eth0
+  # (fallback), so eth0 has to stay covered, not be treated as obsolete.
   IFACE="$(ip -o link show | awk -F': ' '{print $2}' \
-    | grep -Ev '^(lo|docker[0-9]*|veth.*|cni.*|br-.*|virbr.*|flannel.*|cali.*)$' \
+    | grep -E '^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$' \
     | head -n1)"
   if [ -z "$IFACE" ]; then
-    echo "error: no non-loopback, non-virtual network interface found -- pass --iface explicitly" >&2
+    echo "error: no recognized physical network interface found -- pass --iface explicitly" >&2
     exit 1
   fi
 fi
