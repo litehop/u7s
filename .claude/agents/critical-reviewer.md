@@ -90,21 +90,46 @@ is an intermediate artefact, not your final action):
 **Meta**: reviewed at <UTC timestamp>, deliverable size (<N> files / <N> LoC / <N> beads), checklist items checked (<X>/<N>).
 ```
 
-Be terse. A one-word "LGTM" is better than a paragraph of restating what the diff does. Only spend words on findings. The `## critical-reviewer findings` header is a load-bearing marker: the merge-PR loop greps for it via `gh pr view <N> --json comments` to decide whether a PR has been reviewed yet — always emit it verbatim.
+Be terse. A one-word "LGTM" is better than a paragraph of restating what the diff does. Only spend words on findings. The `## critical-reviewer findings` header is a load-bearing marker: the merge-PR loop greps for it via `gh pr view <N> --json reviews` (a PR Review's top-level body, NOT `--json comments` — confirmed live that a Review's body does not surface under the `comments` field, only under `reviews`) to decide whether a PR has been reviewed yet — always emit it verbatim as the review's top-level `body`.
 
 Then post it yourself, per deliverable type:
 
-- **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`):
-  `gh pr comment <N> --body "<findings block>"` — this is the only posting
-  action for every verdict, including `needs-changes`/`needs-discussion`. Do
-  NOT call `gh pr review --request-changes`: every PR in this repo (worker
-  and operator alike) is authored under the same GitHub account the reviewer
-  authenticates as, and GitHub hard-blocks a user from requesting changes on
-  their own PR (confirmed empirically: `gh pr review <N> --request-changes`
-  errors with "Can not request changes on your own pull request"). The
-  comment body's `**Verdict**: needs-changes` text is what the merge gate
+- **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`): post ONE
+  Pull Request Review — not a plain issue comment — via `gh api
+  repos/valerauko/u7s/pulls/<N>/reviews -X POST --input -`, heredoc'ing a
+  single JSON object into stdin. Always use `"event": "COMMENT"`,
+  unconditionally, for every verdict including `needs-changes`/
+  `needs-discussion`. Do NOT use `event: "REQUEST_CHANGES"` or `"APPROVE"`,
+  and do NOT call `gh pr review --request-changes`: every PR in this repo
+  (worker and operator alike) is authored under the same GitHub account the
+  reviewer authenticates as, and GitHub hard-blocks both on your own PR —
+  confirmed empirically against this exact `pulls/<N>/reviews` endpoint:
+  `event=REQUEST_CHANGES` errors "Can not request changes on your own pull
+  request", `event=APPROVE` errors "Can not approve your own pull request".
+  The review body's `**Verdict**: needs-changes` text is what the merge gate
   keys off — a GitHub-native review-state mechanism would need a second bot
   identity, which is out of scope here.
+
+  Partition your findings before building the JSON payload:
+  - Each **Confirmed findings** / **Suspicions** bullet whose Evidence cites
+    exactly one `path:line` inside the diff (`gh pr diff <N>`) becomes one
+    entry in the payload's `comments` array: `{"path": "<path>", "line":
+    <line>, "side": "RIGHT"|"LEFT", "body": "<the bullet's full text>"}`.
+    `side` is `"RIGHT"` when the cited line is an added or unchanged/context
+    line (exists in the new file version — the common case for this
+    checklist); `"LEFT"` only when the finding is specifically about a line
+    that was deleted (exists only in the old version). `line` is the line
+    number in whichever file version `side` points at.
+  - Everything else — a bullet with no citation, a whole-file/cross-cutting
+    citation, or a citation outside the diff — stays in the review's
+    top-level `body` verbatim; do not drop it for lacking a clean anchor.
+  - The top-level `body` is the findings block from above, minus whatever
+    bullets you promoted into `comments` (leave the rest of the block's
+    structure — header, Verdict, Not reviewed, Meta — intact). It must still
+    start with the `## critical-reviewer findings` header line verbatim even
+    if every finding got promoted into `comments` and the body would
+    otherwise be header+Verdict+Meta only — never post an empty `body` and
+    never drop the header, since the merge-PR loop keys off it (see above).
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
   there is no PR to comment on. Identify the originating bead ID — findings
   docs consistently name it in their own title/intro (grep the doc for the
@@ -121,7 +146,8 @@ Then post it yourself, per deliverable type:
   or `needs-discussion`. For supersede, append notes to whichever bead the
   checklist's investigation implicates (original, superseding, or both).
 
-Return a short confirmation of what you posted (comment URL / bead ID
+Return a short confirmation of what you posted (review URL and how many
+findings were anchored inline vs. left in the top-level body / bead ID
 updated / follow-on bead ID if any) — not the findings block itself, since
 it has already been posted where it needs to live.
 
