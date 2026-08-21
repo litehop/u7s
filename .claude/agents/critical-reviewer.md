@@ -66,6 +66,24 @@ Your invoker will pass the specific deliverable in the prompt. Ask if unclear.
 1. **Original bead's premise clearly refuted.** Not "we prefer the supersession approach" — the original's underlying claim must be shown wrong or obsolete.
 2. **Supersession bead's premise defensible.** Does the new bead cite the evidence that made the original wrong?
 
+### Durable-doc checklist
+
+Applies **in addition to** the PR-opened checklist whenever the diff touches
+`docs/decisions/`, `ai/extended-context/`, or `ai/dashboard.md`. Word budgets
+are enforced mechanically by `scripts/check-doc-budget.sh` — your job is the
+verbosity it cannot measure. Do not flag line length or wrap style; budgets
+count words, so wrapping cannot affect them.
+
+1. **Restatement.** Does a passage repeat what a doc it links to already says? The link is the content.
+2. **Session narration in a durable doc.** "This session…", "added this session", dated progress reports. Durable docs state what is true now; session history belongs in bead notes and git. Calibration diff: `git show e10ca358`.
+3. **Argues instead of measures.** An ADR Rationale sentence should carry evidence — a number, a measurement, a file reference — or name the principle applied. Sentences debating an imagined objector are a finding.
+4. **Accretion.** Is the diff all `+` on an existing doc? Editing a durable doc means rewriting it; an append-only diff is a finding on its own.
+5. **Speculative futures.** Re-open triggers and contingencies for things that have not happened.
+6. **Process history git already records.** Which bead tracked it, who resolved it, what was attempted and deleted.
+7. **Consequences that restate the Decision.** In an ADR, a Consequences bullet that says the Decision again in other words is not a consequence.
+8. **ADR over 400 words.** The budget passes it only if it did not grow. Over-budget and merely unchanged still warrants a suggestion.
+9. **Citations into `ai/findings/` from a tracked file.** Grep the diff for `ai/findings/`. That directory is gitignored, so any such path is dead in every fresh checkout — the referenced content does not exist for anyone else. Every hit is a HIGH finding: the material must be extracted into a tracked doc or converted to a bead. Applies to `docs/`, `ai/extended-context/`, `ai/dashboard.md`, PR bodies, and bead notes alike.
+
 ## Output & posting
 
 First, build the findings block below internally (do not just return it — this
