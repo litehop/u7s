@@ -141,7 +141,7 @@ that failure is actually observed rather than pre-emptively applied —
 pre-seeding before attempting the install would mask whatever the real gap
 turns out to be.
 
-### Gate 6 — Packaging & distribution (MVP scope defined, install script not yet written)
+### Gate 6 — Packaging & distribution (local-install MVP shipped 2026-08-21)
 End-game: k3s-style one-shell-script install. See north-star.md's packaging
 philosophy for the settled direction (default everything, minimal
 configurable surface — node identity and network-interface selection only —
@@ -170,13 +170,18 @@ individual ADRs:
   actually served from) — deferred, tracked in
   `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §7.
 
-**This session's MVP scope:** a local install script, exercised against a
-freshly provisioned, clean Ubuntu box (a disposable Lima VM stood up
-specifically for this purpose, not one of the existing conformance dev
-slots), that takes a zero-argument single-node install all the way to a
-working `kubectl get nodes`. Explicitly out of scope for this MVP: the real
-self-hosted distribution domain/origin, multi-node join, CA-trust/rotation
-tooling, metrics-server, and any agent-facing install tooling.
+**MVP shipped 2026-08-21** (`mayor-wl8kl`/PR #1332, `mayor-1uunh`/PR #1340):
+`scripts/install.sh`, exercised end-to-end against a freshly provisioned,
+clean Ubuntu box (a disposable Lima VM stood up specifically for this
+purpose, not one of the existing conformance dev slots), takes a
+zero-argument single-node install all the way to a working `kubectl get
+nodes` with CoreDNS and kube-proxy actually running. Out of scope, still
+open: the real self-hosted distribution domain/origin, multi-node join,
+CA-trust/rotation tooling, metrics-server, and any agent-facing install
+tooling. `kubectl logs`/`exec` also confirmed working end to end (a gap
+found during MVP verification and fixed same-session, `mayor-h0cyv`/PR
+#1343: kubelet's serving cert now signed by the cluster CA, with the
+matching client-CA trust wired in).
 
 **Scoping decision added this session:** the install script's own logic
 (CRI-O setup, systemd units, manifest bootstrap, defaulting behavior — i.e.
@@ -187,7 +192,8 @@ pre-built tarball as a path/file argument rather than fetching one from a
 URL — this lets the install logic be fully tested end-to-end without the
 hosting question blocking anything.
 
-Not a bead yet for the install script itself. Fires when correctness + perf
+The remaining open items above (tarball build/shape, distribution hosting,
+multi-node CA-trust/rotation) are not yet beads — they fire when correctness + perf
 are both stable enough that a packaging story would not need to be
 re-litigated within weeks, and once Gate 2's component decisions are far
 enough along to know what's actually being packaged.
