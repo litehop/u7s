@@ -254,15 +254,27 @@ on different hardware — treat as a range, not a promise):
 **Order of operations that minimises wasted work**:
 
 1. Make your edit.
-2. Run `cargo test --workspace` and `cargo clippy --workspace --tests --no-deps -- -D warnings`
+2. Sync with main before the quality gate. `git fetch origin main`, then
+   `git rev-list --count HEAD..origin/main` — if that's nonzero, `git merge
+   origin/main` and resolve any conflict now. Do this before every push, not
+   just review-feedback fix rounds — it's cheap, and the branch has often
+   drifted behind main during the dispatch → build → review → fix round-trip
+   as other PRs merge. Merging first means the commit you're about to
+   quality-gate and push already reflects current main, so the mayor's merge
+   loop is less likely to need a separate `gh pr update-branch` + CI cycle.
+   Caveat: this reduces but doesn't eliminate that extra cycle — another PR
+   can still merge in the window between your push and the mayor's actual
+   merge attempt, so the PR may show BEHIND again by then. The point is
+   starting from a fresh base, not guaranteeing a final CLEAN state.
+3. Run `cargo test --workspace` and `cargo clippy --workspace --tests --no-deps -- -D warnings`
    ONCE, before commit. This is your "see failures with context" pass — it's
    also what warms the cache for every later run in this worktree. If either
    fails, fix and re-run only the affected target (`cargo test -p <crate>` or
    `cargo test <testname>`) — never re-run the whole workspace on every edit iteration.
-3. `git add` + `git commit`. Pre-commit runs `cargo fmt --check` — the ONLY new
+4. `git add` + `git commit`. Pre-commit runs `cargo fmt --check` — the ONLY new
    thing the hook adds. If `fmt` fails, run `cargo fmt` and re-commit.
-4. `git push`. Pre-push re-runs test+clippy. Because you haven't touched source
-   since step 2, compilation is cached and only test EXECUTION time is spent —
+5. `git push`. Pre-push re-runs test+clippy. Because you haven't touched source
+   since step 3, compilation is cached and only test EXECUTION time is spent —
    see "warm cache" above for the expected wall-clock. Do NOT manually
    re-run test+clippy right before push — the hook is going to do it anyway;
    a manual pre-push run just doubles that warm-cache cost for zero signal.
