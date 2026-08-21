@@ -442,7 +442,7 @@ One bead, one PR. Standard shape. Sections: bead ID + verbatim title; 2–4
 paragraphs of context with `file:line` citations; numbered concrete steps;
 quality gates with exact commands; push + `gh pr create` titled
 `<scope>(<artefact>): <summary> (<BEAD_ID>)`; return PR URL + per-step
-summary + test deltas, under <N> words.
+summary + test deltas, under 250 words.
 
 Step 0 — verify CWD is the worktree root:
 ```bash
@@ -553,6 +553,35 @@ verify locally; **push to the existing PR branch, not main**; return under 300
 words with root cause + fix chosen + verification. Diagnosis often surfaces
 deeper insight than the failure log shows — test the hypothesis before applying
 the fix.
+
+---
+
+## Shape 6 — Durable doc change (ADR, roadmap, extended-context)
+
+One bead asks for a decision recorded or durable context refreshed, not code.
+Sections: what is being settled and what stays open; source material (findings
+doc, bead thread, prior ADRs on the surface); the target file **and its word
+budget** — `docs/decisions/` 400, `ai/extended-context/` 1200,
+`ai/dashboard.md` 400, all enforced by `scripts/check-doc-budget.sh`; for a
+new ADR, start from `docs/decisions/_template.md`; return under 200 words
+with the paths written and their before/after word counts.
+
+Critical learnings:
+
+- **Budget the artefact, not just the return.** Shapes 1–5 cap the worker's
+  message to the mayor; only this shape caps what lands in the repo. A brief
+  that omits the target's word budget is how `a66f38ce` put 277 words back
+  into roadmap.md 23 minutes after `e10ca358` cut 371 — and reintroduced the
+  same session-journal pattern that had just been deleted.
+- **Require deletions.** An all-`+` diff on an existing doc is accretion, not
+  editing. `Write` the whole file rather than appending to it.
+- **Words, never lines.** Do not brief a line budget: joining lines satisfies
+  it with zero content change.
+- **Name what NOT to distil.** Needs-data and deferred sections of a sketch
+  stay in `ai/findings/` and get linked, not copied into the durable doc.
+- **No measurement is an acceptable rationale.** If a decision was a judgment
+  call, the brief should say to name the principle applied rather than
+  manufacture justification for it.
 
 ---
 

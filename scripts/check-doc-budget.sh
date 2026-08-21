@@ -36,10 +36,16 @@ BASE=$(git merge-base "$BASE_REF" HEAD)
 # Word budgets per directory. docs/decisions/ is anchored to the tight cluster
 # of ADRs that work (crio 225, webhook 235, sqlite 263, rust-api 282,
 # custom-bin 306), not to the corpus mean — 400 is ~30% above that cluster.
+#
+# ai/dashboard.md also carries a ~40-line ceiling in bootstrap.md. That rule
+# is about fitting one screen so a returning operator re-orients fast; this
+# one is about content volume. They are complementary — a dashboard reflowed
+# to 20 long lines would satisfy the line rule and still be bloated.
 budget_for() {
   case "$1" in
     docs/decisions/*)      echo 400 ;;
     ai/extended-context/*) echo 1200 ;;
+    ai/dashboard.md)       echo 400 ;;
     *)                     echo 0 ;;   # 0 = not budgeted
   esac
 }
