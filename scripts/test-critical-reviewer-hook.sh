@@ -150,13 +150,15 @@ else
   fail "wrong-org PR URL: expected 0 queue files, got $(count_queue_files)"
 fi
 
-# Bonus: every case should have produced a raw-input log file in log/.
+# Bonus: only "queued" decisions get a raw-input log file (retention policy,
+# 2026-08-21) -- of the 6 cases above, only 1/2/3 (pr, findings, bead-close)
+# are queued; 4/5/6 are skips and must NOT produce a jsonl dump.
 if [ -d "$SANDBOX/.claude/review-queue/log" ]; then
   LOG_COUNT=$(find "$SANDBOX/.claude/review-queue/log" -name '*.jsonl' | wc -l | tr -d ' ')
-  if [ "$LOG_COUNT" = "6" ]; then
-    pass "raw input logged for every fire (6/6)"
+  if [ "$LOG_COUNT" = "3" ]; then
+    pass "raw input logged only for queued decisions (3/3)"
   else
-    fail "raw input log count: expected 6, got $LOG_COUNT"
+    fail "raw input log count: expected 3, got $LOG_COUNT"
   fi
 else
   fail "raw input log dir missing"
