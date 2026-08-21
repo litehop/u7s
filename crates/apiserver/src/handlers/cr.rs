@@ -1613,6 +1613,7 @@ pub async fn create_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -1709,6 +1710,7 @@ pub async fn replace_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -1876,6 +1878,7 @@ pub async fn delete_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2024,6 +2027,7 @@ pub async fn delete_collection_cr<S: Store>(
                     "username": user.username,
                     "uid": user.uid,
                     "groups": user.groups,
+                    "extra": user.extra,
                 })),
                 dry_run: false,
             };
@@ -2431,6 +2435,7 @@ pub async fn create_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2548,6 +2553,7 @@ pub async fn replace_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2624,6 +2630,7 @@ pub async fn delete_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2774,6 +2781,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     "username": user.username,
                     "uid": user.uid,
                     "groups": user.groups,
+                    "extra": user.extra,
                 })),
                 dry_run: false,
             };
@@ -2865,6 +2873,7 @@ pub async fn patch_cr<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -2970,6 +2979,7 @@ pub async fn patch_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -3070,6 +3080,7 @@ pub async fn patch_cr_namespaced<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -3190,6 +3201,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
