@@ -193,6 +193,29 @@ assert_false "(regression guard) install.sh's default --iface detection uses no 
 assert_true "install.sh installs kubernetes-cni (the actual /opt/cni/bin/ plugin binaries CRI-O's bridge config references) alongside kubectl, not just kubectl alone" \
   grep -qF 'apt-get install -y kubectl kubernetes-cni' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# Regression guard: apiserver-to-kubelet proxy (kubectl logs/exec) BadGateway
+# on a host-level single-box install. Root cause had two independent halves,
+# each with its own live-VM-confirmed failure mode -- both assertions below
+# must hold or the specific symptom that was fixed comes back:
+#   1. kubelet's default self-signed serving cert on :10250 is untrusted by
+#      the apiserver's kubelet-client (pinned to the cluster CA), surfacing
+#      as a TLS "unknown CA" alert wrapped in reqwest's opaque "error sending
+#      request" -- confirmed via `curl -v https://<node-ip>:10250/`.
+#   2. even with a trusted serving cert, kubelet has no clientCAFile to
+#      authenticate the apiserver's own client cert against, so it treats
+#      the (now-TLS-trusted) request as anonymous and 401s it -- confirmed
+#      via a direct unauthenticated curl to kubelet's /containerLogs.
+# ---------------------------------------------------------------------------
+assert_true "kubelet-config.yaml points tlsCertFile/tlsPrivateKeyFile at a serving cert signed by the cluster CA, not kubelet's own default self-signed fallback" \
+  grep -qF 'tlsCertFile: $STATE_DIR/kubelet-serving.crt' "$INSTALL"
+
+assert_true "kubelet.service mints that serving cert (ExecStartPre) with an IP SAN matching the node's own cluster-traffic address, since apiserver dials kubelet by IP" \
+  grep -qF 'subjectAltName=IP:$IFACE_IP' "$INSTALL"
+
+assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cluster CA, so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
+  grep -qF 'clientCAFile: $STATE_DIR/ca.pem' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

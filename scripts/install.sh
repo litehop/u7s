@@ -252,6 +252,22 @@ install -d -m 0755 /etc/u7s/static-pods
 # /etc/resolv.conf pointing at the 127.0.0.53 stub, which is unreachable from
 # inside a pod's network namespace; disabling passthrough avoids kubelet
 # propagating that unusable resolver into every pod's /etc/resolv.conf.
+#
+# tlsCertFile/tlsPrivateKeyFile point at a serving cert kubelet.service's
+# ExecStartPre mints below, signed by the cluster CA -- see that unit's
+# comment for why (without it, kubelet falls back to a self-signed cert the
+# apiserver's kubelet-client always rejects, breaking kubectl logs/exec).
+#
+# authentication.x509.clientCAFile is the other half of that same fix: it lets
+# kubelet authenticate apiserver's own client cert (CN=kube-apiserver-kubelet-
+# client, O=system:masters, also signed by this CA) as an identity instead of
+# treating the request as anonymous. Without it, kubelet's default anonymous-
+# auth+AlwaysAllow combination sounds permissive but is actually not what
+# happens here: this real kubelet's own container-log/exec endpoints return a
+# bare 401 "Unauthorized" for a request with no clientCAFile configured to
+# resolve an identity against, propagated verbatim through the apiserver's
+# proxy (see the passthrough comment in handlers/proxy.rs) as the same
+# kubectl-logs/exec failure this unit's serving-cert fix alone does not clear.
 cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -263,6 +279,11 @@ staticPodPath: /etc/u7s/static-pods
 clusterDNS:
   - 10.96.0.10
 clusterDomain: cluster.local
+tlsCertFile: $STATE_DIR/kubelet-serving.crt
+tlsPrivateKeyFile: $STATE_DIR/kubelet-serving.key
+authentication:
+  x509:
+    clientCAFile: $STATE_DIR/ca.pem
 EOF
 
 # --- systemd units -------------------------------------------------------------
@@ -350,6 +371,27 @@ Requires=crio.service u7s-apiserver.service
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
+# Without --tls-cert-file/--tls-private-key-file (wired via kubelet-config.yaml's
+# tlsCertFile/tlsPrivateKeyFile above), kubelet generates its own self-signed
+# serving cert for :10250 (see 'kubelet --help's own --tls-cert-file text) --
+# signed by a CA the apiserver's kubelet-client has no way to trust, since that
+# client is pinned to the cluster CA (build_kubelet_tls_config in
+# crates/apiserver/src/handlers/proxy.rs), not the system trust store. That
+# mismatch is exactly what surfaces as "kubectl logs"/"exec" failing with
+# BadGateway -- confirmed live via curl -v against the kubelet's own :10250
+# showing a TLS "unknown CA" alert against kubelet's self-signed cert.
+# kube-controller-manager's built-in CSR approver has no auto-approve path for
+# kubernetes.io/kubelet-serving requests (unlike client-cert CSRs) -- blindly
+# approving one would let any node claim a cert for any IP/hostname, so real
+# clusters require a human or an external approver. Minting the serving cert
+# once here from the CA install.sh already controls sidesteps that whole flow,
+# which fits this script's current single-node scope.
+# ExecStartPre (not a bash -c wrapping ExecStart itself, matching u7s-kcm.service's
+# reasoning above): idempotent, skips regeneration if the cert already exists so
+# Restart=always crash-restarts do not churn it, and openssl's ca.crt DER->PEM
+# conversion is safe to repeat (same input, same output) across services.
+ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
+ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP") -out $STATE_DIR/kubelet-serving.crt; }'
 ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
 Restart=always
 RestartSec=2
