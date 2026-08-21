@@ -253,6 +253,7 @@ pub async fn create_csr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };

@@ -560,17 +560,26 @@ pub(crate) async fn convert_cr_list_items<S: Store>(
     Ok(())
 }
 
-/// Evict `state.cr_conversion_cache` entries left behind by a CR that was just
-/// hard-deleted. `deleted_resource_version` is the deleted object's own stored
-/// `metadata.resourceVersion` — every entry keyed on it (any target apiVersion) can
-/// never be looked up again, since a deleted object's rv is never reused. Memory hygiene
-/// only: correctness never depended on this (see `CrConversionCache`'s doc comment).
+/// Evict `state.cr_conversion_cache` entries keyed on `superseded_resource_version` (any
+/// target apiVersion) — every entry keyed on it can never be looked up again, since a
+/// resourceVersion is never reused and, the instant a newer one exists, is no longer
+/// reachable via normal API access (Kubernetes has no notion of a read pinned to a stale
+/// rv). Called both when a CR is hard-deleted (its own final rv) and, just as importantly,
+/// after every successful UPDATE (the object's PREVIOUS rv) — without the latter, a CRD
+/// that is never deleted (the common case) never has any of its historical entries
+/// cleaned up, even though each one is orphaned the moment the update that superseded it
+/// commits. Memory hygiene only: correctness never depended on this (see
+/// `CrConversionCache`'s doc comment).
 fn evict_cr_conversion_cache<S: Store>(
     state: &AppState<S>,
-    deleted_resource_version: Option<&str>,
+    superseded_resource_version: Option<&str>,
 ) {
-    if let Some(rv) = deleted_resource_version {
+    if let Some(rv) = superseded_resource_version {
         state.cr_conversion_cache.invalidate_by_rv(rv);
+        tracing::debug!(
+            rv,
+            "cr conversion cache: evicted entries for superseded resourceVersion"
+        );
     }
 }
 
@@ -1604,6 +1613,7 @@ pub async fn create_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -1700,6 +1710,7 @@ pub async fn replace_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -1722,6 +1733,7 @@ pub async fn replace_cr<S: Store>(
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+    evict_cr_conversion_cache(&state, existing["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
@@ -1866,6 +1878,7 @@ pub async fn delete_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2014,6 +2027,7 @@ pub async fn delete_collection_cr<S: Store>(
                     "username": user.username,
                     "uid": user.uid,
                     "groups": user.groups,
+                    "extra": user.extra,
                 })),
                 dry_run: false,
             };
@@ -2421,6 +2435,7 @@ pub async fn create_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2538,6 +2553,7 @@ pub async fn replace_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2560,6 +2576,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+    evict_cr_conversion_cache(&state, existing["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
@@ -2613,6 +2630,7 @@ pub async fn delete_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2763,6 +2781,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     "username": user.username,
                     "uid": user.uid,
                     "groups": user.groups,
+                    "extra": user.extra,
                 })),
                 dry_run: false,
             };
@@ -2854,6 +2873,7 @@ pub async fn patch_cr<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -2959,6 +2979,7 @@ pub async fn patch_cr<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2982,6 +3003,7 @@ pub async fn patch_cr<S: Store>(
         .put(&key, Bytes::from(bytes), Some(stored.revision))
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+    evict_cr_conversion_cache(&state, old["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
@@ -3058,6 +3080,7 @@ pub async fn patch_cr_namespaced<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -3178,6 +3201,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -3201,6 +3225,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         .put(&key, Bytes::from(bytes), Some(stored.revision))
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+    evict_cr_conversion_cache(&state, old["metadata"]["resourceVersion"].as_str());
 
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
@@ -3297,6 +3322,12 @@ pub async fn put_cr_status<S: Store>(
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &name, &kind))?;
+    // `resourceVersion` is in merge_incoming_metadata's PROTECTED list, so `current`
+    // still carries the pre-put (old) rv here, before it's overwritten below. A no-op
+    // for the registry-resource branch above (its rv never appears in the CR conversion
+    // cache), but frequent status-subresource updates on a webhook-converted CR are the
+    // conversion cache's main growth driver, so this matters most exactly here.
+    evict_cr_conversion_cache(&state, current["metadata"]["resourceVersion"].as_str());
 
     let mut current_meta: crate::types::ObjectMeta =
         serde_json::from_value(current["metadata"].take()).unwrap_or_default();
@@ -3520,12 +3551,16 @@ async fn cr_scale_put_impl<S: Store>(
     scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas as i64);
 
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
+    let old_rv = obj["metadata"]["resourceVersion"]
+        .as_str()
+        .map(str::to_string);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, target.name, &ctx.kind))?;
+    evict_cr_conversion_cache(state, old_rv.as_deref());
 
     Ok(Json(super::scale::build_scale(
         target.name,
@@ -3582,12 +3617,16 @@ async fn cr_scale_patch_impl<S: Store>(
     };
 
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
+    let old_rv = obj["metadata"]["resourceVersion"]
+        .as_str()
+        .map(str::to_string);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, target.name, &ctx.kind))?;
+    evict_cr_conversion_cache(state, old_rv.as_deref());
 
     Ok(Json(super::scale::build_scale(
         target.name,
@@ -10063,6 +10102,161 @@ mod tests {
             "an entry cached under a DIFFERENT write's rv must survive this delete — \
              eviction must be scoped to the deleted object's own rv only, never a blanket \
              clear of the whole cache"
+        );
+    }
+
+    /// An ordinary UPDATE (not just hard-delete) must evict `cr_conversion_cache` entries
+    /// keyed on the object's PREVIOUS rv. Without this, a CRD that is never deleted (the
+    /// common case) never has any of its historical entries cleaned up: every write mints
+    /// a new rv, permanently orphaning the previous one's cache entries for the life of
+    /// the process. Fails on revert: without the eviction call, the entry inserted below
+    /// under the pre-update rv survives the replace untouched.
+    #[tokio::test]
+    async fn cr_conversion_cache_evicts_previous_rv_on_replace_cr_update() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("evict-on-update-widget"),
+        )
+        .await
+        .expect("create must succeed")
+        .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let old_rv = created["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("create response must include resourceVersion")
+            .to_string();
+
+        // What a watcher of a different served version would have cached for the create.
+        state.cr_conversion_cache.insert(
+            (old_rv.clone(), "example.io/v2".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+        );
+        // An entry under a DIFFERENT rv (a different write) must survive this update —
+        // eviction must be scoped to the superseded rv only, never a blanket clear.
+        state.cr_conversion_cache.insert(
+            ("999".to_string(), "example.io/v2".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+        );
+
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "evict-on-update-widget" },
+                "spec": { "color": "red" }
+            })
+            .to_string(),
+        );
+        replace_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "evict-on-update-widget".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            update_body,
+        )
+        .await
+        .expect("replace must succeed");
+
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&(old_rv, "example.io/v2".to_string())),
+            "a successful UPDATE must evict cache entries keyed on the object's PREVIOUS \
+             rv — otherwise a CRD that is never deleted never has any of its historical \
+             entries cleaned up, even though the update just made this one unreachable"
+        );
+        assert!(
+            state
+                .cr_conversion_cache
+                .contains(&("999".to_string(), "example.io/v2".to_string())),
+            "an entry cached under a DIFFERENT write's rv must survive this update — \
+             eviction must be scoped to the superseded rv only"
+        );
+    }
+
+    /// Same as the replace_cr case above, but for PATCH — a distinct code path (captures
+    /// its pre-patch snapshot differently) that must independently evict the superseded
+    /// rv's cache entries on a successful merge-patch UPDATE.
+    #[tokio::test]
+    async fn cr_conversion_cache_evicts_previous_rv_on_patch_cr_update() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("evict-on-patch-widget"),
+        )
+        .await
+        .expect("create must succeed")
+        .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let old_rv = created["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("create response must include resourceVersion")
+            .to_string();
+
+        state.cr_conversion_cache.insert(
+            (old_rv.clone(), "example.io/v2".to_string()),
+            Arc::new(serde_json::json!({"apiVersion": "example.io/v2"})),
+        );
+
+        let patch_body =
+            Bytes::from(serde_json::json!({ "spec": { "color": "purple" } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "evict-on-patch-widget".to_string(),
+            )),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await
+        .expect("patch must succeed");
+
+        assert!(
+            !state
+                .cr_conversion_cache
+                .contains(&(old_rv, "example.io/v2".to_string())),
+            "a successful PATCH update must evict cache entries keyed on the object's \
+             PREVIOUS rv, exactly like replace_cr — this is a separate code path with its \
+             own pre-patch snapshot and must not be missed"
         );
     }
 

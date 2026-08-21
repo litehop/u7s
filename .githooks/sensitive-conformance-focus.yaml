@@ -1,0 +1,30 @@
+# Registry of known-recurring-regression files and the sonobuoy --focus
+# regex that MUST record a PASS before a push touching them is allowed
+# through .githooks/pre-push.
+#
+# Why this exists: validate_pod_spec_immutable (crates/apiserver/src/
+# handlers/pods.rs) regressed the same upstream conformance spec 3 times
+# (PR #729, #772, #1213) while `cargo test --workspace` + clippy stayed
+# green the whole time -- unit tests alone don't exercise the real
+# kubelet+KCM+apiserver interaction the upstream spec does. See bd memory
+# `conformance-pr-merge-gate` and the mayor-fdc5z postmortem for the full
+# history this registry operationalizes.
+#
+# Parsed by .githooks/pre-push with grep/awk, NOT a YAML library -- a git
+# hook must not depend on yq/python being installed (a missing dependency
+# would either silently skip the gate or hard-block every push). This means
+# the schema below is a HARD REQUIREMENT, not just a style preference:
+#
+#   - file: <path (or substring of a path), matched against the outgoing
+#            push's changed files>
+#     function: <name of the guarded function -- audit trail only, the hook
+#                does not parse or match on this field>
+#     focus: <sonobuoy --focus regex (ginkgo alternation syntax) that must
+#             PASS before a push touching `file` is allowed>
+#
+# To register a newly-discovered recurring-regression function, copy an
+# entry below and fill in the three fields -- no code change required.
+
+- file: crates/apiserver/src/handlers/pods.rs
+  function: validate_pod_spec_immutable
+  focus: "ReplicationController should release no longer matching pods|Job should adopt matching orphans and release non-matching pods"

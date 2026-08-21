@@ -541,6 +541,7 @@ async fn build_new_crd<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -711,6 +712,7 @@ pub async fn replace_crd<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -773,6 +775,7 @@ pub async fn delete_crd<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -1007,6 +1010,7 @@ pub async fn patch_crd<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
