@@ -814,6 +814,31 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group.is_empty() && plural == "services" {
         validate_service_ip_family_fields(obj)?;
     }
+    if group == "batch" && plural == "cronjobs" {
+        validate_cronjob_timezone(obj)?;
+    }
+    Ok(())
+}
+
+/// Validates CronJob `spec.timeZone` resolves to a real IANA time zone at admission.
+///
+/// Upstream (`pkg/apis/batch/validation/validation.go`'s `validateCronJobSpec`) rejects
+/// a `spec.timeZone` that doesn't resolve via `time.LoadLocation` — e.g. a typo'd or
+/// nonexistent zone. Conformance test `[sig-apps] CronJob should support timezone`
+/// (test/e2e/apps/cronjob.go:351-358) posts `spec.timeZone: "bad-time-zone"` and asserts
+/// the CREATE call itself returns `apierrors.IsInvalid`. Without this check u7s accepted
+/// the CREATE silently — the cronjob controller only surfaced the problem later as an
+/// UnknownTimeZone warning Event on the object, which the conformance test never looks
+/// for; it only checks the CREATE response.
+fn validate_cronjob_timezone(obj: &serde_json::Value) -> Result<(), String> {
+    let Some(tz) = obj["spec"]["timeZone"].as_str() else {
+        return Ok(());
+    };
+    if tz.parse::<chrono_tz::Tz>().is_err() {
+        return Err(format!(
+            "spec.timeZone: Invalid value: \"{tz}\": unknown time zone {tz}"
+        ));
+    }
     Ok(())
 }
 
@@ -4267,6 +4292,81 @@ mod tests {
             msg.contains("spec.egress[0].ports[0].endPort")
                 && msg.contains("greater than or equal to"),
             "error must point at the offending port and explain why: {msg}"
+        );
+    }
+
+    /// A CronJob with a nonexistent `spec.timeZone` must be rejected at CREATE.
+    ///
+    /// Conformance test `[sig-apps] CronJob should support timezone`
+    /// (test/e2e/apps/cronjob.go:351-358) posts `spec.timeZone: "bad-time-zone"` and
+    /// asserts the CREATE call itself returns `apierrors.IsInvalid`. Without this check
+    /// u7s stored the CronJob anyway (the cronjob controller only posts an
+    /// UnknownTimeZone warning Event later, which the test never checks) — this test
+    /// fails on revert since validate_resource would then return Ok(()).
+    #[test]
+    fn cronjob_invalid_timezone_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "spec": {
+                "schedule": "*/1 * * * *",
+                "timeZone": "bad-time-zone",
+                "jobTemplate": {"spec": {"template": {"spec": {"containers": [], "restartPolicy": "OnFailure"}}}}
+            }
+        });
+        let result = validate_resource("batch", "cronjobs", &obj);
+        assert!(
+            result.is_err(),
+            "CronJob with an unresolvable spec.timeZone must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("spec.timeZone") && msg.contains("bad-time-zone"),
+            "error must name the field and the offending value: {msg}"
+        );
+    }
+
+    /// A CronJob with a real IANA `spec.timeZone` must pass validation.
+    ///
+    /// Ensures the new timezone check does not regress the common, valid case —
+    /// conformance also exercises legitimate zones like "America/New_York" elsewhere.
+    #[test]
+    fn cronjob_valid_timezone_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "ok", "namespace": "default"},
+            "spec": {
+                "schedule": "*/1 * * * *",
+                "timeZone": "America/New_York",
+                "jobTemplate": {"spec": {"template": {"spec": {"containers": [], "restartPolicy": "OnFailure"}}}}
+            }
+        });
+        assert!(
+            validate_resource("batch", "cronjobs", &obj).is_ok(),
+            "CronJob with a valid IANA timeZone must pass validation"
+        );
+    }
+
+    /// A CronJob with no `spec.timeZone` at all must pass validation.
+    ///
+    /// `timeZone` is optional upstream; absence must not be misread as an invalid
+    /// value by the new check.
+    #[test]
+    fn cronjob_absent_timezone_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "ok", "namespace": "default"},
+            "spec": {
+                "schedule": "*/1 * * * *",
+                "jobTemplate": {"spec": {"template": {"spec": {"containers": [], "restartPolicy": "OnFailure"}}}}
+            }
+        });
+        assert!(
+            validate_resource("batch", "cronjobs", &obj).is_ok(),
+            "CronJob with no spec.timeZone must pass validation"
         );
     }
 

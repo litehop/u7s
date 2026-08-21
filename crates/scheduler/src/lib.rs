@@ -4557,21 +4557,26 @@ mod tests {
     // an inline copy), this re-export would break at compile time.
     #[test]
     fn drain_watch_buffer_multi_line_chunk_parses_all_events() {
-        // Simulate receiving two complete JSON watch events in a single chunk.
-        // This exercises the production code path: watch_stream calls
+        // Simulate receiving three complete JSON watch events in a single chunk
+        // (an initial ADDED burst, e.g. scheduler startup against a cluster with
+        // many pre-existing pods, is exactly when several lines pile up in one
+        // read). This exercises the production code path: watch_stream calls
         // drain_watch_buffer per frame, and drain_watch_buffer must consume all
-        // complete lines even when multiple arrive in one network frame.
-        let mut buf = "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n"
+        // complete lines even when several arrive in one network frame — each
+        // loop iteration drains the buffer in place, so this also confirms the
+        // repeated drain doesn't lose or misalign later lines.
+        let mut buf = "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n{\"type\":\"DELETED\",\"object\":{}}\n"
             .to_owned();
         let mut events: Vec<Value> = Vec::new();
         drain_watch_buffer(&mut buf, &mut |v| events.push(v));
         assert_eq!(
             events.len(),
-            2,
-            "both lines must be parsed from a single chunk"
+            3,
+            "all three lines must be parsed from a single chunk"
         );
         assert_eq!(events[0]["type"], "ADDED");
         assert_eq!(events[1]["type"], "MODIFIED");
+        assert_eq!(events[2]["type"], "DELETED");
         assert!(buf.is_empty(), "all complete lines must be consumed");
     }
 

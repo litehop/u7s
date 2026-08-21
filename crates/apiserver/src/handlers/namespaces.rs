@@ -449,6 +449,7 @@ pub(crate) async fn replace_namespace<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        state.quota_admission_locks.evict(&name);
         return Ok(Json(obj.body).into_response());
     }
 
@@ -560,6 +561,7 @@ pub(crate) async fn patch_namespace<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        state.quota_admission_locks.evict(&name);
         return Ok(Json(current.body).into_response());
     }
 
@@ -646,6 +648,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        state.quota_admission_locks.evict(&name);
         return Ok(Json(current.body).into_response());
     }
 
@@ -1008,6 +1011,7 @@ pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
     }
     delete_namespace_scoped_crds(state, namespace).await;
     let _ = state.store.delete(&ns_key, None).await;
+    state.quota_admission_locks.evict(namespace);
 }
 
 /// Delete all CRDs whose `spec.group` contains `namespace_name` as a substring.
@@ -1214,6 +1218,7 @@ pub(crate) async fn delete_namespace<S: Store>(
         .delete(&key, None)
         .await
         .map_err(|e| store_err_to_status(e, &name))?;
+    state.quota_admission_locks.evict(&name);
 
     Ok(Json(serde_json::json!({
         "kind": "Status",
@@ -2912,6 +2917,57 @@ mod tests {
             "namespace without finalizers must be hard-deleted immediately — \
              this path applies to namespaces that predate the finalizer-stamping fix"
         );
+    }
+
+    // Every namespace that is ever created and deleted must not leave a permanent
+    // QuotaAdmissionLocks map entry -- a conformance-style run that churns through
+    // hundreds of ephemeral namespaces would otherwise grow this map forever, one
+    // entry per dead namespace, for the life of the process.
+    #[tokio::test]
+    async fn delete_namespace_without_finalizers_evicts_quota_admission_lock() {
+        use u7s_store::Store;
+        let state = make_state();
+
+        let key = crate::keys::cluster_object_key("namespaces", "no-fin-ns");
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "no-fin-ns",
+                "uid": "00000000-0000-0000-0000-000000000099",
+                "resourceVersion": "1"
+            },
+            "status": { "phase": "Active" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(body.to_string()), Some(0))
+            .await
+            .expect("direct store write must succeed");
+
+        // Take the sole quota-admission permit for this namespace before deleting it, and
+        // hold it across the delete — if the delete path failed to evict the map entry,
+        // "no-fin-ns" would still resolve to THIS exhausted semaphore afterward.
+        let held = state.quota_admission_locks.lock("no-fin-ns").await;
+
+        delete_namespace(
+            State(state.clone()),
+            Path("no-fin-ns".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("delete without finalizers must succeed");
+
+        // Must resolve immediately via a freshly-created semaphore, not block on the one
+        // `held` is still sitting on — a timeout here means eviction did not run.
+        let _fresh = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            state.quota_admission_locks.lock("no-fin-ns"),
+        )
+        .await
+        .expect("namespace hard-delete must evict its quota-admission lock entry");
+
+        drop(held);
     }
 
     // Cascade-delete removes namespace resources on hard-delete so re-creating a
