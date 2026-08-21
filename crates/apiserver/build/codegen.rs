@@ -15,6 +15,10 @@
 //! cannot `use` anything from the crate it is building, so textual inclusion is the only way
 //! both consumers share the same exception data without one duplicating the other.
 
+// ============================================================================
+// core_gen_adapter.rs: core/v1 (Phases 0-3.5)
+// ============================================================================
+
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use prost::Message;
 use prost_types::field_descriptor_proto::{Label, Type};
@@ -3052,6 +3056,10 @@ pub fn generate_serviceaccount(descriptor_bytes: &[u8]) -> String {
     out
 }
 
+// ============================================================================
+// apiregistration_gen_adapter.rs: apiregistration.k8s.io/v1
+// ============================================================================
+
 const APISERVICE: &str = ".k8s.io.kube_aggregator.pkg.apis.apiregistration.v1.APIService";
 const APISERVICE_SPEC: &str = ".k8s.io.kube_aggregator.pkg.apis.apiregistration.v1.APIServiceSpec";
 const APISERVICE_STATUS: &str =
@@ -3193,6 +3201,12 @@ pub fn generate_apiservice(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// coord_gen_adapter.rs: coordination.k8s.io/v1,
+// coordination.k8s.io/v1alpha2
+// ============================================================================
+
 const LEASE: &str = ".k8s.io.api.coordination.v1.Lease";
 const LEASE_SPEC: &str = ".k8s.io.api.coordination.v1.LeaseSpec";
 
@@ -3385,6 +3399,11 @@ pub fn generate_leasecandidate(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// rbac_gen_adapter.rs: authentication.k8s.io/v1, authorization.k8s.io/v1,
+// rbac.authorization.k8s.io/v1
+// ============================================================================
 
 const POLICY_RULE: &str = ".k8s.io.api.rbac.v1.PolicyRule";
 const SUBJECT: &str = ".k8s.io.api.rbac.v1.Subject";
@@ -3664,6 +3683,10 @@ pub fn generate_rolebinding(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// apps_gen_adapter.rs: apps/v1
+// ============================================================================
 
 const DEPLOYMENT: &str = ".k8s.io.api.apps.v1.Deployment";
 const DEPLOYMENT_SPEC: &str = ".k8s.io.api.apps.v1.DeploymentSpec";
@@ -4409,6 +4432,10 @@ pub fn generate_controllerrevision(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// apiextensions_gen_adapter.rs: apiextensions.k8s.io/v1
+// ============================================================================
 
 const JSON_SCHEMA_PROPS: &str =
     ".k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1.JSONSchemaProps";
@@ -5195,6 +5222,10 @@ pub fn generate_delete_options(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// admissionreg_gen_adapter.rs: admissionregistration.k8s.io/v1
+// ============================================================================
 
 const APPLY_CONFIGURATION: &str = ".k8s.io.api.admissionregistration.v1.ApplyConfiguration";
 const JSON_PATCH: &str = ".k8s.io.api.admissionregistration.v1.JSONPatch";
@@ -6464,6 +6495,11 @@ pub fn generate_mutating_admission_policy_binding(descriptor_bytes: &[u8]) -> St
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// storage_node_flow_gen_adapter.rs: storage.k8s.io/v1, node.k8s.io/v1,
+// scheduling.k8s.io/v1, flowcontrol.apiserver.k8s.io/v1
+// ============================================================================
 
 const CSI_NODE: &str = ".k8s.io.api.storage.v1.CSINode";
 const CSI_NODE_DRIVER: &str = ".k8s.io.api.storage.v1.CSINodeDriver";
@@ -7818,6 +7854,10 @@ pub fn generate_prioritylevelconfiguration(descriptor_bytes: &[u8]) -> String {
     out
 }
 
+// ============================================================================
+// batch_gen_adapter.rs: batch/v1
+// ============================================================================
+
 const POD_FAILURE_POLICY: &str = ".k8s.io.api.batch.v1.PodFailurePolicy";
 
 /// `rules` must be emitted unconditionally, even as `[]` — matching the pre-migration
@@ -9101,6 +9141,10 @@ pub fn generate_events_v1_event(descriptor_bytes: &[u8]) -> String {
     out
 }
 
+// ============================================================================
+// autoscaling_gen_adapter.rs: autoscaling/v1, autoscaling/v2
+// ============================================================================
+
 const HPA_V1: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscaler";
 const HPA_V1_SPEC: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscalerSpec";
 const HPA_V1_STATUS: &str = ".k8s.io.api.autoscaling.v1.HorizontalPodAutoscalerStatus";
@@ -9398,6 +9442,10 @@ pub fn generate_hpa_v2(descriptor_bytes: &[u8]) -> String {
     out.push_str("}\n");
     out
 }
+
+// ============================================================================
+// resource_gen_adapter.rs: resource.k8s.io/v1
+// ============================================================================
 
 // ---- resource.k8s.io/v1 (DRA) -----------------------------------------------
 //
