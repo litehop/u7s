@@ -35,10 +35,6 @@ mkdir -p "$LOG_DIR"
 
 TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
 
-# Always log raw hook input — enables debugging the wire format if a future
-# Claude Code release changes the JSON schema (see upstream #27755 caveat).
-printf '%s\n' "$INPUT" > "$LOG_DIR/$TS-$AGENT_ID.jsonl"
-
 # Detect reviewable deliverables. Empty MSG → nothing to review.
 [ -z "$MSG" ] && exit 0
 
@@ -90,6 +86,15 @@ if [ -z "$DELIVERABLE_TYPE" ]; then
     "$TS" "$AGENT_ID" "$AGENT_TYPE" >> "$LOG_DIR/decisions.tsv"
   exit 0
 fi
+
+# Retention policy (2026-08-21): only "queued" decisions get a raw JSONL
+# payload logged. Skips (the vast majority of SubagentStop events — every
+# non-deliverable-producing subagent stop) are already cheaply covered by
+# the one-liner above; giving every one of them a full-payload file too is
+# what grew log/ past 4000 files with no bound. The raw payload is still
+# useful for queued events specifically, to debug the wire format if a
+# future Claude Code release changes the JSON schema (upstream #27755).
+printf '%s\n' "$INPUT" > "$LOG_DIR/$TS-$AGENT_ID.jsonl"
 
 # Write the review-request queue file. Mayor sees it on next turn.
 QUEUE_FILE="$QUEUE_DIR/$TS-$AGENT_ID.md"
