@@ -442,7 +442,7 @@ One bead, one PR. Standard shape. Sections: bead ID + verbatim title; 2–4
 paragraphs of context with `file:line` citations; numbered concrete steps;
 quality gates with exact commands; push + `gh pr create` titled
 `<scope>(<artefact>): <summary> (<BEAD_ID>)`; return PR URL + per-step
-summary + test deltas, under <N> words.
+summary + test deltas, under 250 words.
 
 Step 0 — verify CWD is the worktree root:
 ```bash
@@ -553,6 +553,43 @@ verify locally; **push to the existing PR branch, not main**; return under 300
 words with root cause + fix chosen + verification. Diagnosis often surfaces
 deeper insight than the failure log shows — test the hypothesis before applying
 the fix.
+
+---
+
+## Shape 6 — Durable doc change (ADR, roadmap, extended-context)
+
+One bead asks for a decision recorded or durable context refreshed, not code.
+Sections: what is being settled and what stays open; source material (findings
+doc, bead thread, prior ADRs on the surface); the target file **and its word
+budget** — `docs/decisions/` 400, `ai/extended-context/` 1200,
+`ai/dashboard.md` 400, all enforced by `scripts/check-doc-budget.sh`; for a
+new ADR, start from `docs/decisions/_template.md`; return under 200 words
+with the paths written and their before/after word counts.
+
+Critical learnings:
+
+- **Budget the artefact, not just the return.** Shapes 1–5 cap the worker's
+  message to the mayor, which is read once. This shape caps what lands in the
+  repo, which is re-read by every session that touches the surface. State the
+  target file's word budget in the brief: a brief that leaves it unstated
+  reliably comes back with a doc that grew.
+- **Require deletions.** An all-`+` diff on an existing doc is accretion, not
+  editing. `Write` the whole file rather than appending to it.
+- **Words, never lines.** Do not brief a line budget: joining lines satisfies
+  it with zero content change.
+- **A tracked doc must never cite `ai/findings/`.** That directory is
+  gitignored, so the path resolves to nothing in every fresh checkout and
+  every worktree — a findings citation in a committed file is a broken
+  reference, not a pointer. Anything that must survive the session gets
+  extracted into a tracked document under `docs/` or a tracked `ai/`
+  subfolder; anything still open gets a bead. The brief must say which.
+- **Only settled material becomes a durable doc.** Needs-data and deferred
+  sections of a sketch are not ADR content. Name them in the brief as
+  out-of-scope so the worker files beads for them instead of distilling
+  half-decisions into prose that reads as settled.
+- **No measurement is an acceptable rationale.** If a decision was a judgment
+  call, the brief should say to name the principle applied rather than
+  manufacture justification for it.
 
 ---
 

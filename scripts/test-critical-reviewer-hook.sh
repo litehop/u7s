@@ -150,16 +150,15 @@ else
   fail "wrong-org PR URL: expected 0 queue files, got $(count_queue_files)"
 fi
 
-# Bonus: only "queued" cases (1-3) get a raw-input jsonl payload -- per the
-# retention policy in critical-reviewer-dispatch.sh, "skip" cases (4-6) are
-# cheaply covered by decisions.tsv alone, so giving every SubagentStop event a
-# full-payload file too is what grew log/ past 4000 files with no bound.
+# Bonus: only "queued" decisions get a raw-input log file (retention policy,
+# 2026-08-21) -- of the 6 cases above, only 1/2/3 (pr, findings, bead-close)
+# are queued; 4/5/6 are skips and must NOT produce a jsonl dump.
 if [ -d "$SANDBOX/.claude/review-queue/log" ]; then
   LOG_COUNT=$(find "$SANDBOX/.claude/review-queue/log" -name '*.jsonl' | wc -l | tr -d ' ')
   if [ "$LOG_COUNT" = "3" ]; then
-    pass "raw input logged only for queued fires (3/3)"
+    pass "raw input logged only for queued decisions (3/3)"
   else
-    fail "raw input log count: expected 3 (queued cases only), got $LOG_COUNT"
+    fail "raw input log count: expected 3, got $LOG_COUNT"
   fi
 else
   fail "raw input log dir missing"
