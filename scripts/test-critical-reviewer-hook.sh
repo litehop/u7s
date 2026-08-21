@@ -163,7 +163,9 @@ INPUT_SELF_ECHO=$(jq -n \
   '{agent_id:"agent-test7", agent_type:"critical-reviewer", cwd:"/tmp/wt", session_id:"sess7", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
 run_hook "$INPUT_SELF_ECHO"
 if [ "$(count_queue_files)" = "0" ]; then
-  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q 'skip\tself-review-echo' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+  # See the Case 4 comment above: $'...' is required so grep gets a literal
+  # tab byte instead of relying on \t-as-tab, which real GNU grep does not do.
+  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q $'skip\tself-review-echo' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
     pass "critical-reviewer echoing its own reviewed PR → skipped, decision logged"
   else
     fail "critical-reviewer self-echo: hook did not log a self-review-echo skip decision"
