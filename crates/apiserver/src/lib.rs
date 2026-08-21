@@ -1674,12 +1674,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "labels": { "rbac.authorization.k8s.io/aggregate-to-cluster-admin": "true" }
         },
         "rules": [
-            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","bind","escalate"] },
-            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete"] }
+            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection","bind","escalate"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
         ]
     });
     put!(key, body, "admin", "ClusterRole");
@@ -1698,10 +1698,10 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "labels": { "rbac.authorization.k8s.io/aggregate-to-admin": "true" }
         },
         "rules": [
-            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete"] }
+            { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
         ]
     });
     put!(key, body, "edit", "ClusterRole");
@@ -4893,6 +4893,73 @@ mod tests {
              must exist so an extension apiserver's own RoleBinding to it actually grants \
              read access — otherwise every aggregated apiserver / CRD conversion webhook \
              crash-loops fatally on startup"
+        );
+    }
+
+    /// Regression test: a RoleBinding to the built-in "edit" ClusterRole must authorize
+    /// DeleteCollection, not just Delete. Upstream's default "edit" ClusterRole grants
+    /// "deletecollection" alongside "delete" on every namespaced resource it covers; this
+    /// codebase's copy previously omitted it, so a ServiceAccount bound only to "edit" got a
+    /// plain RBAC 403 ("is not allowed to deletecollection configmaps") on the last step of
+    /// sig-auth's "ValidatingAdmissionPolicy can restrict access by-node" conformance test,
+    /// even though it could already DELETE individual configmaps — live-confirmed via
+    /// `kubectl auth can-i deletecollection configmaps --as=<sa>` before this fix.
+    #[tokio::test]
+    async fn edit_rolebinding_can_deletecollection_not_just_delete() {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        // Bind a namespace's default ServiceAccount to the built-in "edit" ClusterRole,
+        // mirroring how the sonobuoy conformance test grants its node-scoped client access.
+        let binding_key =
+            keys::group_object_key(GROUP, "rolebindings", Some("e2e-by-node"), "edit-binding");
+        let binding_val = serde_json::json!({
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "edit"
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": "default",
+                "namespace": "e2e-by-node"
+            }]
+        });
+        use bytes::Bytes;
+        use u7s_store::Store;
+        store
+            .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+            .await
+            .expect("put rolebinding must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        let deletecollection_configmaps = rbac::AuthzRequest {
+            username: "system:serviceaccount:e2e-by-node:default",
+            groups: &groups,
+            verb: "deletecollection",
+            api_group: "",
+            resource: "configmaps",
+            subresource: "",
+            namespace: Some("e2e-by-node"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&deletecollection_configmaps),
+            "a RoleBinding to 'edit' must authorize DELETECOLLECTION on configmaps — the \
+             built-in 'edit' ClusterRole explicitly grants 'delete' on this resource, so \
+             silently denying the bulk form of the same operation is a bootstrap-policy gap, \
+             not an intentional restriction"
         );
     }
 
