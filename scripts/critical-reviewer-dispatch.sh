@@ -39,7 +39,7 @@ TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
 [ -z "$MSG" ] && exit 0
 
 # A dispatched critical-reviewer's own completion report necessarily mentions
-# the PR/deliverable it just reviewed (e.g. "I posted findings on PR #1327:
+# the PR/deliverable it just reviewed (e.g. "I posted findings on PR #<N>:
 # <url>"). Without this check that echo is indistinguishable from a worker
 # having just opened a fresh PR, so the hook would re-queue a review of the
 # review that was JUST completed -- and draining that queue entry would
