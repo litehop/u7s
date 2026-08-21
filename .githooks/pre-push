@@ -2,3 +2,248 @@
 set -e
 cargo test --workspace --quiet
 cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
+
+# --- Self-enforcing conformance gate for known-recurring-regression files ---
+#
+# validate_pod_spec_immutable (crates/apiserver/src/handlers/pods.rs) regressed
+# the same upstream conformance spec 3 times (PR #729, #772, #1213) while
+# `cargo test --workspace` + clippy stayed green the whole time. Below,
+# .githooks/sensitive-conformance-focus.yaml lists file patterns that need a
+# fresh sonobuoy --focus PASS (not just unit tests) before a push touching
+# them is allowed through. See that file's header for the registry schema and
+# bd memory `conformance-pr-merge-gate` / `prefer-local-hook-over-ci-runner-
+# for-conformance-gate` for the full rationale.
+#
+# This also prints a non-blocking test-file-change summary for EVERY push
+# (not just sensitive-registry matches) -- workers legitimately edit tests, so
+# a hook must not block that outright, but a shrunk/weakened/deleted test
+# sailing through unnoticed is exactly how a regression like the one above
+# goes unreviewed. See bd memory `surface-test-edits-for-review-not-block`.
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+REGISTRY="$REPO_ROOT/.githooks/sensitive-conformance-focus.yaml"
+ZERO_OID=0000000000000000000000000000000000000000
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+# Emits one "<file-pattern><TAB><focus-regex>" line per registry entry.
+# Deliberately NOT a general YAML parser -- see the registry's own header
+# comment for why a git hook can't depend on yq/python being installed, and
+# the exact schema (2 meaningful lines per entry: "- file:" then "  focus:")
+# this parser depends on. The "function:" line is intentionally not matched
+# here -- it exists in the registry only as human-readable audit trail.
+parse_registry() {
+  [ -f "$REGISTRY" ] || return 0
+  awk '
+    /^[[:space:]]*-[[:space:]]*file:/ {
+      sub(/^[[:space:]]*-[[:space:]]*file:[[:space:]]*/, "")
+      file = $0
+      next
+    }
+    /^[[:space:]]*focus:/ {
+      sub(/^[[:space:]]*focus:[[:space:]]*/, "")
+      focus = $0
+      gsub(/^"|"$/, "", focus)
+      if (file != "") { print file "\t" focus; file = "" }
+      next
+    }
+  ' "$REGISTRY"
+}
+
+# Prints a prominent, NON-BLOCKING summary of test-file changes in diff range
+# $1. Scope: files under tests/ or matching *_test.rs are reported whole-file;
+# for any other changed .rs file, only hunks whose git-computed enclosing
+# context (mod/fn signature -- git's own default funcname heuristic, which
+# picks the nearest preceding unindented line) mentions "test" are counted --
+# so editing a plain function above an untouched #[cfg(test)] module doesn't
+# trip this. Known gap: a hunk at the very top of a brand-new file has no
+# preceding context to match on, so a new file's own inline tests can be
+# missed -- acceptable for a review aid whose backstop is the reviewer's own
+# diff read (see bd memory `surface-test-edits-for-review-not-block`).
+print_test_change_summary() {
+  range="$1"
+  files_tmp=$(mktemp)
+  git diff --name-only "$range" -- '*.rs' >"$files_tmp" 2>/dev/null || true
+  if [ ! -s "$files_tmp" ]; then
+    rm -f "$files_tmp"
+    return 0
+  fi
+
+  total_files=0
+  total_added=0
+  total_removed=0
+  detail_tmp=$(mktemp)
+
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+      tests/*|*/tests/*|*_test.rs)
+        stat_line=$(git diff --numstat "$range" -- "$f" 2>/dev/null | head -1)
+        added=$(printf '%s' "$stat_line" | awk '{print $1}')
+        removed=$(printf '%s' "$stat_line" | awk '{print $2}')
+        [ "$added" = "-" ] && added=0
+        [ "$removed" = "-" ] && removed=0
+        ;;
+      *)
+        counts=$(git diff --unified=0 "$range" -- "$f" 2>/dev/null | awk '
+          /^@@/ {
+            ctx = $0
+            sub(/^@@[^@]*@@[ \t]*/, "", ctx)
+            in_test = (ctx ~ /test/) ? 1 : 0
+            next
+          }
+          /^\+\+\+/ || /^---/ { next }
+          in_test && /^\+/ { added++; next }
+          in_test && /^-/  { removed++; next }
+          END { printf "%d %d", added + 0, removed + 0 }
+        ')
+        added=$(printf '%s' "$counts" | awk '{print $1}')
+        removed=$(printf '%s' "$counts" | awk '{print $2}')
+        ;;
+    esac
+    added=${added:-0}
+    removed=${removed:-0}
+    if [ "$added" -eq 0 ] && [ "$removed" -eq 0 ]; then
+      continue
+    fi
+    total_files=$((total_files + 1))
+    total_added=$((total_added + added))
+    total_removed=$((total_removed + removed))
+    printf '    %s (+%s/-%s)\n' "$f" "$added" "$removed" >>"$detail_tmp"
+  done <"$files_tmp"
+  rm -f "$files_tmp"
+
+  if [ "$total_files" -eq 0 ]; then
+    rm -f "$detail_tmp"
+    return 0
+  fi
+
+  echo ""
+  echo "################################################################"
+  echo "# [pre-push] TEST-FILE CHANGES DETECTED -- review before merge"
+  echo "################################################################"
+  echo "  files: $total_files   lines: +$total_added/-$total_removed"
+  cat "$detail_tmp"
+  rm -f "$detail_tmp"
+  echo ""
+  echo "  Legitimate: new regression tests, assertions updated for a genuine"
+  echo "  API change. Suspect: a test shrunk/weakened/deleted/#[ignore]'d with"
+  echo "  no PR-body justification. See bd memory"
+  echo "  'surface-test-edits-for-review-not-block' for the full checklist."
+  echo "  (non-blocking -- for review visibility only)"
+  echo "################################################################"
+  echo ""
+}
+
+# Blocking gate: if diff range $1 touches a file pattern in the
+# sensitive-conformance registry, require a FRESH sonobuoy --focus PASS for
+# the matching spec(s) before letting the push through. Runs
+# scripts/conformance/run-all.sh on the VM/port this shell is configured for
+# (U7S_CONFORMANCE_GATE_{VM,PORT,KUBELET_PORT}, defaulting to the project's
+# baseline lima-node/6443/10250) -- a worker's dispatch sets these to its
+# assigned VM slot per ai/prompts/vm-operations.md.
+check_sensitive_conformance_gate() {
+  range="$1"
+  changed_tmp=$(mktemp)
+  git diff --name-only "$range" >"$changed_tmp" 2>/dev/null || true
+  if [ ! -s "$changed_tmp" ]; then
+    rm -f "$changed_tmp"
+    return 0
+  fi
+
+  registry_tmp=$(mktemp)
+  parse_registry >"$registry_tmp"
+  if [ ! -s "$registry_tmp" ]; then
+    rm -f "$changed_tmp" "$registry_tmp"
+    return 0
+  fi
+
+  focus=""
+  matched=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    pattern=$(printf '%s' "$line" | cut -f1)
+    entry_focus=$(printf '%s' "$line" | cut -f2)
+    [ -z "$pattern" ] && continue
+    if grep -qF "$pattern" "$changed_tmp"; then
+      matched="$matched $pattern"
+      if [ -z "$focus" ]; then
+        focus="$entry_focus"
+      else
+        focus="$focus|$entry_focus"
+      fi
+    fi
+  done <"$registry_tmp"
+  rm -f "$changed_tmp" "$registry_tmp"
+
+  [ -z "$focus" ] && return 0
+
+  echo ""
+  echo "================================================================"
+  echo "[pre-push] BLOCKING GATE: push touches known-recurring-regression"
+  echo "file(s):$matched"
+  echo "[pre-push] Requires a fresh sonobuoy PASS for focus:"
+  echo "    $focus"
+  echo "================================================================"
+
+  gate_vm="${U7S_CONFORMANCE_GATE_VM:-lima-node}"
+  gate_port="${U7S_CONFORMANCE_GATE_PORT:-6443}"
+  gate_kubelet_port="${U7S_CONFORMANCE_GATE_KUBELET_PORT:-10250}"
+
+  run_out=$(mktemp)
+  set +e
+  scripts/conformance/run-all.sh \
+    --vm "$gate_vm" --port "$gate_port" --kubelet-port "$gate_kubelet_port" \
+    --focus "$focus" >"$run_out" 2>&1
+  run_rc=$?
+  set -e
+  cat "$run_out"
+
+  if [ "$run_rc" -ne 0 ]; then
+    echo "[pre-push] BLOCKED: run-all.sh exited $run_rc -- see output above." >&2
+    rm -f "$run_out"
+    return 1
+  fi
+
+  run_dir=$(grep -m1 '^Results: ' "$run_out" | awk '{print $2}' | sed 's/\.tar\.gz$//')
+  rm -f "$run_out"
+
+  e2e_txt=""
+  if [ -n "$run_dir" ]; then
+    e2e_txt=$(find "$run_dir" -path '*/logs/e2e.txt' 2>/dev/null | head -1)
+  fi
+
+  if [ -z "$e2e_txt" ] || [ ! -f "$e2e_txt" ]; then
+    echo "[pre-push] BLOCKED: could not locate e2e.txt for the focus run -- cannot confirm PASS." >&2
+    return 1
+  fi
+
+  if ! grep -qE '^Ran [1-9][0-9]* of [0-9]+ Specs' "$e2e_txt"; then
+    echo "[pre-push] BLOCKED: 0 specs matched focus regex -- cannot confirm PASS. See $e2e_txt" >&2
+    return 1
+  fi
+
+  if ! grep -q '^SUCCESS! --' "$e2e_txt"; then
+    echo "[pre-push] BLOCKED: focus run did NOT report SUCCESS -- see $e2e_txt" >&2
+    return 1
+  fi
+
+  echo "[pre-push] Sensitive-conformance gate PASSED ($e2e_txt)."
+}
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [ "$local_oid" = "$ZERO_OID" ] && continue
+
+  if [ "$remote_oid" = "$ZERO_OID" ]; then
+    base=$(git merge-base "$local_oid" origin/main 2>/dev/null || true)
+    if [ -z "$base" ]; then
+      base=$(git merge-base "$local_oid" main 2>/dev/null || true)
+    fi
+    [ -z "$base" ] && base="$EMPTY_TREE"
+    range="$base..$local_oid"
+  else
+    range="$remote_oid..$local_oid"
+  fi
+
+  print_test_change_summary "$range"
+  check_sensitive_conformance_gate "$range"
+done
