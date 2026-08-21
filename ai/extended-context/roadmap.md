@@ -32,14 +32,14 @@ Decision legend: **KEEP** (decision made, no revisit expected) · **MEASURED**
 
 | Component | State | Measured? | Decision | Notes / next action |
 |---|---|---|---|---|
-| **API server** | NATIVE | Yes | KEEP | Smallest of u7s's own components. Ring-resize + fat LTO landed; protobuf response encoder for hot-path LIST; decode-correctness fixes ongoing. Current figures change with nearly every perf PR — see `ai/findings/` and `dashboard.md`, not restated here. |
+| **API server** | NATIVE | Yes | KEEP | Smallest of u7s's own components. Ring-resize + fat LTO landed; protobuf response encoder for hot-path LIST; decode-correctness fixes ongoing. |
 | **Scheduler** | NATIVE | Yes | KEEP | Bin-spread scheduler, custom preemption, DB-04 resolved. Confirmed small relative to the rest of the stack. |
 | **Store** | NATIVE (part of apiserver) | Yes | KEEP | SQLite WAL + sharded watch fan-out + per-shard compaction horizon. |
-| **KCM (kube-controller-manager)** | UPSTREAM | Yes | MEASURED | Runs with `--controllers='*,-cloud-*'`. Confirmed the **second-largest** component in the stack by a wide margin. Native reimplementation attempted then deleted (`mayor-20325`). Least-privilege auth gap (was tracked as EPIC `mayor-axi12`) resolved 2026-08-13: dedicated x509 identities replace the `system:masters` admin-cert shim for both KCM (`mayor-c6rml`) and the scheduler (`mayor-c0b1u`, same gap found via the axi12 audit). Same evidence-gated process applies to the full component — an upstream config-tuning audit comes before any rewrite cost-benefit estimate. |
+| **KCM (kube-controller-manager)** | UPSTREAM | Yes | MEASURED | Runs with `--controllers='*,-cloud-*'`. Confirmed the **second-largest** component in the stack by a wide margin. |
 | **Kubelet** | UPSTREAM | Yes | MEASURED | Runs on every node. Confirmed the **single largest** component by a wide margin — more than double KCM. "Gargantuan" (scope, complexity, footprint) is a real, multi-dimensional description, not a disqualifier: necessity is obvious (skipped), cost is measured, an upstream config-tuning audit is next, native rewrite is only considered after that. Packaging shape (Gate 6) may also factor in eventually. |
 | **CRI-O + crun** | UPSTREAM | Yes | KEEP | Container runtime. No plan to rewrite; measurement was for completeness only. |
 | **kube-proxy** | UPSTREAM | Yes | MEASURED | Low-level networking; native rewrite is high-effort. No presumption either way — same necessity-then-cost-then-tuning-then-rewrite evaluation as everything else, data-first. |
-| **konnectivity-server** | HYBRID | Yes | KEEP-as-dev-tool, skipped in production | Bridges apiserver (host) → kubelet (VM subnet) across Lima's NAT boundary — a dev-topology artifact, not a runtime requirement. Same-network production deployments (k3s-style packaging target) dial `kubelet:10250` directly; no tunnel needed. User-provided VPN/WireGuard mesh covers any cross-network case transparently. Product-shape re-open trigger: if u7s ever targets hosted-control-plane (users bring nodes over public internet), tunnel requirements return and this row should be re-evaluated. Decision settled 2026-08-19 (see `mayor-yi29j` close reason). |
+| **konnectivity-server** | HYBRID | Yes | KEEP-as-dev-tool, skipped in production | Bridges apiserver (host) → kubelet (VM subnet) across Lima's NAT boundary — a dev-topology artifact, not a runtime requirement. Same-network production deployments (k3s-style packaging target) dial `kubelet:10250` directly; no tunnel needed. |
 | **CoreDNS** | UPSTREAM | Yes | KEEP | In-cluster DNS. No plan to rewrite. |
 | **metrics-server** | UPSTREAM | Yes | KEEP | Standard component; no rewrite plan. |
 | **Sentinel / sentinel-derive** | NATIVE (test infra) | n/a | KEEP | Proto-descriptor oracle framework, closed the silent-decode-drop bug class. |
@@ -47,16 +47,8 @@ Decision legend: **KEEP** (decision made, no revisit expected) · **MEASURED**
 **On the k3s/k0s comparison:** resolved — real k3s (v1.36.3+k3s1, native
 containerd) was installed, run through the same sonobuoy harness, and
 measured with the same component-boundary accounting u7s uses on itself.
-Single-node idle matched-boundary total: **~813 MB**, ~8-11x the old
-illustrative "~70-100MB" bare-binary estimate, and ~6.1x above u7s's own
-128 MiB Gate-4 target (a conservative floor against the target, not u7s's
-current actual total). This doesn't change Gate 4's target or urgency; it
-replaces a hand-wavy caveat with a real number, though the container
-runtime's (CRI-O vs containerd) behavior under real load remains only
-partially resolved. Full methodology, deviations, and per-process tables:
-`ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`. The separate
-upstream configuration/tuning audit for kubelet and KCM remains open and
-untouched by this work.
+Full methodology, deviations, and per-process tables:
+`ai/perf/mayor-5x0kh-k3s-matched-comparison-2026-08-20.md`.
 
 ---
 
@@ -130,26 +122,6 @@ processes, not what users deploy on top. This target doesn't depend on the
 unresolved k3s-ratio question above: it's far enough below even the
 illustrative k3s figure that hitting it settles the comparison on any
 reasonable accounting.
-
-**Post-tuning baseline, verified (`mayor-3a0et`, 2026-08-20):** this session
-landed a cluster of memory/correctness fixes (kubelet + KCM Go-runtime
-tuning, codegen migration, protobuf-decode fixes, Lima network partition)
-with no full Conformance run verifying their combined effect until now —
-prior Gate-4 checks this session used a stale pre-tuning run. A fresh
-2-node run (`lima-node-2`+`lima-node-4`, full `--reset`, 483/483 passed,
-same primary-node-only accounting as the pre-tuning baseline) gives:
-**idle 358,456 KB (350.1 MiB, 2.74x target) vs pre-tuning 350,036 KB (2.67x)
-— +2.4%, entirely attributable to CRI-O's idle footprint (+22.0%), not any
-of this session's fixes; peak 460,468 KB (449.7 MiB, 3.51x target) vs
-pre-tuning 492,124 KB (3.76x) — a real -6.4% improvement, driven mostly by
-KCM (-17.7% peak) and the apiserver (-10.4% peak).** This baseline
-deliberately excludes two still-open PRs (`mayor-zbkq1` protobuf fix,
-`mayor-pjtkz` KCM tuning) — neither expected to move these numbers
-materially, but this is not a complete-fixes baseline. A depth-20 dhat
-profile of the same 2-node topology ran immediately after; see
-`ai/findings/mayor-3a0et-post-tuning-baseline-and-depth20-profile-2026-08-20.md`
-for the full per-process table, the 2nd-node cost (not previously reported),
-and the profiling depth/overhead data point.
 
 ### Gate 5 — Correctness baseline beyond Conformance (ongoing, opportunistic)
 Conformance is necessary but not sufficient (Gate 1's caveat). This gate

@@ -15,7 +15,7 @@ None — queue fully drained, all worktrees cleaned up.
 
 ## 📥 Handoff queue — next session's ready candidates
 - **mayor-rwxnu** (P3, chore) — codegen.rs section banners, trivial/mechanical.
-- **mayor-8363r** (P3) — CronJob timezone validation gap (real, pre-existing, Conformance-relevant).
+- **mayor-8363r** (P3) — CronJob timezone validation gap (real, Conformance-relevant).
 - **mayor-k685m** (P3) — admission.rs CEL evaluator node-restriction gap; cross-ref `mayor-fbxcy`.
 - **mayor-fbxcy** (P3) — CEL enforcement at CR admission time; needs operator greenlight.
 - **mayor-po8qf** (P2) — scheduler/apiserver process consolidation.
