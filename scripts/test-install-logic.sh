@@ -177,6 +177,22 @@ assert "default --iface whitelist excludes every virtual/container-runtime/VPN i
 assert_false "(regression guard) install.sh's default --iface detection uses no negated blacklist (grep -Ev / grep -v) to exclude virtual interfaces -- BOTH prior designs (the naive 'exclude only lo' and the docker0/veth*/cni*/... list) were negated blacklists; a positive whitelist (plain grep -E, asserted above) is what actually closes the class of bug critical review found, so reintroducing either shape must fail this suite" \
   grep -qE 'grep -Ev|grep -v' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# Regression guard: the CRI-O/CNI-plugins gap found running install.sh end to
+# end for the first time against a genuinely fresh box. CRI-O's apt package
+# only Recommends (does not Depend on) a CNI-plugins package, and Ubuntu
+# cloud-image apt defaults disable installing recommends -- so without an
+# explicit install, CRI-O validates its bridge CNI config against a plugin
+# directory (/opt/cni/bin/) containing zero actual plugin binaries, and every
+# node sits NotReady forever ("failed to find plugin \"bridge\""). This never
+# showed up in review because it only reproduces on a box that never had
+# recommends installed by anything else first -- a full VM run is what caught
+# it, and this assertion is what stops a silent revert from reintroducing it
+# without another full VM run to catch it again.
+# ---------------------------------------------------------------------------
+assert_true "install.sh installs kubernetes-cni (the actual /opt/cni/bin/ plugin binaries CRI-O's bridge config references) alongside kubectl, not just kubectl alone" \
+  grep -qF 'apt-get install -y kubectl kubernetes-cni' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
