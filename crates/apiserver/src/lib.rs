@@ -1704,6 +1704,13 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // leases/networkpolicies/poddisruptionbudgets above) of encoding the fully-resolved
             // permission set rather than replicating which upstream helper contributed what.
             { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // Upstream's editRules() never grants write on "namespaces" or "resourcequotas"
+            // directly — its own comment on the "edit" ClusterRole explicitly excludes
+            // "quota/limits which are used to control namespaces" from edit's write powers.
+            // The resolved "edit"/"admin" ClusterRole only gets the READ-ONLY grant
+            // viewRules() contributes via the aggregation edit/admin pull in, so this
+            // duplicates "view"'s base rule below rather than granting CRUD.
+            { "apiGroups": [""], "resources": ["namespaces","resourcequotas"], "verbs": ["get","list","watch"] },
             // Upstream's editRules() never mentions any of these /status subresources —
             // they reach the resolved "edit"/"admin" ClusterRole only via the view
             // aggregation, so admin/edit get exactly the same READ-ONLY grant as "view"
@@ -1758,6 +1765,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // See the identical block in "admin" above for why each of these exists.
+            { "apiGroups": [""], "resources": ["namespaces","resourcequotas"], "verbs": ["get","list","watch"] },
             // See the identical block in "admin" above for why each of these exists.
             { "apiGroups": [""], "resources": ["pods/status","services/status","resourcequotas/status","namespaces/status","replicationcontrollers/status","persistentvolumeclaims/status"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["apps"], "resources": ["statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
@@ -5620,6 +5629,111 @@ mod tests {
                  scale — 'view' is read-only, upstream's editRules() (not viewRules()) grants \
                  the write"
             );
+        }
+    }
+
+    /// Regression test: RoleBindings to the built-in "edit" AND "admin" ClusterRoles must
+    /// authorize GET on the base "namespaces" and "resourcequotas" resources (not just their
+    /// /status subresources). Upstream's editRules() never grants write on either resource
+    /// directly — its own doc comment on the "edit" ClusterRole explicitly excludes "quota/
+    /// limits which are used to control namespaces" from edit's write powers — but the
+    /// resolved "edit"/"admin" ClusterRole DOES inherit viewRules()'s read-only grant via the
+    /// view aggregation. Before this fix, this codebase's flat admin/edit copies had no rule
+    /// at all for the base "namespaces"/"resourcequotas" resources (only their /status
+    /// subresources), so a ServiceAccount bound to "edit" or "admin" got a plain RBAC 403
+    /// running `kubectl get resourcequota` or `kubectl get namespace <name>` despite view
+    /// (a strict subset of edit/admin) already being able to. Also spot-checks that CREATE
+    /// stays denied for both roles, matching upstream's explicit non-grant — over-granting
+    /// write here would let a namespace editor bypass the quota/limit controls the resource
+    /// exists to enforce.
+    #[tokio::test]
+    async fn edit_and_admin_rolebindings_can_read_base_namespaces_and_resourcequotas() {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        use bytes::Bytes;
+        use u7s_store::Store;
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-nsquota");
+            let binding_key = keys::group_object_key(
+                GROUP,
+                "rolebindings",
+                Some(namespace.as_str()),
+                &format!("{cluster_role}-binding"),
+            );
+            let binding_val = serde_json::json!({
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": cluster_role
+                },
+                "subjects": [{
+                    "kind": "ServiceAccount",
+                    "name": "default",
+                    "namespace": namespace
+                }]
+            });
+            store
+                .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+                .await
+                .expect("put rolebinding must not fail");
+        }
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-nsquota");
+            let username = format!("system:serviceaccount:{namespace}:default");
+            for resource in ["namespaces", "resourcequotas"] {
+                let get_req = rbac::AuthzRequest {
+                    username: &username,
+                    groups: &groups,
+                    verb: "get",
+                    api_group: "",
+                    resource,
+                    subresource: "",
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&get_req),
+                    "a RoleBinding to '{cluster_role}' must authorize GET on the base \
+                     {resource} resource — upstream's viewRules() grants this and this \
+                     codebase's copy previously had no rule for the base resource at all \
+                     (only its /status subresource)"
+                );
+
+                // Spot-check: neither role may CREATE namespaces/resourcequotas — upstream's
+                // editRules() deliberately never grants write on either, since they are used
+                // to control namespaces and must remain the domain of the system.
+                let create_req = rbac::AuthzRequest {
+                    username: &username,
+                    groups: &groups,
+                    verb: "create",
+                    api_group: "",
+                    resource,
+                    subresource: "",
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    !state.rbac_index.is_allowed(&create_req),
+                    "a RoleBinding to '{cluster_role}' must NOT authorize CREATE on \
+                     {resource} — upstream's editRules() explicitly excludes quota/limit \
+                     resources from edit's write powers, so granting this would be over-broad"
+                );
+            }
         }
     }
 
