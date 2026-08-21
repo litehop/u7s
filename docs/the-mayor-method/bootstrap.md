@@ -126,10 +126,47 @@ re-triggered anyway, so waiting for them first buys nothing. Only a
 BLOCKED PR's pending checks (running against the CURRENT base, i.e. a
 fresh post-update-branch cycle already in flight) are worth waiting on.
 
+0. **Drain the review queue (mayor-oec8e).** For each file in
+   `.claude/review-queue/*.md` (oldest `queued_at` first; cap 5 per tick so a
+   large backlog doesn't blow out this tick's latency — the rest drain over
+   subsequent ticks), read its `deliverable_type`/`deliverable_ref`
+   frontmatter and invoke `.claude/agents/critical-reviewer.md` with that
+   deliverable — it now self-posts its findings (PR comment/review, or bead
+   notes + a follow-on bead for non-PR types; see the agent file's "Output &
+   posting" section). After invocation, `mv` the queue file into
+   `.claude/review-queue/processed/` (create the dir first if absent) — never
+   delete, this is the audit trail. Drain ALL deliverable types here
+   (pr/findings/bead-close/bead-supersede), not just PRs: only the PR type is
+   load-bearing for step 2's merge gate below, but leaving the
+   findings/bead-close/bead-supersede share of the backlog (~30% historically)
+   permanently undrained would just reintroduce the same "queue nobody
+   drains" bug for a subset of deliverables.
 1. Enumerate open PRs and their check state:
    `gh pr list --state open --json number,title,mergeStateStatus,statusCheckRollup | jq`.
-2. Merge any CLEAN PR (checks_pending=0 AND checks_failed=0 AND
-   mergeStateStatus=CLEAN): `gh pr merge <N> --merge --delete-branch`. NEVER
+2. **Review gate (mayor-oec8e), then merge any CLEAN PR.** For a
+   `worker/agent-*`-branch PR (NOT `operator/*` — see below), require a
+   comment whose body starts with `## critical-reviewer findings` before
+   merging: `gh pr view <N> --json comments`. If missing, do not merge this
+   PR THIS tick — step 0 above (same tick) should have just posted one if a
+   queue entry existed for it, so the NEXT tick can merge. `operator/*`
+   branches are exempt: they're authored directly by the mayor's own
+   top-level turn, which never triggers the SubagentStop hook that feeds the
+   queue in the first place, so no review is ever queued for them — that's
+   the hook's actual trigger condition, not a gap to patch.
+   Fallback for a CLEAN `worker/agent-*` PR with NO matching queue entry at
+   all (checked by grepping the PR's URL across both
+   `.claude/review-queue/*.md` and `.claude/review-queue/processed/*.md`):
+   verified 2026-08-21 that every currently-open worker PR has a matching
+   queue file, and every currently-open PR's branch is either
+   `worker/agent-*` or `operator/*` (no third category exists in this repo),
+   so a true no-queue-entry PR should be rare — a missed SubagentStop hook
+   fire (upstream anthropics/claude-code#27755) or a worker's return message
+   that didn't paste the literal `.../pull/<N>` URL the hook's regex matches.
+   When it happens: invoke the critical-reviewer directly for that PR in the
+   SAME tick (same as if a queue file existed) rather than waiting on a
+   queue file that will never arrive.
+   Once gated: `gh pr merge <N> --merge --delete-branch` for any CLEAN PR
+   (checks_pending=0 AND checks_failed=0 AND mergeStateStatus=CLEAN). NEVER
    `--admin`. After each successful merge: `git pull --ff-only` + `git remote
    prune origin`, then remove the merged worker's worktree (and its branch,
    if it survived `--delete-branch`).
