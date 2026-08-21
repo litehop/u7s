@@ -102,22 +102,37 @@ assert_true "tarball binary staging rejects a found-but-non-executable match ins
   grep -qF 'if [ ! -x "$found" ]; then' "$INSTALL"
 
 # ---------------------------------------------------------------------------
-# iface_filter() -- mirrors install.sh's own default-interface regex. The
-# first version of this logic was a BLACKLIST of virtual-interface names
-# (docker0/veth*/cni*/br-*/virbr*/flannel*/cali*), which can only ever cover
-# the names its author happened to think of. This proves the whitelist that
-# replaced it actually discriminates real physical-NIC names from virtual
-# ones -- not just that some filter exists (a purely structural grep check
-# can't tell "discriminates correctly" from "matches nothing" or "matches
-# everything"). Physical-NIC names cover both systemd predictable naming
-# (en*/wl*/ww*: eno1, ens33, enp0s3, enp2s0f1, enx<mac>, wlo1, wlp2s0,
-# wlx<mac>, wwan0, wwp0s20u4i6) and the legacy eth0 kernel fallback --
-# checking our own 5-VM Ubuntu 26.04 Lima fleet (identical template) found
-# it split 2/5 enp0s1 vs 3/5 eth0, so eth0 is a real, live case, not just a
-# theoretical old-kernel one.
+# iface_filter() -- drives its regex from install.sh's OWN source at test
+# time, not a hand-duplicated second copy. An earlier version of this test
+# hardcoded the regex literal here; critical review proved that copy was
+# decoupled from install.sh's real behavior -- reverting install.sh to the
+# exact blacklist this whitelist replaced (docker0/veth*/cni*/br-*/virbr*/
+# flannel*/cali*, via grep -Ev) only tripped 1 of 9 assertions (a brittle
+# literal-string check), while the "matches physical / excludes virtual"
+# assertions below stayed green because they were exercising THIS FILE's
+# own untouched copy of the regex, not install.sh's. Extracting the pattern
+# here closes that gap: these assertions now fail if install.sh's real
+# regex regresses, not just if someone edits this file's copy out of sync.
+#
+# Physical-NIC names cover both systemd predictable naming (en*/wl*/ww*:
+# eno1, ens33, enp0s3, enp2s0f1, enx<mac>, wlo1, wlp2s0, wlx<mac>, wwan0,
+# wwp0s20u4i6) and the legacy eth0 kernel fallback -- checking our own 5-VM
+# Ubuntu 26.04 Lima fleet (identical template) found it split 2/5 enp0s1 vs
+# 3/5 eth0, so eth0 is a real, live case, not just a theoretical old-kernel
+# one.
 # ---------------------------------------------------------------------------
+# `|| true`: grep legitimately exits non-zero if install.sh no longer has a
+# line shaped like this at all (e.g. reverted to grep -Ev/-v, neither of
+# which contain the literal substring "grep -E '") -- this must produce a
+# clear FAIL below, not a silent script-wide abort under set -e/pipefail.
+iface_regex_line="$(grep -m1 "grep -E '" "$INSTALL")" || true
+IFACE_REGEX="${iface_regex_line#*grep -E \'}"
+IFACE_REGEX="${IFACE_REGEX%%\'*}"
+assert "install.sh's --iface whitelist regex was successfully extracted from its real source line (if this fails, the tests below are testing nothing -- a change to how/where the regex is written broke extraction)" \
+  "$([ -n "$IFACE_REGEX" ] && echo 1 || echo 0)"
+
 iface_filter() {
-  grep -E '^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$'
+  grep -E "$IFACE_REGEX"
 }
 
 PHYSICAL_NAMES="eno1
@@ -159,11 +174,8 @@ leaked="$(printf '%s\n' "$VIRTUAL_NAMES" | iface_filter | wc -l | tr -d ' ')" ||
 assert "default --iface whitelist excludes every virtual/container-runtime/VPN interface (docker0, veth*, cni*, br-*, virbr*, flannel*, cali*, tun*, tailscale*) -- picking one of these as the cluster-traffic interface would be wrong" \
   "$([ "$leaked" = "0" ] && echo 1 || echo 0)"
 
-assert_true "install.sh's actual --iface default is wired to this exact whitelist regex, not a hand-duplicated copy that could silently drift out of sync" \
-  grep -qF "grep -E '^(en|wl|ww)[a-zA-Z0-9]+\$|^eth[0-9]+\$'" "$INSTALL"
-
-assert_false "(regression guard) install.sh's default --iface no longer relies on the naive 'exclude only lo' blacklist that let any unrecognized virtual interface slip through" \
-  grep -qF "grep -v '^lo\$'" "$INSTALL"
+assert_false "(regression guard) install.sh's default --iface detection uses no negated blacklist (grep -Ev / grep -v) to exclude virtual interfaces -- BOTH prior designs (the naive 'exclude only lo' and the docker0/veth*/cni*/... list) were negated blacklists; a positive whitelist (plain grep -E, asserted above) is what actually closes the class of bug critical review found, so reintroducing either shape must fail this suite" \
+  grep -qE 'grep -Ev|grep -v' "$INSTALL"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
