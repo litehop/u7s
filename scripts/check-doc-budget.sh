@@ -84,7 +84,16 @@ while IFS= read -r f; do
       "$f" "$new" "$budget" "$old" "$(( new - old ))" >&2
     violations=$(( violations + 1 ))
   fi
-done < <(git diff --name-only "$BASE" -- '*.md')
+done < <(
+  # Tracked changes vs the fork point, plus untracked new docs. Without the
+  # second list a brand-new over-budget doc passes a manual run: `git diff`
+  # only sees tracked paths. The push gate would still catch it (by then it
+  # is committed), but a silent pass before that teaches the wrong lesson.
+  {
+    git diff --name-only "$BASE" -- '*.md'
+    git ls-files --others --exclude-standard -- '*.md'
+  } | sort -u
+)
 
 if [ "$violations" -gt 0 ]; then
   printf 'DOC BUDGET: %d over-budget doc(s) grew. Cut words, do not reflow —\n' \
