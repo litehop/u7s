@@ -572,6 +572,7 @@ pub(crate) async fn create_pod<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: create_query.is_dry_run(),
     };
@@ -807,6 +808,7 @@ pub(crate) async fn replace_pod<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -1022,6 +1024,7 @@ pub(crate) async fn delete_pod<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
