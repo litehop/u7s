@@ -38,6 +38,7 @@ fn runtime_worker_threads() -> usize {
 fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads())
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .build()?
         .block_on(dhat_main())
@@ -80,6 +81,7 @@ async fn dhat_main() -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads())
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .build()?
         .block_on(async {
