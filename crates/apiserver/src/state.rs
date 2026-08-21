@@ -100,6 +100,33 @@ impl WatchLimitState {
             .or_insert_with(|| Arc::new(Semaphore::new(MAX_WATCHES_PER_CLIENT)))
             .clone()
     }
+
+    /// Drop every entry whose semaphore has no live owned permit outstanding (no watch
+    /// stream currently open for that identity). Unlike `QuotaAdmissionLocks`, a client
+    /// identity (authenticated username) has no clean per-identity deletion event to hang
+    /// eviction off — a ServiceAccount's token can simply stop being used, with no
+    /// "this identity is gone" signal short of the owning namespace's deletion, which
+    /// doesn't cover non-namespaced identities either. A periodic idle sweep is the only
+    /// event that fits: `try_acquire_owned`/`acquire_owned` in `handlers::watch` convert
+    /// the `Arc<Semaphore>` returned by `semaphore_for` into an `OwnedSemaphorePermit`,
+    /// which itself holds a clone of that `Arc` for the watch stream's lifetime. So
+    /// `strong_count() == 1` means only this map's own `Arc` remains — no watch currently
+    /// holds a permit — and the entry is safe to drop; the client gets a fresh
+    /// `Semaphore::new(MAX_WATCHES_PER_CLIENT)` next time it opens a watch, with no
+    /// observable behavior change versus never having evicted it.
+    pub fn sweep_idle(&self) {
+        let mut map = self.inner.lock().unwrap();
+        let before = map.len();
+        map.retain(|_, sem| Arc::strong_count(sem) > 1);
+        let evicted = before - map.len();
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                remaining = map.len(),
+                "watch limit sweep: evicted idle client entries"
+            );
+        }
+    }
 }
 
 /// Per-namespace serialization for ResourceQuota admission.
@@ -136,6 +163,23 @@ impl QuotaAdmissionLocks {
             .acquire_owned()
             .await
             .expect("quota admission semaphore is never closed")
+    }
+
+    /// Remove the namespace's lock entry. Called once the namespace itself is hard-deleted
+    /// from the store (the namespace finalizer-drain-complete path, plus the handful of
+    /// write paths that hard-delete a namespace directly) — without this, every namespace
+    /// ever created and deleted leaves a permanent `HashMap` entry for the life of the
+    /// process. Safe with a concurrent in-flight `lock()` for the same (now-deleted)
+    /// namespace: that caller already holds its own clone of the `Arc<Semaphore>`, which
+    /// removing the map entry does not affect; a namespace of the same name created later
+    /// simply gets a fresh `Semaphore::new(1)`.
+    pub fn evict(&self, namespace: &str) {
+        if self.inner.lock().unwrap().remove(namespace).is_some() {
+            tracing::debug!(
+                namespace,
+                "quota admission lock evicted after namespace hard-delete"
+            );
+        }
     }
 }
 
@@ -1598,6 +1642,83 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A permanently-orphaned map entry for a deleted namespace isn't just a memory leak:
+    // if a namespace of the same name is ever recreated, its quota-admission lock would
+    // incorrectly serialize against a semaphore whose only permit some now-irrelevant
+    // past holder may still be sitting on. evict() must let a namespace's successor
+    // start clean.
+    #[tokio::test]
+    async fn quota_admission_locks_evict_lets_recreated_namespace_get_a_fresh_lock() {
+        let locks = QuotaAdmissionLocks::new();
+        let held = locks.lock("ns1").await; // takes the sole permit
+        locks.evict("ns1");
+        // If evict didn't actually remove the map entry, this would block forever on the
+        // still-held old semaphore instead of getting a fresh Semaphore::new(1).
+        let _fresh = tokio::time::timeout(std::time::Duration::from_millis(200), locks.lock("ns1"))
+            .await
+            .expect("evicted namespace must get a fresh, immediately-acquirable lock");
+        drop(held);
+    }
+
+    // Every distinct client identity that ever opens a watch gets a permanent map entry
+    // unless something reclaims it -- a long-uptime control plane serving many distinct
+    // ServiceAccounts over its lifetime would otherwise grow this map forever.
+    // sweep_idle must remove identities with no watch currently open, but must NOT evict
+    // one that still has a live watch (that would let a second concurrent watch bypass
+    // the per-client limit entirely, since semaphore_for would hand out a fresh
+    // MAX_WATCHES_PER_CLIENT-permit semaphore instead of the shared one the live watch is
+    // enforcing against).
+    #[test]
+    fn watch_limit_sweep_idle_evicts_only_entries_with_no_live_permit() {
+        let limiter = WatchLimitState::new();
+
+        // idle-user: acquire then immediately drop a permit, exactly like a watch stream
+        // that already closed -- mirrors handlers::watch's real
+        // `sem.try_acquire_owned()` usage, where the local `Arc<Semaphore>` from
+        // `semaphore_for` is consumed into the permit and nothing else holds it.
+        {
+            let sem = limiter.semaphore_for("idle-user");
+            let permit = sem
+                .try_acquire_owned()
+                .expect("fresh semaphore has permits");
+            drop(permit);
+        }
+
+        // active-user: acquire every permit and keep them held, simulating a client
+        // currently at its MAX_WATCHES_PER_CLIENT concurrent-watch limit.
+        let mut held_permits = Vec::new();
+        {
+            let sem = limiter.semaphore_for("active-user");
+            for _ in 0..MAX_WATCHES_PER_CLIENT {
+                held_permits.push(sem.clone().try_acquire_owned().expect("permit available"));
+            }
+        }
+
+        limiter.sweep_idle();
+
+        // idle-user must have been evicted: semaphore_for now creates a brand new,
+        // immediately-acquirable semaphore.
+        let idle_after = limiter.semaphore_for("idle-user");
+        assert!(
+            idle_after.try_acquire_owned().is_ok(),
+            "an identity with no live watch permit must be evicted so it gets a fresh \
+             semaphore on its next watch -- otherwise every distinct client ever seen \
+             accumulates a permanent map entry for the life of the process"
+        );
+
+        // active-user must still be fully exhausted -- sweep_idle must not evict (and
+        // thereby reset) an identity with live permits.
+        let active_after = limiter.semaphore_for("active-user");
+        assert!(
+            active_after.try_acquire_owned().is_err(),
+            "an identity with live watch permits must survive the sweep -- evicting it \
+             would hand out a fresh, fully-available semaphore, silently letting a client \
+             already at its MAX_WATCHES_PER_CLIENT limit open even more concurrent watches"
+        );
+
+        drop(held_permits);
+    }
 
     #[test]
     fn csinodes_registered_as_cluster_scoped_create_or_update() {

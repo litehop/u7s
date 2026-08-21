@@ -532,6 +532,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         });
     }
 
+    // 10g. Periodically sweep WatchLimitState for client identities with no watch stream
+    // currently open (see `WatchLimitState::sweep_idle`'s doc for why a periodic sweep,
+    // not an event hook, is the only fit here — unlike QuotaAdmissionLocks, a client
+    // identity has no clean per-identity deletion event). 5 minutes: this is memory
+    // hygiene, not a live correctness constraint, so a slow cadence is fine.
+    let (_watch_limit_sweep_shutdown_tx, mut watch_limit_sweep_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let watch_limit = state.watch_limit.clone();
+        tokio::spawn(async move {
+            loop {
+                watch_limit.sweep_idle();
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                    _ = watch_limit_sweep_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before

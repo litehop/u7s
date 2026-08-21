@@ -341,6 +341,7 @@ pub(crate) async fn create_resource<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -705,6 +706,7 @@ pub(crate) async fn replace_resource<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -862,6 +864,7 @@ pub(crate) async fn delete_resource<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -1981,6 +1984,7 @@ pub(crate) async fn patch_resource<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
         },
     )
@@ -2313,6 +2317,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -2927,6 +2932,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -3113,6 +3119,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
             dry_run: false,
         };
@@ -3318,6 +3325,7 @@ pub(crate) async fn patch_namespaced_resource<S: Store>(
                 "username": user.username,
                 "uid": user.uid,
                 "groups": user.groups,
+                "extra": user.extra,
             })),
         },
     )
@@ -3366,6 +3374,7 @@ pub(crate) async fn patch_collection_namespaced_resource<S: Store>(
         "username": user.username,
         "uid": user.uid,
         "groups": user.groups,
+        "extra": user.extra,
     }));
 
     let mut patched_items: Vec<serde_json::Value> = Vec::new();
@@ -3503,6 +3512,7 @@ pub(crate) async fn delete_collection_resource<S: Store>(
         "username": user.username,
         "uid": user.uid,
         "groups": user.groups,
+        "extra": user.extra,
     }));
 
     for obj in resp.items {
@@ -3662,6 +3672,7 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
         "username": user.username,
         "uid": user.uid,
         "groups": user.groups,
+        "extra": user.extra,
     }));
 
     for obj in resp.items {

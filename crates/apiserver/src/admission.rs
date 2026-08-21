@@ -375,6 +375,9 @@ pub(crate) fn webhook_match_conditions_pass(
     // (only ValidatingAdmissionPolicy does) — Null makes any such reference resolve rather
     // than fall through the unbound-identifier fallback further down the parser.
     let no_namespace_object = serde_json::Value::Null;
+    // Same reasoning for `oldObject`: webhook matchConditions aren't threaded an old-object
+    // value here, so Null resolves the identifier instead of erroring the expression.
+    let no_old_object = serde_json::Value::Null;
     for cond in conditions {
         match eval_cel_bool_expr(
             &cond.expression,
@@ -382,6 +385,7 @@ pub(crate) fn webhook_match_conditions_pass(
             &vars,
             request,
             &no_namespace_object,
+            &no_old_object,
         ) {
             Some(false) => return false,
             Some(true) => {}
@@ -1507,6 +1511,8 @@ pub(crate) fn eval_cel_apply_config(
 /// `request` is the admission request context (operation, name, namespace, userInfo, dryRun).
 /// `namespace_object` is the Namespace object the admitted resource belongs to, or `Value::Null`
 /// for cluster-scoped resources (matches the upstream `namespaceObject` CEL variable contract).
+/// `old_object` is the pre-request state of the admitted resource (UPDATE/DELETE), or
+/// `Value::Null` for CREATE — matches the upstream `oldObject` CEL variable contract.
 /// Returns `Some(true)` / `Some(false)`, or `None` on parse/eval error.
 pub(crate) fn eval_cel_bool_expr(
     expr: &str,
@@ -1514,17 +1520,19 @@ pub(crate) fn eval_cel_bool_expr(
     variables: &serde_json::Map<String, serde_json::Value>,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<bool> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    let val = parse_vap_or(
+    let val = parse_vap_ternary(
         &tokens,
         &mut pos,
         object,
         &variables_val,
         request,
         namespace_object,
+        old_object,
     )?;
     val.as_bool()
 }
@@ -1536,23 +1544,84 @@ pub(crate) fn eval_cel_vap_value(
     variables: &serde_json::Map<String, serde_json::Value>,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    parse_vap_or(
+    parse_vap_ternary(
         &tokens,
         &mut pos,
         object,
         &variables_val,
         request,
         namespace_object,
+        old_object,
     )
 }
 
 // ---------------------------------------------------------------------------
 // VAP CEL expression evaluator (full precedence, object + variables roots)
 // ---------------------------------------------------------------------------
+
+/// Parse a `?:` (ternary conditional) expression — the lowest-precedence CEL operator.
+///
+/// Both branches are always evaluated (this evaluator has no side effects, so eager
+/// evaluation of the unchosen branch is observationally equivalent to real CEL's
+/// short-circuiting and keeps the recursive-descent parser simple, matching the
+/// existing non-short-circuit `&&`/`||` above).
+fn parse_vap_ternary(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+    request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let cond = parse_vap_or(
+        tokens,
+        pos,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
+    if *pos < tokens.len() {
+        if let CelToken::Question = &tokens[*pos] {
+            *pos += 1;
+            let true_val = parse_vap_ternary(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
+            if *pos >= tokens.len() {
+                return None;
+            }
+            if let CelToken::Colon = &tokens[*pos] {
+                *pos += 1;
+            } else {
+                return None;
+            }
+            let false_val = parse_vap_ternary(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
+            return Some(if cond.as_bool()? { true_val } else { false_val });
+        }
+    }
+    Some(cond)
+}
 
 /// Parse an `||` (logical OR) expression.
 fn parse_vap_or(
@@ -1562,12 +1631,29 @@ fn parse_vap_or(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_and(tokens, pos, object, variables, request, namespace_object)?;
+    let mut left = parse_vap_and(
+        tokens,
+        pos,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
     while *pos < tokens.len() {
         if let CelToken::Pipe = &tokens[*pos] {
             *pos += 1;
-            let right = parse_vap_and(tokens, pos, object, variables, request, namespace_object)?;
+            let right = parse_vap_and(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
             let result = left.as_bool().unwrap_or(false) || right.as_bool().unwrap_or(false);
             left = serde_json::Value::Bool(result);
         } else {
@@ -1585,12 +1671,29 @@ fn parse_vap_and(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_cmp(tokens, pos, object, variables, request, namespace_object)?;
+    let mut left = parse_vap_cmp(
+        tokens,
+        pos,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
     while *pos < tokens.len() {
         if let CelToken::Ampersand = &tokens[*pos] {
             *pos += 1;
-            let right = parse_vap_cmp(tokens, pos, object, variables, request, namespace_object)?;
+            let right = parse_vap_cmp(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
             let result = left.as_bool().unwrap_or(false) && right.as_bool().unwrap_or(false);
             left = serde_json::Value::Bool(result);
         } else {
@@ -1608,8 +1711,17 @@ fn parse_vap_cmp(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let left = parse_vap_add(tokens, pos, object, variables, request, namespace_object)?;
+    let left = parse_vap_add(
+        tokens,
+        pos,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
     if *pos >= tokens.len() {
         return Some(left);
     }
@@ -1622,7 +1734,15 @@ fn parse_vap_cmp(
         | CelToken::Gt
         | CelToken::Gte => {
             *pos += 1;
-            let right = parse_vap_add(tokens, pos, object, variables, request, namespace_object)?;
+            let right = parse_vap_add(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
             let result = compare_values(&op, &left, &right)?;
             Some(serde_json::Value::Bool(result))
         }
@@ -1670,15 +1790,31 @@ fn parse_vap_add(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_mul(tokens, pos, object, variables, request, namespace_object)?;
+    let mut left = parse_vap_mul(
+        tokens,
+        pos,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
     while *pos < tokens.len() {
         let op = tokens[*pos].clone();
         match op {
             CelToken::Plus | CelToken::Minus => {
                 *pos += 1;
-                let right =
-                    parse_vap_mul(tokens, pos, object, variables, request, namespace_object)?;
+                let right = parse_vap_mul(
+                    tokens,
+                    pos,
+                    object,
+                    variables,
+                    request,
+                    namespace_object,
+                    old_object,
+                )?;
                 left = apply_add_op(&op, &left, &right)?;
             }
             _ => break,
@@ -1730,15 +1866,31 @@ fn parse_vap_mul(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
+    let mut left = parse_vap_unary(
+        tokens,
+        pos,
+        object,
+        variables,
+        request,
+        namespace_object,
+        old_object,
+    )?;
     while *pos < tokens.len() {
         let op = tokens[*pos].clone();
         match op {
             CelToken::Star | CelToken::Slash | CelToken::Percent => {
                 *pos += 1;
-                let right =
-                    parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
+                let right = parse_vap_unary(
+                    tokens,
+                    pos,
+                    object,
+                    variables,
+                    request,
+                    namespace_object,
+                    old_object,
+                )?;
                 left = apply_mul_op(&op, &left, &right)?;
             }
             _ => break,
@@ -1777,6 +1929,7 @@ fn parse_vap_unary(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     if *pos >= tokens.len() {
         return None;
@@ -1784,12 +1937,28 @@ fn parse_vap_unary(
     match &tokens[*pos] {
         CelToken::Bang => {
             *pos += 1;
-            let inner = parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
+            let inner = parse_vap_unary(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
             Some(serde_json::Value::Bool(!inner.as_bool()?))
         }
         CelToken::Minus => {
             *pos += 1;
-            let inner = parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
+            let inner = parse_vap_unary(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
             match inner {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
@@ -1802,7 +1971,15 @@ fn parse_vap_unary(
                 _ => None,
             }
         }
-        _ => parse_vap_primary(tokens, pos, object, variables, request, namespace_object),
+        _ => parse_vap_primary(
+            tokens,
+            pos,
+            object,
+            variables,
+            request,
+            namespace_object,
+            old_object,
+        ),
     }
 }
 
@@ -1814,6 +1991,7 @@ fn parse_vap_primary(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     if *pos >= tokens.len() {
         return None;
@@ -1841,13 +2019,34 @@ fn parse_vap_primary(
         }
         CelToken::LParen => {
             *pos += 1;
-            let val = parse_vap_or(tokens, pos, object, variables, request, namespace_object)?;
+            let val = parse_vap_ternary(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )?;
             if *pos < tokens.len() {
                 if let CelToken::RParen = &tokens[*pos] {
                     *pos += 1;
                 }
             }
-            Some(val)
+            // A parenthesized expression is itself a primary — `(cond ? a : b).field` (the
+            // ternary-then-oldObject pattern ValidatingAdmissionPolicy's node-restriction
+            // rule uses) must support the same `.field`/`[idx]`/`.orValue(...)` postfix
+            // chain as a bare identifier, not just return the raw value.
+            parse_vap_field_chain(
+                tokens,
+                pos,
+                val,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )
         }
         CelToken::Ident(name) => {
             *pos += 1;
@@ -1860,6 +2059,8 @@ fn parse_vap_primary(
                 request.clone()
             } else if name == "namespaceObject" {
                 namespace_object.clone()
+            } else if name == "oldObject" {
+                old_object.clone()
             } else {
                 // Unknown identifier — return as string (struct constructor handled below)
                 // Check for struct constructor: TypeName{...}
@@ -1873,6 +2074,7 @@ fn parse_vap_primary(
                             variables,
                             request,
                             namespace_object,
+                            old_object,
                         );
                     }
                 }
@@ -1889,11 +2091,20 @@ fn parse_vap_primary(
                 variables,
                 request,
                 namespace_object,
+                old_object,
             )
         }
         CelToken::LBrace => {
             *pos += 1;
-            parse_vap_object_body(tokens, pos, object, variables, request, namespace_object)
+            parse_vap_object_body(
+                tokens,
+                pos,
+                object,
+                variables,
+                request,
+                namespace_object,
+                old_object,
+            )
         }
         CelToken::LBracket => {
             *pos += 1;
@@ -1903,7 +2114,15 @@ fn parse_vap_primary(
                     *pos += 1;
                     break;
                 }
-                let val = parse_vap_or(tokens, pos, object, variables, request, namespace_object)?;
+                let val = parse_vap_ternary(
+                    tokens,
+                    pos,
+                    object,
+                    variables,
+                    request,
+                    namespace_object,
+                    old_object,
+                )?;
                 arr.push(val);
                 if *pos < tokens.len() {
                     if let CelToken::Comma = &tokens[*pos] {
@@ -1917,7 +2136,42 @@ fn parse_vap_primary(
     }
 }
 
-/// After reading a root identifier, handle `.field` chains and `{...}` constructors.
+/// Index a value by either a string map key or a numeric list index.
+///
+/// Returns `(present, value)` — `present` is `true` iff the key/index actually exists
+/// (this is what distinguishes "absent" from a legitimately-stored `null` for the `[?...]`
+/// / `.?field` optional-chaining operators below); `value` is the looked-up value, or
+/// `Value::Null` when absent or when `current`/`index` don't form a valid pairing.
+fn vap_index_get(
+    current: &serde_json::Value,
+    index: &serde_json::Value,
+) -> (bool, serde_json::Value) {
+    match (current, index) {
+        (serde_json::Value::Object(map), serde_json::Value::String(key)) => match map.get(key) {
+            Some(v) => (true, v.clone()),
+            None => (false, serde_json::Value::Null),
+        },
+        (serde_json::Value::Array(arr), serde_json::Value::Number(n)) => {
+            let idx = n.as_i64().and_then(|i| usize::try_from(i).ok());
+            match idx.and_then(|i| arr.get(i)) {
+                Some(v) => (true, v.clone()),
+                None => (false, serde_json::Value::Null),
+            }
+        }
+        _ => (false, serde_json::Value::Null),
+    }
+}
+
+/// After reading a root identifier, handle `.field`/`.?field` chains, `[idx]`/`[?idx]`
+/// indexing, `.orValue(default)` calls, and `{...}` constructors.
+///
+/// The optional-chaining subset (`.?field`, `[?idx]`, `.orValue(...)`) mirrors the upstream
+/// CEL `optional` library used by ValidatingAdmissionPolicy's node-restriction pattern, e.g.
+/// `request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')` must
+/// evaluate to `''` — not a hard eval error — when the claim is absent. A `present` flag
+/// threads through the chain: `.?`/`[?]` (re-)derive it, plain `.`/`[]` leave it untouched,
+/// so once it goes false it stays false (absence propagates) until `.orValue()` resolves it.
+#[allow(clippy::too_many_arguments)] // same 5 CEL-root params threaded through every parse_vap_* fn
 fn parse_vap_field_chain(
     tokens: &[CelToken],
     pos: &mut usize,
@@ -1926,7 +2180,9 @@ fn parse_vap_field_chain(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let mut present = true;
     loop {
         if *pos >= tokens.len() {
             break;
@@ -1937,11 +2193,45 @@ fn parse_vap_field_chain(
                 if *pos >= tokens.len() {
                     break;
                 }
+                let optional = if let CelToken::Question = &tokens[*pos] {
+                    *pos += 1;
+                    true
+                } else {
+                    false
+                };
+                if *pos >= tokens.len() {
+                    break;
+                }
                 if let CelToken::Ident(field) = tokens[*pos].clone() {
                     *pos += 1;
-                    // Check if this is a struct constructor (field followed by LBrace)
-                    if *pos < tokens.len() {
-                        if let CelToken::LBrace = &tokens[*pos] {
+                    if field == "orValue" {
+                        if let Some(CelToken::LParen) = tokens.get(*pos) {
+                            *pos += 1;
+                            let default_val = parse_vap_ternary(
+                                tokens,
+                                pos,
+                                object,
+                                variables,
+                                request,
+                                namespace_object,
+                                old_object,
+                            )?;
+                            if let Some(CelToken::RParen) = tokens.get(*pos) {
+                                *pos += 1;
+                            } else {
+                                return None;
+                            }
+                            if !present {
+                                current = default_val;
+                            }
+                            present = true;
+                            continue;
+                        }
+                    }
+                    // Check if this is a struct constructor (field followed by LBrace) —
+                    // only meaningful for plain (non-optional) field access.
+                    if !optional {
+                        if let Some(CelToken::LBrace) = tokens.get(*pos) {
                             // TypeName.qualifier{...} — treat as constructor, discard qualifier
                             *pos += 1;
                             return parse_vap_object_body(
@@ -1951,11 +2241,18 @@ fn parse_vap_field_chain(
                                 variables,
                                 request,
                                 namespace_object,
+                                old_object,
                             );
                         }
                     }
-                    // Field navigation
-                    current = current[&field].clone();
+                    if optional {
+                        let (ok, val) = vap_index_get(&current, &serde_json::Value::String(field));
+                        present = present && ok;
+                        current = val;
+                    } else {
+                        // Field navigation
+                        current = current[&field].clone();
+                    }
                 } else {
                     break;
                 }
@@ -1970,7 +2267,36 @@ fn parse_vap_field_chain(
                     variables,
                     request,
                     namespace_object,
+                    old_object,
                 );
+            }
+            CelToken::LBracket => {
+                *pos += 1;
+                let optional = if let Some(CelToken::Question) = tokens.get(*pos) {
+                    *pos += 1;
+                    true
+                } else {
+                    false
+                };
+                let idx_val = parse_vap_ternary(
+                    tokens,
+                    pos,
+                    object,
+                    variables,
+                    request,
+                    namespace_object,
+                    old_object,
+                )?;
+                if let Some(CelToken::RBracket) = tokens.get(*pos) {
+                    *pos += 1;
+                } else {
+                    return None;
+                }
+                let (ok, val) = vap_index_get(&current, &idx_val);
+                if optional {
+                    present = present && ok;
+                }
+                current = val;
             }
             _ => break,
         }
@@ -1986,6 +2312,7 @@ fn parse_vap_object_body(
     variables: &serde_json::Value,
     request: &serde_json::Value,
     namespace_object: &serde_json::Value,
+    old_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     while *pos < tokens.len() {
@@ -2012,7 +2339,15 @@ fn parse_vap_object_body(
         } else {
             return None;
         }
-        let val = parse_vap_or(tokens, pos, object, variables, request, namespace_object)?;
+        let val = parse_vap_ternary(
+            tokens,
+            pos,
+            object,
+            variables,
+            request,
+            namespace_object,
+            old_object,
+        )?;
         map.insert(key, val);
         if *pos < tokens.len() {
             if let CelToken::Comma = &tokens[*pos] {
@@ -2998,6 +3333,7 @@ async fn fetch_validating_policy_bindings<S: Store>(
 async fn run_validating_admission_policies<S: Store>(
     state: &AppState<S>,
     object: &serde_json::Value,
+    old_object: Option<&serde_json::Value>,
     ctx: &AdmissionContext<'_>,
 ) -> Result<(), StatusError> {
     // Exempt admission configuration resources (same as webhooks).
@@ -3021,6 +3357,10 @@ async fn run_validating_admission_policies<S: Store>(
         Some(ns) => fetch_namespace_object(state, ns).await,
         None => serde_json::Value::Null,
     };
+
+    // Resolve the `oldObject` CEL root once per request: the pre-request state of the
+    // admitted resource on UPDATE/DELETE, or Null on CREATE (upstream contract).
+    let old_object_val = old_object.cloned().unwrap_or(serde_json::Value::Null);
 
     // Index policies by name once so the binding loop below is O(N+M) instead of
     // re-scanning the full policy list (O(N*M)) for every binding.
@@ -3150,7 +3490,14 @@ async fn run_validating_admission_policies<S: Store>(
                     continue;
                 }
                 let vars = serde_json::Map::new();
-                match eval_cel_bool_expr(expr, object, &vars, &request_val, &namespace_object_val) {
+                match eval_cel_bool_expr(
+                    expr,
+                    object,
+                    &vars,
+                    &request_val,
+                    &namespace_object_val,
+                    &old_object_val,
+                ) {
                     Some(true) => {} // condition passes, continue
                     Some(false) => {
                         // matchCondition returned false → skip this webhook (not deny)
@@ -3191,6 +3538,7 @@ async fn run_validating_admission_policies<S: Store>(
                     &variables,
                     &request_val,
                     &namespace_object_val,
+                    &old_object_val,
                 ) {
                     Some(val) => {
                         variables.insert(var_name.to_string(), val);
@@ -3229,6 +3577,7 @@ async fn run_validating_admission_policies<S: Store>(
                     &variables,
                     &request_val,
                     &namespace_object_val,
+                    &old_object_val,
                 );
                 let passed = match result {
                     Some(b) => b,
@@ -3243,15 +3592,42 @@ async fn run_validating_admission_policies<S: Store>(
                 };
                 if !passed {
                     let reason = validation["reason"].as_str().unwrap_or("");
-                    let message = validation["message"]
-                        .as_str()
-                        .map(|m| m.to_string())
+                    // messageExpression takes precedence over the static `message` field
+                    // (upstream contract) — it lets a validation report which specific
+                    // value caused the denial (e.g. the mismatched node/object names).
+                    let message_expr = validation["messageExpression"].as_str().unwrap_or("");
+                    let message = if !message_expr.is_empty() {
+                        eval_cel_vap_value(
+                            message_expr,
+                            object,
+                            &variables,
+                            &request_val,
+                            &namespace_object_val,
+                            &old_object_val,
+                        )
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "admission: VAP \"{}\" messageExpression eval failed: {}",
+                                policy_name,
+                                message_expr
+                            );
                             format!(
                                 "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
                              expression '{expr}' evaluated to false"
                             )
-                        });
+                        })
+                    } else {
+                        validation["message"]
+                            .as_str()
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
+                             expression '{expr}' evaluated to false"
+                                )
+                            })
+                    };
                     if should_deny {
                         tracing::debug!(
                             "admission: VAP \"{}\" denied: {} (reason: {})",
@@ -3486,7 +3862,7 @@ pub async fn run_validating_webhooks<S: Store>(
     }
 
     // Run CEL-based ValidatingAdmissionPolicy enforcement.
-    let result = run_validating_admission_policies(state, object, ctx).await;
+    let result = run_validating_admission_policies(state, object, old_object, ctx).await;
     tracing::debug!(
         elapsed_ms = start.elapsed().as_millis() as u64,
         "admission: run_validating_webhooks exit"
@@ -8049,6 +8425,106 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // CEL ternary / optional-chaining tests (`?:`, `.?field`, `[?idx]`, `.orValue(...)`,
+    // `oldObject`) — the machinery ValidatingAdmissionPolicy's node-restriction pattern
+    // composes to build `variables.userNodeName`/`variables.objectNodeName`.
+    // ---------------------------------------------------------------------------
+
+    /// A `cond ? a : b` ternary must select the correct branch, and the `oldObject` CEL
+    /// root must resolve to the pre-request object state — the mechanism upstream's
+    /// by-node ValidatingAdmissionPolicy uses to compare
+    /// `(operation == 'DELETE' ? oldObject : object)` against the requesting node's
+    /// identity. Without ternary/oldObject support, a DELETE validation would compare
+    /// against the wrong (or a Null) object and either wrongly allow or wrongly deny it.
+    #[test]
+    fn cel_ternary_selects_old_object_on_delete_and_object_otherwise() {
+        let object = json!({"metadata": {"name": "new-name"}});
+        let old_object = json!({"metadata": {"name": "old-name"}});
+        let vars = serde_json::Map::new();
+
+        let delete_request = json!({"operation": "DELETE"});
+        let delete_result = eval_cel_vap_value(
+            "(request.operation == 'DELETE' ? oldObject : object).metadata.name",
+            &object,
+            &vars,
+            &delete_request,
+            &serde_json::Value::Null,
+            &old_object,
+        );
+        assert_eq!(
+            delete_result,
+            Some(json!("old-name")),
+            "DELETE must select oldObject's name; picking `object` instead compares the \
+             wrong resource state and could let a DELETE of a mismatched-name object slip \
+             through the node-restriction check"
+        );
+
+        let update_request = json!({"operation": "UPDATE"});
+        let update_result = eval_cel_vap_value(
+            "(request.operation == 'DELETE' ? oldObject : object).metadata.name",
+            &object,
+            &vars,
+            &update_request,
+            &serde_json::Value::Null,
+            &old_object,
+        );
+        assert_eq!(
+            update_result,
+            Some(json!("new-name")),
+            "non-DELETE operations must select `object` (the new state), not oldObject"
+        );
+    }
+
+    /// `request.userInfo.extra[?'key'][0].orValue('')` — the exact CEL pattern upstream's
+    /// by-node ValidatingAdmissionPolicy uses to read a bound service-account token's
+    /// node-name claim — must resolve to the claim's value when present, and to the
+    /// `orValue` default without a hard eval error when the claim is absent. Treating the
+    /// missing-claim case as an eval error (instead of an empty string) would make every
+    /// unbound request fail with a generic "eval failed" denial instead of upstream's
+    /// dedicated "no node association" validation message.
+    #[test]
+    fn cel_optional_index_and_or_value_reads_extra_claim_or_default() {
+        let object = json!({});
+        let vars = serde_json::Map::new();
+        let namespace_object = serde_json::Value::Null;
+        let old_object = serde_json::Value::Null;
+        let expr =
+            "request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')";
+
+        let bound_request = json!({
+            "userInfo": {"extra": {"authentication.kubernetes.io/node-name": ["worker-1"]}}
+        });
+        assert_eq!(
+            eval_cel_vap_value(
+                expr,
+                &object,
+                &vars,
+                &bound_request,
+                &namespace_object,
+                &old_object
+            ),
+            Some(json!("worker-1")),
+            "must extract the node-name claim's first value when the claim is present"
+        );
+
+        let unbound_request = json!({"userInfo": {"extra": {}}});
+        assert_eq!(
+            eval_cel_vap_value(
+                expr,
+                &object,
+                &vars,
+                &unbound_request,
+                &namespace_object,
+                &old_object
+            ),
+            Some(json!("")),
+            "an absent claim must resolve to the orValue('') default, not an eval error — \
+             an eval error here is silently treated as validation failure with the wrong \
+             (generic) denial message instead of upstream's 'no node association' message"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // CEL arithmetic overflow tests
     //
     // A VAP/MAP author can submit CEL expressions with overflowing integer arithmetic.
@@ -8071,6 +8547,7 @@ mod tests {
             &vars,
             &req,
             &serde_json::Value::Null,
+            &serde_json::Value::Null,
         );
         assert!(
             result.is_none(),
@@ -8092,6 +8569,7 @@ mod tests {
             &vars,
             &req,
             &serde_json::Value::Null,
+            &serde_json::Value::Null,
         );
         assert!(
             result.is_none(),
@@ -8110,6 +8588,7 @@ mod tests {
             &object,
             &vars,
             &req,
+            &serde_json::Value::Null,
             &serde_json::Value::Null,
         );
         assert!(
@@ -8130,6 +8609,7 @@ mod tests {
             &vars,
             &req,
             &serde_json::Value::Null,
+            &serde_json::Value::Null,
         );
         assert!(
             result.is_none(),
@@ -8149,6 +8629,7 @@ mod tests {
             &object,
             &vars,
             &req,
+            &serde_json::Value::Null,
             &serde_json::Value::Null,
         );
         assert!(
@@ -8660,6 +9141,7 @@ mod tests {
 
         let no_request = serde_json::Value::Null;
         let no_namespace = serde_json::Value::Null;
+        let no_old_object = serde_json::Value::Null;
 
         // Step 1: evaluate `replicas = object.spec.replicas`
         let replicas_val = eval_cel_vap_value(
@@ -8668,6 +9150,7 @@ mod tests {
             &variables,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .expect("object.spec.replicas must evaluate");
         variables.insert("replicas".into(), replicas_val);
@@ -8679,6 +9162,7 @@ mod tests {
             &variables,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .expect("variables.replicas % 2 == 1 must evaluate");
         variables.insert("oddReplicas".into(), odd_val);
@@ -8690,6 +9174,7 @@ mod tests {
             &variables,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .expect("variables.replicas > 1 must evaluate");
         assert!(
@@ -8705,6 +9190,7 @@ mod tests {
             &variables,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .expect("variables.oddReplicas must evaluate");
         assert!(
@@ -8722,6 +9208,7 @@ mod tests {
             &variables_even,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .unwrap();
         variables_even.insert("replicas".into(), r2);
@@ -8731,6 +9218,7 @@ mod tests {
             &variables_even,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .unwrap();
         variables_even.insert("oddReplicas".into(), o2);
@@ -8741,6 +9229,7 @@ mod tests {
             &variables_even,
             &no_request,
             &no_namespace,
+            &no_old_object,
         )
         .expect("oddReplicas must evaluate for even replicas");
         assert!(
@@ -9451,6 +9940,220 @@ mod tests {
             result_other.is_err(),
             "VAP with request.userInfo.username == 'system:node:worker-1' must deny other users; \
              worker-2 must not be allowed to update worker-1's node object"
+        );
+    }
+
+    /// End-to-end regression test for the upstream `[sig-auth] ValidatingAdmissionPolicy can
+    /// restrict access by-node` conformance spec: a policy composites
+    /// `variables.userNodeName` (the requester's bound service-account node claim) and
+    /// `variables.objectNodeName` (the object's name, read via `oldObject` on DELETE) using
+    /// optional chaining (`[?...]`, `.?field`, `.orValue(...)`), a ternary, and
+    /// `messageExpression` — CEL features the evaluator could not parse before this fix, so
+    /// every variable expression failed (None), the "userNodeName != ''" validation was
+    /// treated as failed (fail-closed), and every request below would be wrongly denied.
+    ///
+    /// Reverting the ternary/optional-chaining/oldObject/messageExpression support added
+    /// here makes this test fail: the matching-node cases (which must be allowed) get
+    /// denied, and the mismatch case's message reverts to the generic fallback instead of
+    /// naming the actual node and ConfigMap.
+    #[tokio::test]
+    async fn vap_by_node_restriction_allows_matching_node_denies_mismatch_and_missing_claim() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "by-node-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["configmaps"]
+                    }]
+                },
+                "matchConditions": [{
+                    "name": "isRestrictedUser",
+                    "expression": "request.userInfo.username == 'system:serviceaccount:e2e-ns:default'"
+                }],
+                "variables": [
+                    {
+                        "name": "userNodeName",
+                        "expression": "request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')"
+                    },
+                    {
+                        "name": "objectNodeName",
+                        "expression": "(request.operation == 'DELETE' ? oldObject : object).?metadata.name.orValue('')"
+                    }
+                ],
+                "validations": [
+                    {
+                        "expression": "variables.userNodeName != ''",
+                        "message": "no node association found for user, this user must run in a pod on a node and ServiceAccountTokenPodNodeInfo must be enabled"
+                    },
+                    {
+                        "expression": "variables.userNodeName == variables.objectNodeName",
+                        "messageExpression": "\"this user running on node '\" + variables.userNodeName + \"' may not modify ConfigMap '\" + variables.objectNodeName + \"' because the name does not match the node name\""
+                    }
+                ]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/by-node-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "by-node-binding"},
+            "spec": {
+                "policyName": "by-node-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/by-node-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node_bound_user = json!({
+            "username": "system:serviceaccount:e2e-ns:default",
+            "groups": ["system:serviceaccounts", "system:authenticated"],
+            "extra": {"authentication.kubernetes.io/node-name": ["worker-1"]}
+        });
+        let unbound_user = json!({
+            "username": "system:serviceaccount:e2e-ns:default",
+            "groups": ["system:serviceaccounts", "system:authenticated"],
+            "extra": {}
+        });
+
+        let matching_cm = json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "worker-1", "namespace": "e2e-ns"}
+        });
+        let mismatched_cm = json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "unlikely-node", "namespace": "e2e-ns"}
+        });
+
+        // Node-bound user creating the ConfigMap named after their own node → allowed.
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "worker-1",
+            namespace: Some("e2e-ns"),
+            operation: "CREATE",
+            user_info: Some(node_bound_user.clone()),
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &matching_cm, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "a node-bound user creating a ConfigMap named after their own node must be \
+             allowed; got {result:?}"
+        );
+
+        // Node-bound user creating a ConfigMap named after a different node → denied, with
+        // the dynamic messageExpression content (not the static fallback message).
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "unlikely-node",
+            namespace: Some("e2e-ns"),
+            operation: "CREATE",
+            user_info: Some(node_bound_user.clone()),
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &mismatched_cm, None, &ctx).await;
+        let err = result.expect_err(
+            "a node-bound user creating a ConfigMap named after a different node must be denied",
+        );
+        assert!(
+            err.1
+                .message
+                .contains("may not modify ConfigMap 'unlikely-node'")
+                && err.1.message.contains("running on node 'worker-1'"),
+            "denial message must be built from messageExpression (naming both the actual \
+             node and the mismatched ConfigMap), not the generic fallback message; got: {}",
+            err.1.message
+        );
+
+        // DELETE of the matching ConfigMap has no new `object` state — objectNodeName must
+        // be resolved from `oldObject` — and must be allowed.
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "worker-1",
+            namespace: Some("e2e-ns"),
+            operation: "DELETE",
+            user_info: Some(node_bound_user.clone()),
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &matching_cm, Some(&matching_cm), &ctx).await;
+        assert!(
+            result.is_ok(),
+            "DELETE of the matching ConfigMap must be allowed via oldObject resolution; \
+             got {result:?}"
+        );
+
+        // DELETE of the mismatched ConfigMap must still be denied.
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "unlikely-node",
+            namespace: Some("e2e-ns"),
+            operation: "DELETE",
+            user_info: Some(node_bound_user),
+            dry_run: false,
+        };
+        let result =
+            run_validating_webhooks(&state, &mismatched_cm, Some(&mismatched_cm), &ctx).await;
+        assert!(
+            result.is_err(),
+            "DELETE of a mismatched-name ConfigMap must be denied"
+        );
+
+        // A user with no node claim at all (e.g. ServiceAccountTokenPodNodeInfo not
+        // applicable) must be denied by the first validation's "no node association"
+        // message, regardless of which ConfigMap they touch.
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "worker-1",
+            namespace: Some("e2e-ns"),
+            operation: "CREATE",
+            user_info: Some(unbound_user),
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &matching_cm, None, &ctx).await;
+        let err = result.expect_err("a user with no node claim must be denied");
+        assert!(
+            err.1.message.contains("no node association found for user"),
+            "denial message for a claim-less user must be the dedicated 'no node \
+             association' message, not a generic eval-error fallback; got: {}",
+            err.1.message
         );
     }
 
