@@ -1679,7 +1679,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection","bind","escalate"] },
-            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
+            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
         ]
     });
     put!(key, body, "admin", "ClusterRole");
@@ -1701,7 +1703,10 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","secrets","serviceaccounts","events","replicationcontrollers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
         ]
     });
     put!(key, body, "edit", "ClusterRole");
@@ -4961,6 +4966,95 @@ mod tests {
              silently denying the bulk form of the same operation is a bootstrap-policy gap, \
              not an intentional restriction"
         );
+    }
+
+    /// Regression test: RoleBindings to the built-in "edit" AND "admin" ClusterRoles must both
+    /// authorize write access to Leases, NetworkPolicies, Ingresses and PodDisruptionBudgets.
+    /// Upstream's default "edit" ClusterRole (aggregated from system:aggregate-to-edit + view)
+    /// grants full CRUD on coordination.k8s.io/leases and policy/poddisruptionbudgets, and write
+    /// verbs on networking.k8s.io/networkpolicies+ingresses (with read coming from the view
+    /// aggregation) — this codebase's flat copy of "edit" previously had no rule at all for any
+    /// of these four resources, so a namespace editor got a plain RBAC 403 the moment they tried
+    /// to manage a Lease (e.g. for leader election), a NetworkPolicy, an Ingress, or a
+    /// PodDisruptionBudget. "admin" is upstream's "edit" plus extra escalation powers, so it must
+    /// be a strict superset of "edit" — this codebase's "admin" already covered
+    /// NetworkPolicies/Ingresses but, like "edit", had silently drifted to lack Leases and
+    /// PodDisruptionBudgets too. Both roles are checked here so a regression in either one's
+    /// rules fails this test, not just a manual kubectl check.
+    #[tokio::test]
+    async fn edit_and_admin_rolebindings_can_manage_leases_networkpolicies_ingresses_and_poddisruptionbudgets(
+    ) {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        use bytes::Bytes;
+        use u7s_store::Store;
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-gaps");
+            let binding_key = keys::group_object_key(
+                GROUP,
+                "rolebindings",
+                Some(namespace.as_str()),
+                &format!("{cluster_role}-binding"),
+            );
+            let binding_val = serde_json::json!({
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": cluster_role
+                },
+                "subjects": [{
+                    "kind": "ServiceAccount",
+                    "name": "default",
+                    "namespace": namespace
+                }]
+            });
+            store
+                .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+                .await
+                .expect("put rolebinding must not fail");
+        }
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-gaps");
+            for (api_group, resource) in [
+                ("coordination.k8s.io", "leases"),
+                ("networking.k8s.io", "networkpolicies"),
+                ("networking.k8s.io", "ingresses"),
+                ("policy", "poddisruptionbudgets"),
+            ] {
+                let create_req = rbac::AuthzRequest {
+                    username: &format!("system:serviceaccount:{namespace}:default"),
+                    groups: &groups,
+                    verb: "create",
+                    api_group,
+                    resource,
+                    subresource: "",
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&create_req),
+                    "a RoleBinding to '{cluster_role}' must authorize CREATE on \
+                     {api_group}/{resource} — upstream's default '{cluster_role}' ClusterRole \
+                     grants this resource group and this codebase's copy previously had no rule \
+                     for it at all, so a namespace {cluster_role} user got an RBAC 403 trying to \
+                     manage it"
+                );
+            }
+        }
     }
 
     /// Regression test: the KCM resourcequota controller must be able
