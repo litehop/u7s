@@ -4968,42 +4968,53 @@ mod tests {
         );
     }
 
-    /// Regression test: a RoleBinding to the built-in "edit" ClusterRole must authorize write
-    /// access to Leases, NetworkPolicies, Ingresses and PodDisruptionBudgets. Upstream's default
-    /// "edit" ClusterRole (aggregated from system:aggregate-to-edit + view) grants full CRUD on
-    /// coordination.k8s.io/leases and policy/poddisruptionbudgets, and write verbs on
-    /// networking.k8s.io/networkpolicies+ingresses (with read coming from the view aggregation) —
-    /// this codebase's flat copy of "edit" previously had no rule at all for any of these four
-    /// resources, so a namespace editor got a plain RBAC 403 the moment they tried to manage a
-    /// Lease (e.g. for leader election), a NetworkPolicy, an Ingress, or a PodDisruptionBudget,
-    /// even though "admin" (edit plus more) already covered NetworkPolicies/Ingresses.
+    /// Regression test: RoleBindings to the built-in "edit" AND "admin" ClusterRoles must both
+    /// authorize write access to Leases, NetworkPolicies, Ingresses and PodDisruptionBudgets.
+    /// Upstream's default "edit" ClusterRole (aggregated from system:aggregate-to-edit + view)
+    /// grants full CRUD on coordination.k8s.io/leases and policy/poddisruptionbudgets, and write
+    /// verbs on networking.k8s.io/networkpolicies+ingresses (with read coming from the view
+    /// aggregation) — this codebase's flat copy of "edit" previously had no rule at all for any
+    /// of these four resources, so a namespace editor got a plain RBAC 403 the moment they tried
+    /// to manage a Lease (e.g. for leader election), a NetworkPolicy, an Ingress, or a
+    /// PodDisruptionBudget. "admin" is upstream's "edit" plus extra escalation powers, so it must
+    /// be a strict superset of "edit" — this codebase's "admin" already covered
+    /// NetworkPolicies/Ingresses but, like "edit", had silently drifted to lack Leases and
+    /// PodDisruptionBudgets too. Both roles are checked here so a regression in either one's
+    /// rules fails this test, not just a manual kubectl check.
     #[tokio::test]
-    async fn edit_rolebinding_can_manage_leases_networkpolicies_ingresses_and_poddisruptionbudgets()
-    {
+    async fn edit_and_admin_rolebindings_can_manage_leases_networkpolicies_ingresses_and_poddisruptionbudgets(
+    ) {
         const GROUP: &str = "rbac.authorization.k8s.io";
         let store = std::sync::Arc::new(make_store());
         seed_rbac(&store).await.expect("seed must not fail");
 
-        let binding_key =
-            keys::group_object_key(GROUP, "rolebindings", Some("e2e-edit-gaps"), "edit-binding");
-        let binding_val = serde_json::json!({
-            "roleRef": {
-                "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "ClusterRole",
-                "name": "edit"
-            },
-            "subjects": [{
-                "kind": "ServiceAccount",
-                "name": "default",
-                "namespace": "e2e-edit-gaps"
-            }]
-        });
         use bytes::Bytes;
         use u7s_store::Store;
-        store
-            .put(&binding_key, Bytes::from(binding_val.to_string()), None)
-            .await
-            .expect("put rolebinding must not fail");
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-gaps");
+            let binding_key = keys::group_object_key(
+                GROUP,
+                "rolebindings",
+                Some(namespace.as_str()),
+                &format!("{cluster_role}-binding"),
+            );
+            let binding_val = serde_json::json!({
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": cluster_role
+                },
+                "subjects": [{
+                    "kind": "ServiceAccount",
+                    "name": "default",
+                    "namespace": namespace
+                }]
+            });
+            store
+                .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+                .await
+                .expect("put rolebinding must not fail");
+        }
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
@@ -5015,30 +5026,34 @@ mod tests {
         state.init().await;
 
         let groups: Vec<String> = vec![];
-        for (api_group, resource) in [
-            ("coordination.k8s.io", "leases"),
-            ("networking.k8s.io", "networkpolicies"),
-            ("networking.k8s.io", "ingresses"),
-            ("policy", "poddisruptionbudgets"),
-        ] {
-            let create_req = rbac::AuthzRequest {
-                username: "system:serviceaccount:e2e-edit-gaps:default",
-                groups: &groups,
-                verb: "create",
-                api_group,
-                resource,
-                subresource: "",
-                namespace: Some("e2e-edit-gaps"),
-                name: None,
-                non_resource_url: None,
-            };
-            assert!(
-                state.rbac_index.is_allowed(&create_req),
-                "a RoleBinding to 'edit' must authorize CREATE on {api_group}/{resource} — \
-                 upstream's default 'edit' ClusterRole grants this resource group and this \
-                 codebase's copy previously had no rule for it at all, so a namespace editor \
-                 got an RBAC 403 trying to manage it"
-            );
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-gaps");
+            for (api_group, resource) in [
+                ("coordination.k8s.io", "leases"),
+                ("networking.k8s.io", "networkpolicies"),
+                ("networking.k8s.io", "ingresses"),
+                ("policy", "poddisruptionbudgets"),
+            ] {
+                let create_req = rbac::AuthzRequest {
+                    username: &format!("system:serviceaccount:{namespace}:default"),
+                    groups: &groups,
+                    verb: "create",
+                    api_group,
+                    resource,
+                    subresource: "",
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&create_req),
+                    "a RoleBinding to '{cluster_role}' must authorize CREATE on \
+                     {api_group}/{resource} — upstream's default '{cluster_role}' ClusterRole \
+                     grants this resource group and this codebase's copy previously had no rule \
+                     for it at all, so a namespace {cluster_role} user got an RBAC 403 trying to \
+                     manage it"
+                );
+            }
         }
     }
 
