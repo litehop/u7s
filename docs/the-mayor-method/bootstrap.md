@@ -133,7 +133,12 @@ fresh post-update-branch cycle already in flight) are worth waiting on.
    frontmatter and invoke `.claude/agents/critical-reviewer.md` with that
    deliverable — it now self-posts its findings (a PR comment, or bead notes
    + a follow-on bead for non-PR types; see the agent file's "Output &
-   posting" section). Only THEN, after confirming the post actually landed
+   posting" section). The hook (`scripts/critical-reviewer-dispatch.sh`)
+   filters out `agent_type: critical-reviewer` completions before they ever
+   reach this queue, so a review's own completion report echoing the PR
+   URL it just reviewed can never re-queue itself — if you never see
+   critical-reviewer-sourced entries here, that's the filter working, not a
+   broken hook. Only THEN, after confirming the post actually landed
    — `gh pr view <N> --json comments` shows a new `## critical-reviewer
    findings` comment for `pr` deliverables, or `bd show <id>` shows the
    appended note for the others — `mv` the queue file into
