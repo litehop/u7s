@@ -1703,7 +1703,30 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // "admin" ClusterRole grants both, matching this codebase's convention (see
             // leases/networkpolicies/poddisruptionbudgets above) of encoding the fully-resolved
             // permission set rather than replicating which upstream helper contributed what.
-            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
+            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // Upstream's editRules() never mentions any of these /status subresources —
+            // they reach the resolved "edit"/"admin" ClusterRole only via the view
+            // aggregation, so admin/edit get exactly the same READ-ONLY grant as "view"
+            // below. Status is deliberately excluded from edit/admin's write powers
+            // (see upstream's "edit" ClusterRole comment: "/status subresources ... are
+            // the domain of the system"); only controller identities like
+            // system:kube-controller-manager can write status.
+            { "apiGroups": [""], "resources": ["pods/status","services/status","resourcequotas/status","namespaces/status","replicationcontrollers/status","persistentvolumeclaims/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["apps"], "resources": ["statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
+            // Unlike the /status entries above, statefulsets/scale, deployments/scale, and
+            // replicasets/scale ARE granted write directly by upstream's editRules(), so
+            // admin/edit get full CRUD here — the same convention already used for
+            // replicationcontrollers/scale above.
+            { "apiGroups": ["apps"], "resources": ["statefulsets/scale","deployments/scale","replicasets/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["batch"], "resources": ["cronjobs/status","jobs/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["ingresses/status"], "verbs": ["get","list","watch"] },
+            // discovery.k8s.io/endpointslices: upstream's editRules() never mentions the
+            // discovery group at all — only viewRules() does — so the resolved edit/admin
+            // grant is this same READ-ONLY rule, not full CRUD. Writing EndpointSlices is
+            // reserved for the endpointslice controller (system:kube-controller-manager).
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch"] }
         ]
     });
     put!(key, body, "admin", "ClusterRole");
@@ -1734,7 +1757,16 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] },
             { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
             { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
-            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
+            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // See the identical block in "admin" above for why each of these exists.
+            { "apiGroups": [""], "resources": ["pods/status","services/status","resourcequotas/status","namespaces/status","replicationcontrollers/status","persistentvolumeclaims/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["apps"], "resources": ["statefulsets/status","daemonsets/status","deployments/status","replicasets/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["apps"], "resources": ["statefulsets/scale","deployments/scale","replicasets/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["batch"], "resources": ["cronjobs/status","jobs/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["ingresses/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch"] }
         ]
     });
     put!(key, body, "edit", "ClusterRole");
@@ -1764,7 +1796,22 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // replicationcontrollers/scale is non-escalating and part of upstream's viewRules()
             // directly (unlike pods/attach|exec|portforward|proxy and services/proxy, which
             // are intentionally excluded from "view" — see the edit/admin ClusterRoles above).
-            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch"] }
+            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch"] },
+            // Upstream's viewRules() grants read on each workload type's /status
+            // subresource directly — these are non-escalating (unlike pods/attach|exec|
+            // portforward|proxy and services/proxy above), so "view" gets them too.
+            { "apiGroups": [""], "resources": ["pods/status","services/status","resourcequotas/status","namespaces/status","replicationcontrollers/status","persistentvolumeclaims/status"], "verbs": ["get","list","watch"] },
+            // statefulsets/scale, deployments/scale, replicasets/scale are read-only here —
+            // upstream's viewRules() grants Read on them directly; the Write half comes only
+            // from editRules(), so "edit"/"admin" (not "view") get full CRUD (see above).
+            { "apiGroups": ["apps"], "resources": ["statefulsets/status","statefulsets/scale","daemonsets/status","deployments/status","deployments/scale","replicasets/status","replicasets/scale"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["batch"], "resources": ["cronjobs/status","jobs/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets/status"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["ingresses/status"], "verbs": ["get","list","watch"] },
+            // discovery.k8s.io/endpointslices has no rule at all in "view" today — upstream
+            // grants get/list/watch directly.
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch"] }
         ]
     });
     put!(key, body, "view", "ClusterRole");
@@ -5342,6 +5389,238 @@ mod tests {
             "a RoleBinding to 'view' must NOT authorize UPDATE on replicationcontrollers/scale \
              — 'view' is read-only, upstream's editRules() (not viewRules()) grants the write"
         );
+    }
+
+    /// Regression test: RoleBindings to the built-in "edit", "admin", AND "view" ClusterRoles
+    /// must all authorize GET on every workload/status subresource upstream's viewRules()
+    /// grants (pods/status, services/status, resourcequotas/status, namespaces/status,
+    /// replicationcontrollers/status, persistentvolumeclaims/status, statefulsets/status,
+    /// daemonsets/status, deployments/status, replicasets/status, horizontalpodautoscalers/
+    /// status, cronjobs/status, jobs/status, poddisruptionbudgets/status, ingresses/status)
+    /// plus discovery.k8s.io/endpointslices — before this fix this codebase's flat admin/
+    /// edit/view ClusterRoles never split out ANY /status subresource for any resource, so a
+    /// ServiceAccount bound to any of the three got a plain RBAC 403 the moment it tried to
+    /// read a workload's status (e.g. `kubectl get deployment -o yaml` still works because
+    /// status is embedded in the base object, but a controller or client hitting `/status`
+    /// directly did not).
+    ///
+    /// "edit"/"admin" must ALSO authorize full CRUD on statefulsets/scale, deployments/scale,
+    /// and replicasets/scale — upstream's editRules() grants Write on these three directly
+    /// (unlike the /status entries, which editRules() never mentions) — while "view" must
+    /// stay read-only on them, matching the replicationcontrollers/scale precedent.
+    ///
+    /// Spot-checks that nothing was over-granted: none of the three roles may WRITE any
+    /// /status subresource (upstream reserves status writes for controller identities like
+    /// system:kube-controller-manager, never edit/admin/view — see the "edit" ClusterRole's
+    /// own upstream doc comment), and none may write discovery.k8s.io/endpointslices either
+    /// (upstream's editRules() never mentions the discovery group, so edit/admin only
+    /// inherit the read-only grant from the view aggregation, not create/delete).
+    #[tokio::test]
+    async fn edit_admin_and_view_rolebindings_can_read_status_subresources_and_endpointslices() {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        use bytes::Bytes;
+        use u7s_store::Store;
+        for cluster_role in ["edit", "admin", "view"] {
+            let namespace = format!("e2e-{cluster_role}-status");
+            let binding_key = keys::group_object_key(
+                GROUP,
+                "rolebindings",
+                Some(namespace.as_str()),
+                &format!("{cluster_role}-binding"),
+            );
+            let binding_val = serde_json::json!({
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": cluster_role
+                },
+                "subjects": [{
+                    "kind": "ServiceAccount",
+                    "name": "default",
+                    "namespace": namespace
+                }]
+            });
+            store
+                .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+                .await
+                .expect("put rolebinding must not fail");
+        }
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+
+        // Every one of these /status subresources (plus endpointslices) must be readable
+        // by all three roles — this is the shared, resolved read-only grant upstream's
+        // viewRules() contributes to edit/admin via aggregation.
+        let readable = [
+            ("", "pods", "status"),
+            ("", "services", "status"),
+            ("", "resourcequotas", "status"),
+            ("", "namespaces", "status"),
+            ("", "replicationcontrollers", "status"),
+            ("", "persistentvolumeclaims", "status"),
+            ("apps", "statefulsets", "status"),
+            ("apps", "daemonsets", "status"),
+            ("apps", "deployments", "status"),
+            ("apps", "replicasets", "status"),
+            ("autoscaling", "horizontalpodautoscalers", "status"),
+            ("batch", "cronjobs", "status"),
+            ("batch", "jobs", "status"),
+            ("policy", "poddisruptionbudgets", "status"),
+            ("networking.k8s.io", "ingresses", "status"),
+            ("discovery.k8s.io", "endpointslices", ""),
+        ];
+        for cluster_role in ["edit", "admin", "view"] {
+            let namespace = format!("e2e-{cluster_role}-status");
+            let username = format!("system:serviceaccount:{namespace}:default");
+            for (api_group, resource, subresource) in readable {
+                let get_req = rbac::AuthzRequest {
+                    username: &username,
+                    groups: &groups,
+                    verb: "get",
+                    api_group,
+                    resource,
+                    subresource,
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&get_req),
+                    "a RoleBinding to '{cluster_role}' must authorize GET on \
+                     {api_group}/{resource}/{subresource} — upstream's viewRules() grants \
+                     this and this codebase's copy previously had no rule for any /status \
+                     subresource at all"
+                );
+
+                // Spot-check: none of the three roles may WRITE any /status subresource —
+                // upstream reserves status writes for controller identities, never edit/
+                // admin/view. (Skip endpointslices here; its write-denial is asserted
+                // separately below since it isn't a /status subresource.)
+                if subresource == "status" {
+                    let update_req = rbac::AuthzRequest {
+                        username: &username,
+                        groups: &groups,
+                        verb: "update",
+                        api_group,
+                        resource,
+                        subresource,
+                        namespace: Some(namespace.as_str()),
+                        name: None,
+                        non_resource_url: None,
+                    };
+                    assert!(
+                        !state.rbac_index.is_allowed(&update_req),
+                        "a RoleBinding to '{cluster_role}' must NOT authorize UPDATE on \
+                         {api_group}/{resource}/{subresource} — status writes are reserved \
+                         for controller identities (e.g. system:kube-controller-manager), \
+                         never edit/admin/view, so granting this would be over-broad"
+                    );
+                }
+            }
+
+            // discovery.k8s.io/endpointslices is read-only for all three roles — upstream's
+            // editRules() never mentions the discovery group, so edit/admin only inherit
+            // the read-only grant from the view aggregation, not create/delete.
+            let create_endpointslices = rbac::AuthzRequest {
+                username: &username,
+                groups: &groups,
+                verb: "create",
+                api_group: "discovery.k8s.io",
+                resource: "endpointslices",
+                subresource: "",
+                namespace: Some(namespace.as_str()),
+                name: None,
+                non_resource_url: None,
+            };
+            assert!(
+                !state.rbac_index.is_allowed(&create_endpointslices),
+                "a RoleBinding to '{cluster_role}' must NOT authorize CREATE on \
+                 discovery.k8s.io/endpointslices — upstream's editRules() never grants write \
+                 access to this resource, only system:kube-controller-manager (the \
+                 endpointslice controller) may write it"
+            );
+        }
+
+        // statefulsets/scale, deployments/scale, replicasets/scale: "edit"/"admin" get full
+        // CRUD (upstream's editRules() grants Write on these three directly), but "view"
+        // must stay read-only — matching the replicationcontrollers/scale precedent.
+        let scale_resources = [
+            ("apps", "statefulsets"),
+            ("apps", "deployments"),
+            ("apps", "replicasets"),
+        ];
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-status");
+            let username = format!("system:serviceaccount:{namespace}:default");
+            for (api_group, resource) in scale_resources {
+                let update_scale = rbac::AuthzRequest {
+                    username: &username,
+                    groups: &groups,
+                    verb: "update",
+                    api_group,
+                    resource,
+                    subresource: "scale",
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&update_scale),
+                    "a RoleBinding to '{cluster_role}' must authorize UPDATE on \
+                     {api_group}/{resource}/scale — upstream's editRules() grants Write on \
+                     this subresource directly"
+                );
+            }
+        }
+        let view_namespace = "e2e-view-status";
+        let view_username = format!("system:serviceaccount:{view_namespace}:default");
+        for (api_group, resource) in scale_resources {
+            let get_scale = rbac::AuthzRequest {
+                username: &view_username,
+                groups: &groups,
+                verb: "get",
+                api_group,
+                resource,
+                subresource: "scale",
+                namespace: Some(view_namespace),
+                name: None,
+                non_resource_url: None,
+            };
+            assert!(
+                state.rbac_index.is_allowed(&get_scale),
+                "a RoleBinding to 'view' must authorize GET on {api_group}/{resource}/scale \
+                 — upstream's viewRules() grants Read on this subresource directly"
+            );
+            let update_scale = rbac::AuthzRequest {
+                username: &view_username,
+                groups: &groups,
+                verb: "update",
+                api_group,
+                resource,
+                subresource: "scale",
+                namespace: Some(view_namespace),
+                name: None,
+                non_resource_url: None,
+            };
+            assert!(
+                !state.rbac_index.is_allowed(&update_scale),
+                "a RoleBinding to 'view' must NOT authorize UPDATE on {api_group}/{resource}/\
+                 scale — 'view' is read-only, upstream's editRules() (not viewRules()) grants \
+                 the write"
+            );
+        }
     }
 
     /// Regression test: the KCM resourcequota controller must be able
