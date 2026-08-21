@@ -88,10 +88,17 @@ fi
 
 if [ -z "$IFACE" ]; then
   # First non-loopback interface, in kernel ifindex order (the order `ip link
-  # show` lists them) -- matches install-script-ux.md's literal default.
-  IFACE="$(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' | head -n1)"
+  # show` lists them) -- matches install-script-ux.md's literal default. Also
+  # excludes common virtual/container-runtime interfaces (docker0, veth*,
+  # cni*, br-*, virbr*, flannel*, cali*): a genuinely fresh box won't have
+  # any of these, but a box that already has some other container runtime
+  # installed (or a re-run of this script) would, and picking one of those
+  # as "the" cluster-traffic interface would be wrong regardless.
+  IFACE="$(ip -o link show | awk -F': ' '{print $2}' \
+    | grep -Ev '^(lo|docker[0-9]*|veth.*|cni.*|br-.*|virbr.*|flannel.*|cali.*)$' \
+    | head -n1)"
   if [ -z "$IFACE" ]; then
-    echo "error: no non-loopback network interface found -- pass --iface explicitly" >&2
+    echo "error: no non-loopback, non-virtual network interface found -- pass --iface explicitly" >&2
     exit 1
   fi
 fi
@@ -175,6 +182,10 @@ for bin in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
   found="$(find "$STAGE_DIR" -type f -name "$bin" | head -n1)"
   if [ -z "$found" ]; then
     echo "error: tarball is missing required binary: $bin" >&2
+    exit 1
+  fi
+  if [ ! -x "$found" ]; then
+    echo "error: $bin was found in the tarball at $found but is not executable (tarball packaging bug?)" >&2
     exit 1
   fi
   install -m 0755 "$found" "$BIN_DIR/$bin"
@@ -289,7 +300,7 @@ cat > /etc/systemd/system/kubelet.service <<EOF
 Description=Kubernetes kubelet
 After=network-online.target crio.service u7s-apiserver.service
 Wants=network-online.target
-Requires=crio.service
+Requires=crio.service u7s-apiserver.service
 
 [Service]
 Type=simple
