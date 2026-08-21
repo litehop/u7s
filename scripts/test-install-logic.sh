@@ -213,6 +213,14 @@ assert_true "kubelet-config.yaml points tlsCertFile/tlsPrivateKeyFile at a servi
 assert_true "kubelet.service mints that serving cert (ExecStartPre) with an IP SAN matching the node's own cluster-traffic address, since apiserver dials kubelet by IP" \
   grep -qF 'subjectAltName=IP:$IFACE_IP' "$INSTALL"
 
+# extendedKeyUsage=serverAuth: rustls-webpki's EKU check is currently
+# required_if_present (an absent EKU still passes), so this isn't fixing a
+# live failure -- it matches the more defensive pattern scripts/conformance/
+# lima-start.sh already uses for the same kind of cert, so this cert doesn't
+# silently rely on one TLS library's lenient-by-default EKU handling.
+assert_true "the minted kubelet serving cert declares extendedKeyUsage=serverAuth, matching lima-start.sh's existing pattern for the same kind of cert rather than relying on webpki's lenient absent-EKU handling" \
+  grep -qF 'extendedKeyUsage=serverAuth' "$INSTALL"
+
 assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cluster CA, so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
   grep -qF 'clientCAFile: $STATE_DIR/ca.pem' "$INSTALL"
 
