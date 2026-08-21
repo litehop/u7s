@@ -280,6 +280,7 @@ pub(crate) async fn create_namespace<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
@@ -501,6 +502,7 @@ pub(crate) async fn patch_namespace<S: Store>(
                     "username": user.username,
                     "uid": user.uid,
                     "groups": user.groups,
+                    "extra": user.extra,
                 })),
             },
         )
@@ -1132,6 +1134,7 @@ pub(crate) async fn delete_namespace<S: Store>(
             "username": user.username,
             "uid": user.uid,
             "groups": user.groups,
+            "extra": user.extra,
         })),
         dry_run: false,
     };
