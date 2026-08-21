@@ -38,6 +38,38 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+  # Regression guards for scripts/**/test-*-logic.sh (plus the standalone
+  # test-critical-reviewer-hook.sh) -- pure-bash unit tests for shell-script
+  # logic (argument parsing, decision functions, process supervision), none
+  # of which touch a real Lima VM/kubectl/sonobuoy. Discovered via `find` so
+  # new sibling scripts are picked up automatically instead of silently
+  # staying untested like this whole family did before.
+  script-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh
+        run: |
+          tests_file="$(mktemp)"
+          find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' \) | sort > "$tests_file"
+          count=$(wc -l < "$tests_file")
+          if [ "$count" -eq 0 ]; then
+            echo "no scripts/**/test-*-logic.sh regression scripts found — discovery is broken" >&2
+            exit 1
+          fi
+          echo "found $count regression-guard scripts"
+          fail=0
+          while IFS= read -r t; do
+            echo "--- $t ---"
+            bash "$t" || fail=1
+          done < "$tests_file"
+          rm -f "$tests_file"
+          exit "$fail"
+
   # runs the whole suite _and_ checks coverage too
   test-coverage:
     runs-on: ubuntu-latest

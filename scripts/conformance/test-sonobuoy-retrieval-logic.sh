@@ -287,16 +287,20 @@ assert "tar -czf on a pod log dir picks up both the live 0.log and rotated 0.log
   "$(printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log$" && printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log.20260806-000000$" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 8. journald_system_max_use_is_6g -- lima-start.sh's journald drop-in caps
+# 8. journald_system_max_use_is_5g -- lima-start.sh's journald drop-in caps
 #    disk usage; 2G was measured insufficient for an 11h --all-e2e run under
 #    16-way load (the 0805-2202 run's collected kubelet.log/crio.log covered
 #    only the LAST 1h54m of that run, losing the 09:33-09:35 DiskPressure
-#    incident window entirely). A regression back to 2G (or any value below
-#    6G) would silently start truncating forensic evidence again.
+#    incident window entirely), which is why this was raised to 6G. It was
+#    later deliberately retuned to 5G (operator-directed "5GB disk" target)
+#    alongside smaller SystemMaxFileSize/SystemMaxFiles segments to cut
+#    journald's RSS working set -- so 5G is the current intentional floor,
+#    not a regression. A future drop back to 2G (or below 5G) would silently
+#    start truncating forensic evidence again.
 # ---------------------------------------------------------------------------
 LIMA_START="$(dirname "${BASH_SOURCE[0]}")/lima-start.sh"
-assert "journald_system_max_use_is_6g -- 2G was measured insufficient for an 11h --all-e2e run under 16-way load (0805-2202 run lost its own DiskPressure incident window); regression here silently truncates forensic evidence again" \
-  "$(grep -q '^SystemMaxUse=6G$' "$LIMA_START" && ! grep -q '^SystemMaxUse=2G$' "$LIMA_START" && echo 1 || echo 0)"
+assert "journald_system_max_use_is_5g -- 2G was measured insufficient for an 11h --all-e2e run under 16-way load (0805-2202 run lost its own DiskPressure incident window); regression below the current 5G floor silently truncates forensic evidence again" \
+  "$(grep -q '^SystemMaxUse=5G$' "$LIMA_START" && ! grep -q '^SystemMaxUse=2G$' "$LIMA_START" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 9. journal_is_rotated_and_vacuumed_after_config_apply -- lima-start.sh runs

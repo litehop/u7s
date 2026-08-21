@@ -117,7 +117,11 @@ INPUT_NOOP=$(jq -n \
   '{agent_id:"agent-test4", agent_type:"worker", cwd:"/tmp/wt", session_id:"sess4", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
 run_hook "$INPUT_NOOP"
 if [ "$(count_queue_files)" = "0" ]; then
-  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q 'skip\tno-deliverable' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+  # $'...' ANSI-C quoting expands \t to a real tab byte before grep ever sees
+  # the pattern -- a quoted 'skip\tno-deliverable' works on this host's ugrep
+  # (which treats \t as tab even unquoted) but real GNU grep in default BRE
+  # mode treats \t as literal "t", silently matching nothing on Linux CI.
+  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q $'skip\tno-deliverable' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
     pass "no deliverable → skipped, decision logged"
   else
     fail "no deliverable: hook did not log a skip decision"
@@ -159,7 +163,9 @@ INPUT_SELF_ECHO=$(jq -n \
   '{agent_id:"agent-test7", agent_type:"critical-reviewer", cwd:"/tmp/wt", session_id:"sess7", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
 run_hook "$INPUT_SELF_ECHO"
 if [ "$(count_queue_files)" = "0" ]; then
-  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q 'skip\tself-review-echo' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+  # See the Case 4 comment above: $'...' is required so grep gets a literal
+  # tab byte instead of relying on \t-as-tab, which real GNU grep does not do.
+  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q $'skip\tself-review-echo' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
     pass "critical-reviewer echoing its own reviewed PR → skipped, decision logged"
   else
     fail "critical-reviewer self-echo: hook did not log a self-review-echo skip decision"
