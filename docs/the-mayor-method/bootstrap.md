@@ -131,17 +131,19 @@ fresh post-update-branch cycle already in flight) are worth waiting on.
    large backlog doesn't blow out this tick's latency — the rest drain over
    subsequent ticks), read its `deliverable_type`/`deliverable_ref`
    frontmatter and invoke `.claude/agents/critical-reviewer.md` with that
-   deliverable — it now self-posts its findings (a PR comment, or bead notes
-   + a follow-on bead for non-PR types; see the agent file's "Output &
-   posting" section). The hook (`scripts/critical-reviewer-dispatch.sh`)
-   filters out `agent_type: critical-reviewer` completions before they ever
-   reach this queue, so a review's own completion report echoing the PR
-   URL it just reviewed can never re-queue itself — if you never see
-   critical-reviewer-sourced entries here, that's the filter working, not a
-   broken hook. Only THEN, after confirming the post actually landed
-   — `gh pr view <N> --json comments` shows a new `## critical-reviewer
-   findings` comment for `pr` deliverables, or `bd show <id>` shows the
-   appended note for the others — `mv` the queue file into
+   deliverable — it now self-posts its findings (an inline-anchored PR
+   review, or bead notes + a follow-on bead for non-PR types; see the agent
+   file's "Output & posting" section). The hook
+   (`scripts/critical-reviewer-dispatch.sh`) filters out `agent_type:
+   critical-reviewer` completions before they ever reach this queue, so a
+   review's own completion report echoing the PR URL it just reviewed can
+   never re-queue itself — if you never see critical-reviewer-sourced
+   entries here, that's the filter working, not a broken hook. Only THEN,
+   after confirming the post actually landed — `gh pr view <N> --json
+   reviews` shows a new review whose body starts with `## critical-reviewer
+   findings` for `pr` deliverables (NOT `--json comments`: a Review's body
+   does not surface there, only under `reviews`), or `bd show <id>` shows
+   the appended note for the others — `mv` the queue file into
    `.claude/review-queue/processed/` (create the dir first if absent), never
    delete, this is the audit trail. If the confirmation check fails (auth
    hiccup, rate limit, the agent not actually executing its posting
@@ -159,8 +161,8 @@ fresh post-update-branch cycle already in flight) are worth waiting on.
    `gh pr list --state open --json number,title,mergeStateStatus,statusCheckRollup | jq`.
 2. **Review gate (mayor-oec8e), then merge any CLEAN PR.** For a
    `worker/agent-*`-branch PR (NOT `operator/*` — see below), require a
-   comment whose body starts with `## critical-reviewer findings` before
-   merging: `gh pr view <N> --json comments`. If missing, do not merge this
+   review whose body starts with `## critical-reviewer findings` before
+   merging: `gh pr view <N> --json reviews`. If missing, do not merge this
    PR THIS tick — step 0 above (same tick) should have just posted one if a
    queue entry existed for it, so the NEXT tick can merge. `operator/*`
    branches are exempt: they're authored directly by the mayor's own
