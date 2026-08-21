@@ -38,6 +38,20 @@ TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
 # Detect reviewable deliverables. Empty MSG → nothing to review.
 [ -z "$MSG" ] && exit 0
 
+# A dispatched critical-reviewer's own completion report necessarily mentions
+# the PR/deliverable it just reviewed (e.g. "I posted findings on PR #<N>:
+# <url>"). Without this check that echo is indistinguishable from a worker
+# having just opened a fresh PR, so the hook would re-queue a review of the
+# review that was JUST completed -- and draining that queue entry would
+# produce another critical-reviewer completion mentioning the same URL,
+# re-queuing again unboundedly. Skip before running deliverable detection at
+# all; there is nothing to discard, so no reason to regex the message first.
+if [ "$AGENT_TYPE" = "critical-reviewer" ]; then
+  printf '%s\t%s\tskip\tself-review-echo\tagent_type=%s\n' \
+    "$TS" "$AGENT_ID" "$AGENT_TYPE" >> "$LOG_DIR/decisions.tsv"
+  exit 0
+fi
+
 DELIVERABLE_TYPE=""
 DELIVERABLE_REF=""
 
