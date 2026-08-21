@@ -238,7 +238,7 @@ gitignored, not in the committed tree; expect drift as the workspace grows or
 on different hardware — treat as a range, not a promise):
 
 - **Warm cache** (target/ already built by a prior `cargo test`/`cargo build`
-  in the SAME worktree, e.g. your own step-2 run below): `cargo test
+  in the SAME worktree, e.g. your own step-3 run below): `cargo test
   --workspace` ~25-30s, `cargo clippy --workspace --tests --no-deps -- -D
   warnings` ~15-20s. Both fit comfortably inside Bash's default 2-min timeout.
 - **Cold cache** (a brand-new worktree with no prior `cargo` invocation at
