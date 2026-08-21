@@ -117,7 +117,11 @@ INPUT_NOOP=$(jq -n \
   '{agent_id:"agent-test4", agent_type:"worker", cwd:"/tmp/wt", session_id:"sess4", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
 run_hook "$INPUT_NOOP"
 if [ "$(count_queue_files)" = "0" ]; then
-  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q 'skip\tno-deliverable' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+  # $'...' ANSI-C quoting expands \t to a real tab byte before grep ever sees
+  # the pattern -- a quoted 'skip\tno-deliverable' works on this host's ugrep
+  # (which treats \t as tab even unquoted) but real GNU grep in default BRE
+  # mode treats \t as literal "t", silently matching nothing on Linux CI.
+  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q $'skip\tno-deliverable' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
     pass "no deliverable → skipped, decision logged"
   else
     fail "no deliverable: hook did not log a skip decision"
