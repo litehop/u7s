@@ -137,10 +137,14 @@ print_test_change_summary() {
 # Blocking gate: if diff range $1 touches a file pattern in the
 # sensitive-conformance registry, require a FRESH sonobuoy --focus PASS for
 # the matching spec(s) before letting the push through. Runs
-# scripts/conformance/run-all.sh on the VM/port this shell is configured for
-# (U7S_CONFORMANCE_GATE_{VM,PORT,KUBELET_PORT}, defaulting to the project's
-# baseline lima-node/6443/10250) -- a worker's dispatch sets these to its
-# assigned VM slot per ai/prompts/vm-operations.md.
+# scripts/conformance/run-all.sh on the VM/port named by
+# U7S_CONFORMANCE_GATE_{VM,PORT,KUBELET_PORT} -- these have NO default. A
+# fallback here would silently reuse a shared/possibly-in-use slot (e.g. the
+# mayor's own lima-node:6443) instead of the pusher's actually-assigned VM,
+# which is exactly the hazard this gate exists to avoid elsewhere. There is
+# no way to auto-detect "the pusher's assigned VM slot" from inside a git
+# hook, so the pusher must set these three explicitly before pushing a
+# sensitive-file change -- see the error message below for the exact form.
 check_sensitive_conformance_gate() {
   range="$1"
   changed_tmp=$(mktemp)
@@ -151,7 +155,7 @@ check_sensitive_conformance_gate() {
   fi
 
   registry_tmp=$(mktemp)
-  parse_registry >"$registry_tmp"
+  parse_registry >"$registry_tmp" 2>/dev/null || true
   if [ ! -s "$registry_tmp" ]; then
     rm -f "$changed_tmp" "$registry_tmp"
     return 0
@@ -185,9 +189,19 @@ check_sensitive_conformance_gate() {
   echo "    $focus"
   echo "================================================================"
 
-  gate_vm="${U7S_CONFORMANCE_GATE_VM:-lima-node}"
-  gate_port="${U7S_CONFORMANCE_GATE_PORT:-6443}"
-  gate_kubelet_port="${U7S_CONFORMANCE_GATE_KUBELET_PORT:-10250}"
+  gate_vm="${U7S_CONFORMANCE_GATE_VM:-}"
+  gate_port="${U7S_CONFORMANCE_GATE_PORT:-}"
+  gate_kubelet_port="${U7S_CONFORMANCE_GATE_KUBELET_PORT:-}"
+
+  if [ -z "$gate_vm" ] || [ -z "$gate_port" ] || [ -z "$gate_kubelet_port" ]; then
+    echo "[pre-push] BLOCKED: U7S_CONFORMANCE_GATE_VM/_PORT/_KUBELET_PORT are not" >&2
+    echo "all set in this shell -- refusing to guess (a silent default would risk" >&2
+    echo "reusing a shared/in-use VM slot, e.g. the mayor's own lima-node:6443)." >&2
+    echo "Set them to YOUR assigned VM slot before pushing, e.g.:" >&2
+    echo "  U7S_CONFORMANCE_GATE_VM=lima-node-2 U7S_CONFORMANCE_GATE_PORT=6444 \\" >&2
+    echo "  U7S_CONFORMANCE_GATE_KUBELET_PORT=10251 git push ..." >&2
+    return 1
+  fi
 
   run_out=$(mktemp)
   set +e
