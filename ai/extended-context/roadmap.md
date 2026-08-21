@@ -178,8 +178,10 @@ zero-argument single-node install all the way to a working `kubectl get
 nodes` with CoreDNS and kube-proxy actually running. Out of scope, still
 open: the real self-hosted distribution domain/origin, multi-node join,
 CA-trust/rotation tooling, metrics-server, and any agent-facing install
-tooling. Known gap found during MVP verification: `kubectl logs`/`exec`
-return BadGateway on a single-box install, tracked as `mayor-h0cyv`.
+tooling. `kubectl logs`/`exec` also confirmed working end to end (a gap
+found during MVP verification and fixed same-session, `mayor-h0cyv`/PR
+#1343: kubelet's serving cert now signed by the cluster CA, with the
+matching client-CA trust wired in).
 
 **Scoping decision added this session:** the install script's own logic
 (CRI-O setup, systemd units, manifest bootstrap, defaulting behavior — i.e.
