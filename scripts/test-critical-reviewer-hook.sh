@@ -150,13 +150,33 @@ else
   fail "wrong-org PR URL: expected 0 queue files, got $(count_queue_files)"
 fi
 
-# Bonus: every case should have produced a raw-input log file in log/.
+# Case 7: critical-reviewer's own completion echoes the PR it just reviewed
+# → NOT re-queued (would otherwise re-queue a review of the review just
+# completed, unboundedly, if a future drain invoked critical-reviewer again).
+clear_sandbox
+INPUT_SELF_ECHO=$(jq -n \
+  --arg msg 'I posted the critical-reviewer findings comment on PR #9999: https://github.com/valerauko/u7s/pull/9999' \
+  '{agent_id:"agent-test7", agent_type:"critical-reviewer", cwd:"/tmp/wt", session_id:"sess7", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
+run_hook "$INPUT_SELF_ECHO"
+if [ "$(count_queue_files)" = "0" ]; then
+  if [ -f "$SANDBOX/.claude/review-queue/log/decisions.tsv" ] && grep -q 'skip\tself-review-echo' "$SANDBOX/.claude/review-queue/log/decisions.tsv"; then
+    pass "critical-reviewer echoing its own reviewed PR → skipped, decision logged"
+  else
+    fail "critical-reviewer self-echo: hook did not log a self-review-echo skip decision"
+  fi
+else
+  fail "critical-reviewer self-echo: expected 0 queue files, got $(count_queue_files)"
+fi
+
+# Bonus: only "queued" decisions get a raw-input log file (retention policy,
+# 2026-08-21) -- of the 7 cases above, only 1/2/3 (pr, findings, bead-close)
+# are queued; 4/5/6/7 are skips and must NOT produce a jsonl dump.
 if [ -d "$SANDBOX/.claude/review-queue/log" ]; then
   LOG_COUNT=$(find "$SANDBOX/.claude/review-queue/log" -name '*.jsonl' | wc -l | tr -d ' ')
-  if [ "$LOG_COUNT" = "6" ]; then
-    pass "raw input logged for every fire (6/6)"
+  if [ "$LOG_COUNT" = "3" ]; then
+    pass "raw input logged only for queued decisions (3/3)"
   else
-    fail "raw input log count: expected 6, got $LOG_COUNT"
+    fail "raw input log count: expected 3, got $LOG_COUNT"
   fi
 else
   fail "raw input log dir missing"
