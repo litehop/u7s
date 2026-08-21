@@ -54,6 +54,7 @@ sha2            = "0.11"
 u7s-sentinel    = { path = "../sentinel" }
 u7s-proto-generated = { path = "../proto-generated" }
 prometheus      = { version = "0.14", default-features = false, features = ["process"] }
+chrono-tz       = "0.10"
 dhat            = { version = "0.3", optional = true }
 rlimit          = "0.11"
 socket2         = "0.6"
