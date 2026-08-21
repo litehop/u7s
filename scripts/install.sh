@@ -7,9 +7,13 @@
 # pre-built tarball, and writes/enables systemd units for all four so they
 # survive reboots and restart on crash.
 #
-# NOT covered here (see the in-cluster follow-on step): CoreDNS/kube-proxy
-# manifest bootstrap, multi-node join, and fetching the tarball from a URL
-# (this script only accepts an already-downloaded local path).
+# Also installs kubectl and applies the in-cluster kube-proxy DaemonSet
+# manifest once the apiserver is reachable (CoreDNS needs no equivalent step
+# here -- the apiserver applies its own vendored manifest in-process on every
+# boot, see crates/apiserver/src/bootstrap_apply.rs).
+#
+# NOT covered here: multi-node join and fetching the tarball from a URL (this
+# script only accepts an already-downloaded local path).
 #
 # Usage:
 #   sudo scripts/install.sh --tarball <path> [--node-name <name>] [--iface <iface>]
@@ -200,6 +204,38 @@ for bin in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
   install -m 0755 "$found" "$BIN_DIR/$bin"
 done
 
+# --- kubectl + CNI plugin binaries (apt, pinned to kubelet's own version) ----
+#
+# kubectl ships in neither the release tarball (out of scope per
+# docs/decisions/upstream-component-shipping-shape.md -- that ADR only
+# settles kubelet/KCM/kube-proxy/CoreDNS) nor the tarball's binary list this
+# script checks above, but a zero-argument install that ends at a working
+# `kubectl get nodes` needs kubectl to exist somewhere. Pulled from the
+# official Kubernetes apt repo, same signed-apt-repo pattern as CRI-O above,
+# pinned to kubelet's own minor version for client/server skew safety.
+#
+# kubernetes-cni (from the same repo) provides the actual CNI plugin binaries
+# (bridge, host-local, loopback, ...) under /opt/cni/bin/ that CRI-O's own
+# 10-crio-bridge.conflist references. CRI-O's apt package only Recommends
+# (not Depends on) a CNI-plugins package, and cloud-image apt defaults to
+# Install-Recommends=false -- so on a genuinely fresh box CRI-O starts with a
+# CNI config file that validates against no actual plugin binaries, and every
+# node sits NotReady forever with "failed to find plugin \"bridge\" in path
+# [/opt/cni/bin/]" (found running this script end to end for the first time).
+KUBE_VERSION="$("$BIN_DIR/kubelet" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+if [ -z "$KUBE_VERSION" ]; then
+  echo "error: could not determine kubelet version from '$BIN_DIR/kubelet --version'" >&2
+  exit 1
+fi
+KUBE_MINOR="${KUBE_VERSION%.*}"
+
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
+  | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/ /" \
+  > /etc/apt/sources.list.d/kubernetes.list
+apt-get update -qq
+apt-get install -y kubectl kubernetes-cni
+
 # State dir: apiserver's default relative paths (./state.db, ./kubeconfig,
 # ./ca.key, ./ca.crt, ./sa.key, ./sa.pub) resolve here via WorkingDirectory=.
 # 0700 because it ends up holding the CA private key and service-account
@@ -328,6 +364,147 @@ systemctl enable --now u7s-scheduler.service
 systemctl enable --now u7s-kcm.service
 systemctl enable --now kubelet.service
 
-echo "u7s host-level bootstrap complete."
-echo "kubeconfig: $STATE_DIR/kubeconfig"
-echo "Next: apply CoreDNS/kube-proxy manifests (separate in-cluster bootstrap step), then 'kubectl get nodes'."
+# --- In-cluster bootstrap: kube-proxy DaemonSet -------------------------------
+#
+# CoreDNS needs nothing here: the apiserver server-side-applies its own
+# vendored manifest bundle in-process on every boot (bootstrap_apply.rs).
+# kube-proxy has no equivalent in-process path (docs/decisions/upstream-
+# component-shipping-shape.md scopes bootstrap_apply.rs to CoreDNS only), so
+# this script applies it once the apiserver is confirmed reachable. RBAC
+# (ClusterRole system:node-proxier) is already seeded by the apiserver
+# itself; only the ServiceAccount binding, config, and DaemonSet are new.
+#
+# The apiserver's first-run bootstrap (CA/kubeconfig generation) races its
+# own listener binding -- see the Restart=always note above -- so this polls
+# rather than assuming the kubeconfig file and a live listener both already
+# exist right after `systemctl enable --now` returns.
+KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
+echo "Waiting for u7s-apiserver to become reachable..."
+READY=0
+for _ in $(seq 1 60); do
+  if [ -f "$KUBECONFIG_PATH" ] && kubectl --kubeconfig="$KUBECONFIG_PATH" get --raw=/healthz >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+  sleep 2
+done
+if [ "$READY" -ne 1 ]; then
+  echo "error: u7s-apiserver did not become reachable within 120s (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
+  exit 1
+fi
+
+# server: hardcoded to 10.96.0.1 (the "kubernetes" Service's fixed ClusterIP)
+# rather than the ${KUBERNETES_SERVICE_HOST} env-var form upstream's own
+# kubeadm ConfigMap uses -- same reasoning as coredns.yaml pinning kube-dns's
+# ClusterIP: a hardcoded, known-good address beats depending on a Pod-env-var
+# substitution path this project hasn't specifically verified.
+echo "Applying kube-proxy DaemonSet manifest..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeadm:node-proxier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-proxier
+subjects:
+- kind: ServiceAccount
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    mode: "iptables"
+    clientConnection:
+      kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
+  kubeconfig.conf: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - cluster:
+        certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        server: https://10.96.0.1:443
+      name: default
+    contexts:
+    - context:
+        cluster: default
+        user: default
+      name: default
+    current-context: default
+    users:
+    - name: default
+      user:
+        tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+  labels:
+    k8s-app: kube-proxy
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-proxy
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-proxy
+    spec:
+      serviceAccountName: kube-proxy
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: kube-proxy
+        image: registry.k8s.io/kube-proxy:v${KUBE_VERSION}
+        command:
+        - /usr/local/bin/kube-proxy
+        - --config=/var/lib/kube-proxy/config.conf
+        - --hostname-override=\$(NODE_NAME)
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: kube-proxy
+          mountPath: /var/lib/kube-proxy
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: kube-proxy
+        configMap:
+          name: kube-proxy
+      - name: xtables-lock
+        hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+EOF
+
+echo "u7s bootstrap complete (host-level + in-cluster)."
+echo "kubeconfig: $KUBECONFIG_PATH"
+echo "Run: kubectl --kubeconfig=$KUBECONFIG_PATH get nodes"
