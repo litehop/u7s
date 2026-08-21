@@ -131,11 +131,20 @@ fresh post-update-branch cycle already in flight) are worth waiting on.
    large backlog doesn't blow out this tick's latency — the rest drain over
    subsequent ticks), read its `deliverable_type`/`deliverable_ref`
    frontmatter and invoke `.claude/agents/critical-reviewer.md` with that
-   deliverable — it now self-posts its findings (PR comment/review, or bead
-   notes + a follow-on bead for non-PR types; see the agent file's "Output &
-   posting" section). After invocation, `mv` the queue file into
-   `.claude/review-queue/processed/` (create the dir first if absent) — never
-   delete, this is the audit trail. Drain ALL deliverable types here
+   deliverable — it now self-posts its findings (a PR comment, or bead notes
+   + a follow-on bead for non-PR types; see the agent file's "Output &
+   posting" section). Only THEN, after confirming the post actually landed
+   — `gh pr view <N> --json comments` shows a new `## critical-reviewer
+   findings` comment for `pr` deliverables, or `bd show <id>` shows the
+   appended note for the others — `mv` the queue file into
+   `.claude/review-queue/processed/` (create the dir first if absent), never
+   delete, this is the audit trail. If the confirmation check fails (auth
+   hiccup, rate limit, the agent not actually executing its posting
+   instructions), leave the file in place for the next tick to retry —
+   moving it to `processed/` unconditionally would make a failed post
+   indistinguishable from a real one and quietly reintroduce the exact
+   "PR never gets reviewed" risk this whole mechanism exists to close, just
+   via a different failure mode. Drain ALL deliverable types here
    (pr/findings/bead-close/bead-supersede), not just PRs: only the PR type is
    load-bearing for step 2's merge gate below, but leaving the
    findings/bead-close/bead-supersede share of the backlog (~30% historically)

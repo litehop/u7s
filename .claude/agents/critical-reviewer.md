@@ -95,11 +95,16 @@ Be terse. A one-word "LGTM" is better than a paragraph of restating what the dif
 Then post it yourself, per deliverable type:
 
 - **`deliverable_type: pr`** (ref is a PR URL, extract `<N>`):
-  - Always: `gh pr comment <N> --body "<findings block>"`.
-  - Additionally, only when **Verdict** is `needs-changes` or `needs-discussion`:
-    `gh pr review <N> --request-changes --body "<one-line summary + see comment above>"`.
-    For `LGTM` / `LGTM-with-suggestions`, the plain comment is the only action —
-    do not touch review state.
+  `gh pr comment <N> --body "<findings block>"` — this is the only posting
+  action for every verdict, including `needs-changes`/`needs-discussion`. Do
+  NOT call `gh pr review --request-changes`: every PR in this repo (worker
+  and operator alike) is authored under the same GitHub account the reviewer
+  authenticates as, and GitHub hard-blocks a user from requesting changes on
+  their own PR (confirmed empirically: `gh pr review <N> --request-changes`
+  errors with "Can not request changes on your own pull request"). The
+  comment body's `**Verdict**: needs-changes` text is what the merge gate
+  keys off — a GitHub-native review-state mechanism would need a second bot
+  identity, which is out of scope here.
 - **`deliverable_type: findings`** (ref is a file path under `ai/findings/`):
   there is no PR to comment on. Identify the originating bead ID — findings
   docs consistently name it in their own title/intro (grep the doc for the
