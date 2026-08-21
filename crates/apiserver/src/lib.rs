@@ -1681,7 +1681,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles","rolebindings"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection","bind","escalate"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // Upstream grants `impersonate` on serviceaccounts to edit/admin so a namespace
+            // editor can act as one of "their" ServiceAccounts (e.g. to debug a workload
+            // identity) without cluster-admin. auth.rs's Impersonate-User handling branches on
+            // SA-shaped usernames to authorize against this namespaced resource.
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] }
         ]
     });
     put!(key, body, "admin", "ClusterRole");
@@ -1706,7 +1711,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // See the identical rule in "admin" above for why this exists.
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] }
         ]
     });
     put!(key, body, "edit", "ClusterRole");

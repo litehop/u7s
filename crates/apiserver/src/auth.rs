@@ -947,6 +947,17 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
         .unwrap()
 }
 
+/// Splits a `system:serviceaccount:<namespace>:<name>` username into its namespace and
+/// name components, mirroring apf.rs's `service_account_matches_namespace` prefix-stripping
+/// logic. Returns `None` for usernames that aren't ServiceAccount-shaped, so upstream's
+/// `Impersonate-User` handling can fall back to authorizing against the `users` resource
+/// (matching real kube-apiserver's `serviceaccount.SplitUsername` branch in the
+/// impersonation filter).
+fn split_service_account_username(username: &str) -> Option<(&str, &str)> {
+    let rest = username.strip_prefix("system:serviceaccount:")?;
+    rest.split_once(':')
+}
+
 // ---------------------------------------------------------------------------
 // AuthLayer
 // ---------------------------------------------------------------------------
@@ -1143,18 +1154,38 @@ where
                     .map(|s| s.to_owned())
                     .collect();
 
-                // Verify the authenticated caller may impersonate this user.
-                if !rbac_index.is_allowed(&AuthzRequest {
-                    username: &authenticated_user.username,
-                    groups: &authenticated_user.groups,
-                    verb: "impersonate",
-                    api_group: "",
-                    resource: "users",
-                    subresource: "",
-                    namespace: None,
-                    name: Some(&impersonate_user),
-                    non_resource_url: None,
-                }) {
+                // Verify the authenticated caller may impersonate this user. Real kube-apiserver
+                // branches here: a ServiceAccount-shaped identity is authorized against the
+                // namespaced `serviceaccounts` resource (so e.g. `edit` can impersonate "its
+                // own" ServiceAccounts) rather than the cluster-scoped `users` resource used for
+                // every other identity.
+                let sa_parts = split_service_account_username(&impersonate_user);
+                let allowed = if let Some((namespace, name)) = sa_parts {
+                    rbac_index.is_allowed(&AuthzRequest {
+                        username: &authenticated_user.username,
+                        groups: &authenticated_user.groups,
+                        verb: "impersonate",
+                        api_group: "",
+                        resource: "serviceaccounts",
+                        subresource: "",
+                        namespace: Some(namespace),
+                        name: Some(name),
+                        non_resource_url: None,
+                    })
+                } else {
+                    rbac_index.is_allowed(&AuthzRequest {
+                        username: &authenticated_user.username,
+                        groups: &authenticated_user.groups,
+                        verb: "impersonate",
+                        api_group: "",
+                        resource: "users",
+                        subresource: "",
+                        namespace: None,
+                        name: Some(&impersonate_user),
+                        non_resource_url: None,
+                    })
+                };
+                if !allowed {
                     return Ok(forbidden_response(
                         &authenticated_user.username,
                         "impersonate",
@@ -3426,6 +3457,193 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "caller without impersonate verb must get 403 — \
              failing this would allow any authenticated user to escalate to cluster-admin"
+        );
+    }
+
+    // --- SA-shaped Impersonate-User must check resource=serviceaccounts, not users ---
+    //
+    // Real kube-apiserver's impersonation filter branches on the impersonated username: a
+    // `system:serviceaccount:<ns>:<name>`-shaped identity is authorized against the
+    // namespaced `serviceaccounts` resource (so e.g. "edit" can impersonate ServiceAccounts
+    // in its own namespace), not the cluster-scoped `users` resource used for everyone else.
+    // seed_rbac's "edit"/"admin" ClusterRoles grant `impersonate` on `serviceaccounts` (not
+    // `users`) precisely for this reason — before this fix, that grant was inert because
+    // this check always authorized against `users` regardless of the target's shape.
+
+    /// caller-sa (`system:serviceaccount:ns-a:caller`) is bound, via a namespace-scoped
+    /// RoleBinding in "ns-a", to a ClusterRole granting `impersonate` on `serviceaccounts` —
+    /// mirroring the real "edit" ClusterRole's grant. target-sa in both "ns-a" and "ns-b" can
+    /// list pods, so a successful impersonation is distinguishable from a denied one.
+    fn make_rbac_with_sa_edit_binding() -> Arc<RbacIndex> {
+        let idx = Arc::new(RbacIndex::new());
+
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/edit-like";
+        let role_val = serde_json::json!({
+            "rules": [
+                { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] }
+            ]
+        });
+        idx.apply_object(role_key, &role_val);
+
+        // Scoped to "ns-a" only — a real RoleBinding to "edit" only grants impersonation of
+        // ServiceAccounts in the namespace the binding lives in, not cluster-wide.
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/ns-a/rolebindings/caller-edit";
+        let bind_val = serde_json::json!({
+            "subjects": [{ "kind": "ServiceAccount", "name": "caller", "namespace": "ns-a" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "edit-like"
+            }
+        });
+        idx.apply_object(bind_key, &bind_val);
+
+        // target's own permissions are irrelevant to the impersonation check itself, but a
+        // trivially checkable grant lets the test confirm the *substituted* identity (not
+        // caller's) was actually used for the downstream request.
+        let target_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-lister";
+        let target_role_val = serde_json::json!({
+            "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }]
+        });
+        idx.apply_object(target_role_key, &target_role_val);
+        let target_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/targets-pod-lister";
+        let target_bind_val = serde_json::json!({
+            "subjects": [
+                { "kind": "ServiceAccount", "name": "target", "namespace": "ns-a" },
+                { "kind": "ServiceAccount", "name": "target", "namespace": "ns-b" }
+            ],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "pod-lister"
+            }
+        });
+        idx.apply_object(target_bind_key, &target_bind_val);
+
+        idx
+    }
+
+    /// A ServiceAccount bound to an "edit"-shaped ClusterRole (granting `impersonate` on
+    /// `serviceaccounts`, not `users`) must be able to impersonate another ServiceAccount in
+    /// a namespace it holds that RoleBinding in.
+    ///
+    /// Before this fix, the impersonation check always authorized against `resource: "users"`
+    /// regardless of the target's shape — since no rule here grants `impersonate` on `users`,
+    /// this request would be wrongly denied even though the caller holds exactly the RBAC
+    /// grant real kube-apiserver requires for SA-shaped impersonation. This is the gap
+    /// deliberately left inert by seed_rbac's `serviceaccounts` impersonate rule until this
+    /// fix landed.
+    #[tokio::test]
+    async fn impersonation_of_sa_shaped_identity_checks_serviceaccounts_resource() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_sa_edit_binding();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "caller-token".to_owned(),
+            UserInfo {
+                username: "system:serviceaccount:ns-a:caller".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            user.username
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/ns-a/pods", get(whoami))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/ns-a/pods")
+            .header("authorization", "Bearer caller-token")
+            .header("Impersonate-User", "system:serviceaccount:ns-a:target")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "caller holds impersonate on serviceaccounts in ns-a via its RoleBinding, so \
+             impersonating target-sa in ns-a must succeed — checking resource=users here \
+             (as before this fix) would wrongly deny it since no rule grants that"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body_bytes).unwrap(),
+            "system:serviceaccount:ns-a:target",
+            "effective identity must be the impersonated ServiceAccount, not the caller"
+        );
+    }
+
+    /// The same caller from the success case above must be DENIED when impersonating a
+    /// ServiceAccount in a namespace it holds no RoleBinding for — the `serviceaccounts`
+    /// impersonate check must be namespace-scoped to the target, matching real
+    /// kube-apiserver's `serviceAccountMatchesNamespace` semantics.
+    ///
+    /// Without this scoping, extracting the wrong namespace (or treating the grant as
+    /// cluster-wide) would let any namespace's "edit" RoleBinding impersonate ServiceAccounts
+    /// in every other namespace too — a privilege-escalation regression this test guards.
+    #[tokio::test]
+    async fn impersonation_of_sa_shaped_identity_denied_outside_bound_namespace() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_sa_edit_binding();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "caller-token".to_owned(),
+            UserInfo {
+                username: "system:serviceaccount:ns-a:caller".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/ns-b/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/ns-b/pods")
+            .header("authorization", "Bearer caller-token")
+            .header("Impersonate-User", "system:serviceaccount:ns-b:target")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "caller's RoleBinding only grants impersonate on serviceaccounts in ns-a — \
+             impersonating target-sa in ns-b must be denied"
         );
     }
 
