@@ -3,7 +3,7 @@ name: roadmap
 description: u7s roadmap — current state and priorities via a per-component decision matrix and horizontal gates. Not a phase list. Durable north star, decision framework, and guiding principles live in north-star.md; this file changes often and links back rather than restating them.
 metadata:
   type: project
-as_of: 2026-08-18
+as_of: 2026-08-21
 kind: roadmap
 ---
 
@@ -141,21 +141,56 @@ that failure is actually observed rather than pre-emptively applied —
 pre-seeding before attempting the install would mask whatever the real gap
 turns out to be.
 
-### Gate 6 — Packaging & distribution (NOT STARTED)
+### Gate 6 — Packaging & distribution (MVP scope defined, install script not yet written)
 End-game: k3s-style one-shell-script install. See north-star.md's packaging
 philosophy for the settled direction (default everything, minimal
 configurable surface — node identity and network-interface selection only —
-motivated by concrete k3s/k0s failure modes). Still open:
-- Binary distribution shape: single static binary? per-component binaries?
-- How upstream KCM/kubelet/CRI-O ship alongside u7s (download at first-run
-  vs. bundled vs. dependency).
-- Fresh-VM install contract (systemd unit? podman? bare processes?).
-- Multi-node scale-out shape.
+motivated by concrete k3s/k0s failure modes). A planning sketch worked
+through this end-to-end and settled several sub-decisions, now recorded as
+individual ADRs:
+- Install UX shape — settled, see
+  `docs/decisions/install-script-ux.md`.
+- How upstream components ship (kubelet/KCM bundled, kube-proxy as an
+  in-cluster DaemonSet, CRI-O via apt on Ubuntu-first, CoreDNS as a manifest,
+  metrics-server excluded by default) — settled, see
+  `docs/decisions/upstream-component-shipping-shape.md`.
+- Fresh-node install contract (systemd units per host binary, Ubuntu-only
+  initial scope) — settled, see
+  `docs/decisions/systemd-install-contract.md`.
+- Binary distribution/tarball shape (what exactly the release tarball
+  contains and how large it is) — still needs-data, tracked in
+  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §2.
+- Multi-node scale-out shape (join token mechanics, CA-trust bootstrap and
+  rotation on a long-lived cluster) — join-token shape is settled but the
+  underlying trust/rotation mechanics are still needs-data, tracked in
+  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §5
+  and its companion
+  `ai/findings/mayor-xk0pa-ca-trust-bootstrap-and-rotation-2026-08-20.md`.
+- Distribution hosting (where the install script and release tarball are
+  actually served from) — deferred, tracked in
+  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §7.
 
-Not a bead yet. Fires when correctness + perf are both stable enough that a
-packaging story would not need to be re-litigated within weeks, and once
-Gate 2's component decisions are far enough along to know what's actually
-being packaged.
+**This session's MVP scope:** a local install script, exercised against a
+freshly provisioned, clean Ubuntu box (a disposable Lima VM stood up
+specifically for this purpose, not one of the existing conformance dev
+slots), that takes a zero-argument single-node install all the way to a
+working `kubectl get nodes`. Explicitly out of scope for this MVP: the real
+self-hosted distribution domain/origin, multi-node join, CA-trust/rotation
+tooling, metrics-server, and any agent-facing install tooling.
+
+**Scoping decision added this session:** the install script's own logic
+(CRI-O setup, systemd units, manifest bootstrap, defaulting behavior — i.e.
+what it *does* once it has a release tarball) is deliberately decoupled from
+how that tarball gets *built and hosted* (still open, see the distribution-
+hosting item above). For this MVP, the install script takes a locally
+pre-built tarball as a path/file argument rather than fetching one from a
+URL — this lets the install logic be fully tested end-to-end without the
+hosting question blocking anything.
+
+Not a bead yet for the install script itself. Fires when correctness + perf
+are both stable enough that a packaging story would not need to be
+re-litigated within weeks, and once Gate 2's component decisions are far
+enough along to know what's actually being packaged.
 
 ### Gate 7 — Migration story (future consideration, NOT STARTED)
 Operator observation (2026-08-14): a fresh-install story (Gate 6) answers
