@@ -77,9 +77,12 @@ watchdog_decide() {
     fi
   fi
 
-  # Convert RFC3339 to epoch seconds on macOS.
+  # Convert RFC3339 to epoch seconds. GNU date (Linux CI) understands -d
+  # directly; BSD date (macOS dev host) has no -d at all and errors out
+  # immediately with no stdout, so the fallback to -j -f is safe on both.
   local created_s
-  created_s=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${created}" "+%s" 2>/dev/null) || return 0
+  created_s=$(date -u -d "${created}" "+%s" 2>/dev/null) || \
+    created_s=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${created}" "+%s" 2>/dev/null) || return 0
   local age_s=$(( now - created_s ))
 
   local should_delete=0 reason=""
@@ -102,10 +105,14 @@ watchdog_decide() {
 # ---------------------------------------------------------------------------
 NOW=$(date -u +%s)
 
-# Helper: subtract seconds from NOW and format as RFC3339.
+# Helper: subtract seconds from NOW and format as RFC3339. GNU date accepts
+# "@<epoch>" directly; BSD date has no -d at all and errors with no stdout,
+# so falling back to -j -r is safe on both.
 ts_ago() {
   local secs="$1"
-  date -j -u -r $(( NOW - secs )) "+%Y-%m-%dT%H:%M:%SZ"
+  local epoch=$(( NOW - secs ))
+  date -u -d "@${epoch}" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+    date -j -u -r "${epoch}" "+%Y-%m-%dT%H:%M:%SZ"
 }
 
 # ---------------------------------------------------------------------------
