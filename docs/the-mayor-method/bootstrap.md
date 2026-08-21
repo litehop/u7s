@@ -160,9 +160,17 @@ fresh post-update-branch cycle already in flight) are worth waiting on.
 1. Enumerate open PRs and their check state:
    `gh pr list --state open --json number,title,mergeStateStatus,statusCheckRollup | jq`.
 2. **Review gate (mayor-oec8e), then merge any CLEAN PR.** For a
-   `worker/agent-*`-branch PR (NOT `operator/*` — see below), require a
-   review whose body starts with `## critical-reviewer findings` before
-   merging: `gh pr view <N> --json reviews`. If missing, do not merge this
+   `worker/agent-*`-branch PR (NOT `operator/*` — see below), take the
+   LATEST (highest `submittedAt`) review whose body starts with `##
+   critical-reviewer findings`: `gh pr view <N> --json reviews`. Parse that
+   review's `**Verdict**:` line — only `LGTM` or `LGTM-with-suggestions`
+   satisfies the gate; `needs-changes`/`needs-discussion` does NOT, even
+   though the header is present. Resolve by `submittedAt`, never by mere
+   header presence: an older superseded LGTM must not mask a newer
+   needs-changes, and a newer LGTM does supersede an older needs-changes.
+   This exact gap let PR #1336 sit CLEAN with an unaddressed needs-changes
+   verdict still on record on 2026-08-21, caught only by manual attention,
+   not by this gate. If no qualifying review exists, do not merge this
    PR THIS tick — step 0 above (same tick) should have just posted one if a
    queue entry existed for it, so the NEXT tick can merge. `operator/*`
    branches are exempt: they're authored directly by the mayor's own
