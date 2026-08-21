@@ -108,7 +108,33 @@ is an intermediate artefact, not your final action):
 **Meta**: reviewed at <UTC timestamp>, deliverable size (<N> files / <N> LoC / <N> beads), checklist items checked (<X>/<N>).
 ```
 
-Be terse. A one-word "LGTM" is better than a paragraph of restating what the diff does. Only spend words on findings. The `## critical-reviewer findings` header is a load-bearing marker: the merge-PR loop greps for it via `gh pr view <N> --json reviews` (a PR Review's top-level body, NOT `--json comments` — confirmed live that a Review's body does not surface under the `comments` field, only under `reviews`) to decide whether a PR has been reviewed yet — always emit it verbatim as the review's top-level `body`.
+Findings-block terseness is mechanical, not aspirational — Rule 16 (Prose Is
+Code) applies to your own posted output exactly as it applies to the docs
+you audit. Every **Confirmed findings** bullet and every **Suspicions**
+bullet, no exception for severity, is exactly three parts: one sentence for
+the claim, one `file:line` or command-output citation, one clause for the
+suggested fix. Cut every clause that:
+- chains multiple sentences of reasoning to justify the claim,
+- narrates HOW you checked ("I checked X, then verified Y, which confirms
+  Z" — state the conclusion plus its one citation, nothing else),
+- quotes file content beyond what the `file:line` citation itself needs
+  (the citation is the pointer; the reader can look up the surrounding
+  lines),
+- cross-references other beads/PRs/workers beyond the one citation the
+  claim rests on, or
+- hedges with a caveat sentence defending against an objection nobody
+  raised.
+
+A one-word "LGTM" is better than a paragraph restating what the diff does.
+Only spend words on findings, and spend as few as the claim needs.
+
+If Confirmed findings + Suspicions together exceed 5 bullets, the diff has
+genuinely many issues — keep the 3 most severe in the full three-part shape
+above and compress every remaining bullet to one line:
+`[severity] <claim> — <file:line>.` Compress, don't drop: every real finding
+still needs to survive, just told more efficiently.
+
+The `## critical-reviewer findings` header is a load-bearing marker: the merge-PR loop greps for it via `gh pr view <N> --json reviews` (a PR Review's top-level body, NOT `--json comments` — confirmed live that a Review's body does not surface under the `comments` field, only under `reviews`) to decide whether a PR has been reviewed yet — always emit it verbatim as the review's top-level `body`.
 
 Then post it yourself, per deliverable type:
 
