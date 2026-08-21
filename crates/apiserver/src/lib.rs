@@ -1682,11 +1682,28 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            // Read+write on the "escalating" pod/service subresources upstream's editRules()
+            // grants directly (never via the view aggregation, so "view" must NOT get these):
+            // Read covers a plain GET dial (e.g. `kubectl exec`/`attach`/`port-forward`), write
+            // covers the arbitrary HTTP methods `pods/proxy`+`services/proxy` forward to the
+            // target pod/service and the POST retry leg exec/attach fall back to.
+            { "apiGroups": [""], "resources": ["pods/attach","pods/exec","pods/portforward","pods/proxy","services/proxy"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             // Upstream grants `impersonate` on serviceaccounts to edit/admin so a namespace
             // editor can act as one of "their" ServiceAccounts (e.g. to debug a workload
             // identity) without cluster-admin. auth.rs's Impersonate-User handling branches on
             // SA-shaped usernames to authorize against this namespaced resource.
-            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] }
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
+            // kubectl drain / voluntary disruption POSTs an Eviction rather than deleting the
+            // Pod directly — without this a namespace editor could delete Pods but not evict
+            // them through PodDisruptionBudget-aware eviction.
+            { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
+            // replicationcontrollers/scale: write comes from upstream's editRules() directly;
+            // read comes from the view aggregation editRules() pulls in. The resolved "edit"/
+            // "admin" ClusterRole grants both, matching this codebase's convention (see
+            // leases/networkpolicies/poddisruptionbudgets above) of encoding the fully-resolved
+            // permission set rather than replicating which upstream helper contributed what.
+            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
         ]
     });
     put!(key, body, "admin", "ClusterRole");
@@ -1712,8 +1729,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
             { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
-            // See the identical rule in "admin" above for why this exists.
-            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] }
+            // See the identical block in "admin" above for why each of these exists.
+            { "apiGroups": [""], "resources": ["pods/attach","pods/exec","pods/portforward","pods/proxy","services/proxy"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["pods/eviction"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch","create","update","patch","delete","deletecollection"] }
         ]
     });
     put!(key, body, "edit", "ClusterRole");
@@ -1735,7 +1756,15 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods","services","endpoints","persistentvolumeclaims","configmaps","serviceaccounts","events","replicationcontrollers","namespaces","nodes","resourcequotas","limitranges"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch"] },
-            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch"] }
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch"] },
+            // NOTE: intentionally no coordination.k8s.io/leases rule here — upstream's
+            // viewRules() doesn't grant leases either; edit/admin get it directly.
+            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies","ingresses"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": ["get","list","watch"] },
+            // replicationcontrollers/scale is non-escalating and part of upstream's viewRules()
+            // directly (unlike pods/attach|exec|portforward|proxy and services/proxy, which
+            // are intentionally excluded from "view" — see the edit/admin ClusterRoles above).
+            { "apiGroups": [""], "resources": ["replicationcontrollers/scale"], "verbs": ["get","list","watch"] }
         ]
     });
     put!(key, body, "view", "ClusterRole");
@@ -5062,6 +5091,257 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test: a RoleBinding to the built-in "view" ClusterRole must authorize read
+    /// (get) access to NetworkPolicies, Ingresses and PodDisruptionBudgets. Upstream's default
+    /// "view" ClusterRole grants get/list/watch on networking.k8s.io/networkpolicies+ingresses
+    /// and policy/poddisruptionbudgets — this codebase's flat copy of "view" previously had no
+    /// rule at all for any of these three resources, so a namespace viewer got a plain RBAC 403
+    /// trying to even read a NetworkPolicy, Ingress, or PodDisruptionBudget they don't own, even
+    /// though "edit"/"admin" (full CRUD) already covered them. Also asserts "view" was NOT
+    /// accidentally granted coordination.k8s.io/leases: upstream grants leases directly to
+    /// edit/admin, not via the view aggregation, so a view-bound identity reading a Lease is
+    /// over-privileged, not a gap.
+    #[tokio::test]
+    async fn view_rolebinding_can_read_networkpolicies_ingresses_and_poddisruptionbudgets() {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let binding_key =
+            keys::group_object_key(GROUP, "rolebindings", Some("e2e-view-gaps"), "view-binding");
+        let binding_val = serde_json::json!({
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "view"
+            },
+            "subjects": [{
+                "kind": "ServiceAccount",
+                "name": "default",
+                "namespace": "e2e-view-gaps"
+            }]
+        });
+        use bytes::Bytes;
+        use u7s_store::Store;
+        store
+            .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+            .await
+            .expect("put rolebinding must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        for (api_group, resource) in [
+            ("networking.k8s.io", "networkpolicies"),
+            ("networking.k8s.io", "ingresses"),
+            ("policy", "poddisruptionbudgets"),
+        ] {
+            let get_req = rbac::AuthzRequest {
+                username: "system:serviceaccount:e2e-view-gaps:default",
+                groups: &groups,
+                verb: "get",
+                api_group,
+                resource,
+                subresource: "",
+                namespace: Some("e2e-view-gaps"),
+                name: None,
+                non_resource_url: None,
+            };
+            assert!(
+                state.rbac_index.is_allowed(&get_req),
+                "a RoleBinding to 'view' must authorize GET on {api_group}/{resource} — \
+                 upstream's default 'view' ClusterRole grants read on this resource group and \
+                 this codebase's copy had no rule for it at all, so a namespace viewer got an \
+                 RBAC 403 trying to read it"
+            );
+        }
+
+        let get_leases = rbac::AuthzRequest {
+            username: "system:serviceaccount:e2e-view-gaps:default",
+            groups: &groups,
+            verb: "get",
+            api_group: "coordination.k8s.io",
+            resource: "leases",
+            subresource: "",
+            namespace: Some("e2e-view-gaps"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&get_leases),
+            "a RoleBinding to 'view' must NOT authorize access to coordination.k8s.io/leases — \
+             upstream grants leases directly to edit/admin, not via the view aggregation, so \
+             granting it here would be an over-broad, not upstream-matching, fix"
+        );
+    }
+
+    /// Regression test: RoleBindings to the built-in "edit" AND "admin" ClusterRoles must
+    /// authorize the escalating pod/service subresources, SA token creation, SA impersonation,
+    /// pod eviction, and replicationcontrollers/scale that upstream's default "edit"/"admin"
+    /// ClusterRoles grant but this codebase's flat copies never split out any subresource for
+    /// at all — before this fix, a ServiceAccount bound only to "edit" got a plain RBAC 403
+    /// running `kubectl exec`/`attach`/`port-forward` against a Pod, requesting a token for one
+    /// of its own ServiceAccounts, impersonating another of its own ServiceAccounts, draining a
+    /// Pod via Eviction, or reading/writing an RC's scale, even though `kubectl create`/`delete`
+    /// on the underlying resources already worked. Also asserts "view" was NOT granted the
+    /// escalating subresources or serviceaccount impersonation: upstream's viewRules()
+    /// deliberately excludes them because "view" is documented to grant read access to
+    /// non-escalating resources only. (This test only exercises `rbac_index` directly; the
+    /// SA-shaped-Impersonate-User branching that makes the `impersonate`/`serviceaccounts` rule
+    /// non-inert lives in auth.rs's `AuthLayer` middleware and is covered there.)
+    #[tokio::test]
+    async fn edit_and_admin_rolebindings_can_use_escalating_pod_subresources_and_scale() {
+        const GROUP: &str = "rbac.authorization.k8s.io";
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        use bytes::Bytes;
+        use u7s_store::Store;
+        for cluster_role in ["edit", "admin", "view"] {
+            let namespace = format!("e2e-{cluster_role}-subres");
+            let binding_key = keys::group_object_key(
+                GROUP,
+                "rolebindings",
+                Some(namespace.as_str()),
+                &format!("{cluster_role}-binding"),
+            );
+            let binding_val = serde_json::json!({
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": cluster_role
+                },
+                "subjects": [{
+                    "kind": "ServiceAccount",
+                    "name": "default",
+                    "namespace": namespace
+                }]
+            });
+            store
+                .put(&binding_key, Bytes::from(binding_val.to_string()), None)
+                .await
+                .expect("put rolebinding must not fail");
+        }
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+        for cluster_role in ["edit", "admin"] {
+            let namespace = format!("e2e-{cluster_role}-subres");
+            let username = format!("system:serviceaccount:{namespace}:default");
+            for (verb, resource, subresource) in [
+                ("get", "pods", "exec"),
+                ("get", "pods", "attach"),
+                ("get", "pods", "portforward"),
+                ("create", "pods", "proxy"),
+                ("create", "services", "proxy"),
+                ("create", "serviceaccounts", "token"),
+                ("impersonate", "serviceaccounts", ""),
+                ("create", "pods", "eviction"),
+                ("get", "replicationcontrollers", "scale"),
+                ("update", "replicationcontrollers", "scale"),
+            ] {
+                let req = rbac::AuthzRequest {
+                    username: &username,
+                    groups: &groups,
+                    verb,
+                    api_group: "",
+                    resource,
+                    subresource,
+                    namespace: Some(namespace.as_str()),
+                    name: None,
+                    non_resource_url: None,
+                };
+                assert!(
+                    state.rbac_index.is_allowed(&req),
+                    "a RoleBinding to '{cluster_role}' must authorize {verb} on \
+                     {resource}/{subresource} — upstream's default '{cluster_role}' ClusterRole \
+                     grants this and this codebase's copy previously had no rule for any \
+                     subresource at all, so a namespace {cluster_role} user got an RBAC 403"
+                );
+            }
+        }
+
+        // "view" must NOT gain the escalating subresources — upstream's viewRules()
+        // deliberately omits them ("view" is read-only on non-escalating resources).
+        let view_username = "system:serviceaccount:e2e-view-subres:default";
+        for (verb, resource, subresource) in [
+            ("get", "pods", "exec"),
+            ("get", "pods", "attach"),
+            ("create", "serviceaccounts", "token"),
+            ("impersonate", "serviceaccounts", ""),
+            ("create", "pods", "eviction"),
+        ] {
+            let req = rbac::AuthzRequest {
+                username: view_username,
+                groups: &groups,
+                verb,
+                api_group: "",
+                resource,
+                subresource,
+                namespace: Some("e2e-view-subres"),
+                name: None,
+                non_resource_url: None,
+            };
+            assert!(
+                !state.rbac_index.is_allowed(&req),
+                "a RoleBinding to 'view' must NOT authorize {verb} on {resource}/{subresource} \
+                 — upstream's viewRules() deliberately excludes escalating subresources and \
+                 impersonation, so granting this here would be an over-broad, not \
+                 upstream-matching, fix"
+            );
+        }
+
+        // replicationcontrollers/scale IS non-escalating and part of upstream's viewRules()
+        // directly, so "view" alone must be able to read (but not write) it.
+        let get_scale = rbac::AuthzRequest {
+            username: view_username,
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "replicationcontrollers",
+            subresource: "scale",
+            namespace: Some("e2e-view-subres"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&get_scale),
+            "a RoleBinding to 'view' must authorize GET on replicationcontrollers/scale — \
+             upstream's viewRules() grants this non-escalating subresource directly"
+        );
+        let update_scale = rbac::AuthzRequest {
+            username: view_username,
+            groups: &groups,
+            verb: "update",
+            api_group: "",
+            resource: "replicationcontrollers",
+            subresource: "scale",
+            namespace: Some("e2e-view-subres"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&update_scale),
+            "a RoleBinding to 'view' must NOT authorize UPDATE on replicationcontrollers/scale \
+             — 'view' is read-only, upstream's editRules() (not viewRules()) grants the write"
+        );
     }
 
     /// Regression test: the KCM resourcequota controller must be able

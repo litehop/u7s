@@ -948,14 +948,22 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
 }
 
 /// Splits a `system:serviceaccount:<namespace>:<name>` username into its namespace and
-/// name components, mirroring apf.rs's `service_account_matches_namespace` prefix-stripping
-/// logic. Returns `None` for usernames that aren't ServiceAccount-shaped, so upstream's
-/// `Impersonate-User` handling can fall back to authorizing against the `users` resource
-/// (matching real kube-apiserver's `serviceaccount.SplitUsername` branch in the
-/// impersonation filter).
+/// name components. Reuses apf.rs's `service_account_matches_namespace` prefix constant and
+/// stripping approach, but (unlike that function, which only tests membership in an already-
+/// known namespace) this must also extract an unvalidated `name`, so it additionally requires
+/// exactly two `:`-separated segments after the prefix — matching upstream's
+/// `serviceaccount.SplitUsername`, which rejects anything but a 2-part split (e.g. a malformed
+/// `...:<ns>:<name>:<extra>` username falls through to the `users` resource path below rather
+/// than being treated as SA-shaped with a bogus name).
 fn split_service_account_username(username: &str) -> Option<(&str, &str)> {
     let rest = username.strip_prefix("system:serviceaccount:")?;
-    rest.split_once(':')
+    let mut parts = rest.split(':');
+    let namespace = parts.next().filter(|s| !s.is_empty())?;
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((namespace, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -3644,6 +3652,32 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "caller's RoleBinding only grants impersonate on serviceaccounts in ns-a — \
              impersonating target-sa in ns-b must be denied"
+        );
+    }
+
+    /// A malformed `Impersonate-User` value with an extra `:`-separated segment beyond
+    /// `<ns>:<name>` must NOT be treated as ServiceAccount-shaped — it must fall through to
+    /// the `users` resource path, matching upstream's `serviceaccount.SplitUsername` (which
+    /// requires exactly two segments). A naive first-colon split would instead extract a
+    /// name containing the extra segment, silently authorizing a value real kube-apiserver
+    /// would authorize as a `users` impersonation target instead.
+    #[test]
+    fn split_service_account_username_rejects_more_than_two_segments() {
+        assert_eq!(
+            split_service_account_username("system:serviceaccount:ns:name"),
+            Some(("ns", "name")),
+            "a well-formed SA username must still split into (namespace, name)"
+        );
+        assert_eq!(
+            split_service_account_username("system:serviceaccount:ns:name:extra"),
+            None,
+            "an extra ':'-separated segment must reject the SA-shaped parse entirely, not \
+             silently fold it into the name"
+        );
+        assert_eq!(
+            split_service_account_username("alice"),
+            None,
+            "a plain username with no SA prefix must not be SA-shaped"
         );
     }
 
