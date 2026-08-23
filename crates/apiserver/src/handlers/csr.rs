@@ -93,6 +93,40 @@ pub(crate) fn validate_csr_spec(
     Ok(())
 }
 
+/// Stamp spec.username/uid/groups/extra from the authenticated caller's UserInfo,
+/// discarding any client-supplied values for these fields.
+///
+/// Security-critical: kube-controller-manager's builtin csrapproving controller
+/// authorizes auto-approval by building a SubjectAccessReview directly from these
+/// spec fields (pkg/controller/certificates/approver/sarapprove.go's `authorize()`).
+/// If a client could set them, it could submit a CSR claiming to be `system:node:foo`
+/// in group `system:nodes` while authenticated as someone else entirely — KCM would
+/// then approve and sign a client certificate for an identity the caller never proved
+/// it holds. Discarding client-supplied values here mirrors the existing status-strip
+/// already done on create — a client must not be able to set fields that are the
+/// server's exclusive responsibility to assert.
+fn stamp_csr_identity(body: &mut serde_json::Value, user: &UserInfo) {
+    if let Some(spec) = body.get_mut("spec").and_then(|s| s.as_object_mut()) {
+        spec.insert(
+            "username".to_string(),
+            serde_json::Value::String(user.username.clone()),
+        );
+        spec.insert(
+            "uid".to_string(),
+            serde_json::Value::String(user.uid.clone()),
+        );
+        spec.insert(
+            "groups".to_string(),
+            serde_json::to_value(&user.groups).expect("Vec<String> always serializes"),
+        );
+        spec.insert(
+            "extra".to_string(),
+            serde_json::to_value(&user.extra)
+                .expect("HashMap<String, Vec<String>> always serializes"),
+        );
+    }
+}
+
 /// GET /apis/certificates.k8s.io/v1/certificatesigningrequests
 ///
 /// List all CertificateSigningRequests. The route is a hardcoded literal (no
@@ -241,6 +275,7 @@ pub async fn create_csr<S: Store>(
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
+    stamp_csr_identity(&mut obj.body, &user);
 
     let admission_ctx = AdmissionContext {
         group: GROUP,
@@ -782,6 +817,126 @@ mod tests {
              clients must not pre-set status; that is the signer's exclusive right. \
              Got: {:?}",
             v.get("status")
+        );
+    }
+
+    /// stamp_csr_identity overwrites a client-supplied spec.username/uid/groups/extra
+    /// with the authenticated caller's real identity.
+    ///
+    /// KCM's builtin csrapproving controller authorizes auto-approval via a
+    /// SubjectAccessReview built directly from these spec fields. If a client could set
+    /// them, it could submit a CSR claiming to be `system:node:victim` in group
+    /// `system:nodes` while authenticated as an unrelated, unprivileged identity — KCM
+    /// would approve and sign a client certificate for an identity the caller never
+    /// proved it holds.
+    #[test]
+    fn stamp_csr_identity_overwrites_client_supplied_spoof() {
+        let mut body = serde_json::json!({
+            "spec": {
+                "request": "irrelevant-for-this-test",
+                "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                "username": "system:node:victim",
+                "uid": "attacker-chosen-uid",
+                "groups": ["system:masters"],
+                "extra": {"attacker-key": ["attacker-value"]}
+            }
+        });
+
+        let real_caller = crate::auth::UserInfo {
+            username: "system:bootstrap:abcdef".into(),
+            uid: "real-uid".into(),
+            groups: vec!["system:bootstrappers".into()],
+            extra: [("real-key".to_string(), vec!["real-value".to_string()])].into(),
+        };
+        stamp_csr_identity(&mut body, &real_caller);
+
+        assert_eq!(
+            body["spec"]["username"], "system:bootstrap:abcdef",
+            "client-supplied spec.username must be discarded — a caller must never be \
+             able to request approval for an identity it did not authenticate as"
+        );
+        assert_eq!(
+            body["spec"]["uid"], "real-uid",
+            "client-supplied spec.uid must be discarded, matching the real caller's uid"
+        );
+        assert_eq!(
+            body["spec"]["groups"],
+            serde_json::json!(["system:bootstrappers"]),
+            "client-supplied spec.groups must be discarded — a caller must not be able \
+             to forge membership in a privileged group like system:masters"
+        );
+        assert_eq!(
+            body["spec"]["extra"],
+            serde_json::json!({"real-key": ["real-value"]}),
+            "client-supplied spec.extra must be discarded"
+        );
+    }
+
+    /// create_csr end-to-end: a client-supplied spec.username/uid/groups/extra never
+    /// reaches the stored object — the authenticated caller's identity always wins.
+    ///
+    /// This is the regression test for the CSR identity-spoofing security fix: without
+    /// the stamp, an unprivileged caller could submit a CSR with spec.username set to
+    /// a node identity and spec.groups set to system:nodes, and KCM's csrapproving
+    /// controller (which authorizes purely from these stored spec fields) would approve
+    /// and sign a client certificate for that forged identity.
+    #[tokio::test]
+    async fn create_csr_stamps_authenticated_identity_over_client_supplied_spoof() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let b64 = valid_csr_b64();
+
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "spoofed-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                "username": "system:node:victim",
+                "uid": "attacker-chosen-uid",
+                "groups": ["system:nodes", "system:masters"],
+                "extra": {"attacker-key": ["attacker-value"]}
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "system:bootstrap:abcdef".into(),
+                uid: String::new(),
+                groups: vec!["system:bootstrappers".into()],
+                extra: Default::default(),
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|_| panic!("create must succeed"));
+
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/spoofed-csr";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["spec"]["username"], "system:bootstrap:abcdef",
+            "stored spec.username must be the authenticated caller, not the client-supplied \
+             value — a mismatch here means KCM's SAR-based auto-approval would authorize \
+             the wrong identity"
+        );
+        assert_eq!(
+            v["spec"]["groups"],
+            serde_json::json!(["system:bootstrappers"]),
+            "stored spec.groups must be the authenticated caller's real groups, not the \
+             client-supplied system:nodes/system:masters spoof"
         );
     }
 

@@ -1187,7 +1187,14 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             // SubjectAccessReview and TokenReview. Without these the kubelet denies all
             // proxy requests (logs, exec, attach) with "Authorization error".
             { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
-            { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] }
+            { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
+            // Used to create a certificatesigningrequest for a node-specific client certificate,
+            // and watch for it to be signed. This allows the kubelet to rotate its own
+            // certificate. Matches upstream bootstrappolicy.go's NodeRules() exactly — without
+            // this, a joined node has no permission to even submit its own self-renewal CSR,
+            // regardless of whether the selfnodeclient ClusterRole/binding (which only governs
+            // KCM's SAR-based auto-approval) exists.
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests"], "verbs": ["create","get","list","watch"] }
         ]
     });
     put!(key, body, "system:node", "ClusterRole");
@@ -1596,6 +1603,125 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         ]
     });
     put!(key, body, "system:node-bootstrapper", "ClusterRole");
+
+    // ClusterRoleBinding: system:node-bootstrapper → system:bootstrappers group.
+    // Upstream binds this via kubeadm's `kubeadm:kubelet-bootstrap` ClusterRoleBinding —
+    // this ClusterRole existed in u7s already but was never bound to anything, so no
+    // bootstrap identity could ever submit a join CSR. system:bootstrappers is the group
+    // a bootstrap-token-authenticated caller belongs to (mirroring upstream's
+    // node-bootstrap-token-auth flow).
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:node-bootstrapper",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:node-bootstrapper", "uid": "00000000-0000-0000-0000-00000000007b", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:bootstrappers" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node-bootstrapper" }
+    });
+    put!(key, body, "system:node-bootstrapper", "ClusterRoleBinding");
+
+    // -----------------------------------------------------------------------
+    // ClusterRole: system:certificates.k8s.io:certificatesigningrequests:nodeclient
+    // and ...:selfnodeclient — these are not real subresources of the CSR object;
+    // KCM's builtin csrapproving controller (pkg/controller/certificates/approver/
+    // sarapprove.go) checks auto-approval eligibility by issuing a SubjectAccessReview
+    // against exactly these resource/subresource pairs, built from the CSR's (now
+    // server-stamped, see stamp_csr_identity in handlers/csr.rs) spec.username/groups.
+    // nodeclient authorizes a brand-new node join CSR; selfnodeclient authorizes an
+    // already-joined node renewing its own client cert. Pure seed data — u7s's RBAC
+    // engine already supports arbitrary "resource/subresource" strings generically.
+    // -----------------------------------------------------------------------
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterroles",
+        None,
+        "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:certificates.k8s.io:certificatesigningrequests:nodeclient", "uid": "00000000-0000-0000-0000-00000000007c", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests/nodeclient"], "verbs": ["create"] }
+        ]
+    });
+    put!(
+        key,
+        body,
+        "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+        "ClusterRole"
+    );
+
+    // ClusterRoleBinding: nodeclient ClusterRole → system:bootstrappers group.
+    // Matches upstream's `kubeadm:node-autoapprove-bootstrap` ClusterRoleBinding.
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:certificates.k8s.io:certificatesigningrequests:nodeclient", "uid": "00000000-0000-0000-0000-00000000007d", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:bootstrappers" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:certificates.k8s.io:certificatesigningrequests:nodeclient" }
+    });
+    put!(
+        key,
+        body,
+        "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+        "ClusterRoleBinding"
+    );
+
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterroles",
+        None,
+        "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient", "uid": "00000000-0000-0000-0000-00000000007e", "creationTimestamp": TS },
+        "rules": [
+            { "apiGroups": ["certificates.k8s.io"], "resources": ["certificatesigningrequests/selfnodeclient"], "verbs": ["create"] }
+        ]
+    });
+    put!(
+        key,
+        body,
+        "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+        "ClusterRole"
+    );
+
+    // ClusterRoleBinding: selfnodeclient ClusterRole → system:nodes group (already bound
+    // to system:node above) — an already-joined node may renew its own client cert.
+    // Matches upstream's `kubeadm:node-autoapprove-certificate-rotation` ClusterRoleBinding.
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient", "uid": "00000000-0000-0000-0000-00000000007f", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient" }
+    });
+    put!(
+        key,
+        body,
+        "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+        "ClusterRoleBinding"
+    );
 
     // -----------------------------------------------------------------------
     // ClusterRole: system:heapster — legacy metrics aggregator.
@@ -4900,6 +5026,29 @@ mod tests {
              kubelet needs this to project SA tokens into pod volumes"
         );
 
+        // A kubelet in system:nodes must be able to create a plain (no-subresource) CSR
+        // to rotate its own client certificate. Matches upstream bootstrappolicy.go's
+        // NodeRules() exactly. Without this rule, a joined node has no permission to even
+        // submit its own self-renewal CSR — the selfnodeclient ClusterRole/binding only
+        // governs KCM's SAR-based auto-approval decision, not the initial create call,
+        // so self-renewal is fully broken without both being present together.
+        let csr_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&csr_create),
+            "system:nodes must be allowed to create certificatesigningrequests — \
+             a kubelet cannot submit its own certificate-rotation CSR without this rule"
+        );
+
         // A user NOT in system:nodes must be denied — the binding is group-specific.
         let other_groups = vec!["system:authenticated".to_owned()];
         let pod_read_other = rbac::AuthzRequest {
@@ -4916,6 +5065,129 @@ mod tests {
         assert!(
             !state.rbac_index.is_allowed(&pod_read_other),
             "users not in system:nodes must not inherit kubelet permissions"
+        );
+    }
+
+    #[tokio::test]
+    async fn csr_nodeclient_and_selfnodeclient_rbac_authorized_after_seed_and_init() {
+        // Verifies the full chain for the join/rotation RBAC: seed_rbac writes the
+        // nodeclient/selfnodeclient ClusterRoles + bindings and binds the previously
+        // unbound system:node-bootstrapper ClusterRole, AppState::init() loads them
+        // into the RBAC index, and is_allowed matches what KCM's builtin csrapproving
+        // controller actually checks — a SubjectAccessReview for
+        // create on certificatesigningrequests/nodeclient or /selfnodeclient, built
+        // straight from the CSR's (server-stamped) spec.username/groups. If this authz
+        // chain is broken, KCM's real controller can never auto-approve a join or
+        // self-renewal CSR, even though the ClusterRole/Binding objects exist.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        // A bootstrap-token-authenticated joiner (group system:bootstrappers) must be
+        // authorized for the SAR KCM issues to auto-approve a brand-new node-join CSR.
+        let bootstrapper_groups = vec!["system:bootstrappers".to_owned()];
+        let nodeclient_sar = rbac::AuthzRequest {
+            username: "system:bootstrap:abcdef",
+            groups: &bootstrapper_groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "nodeclient",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&nodeclient_sar),
+            "system:bootstrappers must be allowed to create certificatesigningrequests/nodeclient \
+             — without this, KCM's csrapproving controller can never auto-approve a node-join CSR"
+        );
+
+        // The same bootstrapper must also be able to submit the CSR object itself, via the
+        // now-bound system:node-bootstrapper ClusterRole (previously seeded but unbound).
+        let csr_create = rbac::AuthzRequest {
+            username: "system:bootstrap:abcdef",
+            groups: &bootstrapper_groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&csr_create),
+            "system:bootstrappers must be allowed to create certificatesigningrequests — \
+             system:node-bootstrapper ClusterRole existed but was never bound to any group \
+             before this fix, so no bootstrap identity could ever submit a join CSR"
+        );
+
+        // An already-joined node (group system:nodes) must be authorized for the SAR KCM
+        // issues to auto-approve its own client-cert renewal CSR.
+        let node_groups = vec!["system:nodes".to_owned()];
+        let selfnodeclient_sar = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &node_groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "selfnodeclient",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&selfnodeclient_sar),
+            "system:nodes must be allowed to create certificatesigningrequests/selfnodeclient \
+             — without this, KCM's csrapproving controller can never auto-approve a node's own \
+             certificate-rotation CSR"
+        );
+
+        // A node must NOT be authorized for nodeclient (that's the bootstrap-only join grant)
+        // and a bootstrapper must NOT be authorized for selfnodeclient — the two scopes are
+        // intentionally not interchangeable, matching upstream's separate ClusterRoleBindings.
+        let node_tries_nodeclient = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &node_groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "nodeclient",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&node_tries_nodeclient),
+            "system:nodes must not be granted the nodeclient (join) scope — an already-joined \
+             node renewing its own cert is a distinct, narrower authorization than a fresh join"
+        );
+        let bootstrapper_tries_selfnodeclient = rbac::AuthzRequest {
+            username: "system:bootstrap:abcdef",
+            groups: &bootstrapper_groups,
+            verb: "create",
+            api_group: "certificates.k8s.io",
+            resource: "certificatesigningrequests",
+            subresource: "selfnodeclient",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            !state
+                .rbac_index
+                .is_allowed(&bootstrapper_tries_selfnodeclient),
+            "system:bootstrappers must not be granted the selfnodeclient (self-renewal) scope — \
+             a bootstrap identity has no existing node cert to renew"
         );
     }
 
