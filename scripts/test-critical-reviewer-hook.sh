@@ -50,14 +50,14 @@ clear_sandbox() {
 # Case 1: PR opened → queued as "pr" with the URL as ref.
 clear_sandbox
 INPUT_PR=$(jq -n \
-  --arg msg 'Done. Opened PR https://github.com/valerauko/u7s/pull/9999 for review.' \
+  --arg msg 'Done. Opened PR https://github.com/litehop/u7s/pull/9999 for review.' \
   '{agent_id:"agent-test1", agent_type:"worker", cwd:"/tmp/wt", session_id:"sess1", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
 run_hook "$INPUT_PR"
 if [ "$(count_queue_files)" = "1" ]; then
   QFILE=$(find "$SANDBOX/.claude/review-queue" -maxdepth 1 -name '*.md' | head -1)
   TYPE=$(grep -m1 '^deliverable_type:' "$QFILE" | awk '{print $2}')
   REF=$(grep -m1 '^deliverable_ref:' "$QFILE" | cut -d' ' -f2-)
-  if [ "$TYPE" = "pr" ] && [ "$REF" = "https://github.com/valerauko/u7s/pull/9999" ]; then
+  if [ "$TYPE" = "pr" ] && [ "$REF" = "https://github.com/litehop/u7s/pull/9999" ]; then
     pass "PR URL → queued with correct type + ref"
   else
     fail "PR URL detection: type=$TYPE ref=$REF (expected pr / …/pull/9999)"
@@ -159,7 +159,7 @@ fi
 # completed, unboundedly, if a future drain invoked critical-reviewer again).
 clear_sandbox
 INPUT_SELF_ECHO=$(jq -n \
-  --arg msg 'I posted the critical-reviewer findings comment on PR #9999: https://github.com/valerauko/u7s/pull/9999' \
+  --arg msg 'I posted the critical-reviewer findings comment on PR #9999: https://github.com/litehop/u7s/pull/9999' \
   '{agent_id:"agent-test7", agent_type:"critical-reviewer", cwd:"/tmp/wt", session_id:"sess7", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
 run_hook "$INPUT_SELF_ECHO"
 if [ "$(count_queue_files)" = "0" ]; then

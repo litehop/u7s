@@ -55,10 +55,8 @@ fi
 DELIVERABLE_TYPE=""
 DELIVERABLE_REF=""
 
-# 1. PR opened. Repo slug is github.com/valerauko/u7s (verified via
-#    `git remote -v` 2026-08-18; not github.com/rootless-containers/usernetes
-#    — that is an unrelated project).
-PR_URL=$(printf '%s' "$MSG" | grep -oE 'https?://github\.com/valerauko/u7s/pull/[0-9]+' | head -1 || true)
+# 1. PR opened. Repo slug is github.com/litehop/u7s
+PR_URL=$(printf '%s' "$MSG" | grep -oE 'https?://github\.com/litehop/u7s/pull/[0-9]+' | head -1 || true)
 if [ -n "$PR_URL" ]; then
   DELIVERABLE_TYPE="pr"
   DELIVERABLE_REF="$PR_URL"
