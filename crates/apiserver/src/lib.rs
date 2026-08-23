@@ -8005,19 +8005,29 @@ mod tests {
 
         let user = auth::UserInfo {
             username: "test-user".into(),
-            uid: "".into(),
-            groups: vec![],
+            uid: "real-uid".into(),
+            groups: vec!["real-group".into()],
             extra: Default::default(),
         };
 
         // --- Step 1: POST — create the CSR ---
+        // spec.username/uid/groups/extra are deliberately spoofed here — KCM's real
+        // csrapproving controller authorizes auto-approval directly from these stored
+        // fields (see sarapprove.go's authorize()), so a client that could set them could
+        // forge the identity being approved. The POST handler must discard every one of
+        // these values and stamp the authenticated caller's real identity instead
+        // (asserted right after the store read below).
         let create_body = serde_json::json!({
             "apiVersion": "certificates.k8s.io/v1",
             "kind": "CertificateSigningRequest",
             "metadata": {"name": "lifecycle-csr"},
             "spec": {
                 "request": csr_b64,
-                "signerName": "kubernetes.io/kube-apiserver-client"
+                "signerName": "kubernetes.io/kube-apiserver-client",
+                "username": "system:node:should-not-be-trusted",
+                "uid": "attacker-chosen-uid",
+                "groups": ["system:masters"],
+                "extra": {"attacker-key": ["attacker-value"]}
             }
         });
         let create_result = handlers::csr::create_csr(
@@ -8055,6 +8065,37 @@ mod tests {
             stored_v["status"].is_null() || stored_v.get("status").is_none(),
             "POST must not store a status field — spec is immutable, status starts empty"
         );
+
+        // This is the bead's core security-fix assertion: the client-supplied spoof
+        // above must never reach storage. If stamp_csr_identity regresses (removed, or
+        // reordered so a mutating webhook could undo it), these fields would show the
+        // attacker-supplied values instead, and this test would fail.
+        assert_eq!(
+            stored_v["spec"]["username"], "test-user",
+            "POST must stamp spec.username from the authenticated caller, discarding any \
+             client-supplied value — KCM's csrapproving controller authorizes \
+             auto-approval directly from this stored field, so a client-controlled value \
+             would let a caller forge the identity being approved"
+        );
+        assert_eq!(
+            stored_v["spec"]["uid"], "real-uid",
+            "POST must stamp spec.uid from the authenticated caller, discarding the \
+             client-supplied uid spoof"
+        );
+        assert_eq!(
+            stored_v["spec"]["groups"],
+            serde_json::json!(["real-group"]),
+            "POST must stamp spec.groups from the authenticated caller, discarding the \
+             client-supplied system:masters spoof — otherwise a caller could forge \
+             membership in a privileged group for KCM's SAR-based auto-approval"
+        );
+        assert_eq!(
+            stored_v["spec"]["extra"],
+            serde_json::json!({}),
+            "POST must stamp spec.extra from the authenticated caller, discarding the \
+             client-supplied extra spoof"
+        );
+
         let rv1 = stored_v["metadata"]["resourceVersion"]
             .as_str()
             .expect("resourceVersion must be set after POST")
