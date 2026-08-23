@@ -1,39 +1,36 @@
 #!/usr/bin/env bash
-# Builds one arch's u7s release tarball: cargo-builds u7s-apiserver +
-# u7s-scheduler for the given Rust target triple, downloads the matching
-# kubelet + kube-controller-manager from dl.k8s.io (checksum-verified), and
-# packages all four into the flat layout scripts/install.sh expects (it finds
-# each binary by name anywhere in the extracted tree, so internal layout is
-# not load-bearing -- docs/decisions/upstream-component-shipping-shape.md).
+# Builds the u7s release tarball for linux/x86_64: cargo-builds
+# u7s-apiserver + u7s-scheduler for x86_64-unknown-linux-gnu, downloads the
+# matching kubelet + kube-controller-manager from dl.k8s.io (checksum-
+# verified), and packages all four into the flat layout scripts/install.sh
+# expects (it finds each binary by name anywhere in the extracted tree, so
+# internal layout is not load-bearing --
+# docs/decisions/upstream-component-shipping-shape.md).
 #
-# Called once per arch by .github/workflows/release-tarball.yaml; also
-# runnable locally for manual reproduction, e.g.:
-#   scripts/build-release-tarball.sh v0.1.0 x86_64-unknown-linux-gnu
+# x86_64 only for now (operator direction, YAGNI-first) -- aarch64 is
+# deliberately deferred until there's real demand, not built speculatively.
 #
-# Requires: cargo/rustup with the target installed, curl, sha256sum, tar.
+# Called by .github/workflows/release-tarball.yaml; also runnable locally
+# for manual reproduction, e.g.:
+#   scripts/build-release-tarball.sh v0.1.0
+#
+# Requires: cargo/rustup (with the x86_64-unknown-linux-gnu target
+# installable), curl, sha256sum, tar.
 set -euo pipefail
 
 # Same Kubernetes version pinned elsewhere in this project (e2e-focus.yaml's
 # matrix, scripts/conformance/04-start-kcm.sh, lima/kubelet.yaml's CRI-O repo).
 K8S_VERSION="1.36.2"
+TARGET="x86_64-unknown-linux-gnu"
+K8S_ARCH="amd64"
 
-if [ $# -ne 2 ]; then
-  echo "Usage: $0 <version> <rust-target-triple>" >&2
-  echo "  e.g.: $0 v0.1.0 x86_64-unknown-linux-gnu" >&2
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <version>" >&2
+  echo "  e.g.: $0 v0.1.0" >&2
   exit 1
 fi
 
 VERSION="$1"
-TARGET="$2"
-
-case "$TARGET" in
-  x86_64-unknown-linux-gnu) K8S_ARCH="amd64" ;;
-  aarch64-unknown-linux-gnu) K8S_ARCH="arm64" ;;
-  *)
-    echo "error: unsupported target: $TARGET (expected x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu)" >&2
-    exit 1
-    ;;
-esac
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/dist"

@@ -7,6 +7,10 @@ name: Release tarball
 # ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md §7) --
 # it exists so the build pipeline itself can be validated end to end while
 # that separate question stays open.
+#
+# x86_64 only for now (operator direction, YAGNI-first) -- aarch64 is
+# deliberately deferred until there's real demand, not designed around
+# speculatively.
 on:
   push:
     tags:
@@ -25,52 +29,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "v=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "v=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build tarball
-        run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}" "${{ matrix.target }}"
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: u7s-tarball-${{ matrix.target }}
-          path: dist/*.tar.gz
-          retention-days: 7
-          if-no-files-found: error
-
-  publish:
-    needs: build
+  build-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -90,11 +51,11 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: dist
-          pattern: u7s-tarball-*
-          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build tarball
+        run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}"
 
       - name: Create or update GitHub Release
         env:
@@ -115,6 +76,6 @@ jobs:
             [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
             gh release create "$VERSION" dist/*.tar.gz \
               --title "$VERSION" \
-              --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64 and linux/arm64. Interim GitHub Release hosting -- see ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md §7 for the still-open real distribution-hosting question." \
+              --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64. Interim GitHub Release hosting -- see ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md §7 for the still-open real distribution-hosting question." \
               $prerelease_flag
           fi
