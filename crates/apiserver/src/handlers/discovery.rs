@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -7,6 +7,7 @@ use axum::{
 use std::sync::Arc;
 use u7s_store::{ListOptions, Store};
 
+use crate::auth::{AuthnResult, PeerCertificate, UserInfo};
 use crate::handlers::crd::CustomResourceDefinition;
 use crate::state::{
     AppState, CachedDiscoveryGroup, CachedDiscoveryResource, CachedDiscoverySubresource,
@@ -69,8 +70,48 @@ fn aggregated_content_type(version: &str) -> String {
     format!("application/json;g=apidiscovery.k8s.io;v={version};as=APIGroupDiscoveryList")
 }
 
+/// Resolve the caller's identity for the auth-EXEMPT discovery routes (`/api`, `/apis`,
+/// `/discovery/v2` — see `auth::is_exempt`'s doc), which `AuthLayer` never runs `authenticate`
+/// for at all. These routes still need a real identity to assert via front-proxy headers when a
+/// registered `APIService`'s own discovery document has to be fetched
+/// (`aggregation::discovery_resources_for_apiservice`), so this calls the exact same
+/// `auth::authenticate` `AuthLayer` itself would have called, from the same inputs
+/// (`Authorization` header, TLS peer cert). A bad/unrecognized bearer token falls back to
+/// anonymous rather than failing the whole discovery request — these routes never 401 a caller
+/// at the u7s layer (that's the entire point of the exemption), so a malformed credential here
+/// should just mean "can't assert an identity to the backend", not break discovery of every
+/// other group.
+async fn resolve_caller_identity<S: Store>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+    peer_cert: Option<&PeerCertificate>,
+) -> UserInfo {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    match crate::auth::authenticate(
+        auth_header,
+        &state.token_map,
+        state.sa_decoding_key.as_deref(),
+        peer_cert,
+        state.store.as_ref(),
+        state.sa_sig_cache.as_ref(),
+    )
+    .await
+    {
+        AuthnResult::Identified(user) => user,
+        AuthnResult::BadToken => UserInfo {
+            username: "system:anonymous".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:unauthenticated".to_owned()],
+            extra: Default::default(),
+        },
+    }
+}
+
 pub async fn api_versions<S: Store>(
     State(state): State<AppState<S>>,
+    peer_cert: Option<Extension<PeerCertificate>>,
     headers: HeaderMap,
 ) -> Response {
     let accept = headers
@@ -82,8 +123,9 @@ pub async fn api_versions<S: Store>(
         // /api returns only the core group (name="") in the aggregated discovery list.
         // client-go's GroupsAndMaybeResources() handles /api and /apis separately;
         // include_core=true here, and /apis uses include_core=false to avoid duplicates.
-        let authorization = headers.get(axum::http::header::AUTHORIZATION);
-        let body = build_aggregated_discovery(&state, version, true, authorization, "/api").await;
+        let peer_cert = peer_cert.map(|Extension(c)| c);
+        let user = resolve_caller_identity(&state, &headers, peer_cert.as_ref()).await;
+        let body = build_aggregated_discovery(&state, version, true, &user, "/api").await;
         let core_only = body
             .items
             .into_iter()
@@ -139,6 +181,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
 
 pub async fn api_group_list<S: Store>(
     State(state): State<AppState<S>>,
+    peer_cert: Option<Extension<PeerCertificate>>,
     headers: HeaderMap,
 ) -> Response {
     let accept = headers
@@ -150,8 +193,9 @@ pub async fn api_group_list<S: Store>(
         // /apis returns only non-core groups (include_core=false).
         // The core group is returned by /api; client-go merges both separately.
         // Including core here would cause duplicate kind registrations (Namespace, Pod, etc.).
-        let authorization = headers.get(axum::http::header::AUTHORIZATION);
-        let body = build_aggregated_discovery(&state, version, false, authorization, "/apis").await;
+        let peer_cert = peer_cert.map(|Extension(c)| c);
+        let user = resolve_caller_identity(&state, &headers, peer_cert.as_ref()).await;
+        let body = build_aggregated_discovery(&state, version, false, &user, "/apis").await;
         return (
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -301,14 +345,16 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 /// with aggregated Accept. client-go's GroupsAndMaybeResources() merges /api (core) and /apis
 /// (non-core) separately; including core in /apis causes duplicate Namespace/Pod registrations.
 ///
-/// `authorization` is the caller's own bearer token (forwarded to APIService backends for
-/// their live discovery fetch — see `discovery_resources_for_apiservice`'s doc for why an
-/// aggregated group would otherwise silently show zero resources).
+/// `user` is the caller's ALREADY-resolved identity (see `resolve_caller_identity`'s doc for why
+/// the discovery routes need to resolve it themselves), asserted via front-proxy headers to
+/// APIService backends for their live discovery fetch — see
+/// `discovery_resources_for_apiservice`'s doc for why an aggregated group would otherwise
+/// silently show zero resources.
 ///
 /// `route` identifies which caller fired this build (`/api`, `/apis`, or `/discovery/v2`) —
 /// used only to label `u7s_discovery_build_total`, never to change behavior.
 ///
-/// APIService cache-safety constraint: `authorization` above is forwarded, unmodified, from
+/// APIService cache-safety constraint: `user` above is forwarded, unmodified, from
 /// `resolve_group_version_resources` into `aggregation::discovery_resources_for_apiservice`'s
 /// outbound request to the backend, so a live `APIService` backend can enforce its own
 /// per-caller authorization on the discovery document it returns. That means two different
@@ -318,14 +364,14 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 /// response to a different caller.
 ///
 /// Resolution (option (a) of the four once listed here): only the `STATIC_GROUPS` + CRD-backed
-/// portion is cached (`DiscoveryCache`, state.rs — never touches `authorization`); every
+/// portion is cached (`DiscoveryCache`, state.rs — never touches `user`); every
 /// `APIService`-backed group is still resolved per-request, uncached, exactly as before this
 /// cache existed.
 pub(crate) async fn build_aggregated_discovery<S: Store>(
     state: &AppState<S>,
     discovery_version: &str,
     include_core: bool,
-    authorization: Option<&axum::http::HeaderValue>,
+    user: &UserInfo,
     route: &str,
 ) -> APIGroupDiscoveryList {
     let apiservice_groups = super::aggregation::list_apiservice_groups(state).await;
@@ -394,8 +440,7 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         .filter(|(group, _preferred, _served)| !seen.contains(group))
         .map(|(group, _preferred, served)| async move {
             let version_futures = served.iter().map(|version| async {
-                let resources =
-                    resolve_group_version_resources(state, &group, version, authorization).await;
+                let resources = resolve_group_version_resources(state, &group, version, user).await;
                 APIVersionDiscovery {
                     freshness: "Current",
                     resources,
@@ -453,12 +498,16 @@ async fn cached_core_and_crd_groups<S: Store>(
 pub(crate) async fn refresh_discovery_cache<S: Store>(state: &AppState<S>) {
     let groups = core_and_crd_groups(state).await;
     let group_futures = groups.iter().map(|group| async move {
-        let version_futures = group.versions.iter().map(|gv| async move {
+        let version_futures = group.versions.iter().map(|gv| async {
+            // `core_and_crd_groups` only ever contains STATIC_GROUPS/CRD-backed groups (see
+            // this function's own doc), so `resolve_group_version_resources` below always
+            // returns from its static/CRD branches and never reaches the APIService branch
+            // that actually reads `user` -- an anonymous placeholder is safe here.
             let resources = resolve_group_version_resources(
                 state,
                 group.name.as_str(),
                 gv.version.as_str(),
-                None,
+                &UserInfo::default(),
             )
             .await;
             CachedDiscoveryVersion {
@@ -541,7 +590,7 @@ async fn resolve_group_version_resources<S: Store>(
     state: &AppState<S>,
     group: &str,
     version: &str,
-    authorization: Option<&axum::http::HeaderValue>,
+    user: &UserInfo,
 ) -> Vec<APIResourceDiscovery> {
     if let Some(rl) = static_group_resources(group, version) {
         return api_resources_to_discovery_resources(&rl);
@@ -554,9 +603,7 @@ async fn resolve_group_version_resources<S: Store>(
     // Not a CRD either: try an APIService-backed (aggregated) group.
     match super::aggregation::find_apiservice(state, group, version).await {
         Some(svc) => {
-            match super::aggregation::discovery_resources_for_apiservice(state, &svc, authorization)
-                .await
-            {
+            match super::aggregation::discovery_resources_for_apiservice(state, &svc, user).await {
                 Some(rl) => api_resources_to_discovery_resources(&rl),
                 None => crd_resources,
             }
@@ -772,18 +819,17 @@ fn api_v1_resource_list_value() -> serde_json::Value {
 /// Handler for `GET /discovery/v2` — always returns the aggregated discovery list.
 pub async fn aggregated_discovery_v2<S: Store>(
     State(state): State<AppState<S>>,
+    peer_cert: Option<Extension<PeerCertificate>>,
     headers: HeaderMap,
 ) -> Response {
-    let authorization = headers.get(axum::http::header::AUTHORIZATION);
+    let peer_cert = peer_cert.map(|Extension(c)| c);
+    let user = resolve_caller_identity(&state, &headers, peer_cert.as_ref()).await;
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "application/json;g=apidiscovery.k8s.io;v=v2beta1",
         )],
-        Json(
-            build_aggregated_discovery(&state, "v2beta1", true, authorization, "/discovery/v2")
-                .await,
-        ),
+        Json(build_aggregated_discovery(&state, "v2beta1", true, &user, "/discovery/v2").await),
     )
         .into_response()
 }
@@ -2669,6 +2715,85 @@ mod tests {
         })
     }
 
+    // ---- resolve_caller_identity ---------------------------------------------------
+
+    /// The core regression this bead fixes: `/api`/`/apis`/`/discovery/v2` are auth-EXEMPT
+    /// (see `auth::is_exempt`), so `AuthLayer` never runs `authenticate` for them and never
+    /// inserts a resolved `UserInfo` into request extensions. Before this fix, the only signal
+    /// this discovery path had was the caller's raw `Authorization` header string, forwarded
+    /// unchanged to the backend — the caller's real groups (needed for the backend to make its
+    /// own authorization decision) were never resolved at all. `resolve_caller_identity` must
+    /// resolve the SAME full `UserInfo` (including groups from the static token map) that
+    /// `AuthLayer` itself would have resolved for this bearer token on a non-exempt route.
+    #[tokio::test]
+    async fn resolve_caller_identity_resolves_full_user_info_from_bearer_token() {
+        let mut token_map = std::collections::HashMap::new();
+        token_map.insert(
+            "tok".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: String::new(),
+                groups: vec!["system:masters".to_owned()],
+                extra: Default::default(),
+            },
+        );
+        let state = AppState::new(
+            Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
+            None,
+            None,
+            token_map,
+            "https://localhost:6443".into(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer tok"),
+        );
+
+        let user = resolve_caller_identity(&state, &headers, None).await;
+
+        assert_eq!(user.username, "alice");
+        assert!(
+            user.groups.contains(&"system:masters".to_owned()),
+            "must resolve the token's real groups, not just echo the raw bearer string; \
+             got: {user:?}"
+        );
+    }
+
+    /// No `Authorization` header and no TLS peer certificate (the caller sent no credential of
+    /// any kind) must resolve to `system:anonymous`, exactly like `AuthLayer`'s own fallback for
+    /// a non-exempt route — this path must not treat "no signal" as an error.
+    #[tokio::test]
+    async fn resolve_caller_identity_falls_back_to_anonymous_with_no_credential() {
+        let state = make_state();
+        let user = resolve_caller_identity(&state, &HeaderMap::new(), None).await;
+        assert_eq!(user.username, "system:anonymous");
+        assert!(user.groups.contains(&"system:unauthenticated".to_owned()));
+    }
+
+    /// An unrecognized bearer token must also fall back to anonymous rather than failing the
+    /// whole discovery request — `/api`/`/apis`/`/discovery/v2` never 401 a caller at the u7s
+    /// layer (that is the entire point of `auth::is_exempt`), so a bad credential here should
+    /// only mean "this call can't assert an identity to the backend", not break discovery of
+    /// every other (non-aggregated) group in the same response.
+    #[tokio::test]
+    async fn resolve_caller_identity_falls_back_to_anonymous_on_unrecognized_token() {
+        let state = make_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer not-a-real-token"),
+        );
+
+        let user = resolve_caller_identity(&state, &headers, None).await;
+
+        assert_eq!(
+            user.username, "system:anonymous",
+            "an unrecognized token must degrade to anonymous, not panic or propagate an error \
+             that would break discovery of unrelated groups"
+        );
+    }
+
     fn crd_bytes(
         group: &str,
         plural: &str,
@@ -3033,7 +3158,9 @@ mod tests {
         .await
         .expect("create must succeed");
 
-        let discovery = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let discovery =
+            build_aggregated_discovery(&state, "v2beta1", false, &UserInfo::default(), "/apis")
+                .await;
         let group = discovery
             .items
             .iter()
@@ -4211,7 +4338,7 @@ mod tests {
     #[tokio::test]
     async fn apis_returns_api_group_list() {
         let state = make_state();
-        let resp = api_group_list(State(state), axum::http::HeaderMap::new()).await;
+        let resp = api_group_list(State(state), None, axum::http::HeaderMap::new()).await;
 
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -4252,7 +4379,7 @@ mod tests {
                 "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList, application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList, application/json",
             ),
         );
-        let resp = api_group_list(State(state), headers).await;
+        let resp = api_group_list(State(state), None, headers).await;
 
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
@@ -4296,7 +4423,7 @@ mod tests {
                 "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList, application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList, application/json",
             ),
         );
-        let resp = api_versions(State(state), headers).await;
+        let resp = api_versions(State(state), None, headers).await;
 
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
@@ -5438,7 +5565,7 @@ mod tests {
             &state,
             "v2beta1",
             true,
-            None,
+            &UserInfo::default(),
             "/test-only/discovery-build-total",
         )
         .await;
@@ -5613,7 +5740,9 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let body = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let body =
+            build_aggregated_discovery(&state, "v2beta1", false, &UserInfo::default(), "/apis")
+                .await;
         let elapsed = start.elapsed();
 
         let names: Vec<String> = body.items.iter().map(|i| i.metadata.name.clone()).collect();
@@ -5662,7 +5791,14 @@ mod tests {
     #[tokio::test]
     async fn build_aggregated_discovery_output_is_byte_identical_to_pre_migration_golden() {
         let state = make_state();
-        let body = build_aggregated_discovery(&state, "v2beta1", true, None, "/discovery/v2").await;
+        let body = build_aggregated_discovery(
+            &state,
+            "v2beta1",
+            true,
+            &UserInfo::default(),
+            "/discovery/v2",
+        )
+        .await;
         let actual = serde_json::to_string(&body).unwrap();
         let golden = include_str!("testdata/aggregated_discovery_golden.json");
         assert_eq!(
@@ -5748,13 +5884,17 @@ mod tests {
         .expect("create_crd must succeed");
 
         // First call: whatever cache state create_crd's write-through refresh left behind.
-        let warm = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let warm =
+            build_aggregated_discovery(&state, "v2beta1", false, &UserInfo::default(), "/apis")
+                .await;
         let warm_bytes = serde_json::to_string(&warm).unwrap();
 
         // Force the cache cold, bypassing any invalidation path, so the next call must rebuild
         // straight from the store -- the "uncached" side of this comparison.
         *state.discovery_cache.groups.write().unwrap() = None;
-        let cold = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let cold =
+            build_aggregated_discovery(&state, "v2beta1", false, &UserInfo::default(), "/apis")
+                .await;
         let cold_bytes = serde_json::to_string(&cold).unwrap();
 
         assert_eq!(
@@ -5809,7 +5949,9 @@ mod tests {
         .await
         .expect("create_crd must succeed");
 
-        let before = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let before =
+            build_aggregated_discovery(&state, "v2beta1", false, &UserInfo::default(), "/apis")
+                .await;
         assert!(
             before
                 .items
@@ -5826,7 +5968,9 @@ mod tests {
         .await
         .expect("delete_crd must succeed");
 
-        let after = build_aggregated_discovery(&state, "v2beta1", false, None, "/apis").await;
+        let after =
+            build_aggregated_discovery(&state, "v2beta1", false, &UserInfo::default(), "/apis")
+                .await;
         assert!(
             !after
                 .items
