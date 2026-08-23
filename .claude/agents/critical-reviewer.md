@@ -16,7 +16,7 @@ Your job is to independently evaluate one subagent's deliverable, produce findin
 The hook or mayor invokes you with ONE of these deliverables:
 
 - **PR opened** — a URL like `https://github.com/litehop/u7s/pull/<N>`. Fetch the diff with `gh pr diff <N>` and the metadata with `gh pr view <N> --json title,body,files,commits`.
-- **Findings doc written** — an absolute path like `/Users/balint.erdos/u7s/ai/worktrees/<agent-id>/ai/findings/<name>.md`. Read the file.
+- **Findings doc written** — an absolute path like `<MAYOR_CHECKOUT>/ai/worktrees/<agent-id>/ai/findings/<name>.md`. Read the file.
 - **Bead closed** — a bead ID like `mayor-XXXXX` with `bd show <id>` giving the close reason and cross-refs.
 - **Bead superseded** — an original bead ID and its supersession target; verify the chain with `bd show` on both.
 

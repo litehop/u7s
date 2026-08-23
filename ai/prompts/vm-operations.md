@@ -555,9 +555,9 @@ Before removing any worker worktree, evacuate first:
    `<worktree>/(ai/findings|temp/e2e|temp/profile)/`.
 2. `mv` each mentioned artifact to the mayor-side equivalent path, e.g.:
    ```bash
-   mv <worktree>/ai/findings/<slug>-YYYY-MM-DD.md /Users/balint.erdos/u7s/ai/findings/
-   mv <worktree>/temp/e2e/<timestamp>-conformance /Users/balint.erdos/u7s/temp/e2e/
-   mv <worktree>/temp/e2e/<timestamp>-conformance.tar.gz /Users/balint.erdos/u7s/temp/e2e/
+   mv <worktree>/ai/findings/<slug>-YYYY-MM-DD.md <MAYOR_CHECKOUT>/ai/findings/
+   mv <worktree>/temp/e2e/<timestamp>-conformance <MAYOR_CHECKOUT>/temp/e2e/
+   mv <worktree>/temp/e2e/<timestamp>-conformance.tar.gz <MAYOR_CHECKOUT>/temp/e2e/
    ```
 3. `ls -la` the destination to confirm the evacuation succeeded.
 4. Only THEN run `git worktree remove --force <worktree>`.
