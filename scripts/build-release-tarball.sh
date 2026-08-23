@@ -56,7 +56,7 @@ for bin in kubelet kube-controller-manager; do
   # dl.k8s.io publishes a raw-hex sha256 sidecar alongside every binary --
   # verify it rather than trusting -fL's exit code alone (a proxy could serve
   # a truncated-but-200 response, or a corrupted-in-transit file).
-  expected="$(curl -fsSL "${url}.sha256")"
+  expected="$(curl -fsSL --retry 3 --retry-connrefused "${url}.sha256")"
   actual="$(sha256sum "$STAGE_DIR/$bin" | cut -d' ' -f1)"
   if [ "$expected" != "$actual" ]; then
     echo "error: checksum mismatch for $bin: expected $expected, got $actual" >&2

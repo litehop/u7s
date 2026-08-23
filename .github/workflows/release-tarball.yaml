@@ -1,12 +1,11 @@
 name: Release tarball
 
-# Interim distribution mechanism (mayor-j19o1): builds the four-binary
-# release tarball scripts/install.sh expects and publishes it as a GitHub
-# Release artifact. This is explicitly NOT the final distribution-hosting
-# answer -- GitHub cannot be the real curl|sh origin (no IPv6, see
-# ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md §7) --
-# it exists so the build pipeline itself can be validated end to end while
-# that separate question stays open.
+# Interim distribution mechanism: builds the four-binary release tarball
+# scripts/install.sh expects and publishes it as a GitHub Release artifact.
+# This is explicitly NOT the final distribution-hosting answer -- GitHub
+# cannot be the real curl|sh origin (no IPv6) -- it exists so the build
+# pipeline itself can be validated end to end while that separate question
+# stays open.
 #
 # x86_64 only for now (operator direction, YAGNI-first) -- aarch64 is
 # deliberately deferred until there's real demand, not designed around
@@ -41,15 +40,29 @@ jobs:
         id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "v=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            V="${{ inputs.version }}"
             # workflow_dispatch exists to validate this pipeline without a
             # real tag -- mark it prerelease so it's never mistaken for a
             # real, supported release.
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            PRERELEASE=true
           else
-            echo "v=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            V="${GITHUB_REF_NAME}"
+            PRERELEASE=false
           fi
+          # The tag-push trigger only ever matches v* refs; workflow_dispatch
+          # takes a free-text input with no such enforcement, and every
+          # downstream step (tarball name, release tag) assumes a leading
+          # "v". Fail loud on a mismatched input instead of publishing a
+          # release/tarball with an inconsistent version string.
+          case "$V" in
+            v*) ;;
+            *)
+              echo "error: version must start with 'v' (got: '$V')" >&2
+              exit 1
+              ;;
+          esac
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -76,6 +89,6 @@ jobs:
             [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
             gh release create "$VERSION" dist/*.tar.gz \
               --title "$VERSION" \
-              --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64. Interim GitHub Release hosting -- see ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md §7 for the still-open real distribution-hosting question." \
+              --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64. Interim GitHub Release hosting; the real distribution-hosting story is a separate, not-yet-settled project decision." \
               $prerelease_flag
           fi
