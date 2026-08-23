@@ -1,4 +1,4 @@
-# Distribution-hosting reverse-proxy (mayor-7kkhi), implementing
+# Distribution-hosting reverse-proxy, implementing
 # docs/decisions/distribution-hosting-shape.md: streams the install script
 # and release-tarball bytes server-side rather than redirecting the client to
 # GitHub, so an IPv6-only client never has to open a fresh connection to
@@ -57,6 +57,12 @@ data:
   # confirmed live) because of how nginx re-evaluates $upstream_http_* across
   # the named-location transition triggered by error_page.
   default.conf: |
+    # Public resolvers, reachable over both IPv4 and IPv6 -- TODO(operator):
+    # verify these aren't blocked by the real cluster's egress NetworkPolicy.
+    # If they are, the fix is pointing this at the cluster's own DNS Service
+    # ClusterIP instead, but that address is cluster-specific (not something
+    # this worktree can discover or safely guess), so it's left as a known
+    # assumption rather than a guessed hardcoded value.
     resolver 1.1.1.1 8.8.8.8 [2606:4700:4700::1111] [2001:4860:4860::8888] ipv6=on valid=300s;
     recursive_error_pages on;
 
@@ -67,6 +73,16 @@ data:
 
         proxy_intercept_errors on;
         proxy_ssl_server_name on;
+        # Without proxy_ssl_verify, nginx accepts ANY certificate the
+        # upstream presents -- a real MITM gap on a proxy whose entire job
+        # is distributing binaries people will execute. Alpine's own
+        # ca-certificates package bundle (already present in the base
+        # image, not something this manifest ships) is the trust root;
+        # verify_depth 2 covers GitHub's leaf+intermediate chain (confirmed
+        # live -- see README.md's Verification section).
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 2;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
         proxy_http_version 1.1;
         # github.com's redirect responses carry several KB of
         # Content-Security-Policy + Set-Cookie headers -- nginx's small

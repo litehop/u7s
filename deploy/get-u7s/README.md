@@ -93,6 +93,18 @@ at runtime with `invalid URL prefix in ""`.
   not an error or a redirect. Byte-range requests (`Range: bytes=0-99`)
   passed through correctly as `206 Partial Content`, confirming resumable
   downloads work.
+- Upstream TLS certificate verification (`proxy_ssl_verify on;` +
+  `proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;`, the
+  system CA bundle already present in the base image -- confirmed by path
+  and confirmed non-empty, no custom bundle shipped): the full redirect
+  chase above still succeeds with verification on (proves the trust chain
+  for github.com, github.com's own redirect target, and the signed
+  release-assets.githubusercontent.com URL all validate against
+  `verify_depth 2`). As a negative control, proxying the same config at
+  `self-signed.badssl.com` fails with `upstream SSL certificate verify
+  error: (18:self-signed certificate)` rather than silently accepting the
+  untrusted cert -- confirming `proxy_ssl_verify` is actually enforcing,
+  not a no-op.
 - The exact final config, pointed at the real `litehop/u7s` repo: `/stable/
   install.sh` and `/dev/install.sh` both return the real script (200,
   23864 bytes matching the actual file); `/stable/<asset>` and `/dev/<asset>`
@@ -117,3 +129,12 @@ worktree):
   real values before this can serve real TLS traffic.
 - Publishing the `dev` release tag (separate, tracked against the
   release-tarball workflow) -- until that lands, the `dev` channel 404s.
+- The `resolver` directive points at public DNS (`1.1.1.1`/`8.8.8.8` +
+  their IPv6 equivalents) -- if the real cluster's egress NetworkPolicy
+  blocks traffic to arbitrary external IPs, this proxy's dynamic hop-
+  following (which needs `resolver` to look up each redirect target) will
+  fail. The alternative -- pointing `resolver` at the cluster's own DNS
+  Service ClusterIP -- wasn't applied here because that address is
+  cluster-specific and not something this worktree could discover or
+  safely guess; verify against the real NetworkPolicy and swap it in if
+  needed.
