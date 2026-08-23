@@ -638,6 +638,15 @@ fi
 touch "$STATE_DIR/token-auth-file"
 chmod 600 "$STATE_DIR/token-auth-file"
 
+# No --kubelet-preferred-address here (unlike the dev/conformance Lima harness's own
+# apiserver invocation): that flag overrides EVERY node's resolved kubelet address to one
+# fixed value, which only makes sense when a single kubelet's real InternalIP is unreachable
+# from the apiserver (e.g. Mac host + port-forwarded Lima VM). A real multi-node install has
+# one real, directly-routable IP per node already reported via kubelet's own --node-ip flag
+# below -- forcing every node's proxy target (logs/exec/attach) to THIS node's own IP instead
+# would silently proxy a joined node's log/exec requests to the wrong kubelet entirely
+# (confirmed live: a joined node's `kubectl logs` returned "pod ... does not exist" because it
+# was asking the control-plane's own kubelet, mayor-yocic's 2-node acceptance test).
 cat > /etc/systemd/system/u7s-apiserver.service <<EOF
 [Unit]
 Description=u7s API server
@@ -647,7 +656,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --kubelet-preferred-address $IFACE_IP --token-auth-file $STATE_DIR/token-auth-file
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --token-auth-file $STATE_DIR/token-auth-file
 Restart=always
 RestartSec=2
 
