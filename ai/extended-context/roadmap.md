@@ -167,8 +167,8 @@ individual ADRs:
   and its companion
   `ai/findings/mayor-xk0pa-ca-trust-bootstrap-and-rotation-2026-08-20.md`.
 - Distribution hosting (where the install script and release tarball are
-  actually served from) — deferred, tracked in
-  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §7.
+  actually served from) — settled, see
+  `docs/decisions/distribution-hosting-shape.md`.
 
 **MVP shipped 2026-08-21** (`mayor-wl8kl`/PR #1332, `mayor-1uunh`/PR #1340):
 `scripts/install.sh`, exercised end-to-end against a freshly provisioned,
