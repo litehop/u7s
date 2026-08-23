@@ -251,8 +251,8 @@ verified to fail on revert.
 ## Cross-references
 
 - Bead: `mayor-ido0r` (closed 2026-07-27).
-- Fix PR: [#907](https://github.com/valerauko/u7s/pull/907).
-- Enabling tooling PR: [#906](https://github.com/valerauko/u7s/pull/906) (`mayor-tfggx`).
+- Fix PR: [#907](https://github.com/litehop/u7s/pull/907).
+- Enabling tooling PR: [#906](https://github.com/litehop/u7s/pull/906) (`mayor-tfggx`).
 - Regressing PR: #895 (`040855f1`, `feat(apiserver): structured access log with
   user_agent/latency/request_id`).
 - Follow-up investigation: `mayor-mo96q` (CLOSED 2026-07-28, inconclusive) and
