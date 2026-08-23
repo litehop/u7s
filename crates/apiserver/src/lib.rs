@@ -9656,6 +9656,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: dir.join("admin-token").to_string_lossy().into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
