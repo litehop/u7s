@@ -28,9 +28,9 @@
 #                       sign it, and joins as a kubelet with its own
 #                       dedicated x509 identity.
 #
-# NOT covered here: fetching the tarball from a URL (this script only accepts
-# an already-downloaded local path), HA/multi-apiserver control-plane join,
-# or CA rotation tooling.
+# NOT covered here: HA/multi-apiserver control-plane join, or CA rotation
+# tooling. (Fetching a tarball by URL, with sha256 verification against its
+# published sidecar, is covered via --tarball-url -- see below.)
 #
 # Usage:
 #   sudo scripts/install.sh --tarball <path> [--node-name <name>] [--iface <iface>]
@@ -47,24 +47,33 @@
 # surface docs/decisions/install-script-ux.md anticipates; they do not exist
 # on the zero-argument default path.
 #
-# --tarball <path> is required for the default and --join modes
-# (docs/decisions/upstream-component-shipping-shape.md + the roadmap's Gate 6
-# MVP scope: building/hosting the tarball is explicitly out of scope for this
-# script). The tarball is expected to contain the binaries each mode needs
-# (u7s-apiserver, u7s-scheduler, kubelet, kube-controller-manager for the
-# default control-plane mode; kubelet only for --join), findable anywhere in
-# its extracted tree.
+# One of --tarball <path> / --tarball-url <url> is required for the default
+# and --join modes (docs/decisions/upstream-component-shipping-shape.md + the
+# roadmap's Gate 6 MVP scope: building/hosting the tarball is explicitly out
+# of scope for this script -- --tarball-url only fetches bytes an operator
+# already pointed it at, verified against the checksum sidecar
+# .github/workflows/release-tarball.yaml publishes alongside it; it does not
+# decide where those bytes are hosted). The tarball is expected to contain
+# the binaries each mode needs (u7s-apiserver, u7s-scheduler, kubelet,
+# kube-controller-manager for the default control-plane mode; kubelet only
+# for --join), findable anywhere in its extracted tree.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh --tarball <path> [--node-name <name>] [--iface <iface>]
+  install.sh (--tarball <path> | --tarball-url <url>) [--node-name <name>] [--iface <iface>]
   install.sh --mint-join-token --node-name <name> --node-ip <ip>
-  install.sh --join <url> --token <artifact> --tarball <path> [--node-name <name>] [--iface <iface>]
+  install.sh --join <url> --token <artifact> (--tarball <path> | --tarball-url <url>) [--node-name <name>] [--iface <iface>]
 
-  --tarball <path>      Path to a locally pre-built u7s release tarball
-                         (required -- see docs/decisions/upstream-component-shipping-shape.md).
+  --tarball <path>      Path to a locally pre-built u7s release tarball.
+                         One of --tarball / --tarball-url is required -- see
+                         docs/decisions/upstream-component-shipping-shape.md.
+  --tarball-url <url>   URL to fetch the release tarball from instead of a
+                         local path. Fetches and verifies "<url>.sha256"
+                         (raw hex digest) automatically; a checksum mismatch
+                         hard-fails the install rather than proceeding with a
+                         corrupted or tampered-with download.
   --node-name <name>    Node identity (default: hostname). For --mint-join-token
                          this is the NAME OF THE JOINING NODE, not this host.
   --iface <iface>       Network interface used for cluster traffic
@@ -82,6 +91,11 @@ EOF
 NODE_NAME="${U7S_NODE_NAME:-}"
 IFACE="${U7S_IFACE:-}"
 TARBALL=""
+TARBALL_URL=""
+# Set by fetch_tarball_with_checksum (only when --tarball-url is used) so its
+# scratch download dir is cleaned up by the same EXIT trap as STAGE_DIR below,
+# rather than needing a second trap that would silently clobber the first.
+DOWNLOAD_DIR=""
 MINT_JOIN_TOKEN=0
 NODE_IP=""
 JOIN_SERVER=""
@@ -92,6 +106,7 @@ while [ $# -gt 0 ]; do
     --node-name) NODE_NAME="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
+    --tarball-url) TARBALL_URL="$2"; shift 2 ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
     --node-ip) NODE_IP="$2"; shift 2 ;;
     --join) JOIN_SERVER="$2"; shift 2 ;;
@@ -100,6 +115,11 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+if [ -n "$TARBALL" ] && [ -n "$TARBALL_URL" ]; then
+  echo "error: --tarball and --tarball-url are mutually exclusive -- pass a local path or a URL to fetch, not both" >&2
+  exit 1
+fi
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ] && [ -n "$JOIN_SERVER" ]; then
   echo "error: --mint-join-token and --join are mutually exclusive modes" >&2
@@ -148,6 +168,37 @@ wait_for_apiserver() {
     echo "error: u7s-apiserver did not become reachable within 120s (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
     exit 1
   fi
+}
+
+# --tarball-url: downloads the tarball itself (rather than trusting an
+# already-downloaded local path, --tarball's contract) and verifies it
+# against a "<url>.sha256" sidecar -- a raw hex digest with no filename
+# column, the same convention scripts/build-release-tarball.sh already
+# trusts for kubelet/KCM's own dl.k8s.io sidecars, and the one
+# .github/workflows/release-tarball.yaml publishes for this tarball. A
+# mismatch means the download is corrupted or was tampered with in transit;
+# proceeding to `tar -xzf` (and eventually running the binaries inside as
+# root) on unverified bytes silently defeats the entire point of shipping a
+# checksum, so this hard-fails rather than logging a warning and continuing.
+fetch_tarball_with_checksum() {
+  local url="$1" expected actual
+  DOWNLOAD_DIR="$(mktemp -d)"
+  TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
+
+  echo "Downloading tarball from $url..."
+  curl -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
+
+  echo "Verifying checksum against ${url}.sha256..."
+  expected="$(curl -fsSL --retry 3 --retry-connrefused "${url}.sha256")"
+  actual="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+  if [ "$expected" != "$actual" ]; then
+    echo "error: checksum mismatch for downloaded tarball ($url)" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    echo "  the download is corrupted or was tampered with -- refusing to install it" >&2
+    exit 1
+  fi
+  echo "Checksum OK ($actual)."
 }
 
 # jq is only needed by --mint-join-token/--join (building/parsing the join
@@ -421,8 +472,12 @@ if [ -n "$JOIN_SERVER" ]; then
   JOIN_MODE=1
 fi
 
+if [ -n "$TARBALL_URL" ]; then
+  fetch_tarball_with_checksum "$TARBALL_URL"
+fi
+
 if [ -z "$TARBALL" ]; then
-  echo "error: --tarball <path> is required (fetching a tarball by URL is out of scope for this script)" >&2
+  echo "error: --tarball <path> or --tarball-url <url> is required" >&2
   usage
   exit 1
 fi
@@ -532,7 +587,11 @@ systemctl enable --now crio
 # internal layout the tarball-build step hasn't been designed yet. --join only
 # needs kubelet (no control-plane binaries on a worker-only node).
 STAGE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
+# DOWNLOAD_DIR is only ever set (by fetch_tarball_with_checksum) when
+# --tarball-url was used; cleaning it up here too means --tarball-url's own
+# downloaded tarball doesn't need a second, separately-managed EXIT trap
+# (bash keeps only the last trap registered for a given signal).
+trap 'rm -rf "$STAGE_DIR" "$DOWNLOAD_DIR"' EXIT
 
 tar -xzf "$TARBALL" -C "$STAGE_DIR"
 

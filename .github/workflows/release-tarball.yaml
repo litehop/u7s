@@ -70,6 +70,19 @@ jobs:
       - name: Build tarball
         run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}"
 
+      - name: Checksum tarball
+        # A raw-hex ".sha256" sidecar per asset (no filename column), matching
+        # the convention scripts/build-release-tarball.sh already trusts for
+        # kubelet/KCM's own dl.k8s.io sidecars -- install.sh's --tarball-url
+        # path fetches this file and hard-fails on mismatch rather than
+        # silently installing a corrupted or tampered-with download.
+        run: |
+          cd dist
+          for f in *.tar.gz; do
+            sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
+          done
+          ls -la .
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,7 +91,7 @@ jobs:
         run: |
           ls -la dist
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" dist/*.tar.gz --clobber
+            gh release upload "$VERSION" dist/*.tar.gz dist/*.sha256 --clobber
           else
             # --generate-notes diffs against the previous release tag; with
             # none yet (this repo's first release), it falls back to the
@@ -87,7 +100,7 @@ jobs:
             # sidesteps that regardless of how much history has accumulated.
             prerelease_flag=""
             [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
-            gh release create "$VERSION" dist/*.tar.gz \
+            gh release create "$VERSION" dist/*.tar.gz dist/*.sha256 \
               --title "$VERSION" \
               --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64. Interim GitHub Release hosting; the real distribution-hosting story is a separate, not-yet-settled project decision." \
               $prerelease_flag
