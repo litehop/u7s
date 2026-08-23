@@ -42,16 +42,21 @@ pub struct Args {
     #[arg(long, default_value = "./ca.crt")]
     pub(crate) ca_cert: String,
 
-    /// Path to the file storing the admin bearer token embedded in the admin
-    /// kubeconfig (see `TlsMaterial::admin_bearer_token`'s doc). Generated on
-    /// first run; loaded on subsequent starts so a kubeconfig copied off the
-    /// box before a restart keeps authenticating afterward — `authenticate()`
-    /// treats a present-but-unrecognized Authorization header as fatal and
-    /// never falls back to the x509 client cert, so minting a fresh token on
-    /// every restart would silently reject every pre-restart kubeconfig with
-    /// 401 Unauthorized regardless of the CA/cert staying stable.
-    #[arg(long, default_value = "./admin-token")]
-    pub(crate) admin_token_path: String,
+    /// Path to the dedicated front-proxy CA private key (PEM). Generated on first run;
+    /// loaded on subsequent starts so the CA stays stable across restarts. Distinct from
+    /// `--ca-key`/`--ca-cert` (the main cluster CA): this CA signs only the proxy-client
+    /// leaf cert u7s presents to AGGREGATED BACKENDS (see `TlsMaterial::proxy_client_cert_pem`'s
+    /// doc), so a cert issued for any other purpose (e.g. a leaked admin kubeconfig) can
+    /// never be replayed against an aggregated backend to spoof `X-Remote-User`/`-Group`.
+    #[arg(long, default_value = "./proxy-client-ca.key")]
+    pub(crate) proxy_client_ca_key: String,
+
+    /// Path to the dedicated front-proxy CA certificate (DER). Generated on first run;
+    /// loaded on subsequent starts. Published into the `kube-system/extension-apiserver-
+    /// authentication` ConfigMap's `requestheader-client-ca-file` key so aggregated
+    /// backends trust leaf certs signed by it (see `reconcile_extension_apiserver_authentication`).
+    #[arg(long, default_value = "./proxy-client-ca.crt")]
+    pub(crate) proxy_client_ca_cert: String,
 
     /// Address advertised to clients in /api discovery (e.g. "https://1.2.3.4:6443").
     /// Defaults to the listen address, substituting 0.0.0.0 with 127.0.0.1.
