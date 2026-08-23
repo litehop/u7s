@@ -269,31 +269,23 @@ fn header_key_escape(key: &str) -> String {
     out
 }
 
-/// Headers `proxy_to_backend` attaches to the outbound backend request. Split out as a pure
-/// function (mirrors `discovery_request_headers` below) so a regression test can assert the
-/// front-proxy headers are exactly right without a live network call.
+/// Build the `X-Remote-User`/`-Group`/`-Extra-*` front-proxy identity assertion for `user`, the
+/// caller's ALREADY-resolved identity (x509 client cert, static token file, or SA JWT — this
+/// doesn't care which). Mirrors client-go's own `transport.NewAuthProxyRoundTripper`, which real
+/// kube-apiserver's aggregator uses for this identical purpose. `.ok()` on each conversion below
+/// skips a value that isn't valid header content (e.g. a username with a raw control byte)
+/// rather than dropping the whole request — a "best-effort, never fatal" posture.
 ///
-/// Never includes the caller's own `Authorization` header (see module doc for why) — only
-/// `Accept`/`Content-Type` negotiation headers plus the identity assertion
-/// (`X-Remote-User`/`-Group`/`-Extra-*`) built from `user`, the caller's ALREADY-resolved
-/// identity.
-fn proxy_backend_headers(
-    headers: &HeaderMap,
+/// Shared by `proxy_backend_headers` (resource proxy) and `discovery_request_headers` (backend
+/// discovery fetch) — both assert the identical identity; only the negotiation headers around it
+/// differ (the resource proxy forwards the caller's own Accept/Content-Type, while the discovery
+/// fetch always asks for `application/json` regardless of what the caller's own request asked
+/// for, since it's fetching the backend's raw `APIResourceList`, not an aggregated-discovery
+/// document).
+fn identity_assertion_headers(
     user: &UserInfo,
 ) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
     let mut out = Vec::new();
-    for name in [axum::http::header::ACCEPT, axum::http::header::CONTENT_TYPE] {
-        if let Some(value) = headers.get(&name) {
-            out.push((name, value.clone()));
-        }
-    }
-    // Assert the caller's identity, exactly as AuthLayer already resolved it (x509 client
-    // cert, static token file, or SA JWT — this proxy doesn't care which). Mirrors
-    // client-go's own `transport.NewAuthProxyRoundTripper`, which real kube-apiserver's
-    // aggregator uses for this identical purpose. `.ok()` on each conversion below skips a
-    // value that isn't valid header content (e.g. a username with a raw control byte)
-    // rather than dropping the whole request — the same "best-effort, never fatal" posture
-    // discovery_request_headers already takes on this file's other backend-call path.
     if let Ok(value) = axum::http::HeaderValue::from_str(&user.username) {
         out.push((axum::http::HeaderName::from_static("x-remote-user"), value));
     }
@@ -314,6 +306,28 @@ fn proxy_backend_headers(
             }
         }
     }
+    out
+}
+
+/// Headers `proxy_to_backend` attaches to the outbound backend request. Split out as a pure
+/// function (mirrors `discovery_request_headers` below) so a regression test can assert the
+/// front-proxy headers are exactly right without a live network call.
+///
+/// Never includes the caller's own `Authorization` header (see module doc for why) — only
+/// `Accept`/`Content-Type` negotiation headers plus the identity assertion
+/// (`X-Remote-User`/`-Group`/`-Extra-*`) built from `user`, the caller's ALREADY-resolved
+/// identity.
+fn proxy_backend_headers(
+    headers: &HeaderMap,
+    user: &UserInfo,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    let mut out = Vec::new();
+    for name in [axum::http::header::ACCEPT, axum::http::header::CONTENT_TYPE] {
+        if let Some(value) = headers.get(&name) {
+            out.push((name, value.clone()));
+        }
+    }
+    out.extend(identity_assertion_headers(user));
     out
 }
 
@@ -486,18 +500,21 @@ pub async fn proxy_middleware<S: Store>(
 /// exactly like the classic `/apis/{group}/{version}` route would if it were reached — the
 /// backend is the only source of truth for what resources it actually serves.
 ///
-/// `authorization` is the caller's own bearer token, forwarded unchanged — unlike the
-/// resource-proxy path (`proxy_to_backend`), this fetch does NOT assert the caller's
-/// identity via X-Remote-* headers, so it relies entirely on the backend's delegated-
-/// TokenReview fallback authenticator (every aggregated backend configures both). A
-/// caller with no bearer token (e.g. a cert-only kubeconfig) gets `authorization: None`
-/// here and the backend 401s the discovery fetch — which this function would otherwise
-/// silently treat as "no resources", making the group invisible to dynamic-client
-/// discovery even though the resource proxy itself works fine for that same caller.
+/// `user` is the caller's ALREADY-resolved identity, asserted via the same
+/// `X-Remote-User`/`-Group`/`-Extra-*` front-proxy headers the resource-proxy path
+/// (`proxy_to_backend`) uses — NOT the caller's raw `Authorization` header, which this fetch
+/// never forwards. Before this, the caller's raw bearer token was forwarded unchanged and the
+/// backend had to re-derive identity itself via its delegated-TokenReview fallback
+/// authenticator, which only recognizes bearer tokens: a cert-only caller (e.g. kubectl/KCM,
+/// which authenticate to u7s via mTLS only and send no `Authorization` header at all) got no
+/// identity forwarded here whatsoever, the backend 401'd the discovery fetch, and this function
+/// silently treated that as "no resources" — making the group invisible to dynamic-client
+/// discovery even though the resource proxy itself worked fine for that same caller. Front-proxy
+/// headers work uniformly regardless of how the caller authenticated to u7s.
 pub async fn discovery_resources_for_apiservice<S: Store>(
     state: &AppState<S>,
     apiservice: &serde_json::Value,
-    authorization: Option<&axum::http::HeaderValue>,
+    user: &UserInfo,
 ) -> Option<serde_json::Value> {
     let spec = apiservice.get("spec")?;
     let group = spec.get("group")?.as_str()?;
@@ -510,7 +527,7 @@ pub async fn discovery_resources_for_apiservice<S: Store>(
     let client = build_backend_client(state, spec);
     let url = format!("{base}/apis/{group}/{version}");
     let mut req = client.get(&url);
-    for (name, value) in discovery_request_headers(authorization) {
+    for (name, value) in discovery_request_headers(user) {
         req = req.header(name, value);
     }
     let resp = req.send().await.ok()?;
@@ -522,18 +539,17 @@ pub async fn discovery_resources_for_apiservice<S: Store>(
 }
 
 /// Headers attached to the backend discovery fetch. Split out as a pure function so a
-/// regression test can assert Authorization is forwarded without a live network call --
-/// see `discovery_resources_for_apiservice`'s doc for why forwarding it matters.
+/// regression test can assert the front-proxy identity assertion is exactly right without a
+/// live network call -- see `discovery_resources_for_apiservice`'s doc for why asserting it
+/// matters.
 fn discovery_request_headers(
-    authorization: Option<&axum::http::HeaderValue>,
+    user: &UserInfo,
 ) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
     let mut headers = vec![(
         axum::http::header::ACCEPT,
         axum::http::HeaderValue::from_static("application/json"),
     )];
-    if let Some(auth) = authorization {
-        headers.push((axum::http::header::AUTHORIZATION, auth.clone()));
-    }
+    headers.extend(identity_assertion_headers(user));
     headers
 }
 
@@ -990,43 +1006,76 @@ mod tests {
 
     // ---- discovery_request_headers ---------------------------------------------------
 
-    /// Regression test: `discovery_resources_for_apiservice`'s fetch (unlike the resource
-    /// proxy's `proxy_to_backend`) sends no X-Remote-User identity assertion, so a caller
-    /// with no bearer token relies entirely on the backend's delegated-TokenReview fallback
-    /// authenticator and an unauthenticated discovery fetch gets 401'd. Before this fix,
-    /// `discovery_resources_for_apiservice` never attached the caller's Authorization
-    /// header at all, so every APIService-backed group silently showed zero resources in
-    /// `/apis` discovery — confirmed live against a real sample-apiserver, where the
-    /// aggregator conformance test's dynamic-client GVR lookup failed with "could not find
-    /// group version resource for dynamic client and wardle/flunders" even though the
-    /// resource proxy itself worked. Revert the header-forwarding and this must fail again.
+    /// The core regression this bead fixes: before this fix, `discovery_request_headers`
+    /// forwarded the caller's raw `Authorization` header unchanged and asserted no identity at
+    /// all, so a cert-only caller (kubectl/KCM authenticate to u7s via mTLS only and send no
+    /// `Authorization` header) had no identity forwarded whatsoever — the backend 401'd the
+    /// discovery fetch and the APIService-backed group silently vanished from `/apis` discovery,
+    /// even though the resource proxy itself worked fine for that same caller (confirmed live
+    /// against a real sample-apiserver: the aggregator conformance test's dynamic-client GVR
+    /// lookup failed with "could not find group version resource for dynamic client and
+    /// wardle/flunders"). Must assert the caller's ALREADY-resolved identity via
+    /// X-Remote-User/-Group instead, exactly like the resource-proxy path's
+    /// `proxy_backend_headers`, and must NEVER forward a raw Authorization header. Revert to
+    /// forwarding Authorization and this test fails both assertions.
     #[test]
-    fn discovery_request_headers_forwards_authorization_when_present() {
-        let auth = axum::http::HeaderValue::from_static("Bearer test-token");
-        let headers = discovery_request_headers(Some(&auth));
-        assert!(
-            headers
-                .iter()
-                .any(|(name, value)| *name == axum::http::header::AUTHORIZATION
-                    && value == "Bearer test-token"),
-            "the caller's Authorization header must be forwarded to the backend's discovery \
-             endpoint, or an aggregated backend requiring auth 401s and its resources vanish \
-             from discovery"
-        );
-    }
+    fn discovery_request_headers_asserts_identity_and_never_forwards_authorization() {
+        let user = UserInfo {
+            username: "alice".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_owned()],
+            extra: Default::default(),
+        };
 
-    /// No Authorization on the inbound request (e.g. an anonymous discovery call, if RBAC
-    /// even allows one) must not synthesize one — forwarding a missing/None header as some
-    /// placeholder would be worse than simply omitting it.
-    #[test]
-    fn discovery_request_headers_omits_authorization_when_absent() {
-        let headers = discovery_request_headers(None);
+        let headers = discovery_request_headers(&user);
+
         assert!(
             !headers
                 .iter()
                 .any(|(name, _)| *name == axum::http::header::AUTHORIZATION),
-            "must not fabricate an Authorization header when the caller sent none"
+            "must never forward a raw Authorization header to the backend's discovery \
+             endpoint — identity travels via X-Remote-User/-Group instead"
         );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-remote-user" && value == "alice"),
+            "must assert the caller's username via X-Remote-User; got: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "x-remote-group" && value == "system:masters"),
+            "must assert the caller's groups via X-Remote-Group; got: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| *name == axum::http::header::ACCEPT
+                    && value == "application/json"),
+            "must still request application/json from the backend's raw discovery endpoint"
+        );
+    }
+
+    /// Anonymous identity (no credential at all) must still be asserted via the same X-Remote-*
+    /// mechanism, not omitted — mirrors `proxy_backend_headers_asserts_anonymous_identity_when_unauthenticated`.
+    #[test]
+    fn discovery_request_headers_asserts_anonymous_identity_when_unauthenticated() {
+        let user = UserInfo {
+            username: "system:anonymous".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:unauthenticated".to_owned()],
+            extra: Default::default(),
+        };
+
+        let headers = discovery_request_headers(&user);
+
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-remote-user" && value == "system:anonymous"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-remote-group" && value == "system:unauthenticated"));
     }
 
     // ---- header_key_escape ---------------------------------------------------

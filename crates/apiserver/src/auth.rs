@@ -216,7 +216,13 @@ fn ct_token_lookup<'a>(
 // ---------------------------------------------------------------------------
 
 /// Outcome of authenticating a single request.
-enum AuthnResult {
+///
+/// `pub(crate)`: also called directly by `handlers::discovery`'s auth-exempt routes (`/api`,
+/// `/apis`, `/discovery/v2` — see `is_exempt`'s doc), which need to resolve the caller's
+/// identity for asserting front-proxy headers to an aggregated APIService backend
+/// (`aggregation::discovery_resources_for_apiservice`) even though `AuthLayer` itself never
+/// runs `authenticate` for them.
+pub(crate) enum AuthnResult {
     /// Authenticated — carry UserInfo forward.
     Identified(UserInfo),
     /// Bad token — respond with 401.
@@ -228,7 +234,7 @@ enum AuthnResult {
 // function's internal `.await` (the store-backed liveness check) would make the generated
 // future `!Send`, which Tower's `Service::Future: Send` bound requires. Extracting the header
 // value before calling keeps this function decoupled from the Request type entirely.
-async fn authenticate<S: Store>(
+pub(crate) async fn authenticate<S: Store>(
     auth_header: Option<&str>,
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
