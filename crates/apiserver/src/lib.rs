@@ -1170,6 +1170,15 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
+            // Kubelet's own service informer populates Service-discovery env vars
+            // (SERVICE_HOST/SERVICE_PORT) injected into every pod's containers. Without this
+            // rule the informer's List/Watch is denied, the informer never completes its first
+            // sync, and every container on that node fails to start with
+            // CreateContainerConfigError: "services have not yet been read at least once" --
+            // silently masked as long as the only kubelet ever exercised authenticates as
+            // system:masters (admin) instead of a real system:node identity. Matches upstream
+            // bootstrappolicy.go's NodeRules() exactly.
+            { "apiGroups": [""], "resources": ["services"],     "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["configmaps"],          "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["secrets"],             "verbs": ["get","list","watch"] },
             // Kubelet calls TokenRequest to project SA tokens into pods (projected volumes).
@@ -4972,6 +4981,29 @@ mod tests {
         assert!(
             state.rbac_index.is_allowed(&pod_read),
             "system:nodes must be allowed to GET pods — kubelet needs this to reconcile its pod list"
+        );
+
+        // A kubelet in system:nodes must be able to LIST services -- kubelet's own service
+        // informer needs this to populate Service-discovery env vars in every pod's
+        // containers. A real joined node (mayor-yocic) authenticates as this exact identity,
+        // unlike a single-node install's kubelet which shares the admin/system:masters
+        // kubeconfig and never exercises this rule at all.
+        let service_list = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "list",
+            api_group: "",
+            resource: "services",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&service_list),
+            "system:nodes must be allowed to LIST services — kubelet's service informer needs \
+             this or every container on the node fails to start with CreateContainerConfigError \
+             (\"services have not yet been read at least once\")"
         );
 
         // A kubelet in system:nodes must be able to create a lease (heartbeat).
