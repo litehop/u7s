@@ -93,6 +93,41 @@ pub(crate) fn validate_csr_spec(
     Ok(())
 }
 
+/// Stamp spec.username/uid/groups/extra from the authenticated caller's UserInfo,
+/// discarding any client-supplied values for these fields.
+///
+/// Security-critical: kube-controller-manager's builtin csrapproving controller
+/// authorizes auto-approval by building a SubjectAccessReview directly from these
+/// spec fields (pkg/controller/certificates/approver/sarapprove.go's `authorize()`).
+/// If a client could set them, it could submit a CSR claiming to be `system:node:foo`
+/// in group `system:nodes` while authenticated as someone else entirely — KCM would
+/// then approve and sign a client certificate for an identity the caller never proved
+/// it holds. Called AFTER admission webhooks run (mirroring the existing status-strip's
+/// position, not stamp_metadata's) so a registered mutating webhook cannot reintroduce
+/// a spoofed value into these fields either — nothing downstream of this call can
+/// undo the stamp before the object is persisted.
+fn stamp_csr_identity(body: &mut serde_json::Value, user: &UserInfo) {
+    if let Some(spec) = body.get_mut("spec").and_then(|s| s.as_object_mut()) {
+        spec.insert(
+            "username".to_string(),
+            serde_json::Value::String(user.username.clone()),
+        );
+        spec.insert(
+            "uid".to_string(),
+            serde_json::Value::String(user.uid.clone()),
+        );
+        spec.insert(
+            "groups".to_string(),
+            serde_json::to_value(&user.groups).expect("Vec<String> always serializes"),
+        );
+        spec.insert(
+            "extra".to_string(),
+            serde_json::to_value(&user.extra)
+                .expect("HashMap<String, Vec<String>> always serializes"),
+        );
+    }
+}
+
 /// GET /apis/certificates.k8s.io/v1/certificatesigningrequests
 ///
 /// List all CertificateSigningRequests. The route is a hardcoded literal (no
@@ -250,17 +285,20 @@ pub async fn create_csr<S: Store>(
         namespace: None,
         operation: "CREATE",
         user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
+            "username": user.username.clone(),
+            "uid": user.uid.clone(),
+            "groups": user.groups.clone(),
+            "extra": user.extra.clone(),
         })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
-    // Strip status from incoming body — spec is immutable after create.
+    // Re-stamp spec identity from the authenticated caller and strip status — neither may
+    // survive a client, OR a mutating webhook, attempting to set them. spec is immutable
+    // after create; status is the signer's exclusive write.
+    stamp_csr_identity(&mut obj.body, &user);
     if let Some(map) = obj.body.as_object_mut() {
         map.remove("status");
     }
@@ -785,6 +823,126 @@ mod tests {
         );
     }
 
+    /// stamp_csr_identity overwrites a client-supplied spec.username/uid/groups/extra
+    /// with the authenticated caller's real identity.
+    ///
+    /// KCM's builtin csrapproving controller authorizes auto-approval via a
+    /// SubjectAccessReview built directly from these spec fields. If a client could set
+    /// them, it could submit a CSR claiming to be `system:node:victim` in group
+    /// `system:nodes` while authenticated as an unrelated, unprivileged identity — KCM
+    /// would approve and sign a client certificate for an identity the caller never
+    /// proved it holds.
+    #[test]
+    fn stamp_csr_identity_overwrites_client_supplied_spoof() {
+        let mut body = serde_json::json!({
+            "spec": {
+                "request": "irrelevant-for-this-test",
+                "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                "username": "system:node:victim",
+                "uid": "attacker-chosen-uid",
+                "groups": ["system:masters"],
+                "extra": {"attacker-key": ["attacker-value"]}
+            }
+        });
+
+        let real_caller = crate::auth::UserInfo {
+            username: "system:bootstrap:abcdef".into(),
+            uid: "real-uid".into(),
+            groups: vec!["system:bootstrappers".into()],
+            extra: [("real-key".to_string(), vec!["real-value".to_string()])].into(),
+        };
+        stamp_csr_identity(&mut body, &real_caller);
+
+        assert_eq!(
+            body["spec"]["username"], "system:bootstrap:abcdef",
+            "client-supplied spec.username must be discarded — a caller must never be \
+             able to request approval for an identity it did not authenticate as"
+        );
+        assert_eq!(
+            body["spec"]["uid"], "real-uid",
+            "client-supplied spec.uid must be discarded, matching the real caller's uid"
+        );
+        assert_eq!(
+            body["spec"]["groups"],
+            serde_json::json!(["system:bootstrappers"]),
+            "client-supplied spec.groups must be discarded — a caller must not be able \
+             to forge membership in a privileged group like system:masters"
+        );
+        assert_eq!(
+            body["spec"]["extra"],
+            serde_json::json!({"real-key": ["real-value"]}),
+            "client-supplied spec.extra must be discarded"
+        );
+    }
+
+    /// create_csr end-to-end: a client-supplied spec.username/uid/groups/extra never
+    /// reaches the stored object — the authenticated caller's identity always wins.
+    ///
+    /// This is the regression test for the CSR identity-spoofing security fix: without
+    /// the stamp, an unprivileged caller could submit a CSR with spec.username set to
+    /// a node identity and spec.groups set to system:nodes, and KCM's csrapproving
+    /// controller (which authorizes purely from these stored spec fields) would approve
+    /// and sign a client certificate for that forged identity.
+    #[tokio::test]
+    async fn create_csr_stamps_authenticated_identity_over_client_supplied_spoof() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let b64 = valid_csr_b64();
+
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "spoofed-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                "username": "system:node:victim",
+                "uid": "attacker-chosen-uid",
+                "groups": ["system:nodes", "system:masters"],
+                "extra": {"attacker-key": ["attacker-value"]}
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "system:bootstrap:abcdef".into(),
+                uid: String::new(),
+                groups: vec!["system:bootstrappers".into()],
+                extra: Default::default(),
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|_| panic!("create must succeed"));
+
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/spoofed-csr";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["spec"]["username"], "system:bootstrap:abcdef",
+            "stored spec.username must be the authenticated caller, not the client-supplied \
+             value — a mismatch here means KCM's SAR-based auto-approval would authorize \
+             the wrong identity"
+        );
+        assert_eq!(
+            v["spec"]["groups"],
+            serde_json::json!(["system:bootstrappers"]),
+            "stored spec.groups must be the authenticated caller's real groups, not the \
+             client-supplied system:nodes/system:masters spoof"
+        );
+    }
+
     /// list_csr with label selector must filter results.
     /// This covers the label_selector branch in list_csr (non-watch path).
     #[tokio::test]
@@ -1035,6 +1193,142 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "a denying validating webhook must produce 403 — \
              without admission wiring the webhook is never called and policy is bypassed"
+        );
+    }
+
+    /// A mutating webhook that patches spec.username/groups must NOT have its patch
+    /// survive into the stored object — stamp_csr_identity must run AFTER the admission
+    /// webhook chain, re-overwriting whatever a webhook injected.
+    ///
+    /// KCM's csrapproving controller authorizes auto-approval from the STORED
+    /// spec.username/groups. If stamp_csr_identity ran before mutating webhooks (or was
+    /// otherwise reverted to that ordering), a compromised or misconfigured mutating
+    /// webhook could reintroduce a spoofed identity after the honest stamp, defeating the
+    /// fix at the very last step before persistence. This test fails if that ordering
+    /// regresses: the JSONPatch below injects an attacker identity, and the assertions
+    /// require the caller's REAL identity to win regardless.
+    #[tokio::test]
+    async fn create_csr_mutating_webhook_cannot_reintroduce_spoofed_identity() {
+        use std::sync::Arc;
+
+        use axum::{routing::post, Router};
+        use base64::Engine as _;
+        use tokio::net::TcpListener;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/spec/username", "value": "system:node:mutated-by-webhook"},
+                    {"op": "add", "path": "/spec/groups", "value": ["system:masters"]}
+                ]);
+                let patch_b64 = base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_string(&patch).unwrap());
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, patch_router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        let url = format!("http://{addr}");
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "mutate-csr-identity"},
+            "webhooks": [{
+                "name": "mutate-csr-identity.test.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{
+                    "apiGroups": ["certificates.k8s.io"],
+                    "apiVersions": ["v1"],
+                    "resources": ["certificatesigningrequests"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/mutate-csr-identity",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed MutatingWebhookConfiguration");
+
+        let b64 = valid_csr_b64();
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "webhook-cannot-spoof-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client-kubelet"
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "real-caller".into(),
+                uid: String::new(),
+                groups: vec!["real-group".into()],
+                extra: Default::default(),
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create must succeed, got status={}", e.0));
+
+        let key =
+            "/registry/certificates.k8s.io/certificatesigningrequests/webhook-cannot-spoof-csr";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["spec"]["username"], "real-caller",
+            "a mutating webhook's patch to spec.username must not survive into the stored \
+             object — stamp_csr_identity must run after the admission webhook chain, or a \
+             webhook could reintroduce a spoofed identity that KCM's SAR-based auto-approval \
+             would then trust"
+        );
+        assert_eq!(
+            v["spec"]["groups"],
+            serde_json::json!(["real-group"]),
+            "a mutating webhook's patch to spec.groups (here: forging system:masters) must \
+             not survive into the stored object"
         );
     }
 }
