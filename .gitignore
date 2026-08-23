@@ -17,9 +17,10 @@ ai/worktrees/
 # Generated TLS / signing-key files (written by u7s-apiserver on first start)
 ca.key
 ca.crt
+proxy-client-ca.key
+proxy-client-ca.crt
 sa.key
 sa.pub
-admin-token
 /kubeconfig
 
 # Local dev state (scripts/u7s-start.sh); temp/u7s/ lives in each worktree

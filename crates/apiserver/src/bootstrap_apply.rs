@@ -673,7 +673,14 @@ mod tests {
             sa_pub: dir.join("sa.pub").to_string_lossy().into_owned(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: dir.join("admin-token").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,

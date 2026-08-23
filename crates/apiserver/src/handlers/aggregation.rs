@@ -3,14 +3,22 @@
 ///
 /// Real kube-apiserver's aggregation layer has two pieces:
 ///   1. A dynamic proxy handler for `/apis/{group}/{version}/*` that forwards to the
-///      backend, presenting a dedicated proxy-client certificate the backend trusts via
-///      `requestheader-client-ca-file` (populated from the extension-apiserver-authentication
-///      configmap). u7s does not populate that configmap with real CA data (the lookup is
-///      only made to *tolerate* 404 instead of crashing), so an aggregated
-///      backend such as sample-apiserver falls back to its other configured authenticator:
-///      delegated TokenReview against this apiserver. This proxy therefore forwards the
-///      caller's own Authorization header unchanged instead of minting an impersonation
-///      identity — the backend authenticates the original caller itself.
+///      backend, presenting a dedicated proxy-client certificate (see `TlsMaterial::
+///      proxy_client_cert_pem`'s doc) the backend trusts via `requestheader-client-ca-file`
+///      (populated from the `kube-system/extension-apiserver-authentication` ConfigMap —
+///      see `reconcile_extension_apiserver_authentication`, lib.rs), and asserting the
+///      caller's ALREADY-resolved identity via `X-Remote-User`/`X-Remote-Group`/
+///      `X-Remote-Extra-*` headers (`proxy_to_backend`, below) instead of forwarding the
+///      caller's own credential — the backend never needs to re-authenticate the caller
+///      itself. This is the standard Kubernetes front-proxy pattern (mirrors kube-apiserver's
+///      `--proxy-client-cert-file`/`--requestheader-*` flags); a prior design forwarded the
+///      caller's raw `Authorization` header instead and relied on the backend's delegated-
+///      TokenReview fallback, which only worked for bearer-token callers — kubectl/KCM
+///      authenticate to u7s via mTLS client cert only, so their requests carried no
+///      `Authorization` header at all, and every such call to an aggregated backend was
+///      silently treated as `system:anonymous` (confirmed live: `kubectl top nodes` failed
+///      with "User \"system:anonymous\" cannot list resource \"nodes\""). Front-proxy headers
+///      work uniformly regardless of how the caller authenticated to u7s.
 ///   2. An availability controller that periodically health-checks the backend and sets
 ///      `status.conditions[type=Available]`. u7s runs this as a fixed-interval sweep
 ///      (`reconcile_apiservice_availability`, spawned once in main.rs) rather than a full
@@ -39,6 +47,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use u7s_store::{ListOptions, Store};
 
+use crate::auth::UserInfo;
 use crate::keys::group_list_prefix;
 use crate::state::AppState;
 use crate::status::Status;
@@ -110,13 +119,13 @@ pub async fn find_apiservice<S: Store>(
 /// Returns `Err` when `name`/`namespace` are present but fail `validate_name` (e.g. contain
 /// `/` or `..`). Without this check, a crafted `spec.service.namespace` such as
 /// `"ns/evil.example.com"` would break the intended host out of the URL authority (built
-/// via a bare `format!`), redirecting the connection — and the caller's live bearer token,
-/// which `proxy_to_backend` forwards unchanged — to an attacker-controlled destination.
-/// Mirrors `admission.rs`'s `validate_service_reference`, which guards the identical
-/// Service-DNS-URL construction for webhook `clientConfig.service` references; registering
-/// an `APIService` requires the same cluster-admin-tier privilege as webhook configs, so
-/// this is a defense against a privileged actor harvesting *other* callers' credentials,
-/// not a low-privilege escalation.
+/// via a bare `format!`), redirecting the connection — and the caller's identity, asserted
+/// via the `X-Remote-User`/`-Group` headers `proxy_to_backend` sends — to an
+/// attacker-controlled destination. Mirrors `admission.rs`'s `validate_service_reference`,
+/// which guards the identical Service-DNS-URL construction for webhook `clientConfig.service`
+/// references; registering an `APIService` requires the same cluster-admin-tier privilege as
+/// webhook configs, so this is a defense against a privileged actor disclosing *other*
+/// callers' identities to an attacker-controlled endpoint, not a low-privilege escalation.
 fn backend_base_url(apiservice: &serde_json::Value) -> Result<Option<String>, String> {
     let spec: ApiServiceSpec = apiservice
         .get("spec")
@@ -174,8 +183,16 @@ struct ApiServiceServiceRef {
 ///     own serving certificate is signed by the cluster CA, not by the APIService's
 ///     backend-specific CA, and `tls_certs_only` replaces the trust store rather than
 ///     extending it.
-///   - `webhook_identity_pem` (the apiserver's own mTLS identity) must be presented:
-///     konnectivity-server requires client-cert authentication from callers.
+///   - `proxy_client_identity_pem` (the dedicated proxy-client mTLS identity — see
+///     `TlsMaterial::proxy_client_cert_pem`'s doc, NOT the admin cert `admission.rs`'s
+///     webhook client presents) must be presented: konnectivity-server requires client-cert
+///     authentication from callers, and the backend itself only trusts THIS identity (via
+///     `requestheader-client-ca-file`) to assert `X-Remote-User`/`-Group` headers
+///     (`proxy_to_backend`, below). konnectivity-server's own `--server-ca-cert` trust
+///     bundle is provisioned to accept both this identity's CA and the main cluster CA
+///     (see `scripts/u7s-start.sh`) — the two CAs gate different downstream trust
+///     decisions, but neither gates access to konnectivity itself (only u7s holds either
+///     private key).
 fn build_backend_client<S: Store>(
     state: &AppState<S>,
     spec: &serde_json::Value,
@@ -211,7 +228,7 @@ fn build_backend_client<S: Store>(
         }
     }
 
-    if let Some(pem) = state.webhook_identity_pem.as_deref() {
+    if let Some(pem) = state.proxy_client_identity_pem.as_deref() {
         if let Ok(identity) = reqwest::Identity::from_pem(pem) {
             builder = builder.identity(identity);
         }
@@ -230,6 +247,76 @@ fn build_backend_client<S: Store>(
 // Request proxying
 // ---------------------------------------------------------------------------
 
+/// Percent-encode a `UserInfo.extra` key for use in an `X-Remote-Extra-<key>` header name.
+///
+/// Mirrors client-go's `transport.headerKeyEscape` (`round_trippers.go`) byte-for-byte: HTTP
+/// header field names may only contain RFC 7230 `tchar` bytes, which excludes `/` — and a
+/// real extra key like `authentication.kubernetes.io/credential-id` (see `auth.rs`'s SA-JWT
+/// `extra` doc) contains exactly that. Building `HeaderName::from_str` with the raw key
+/// present would fail outright, silently dropping the extra field from every proxied
+/// request. Percent-encoding every byte outside RFC 3986's "unreserved" set keeps this
+/// decodable by any backend that unescapes header names the same way — every real
+/// aggregated backend does, via `k8s.io/apiserver`'s own request-header authenticator.
+fn header_key_escape(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for b in key.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Headers `proxy_to_backend` attaches to the outbound backend request. Split out as a pure
+/// function (mirrors `discovery_request_headers` below) so a regression test can assert the
+/// front-proxy headers are exactly right without a live network call.
+///
+/// Never includes the caller's own `Authorization` header (see module doc for why) — only
+/// `Accept`/`Content-Type` negotiation headers plus the identity assertion
+/// (`X-Remote-User`/`-Group`/`-Extra-*`) built from `user`, the caller's ALREADY-resolved
+/// identity.
+fn proxy_backend_headers(
+    headers: &HeaderMap,
+    user: &UserInfo,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    let mut out = Vec::new();
+    for name in [axum::http::header::ACCEPT, axum::http::header::CONTENT_TYPE] {
+        if let Some(value) = headers.get(&name) {
+            out.push((name, value.clone()));
+        }
+    }
+    // Assert the caller's identity, exactly as AuthLayer already resolved it (x509 client
+    // cert, static token file, or SA JWT — this proxy doesn't care which). Mirrors
+    // client-go's own `transport.NewAuthProxyRoundTripper`, which real kube-apiserver's
+    // aggregator uses for this identical purpose. `.ok()` on each conversion below skips a
+    // value that isn't valid header content (e.g. a username with a raw control byte)
+    // rather than dropping the whole request — the same "best-effort, never fatal" posture
+    // discovery_request_headers already takes on this file's other backend-call path.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&user.username) {
+        out.push((axum::http::HeaderName::from_static("x-remote-user"), value));
+    }
+    for group in &user.groups {
+        if let Ok(value) = axum::http::HeaderValue::from_str(group) {
+            out.push((axum::http::HeaderName::from_static("x-remote-group"), value));
+        }
+    }
+    for (key, values) in &user.extra {
+        let Ok(header_name) =
+            axum::http::HeaderName::try_from(format!("x-remote-extra-{}", header_key_escape(key)))
+        else {
+            continue;
+        };
+        for value in values {
+            if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+                out.push((header_name.clone(), value));
+            }
+        }
+    }
+    out
+}
+
 /// Proxy one request to the `APIService`'s backend and return its response verbatim.
 ///
 /// Connection failures (backend not yet reachable, DNS/TLS errors) map to 503 Service
@@ -247,6 +334,7 @@ pub async fn proxy_to_backend<S: Store>(
     method: axum::http::Method,
     headers: &HeaderMap,
     body: Bytes,
+    user: &UserInfo,
 ) -> Response {
     let spec = apiservice
         .get("spec")
@@ -283,18 +371,8 @@ pub async fn proxy_to_backend<S: Store>(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
 
     let mut outbound = client.request(reqwest_method, &url).body(body);
-    // Forward only the headers the backend needs to authenticate/negotiate the request.
-    // The backend has no requestheader-client-ca trust configured (see module doc), so it
-    // authenticates the original caller itself via delegated TokenReview against this
-    // apiserver — that requires the caller's own Authorization header, unmodified.
-    for name in [
-        axum::http::header::AUTHORIZATION,
-        axum::http::header::ACCEPT,
-        axum::http::header::CONTENT_TYPE,
-    ] {
-        if let Some(value) = headers.get(&name) {
-            outbound = outbound.header(name, value.clone());
-        }
+    for (name, value) in proxy_backend_headers(headers, user) {
+        outbound = outbound.header(name, value);
     }
 
     match outbound.send().await {
@@ -317,7 +395,10 @@ pub async fn proxy_to_backend<S: Store>(
 /// u7s's own RBAC check already happened) and *before* axum's route matching — the same
 /// ordering every other route gets, just intercepted one step earlier so a single check
 /// covers every verb and subpath uniformly (collection, named resource, status subresource,
-/// ...) without touching the generic CR/built-in handlers at all.
+/// ...) without touching the generic CR/built-in handlers at all. Running after `AuthLayer`
+/// is also why this can read the caller's already-resolved `UserInfo` straight out of the
+/// request extensions below — `AuthLayer` inserts it right before calling into this layer's
+/// stack, for exactly this kind of downstream consumer (see auth.rs's `AuthService::call`).
 ///
 /// Built-in and CRD-backed groups are unaffected: u7s never creates an `APIService` object
 /// for them, so the lookup below simply misses and the request falls through to `next`.
@@ -326,6 +407,20 @@ pub async fn proxy_middleware<S: Store>(
     req: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
+    // Defensive fallback to anonymous (mirrors auth.rs's own no-credential fallback):
+    // AuthLayer always inserts UserInfo before reaching this layer in production, but a
+    // test that exercises build_router() directly (bypassing AuthLayer) must not panic.
+    let user = req
+        .extensions()
+        .get::<UserInfo>()
+        .cloned()
+        .unwrap_or_else(|| UserInfo {
+            username: "system:anonymous".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:unauthenticated".to_owned()],
+            extra: Default::default(),
+        });
+
     let path = req.uri().path().to_owned();
     let Some((group, version, tail)) = parse_apis_path(&path) else {
         return next.run(req).await;
@@ -376,6 +471,7 @@ pub async fn proxy_middleware<S: Store>(
         method,
         &headers,
         body,
+        &user,
     )
     .await
 }
@@ -390,12 +486,14 @@ pub async fn proxy_middleware<S: Store>(
 /// exactly like the classic `/apis/{group}/{version}` route would if it were reached — the
 /// backend is the only source of truth for what resources it actually serves.
 ///
-/// `authorization` must be the caller's own bearer token, forwarded unchanged: the backend
-/// authenticates callers via delegated TokenReview against this apiserver (see module doc),
-/// so an unauthenticated discovery request gets 401'd by the backend — which this function
-/// would otherwise silently treat as "no resources", making every aggregated resource
-/// invisible to `kubectl`/dynamic-client discovery even though the resource proxy itself
-/// works fine.
+/// `authorization` is the caller's own bearer token, forwarded unchanged — unlike the
+/// resource-proxy path (`proxy_to_backend`), this fetch does NOT assert the caller's
+/// identity via X-Remote-* headers, so it relies entirely on the backend's delegated-
+/// TokenReview fallback authenticator (every aggregated backend configures both). A
+/// caller with no bearer token (e.g. a cert-only kubeconfig) gets `authorization: None`
+/// here and the backend 401s the discovery fetch — which this function would otherwise
+/// silently treat as "no resources", making the group invisible to dynamic-client
+/// discovery even though the resource proxy itself works fine for that same caller.
 pub async fn discovery_resources_for_apiservice<S: Store>(
     state: &AppState<S>,
     apiservice: &serde_json::Value,
@@ -789,9 +887,9 @@ mod tests {
     /// rejected, not silently built into a URL. `format!("https://{name}.{namespace}.svc:{port}")`
     /// has no escaping — a namespace of `"ns/evil.example.com"` would build
     /// `https://svc.ns/evil.example.com.svc:443`, breaking `evil.example.com` out of the
-    /// intended host and redirecting the connection (and the caller's live bearer token,
-    /// which `proxy_to_backend` forwards unchanged) to an attacker-controlled destination.
-    /// Revert the `validate_name` calls in `backend_base_url` and this fails again.
+    /// intended host and redirecting the connection (and the caller's identity, asserted via
+    /// the X-Remote-User/-Group headers `proxy_to_backend` sends) to an attacker-controlled
+    /// destination. Revert the `validate_name` calls in `backend_base_url` and this fails again.
     #[test]
     fn backend_base_url_rejects_namespace_containing_slash() {
         let apiservice = serde_json::json!({
@@ -892,12 +990,13 @@ mod tests {
 
     // ---- discovery_request_headers ---------------------------------------------------
 
-    /// Regression test: a live sample-apiserver backend authenticates callers via delegated
-    /// TokenReview against this apiserver (no requestheader-client-ca trust configured — see
-    /// module doc), so an unauthenticated discovery fetch gets 401'd by the backend. Before
-    /// this fix, `discovery_resources_for_apiservice` never attached the caller's
-    /// Authorization header, so every APIService-backed group silently showed zero resources
-    /// in `/apis` discovery — confirmed live against a real sample-apiserver, where the
+    /// Regression test: `discovery_resources_for_apiservice`'s fetch (unlike the resource
+    /// proxy's `proxy_to_backend`) sends no X-Remote-User identity assertion, so a caller
+    /// with no bearer token relies entirely on the backend's delegated-TokenReview fallback
+    /// authenticator and an unauthenticated discovery fetch gets 401'd. Before this fix,
+    /// `discovery_resources_for_apiservice` never attached the caller's Authorization
+    /// header at all, so every APIService-backed group silently showed zero resources in
+    /// `/apis` discovery — confirmed live against a real sample-apiserver, where the
     /// aggregator conformance test's dynamic-client GVR lookup failed with "could not find
     /// group version resource for dynamic client and wardle/flunders" even though the
     /// resource proxy itself worked. Revert the header-forwarding and this must fail again.
@@ -928,6 +1027,145 @@ mod tests {
                 .any(|(name, _)| *name == axum::http::header::AUTHORIZATION),
             "must not fabricate an Authorization header when the caller sent none"
         );
+    }
+
+    // ---- header_key_escape ---------------------------------------------------
+
+    /// Alphanumerics and the RFC 3986 "unreserved" punctuation (`-_.~`) must pass through
+    /// unescaped — over-escaping a benign key like an SA namespace/name would still be
+    /// correct once round-tripped, but would make every X-Remote-Extra-* header needlessly
+    /// unreadable in a raw capture, unlike client-go's own `headerKeyEscape` this mirrors.
+    #[test]
+    fn header_key_escape_passes_through_unreserved_bytes() {
+        assert_eq!(header_key_escape("pod-name_v1.2~x"), "pod-name_v1.2~x");
+    }
+
+    /// Regression test: a real extra key from `auth.rs`'s SA-JWT `extra` map —
+    /// `authentication.kubernetes.io/credential-id` — contains `/`, which is not a legal
+    /// HTTP header-name byte at all. Without escaping, building the `X-Remote-Extra-<key>`
+    /// header name from this key verbatim would fail outright (invalid `HeaderName`),
+    /// silently dropping the credential-id extra field from every proxied request instead
+    /// of asserting it to the backend. `/` must become `%2F`, matching client-go's
+    /// `transport.headerKeyEscape` exactly so a real aggregated backend (which unescapes
+    /// the same way) decodes the identical key back out.
+    #[test]
+    fn header_key_escape_percent_encodes_slash_in_credential_id_extra_key() {
+        assert_eq!(
+            header_key_escape("authentication.kubernetes.io/credential-id"),
+            "authentication.kubernetes.io%2Fcredential-id",
+            "a '/' in an extra key must be percent-encoded as %2F, or the resulting header \
+             name is not constructible at all and the whole extra field silently vanishes"
+        );
+    }
+
+    // ---- proxy_backend_headers ---------------------------------------------------
+
+    /// The core regression this bead fixes: `proxy_backend_headers` must assert the
+    /// caller's ALREADY-resolved identity via X-Remote-User/-Group, and must NEVER forward
+    /// the caller's own Authorization header — a cert-only caller (kubectl/KCM authenticate
+    /// to u7s via mTLS only) sends no Authorization header at all, so the OLD
+    /// forward-Authorization-verbatim design left the backend treating every such request
+    /// as `system:anonymous` (confirmed live: `kubectl top nodes` failed with "User
+    /// \"system:anonymous\" cannot list resource \"nodes\""). Revert to forwarding
+    /// Authorization and this test fails both assertions.
+    #[test]
+    fn proxy_backend_headers_asserts_identity_and_never_forwards_authorization() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer caller-own-token"),
+        );
+        inbound.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let user = UserInfo {
+            username: "admin".to_owned(),
+            uid: String::new(),
+            groups: vec![
+                "system:masters".to_owned(),
+                "system:authenticated".to_owned(),
+            ],
+            extra: Default::default(),
+        };
+
+        let out = proxy_backend_headers(&inbound, &user);
+
+        assert!(
+            !out.iter()
+                .any(|(name, _)| *name == axum::http::header::AUTHORIZATION),
+            "must never forward the caller's own Authorization header to the backend — \
+             identity travels via X-Remote-User/-Group instead"
+        );
+        assert!(
+            out.iter()
+                .any(|(name, value)| name == "x-remote-user" && value == "admin"),
+            "must assert the caller's username via X-Remote-User; got: {out:?}"
+        );
+        for expected_group in ["system:masters", "system:authenticated"] {
+            assert!(
+                out.iter()
+                    .any(|(name, value)| name == "x-remote-group" && value == expected_group),
+                "must assert group '{expected_group}' via a repeated X-Remote-Group header; \
+                 got: {out:?}"
+            );
+        }
+        assert!(
+            out.iter()
+                .any(|(name, value)| *name == axum::http::header::ACCEPT
+                    && value == "application/json"),
+            "must still forward negotiation headers like Accept"
+        );
+    }
+
+    /// `UserInfo.extra` (e.g. a bound SA token's `authentication.kubernetes.io/credential-id`)
+    /// must round-trip into an escaped `X-Remote-Extra-*` header, one header per value.
+    #[test]
+    fn proxy_backend_headers_asserts_extra_fields_with_escaped_key() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "authentication.kubernetes.io/credential-id".to_owned(),
+            vec!["JTI=abc123".to_owned()],
+        );
+        let user = UserInfo {
+            username: "system:serviceaccount:default:my-sa".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:serviceaccounts".to_owned()],
+            extra,
+        };
+
+        let out = proxy_backend_headers(&HeaderMap::new(), &user);
+
+        assert!(
+            out.iter().any(|(name, value)| name
+                == "x-remote-extra-authentication.kubernetes.io%2Fcredential-id"
+                && value == "JTI=abc123"),
+            "must assert the extra field under its escaped X-Remote-Extra-* header name; \
+             got: {out:?}"
+        );
+    }
+
+    /// No caller credential (anonymous) must still assert `system:anonymous` /
+    /// `system:unauthenticated` via the same X-Remote-* mechanism, not omit identity
+    /// headers entirely — an aggregated backend with no other authenticator configured
+    /// would otherwise have no way to apply its own anonymous-access RBAC consistently.
+    #[test]
+    fn proxy_backend_headers_asserts_anonymous_identity_when_unauthenticated() {
+        let user = UserInfo {
+            username: "system:anonymous".to_owned(),
+            uid: String::new(),
+            groups: vec!["system:unauthenticated".to_owned()],
+            extra: Default::default(),
+        };
+
+        let out = proxy_backend_headers(&HeaderMap::new(), &user);
+
+        assert!(out
+            .iter()
+            .any(|(name, value)| name == "x-remote-user" && value == "system:anonymous"));
+        assert!(out
+            .iter()
+            .any(|(name, value)| name == "x-remote-group" && value == "system:unauthenticated"));
     }
 
     // ---- find_apiservice ---------------------------------------------------
@@ -1531,7 +1769,7 @@ mod tests {
     /// `APIService` with a crafted `spec.service.namespace` containing `/` must be rejected
     /// outright, not proxied. Without the `validate_name` check in `backend_base_url`, this
     /// would build `https://sample-api.agg-1/evil.example.com.svc:443` and attempt to dial
-    /// it — forwarding whatever Authorization header the caller sent (see `proxy_to_backend`)
+    /// it — asserting the caller's identity via X-Remote-User/-Group (see `proxy_to_backend`)
     /// to a host an attacker fully controls via the crafted namespace. Asserting a distinct
     /// status (not 503, which is what an *unreachable-but-well-formed* backend returns —
     /// see `proxy_middleware_returns_503_not_502_when_backend_unreachable`) proves the
@@ -1581,7 +1819,8 @@ mod tests {
         assert!(
             resp.status().is_client_error() || resp.status().is_server_error(),
             "a crafted spec.service.namespace must produce an error response, not a 2xx that \
-             would mean the caller's bearer token was silently forwarded somewhere"
+             would mean the caller's identity was silently asserted to an attacker-controlled \
+             destination"
         );
     }
 

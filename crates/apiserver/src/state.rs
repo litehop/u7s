@@ -603,6 +603,15 @@ pub struct AppState<S = SqliteStore> {
     /// Stored here so the per-webhook reqwest::Client can present the same identity as the shared
     /// webhook_client when talking to the konnectivity proxy (which requires mTLS).
     pub webhook_identity_pem: Option<Arc<Vec<u8>>>,
+    /// Concatenated PEM (cert + key) presented to AGGREGATED BACKENDS (not to u7s itself)
+    /// by `handlers::aggregation::build_backend_client`. Signed by the dedicated front-proxy
+    /// CA (`TlsMaterial::proxy_client_cert_pem`'s doc), NOT the same identity as
+    /// `webhook_identity_pem` (which is the admin cert, signed by the main cluster CA) —
+    /// an aggregated backend trusts this one specifically via `requestheader-client-ca-file`
+    /// to assert X-Remote-User/-Group identity. Not part of `AppStateConfig`: no test caller
+    /// needs a non-default value at construction time, so `run()` sets this field directly
+    /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
+    pub proxy_client_identity_pem: Option<Arc<Vec<u8>>>,
     /// PEM-encoded RSA public key for the SA signing key.
     /// Stored so the OIDC JWKS endpoint can serve the public key material without
     /// holding a reference to the private key. None when SA key is unavailable.
@@ -695,6 +704,7 @@ impl<S> Clone for AppState<S> {
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
             webhook_identity_pem: self.webhook_identity_pem.clone(),
+            proxy_client_identity_pem: self.proxy_client_identity_pem.clone(),
             sa_public_key_pem: self.sa_public_key_pem.clone(),
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
@@ -891,6 +901,9 @@ impl<S: Store> AppState<S> {
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
             webhook_identity_pem: cfg.webhook_identity_pem.map(Arc::new),
+            // Not part of AppStateConfig: see the field's own doc — run() sets this
+            // directly after construction, same pattern as node_kubelet_ports above.
+            proxy_client_identity_pem: None,
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),

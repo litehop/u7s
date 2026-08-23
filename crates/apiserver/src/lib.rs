@@ -280,28 +280,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     )?;
 
     // 6. Load optional static token map.
-    let mut token_map = match &args.token_auth_file {
+    let token_map = match &args.token_auth_file {
         Some(path) => {
             tracing::info!("loading token auth file: {path}");
             auth::load_token_file(path)?
         }
         None => std::collections::HashMap::new(),
     };
-    // Also recognize the bearer token embedded in the admin kubeconfig (see
-    // TlsMaterial::admin_bearer_token's doc for why): without this, an aggregated backend
-    // (e.g. metrics-server) sees every request from kubectl/KCM — which authenticate to us
-    // via the admin cert only, never a bearer token — as unauthenticated, because
-    // handlers::aggregation's proxy only forwards an Authorization header that already
-    // exists, it never mints one from the resolved x509 identity.
-    token_map.insert(
-        tls_material.admin_bearer_token.clone(),
-        auth::UserInfo {
-            username: "admin".to_owned(),
-            uid: "00000000-0000-0000-0000-0000000000fe".to_owned(),
-            groups: vec!["system:masters".to_owned()],
-            extra: std::collections::HashMap::new(),
-        },
-    );
 
     // 7. Load or generate the SA signing key.
     let (sa_encoding_key, sa_decoding_key, sa_public_key_pem) =
@@ -377,6 +362,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
     let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
     kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
+    // Combine proxy-client cert PEM + key PEM for the mTLS identity presented to
+    // AGGREGATED BACKENDS (see `TlsMaterial::proxy_client_cert_pem`'s doc) — distinct from
+    // webhook_identity_pem (the admin cert) above.
+    let mut proxy_client_identity_pem = tls_material.proxy_client_cert_pem.clone();
+    proxy_client_identity_pem.extend_from_slice(&tls_material.proxy_client_key_pem);
     let mut state = state::AppState::new_with_config(state::AppStateConfig {
         store: Arc::clone(&store),
         sa_key: sa_encoding_key,
@@ -393,6 +383,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
         sa_public_key_pem,
     });
+    // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
+    state.proxy_client_identity_pem = Some(Arc::new(proxy_client_identity_pem));
     state.node_kubelet_ports = parse_node_kubelet_ports(&args.node_kubelet_port)?;
     // Resolve the SA-JWT signature-verify cache capacity: --sa-sig-cache-size, then
     // U7S_SA_SIG_CACHE_SIZE, then the default. Overwrites the AppStateConfig-default cache
@@ -508,12 +500,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     {
         let reconcile_store = Arc::clone(&store);
         let ca_cert_path = args.ca_cert.clone();
+        let proxy_client_ca_cert_path = args.proxy_client_ca_cert.clone();
         tokio::spawn(async move {
             let mut consecutive_errors: u32 = 0;
             loop {
-                let ok =
-                    reconcile_extension_apiserver_authentication(&reconcile_store, &ca_cert_path)
-                        .await;
+                let ok = reconcile_extension_apiserver_authentication(
+                    &reconcile_store,
+                    &ca_cert_path,
+                    &proxy_client_ca_cert_path,
+                )
+                .await;
                 if ok {
                     consecutive_errors = 0;
                 } else {
@@ -3046,14 +3042,17 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
 /// controller (`pkg/controlplane/controller/clusterauthenticationtrust`), which re-syncs
 /// this ConfigMap whenever its `dynamiccertificates.CAContentProvider` sees new CA
 /// content — implemented here as a polling reconcile loop, not a one-shot seed, so this
-/// doesn't need to be revisited if/when u7s ever adds CA rotation (the CA cert is read
-/// fresh from `ca_cert_path` on every tick).
+/// doesn't need to be revisited if/when u7s ever adds CA rotation (both CA certs are read
+/// fresh from disk on every tick).
 ///
-/// Only `client-ca-file` is populated. u7s does not implement requestheader-based
-/// delegated auth for aggregated backends (see `handlers::aggregation`'s module doc —
-/// backends authenticate the original caller via delegated TokenReview instead), so the
-/// `requestheader-*` keys are omitted, matching upstream's own behavior when no
-/// requestheader authenticator is configured.
+/// Populates the real front-proxy trust anchor: `requestheader-client-ca-file` (the
+/// dedicated proxy-client CA, `TlsMaterial::proxy_client_cert_pem`'s doc) plus the fixed
+/// `requestheader-username-headers`/`-group-headers`/`-extra-headers-prefix`/
+/// `-allowed-names` u7s always uses (see `handlers::aggregation::proxy_to_backend`) —
+/// matching upstream's own `clusterauthenticationtrust` controller output. `client-ca-file`
+/// (the main cluster CA) is unrelated to request-header auth but is populated for the same
+/// reason upstream does: some aggregated backends mirror it into their own `--client-ca-file`
+/// for direct x509 auth of non-proxied callers.
 ///
 /// Returns `true` on success (including "already up to date"), `false` on any I/O or
 /// store error, so the caller's exponential-backoff loop can distinguish real failures
@@ -3061,6 +3060,7 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
 pub async fn reconcile_extension_apiserver_authentication(
     store: &SqliteStore,
     ca_cert_path: &str,
+    proxy_client_ca_cert_path: &str,
 ) -> bool {
     use bytes::Bytes;
     use u7s_store::Store;
@@ -3077,6 +3077,19 @@ pub async fn reconcile_extension_apiserver_authentication(
     };
     let ca_pem =
         String::from_utf8_lossy(&tls::pem_encode("CERTIFICATE", &ca_cert_der)).into_owned();
+
+    let proxy_client_ca_der = match std::fs::read(proxy_client_ca_cert_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "extension-apiserver-authentication reconciler: failed to read front-proxy \
+                 CA cert {proxy_client_ca_cert_path}: {e}"
+            );
+            return false;
+        }
+    };
+    let proxy_client_ca_pem =
+        String::from_utf8_lossy(&tls::pem_encode("CERTIFICATE", &proxy_client_ca_der)).into_owned();
 
     let key = keys::object_key(
         "configmaps",
@@ -3095,7 +3108,10 @@ pub async fn reconcile_extension_apiserver_authentication(
                     return false;
                 }
             };
-            if existing["data"]["client-ca-file"].as_str() == Some(ca_pem.as_str()) {
+            if existing["data"]["client-ca-file"].as_str() == Some(ca_pem.as_str())
+                && existing["data"]["requestheader-client-ca-file"].as_str()
+                    == Some(proxy_client_ca_pem.as_str())
+            {
                 return true;
             }
             (obj.revision, existing)
@@ -3121,6 +3137,15 @@ pub async fn reconcile_extension_apiserver_authentication(
         }
     };
     body["data"]["client-ca-file"] = serde_json::Value::String(ca_pem);
+    body["data"]["requestheader-client-ca-file"] = serde_json::Value::String(proxy_client_ca_pem);
+    body["data"]["requestheader-allowed-names"] =
+        serde_json::Value::String("[\"front-proxy-client\"]".to_owned());
+    body["data"]["requestheader-extra-headers-prefix"] =
+        serde_json::Value::String("[\"X-Remote-Extra-\"]".to_owned());
+    body["data"]["requestheader-group-headers"] =
+        serde_json::Value::String("[\"X-Remote-Group\"]".to_owned());
+    body["data"]["requestheader-username-headers"] =
+        serde_json::Value::String("[\"X-Remote-User\"]".to_owned());
 
     match store
         .put(&key, Bytes::from(body.to_string()), Some(expected_revision))
@@ -3129,7 +3154,7 @@ pub async fn reconcile_extension_apiserver_authentication(
         Ok(_) => {
             tracing::info!(
                 "reconciled ConfigMap kube-system/extension-apiserver-authentication \
-                 (client-ca-file updated)"
+                 (client-ca-file / requestheader-* updated)"
             );
             true
         }
@@ -6764,11 +6789,16 @@ mod tests {
         );
     }
 
-    /// Returns a unique temp file path for a test-local CA cert, writing `bytes` to it.
-    /// `reconcile_extension_apiserver_authentication` only reads the file's raw bytes and
-    /// PEM-wraps them — it never parses them as a real certificate — so arbitrary bytes are
-    /// sufficient to exercise the reconciler without paying for real cert generation.
-    fn write_temp_ca_cert(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+    /// Returns a unique temp dir with `ca.crt`/`proxy-client-ca.crt` written to it (contents
+    /// `ca_bytes`/`proxy_ca_bytes` respectively). `reconcile_extension_apiserver_authentication`
+    /// only reads each file's raw bytes and PEM-wraps them — it never parses them as real
+    /// certificates — so arbitrary bytes are sufficient to exercise the reconciler without
+    /// paying for real cert generation.
+    fn write_temp_ca_certs(
+        tag: &str,
+        ca_bytes: &[u8],
+        proxy_ca_bytes: &[u8],
+    ) -> std::path::PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6777,25 +6807,31 @@ mod tests {
         let tid = std::thread::current().id();
         let dir = std::env::temp_dir().join(format!("u7s-authinfo-test-{tag}-{nanos}-{tid:?}"));
         std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
-        let path = dir.join("ca.crt");
-        std::fs::write(&path, bytes).expect("write temp CA cert"); // lgtm[rust/path-injection]
-        path
+        std::fs::write(dir.join("ca.crt"), ca_bytes).expect("write temp CA cert"); // lgtm[rust/path-injection]
+        std::fs::write(dir.join("proxy-client-ca.crt"), proxy_ca_bytes) // lgtm[rust/path-injection]
+            .expect("write temp front-proxy CA cert");
+        dir
     }
 
-    /// On a fresh cluster (no prior extension-apiserver-authentication ConfigMap),
-    /// the first reconcile tick must create it with client-ca-file set from the on-disk
-    /// CA cert. Without this, metrics-server's ConfigMapCAFileContent informer retries
-    /// against a 404 forever (the bug this reconciler exists to fix — see module-level
-    /// bead context), and any future aggregated backend that actually needs delegated
-    /// request-header auth (rather than tolerating its absence) would never see a CA to
-    /// trust.
+    /// On a fresh cluster (no prior extension-apiserver-authentication ConfigMap), the
+    /// first reconcile tick must create it with `client-ca-file` AND the real front-proxy
+    /// trust anchor (`requestheader-client-ca-file` plus the fixed `requestheader-*-headers`/
+    /// `-allowed-names` keys) populated. Without `client-ca-file`, metrics-server's
+    /// `ConfigMapCAFileContent` informer retries against a 404 forever (the original bug
+    /// this reconciler exists to fix); without the `requestheader-*` keys, an aggregated
+    /// backend never trusts the proxy-client cert `handlers::aggregation::proxy_to_backend`
+    /// presents, so it never trusts the X-Remote-User/-Group headers that ride along with it.
     #[tokio::test]
     async fn reconcile_extension_apiserver_authentication_creates_configmap_on_fresh_cluster() {
         let store = make_store();
-        let ca_path = write_temp_ca_cert("fresh", b"fake-ca-der-bytes-v1");
+        let dir = write_temp_ca_certs("fresh", b"fake-ca-der-bytes-v1", b"fake-proxy-ca-v1");
 
-        let ok =
-            reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        let ok = reconcile_extension_apiserver_authentication(
+            &store,
+            &dir.join("ca.crt").to_string_lossy(),
+            &dir.join("proxy-client-ca.crt").to_string_lossy(),
+        )
+        .await;
         assert!(ok, "reconcile must succeed against a fresh, empty store");
 
         let key = keys::object_key(
@@ -6818,14 +6854,36 @@ mod tests {
             "client-ca-file must contain the PEM-encoded bytes of the on-disk CA cert, or \
              an aggregated backend's RequestHeaderAuthRequestController has nothing to trust"
         );
-        assert!(
-            cm["data"]["requestheader-client-ca-file"].is_null(),
-            "u7s does not implement requestheader-based delegated auth for aggregated \
-             backends (see handlers::aggregation's module doc) — populating this key would \
-             falsely advertise a trust path that doesn't work"
+        let expected_proxy_pem =
+            String::from_utf8(tls::pem_encode("CERTIFICATE", b"fake-proxy-ca-v1")).unwrap();
+        assert_eq!(
+            cm["data"]["requestheader-client-ca-file"].as_str(),
+            Some(expected_proxy_pem.as_str()),
+            "requestheader-client-ca-file must contain the PEM-encoded dedicated front-proxy \
+             CA, or an aggregated backend never trusts the proxy-client cert presented by \
+             handlers::aggregation::proxy_to_backend and falls back to treating every \
+             proxied request as anonymous"
+        );
+        assert_eq!(
+            cm["data"]["requestheader-username-headers"].as_str(),
+            Some("[\"X-Remote-User\"]"),
+            "must advertise X-Remote-User as the username header, matching what \
+             proxy_to_backend actually sets"
+        );
+        assert_eq!(
+            cm["data"]["requestheader-group-headers"].as_str(),
+            Some("[\"X-Remote-Group\"]")
+        );
+        assert_eq!(
+            cm["data"]["requestheader-extra-headers-prefix"].as_str(),
+            Some("[\"X-Remote-Extra-\"]")
+        );
+        assert_eq!(
+            cm["data"]["requestheader-allowed-names"].as_str(),
+            Some("[\"front-proxy-client\"]")
         );
 
-        let _ = std::fs::remove_dir_all(ca_path.parent().unwrap()); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// A CA rotation (the on-disk CA cert file's content changes) must be picked up on the
@@ -6838,15 +6896,26 @@ mod tests {
     #[tokio::test]
     async fn reconcile_extension_apiserver_authentication_updates_configmap_on_ca_rotation() {
         let store = make_store();
-        let ca_path = write_temp_ca_cert("rotate", b"fake-ca-der-bytes-v1");
+        let dir = write_temp_ca_certs("rotate", b"fake-ca-der-bytes-v1", b"fake-proxy-ca-v1");
+        let ca_path = dir.join("ca.crt");
+        let proxy_ca_path = dir.join("proxy-client-ca.crt");
 
-        reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        reconcile_extension_apiserver_authentication(
+            &store,
+            &ca_path.to_string_lossy(),
+            &proxy_ca_path.to_string_lossy(),
+        )
+        .await;
 
         // Simulate CA rotation: the file's content changes on disk without a restart.
         std::fs::write(&ca_path, b"fake-ca-der-bytes-v2-rotated").expect("rewrite CA cert"); // lgtm[rust/path-injection]
 
-        let ok =
-            reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        let ok = reconcile_extension_apiserver_authentication(
+            &store,
+            &ca_path.to_string_lossy(),
+            &proxy_ca_path.to_string_lossy(),
+        )
+        .await;
         assert!(ok, "reconcile must succeed after CA rotation");
 
         let key = keys::object_key(
@@ -6872,10 +6941,63 @@ mod tests {
              every aggregated backend keeps trusting a retired CA after rotation"
         );
 
-        let _ = std::fs::remove_dir_all(ca_path.parent().unwrap()); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// When the on-disk CA cert is unchanged between ticks, the reconciler must not write
+    /// Regression test for the "return early only if BOTH CAs already match" logic: a
+    /// front-proxy CA rotation must be picked up even when the (unrelated) main cluster CA
+    /// is UNCHANGED. A naive "skip write if client-ca-file matches" check (checking only
+    /// one of the two CA fields) would silently leave requestheader-client-ca-file stale
+    /// forever once client-ca-file happened to already match, permanently breaking the
+    /// aggregation front-proxy trust anchor with no further reconcile tick able to fix it.
+    #[tokio::test]
+    async fn reconcile_extension_apiserver_authentication_updates_on_proxy_ca_rotation_alone() {
+        let store = make_store();
+        let dir = write_temp_ca_certs("proxy-rotate", b"stable-cluster-ca", b"proxy-ca-v1");
+        let ca_path = dir.join("ca.crt");
+        let proxy_ca_path = dir.join("proxy-client-ca.crt");
+
+        reconcile_extension_apiserver_authentication(
+            &store,
+            &ca_path.to_string_lossy(),
+            &proxy_ca_path.to_string_lossy(),
+        )
+        .await;
+
+        // Rotate ONLY the front-proxy CA; the cluster CA file is untouched.
+        std::fs::write(&proxy_ca_path, b"proxy-ca-v2-rotated").expect("rewrite proxy CA"); // lgtm[rust/path-injection]
+
+        reconcile_extension_apiserver_authentication(
+            &store,
+            &ca_path.to_string_lossy(),
+            &proxy_ca_path.to_string_lossy(),
+        )
+        .await;
+
+        let key = keys::object_key(
+            "configmaps",
+            "kube-system",
+            "extension-apiserver-authentication",
+        );
+        let obj = store
+            .get(&key)
+            .await
+            .expect("get must not fail")
+            .expect("ConfigMap must still exist");
+        let cm: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+        let expected_pem =
+            String::from_utf8(tls::pem_encode("CERTIFICATE", b"proxy-ca-v2-rotated")).unwrap();
+        assert_eq!(
+            cm["data"]["requestheader-client-ca-file"].as_str(),
+            Some(expected_pem.as_str()),
+            "requestheader-client-ca-file must reflect the rotated front-proxy CA even though \
+             client-ca-file (the unrelated cluster CA) never changed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// When both on-disk CA certs are unchanged between ticks, the reconciler must not write
     /// to the store. An unconditional write every tick would bump the ConfigMap's
     /// resourceVersion and fire a spurious MODIFIED event on every poll interval,
     /// flooding any watcher of this ConfigMap (mirrors the same concern already tested for
@@ -6883,9 +7005,16 @@ mod tests {
     #[tokio::test]
     async fn reconcile_extension_apiserver_authentication_skips_write_when_ca_unchanged() {
         let store = make_store();
-        let ca_path = write_temp_ca_cert("unchanged", b"fake-ca-der-bytes-stable");
+        let dir = write_temp_ca_certs("unchanged", b"fake-ca-der-bytes-stable", b"fake-proxy-ca");
+        let ca_path = dir.join("ca.crt");
+        let proxy_ca_path = dir.join("proxy-client-ca.crt");
 
-        reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        reconcile_extension_apiserver_authentication(
+            &store,
+            &ca_path.to_string_lossy(),
+            &proxy_ca_path.to_string_lossy(),
+        )
+        .await;
         let key = keys::object_key(
             "configmaps",
             "kube-system",
@@ -6898,7 +7027,12 @@ mod tests {
             .unwrap()
             .revision;
 
-        reconcile_extension_apiserver_authentication(&store, &ca_path.to_string_lossy()).await;
+        reconcile_extension_apiserver_authentication(
+            &store,
+            &ca_path.to_string_lossy(),
+            &proxy_ca_path.to_string_lossy(),
+        )
+        .await;
         let revision_after_second = store
             .get(&key)
             .await
@@ -6912,7 +7046,7 @@ mod tests {
              — spurious writes would generate a MODIFIED watch event every poll interval"
         );
 
-        let _ = std::fs::remove_dir_all(ca_path.parent().unwrap()); // lgtm[rust/path-injection]
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     #[tokio::test]
@@ -9656,7 +9790,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: dir.join("admin-token").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,

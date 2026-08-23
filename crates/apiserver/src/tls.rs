@@ -241,34 +241,6 @@ fn load_or_generate_ca(
     Ok((ca_key, ca_params, ca_cert_der))
 }
 
-/// Load-or-generate the admin bearer token embedded in the admin kubeconfig.
-///
-/// Design: mirrors `load_or_generate_sa_keys` — `authenticate()` treats a
-/// present-but-unrecognized `Authorization` header as fatal and never falls
-/// back to checking the x509 client cert (see its doc comment), so minting a
-/// fresh random token on every restart would silently reject every
-/// pre-restart kubeconfig with 401 Unauthorized the instant the apiserver
-/// restarts, even though the CA and the client cert it signed are both still
-/// perfectly valid. Persisting the token keeps it, and therefore old
-/// kubeconfigs, valid across restarts.
-fn load_or_generate_admin_bearer_token(path: &str) -> anyhow::Result<String> {
-    if std::path::Path::new(path).exists() {
-        let token = std::fs::read_to_string(validate_cli_path(std::path::Path::new(path))?)
-            .map_err(|e| anyhow::anyhow!("read admin bearer token {path}: {e}"))?;
-        tracing::info!("loaded admin bearer token from {path}");
-        return Ok(token.trim().to_owned());
-    }
-
-    let token = uuid::Uuid::new_v4().to_string();
-    write_private_key(
-        validate_cli_path(std::path::Path::new(path))?,
-        token.as_bytes(),
-    )
-    .map_err(|e| anyhow::anyhow!("write admin bearer token {path}: {e}"))?;
-    tracing::info!("generated new admin bearer token → {path}");
-    Ok(token)
-}
-
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,
@@ -303,28 +275,20 @@ pub struct TlsMaterial {
     pub bootstrap_installer_cert_der: Vec<u8>,
     /// PEM-encoded bootstrap-installer client private key.
     pub bootstrap_installer_key_pem: Vec<u8>,
-    /// Bearer token embedded in the admin kubeconfig alongside the client cert.
-    ///
-    /// kubectl/KCM authenticate to us via the admin cert (mTLS) only, so the HTTP request
-    /// they send never carries an Authorization header for the aggregation proxy
-    /// (`handlers::aggregation::proxy_middleware`) to forward — it only forwards whatever
-    /// Authorization header is already present, it does not mint one from the resolved
-    /// x509 identity. Without this token, an aggregated backend (e.g. metrics-server) sees
-    /// every such request as unauthenticated and denies it, even though u7s's own RBAC
-    /// already granted the caller full access. `client-go`'s transport sends the bearer
-    /// token in the Authorization header independently of presenting the TLS client cert,
-    /// so both credentials travel on the same request; main.rs seeds this token into
-    /// `token_map` so u7s's own authenticate() (which uses the bearer token whenever the
-    /// request carries one, only falling back to the client cert when it does not) still
-    /// resolves the caller to the identical admin/system:masters identity.
-    ///
-    /// Persisted via `load_or_generate_admin_bearer_token` (mirroring the CA/SA-key
-    /// load-or-generate pattern) so a kubeconfig copied off the box before a restart
-    /// keeps authenticating afterward: `authenticate()` never falls back to the x509
-    /// client cert once an Authorization header is present, so a freshly minted token
-    /// on every restart would reject that stale kubeconfig with 401 Unauthorized even
-    /// though its client cert (signed by the still-stable CA) is otherwise fine.
-    pub admin_bearer_token: String,
+    /// PEM-encoded proxy-client certificate (CN=front-proxy-client), signed by the
+    /// DEDICATED front-proxy CA (`--proxy-client-ca-key`/`--proxy-client-ca-cert`), not
+    /// the main cluster CA. Presented by u7s to AGGREGATED BACKENDS (never to u7s itself)
+    /// — analogous to real kube-apiserver's `--proxy-client-cert-file`. The backend trusts
+    /// it via `requestheader-client-ca-file` (populated from the `kube-system/extension-
+    /// apiserver-authentication` ConfigMap — see `reconcile_extension_apiserver_authentication`)
+    /// and, once trusted, believes whatever `X-Remote-User`/`X-Remote-Group` headers
+    /// accompany the request (see `handlers::aggregation::proxy_to_backend`) instead of
+    /// re-authenticating the original caller itself. Signing this from a CA distinct from
+    /// the one that signs admin/KCM/scheduler/kubelet-client certs means none of those
+    /// OTHER certs can be replayed directly against an aggregated backend to spoof identity.
+    pub proxy_client_cert_pem: Vec<u8>,
+    /// PEM-encoded proxy-client private key, paired with `proxy_client_cert_pem`.
+    pub proxy_client_key_pem: Vec<u8>,
     /// Configured rustls ServerConfig for the axum server.
     pub server_config: Arc<ServerConfig>,
 }
@@ -468,6 +432,28 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let bootstrap_installer_cert =
         bootstrap_installer_params.signed_by(&bootstrap_installer_key, &ca_issuer)?;
 
+    // --- Dedicated front-proxy CA: load-or-generate ---
+    // A CA distinct from the main cluster CA above -- see `TlsMaterial::proxy_client_cert_pem`'s
+    // doc for why a dedicated CA (not just a dedicated leaf cert under the shared CA, like
+    // KCM/scheduler/kubelet-client above) matters here: it's what an aggregated backend
+    // trusts via requestheader-client-ca-file, so only a leaf THIS CA signed can assert
+    // X-Remote-User/-Group identity, regardless of what other certs the cluster CA has signed.
+    let (proxy_client_ca_key, proxy_client_ca_params, _proxy_client_ca_cert_der) =
+        load_or_generate_ca(&args.proxy_client_ca_key, &args.proxy_client_ca_cert)?;
+    let proxy_client_ca_issuer = Issuer::new(proxy_client_ca_params, proxy_client_ca_key);
+
+    // --- Proxy-client cert ---
+    // CN follows kubeadm's own "front-proxy-client" convention. Presented to aggregated
+    // backends only (see doc); no O= is needed since the backend's own RBAC/authorization
+    // config never sees this cert's Subject, only the X-Remote-User/-Group headers it vouches for.
+    let proxy_client_key = KeyPair::generate()?;
+    let mut proxy_client_params = CertificateParams::default();
+    proxy_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "front-proxy-client");
+    let proxy_client_cert =
+        proxy_client_params.signed_by(&proxy_client_key, &proxy_client_ca_issuer)?;
+
     // --- Build rustls ServerConfig ---
     // Present only the leaf cert in the chain. The CA cert is already in the
     // kubelet's trust store (via kubeconfig certificate-authority-data). Including
@@ -513,6 +499,8 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let kcm_cert_der = kcm_cert.der().to_vec();
     let scheduler_cert_der = scheduler_cert.der().to_vec();
     let bootstrap_installer_cert_der = bootstrap_installer_cert.der().to_vec();
+    let proxy_client_cert_der = proxy_client_cert.der().to_vec();
+    let proxy_client_cert_pem = pem_encode("CERTIFICATE", &proxy_client_cert_der);
     Ok(TlsMaterial {
         ca_cert_der,
         server_cert_der,
@@ -527,7 +515,8 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         scheduler_key_pem: scheduler_key.serialize_pem().into_bytes(),
         bootstrap_installer_cert_der,
         bootstrap_installer_key_pem: bootstrap_installer_key.serialize_pem().into_bytes(),
-        admin_bearer_token: load_or_generate_admin_bearer_token(&args.admin_token_path)?,
+        proxy_client_cert_pem,
+        proxy_client_key_pem: proxy_client_key.serialize_pem().into_bytes(),
         server_config: Arc::new(server_config),
     })
 }
@@ -547,29 +536,29 @@ pub(crate) fn pem_encode(label: &str, der: &[u8]) -> Vec<u8> {
 
 /// Typed builder for a minimal kubeconfig.
 /// Serialised to YAML manually — no serde_yaml dependency required.
+///
+/// Cert-only, matching kubeadm/k3s's own admin-kubeconfig shape — no bearer token field.
+/// Every identity this module writes (admin included) authenticates via x509 client cert
+/// alone; `handlers::aggregation`'s proxy asserts the caller's ALREADY-resolved identity to
+/// aggregated backends via X-Remote-User/-Group headers (see `proxy_to_backend`), so no
+/// caller ever needs its own bearer token forwarded for that to work.
 struct Kubeconfig {
     server: String,
     ca_data: String,
     cert_data: String,
     key_data: String,
-    /// `None` for dedicated component identities (KCM, scheduler): they authenticate via
-    /// x509 client cert only and never go through `handlers::aggregation`'s proxy, so they
-    /// have no need for the admin-bearer-token forwarding shim (see `admin_bearer_token`'s doc).
-    token: Option<String>,
     user: String,
 }
 
 impl Kubeconfig {
     fn new(server: &str, tls: &TlsMaterial) -> Self {
-        let mut kc = Self::for_identity(
+        Self::for_identity(
             server,
             tls,
             &tls.admin_cert_der,
             &tls.admin_key_pem,
             "admin",
-        );
-        kc.token = Some(tls.admin_bearer_token.clone());
-        kc
+        )
     }
 
     /// Build a kubeconfig for a dedicated non-admin component identity (KCM, scheduler),
@@ -591,16 +580,11 @@ impl Kubeconfig {
             ca_data: b64.encode(&ca_pem),
             cert_data: b64.encode(&cert_pem),
             key_data: b64.encode(key_pem),
-            token: None,
             user: username.to_owned(),
         }
     }
 
     fn to_yaml(&self) -> String {
-        let token_line = match &self.token {
-            Some(token) => format!("\x20   token: {token}\n"),
-            None => String::new(),
-        };
         format!(
             "apiVersion: v1\n\
              kind: Config\n\
@@ -619,8 +603,7 @@ impl Kubeconfig {
              - name: {user}\n\
              \x20 user:\n\
              \x20   client-certificate-data: {cert_data}\n\
-             \x20   client-key-data: {key_data}\n\
-             {token_line}",
+             \x20   client-key-data: {key_data}\n",
             server = self.server,
             ca_data = self.ca_data,
             user = self.user,
@@ -706,6 +689,18 @@ mod tests {
         dir
     }
 
+    /// Strip PEM armor and base64-decode back to DER — the test-only inverse of
+    /// `pem_encode`, needed because `TlsMaterial::proxy_client_cert_pem` (unlike
+    /// `kcm_cert_der`/`scheduler_cert_der`) is stored PEM-encoded, not DER.
+    fn der_from_pem(pem: &[u8]) -> Vec<u8> {
+        use base64::Engine;
+        let s = std::str::from_utf8(pem).expect("pem must be utf8");
+        let b64: String = s.lines().filter(|l| !l.starts_with("-----")).collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("valid base64 PEM body")
+    }
+
     fn args_with(advertise_address: Option<&str>) -> Args {
         Args {
             db: "./state.db".into(),
@@ -716,7 +711,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: "./ca.key".into(),
             ca_cert: "./ca.crt".into(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: advertise_address.map(str::to_owned),
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -920,7 +916,14 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: ca_key_path.clone(),
             ca_cert: ca_cert_path.clone(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -953,48 +956,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// Regression test for the "kubeconfig copied off the box before a restart stops
-    /// authenticating" bug (mayor-1oj4d): live repro against a real install.sh-provisioned
-    /// box showed `kubectl get nodes` with the pre-restart kubeconfig failing with a clean
-    /// HTTP 401 "Unauthorized" — not a TLS/x509 error — even though the CA file's mtime
-    /// was provably unchanged across the restart. Root cause: `authenticate()` treats a
-    /// present-but-unrecognized `Authorization: Bearer <token>` header as fatal and never
-    /// falls back to checking the x509 client cert, so a bearer token minted fresh (via
-    /// `uuid::Uuid::new_v4()`) on every `generate_tls()` call invalidated every kubeconfig
-    /// issued before the restart, regardless of the CA/cert staying stable. Call
-    /// generate_tls() twice against the same on-disk state dir and assert the admin bearer
-    /// token is identical — proving it was loaded, not regenerated. Revert
-    /// load_or_generate_admin_bearer_token back to an unconditional `Uuid::new_v4()` call
-    /// and this test fails.
+    /// The dedicated front-proxy CA must persist across restarts, exactly like the main
+    /// cluster CA (`ca_key_is_loaded_not_regenerated` above): aggregated backends trust it
+    /// via `requestheader-client-ca-file`, and a freshly-minted CA on every restart would
+    /// make every backend reject the proxy-client cert the very next tick, silently
+    /// breaking the aggregation proxy until the backend's own informer re-syncs.
     #[test]
-    fn admin_bearer_token_is_loaded_not_regenerated() {
-        let dir = test_temp_dir("admin-token-persist");
+    fn proxy_client_ca_is_loaded_not_regenerated() {
+        let dir = test_temp_dir("proxy-client-ca-persist");
         let args = Args {
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: dir.join("admin-token").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             ..args_with(None)
         };
 
-        let admin_token_path = dir.join("admin-token");
-
-        // First call: generates and writes the admin bearer token.
-        let tls1 = generate_tls(&args).expect("first generate_tls failed");
+        // First call: generates and writes the front-proxy CA files.
+        generate_tls(&args).expect("first generate_tls failed");
         assert!(
-            admin_token_path.exists(),
-            "admin bearer token file must be written on first call"
+            dir.join("proxy-client-ca.key").exists(),
+            "proxy-client-ca.key must be written on first call"
         );
+        let ca_cert_after_first =
+            std::fs::read(dir.join("proxy-client-ca.crt")).expect("proxy-client-ca.crt readable");
 
-        // Second call (simulating a restart with the same on-disk state dir): must load
-        // the existing token, not mint a new one.
-        let tls2 = generate_tls(&args).expect("second generate_tls failed");
+        // Second call (simulating a restart): must load the existing CA, not mint a fresh
+        // one. The proxy-client LEAF cert is regenerated every call (same as the
+        // KCM/scheduler/admin leaves above — none of them persist their leaf either), which
+        // is fine: what an aggregated backend actually pins via requestheader-client-ca-file
+        // is the CA, not any one leaf it signs.
+        generate_tls(&args).expect("second generate_tls failed");
+        let ca_cert_after_second =
+            std::fs::read(dir.join("proxy-client-ca.crt")).expect("proxy-client-ca.crt readable");
 
         assert_eq!(
-            tls1.admin_bearer_token, tls2.admin_bearer_token,
-            "admin bearer token must be identical across restarts — otherwise every \
-             kubeconfig copied off the box before a restart is permanently rejected with \
-             401 Unauthorized, even though its client cert (signed by the still-stable CA) \
-             would otherwise still be valid"
+            ca_cert_after_first, ca_cert_after_second,
+            "the front-proxy CA cert on disk must be identical across restarts — a fresh CA \
+             every restart would invalidate every proxy-client leaf an aggregated backend \
+             already trusts via requestheader-client-ca-file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Regression/security test: the proxy-client cert must be signed by the DEDICATED
+    /// front-proxy CA, not the main cluster CA that signs admin/KCM/scheduler/kubelet-client
+    /// certs. If it were signed by the cluster CA instead, an aggregated backend configured
+    /// with `requestheader-client-ca-file` pointed at that SAME CA (a natural but wrong
+    /// simplification) would also trust the admin cert (or any other cluster-CA-signed
+    /// cert) to assert X-Remote-User/-Group identity directly — collapsing the whole point
+    /// of a dedicated front-proxy trust anchor.
+    #[test]
+    fn proxy_client_cert_is_signed_by_dedicated_ca_not_cluster_ca() {
+        let dir = test_temp_dir("proxy-client-ca-distinct");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls failed");
+
+        let cluster_ca_cn = crate::auth::extract_client_cert_identity(&tls.ca_cert_der)
+            .map(|id| id.username)
+            .expect("cluster CA cert must have a parseable Subject CN");
+        let proxy_client_ca_pem =
+            std::fs::read(dir.join("proxy-client-ca.crt")).expect("proxy-client-ca.crt readable");
+        let proxy_client_ca_cn = crate::auth::extract_client_cert_identity(&proxy_client_ca_pem)
+            .map(|id| id.username)
+            .expect("front-proxy CA cert must have a parseable Subject CN");
+
+        assert_ne!(
+            cluster_ca_cn, proxy_client_ca_cn,
+            "the front-proxy CA must be a DIFFERENT CA from the main cluster CA, or any \
+             cluster-CA-signed cert (admin, KCM, kubelet-client, ...) could be replayed \
+             directly against an aggregated backend to spoof X-Remote-User/-Group identity"
+        );
+
+        let proxy_client_id =
+            crate::auth::extract_client_cert_identity(&der_from_pem(&tls.proxy_client_cert_pem))
+                .expect("proxy_client_cert_pem must parse as a valid x509 cert");
+        assert_eq!(
+            proxy_client_id.username, "front-proxy-client",
+            "proxy-client cert's CN must be 'front-proxy-client' (kubeadm's own convention)"
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
@@ -1101,7 +1159,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1239,7 +1298,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1291,7 +1351,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1321,20 +1382,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// Regression test: kubectl/KCM authenticate to us via the admin client cert only, so
-    /// their requests carry no Authorization header at all. Before admin_bearer_token
-    /// existed, an aggregated backend (e.g. metrics-server) reached through
-    /// handlers::aggregation's proxy — which only forwards an Authorization header that
-    /// already exists on the request, it never mints one from the resolved x509 identity —
-    /// saw every such request as unauthenticated ("system:anonymous") and denied it, even
-    /// though u7s's own RBAC already granted the caller full access. Confirmed live: before
-    /// this fix, `kubectl top nodes` failed with "User \"system:anonymous\" cannot list
-    /// resource \"nodes\" in API group \"metrics.k8s.io\"" despite kubectl's own request to
-    /// u7s succeeding as admin. Revert the token line from Kubeconfig::to_yaml and this
-    /// test fails again.
+    /// Regression test: the admin kubeconfig must be cert-only, with NO `token:` field at
+    /// all — matching kubeadm/k3s's own admin-kubeconfig shape. A previous design embedded
+    /// a bearer token here purely so the aggregation proxy had an Authorization header to
+    /// forward to aggregated backends on kubectl/KCM's cert-only requests; that token
+    /// forced `authenticate()` into a bearer-token-wins-over-cert precedence rule, which is
+    /// exactly what broke every previously-issued kubeconfig on apiserver restart (the token
+    /// was originally minted fresh on every restart with no persistence — mayor-1oj4d). The
+    /// aggregation proxy now asserts the caller's already-resolved identity via
+    /// X-Remote-User/-Group headers instead (see `handlers::aggregation::proxy_to_backend`),
+    /// so no caller — cert-only or bearer-token — ever needs a second credential embedded
+    /// here. Reintroduce a token line in `Kubeconfig::to_yaml` and this test fails.
     #[test]
-    fn kubeconfig_yaml_embeds_admin_bearer_token_for_aggregation_proxy_forwarding() {
-        let dir = test_temp_dir("kubeconfig-token");
+    fn admin_kubeconfig_yaml_has_no_token_field() {
+        let dir = test_temp_dir("kubeconfig-no-token");
         let args = Args {
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
@@ -1345,10 +1406,9 @@ mod tests {
         let yaml = kc.to_yaml();
 
         assert!(
-            yaml.contains(&format!("token: {}", tls.admin_bearer_token)),
-            "kubeconfig YAML must embed the exact admin_bearer_token, or the aggregation \
-             proxy has nothing to forward to an aggregated backend on kubectl/KCM's \
-             cert-only requests; got: {yaml}"
+            !yaml.contains("token:"),
+            "admin kubeconfig must have no 'token:' field at all — it must be cert-only, \
+             matching kubeadm/k3s's own admin-kubeconfig shape; got: {yaml}"
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
@@ -1394,7 +1454,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1438,7 +1499,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: ca_key_path.to_string_lossy().into_owned(),
             ca_cert: ca_cert_path.to_string_lossy().into_owned(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1503,7 +1565,8 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            admin_token_path: "./admin-token".into(),
+            proxy_client_ca_key: "./proxy-client-ca.key".into(),
+            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1714,15 +1777,12 @@ mod tests {
     }
 
     /// Regression: `write_component_kubeconfig` must embed the given component's own
-    /// cert/key under its own username, and must NOT carry the admin bearer token —
-    /// that token exists solely so kubectl/admin's cert-only requests still carry an
-    /// Authorization header for the aggregation proxy to forward (see
-    /// `TlsMaterial::admin_bearer_token`'s doc); embedding it into a component
-    /// kubeconfig would make every KCM/scheduler request also present the raw admin
-    /// token, silently reintroducing the cluster-admin escape hatch this feature
-    /// exists to close.
+    /// cert/key under its own username, and must NOT carry any bearer token — every
+    /// identity this module writes is cert-only (see `Kubeconfig`'s doc), so a token
+    /// field here would silently grant whatever identity that token resolves to
+    /// alongside the component's own least-privilege cert.
     #[test]
-    fn write_component_kubeconfig_omits_admin_bearer_token_and_uses_component_identity() {
+    fn write_component_kubeconfig_uses_component_identity_with_no_token() {
         let dir = test_temp_dir("component-kubeconfig");
         let args = Args {
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
@@ -1746,12 +1806,6 @@ mod tests {
         assert!(
             yaml.contains("user: system:kube-scheduler"),
             "component kubeconfig must reference its own identity, not 'admin'; got: {yaml}"
-        );
-        assert!(
-            !yaml.contains(&tls.admin_bearer_token),
-            "component kubeconfig must never embed the admin bearer token — doing so would \
-             let a request authenticated via the scheduler's cert also carry cluster-admin \
-             credentials, defeating least-privilege; got: {yaml}"
         );
         assert!(
             !yaml.contains("token:"),
