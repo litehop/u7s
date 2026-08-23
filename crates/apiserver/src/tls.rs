@@ -241,6 +241,34 @@ fn load_or_generate_ca(
     Ok((ca_key, ca_params, ca_cert_der))
 }
 
+/// Load-or-generate the admin bearer token embedded in the admin kubeconfig.
+///
+/// Design: mirrors `load_or_generate_sa_keys` — `authenticate()` treats a
+/// present-but-unrecognized `Authorization` header as fatal and never falls
+/// back to checking the x509 client cert (see its doc comment), so minting a
+/// fresh random token on every restart would silently reject every
+/// pre-restart kubeconfig with 401 Unauthorized the instant the apiserver
+/// restarts, even though the CA and the client cert it signed are both still
+/// perfectly valid. Persisting the token keeps it, and therefore old
+/// kubeconfigs, valid across restarts.
+fn load_or_generate_admin_bearer_token(path: &str) -> anyhow::Result<String> {
+    if std::path::Path::new(path).exists() {
+        let token = std::fs::read_to_string(validate_cli_path(std::path::Path::new(path))?)
+            .map_err(|e| anyhow::anyhow!("read admin bearer token {path}: {e}"))?;
+        tracing::info!("loaded admin bearer token from {path}");
+        return Ok(token.trim().to_owned());
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    write_private_key(
+        validate_cli_path(std::path::Path::new(path))?,
+        token.as_bytes(),
+    )
+    .map_err(|e| anyhow::anyhow!("write admin bearer token {path}: {e}"))?;
+    tracing::info!("generated new admin bearer token → {path}");
+    Ok(token)
+}
+
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,
@@ -289,6 +317,13 @@ pub struct TlsMaterial {
     /// `token_map` so u7s's own authenticate() (which uses the bearer token whenever the
     /// request carries one, only falling back to the client cert when it does not) still
     /// resolves the caller to the identical admin/system:masters identity.
+    ///
+    /// Persisted via `load_or_generate_admin_bearer_token` (mirroring the CA/SA-key
+    /// load-or-generate pattern) so a kubeconfig copied off the box before a restart
+    /// keeps authenticating afterward: `authenticate()` never falls back to the x509
+    /// client cert once an Authorization header is present, so a freshly minted token
+    /// on every restart would reject that stale kubeconfig with 401 Unauthorized even
+    /// though its client cert (signed by the still-stable CA) is otherwise fine.
     pub admin_bearer_token: String,
     /// Configured rustls ServerConfig for the axum server.
     pub server_config: Arc<ServerConfig>,
@@ -492,7 +527,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         scheduler_key_pem: scheduler_key.serialize_pem().into_bytes(),
         bootstrap_installer_cert_der,
         bootstrap_installer_key_pem: bootstrap_installer_key.serialize_pem().into_bytes(),
-        admin_bearer_token: uuid::Uuid::new_v4().to_string(),
+        admin_bearer_token: load_or_generate_admin_bearer_token(&args.admin_token_path)?,
         server_config: Arc::new(server_config),
     })
 }
@@ -681,6 +716,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: "./ca.key".into(),
             ca_cert: "./ca.crt".into(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: advertise_address.map(str::to_owned),
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -884,6 +920,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: ca_key_path.clone(),
             ca_cert: ca_cert_path.clone(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -913,6 +950,53 @@ mod tests {
         );
 
         // Clean up.
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Regression test for the "kubeconfig copied off the box before a restart stops
+    /// authenticating" bug (mayor-1oj4d): live repro against a real install.sh-provisioned
+    /// box showed `kubectl get nodes` with the pre-restart kubeconfig failing with a clean
+    /// HTTP 401 "Unauthorized" — not a TLS/x509 error — even though the CA file's mtime
+    /// was provably unchanged across the restart. Root cause: `authenticate()` treats a
+    /// present-but-unrecognized `Authorization: Bearer <token>` header as fatal and never
+    /// falls back to checking the x509 client cert, so a bearer token minted fresh (via
+    /// `uuid::Uuid::new_v4()`) on every `generate_tls()` call invalidated every kubeconfig
+    /// issued before the restart, regardless of the CA/cert staying stable. Call
+    /// generate_tls() twice against the same on-disk state dir and assert the admin bearer
+    /// token is identical — proving it was loaded, not regenerated. Revert
+    /// load_or_generate_admin_bearer_token back to an unconditional `Uuid::new_v4()` call
+    /// and this test fails.
+    #[test]
+    fn admin_bearer_token_is_loaded_not_regenerated() {
+        let dir = test_temp_dir("admin-token-persist");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: dir.join("admin-token").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+
+        let admin_token_path = dir.join("admin-token");
+
+        // First call: generates and writes the admin bearer token.
+        let tls1 = generate_tls(&args).expect("first generate_tls failed");
+        assert!(
+            admin_token_path.exists(),
+            "admin bearer token file must be written on first call"
+        );
+
+        // Second call (simulating a restart with the same on-disk state dir): must load
+        // the existing token, not mint a new one.
+        let tls2 = generate_tls(&args).expect("second generate_tls failed");
+
+        assert_eq!(
+            tls1.admin_bearer_token, tls2.admin_bearer_token,
+            "admin bearer token must be identical across restarts — otherwise every \
+             kubeconfig copied off the box before a restart is permanently rejected with \
+             401 Unauthorized, even though its client cert (signed by the still-stable CA) \
+             would otherwise still be valid"
+        );
+
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
@@ -1017,6 +1101,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1154,6 +1239,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1205,6 +1291,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1307,6 +1394,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1350,6 +1438,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: ca_key_path.to_string_lossy().into_owned(),
             ca_cert: ca_cert_path.to_string_lossy().into_owned(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -1414,6 +1503,7 @@ mod tests {
             sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            admin_token_path: "./admin-token".into(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
