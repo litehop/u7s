@@ -106,10 +106,15 @@ jobs:
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release upload "$VERSION" dist/*.tar.gz --clobber
           else
+            # --generate-notes diffs against the previous release tag; with
+            # none yet (this repo's first release), it falls back to the
+            # entire commit history and trips GitHub's 125000-char release-
+            # body limit (HTTP 422, confirmed live). A short static note
+            # sidesteps that regardless of how much history has accumulated.
             prerelease_flag=""
             [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
             gh release create "$VERSION" dist/*.tar.gz \
               --title "$VERSION" \
-              --generate-notes \
+              --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64 and linux/arm64. Interim GitHub Release hosting -- see ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md §7 for the still-open real distribution-hosting question." \
               $prerelease_flag
           fi
