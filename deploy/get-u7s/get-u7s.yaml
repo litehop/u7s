@@ -1,16 +1,11 @@
 apiVersion: v1
-kind: Namespace
-metadata:
-  name: get-u7s
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: get-u7s-nginx-conf
-  namespace: get-u7s
+  labels:
+    app: get-u7s
 data:
   default.conf: |
-    resolver 1.1.1.1 8.8.8.8 [2606:4700:4700::1111] [2001:4860:4860::8888] ipv6=on valid=300s;
     recursive_error_pages on;
 
     server {
@@ -82,7 +77,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: get-u7s
-  namespace: get-u7s
   labels:
     app: get-u7s
 spec:
@@ -142,7 +136,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: get-u7s
-  namespace: get-u7s
+  labels:
+    app: get-u7s
 spec:
   ipFamilyPolicy: PreferDualStack
   selector:
@@ -156,27 +151,22 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: get-u7s
-  namespace: get-u7s
-  annotations:
-    # TODO(operator): fill in the real cluster-issuer name once the
-    # cert-manager/TLS wiring for this domain is decided -- not investigated
-    # by docs/decisions/distribution-hosting-shape.md.
-    cert-manager.io/cluster-issuer: "TODO-operator-cluster-issuer"
+  labels:
+    app: get-u7s
 spec:
-  # TODO(operator): fill in the real ingress class for this cluster.
-  ingressClassName: TODO-operator-ingress-class
   tls:
     - hosts:
-        - get.u7s.TODO-operator-domain.example
-      secretName: get-u7s-tls
+        - u7s.dekiru.tech
+      secretName: dekiru-tech-tls
   rules:
-    - host: get.u7s.TODO-operator-domain.example
+    - host: u7s.dekiru.tech
       http:
         paths:
-          - path: /
-            pathType: Prefix
-            backend:
+          - backend:
               service:
                 name: get-u7s
                 port:
                   name: http
+            path: /
+            pathType: Prefix
+            

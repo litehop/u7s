@@ -31,9 +31,5 @@ Footgun: `$upstream_http_location` reads empty if used directly in the next hop'
 
 ## Open items
 
-- Ingress `cert-manager.io/cluster-issuer`, `ingressClassName` and hostname are `TODO` placeholders.
-- External IPv6 reachability and `ipFamilyPolicy: PreferDualStack` are unverified against a real cluster.
 - `/install.sh` 404s until a non-prerelease `v*` tag is pushed -- both existing releases are prereleases.
-- `scripts/install.sh` still requires `--tarball <path>` and refuses URL fetches, so the one-liner is not yet end-to-end.
-- `resolver` points at public DNS; if egress NetworkPolicy blocks it, hop chasing fails. Swap in the cluster DNS ClusterIP if so.
 - `@follow_hop3` has no `error_page`, so a fourth GitHub hop would reach the client instead of failing loudly.
