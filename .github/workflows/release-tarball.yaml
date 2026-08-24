@@ -57,6 +57,18 @@ jobs:
       - name: Build tarball
         run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}"
 
+      - name: Compute checksum sidecar
+        # install.sh's fetch_tarball() hard-fails a download whose bytes
+        # don't match this sidecar -- raw hex, no filename, so it compares
+        # byte-for-byte against `sha256sum | cut -d' ' -f1`.
+        run: |
+          set -- dist/*.tar.gz
+          if [ $# -ne 1 ]; then
+            echo "error: expected exactly one tarball in dist/, found $#" >&2
+            exit 1
+          fi
+          sha256sum "$1" | cut -d' ' -f1 > "$1.sha256"
+
       - name: Bake the release tarball URL into install.sh
         # A script piped into `sh` cannot discover the URL it was fetched from,
         # so the published copy carries it as a literal. Baked here because the
@@ -97,7 +109,7 @@ jobs:
           prerelease_flag=""
           [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
           # See docs/decisions/distribution-hosting-shape.md.
-          gh release create "$VERSION" dist/*.tar.gz dist/install.sh \
+          gh release create "$VERSION" dist/*.tar.gz dist/*.sha256 dist/install.sh \
             --title "$VERSION" \
             --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh" \
             $prerelease_flag
