@@ -1,7 +1,7 @@
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
     RootCertStore, ServerConfig,
 };
 use std::sync::Arc;
@@ -241,6 +241,131 @@ fn load_or_generate_ca(
     Ok((ca_key, ca_params, ca_cert_der))
 }
 
+/// True if `leaf_der` cryptographically chain-validates against `ca_der` as the sole trust
+/// anchor -- i.e. it was actually signed by the CA's private key -- using the same rustls
+/// webpki verification the live server runs on every mTLS handshake. A Name-string
+/// comparison of Issuer vs. Subject would wrongly trust a different-key CA that happens to
+/// share a Subject CN; this checks the signature, not just the claimed name.
+fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
+    let mut root_store = RootCertStore::empty();
+    if root_store
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(verifier) = WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+    else {
+        return false;
+    };
+    verifier
+        .verify_client_cert(
+            &CertificateDer::from(leaf_der.to_vec()),
+            &[],
+            UnixTime::now(),
+        )
+        .is_ok()
+}
+
+/// Load-or-generate the admin client cert+key (CN=admin, O=system:masters) embedded in
+/// the "admin" kubeconfig. kubelet.service authenticates as this SAME identity too
+/// (install.sh points both at $STATE_DIR/kubeconfig).
+///
+/// Persisted the same way as the CA (`load_or_generate_ca`): the CA surviving a restart is
+/// not enough on its own to keep `--kubeconfig`'s bytes stable — without this, every
+/// restart still mints a brand-new system:masters credential (new key, new signature,
+/// unconditionally overwritten into the kubeconfig file), with no way to revoke the
+/// previous one.
+fn load_or_generate_admin_cert(
+    key_path: &std::path::Path,
+    cert_path: &std::path::Path,
+    ca_cert_der: &[u8],
+    ca_issuer: &Issuer<'_, KeyPair>,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let key_exists = key_path.exists();
+    let cert_exists = cert_path.exists();
+
+    // Same partial-state rationale as load_or_generate_ca: only one of the two files
+    // existing means a prior run crashed mid-write. Delete the stale half and regenerate
+    // rather than silently loading a key with no matching cert (or vice versa).
+    if key_exists ^ cert_exists {
+        if key_exists {
+            tracing::error!(
+                "partial admin cert state: {} exists but {} is missing; \
+                 deleting stale key and regenerating admin cert",
+                key_path.display(),
+                cert_path.display()
+            );
+            std::fs::remove_file(key_path).map_err(|e| {
+                anyhow::anyhow!("remove stale admin key {}: {e}", key_path.display())
+            })?;
+        } else {
+            tracing::error!(
+                "partial admin cert state: {} exists but {} is missing; \
+                 deleting stale cert and regenerating admin cert",
+                cert_path.display(),
+                key_path.display()
+            );
+            std::fs::remove_file(cert_path).map_err(|e| {
+                anyhow::anyhow!("remove stale admin cert {}: {e}", cert_path.display())
+            })?;
+        }
+    }
+
+    if key_path.exists() && cert_path.exists() {
+        let key_pem = std::fs::read_to_string(validate_cli_path(key_path)?)
+            .map_err(|e| anyhow::anyhow!("read admin key {}: {e}", key_path.display()))?;
+        // Parse only to fail loud on a corrupt file; the PEM bytes (not this KeyPair) are
+        // what TlsMaterial actually carries forward.
+        KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse admin key: {e}"))?;
+        let cert_der = std::fs::read(validate_cli_path(cert_path)?)
+            .map_err(|e| anyhow::anyhow!("read admin cert {}: {e}", cert_path.display()))?;
+
+        if leaf_cert_chain_validates(&cert_der, ca_cert_der) {
+            tracing::info!("loaded admin cert from {}", cert_path.display());
+            return Ok((cert_der, key_pem.into_bytes()));
+        }
+        // The on-disk admin cert does not chain-validate against the CA just loaded
+        // (e.g. ca.key/ca.crt were rotated independently, or -- observed only under test
+        // parallelism, where multiple processes race on the same relative default paths --
+        // a concurrent writer regenerated the CA after this admin cert was signed).
+        // Loading it anyway would hand out a chain that fails verification for every
+        // client that receives it. Discard and regenerate against the CA now in memory.
+        tracing::error!(
+            "admin cert at {} does not chain-validate against the CA now loaded from disk; \
+             discarding and regenerating",
+            cert_path.display()
+        );
+        std::fs::remove_file(key_path)
+            .map_err(|e| anyhow::anyhow!("remove stale admin key {}: {e}", key_path.display()))?;
+        std::fs::remove_file(cert_path)
+            .map_err(|e| anyhow::anyhow!("remove stale admin cert {}: {e}", cert_path.display()))?;
+    }
+
+    let admin_key = KeyPair::generate().map_err(|e| anyhow::anyhow!("generate admin key: {e}"))?;
+    let mut admin_params = CertificateParams::default();
+    admin_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "admin");
+    // O=system:masters bypasses RBAC (Phase 3+). Harmless in Phase 1 (no RBAC).
+    admin_params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "system:masters");
+    let admin_cert = admin_params.signed_by(&admin_key, ca_issuer)?;
+    let admin_cert_der = admin_cert.der().to_vec();
+    let admin_key_pem = admin_key.serialize_pem().into_bytes();
+
+    write_private_key(validate_cli_path(key_path)?, &admin_key_pem)
+        .map_err(|e| anyhow::anyhow!("write admin key {}: {e}", key_path.display()))?;
+    std::fs::write(validate_cli_path(cert_path)?, &admin_cert_der)
+        .map_err(|e| anyhow::anyhow!("write admin cert {}: {e}", cert_path.display()))?;
+    tracing::info!("generated new admin cert → {}", cert_path.display());
+
+    Ok((admin_cert_der, admin_key_pem))
+}
+
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,
@@ -373,17 +498,13 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .push(rcgen::DnType::CommonName, "u7s-apiserver");
     let server_cert = server_params.signed_by(&server_key, &ca_issuer)?;
 
-    // --- Admin client cert ---
-    let admin_key = KeyPair::generate()?;
-    let mut admin_params = CertificateParams::default();
-    admin_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "admin");
-    // O=system:masters bypasses RBAC (Phase 3+). Harmless in Phase 1 (no RBAC).
-    admin_params
-        .distinguished_name
-        .push(rcgen::DnType::OrganizationName, "system:masters");
-    let admin_cert = admin_params.signed_by(&admin_key, &ca_issuer)?;
+    // --- Admin client cert: load-or-generate, persisted alongside the CA -----------------
+    // Sibling files next to ca.key/ca.crt rather than new CLI flags -- see
+    // load_or_generate_admin_cert's doc for why persisting this (not just the CA) matters.
+    let admin_key_path = std::path::Path::new(&args.ca_key).with_file_name("admin.key");
+    let admin_cert_path = std::path::Path::new(&args.ca_cert).with_file_name("admin.crt");
+    let (admin_cert_der, admin_key_pem) =
+        load_or_generate_admin_cert(&admin_key_path, &admin_cert_path, &ca_cert_der, &ca_issuer)?;
 
     // --- Kubelet client cert ---
     // Kubelet's --client-ca-file trusts our cluster CA, and kubelet accepts clients
@@ -492,7 +613,6 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let server_cert_der = server_cert.der().to_vec();
-    let admin_cert_der = admin_cert.der().to_vec();
     let admin_cert_pem = pem_encode("CERTIFICATE", &admin_cert_der);
     let kubelet_client_cert_der = kubelet_client_cert.der().to_vec();
     let kubelet_client_cert_pem = pem_encode("CERTIFICATE", &kubelet_client_cert_der);
@@ -506,7 +626,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         server_cert_der,
         admin_cert_der,
         admin_cert_pem,
-        admin_key_pem: admin_key.serialize_pem().into_bytes(),
+        admin_key_pem,
         kubelet_client_cert_pem,
         kubelet_client_key_pem: kubelet_client_key.serialize_pem().into_bytes(),
         kcm_cert_der,
@@ -702,17 +822,29 @@ mod tests {
     }
 
     fn args_with(advertise_address: Option<&str>) -> Args {
+        // A fresh temp dir per call, not shared literal "./ca.key" etc.: multiple tests
+        // call args_with() and cargo runs tests in parallel by default, so a shared path
+        // races load_or_generate_ca / load_or_generate_admin_cert's read-then-write across
+        // threads and can leave an admin cert issued by a CA a concurrent thread has since
+        // replaced on disk.
+        let dir = test_temp_dir("args-with");
         Args {
-            db: "./state.db".into(),
+            db: dir.join("state.db").to_string_lossy().into_owned(),
             listen: "0.0.0.0:6443".into(),
-            kubeconfig: "./kubeconfig".into(),
+            kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
-            sa_key: "./sa.key".into(),
-            sa_pub: "./sa.pub".into(),
-            ca_key: "./ca.key".into(),
-            ca_cert: "./ca.crt".into(),
-            proxy_client_ca_key: "./proxy-client-ca.key".into(),
-            proxy_client_ca_cert: "./proxy-client-ca.crt".into(),
+            sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
+            sa_pub: dir.join("sa.pub").to_string_lossy().into_owned(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
             advertise_address: advertise_address.map(str::to_owned),
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
@@ -953,6 +1085,110 @@ mod tests {
         );
 
         // Clean up.
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Proves two things `generate_tls()` must guarantee across a restart: (1) the admin
+    /// cert file bytes are preserved rather than re-minted, so an admin kubeconfig copied
+    /// off-node before the restart is not silently swapped for a different credential; and
+    /// (2) that preserved, pre-restart-issued cert still cryptographically chain-validates
+    /// against the CA loaded on the second call. This does not by itself establish that a
+    /// missing guarantee here is what produced any specific operator-observed failure --
+    /// only that the guarantee holds.
+    #[test]
+    fn admin_cert_issued_before_restart_still_chain_validates_after_restart() {
+        let dir = test_temp_dir("admin-cert-restart-survives");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
+            ..args_with(None)
+        };
+
+        // First "start": mints the CA + admin cert an operator would copy off-node.
+        let tls1 = generate_tls(&args).expect("first generate_tls failed");
+        // Second "start" (simulating `systemctl restart u7s-apiserver`): both must load
+        // from disk, not regenerate.
+        let tls2 = generate_tls(&args).expect("second generate_tls failed");
+
+        assert_eq!(
+            tls1.admin_cert_der, tls2.admin_cert_der,
+            "the admin cert must be loaded, not re-minted, on restart -- minting a new one \
+             every restart hands out a DIFFERENT, never-revoked system:masters identity \
+             each time an admin kubeconfig is copied off-node"
+        );
+
+        assert!(
+            leaf_cert_chain_validates(&tls1.admin_cert_der, &tls2.ca_cert_der),
+            "an admin cert issued BEFORE a restart must still cryptographically \
+             chain-validate against the CA loaded AFTER the restart, using the same rustls \
+             verification the live server runs on every mTLS handshake"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Simulates the exact corruption `leaf_cert_chain_validates` exists to catch:
+    /// admin.key/admin.crt on disk were signed by a CA that is no longer the one loaded
+    /// from ca.key/ca.crt (an operator rotating CA files independently, or -- under test
+    /// parallelism -- a concurrent process regenerating the CA after this admin cert was
+    /// already signed). Loading the stale pair anyway would hand kubectl a chain that
+    /// fails real TLS validation against the CA the server now trusts.
+    #[test]
+    fn admin_cert_from_a_different_ca_is_discarded_and_regenerated() {
+        let dir = test_temp_dir("admin-cert-ca-mismatch");
+        let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
+        let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
+        let (real_ca_key, real_ca_params, real_ca_cert_der) =
+            load_or_generate_ca(&ca_key_path, &ca_cert_path).expect("generate real CA");
+        let real_ca_issuer = Issuer::new(real_ca_params, real_ca_key);
+
+        // A DIFFERENT, unrelated CA signs the "stale" admin cert.
+        let other_ca_key = KeyPair::generate().expect("generate other CA key");
+        let mut other_ca_params = CertificateParams::default();
+        other_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        other_ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "some-other-ca");
+        let other_ca_issuer = Issuer::new(other_ca_params, other_ca_key);
+
+        let stale_admin_key = KeyPair::generate().expect("generate stale admin key");
+        let mut stale_admin_params = CertificateParams::default();
+        stale_admin_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "admin");
+        let stale_admin_cert = stale_admin_params
+            .signed_by(&stale_admin_key, &other_ca_issuer)
+            .expect("sign stale admin cert");
+
+        let admin_key_path = dir.join("admin.key");
+        let admin_cert_path = dir.join("admin.crt");
+        write_private_key(&admin_key_path, stale_admin_key.serialize_pem().as_bytes())
+            .expect("write stale admin key");
+        std::fs::write(&admin_cert_path, stale_admin_cert.der()).expect("write stale admin cert");
+
+        let (admin_cert_der, _admin_key_pem) = load_or_generate_admin_cert(
+            &admin_key_path,
+            &admin_cert_path,
+            &real_ca_cert_der,
+            &real_ca_issuer,
+        )
+        .expect("load_or_generate_admin_cert must recover, not fail");
+
+        assert!(
+            leaf_cert_chain_validates(&admin_cert_der, &real_ca_cert_der),
+            "a stale admin cert issued by a DIFFERENT CA must be discarded and replaced \
+             with one actually issued by the CA now loaded from disk, or kubectl gets a \
+             chain that fails real TLS validation"
+        );
+
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
