@@ -57,6 +57,37 @@ jobs:
       - name: Build tarball
         run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}"
 
+      - name: Bake the release tarball URL into install.sh
+        # A script piped into `sh` cannot discover the URL it was fetched from,
+        # so the published copy carries it as a literal. Baked here because the
+        # distribution host is a deployment concern, not a build input
+        env:
+          VERSION: ${{ steps.version.outputs.v }}
+          DIST_BASE_URL: ${{ vars.U7S_DIST_BASE_URL }}
+        run: |
+          if [ -z "$DIST_BASE_URL" ]; then
+            echo "error: repository variable U7S_DIST_BASE_URL is unset -- set it to the" >&2
+            echo "       distribution proxy's base URL (deploy/get-u7s/), e.g. https://get.u7s.example" >&2
+            exit 1
+          fi
+          set -- dist/*.tar.gz
+          if [ $# -ne 1 ]; then
+            echo "error: expected exactly one tarball in dist/, found $#" >&2
+            exit 1
+          fi
+          url="${DIST_BASE_URL%/}/$VERSION/$(basename "$1")"
+          sed "s|^DEFAULT_TARBALL_URL=\"\"$|DEFAULT_TARBALL_URL=\"$url\"|" \
+            scripts/install.sh > dist/install.sh
+          # A no-op sed exits 0 and would publish a script that tells users it
+          # came from a git checkout, so assert the substitution took effect.
+          if ! grep -qxF "DEFAULT_TARBALL_URL=\"$url\"" dist/install.sh; then
+            echo "error: failed to bake DEFAULT_TARBALL_URL into install.sh -- has the" >&2
+            echo "       'DEFAULT_TARBALL_URL=\"\"' line in scripts/install.sh been renamed?" >&2
+            exit 1
+          fi
+          chmod +x dist/install.sh
+          echo "baked: $url"
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -66,7 +97,7 @@ jobs:
           prerelease_flag=""
           [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
           # See docs/decisions/distribution-hosting-shape.md.
-          gh release create "$VERSION" dist/*.tar.gz scripts/install.sh \
+          gh release create "$VERSION" dist/*.tar.gz dist/install.sh \
             --title "$VERSION" \
             --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh" \
             $prerelease_flag

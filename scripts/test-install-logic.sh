@@ -224,6 +224,49 @@ assert_true "the minted kubelet serving cert declares extendedKeyUsage=serverAut
 assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cluster CA, so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
   grep -qF 'clientCAFile: $STATE_DIR/ca.pem' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# Tarball sourcing: --tarball (local path) / --tarball-url / the URL baked in
+# at release time. A script piped into `sh` cannot discover the URL it came
+# from, so the published copy carries it as a literal that
+# .github/workflows/release-tarball.yaml substitutes in -- these assertions
+# pin the two halves of that contract together.
+# ---------------------------------------------------------------------------
+
+# The single most damaging way this can regress: someone commits a real URL
+# here. Every git checkout would then silently fetch and install THAT
+# release's binaries instead of failing loud, and `curl | sh` users of a
+# later release would get a script pinned to an older one. This literal is
+# also the exact anchor the release workflow's sed matches on, so renaming
+# the variable breaks publishing -- caught here at commit time rather than
+# mid-release.
+assert_true "DEFAULT_TARBALL_URL is empty in the repo copy, so a checkout fails loud instead of silently installing whichever release a committed URL pointed at (and the release workflow's sed anchor still matches)" \
+  grep -qxF 'DEFAULT_TARBALL_URL=""' "$INSTALL"
+
+# Asserted on the message, not just a non-zero exit: this check has to run
+# BEFORE the root gate, or a non-root operator gets "must be run as root",
+# fixes that, and only then learns their flags conflict. Exit-code-only would
+# pass either way and so could not fail when that ordering regresses.
+conflict_out="$(bash "$INSTALL" --tarball /x --tarball-url http://y 2>&1 || true)"
+conflict_ok=0
+printf '%s' "$conflict_out" | grep -q 'mutually exclusive' && conflict_ok=1
+assert "passing both --tarball and --tarball-url is rejected by name before the root check, so the operator learns their flags conflict on the first run rather than after re-running under sudo" \
+  "$conflict_ok"
+
+# A local path the operator already has must never trigger a download, even
+# on a released copy where DEFAULT_TARBALL_URL is always non-empty (so an
+# unguarded fetch would run on every install).
+assert_true "--tarball short-circuits the download entirely, rather than fetching the baked URL and discarding it" \
+  grep -qF 'if [ -z "$TARBALL" ]; then' "$INSTALL"
+
+# Ordering guard. The download used to sit next to `tar -xzf`, well after apt
+# had installed and started CRI-O -- so a 404 (the expected state until a
+# non-prerelease release exists) left the host half-configured. Fetching
+# first means a bad URL leaves it untouched.
+fetch_line="$(grep -n 'fetch_tarball "$TARBALL_URL"' "$INSTALL" | cut -d: -f1)"
+apt_line="$(grep -n '^apt-get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
+assert "the tarball is downloaded before apt installs anything, so an unreachable or wrong URL aborts with the host untouched instead of half-configured with CRI-O running" \
+  "$([ -n "$fetch_line" ] && [ -n "$apt_line" ] && [ "$fetch_line" -lt "$apt_line" ] && echo 1 || echo 0)"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
