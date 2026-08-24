@@ -14,6 +14,11 @@ data:
         server_name _;
 
         proxy_intercept_errors on;
+        # without a matching error_page, proxy_intercept_errors is a no-op --
+        # upstream 404s reach the client with GitHub's Set-Cookie / CSP /
+        # x-github-* headers passed through, which reads as "hosted by GitHub"
+        error_page 404 = @not_found;
+
         proxy_ssl_server_name on;
         
         proxy_ssl_verify on;
@@ -70,6 +75,12 @@ data:
             internal;
             set $loc3 $upstream_http_location;
             proxy_pass $loc3;
+        }
+
+        location @not_found {
+            internal;
+            default_type text/plain;
+            return 404 "404 Not Found\n";
         }
     }
 ---
