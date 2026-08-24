@@ -69,5 +69,10 @@ jobs:
             --title "$VERSION" \
             --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64" \
             $prerelease_flag
-          # TODO: fast-forward the snapshot tag to $VERSION
+          # only update the dynamic "snapshot" tag if the release was successfully created
+          if [ "$PRERELEASE" = "true" ]; then
+            git checkout snapshot
+            git merge --ff-only "$VERSION"
+            git push origin snapshot
+          fi
           
