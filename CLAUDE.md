@@ -87,11 +87,9 @@ into the branch; do not force-push.
 ### Rule 16 — Prose Is Code
 Rule 2 applies to sentences. Cut every clause that restates a doc you linked,
 narrates how a decision was reached, defends against an objection nobody
-raised, or reports what "this session" did. Editing a durable doc means
-rewriting it: if your diff is all `+`, you accreted rather than edited.
-Budgets are words, not lines — `scripts/check-doc-budget.sh` enforces them,
-so reflowing changes nothing. A `bd remember` entry is one fact in ≤3
-sentences; if it needs headings it is a doc. Before/after: `git show e10ca358`.
+raised, or reports what "this session" did. A concise "why" is sufficient if
+something is not obvious, but otherwise text (comments, commits) should be as
+concise and factual as possible.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
