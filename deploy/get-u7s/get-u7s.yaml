@@ -37,26 +37,26 @@ data:
             return 200 "ok\n";
         }
         
-        location = /stable/install.sh {
-            proxy_pass https://raw.githubusercontent.com/litehop/u7s/main/scripts/install.sh;
+        # Stable. The install script is a release ASSET, not a repo file, so
+        # it arrives from the same immutable release as the tarball it goes
+        # on to install and the two can never skew
+        location = /install.sh {
+            error_page 301 302 303 307 308 = @follow_hop1;
+            proxy_pass https://github.com/litehop/u7s/releases/latest/download/install.sh;
         }
 
-        location = /dev/install.sh {
-            proxy_pass https://raw.githubusercontent.com/litehop/u7s/main/scripts/install.sh;
-        }
-
-        location ~ ^/stable/(?<asset>[^/]+)$ {
-            rewrite ^/stable/([^/]+)$ /litehop/u7s/releases/latest/download/$1 break;
+        # Pinned. The caller names the release tag, which is the only way to
+        # reach a pre-release build. install.sh re-enters here to fetch its
+        # own tarball, so this single route serves both the script and the
+        # binaries.
+        location ~ ^/(v[0-9][A-Za-z0-9.+-]*)/([A-Za-z0-9][A-Za-z0-9._+-]*)$ {
+            rewrite ^/([^/]+)/([^/]+)$ /litehop/u7s/releases/download/$1/$2 break;
             error_page 301 302 303 307 308 = @follow_hop1;
             proxy_pass https://github.com;
         }
 
-        location ~ ^/dev/(?<asset>[^/]+)$ {
-            rewrite ^/dev/([^/]+)$ /litehop/u7s/releases/download/dev/$1 break;
-            error_page 301 302 303 307 308 = @follow_hop1;
-            proxy_pass https://github.com;
-        }
-
+        # Follow Github redirects to up to three hops
+        # latest/download -> download/<tag> -> signed raw URL + 1 safety
         location @follow_hop1 {
             internal;
             set $loc1 $upstream_http_location;

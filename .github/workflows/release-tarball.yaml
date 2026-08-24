@@ -57,7 +57,7 @@ jobs:
       - name: Build tarball
         run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}"
 
-      - name: Create or update GitHub Release
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.v }}
@@ -65,7 +65,8 @@ jobs:
         run: |
           prerelease_flag=""
           [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
-          gh release create "$VERSION" dist/*.tar.gz \
+          # See docs/decisions/distribution-hosting-shape.md.
+          gh release create "$VERSION" dist/*.tar.gz scripts/install.sh \
             --title "$VERSION" \
-            --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64" \
+            --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh" \
             $prerelease_flag
