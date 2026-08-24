@@ -71,6 +71,7 @@ jobs:
             $prerelease_flag
           # only update the dynamic "snapshot" tag if the release was successfully created
           if [ "$PRERELEASE" = "true" ]; then
+            git fetch origin 'refs/tags/*:refs/tags/*'
             git checkout snapshot
             git merge --ff-only "$VERSION"
             git push origin snapshot
