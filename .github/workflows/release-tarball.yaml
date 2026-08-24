@@ -17,6 +17,10 @@ concurrency:
   # cancel a run mid-publish.
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
