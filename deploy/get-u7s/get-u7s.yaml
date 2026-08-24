@@ -26,6 +26,12 @@ data:
         proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
         proxy_http_version 1.1;
 
+        # nginx's variable-based proxy_pass (@follow_hop*) skips /etc/resolv.conf
+        # entirely and requires its own resolver -- CoreDNS on the pod's
+        # ClusterIP nameserver is unreachable to it. Public resolver because
+        # we only ever look up external GitHub asset CDN names from here.
+        resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+
         # github.com's redirect responses carry several KB of
         # Content-Security-Policy + Set-Cookie headers -- nginx's small
         # default buffers overflow on them ("upstream sent too big header")
