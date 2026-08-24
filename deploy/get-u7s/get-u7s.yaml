@@ -1,69 +1,11 @@
-# Distribution-hosting reverse-proxy, implementing
-# docs/decisions/distribution-hosting-shape.md: streams the install script
-# and release-tarball bytes server-side rather than redirecting the client to
-# GitHub, so an IPv6-only client never has to open a fresh connection to
-# infrastructure whose IPv6 support is unverified (github.com has no AAAA
-# record; only raw.githubusercontent.com does).
-#
-# Deployed by Argo CD pointing an Application at this subfolder (see
-# README.md) -- not applied manually.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: get-u7s
----
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: get-u7s-nginx-conf
-  namespace: get-u7s
+  labels:
+    app: get-u7s
 data:
-  # Mounted as /etc/nginx/conf.d/default.conf, replacing the image's own
-  # default server block entirely.
-  #
-  # Both channels are fixed-URL, mechanically identical proxies (no JSON
-  # parsing, no request-time GitHub API call, so no rate-limit exposure and
-  # nothing to proxy_cache):
-  #   stable -> github.com/litehop/u7s/releases/latest/download/<asset>
-  #             GitHub resolves "latest" itself (newest non-draft,
-  #             non-prerelease release) -- no channel-selection logic needed.
-  #   dev    -> github.com/litehop/u7s/releases/download/dev/<asset>
-  #             A fixed, floating "dev" tag whose assets get overwritten on
-  #             every relevant build. Publishing/overwriting that tag on a
-  #             trigger (main-branch push is the natural one) is NOT covered
-  #             by this manifest -- tracked separately against
-  #             .github/workflows/release-tarball.yaml. Until that exists,
-  #             this channel 404s, same as stable does before the first
-  #             tagged release.
-  #
-  # Neither GitHub download URL serves bytes directly: both 302 twice before
-  # reaching the actual asset (confirmed live against a real GitHub release,
-  # 2026-08-23):
-  #   .../releases/latest/download/<asset>
-  #     -> 302 -> .../releases/download/<tag>/<asset>
-  #     -> 302 -> a signed release-assets.githubusercontent.com URL (200/206)
-  # proxy_pass does not follow upstream redirects on its own -- it would hand
-  # the 3xx straight to the client, reintroducing exactly the IPv6-reachability
-  # problem this proxy exists to remove. error_page+recursive_error_pages
-  # chains three internal redirects (one hop of margin over the two observed
-  # live) so every hop is followed server-side; only the final 200/206
-  # response ever reaches the client. This needed no njs: once both channels
-  # collapsed to fixed URLs (no per-request JSON/list-indexing), plain nginx
-  # directives were sufficient, so njs was dropped from the design entirely.
-  #
-  # $upstream_http_location must be captured into a `set` variable before
-  # being handed to proxy_pass in each hop -- referencing it directly in
-  # proxy_pass reads as empty ("invalid URL prefix in ''" at runtime,
-  # confirmed live) because of how nginx re-evaluates $upstream_http_* across
-  # the named-location transition triggered by error_page.
   default.conf: |
-    # Public resolvers, reachable over both IPv4 and IPv6 -- TODO(operator):
-    # verify these aren't blocked by the real cluster's egress NetworkPolicy.
-    # If they are, the fix is pointing this at the cluster's own DNS Service
-    # ClusterIP instead, but that address is cluster-specific (not something
-    # this worktree can discover or safely guess), so it's left as a known
-    # assumption rather than a guessed hardcoded value.
-    resolver 1.1.1.1 8.8.8.8 [2606:4700:4700::1111] [2001:4860:4860::8888] ipv6=on valid=300s;
     recursive_error_pages on;
 
     server {
@@ -73,21 +15,15 @@ data:
 
         proxy_intercept_errors on;
         proxy_ssl_server_name on;
-        # Without proxy_ssl_verify, nginx accepts ANY certificate the
-        # upstream presents -- a real MITM gap on a proxy whose entire job
-        # is distributing binaries people will execute. Alpine's own
-        # ca-certificates package bundle (already present in the base
-        # image, not something this manifest ships) is the trust root;
-        # verify_depth 2 covers GitHub's leaf+intermediate chain (confirmed
-        # live -- see README.md's Verification section).
+        
         proxy_ssl_verify on;
         proxy_ssl_verify_depth 2;
         proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
         proxy_http_version 1.1;
+
         # github.com's redirect responses carry several KB of
         # Content-Security-Policy + Set-Cookie headers -- nginx's small
-        # default buffers overflow on them ("upstream sent too big header"),
-        # confirmed live against a real redirect.
+        # default buffers overflow on them ("upstream sent too big header")
         proxy_buffer_size 32k;
         proxy_buffers 4 32k;
         proxy_busy_buffers_size 64k;
@@ -95,32 +31,27 @@ data:
         location = /healthz {
             return 200 "ok\n";
         }
-
-        # Same script regardless of channel -- one location per channel
-        # prefix rather than a regex, since combining a regex location with
-        # a proxy_pass URI part is rejected by nginx at config-load time.
-        # raw.githubusercontent.com serves this directly (confirmed live:
-        # plain 200, no redirect), so no hop-following is needed here.
-        location = /stable/install.sh {
-            proxy_pass https://raw.githubusercontent.com/litehop/u7s/main/scripts/install.sh;
+        
+        # Stable. The install script is a release ASSET, not a repo file, so
+        # it arrives from the same immutable release as the tarball it goes
+        # on to install and the two can never skew
+        location = /install.sh {
+            error_page 301 302 303 307 308 = @follow_hop1;
+            proxy_pass https://github.com/litehop/u7s/releases/latest/download/install.sh;
         }
 
-        location = /dev/install.sh {
-            proxy_pass https://raw.githubusercontent.com/litehop/u7s/main/scripts/install.sh;
-        }
-
-        location ~ ^/stable/(?<asset>[^/]+)$ {
-            rewrite ^/stable/([^/]+)$ /litehop/u7s/releases/latest/download/$1 break;
+        # Pinned. The caller names the release tag, which is the only way to
+        # reach a pre-release build. install.sh re-enters here to fetch its
+        # own tarball, so this single route serves both the script and the
+        # binaries.
+        location ~ ^/(v[0-9][A-Za-z0-9.+-]*)/([A-Za-z0-9][A-Za-z0-9._+-]*)$ {
+            rewrite ^/([^/]+)/([^/]+)$ /litehop/u7s/releases/download/$1/$2 break;
             error_page 301 302 303 307 308 = @follow_hop1;
             proxy_pass https://github.com;
         }
 
-        location ~ ^/dev/(?<asset>[^/]+)$ {
-            rewrite ^/dev/([^/]+)$ /litehop/u7s/releases/download/dev/$1 break;
-            error_page 301 302 303 307 308 = @follow_hop1;
-            proxy_pass https://github.com;
-        }
-
+        # Follow Github redirects to up to three hops
+        # latest/download -> download/<tag> -> signed raw URL + 1 safety
         location @follow_hop1 {
             internal;
             set $loc1 $upstream_http_location;
@@ -146,7 +77,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: get-u7s
-  namespace: get-u7s
   labels:
     app: get-u7s
 spec:
@@ -161,13 +91,6 @@ spec:
     spec:
       containers:
         - name: nginx
-          # Plain nginx, no njs -- both channels are fixed-URL redirect
-          # chases, expressible in pure nginx.conf (see ConfigMap above).
-          # Unprivileged variant: runs as uid 101, listens on 8080 by
-          # default (not 80), fine for a container that never needs to bind
-          # a privileged port. Pinned by tag+digest, resolved and functionally
-          # smoke-tested locally 2026-08-23 (see README.md's Verification
-          # section).
           image: "nginxinc/nginx-unprivileged:1.31-alpine@sha256:c3fed6436b61d2bf2201ec032c35c000871f7ed062dea5d586bc6bf4d0fdd140"
           ports:
             - name: http
@@ -205,9 +128,7 @@ spec:
           configMap:
             name: get-u7s-nginx-conf
         # nginx needs a writable /tmp (proxy_temp etc.) even though the rest
-        # of the root filesystem is read-only -- confirmed live: without
-        # this, nginx fails to start ("mkdir() \"/tmp/proxy_temp\" failed
-        # (30: Read-only file system)").
+        # of the root filesystem is read-only
         - name: tmp
           emptyDir: {}
 ---
@@ -215,11 +136,9 @@ apiVersion: v1
 kind: Service
 metadata:
   name: get-u7s
-  namespace: get-u7s
+  labels:
+    app: get-u7s
 spec:
-  # Requests dual-stack; whether the cluster's CNI actually honors it needs
-  # confirming on the operator's real cluster (not verifiable from this
-  # worktree -- see README.md).
   ipFamilyPolicy: PreferDualStack
   selector:
     app: get-u7s
@@ -232,27 +151,22 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: get-u7s
-  namespace: get-u7s
-  annotations:
-    # TODO(operator): fill in the real cluster-issuer name once the
-    # cert-manager/TLS wiring for this domain is decided -- not investigated
-    # by docs/decisions/distribution-hosting-shape.md.
-    cert-manager.io/cluster-issuer: "TODO-operator-cluster-issuer"
+  labels:
+    app: get-u7s
 spec:
-  # TODO(operator): fill in the real ingress class for this cluster.
-  ingressClassName: TODO-operator-ingress-class
   tls:
     - hosts:
-        - get.u7s.TODO-operator-domain.example
-      secretName: get-u7s-tls
+        - u7s.dekiru.tech
+      secretName: dekiru-tech-tls
   rules:
-    - host: get.u7s.TODO-operator-domain.example
+    - host: u7s.dekiru.tech
       http:
         paths:
-          - path: /
-            pathType: Prefix
-            backend:
+          - backend:
               service:
                 name: get-u7s
                 port:
                   name: http
+            path: /
+            pathType: Prefix
+            

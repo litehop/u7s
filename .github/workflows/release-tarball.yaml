@@ -1,15 +1,5 @@
-name: Release tarball
+name: Release
 
-# Interim distribution mechanism: builds the four-binary release tarball
-# scripts/install.sh expects and publishes it as a GitHub Release artifact.
-# This is explicitly NOT the final distribution-hosting answer -- GitHub
-# cannot be the real curl|sh origin (no IPv6) -- it exists so the build
-# pipeline itself can be validated end to end while that separate question
-# stays open.
-#
-# x86_64 only for now (operator direction, YAGNI-first) -- aarch64 is
-# deliberately deferred until there's real demand, not designed around
-# speculatively.
 on:
   push:
     tags:
@@ -17,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version to build and publish (e.g. v0.1.0)'
+        description: 'Release version to build and publish (e.g. v0.1.0-SNAPSHOT.1)'
         required: true
         type: string
 
@@ -26,6 +16,10 @@ concurrency:
   # A partially-uploaded GitHub Release is worse than a slow one -- never
   # cancel a run mid-publish.
   cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
 
 jobs:
   build-and-publish:
@@ -41,21 +35,14 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             V="${{ inputs.version }}"
-            # workflow_dispatch exists to validate this pipeline without a
-            # real tag -- mark it prerelease so it's never mistaken for a
-            # real, supported release.
-            PRERELEASE=true
           else
             V="${GITHUB_REF_NAME}"
-            PRERELEASE=false
           fi
-          # The tag-push trigger only ever matches v* refs; workflow_dispatch
-          # takes a free-text input with no such enforcement, and every
-          # downstream step (tarball name, release tag) assumes a leading
-          # "v". Fail loud on a mismatched input instead of publishing a
-          # release/tarball with an inconsistent version string.
           case "$V" in
-            v*) ;;
+            v*-*) PRERELEASE=true
+              ;;
+            v*) PRERELEASE=false
+              ;;
             *)
               echo "error: version must start with 'v' (got: '$V')" >&2
               exit 1
@@ -70,25 +57,47 @@ jobs:
       - name: Build tarball
         run: scripts/build-release-tarball.sh "${{ steps.version.outputs.v }}"
 
-      - name: Create or update GitHub Release
+      - name: Bake the release tarball URL into install.sh
+        # A script piped into `sh` cannot discover the URL it was fetched from,
+        # so the published copy carries it as a literal. Baked here because the
+        # distribution host is a deployment concern, not a build input
+        env:
+          VERSION: ${{ steps.version.outputs.v }}
+          DIST_BASE_URL: ${{ vars.U7S_DIST_BASE_URL }}
+        run: |
+          if [ -z "$DIST_BASE_URL" ]; then
+            echo "error: repository variable U7S_DIST_BASE_URL is unset -- set it to the" >&2
+            echo "       distribution proxy's base URL (deploy/get-u7s/), e.g. https://get.u7s.example" >&2
+            exit 1
+          fi
+          set -- dist/*.tar.gz
+          if [ $# -ne 1 ]; then
+            echo "error: expected exactly one tarball in dist/, found $#" >&2
+            exit 1
+          fi
+          url="${DIST_BASE_URL%/}/$VERSION/$(basename "$1")"
+          sed "s|^DEFAULT_TARBALL_URL=\"\"$|DEFAULT_TARBALL_URL=\"$url\"|" \
+            scripts/install.sh > dist/install.sh
+          # A no-op sed exits 0 and would publish a script that tells users it
+          # came from a git checkout, so assert the substitution took effect.
+          if ! grep -qxF "DEFAULT_TARBALL_URL=\"$url\"" dist/install.sh; then
+            echo "error: failed to bake DEFAULT_TARBALL_URL into install.sh -- has the" >&2
+            echo "       'DEFAULT_TARBALL_URL=\"\"' line in scripts/install.sh been renamed?" >&2
+            exit 1
+          fi
+          chmod +x dist/install.sh
+          echo "baked: $url"
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.v }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
-          ls -la dist
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" dist/*.tar.gz --clobber
-          else
-            # --generate-notes diffs against the previous release tag; with
-            # none yet (this repo's first release), it falls back to the
-            # entire commit history and trips GitHub's 125000-char release-
-            # body limit (HTTP 422, confirmed live). A short static note
-            # sidesteps that regardless of how much history has accumulated.
-            prerelease_flag=""
-            [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
-            gh release create "$VERSION" dist/*.tar.gz \
-              --title "$VERSION" \
-              --notes "u7s release tarball for $VERSION: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager for linux/amd64. Interim GitHub Release hosting; the real distribution-hosting story is a separate, not-yet-settled project decision." \
-              $prerelease_flag
-          fi
+          prerelease_flag=""
+          [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
+          # See docs/decisions/distribution-hosting-shape.md.
+          gh release create "$VERSION" dist/*.tar.gz dist/install.sh \
+            --title "$VERSION" \
+            --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh" \
+            $prerelease_flag

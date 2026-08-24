@@ -1,35 +1,33 @@
 # Dashboard
-2026-08-21T08:58Z — **session wrapped.** Queue idle, all loops stopped. Resume: `bd prime` → this file.
-
-**This session's target achieved in full**: Gate 6 packaging MVP shipped — `scripts/install.sh` takes a genuinely fresh Ubuntu box, zero arguments, to a real working `kubectl get nodes` Ready with CoreDNS + kube-proxy running and `kubectl logs`/`exec` both working. First-ever end-to-end runs on fresh Lima VMs (twice) found and fixed 3 real integration bugs no piecemeal test could have caught: a CRI-O/CNI apt-dependency gap, and a two-layered kubelet TLS-trust + client-auth gap. Also rebuilt the critical-reviewer automation pipeline end-to-end this session (queue-drain, self-posting inline GitHub Reviews, presence-vs-verdict merge gate) and used it to review essentially every PR, catching several real bugs along the way (broken JSON escaping, an inert RBAC rule, a test that exercised a decoupled copy of the real logic).
+2026-08-23T15:56Z — `mayor-te5y0` in flight; `mayor-xm2zp` blocked (see decision point); queue idle. Resume: `bd prime` → this file.
 
 Stance: pre-alpha/greenfield, no backward compatibility, break freely, merge-on-green.
 
-## ▶ In-flight workers (0)
-None — queue fully drained, all worktrees cleaned up.
+## 🆕 Session-scope change (2026-08-23)
+Repo moved from `valerauko/u7s` → **`litehop/u7s`** (organization). Main-branch ruleset ACTIVE (18156794) with strict status checks + Merge Queue (MERGE method, all-green grouping, min 1 / max 5). `allow_auto_merge=true` confirmed working end-to-end — all 4 PRs this session merged cleanly via `gh pr merge <N>` (bare, no flags) → queue.
 
-## 🌊 Open PRs (0)
+## ▶ In-flight workers (0)
+None. `mayor-xm2zp` still blocked (see decision point) — worktree left as-is, may resume once direction is picked.
+
+## 🌊 Open PRs (1)
+- **#1356** — `mayor-te5y0` checksum verification. Rigorous test verification: extracts real `install.sh` function at test time (not a reimplemented copy), bit-flip corruption test + a mutation test proving the test suite itself catches a broken implementation. Reviewed (not modified) `deploy/get-u7s/`'s routes, claims `.sha256` passes through unmodified. Critical-reviewer dispatched; CI running.
 
 ## 🎯 DECISION POINT
-(none blocking)
+- **`mayor-xm2zp` BLOCKED — floating `dev` release tag is impossible as designed.** GitHub's immutable-release policy applies repo-wide (confirmed even on the real `v0.2.0-alpha.1`) — published release assets can never be overwritten, and deleting a release doesn't free its tag name (permanently burned). Worker's live testing confirmed this and, as an unavoidable side effect of testing, permanently burned the `dev` tag name on `litehop/u7s` (disclosed, test artifacts cleaned up). This retroactively affects `mayor-7kkhi`'s merged proxy (#1353), which assumes `releases/download/dev/<asset>` is a stable URL — it is not, and can't be recreated under that name. 3 options: (1) check if an org owner can disable immutable releases via GitHub's web UI — cheapest if it exists, unverified; (2) revert to live Releases-API querying for dev (mayor's original pre-simplification design, sidesteps immutability entirely, costs re-adding njs logic to the already-merged #1353); (3) host the rolling dev artifact outside GitHub Releases (proxy caches from a direct CI push instead) — cleanest long-term, biggest lift. Awaiting operator call.
 
-## 📥 Handoff queue — next session's ready candidates
-- **mayor-72kil / mayor-lrpi2 / mayor-gkgg9 / mayor-po8qf / mayor-0fdes / mayor-tnzdi** — held pending operator nod, carried over unchanged.
-- **mayor-o61zz** (P1, Lima ARP defect) — root cause confirmed (`gvisor-tap-vsock` upstream bug, unfixed), Phase-A+B mitigations both live. Stays open as the root-cause tracker; no further action available until an upstream fix lands.
-- **Held (operator)**: `mayor-u6ju` (EPIC, deferred), `mayor-t8ucq` (P4).
-- **Packaging next phase, not beads yet** — operator flagged as priorities this session: CI-built tarball via GitHub Actions with GitHub Release artifacts as interim hosting, and multi-node join sooner rather than later. Neither filed yet; operator said to file tracking beads on request.
-- **Bot-identity architecture fork** — single bot (self-review limitation persists) vs. dual-identity (real REQUEST_CHANGES/APPROVE) — surfaced, undecided.
+## 📥 Handoff queue
+- **mayor-ua9gg** (P2) — multi-node pod network has no CIDR coordination; needs a design decision (CIDR-coordination fix vs. CNI overlay) before dispatch.
+- **mayor-72kil / mayor-lrpi2 / mayor-gkgg9 / mayor-po8qf / mayor-0fdes / mayor-tnzdi** — held pending operator nod.
+- **mayor-fbxcy** (P3, CEL admission gap) — deferred by context; safe to dispatch as audit later.
+- **mayor-o61zz** (P1, Lima ARP) — upstream-blocked; Phase A+B mitigations live.
+- **Operator-held**: `mayor-u6ju` (EPIC), `mayor-t8ucq` (P4).
+- **Not yet a bead**: tiny #1349 follow-on cleanup (bead-ID-in-comment + fail-loud-on-corrupt-token, both MED); #1354's 2 bead-ID-in-comment leaks (LOW) — worth batching into one small cleanup bead.
 
-## 🩹 Post-mortems this session (for context, already resolved)
-- Caught and corrected a real, session-long mistake: kept listing "Lima Phase-B decision" as an open blocker for a good chunk of the session when it had actually already landed weeks earlier (`mayor-q7bs3`) — was citing a stale comment instead of the bead's current state.
-- Found and fixed a real gap in the merge gate itself: it checked review *presence* only, not the latest review's *verdict* — a PR could have merged with an unaddressed needs-changes review still standing. Caught live on `#1336`, fixed, and written back into `bootstrap.md` so a fresh mayor doesn't reintroduce it.
-- Two dispatch-collision cascades earlier in the session (overlapping write surfaces on `lib.rs` and a test file) needed multi-round conflict resolution — later mitigated by checking in-flight write-surfaces before dispatching adjacent RBAC beads.
+## ✅ Merged this session (9 PRs)
+#1347 (portability), #1348 (CI release-tarball, x86_64), #1349 (kubeconfig-survives-restart fix), #1350 (real front-proxy headers, removed `admin_bearer_token`), #1351 (CSR spec-stamping security fix + RBAC seed), #1352 (front-proxy headers for discovery), #1353 (distribution reverse-proxy), #1354 (install.sh CSR-based join/rotation — Gate 6 multi-node milestone), #1355 (distribution-hosting ADR).
 
-## ✅ Merged this session (28 PRs): #1316-1343. Headlines: critical-reviewer automation rebuild (#1324/#1327/#1330/#1336), RBAC bootstrap gap fixes across 6 PRs (#1325/#1331/#1335/#1339/#1341/#1342), Gate 6 packaging MVP (#1332/#1340/#1343), CI cross-platform fixes (#1334), process docs (#1337/#1338).
-## ✔️ Closed beads this session: 27, including the full packaging MVP chain (`mayor-wl8kl`/`mayor-1uunh`/`mayor-h0cyv`), the RBAC bootstrap chain (`mayor-hzv50`/`mayor-az12r`/`mayor-40wca`/`mayor-gnyu6`/`mayor-936mf`/`mayor-fqkqp`/`mayor-ykmca`), critical-reviewer automation (`mayor-oec8e`/`mayor-03b9j`/`mayor-6jj91`/`mayor-7kizk`), and 2 stale in-progress beads from earlier in the session found and closed during wrap-up (`mayor-9axl7`, `mayor-yw8b3` — both landed via #1322, never marked closed).
-
-## 📖 Findings preserved this session
-`ai/findings/mayor-7gn5c-sa-username-dns1123-verification-2026-08-21.md` — investigated a critical-reviewer suspicion on the impersonation fix, confirmed benign non-issue (fail-closed by design), closed with no follow-on needed.
+## 🔁 Cron loops (6, durable)
+5m merge · 10m dashboard · 15m dispatch · 30m cluster-review · 60m hygiene · 60m reread. Persisted to `.claude/scheduled_tasks.json`.
 
 ## Repo state
-Main @ `61aa4f43`. Gate 6 (packaging) local-install MVP shipped and verified end-to-end twice on genuinely fresh VMs. All 6 cron loops stopped for session end. Next session: `bd prime`, review handoff queue above — packaging's next phase (CI tarball build, multi-node join) needs the operator to say go before beads get filed.
+Main @ `a0187adb`. Ruleset 18156794 ACTIVE, merge queue live and proven across 9 merges.

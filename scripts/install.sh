@@ -1,70 +1,53 @@
 #!/usr/bin/env bash
-# u7s host-level install bootstrap (Gate 6 MVP, HOST-LEVEL half).
+# u7s host-level install bootstrap.
 #
 # Takes a fresh Ubuntu LTS box to a running control plane + kubelet: installs
-# CRI-O + crun via apt, stages u7s's own binaries (apiserver, scheduler) plus
-# the vendored kubelet and kube-controller-manager binaries from a locally
-# pre-built tarball, and writes/enables systemd units for all four so they
-# survive reboots and restart on crash.
+# CRI-O + crun via apt, stages u7s-apiserver/u7s-scheduler plus the vendored
+# kubelet and kube-controller-manager from a release tarball, and writes
+# systemd units for all four. Also installs kubectl and applies vendored
+# component manifests.
 #
-# Also installs kubectl and applies the in-cluster kube-proxy DaemonSet
-# manifest once the apiserver is reachable (CoreDNS needs no equivalent step
-# here -- the apiserver applies its own vendored manifest in-process on every
-# boot, see crates/apiserver/src/bootstrap_apply.rs).
-#
-# Multi-node join uses the real certificates.k8s.io CSR API, not a custom
-# endpoint -- u7s's kube-controller-manager is the real unmodified upstream
-# binary, and its builtin csrapproving/csrsigning controllers already
-# auto-approve and sign join/renewal CSRs against u7s's real CA once the
-# nodeclient/selfnodeclient RBAC grants exist (seeded by the apiserver
-# itself). Two additional modes:
-#   --mint-join-token   Run on an existing control-plane node: mints a
-#                       bootstrap bearer token plus a pre-signed kubelet
-#                       serving cert for a new node, and prints one
-#                       base64(JSON) join artifact to hand to that node.
-#   --join <url>        Run on a fresh node with --token <artifact>: submits
-#                       a client CSR authenticated by the bootstrap token,
-#                       waits for kube-controller-manager to auto-approve and
-#                       sign it, and joins as a kubelet with its own
-#                       dedicated x509 identity.
-#
-# NOT covered here: fetching the tarball from a URL (this script only accepts
-# an already-downloaded local path), HA/multi-apiserver control-plane join,
-# or CA rotation tooling.
+# Multi-node join goes through the real certificates.k8s.io CSR API: u7s's
+# kube-controller-manager is unmodified upstream, so its builtin
+# csrapproving/csrsigning controllers auto-approve and sign join CSRs against
+# u7s's CA once the nodeclient/selfnodeclient RBAC grants exist. Two
+# additional modes:
+#   --mint-join-token   On an existing control-plane node: mint a bootstrap
+#                       token plus a pre-signed kubelet serving cert, printed
+#                       as one base64(JSON) join artifact.
+#   --join <url>        On a fresh node with --token <artifact>: submit a
+#                       client CSR, wait for it to be signed, and join as a
+#                       kubelet with its own x509 identity.
 #
 # Usage:
-#   sudo scripts/install.sh --tarball <path> [--node-name <name>] [--iface <iface>]
+#   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 #   sudo scripts/install.sh --mint-join-token --node-name <name> --node-ip <ip>
-#   sudo scripts/install.sh --join <url> --token <artifact> --tarball <path> [--node-name <name>] [--iface <iface>]
+#   sudo scripts/install.sh --join <url> --token <artifact> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 #
-# Configurable knobs (docs/decisions/install-script-ux.md) -- exactly two,
-# both optional, both also settable via env var, for the zero-argument
-# single-node path:
+# Knobs on the zero-argument path are exactly two, both env-settable
+# (docs/decisions/install-script-ux.md):
 #   --node-name / U7S_NODE_NAME   Node identity (default: hostname).
-#   --iface     / U7S_IFACE       Interface used for cluster traffic
-#                                 (default: first non-loopback interface).
-# --mint-join-token/--join/--token/--node-ip are the additive multi-node-join
-# surface docs/decisions/install-script-ux.md anticipates; they do not exist
-# on the zero-argument default path.
+#   --iface     / U7S_IFACE       Cluster-traffic interface (default: first
+#                                 physical non-loopback interface).
 #
-# --tarball <path> is required for the default and --join modes
-# (docs/decisions/upstream-component-shipping-shape.md + the roadmap's Gate 6
-# MVP scope: building/hosting the tarball is explicitly out of scope for this
-# script). The tarball is expected to contain the binaries each mode needs
-# (u7s-apiserver, u7s-scheduler, kubelet, kube-controller-manager for the
-# default control-plane mode; kubelet only for --join), findable anywhere in
+# The default and --join modes need a tarball, from --tarball <path>,
+# --tarball-url <url>, or DEFAULT_TARBALL_URL below. It must contain the
+# binaries the mode needs (u7s-apiserver, u7s-scheduler, kubelet,
+# kube-controller-manager; kubelet alone for --join), findable anywhere in
 # its extracted tree.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh --tarball <path> [--node-name <name>] [--iface <iface>]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
   install.sh --mint-join-token --node-name <name> --node-ip <ip>
-  install.sh --join <url> --token <artifact> --tarball <path> [--node-name <name>] [--iface <iface>]
+  install.sh --join <url> --token <artifact> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
-  --tarball <path>      Path to a locally pre-built u7s release tarball
-                         (required -- see docs/decisions/upstream-component-shipping-shape.md).
+  --tarball <path>      Path to an already-downloaded u7s release tarball.
+                         Overrides the release URL baked into this copy.
+  --tarball-url <url>   Fetch the release tarball from <url> instead of the
+                         one baked into this copy at release time.
   --node-name <name>    Node identity (default: hostname). For --mint-join-token
                          this is the NAME OF THE JOINING NODE, not this host.
   --iface <iface>       Network interface used for cluster traffic
@@ -79,9 +62,21 @@ Usage:
 EOF
 }
 
+# Substituted at release time by .github/workflows/release-tarball.yaml, which
+# asserts its own substitution took effect. Empty in the repo copy: a checkout
+# has no release to point at, so it fails loud instead of fetching an
+# unrelated one (docs/decisions/distribution-hosting-shape.md).
+DEFAULT_TARBALL_URL=""
+
 NODE_NAME="${U7S_NODE_NAME:-}"
 IFACE="${U7S_IFACE:-}"
 TARBALL=""
+TARBALL_URL="$DEFAULT_TARBALL_URL"
+# Only an operator-passed --tarball-url conflicts with --tarball; a released
+# copy always has a non-empty default, so emptiness cannot distinguish them.
+TARBALL_URL_EXPLICIT=0
+# Set by fetch_tarball; removed by the same EXIT trap as STAGE_DIR.
+DOWNLOAD_DIR=""
 MINT_JOIN_TOKEN=0
 NODE_IP=""
 JOIN_SERVER=""
@@ -92,6 +87,7 @@ while [ $# -gt 0 ]; do
     --node-name) NODE_NAME="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
+    --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
     --node-ip) NODE_IP="$2"; shift 2 ;;
     --join) JOIN_SERVER="$2"; shift 2 ;;
@@ -100,6 +96,11 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+if [ -n "$TARBALL" ] && [ "$TARBALL_URL_EXPLICIT" -eq 1 ]; then
+  echo "error: --tarball and --tarball-url are mutually exclusive -- pass a local path or a URL to fetch, not both" >&2
+  exit 1
+fi
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ] && [ -n "$JOIN_SERVER" ]; then
   echo "error: --mint-join-token and --join are mutually exclusive modes" >&2
@@ -113,10 +114,9 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-# Fail loud rather than silently degrading to an unsupervised bare process
-# (docs/decisions/systemd-install-contract.md). /run/systemd/system only
-# exists when systemd is genuinely running as PID 1 -- the standard,
-# widely-used detection check (e.g. systemd-detect-virt uses the same test).
+# /run/systemd/system exists only when systemd is PID 1 (the same test
+# systemd-detect-virt uses). Fail rather than degrade to unsupervised bare
+# processes (docs/decisions/systemd-install-contract.md).
 if [ ! -d /run/systemd/system ]; then
   echo "error: systemd not detected (no /run/systemd/system) -- u7s requires systemd" >&2
   exit 1
@@ -127,12 +127,10 @@ STATE_DIR=/var/lib/u7s
 
 # --- Shared helpers (used by more than one mode) -----------------------------
 
-# Poll the local apiserver's /healthz via its own admin kubeconfig. Used both
-# after a fresh single-node boot and after --mint-join-token's restart --
-# apiserver's first-run bootstrap (or the restart picking up a new
-# token-auth-file entry) races its own listener binding, so callers must poll
-# rather than assume the kubeconfig file and a live listener both already
-# exist right after systemctl returns.
+# Poll the local apiserver's /healthz via its own admin kubeconfig. Polling
+# rather than assuming: apiserver's first-run bootstrap (and the restart that
+# picks up a new token-auth-file entry) races its own listener bind, so
+# neither the kubeconfig nor a live listener exists when systemctl returns.
 wait_for_apiserver() {
   local kubeconfig_path="$1"
   echo "Waiting for u7s-apiserver to become reachable..."
@@ -150,9 +148,8 @@ wait_for_apiserver() {
   fi
 }
 
-# jq is only needed by --mint-join-token/--join (building/parsing the join
-# artifact and CSR API JSON bodies) -- not installed unconditionally so the
-# default single-node path's apt footprint stays unchanged.
+# Only --mint-join-token/--join need jq; not installed unconditionally so the
+# default path's apt footprint stays unchanged.
 ensure_jq() {
   if ! command -v jq >/dev/null 2>&1; then
     apt-get update -qq
@@ -160,10 +157,24 @@ ensure_jq() {
   fi
 }
 
-# Find each named binary anywhere in $STAGE_DIR and install it into $BIN_DIR,
-# rejecting a found-but-non-executable match instead of silently installing
-# it (e.g. a stray non-binary file that happens to share a required binary's
-# name inside the tarball).
+# Download the release tarball and point $TARBALL at it. The caller sets the
+# EXIT trap that removes $DOWNLOAD_DIR.
+#
+# No checksum yet: bytes reaching `tar -xzf` are unverified, and end up as
+# binaries run as root. Sidecar verification is mayor-te5y0's scope (PR #1356)
+# and lands inside this body.
+fetch_tarball() {
+  local url="$1"
+  DOWNLOAD_DIR="$(mktemp -d)"
+  TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
+
+  echo "Downloading release tarball from $url..."
+  curl -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
+}
+
+# Install each named binary found anywhere in $STAGE_DIR into $BIN_DIR,
+# rejecting a found-but-non-executable match rather than installing it (e.g. a
+# stray file sharing a required binary's name).
 stage_binaries() {
   for bin in "$@"; do
     found="$(find "$STAGE_DIR" -type f -name "$bin" | head -n1)"
@@ -180,37 +191,24 @@ stage_binaries() {
 }
 
 # Minimal KubeletConfiguration: CRI-O's socket, cluster DNS matching
-# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and
-# resolvConf disabled. resolvConf: "" is not a Lima-only workaround -- any
-# Ubuntu LTS box running systemd-resolved (the Ubuntu default) has
-# /etc/resolv.conf pointing at the 127.0.0.53 stub, which is unreachable from
-# inside a pod's network namespace; disabling passthrough avoids kubelet
-# propagating that unusable resolver into every pod's /etc/resolv.conf.
+# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and four
+# settings that are not obvious:
 #
-# tlsCertFile/tlsPrivateKeyFile point at a serving cert signed by the cluster
-# CA -- either minted locally by kubelet.service's ExecStartPre (single-node)
-# or delivered pre-signed in the join artifact (--join) -- see those call
-# sites' comments for why (without it, kubelet falls back to a self-signed
-# cert the apiserver's kubelet-client always rejects, breaking kubectl
-# logs/exec).
+# resolvConf: "" -- Ubuntu's systemd-resolved points /etc/resolv.conf at the
+# 127.0.0.53 stub, unreachable from inside a pod netns; passing it through
+# would give every pod an unusable resolver.
 #
-# authentication.x509.clientCAFile is the other half of that same fix: it lets
-# kubelet authenticate apiserver's own client cert (CN=kube-apiserver-kubelet-
-# client, O=system:masters, also signed by this CA) as an identity instead of
-# treating the request as anonymous. Without it, kubelet's default anonymous-
-# auth+AlwaysAllow combination sounds permissive but is actually not what
-# happens here: this real kubelet's own container-log/exec endpoints return a
-# bare 401 "Unauthorized" for a request with no clientCAFile configured to
-# resolve an identity against, propagated verbatim through the apiserver's
-# proxy (see the passthrough comment in handlers/proxy.rs) as the same
-# kubectl-logs/exec failure this unit's serving-cert fix alone does not clear.
+# tlsCertFile/tlsPrivateKeyFile -- a serving cert signed by the cluster CA,
+# minted by kubelet.service's ExecStartPre or delivered in the join artifact.
+# Without it kubelet self-signs and the apiserver's kubelet-client rejects it,
+# breaking kubectl logs/exec.
 #
-# rotateCertificates: true lets kubelet self-renew its own client cert (the
-# one embedded in --kubeconfig) via this same CSR mechanism once it holds a
-# real x509 identity -- the selfnodeclient RBAC grant (seeded by the
-# apiserver) is the only other piece that needs to exist, and it already
-# does. Needs no other install.sh logic: it is kubelet's own standing
-# capability.
+# clientCAFile -- lets kubelet authenticate the apiserver's own client cert
+# rather than treating proxied requests as anonymous, which its container-log
+# and exec endpoints answer with a bare 401.
+#
+# rotateCertificates -- kubelet self-renews its client cert over the same CSR
+# path; the selfnodeclient RBAC grant it needs is already seeded.
 write_kubelet_config_yaml() {
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -232,20 +230,13 @@ rotateCertificates: true
 EOF
 }
 
-# --mint-join-token: run on an existing control-plane node (which already has
-# ca.key/ca.pem on disk from its own single-node bootstrap). Mints a
-# bootstrap bearer token authorized (via the apiserver's already-seeded
-# system:node-bootstrapper / nodeclient ClusterRoles, bound to group
+# --mint-join-token: run on a control-plane node that already has ca.key/ca.pem
+# from its own bootstrap. Mints a bootstrap token authorized (by the
+# apiserver's seeded system:node-bootstrapper/nodeclient grants for group
 # system:bootstrappers) to submit exactly one join CSR, restarts
-# u7s-apiserver.service to load it (the token map is load-once-at-startup,
-# confirmed no hot-reload path -- a brief restart is unavoidable and
-# acceptable given u7s's single-apiserver, already-accepted no-HA
-# architecture), and locally signs a kubelet serving cert for the joining
-# node using the exact same openssl invocation kubelet.service's own
-# ExecStartPre uses for single-node, just parameterized by the joining node's
-# name/IP instead of this host's own. All three (CA cert, bootstrap token,
-# serving cert+key) are bundled into one base64(JSON) artifact for the
-# operator to copy to the joining node.
+# u7s-apiserver.service to load it -- the token map is read once at startup,
+# with no hot-reload path -- and signs a kubelet serving cert for the joining
+# node. CA cert, token and serving cert+key go into one base64(JSON) artifact.
 mint_join_token() {
   if [ -z "$NODE_NAME" ] || [ -z "$NODE_IP" ]; then
     echo "error: --mint-join-token requires --node-name <joining-node-name> and --node-ip <joining-node-ip>" >&2
@@ -272,14 +263,10 @@ mint_join_token() {
 
   local mint_dir
   mint_dir="$(mktemp -d)"
-  # Double-quoted (not the single-quoted style used for $STAGE_DIR's EXIT trap
-  # elsewhere in this script) so $mint_dir's value is baked into the trap
-  # command NOW: mint_dir is `local` to this function and goes out of scope
-  # once it returns, but this same EXIT trap only actually fires later, at
-  # the whole script's real process exit -- a single-quoted trap would
-  # re-evaluate "$mint_dir" at that point against an unset local, tripping
-  # `set -u`.
-  # shellcheck disable=SC2064 # intentional: see the immediate-expansion note above
+  # Double-quoted so $mint_dir is baked in now: it is `local` and out of scope
+  # by the time this EXIT trap fires at real process exit, where a
+  # single-quoted trap would re-evaluate it against an unset var under `set -u`.
+  # shellcheck disable=SC2064 # intentional: see above
   trap "rm -rf '$mint_dir'" EXIT
 
   openssl ecparam -name prime256v1 -genkey -noout -out "$mint_dir/kubelet-serving.key"
@@ -306,17 +293,13 @@ mint_join_token() {
   echo "    --token '$artifact' --tarball <path> --node-name $NODE_NAME [--iface <iface>]"
 }
 
-# --join: run on a fresh node. Decodes the join artifact locally (no network
-# fetch needed for CA trust), generates a local keypair, builds a PKCS#10 CSR
-# shaped exactly as upstream kube-controller-manager's builtin csrapproving
-# controller requires for its isNodeClientCert auto-approval recognizer
-# (CN=system:node:<name>, O=system:nodes, signerName=kubernetes.io/kube-
-# apiserver-client-kubelet, usages digital signature/key encipherment/client
-# auth), and submits it authenticated with the bootstrap bearer token. KCM's
-# real (unmodified upstream) csrapproving/csrsigning controllers auto-approve
-# and sign it -- no manual approval step anywhere in this flow. The signed
-# cert becomes kubelet's own dedicated x509 kubeconfig identity, not a shared
-# admin kubeconfig and not a bearer-token one.
+# --join: run on a fresh node. Decodes the artifact locally (so CA trust needs
+# no network), then builds a PKCS#10 CSR shaped exactly as upstream
+# csrapproving's isNodeClientCert recognizer requires (CN=system:node:<name>,
+# O=system:nodes, signerName kubernetes.io/kube-apiserver-client-kubelet,
+# usages digital signature/key encipherment/client auth) and submits it under
+# the bootstrap token. KCM auto-approves and signs it -- no manual step -- and
+# the result becomes kubelet's own x509 identity, not a shared admin one.
 join_cluster() {
   if [ -z "$JOIN_TOKEN" ]; then
     echo "error: --join requires --token <join-artifact>" >&2
@@ -361,10 +344,8 @@ join_cluster() {
     -X POST "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" \
     -d "$csr_body" >/dev/null
 
-  # kube-controller-manager's builtin csrapproving/csrsigning controllers
-  # handle approval and signing automatically (react to the create event,
-  # not on a fixed poll interval) -- this loop is waiting on that, not
-  # performing any approval itself.
+  # KCM's csrapproving/csrsigning controllers react to the create event; this
+  # loop only waits on them, it approves nothing itself.
   echo "Waiting for kube-controller-manager to auto-approve and sign the CSR..."
   local signed_cert_b64="" resp
   for _ in $(seq 1 60); do
@@ -421,14 +402,28 @@ if [ -n "$JOIN_SERVER" ]; then
   JOIN_MODE=1
 fi
 
-if [ -z "$TARBALL" ]; then
-  echo "error: --tarball <path> is required (fetching a tarball by URL is out of scope for this script)" >&2
-  usage
+if [ -z "$TARBALL" ] && [ -z "$TARBALL_URL" ]; then
+  # Only a checkout copy reaches this: a released one always has a baked URL,
+  # so name that case rather than repeating usage's "one of these is required".
+  echo "error: this copy of install.sh has no release URL baked into it (DEFAULT_TARBALL_URL is empty)," >&2
+  echo "       which means it came from a git checkout rather than a published release." >&2
+  echo "       Pass --tarball <path> (e.g. the output of scripts/build-release-tarball.sh)" >&2
+  echo "       or --tarball-url <url>." >&2
   exit 1
 fi
-if [ ! -f "$TARBALL" ]; then
+if [ -n "$TARBALL" ] && [ ! -f "$TARBALL" ]; then
   echo "error: tarball not found: $TARBALL" >&2
   exit 1
+fi
+
+# Download before apt installs and starts CRI-O, so a wrong or unreachable URL
+# leaves the host untouched rather than half-configured -- a likely failure
+# while the stable /install.sh URL still 404s. --tarball wins over both
+# --tarball-url and the baked default, so an operator already holding the bytes
+# never triggers a download.
+if [ -z "$TARBALL" ]; then
+  trap 'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
+  fetch_tarball "$TARBALL_URL"
 fi
 
 # --- Defaults: node name, network interface ----------------------------------
@@ -438,22 +433,12 @@ if [ -z "$NODE_NAME" ]; then
 fi
 
 if [ -z "$IFACE" ]; then
-  # Whitelist of real physical-NIC name patterns, not a blacklist of virtual
-  # ones. A blacklist can only ever cover the virtual-interface names its
-  # author happened to think of (docker0/veth*/cni*/... today, something
-  # else tomorrow); the physical-NIC vocabulary is small, finite, and
-  # documented (systemd.net-naming-scheme(7)): predictable names are always
-  # en<x>/wl<x>/ww<x> (Ethernet/WLAN/WWAN) followed by an o/s/p/x-prefixed
-  # location suffix -- eno1, ens33, enp0s3, enp2s0f1, enx<mac>, wlo1, wlp2s0,
-  # wlx<mac>, wwp0s20u4i6 -- so "en"/"wl"/"ww" is the right level of
-  # abstraction, not literally "eno"/"wlo" (which are just two instances of
-  # the "en"/"wl" prefix, specific to onboard-device naming). The legacy
-  # pre-predictable-naming kernel names (eth0, wlan0 -- wlan0 already matches
-  # the "wl" prefix, so only eth0/ethN needs its own branch) are also
-  # whitelisted: this is not just a theoretical old-kernel fallback -- a live
-  # check across this project's own 5-VM Ubuntu 26.04 Lima fleet (identical
-  # VM template) found it split 2/5 enp0s1 (predictable) vs 3/5 eth0
-  # (fallback), so eth0 has to stay covered, not be treated as obsolete.
+  # Whitelist physical-NIC name patterns rather than blacklisting virtual
+  # ones: a blacklist only ever covers the names its author thought of, while
+  # systemd.net-naming-scheme(7) fixes the physical vocabulary at
+  # en/wl/ww<suffix> (Ethernet/WLAN/WWAN). eth[0-9] covers the legacy kernel
+  # names, which are not merely a theoretical fallback -- our own 5-VM Ubuntu
+  # 26.04 Lima fleet, one template, splits 2/5 enp0s1 vs 3/5 eth0.
   IFACE="$(ip -o link show | awk -F': ' '{print $2}' \
     | grep -E '^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$' \
     | head -n1)"
@@ -473,21 +458,11 @@ echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
 
 # --- CRI-O + crun via apt -----------------------------------------------------
 #
-# Near-direct lift of the proven sequence in lima/kubelet.yaml's provisioning
-# (lines 74-115), with two test-harness-specific bits deliberately excluded:
-#
-#   - The 20-test-handler.conf runtime alias: added only to satisfy upstream
-#     CRI-O CI's RuntimeClass e2e suite, not needed by a real deployment.
-#   - Disabling containerd: investigated, not carried over. A live check
-#     against lima-node-3 (an existing provisioned dev VM) found no `containerd`
-#     apt package installed at all (`dpkg -l` returns nothing) -- the
-#     containerd.service unit present there is injected by Lima's own guest
-#     agent (per lima/kubelet.yaml's own comment: "Lima's builtin default
-#     enables a per-USER (rootless) containerd ... unconditionally"), not by
-#     anything in Ubuntu's base package set. A genuine fresh Ubuntu LTS box
-#     provisioned outside Lima never gets containerd unless something else
-#     (docker.io, containerd.io) explicitly installs it, so there is nothing
-#     for a real install to conflict with or need to disable.
+# Mirrors lima/kubelet.yaml's provisioning, minus two test-harness-only bits:
+# its 20-test-handler.conf runtime alias (needed by CRI-O's own CI, not by a
+# real deployment) and its containerd-disabling step (a fresh Ubuntu box ships
+# no containerd package at all; the unit Lima VMs have is injected by Lima's
+# guest agent, so a real install has nothing to conflict with).
 apt-get update -qq
 apt-get install -y apt-transport-https ca-certificates curl gpg
 
@@ -498,18 +473,16 @@ echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror
   > /etc/apt/sources.list.d/cri-o.list
 apt-get update -qq
 apt-get install -y cri-o crun conmon
-# Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun.
-# CRI-O ships its own crun at /usr/libexec/crio/crun that matches the OCI
-# spec version it generates (1.2.x). The system crun only accepts 1.0/1.1
-# and will fail with "unknown version specified" on every sandbox create.
-# The 10-crio.conf shipped by the cri-o package already sets the correct path.
+# Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun: CRI-O ships its
+# own crun at /usr/libexec/crio/crun matching the OCI spec version it generates
+# (1.2.x), while the system crun accepts only 1.0/1.1 and fails every sandbox
+# create with "unknown version specified". The package's own 10-crio.conf
+# already sets the correct path.
 mkdir -p /etc/crio/crio.conf.d
 
-# Enable the CNI 1.0.0 conflist bridge config.
-# The cri-o package ships two CNI configs:
-#   10-crio-bridge.conf         -- old 0.4.0 single-plugin format (fails with crun 1.26+)
-#   10-crio-bridge.conflist     -- new 1.0.0 conflist format (correct)
-# Disable the old one and enable the new one.
+# The cri-o package ships both 10-crio-bridge.conf (old 0.4.0 single-plugin
+# format, fails with crun 1.26+) and 10-crio-bridge.conflist (1.0.0, correct).
+# Swap to the conflist.
 CNI_DIR=/etc/cni/net.d
 if [ -f "$CNI_DIR/10-crio-bridge.conf" ]; then
   mv "$CNI_DIR/10-crio-bridge.conf" "$CNI_DIR/10-crio-bridge.conf.disabled" || true
@@ -518,21 +491,20 @@ if [ -f "$CNI_DIR/10-crio-bridge.conflist.disabled" ]; then
   mv "$CNI_DIR/10-crio-bridge.conflist.disabled" "$CNI_DIR/10-crio-bridge.conflist" || true
 fi
 
-# crio.service itself is installed and enabled by the cri-o apt package
-# (docs/decisions/systemd-install-contract.md) -- no unit is authored here.
-# This just starts it, matching the proven sequence.
+# crio.service is owned and enabled by the apt package
+# (docs/decisions/systemd-install-contract.md); this only starts it.
 systemctl enable --now crio
 
 # --- Stage binaries from the tarball ------------------------------------------
 #
-# u7s and KCM/kubelet ship together in one release tarball
-# (docs/decisions/upstream-component-shipping-shape.md); building/hosting that
-# tarball is out of scope here. Extract to a scratch dir and locate each
-# required binary by name anywhere in the tree, rather than assuming a fixed
-# internal layout the tarball-build step hasn't been designed yet. --join only
-# needs kubelet (no control-plane binaries on a worker-only node).
+# u7s and KCM/kubelet ship in one tarball
+# (docs/decisions/upstream-component-shipping-shape.md). Binaries are located
+# by name anywhere in the extracted tree rather than at a fixed path, so the
+# tarball's internal layout is not load-bearing. --join needs only kubelet.
 STAGE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
+# Replaces the download-only trap above, so it must still cover $DOWNLOAD_DIR.
+# ${DOWNLOAD_DIR:+...} expands to nothing when --tarball gave a local path.
+trap 'rm -rf "$STAGE_DIR" ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
 
 tar -xzf "$TARBALL" -C "$STAGE_DIR"
 
@@ -545,22 +517,14 @@ fi
 
 # --- kubectl + CNI plugin binaries (apt, pinned to kubelet's own version) ----
 #
-# kubectl ships in neither the release tarball (out of scope per
-# docs/decisions/upstream-component-shipping-shape.md -- that ADR only
-# settles kubelet/KCM/kube-proxy/CoreDNS) nor the tarball's binary list this
-# script checks above, but a zero-argument install that ends at a working
-# `kubectl get nodes` needs kubectl to exist somewhere. Pulled from the
-# official Kubernetes apt repo, same signed-apt-repo pattern as CRI-O above,
-# pinned to kubelet's own minor version for client/server skew safety.
+# kubectl is not in the release tarball, but a zero-argument install has to
+# end at a working `kubectl get nodes`. Pinned to kubelet's own minor version
+# for client/server skew safety.
 #
-# kubernetes-cni (from the same repo) provides the actual CNI plugin binaries
-# (bridge, host-local, loopback, ...) under /opt/cni/bin/ that CRI-O's own
-# 10-crio-bridge.conflist references. CRI-O's apt package only Recommends
-# (not Depends on) a CNI-plugins package, and cloud-image apt defaults to
-# Install-Recommends=false -- so on a genuinely fresh box CRI-O starts with a
-# CNI config file that validates against no actual plugin binaries, and every
-# node sits NotReady forever with "failed to find plugin \"bridge\" in path
-# [/opt/cni/bin/]" (found running this script end to end for the first time).
+# kubernetes-cni supplies the /opt/cni/bin/ plugins (bridge, host-local, ...)
+# that CRI-O's 10-crio-bridge.conflist references. CRI-O only Recommends a
+# CNI-plugins package and cloud-image apt disables recommends, so without this
+# every node sits NotReady forever with "failed to find plugin \"bridge\"".
 KUBE_VERSION="$("$BIN_DIR/kubelet" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 if [ -z "$KUBE_VERSION" ]; then
   echo "error: could not determine kubelet version from '$BIN_DIR/kubelet --version'" >&2
@@ -575,10 +539,9 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 apt-get update -qq
 apt-get install -y kubectl kubernetes-cni
 
-# State dir: apiserver's default relative paths (./state.db, ./kubeconfig,
-# ./ca.key, ./ca.crt, ./sa.key, ./sa.pub) resolve here via WorkingDirectory=.
-# 0700 because it ends up holding the CA private key and service-account
-# signing key.
+# apiserver's relative default paths (./state.db, ./kubeconfig, ./ca.key,
+# ./ca.crt, ./sa.key, ./sa.pub) resolve here via WorkingDirectory=. 0700
+# because it holds the CA and service-account signing keys.
 install -d -m 0700 "$STATE_DIR"
 install -d -m 0755 /etc/u7s/static-pods
 
@@ -617,36 +580,22 @@ fi
 
 # --- systemd units -------------------------------------------------------------
 #
-# Per docs/decisions/systemd-install-contract.md: one unit per host binary,
-# Restart=always, boot-enabled. crio.service is intentionally not authored
-# here (the apt package already owns it, enabled above).
+# One unit per host binary, Restart=always, boot-enabled
+# (docs/decisions/systemd-install-contract.md); crio.service is the apt
+# package's, not authored here.
 #
-# u7s-apiserver generates ca.key/ca.crt/sa.key/sa.pub/kubeconfig(+variants)
-# on its first run inside $STATE_DIR -- u7s-scheduler, u7s-kcm, and kubelet
-# all depend on files that do not exist until that first run completes.
-# Type=simple only guarantees the *process* has started, not that bootstrap
-# writes are done, so each dependent unit's first ExecStart can legitimately
-# fail before those files exist. Restart=always (the same mechanism the
-# install contract already relies on for crash recovery) absorbs this
-# startup race for free -- no extra wait-loop/supervisor script needed.
+# u7s-apiserver writes ca.key/ca.crt/sa.key/sa.pub/kubeconfig on its first run,
+# and Type=simple guarantees only that the process started, not that those
+# writes finished -- so each dependent unit's first ExecStart can legitimately
+# fail. Restart=always absorbs that race, so no wait-loop is needed.
 
-# --token-auth-file is always passed so a later --mint-join-token on this
-# same node never needs a units-file edit + extra restart just to turn the
-# flag on -- an empty file here is a valid, always-loadable token map
-# (auth::load_token_file skips blank/comment lines), so this default path's
-# behavior is unchanged until a token actually gets appended.
+# --token-auth-file is always passed so a later --mint-join-token needs no unit
+# edit plus extra restart to enable it. An empty file is a valid token map
+# (auth::load_token_file skips blank lines), so the default path is unchanged
+# until a token is appended.
 touch "$STATE_DIR/token-auth-file"
 chmod 600 "$STATE_DIR/token-auth-file"
 
-# No --kubelet-preferred-address here (unlike the dev/conformance Lima harness's own
-# apiserver invocation): that flag overrides EVERY node's resolved kubelet address to one
-# fixed value, which only makes sense when a single kubelet's real InternalIP is unreachable
-# from the apiserver (e.g. Mac host + port-forwarded Lima VM). A real multi-node install has
-# one real, directly-routable IP per node already reported via kubelet's own --node-ip flag
-# below -- forcing every node's proxy target (logs/exec/attach) to THIS node's own IP instead
-# would silently proxy a joined node's log/exec requests to the wrong kubelet entirely
-# (confirmed live: a joined node's `kubectl logs` returned "pod ... does not exist" because it
-# was asking the control-plane's own kubelet, mayor-yocic's 2-node acceptance test).
 cat > /etc/systemd/system/u7s-apiserver.service <<EOF
 [Unit]
 Description=u7s API server
@@ -690,14 +639,11 @@ Requires=u7s-apiserver.service
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
-# ca.crt is written by u7s in DER form; KCM requires PEM. Converted here
-# (not at install time) because ca.crt does not exist until u7s-apiserver's
-# first run -- see the Restart=always note above. ExecStartPre (not a
-# bash -c wrapper around ExecStart) so the --controllers=*,-... value below
-# is passed to kube-controller-manager as a literal argv entry: systemd's
-# own ExecStart line-splitting never runs a shell and never globs, but
-# wrapping the whole command in bash -c would hand that unquoted "*" to a
-# real shell parsing the WorkingDirectory's contents.
+# ca.crt is DER from u7s but KCM needs PEM, converted at start rather than at
+# install time because it does not exist until apiserver's first run.
+# ExecStartPre rather than a bash -c wrapper so --controllers=*,-... stays a
+# literal argv entry: systemd's own line-splitting never globs, but a real
+# shell would expand that "*" against WorkingDirectory's contents.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
@@ -717,25 +663,17 @@ Requires=crio.service u7s-apiserver.service
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
-# Without --tls-cert-file/--tls-private-key-file (wired via kubelet-config.yaml's
-# tlsCertFile/tlsPrivateKeyFile above), kubelet generates its own self-signed
-# serving cert for :10250 (see 'kubelet --help's own --tls-cert-file text) --
-# signed by a CA the apiserver's kubelet-client has no way to trust, since that
-# client is pinned to the cluster CA (build_kubelet_tls_config in
-# crates/apiserver/src/handlers/proxy.rs), not the system trust store. That
-# mismatch is exactly what surfaces as "kubectl logs"/"exec" failing with
-# BadGateway -- confirmed live via curl -v against the kubelet's own :10250
-# showing a TLS "unknown CA" alert against kubelet's self-signed cert.
-# kube-controller-manager's built-in CSR approver has no auto-approve path for
-# kubernetes.io/kubelet-serving requests (unlike client-cert CSRs) -- blindly
-# approving one would let any node claim a cert for any IP/hostname, so real
-# clusters require a human or an external approver. Minting the serving cert
-# once here from the CA install.sh already controls sidesteps that whole flow,
-# which fits this script's current single-node scope.
-# ExecStartPre (not a bash -c wrapping ExecStart itself, matching u7s-kcm.service's
-# reasoning above): idempotent, skips regeneration if the cert already exists so
-# Restart=always crash-restarts do not churn it, and openssl's ca.crt DER->PEM
-# conversion is safe to repeat (same input, same output) across services.
+# Without a CA-signed serving cert (wired via kubelet-config.yaml's
+# tlsCertFile), kubelet self-signs for :10250, and the apiserver's
+# kubelet-client -- pinned to the cluster CA by build_kubelet_tls_config in
+# crates/apiserver/src/handlers/proxy.rs, not the system trust store --
+# rejects it, surfacing as BadGateway on kubectl logs/exec. KCM has no
+# auto-approve path for kubelet-serving CSRs, since approving one blindly
+# would let any node claim a cert for any IP or hostname, so the cert is
+# minted here from the CA this script already controls.
+# ExecStartPre is idempotent: it skips regeneration when the cert exists, so
+# Restart=always does not churn it, and the DER->PEM conversion is safe to
+# repeat across services.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP\nextendedKeyUsage=serverAuth\n") -out $STATE_DIR/kubelet-serving.crt; }'
 ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP
@@ -754,21 +692,18 @@ systemctl enable --now kubelet.service
 
 # --- In-cluster bootstrap: kube-proxy DaemonSet -------------------------------
 #
-# CoreDNS needs nothing here: the apiserver server-side-applies its own
-# vendored manifest bundle in-process on every boot (bootstrap_apply.rs).
-# kube-proxy has no equivalent in-process path (docs/decisions/upstream-
-# component-shipping-shape.md scopes bootstrap_apply.rs to CoreDNS only), so
-# this script applies it once the apiserver is confirmed reachable. RBAC
-# (ClusterRole system:node-proxier) is already seeded by the apiserver
-# itself; only the ServiceAccount binding, config, and DaemonSet are new.
+# CoreDNS needs nothing here -- the apiserver server-side-applies its own
+# vendored manifest in-process on every boot (bootstrap_apply.rs) -- but
+# kube-proxy has no equivalent path, so it is applied once the apiserver is
+# reachable. Its ClusterRole is already seeded by the apiserver; only the
+# ServiceAccount binding, config and DaemonSet are new.
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
 wait_for_apiserver "$KUBECONFIG_PATH"
 
-# server: hardcoded to 10.96.0.1 (the "kubernetes" Service's fixed ClusterIP)
-# rather than the ${KUBERNETES_SERVICE_HOST} env-var form upstream's own
-# kubeadm ConfigMap uses -- same reasoning as coredns.yaml pinning kube-dns's
-# ClusterIP: a hardcoded, known-good address beats depending on a Pod-env-var
-# substitution path this project hasn't specifically verified.
+# server: the "kubernetes" Service's fixed ClusterIP, hardcoded rather than
+# kubeadm's ${KUBERNETES_SERVICE_HOST} env form -- same reasoning as
+# coredns.yaml pinning kube-dns's ClusterIP, a known-good address over a
+# Pod-env-var substitution path this project has not verified.
 echo "Applying kube-proxy DaemonSet manifest..."
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
 apiVersion: v1
