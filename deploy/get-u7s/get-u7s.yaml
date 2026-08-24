@@ -42,6 +42,10 @@ data:
         # on to install and the two can never skew
         location = /install.sh {
             error_page 301 302 303 307 308 = @follow_hop1;
+            # nginx location error_page REPLACES the server-level set --
+            # inheritance is all-or-nothing, so we re-declare 404 -> @not_found
+            # here and in every sibling location with its own error_page
+            error_page 404 = @not_found;
             proxy_pass https://github.com/litehop/u7s/releases/latest/download/install.sh;
         }
 
@@ -52,6 +56,7 @@ data:
         location ~ ^/(v[0-9][A-Za-z0-9.+-]*)/([A-Za-z0-9][A-Za-z0-9._+-]*)$ {
             rewrite ^/([^/]+)/([^/]+)$ /litehop/u7s/releases/download/$1/$2 break;
             error_page 301 302 303 307 308 = @follow_hop1;
+            error_page 404 = @not_found;
             proxy_pass https://github.com;
         }
 
@@ -61,6 +66,7 @@ data:
             internal;
             set $loc1 $upstream_http_location;
             error_page 301 302 303 307 308 = @follow_hop2;
+            error_page 404 = @not_found;
             proxy_pass $loc1;
         }
 
@@ -68,6 +74,7 @@ data:
             internal;
             set $loc2 $upstream_http_location;
             error_page 301 302 303 307 308 = @follow_hop3;
+            error_page 404 = @not_found;
             proxy_pass $loc2;
         }
 
