@@ -157,19 +157,34 @@ ensure_jq() {
   fi
 }
 
-# Download the release tarball and point $TARBALL at it. The caller sets the
-# EXIT trap that removes $DOWNLOAD_DIR.
-#
-# No checksum yet: bytes reaching `tar -xzf` are unverified, and end up as
-# binaries run as root. Sidecar verification is mayor-te5y0's scope (PR #1356)
-# and lands inside this body.
+# Download the release tarball and its .sha256 sidecar, verify the sidecar's
+# hash against the downloaded bytes, and point $TARBALL at it. The caller
+# sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch failure
+# (including a 404, e.g. a pre-checksum release) fails the same as any other
+# curl error here: unverified bytes reaching `tar -xzf` become binaries run
+# as root, so a URL-based fetch always requires a passing checksum.
 fetch_tarball() {
   local url="$1"
   DOWNLOAD_DIR="$(mktemp -d)"
   TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
+  local checksum_url="$url.sha256"
+  local checksum_file="$TARBALL.sha256"
 
   echo "Downloading release tarball from $url..."
   curl -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
+
+  echo "Downloading checksum sidecar from $checksum_url..."
+  curl -fsSL --retry 3 --retry-connrefused -o "$checksum_file" "$checksum_url"
+
+  local expected actual
+  expected="$(cut -d' ' -f1 "$checksum_file")"
+  actual="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+  if [ "$expected" != "$actual" ]; then
+    echo "error: checksum mismatch for $url" >&2
+    echo "       expected (from $checksum_url): $expected" >&2
+    echo "       actual:                        $actual" >&2
+    exit 1
+  fi
 }
 
 # Install each named binary found anywhere in $STAGE_DIR into $BIN_DIR,

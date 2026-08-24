@@ -39,11 +39,11 @@ jobs:
         run: cargo fmt --check
 
   # Regression guards for scripts/**/test-*-logic.sh (plus the standalone
-  # test-critical-reviewer-hook.sh) -- pure-bash unit tests for shell-script
-  # logic (argument parsing, decision functions, process supervision), none
-  # of which touch a real Lima VM/kubectl/sonobuoy. Discovered via `find` so
-  # new sibling scripts are picked up automatically instead of silently
-  # staying untested like this whole family did before.
+  # test-critical-reviewer-hook.sh and test-install-checksum.sh) -- pure-bash
+  # unit tests for shell-script logic (argument parsing, decision functions,
+  # process supervision), none of which touch a real Lima VM/kubectl/sonobuoy.
+  # Discovered via `find` so new sibling scripts are picked up automatically
+  # instead of silently staying untested like this whole family did before.
   script-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -52,10 +52,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh
+      - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh + test-install-checksum.sh
         run: |
           tests_file="$(mktemp)"
-          find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' \) | sort > "$tests_file"
+          find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' -o -name 'test-install-checksum.sh' \) | sort > "$tests_file"
           count=$(wc -l < "$tests_file")
           if [ "$count" -eq 0 ]; then
             echo "no scripts/**/test-*-logic.sh regression scripts found — discovery is broken" >&2
