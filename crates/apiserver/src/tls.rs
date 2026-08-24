@@ -1,7 +1,7 @@
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
     RootCertStore, ServerConfig,
 };
 use std::sync::Arc;
@@ -241,31 +241,43 @@ fn load_or_generate_ca(
     Ok((ca_key, ca_params, ca_cert_der))
 }
 
-/// True if `leaf_der`'s Issuer field matches `ca_der`'s Subject field. Malformed DER on
-/// either side is treated as a mismatch (fail closed — regenerate rather than trust
-/// unparseable bytes).
-fn cert_issuer_matches_ca_subject(leaf_der: &[u8], ca_der: &[u8]) -> bool {
-    use x509_cert::der::Decode as _;
-    use x509_cert::Certificate;
-    let Ok(leaf) = Certificate::from_der(leaf_der) else {
+/// True if `leaf_der` cryptographically chain-validates against `ca_der` as the sole trust
+/// anchor -- i.e. it was actually signed by the CA's private key -- using the same rustls
+/// webpki verification the live server runs on every mTLS handshake. A Name-string
+/// comparison of Issuer vs. Subject would wrongly trust a different-key CA that happens to
+/// share a Subject CN; this checks the signature, not just the claimed name.
+fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
+    let mut root_store = RootCertStore::empty();
+    if root_store
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(verifier) = WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+    else {
         return false;
     };
-    let Ok(ca) = Certificate::from_der(ca_der) else {
-        return false;
-    };
-    leaf.tbs_certificate().issuer() == ca.tbs_certificate().subject()
+    verifier
+        .verify_client_cert(
+            &CertificateDer::from(leaf_der.to_vec()),
+            &[],
+            UnixTime::now(),
+        )
+        .is_ok()
 }
 
 /// Load-or-generate the admin client cert+key (CN=admin, O=system:masters) embedded in
 /// the "admin" kubeconfig. kubelet.service authenticates as this SAME identity too
 /// (install.sh points both at $STATE_DIR/kubeconfig).
 ///
-/// Persisted the same way as the CA (`load_or_generate_ca`): the CA surviving a restart
-/// is not enough on its own to keep `--kubeconfig`'s bytes stable — without this, every
+/// Persisted the same way as the CA (`load_or_generate_ca`): the CA surviving a restart is
+/// not enough on its own to keep `--kubeconfig`'s bytes stable — without this, every
 /// restart still mints a brand-new system:masters credential (new key, new signature,
 /// unconditionally overwritten into the kubeconfig file), with no way to revoke the
-/// previous one. That is exactly the kind of "rotation of admin identity on restart"
-/// mayor-1oj4d already ruled out once, in bearer-token form.
+/// previous one.
 fn load_or_generate_admin_cert(
     key_path: &std::path::Path,
     cert_path: &std::path::Path,
@@ -311,18 +323,18 @@ fn load_or_generate_admin_cert(
         let cert_der = std::fs::read(validate_cli_path(cert_path)?)
             .map_err(|e| anyhow::anyhow!("read admin cert {}: {e}", cert_path.display()))?;
 
-        if cert_issuer_matches_ca_subject(&cert_der, ca_cert_der) {
+        if leaf_cert_chain_validates(&cert_der, ca_cert_der) {
             tracing::info!("loaded admin cert from {}", cert_path.display());
             return Ok((cert_der, key_pem.into_bytes()));
         }
-        // The on-disk admin cert was issued by a DIFFERENT CA than the one just loaded
+        // The on-disk admin cert does not chain-validate against the CA just loaded
         // (e.g. ca.key/ca.crt were rotated independently, or -- observed only under test
         // parallelism, where multiple processes race on the same relative default paths --
         // a concurrent writer regenerated the CA after this admin cert was signed).
         // Loading it anyway would hand out a chain that fails verification for every
         // client that receives it. Discard and regenerate against the CA now in memory.
         tracing::error!(
-            "admin cert at {} was not issued by the CA now loaded from disk; \
+            "admin cert at {} does not chain-validate against the CA now loaded from disk; \
              discarding and regenerating",
             cert_path.display()
         );
@@ -1076,16 +1088,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// Regression for the exact live-operator symptom this fix targets: an admin
-    /// kubeconfig copied off the node before `systemctl restart u7s-apiserver` must keep
-    /// authenticating after the restart, with no client-side action. A prior incarnation
-    /// of this invariant (mayor-1oj4d, bearer-token era) was already broken once by a
-    /// restart regenerating the credential; this reproduces the same class of break at
-    /// the TLS chain-validation layer the current x509-only auth model depends on.
+    /// Proves two things `generate_tls()` must guarantee across a restart: (1) the admin
+    /// cert file bytes are preserved rather than re-minted, so an admin kubeconfig copied
+    /// off-node before the restart is not silently swapped for a different credential; and
+    /// (2) that preserved, pre-restart-issued cert still cryptographically chain-validates
+    /// against the CA loaded on the second call. This does not by itself establish that a
+    /// missing guarantee here is what produced any specific operator-observed failure --
+    /// only that the guarantee holds.
     #[test]
     fn admin_cert_issued_before_restart_still_chain_validates_after_restart() {
-        use rustls::pki_types::UnixTime;
-
         let dir = test_temp_dir("admin-cert-restart-survives");
         let args = Args {
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
@@ -1111,39 +1122,20 @@ mod tests {
             tls1.admin_cert_der, tls2.admin_cert_der,
             "the admin cert must be loaded, not re-minted, on restart -- minting a new one \
              every restart hands out a DIFFERENT, never-revoked system:masters identity \
-             each time, which is the credential-rotation-on-restart mayor-1oj4d already \
-             ruled out once"
+             each time an admin kubeconfig is copied off-node"
         );
 
-        // The operator-visible failure mode: does the cert captured BEFORE the restart
-        // still pass the exact chain-validation check the live server runs on every mTLS
-        // handshake, built from the CA loaded AFTER the restart?
-        let mut root_store = RootCertStore::empty();
-        root_store
-            .add(CertificateDer::from(tls2.ca_cert_der.clone()))
-            .expect("root store add");
-        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
-            .allow_unauthenticated()
-            .build()
-            .expect("build verifier");
-
-        verifier
-            .verify_client_cert(
-                &CertificateDer::from(tls1.admin_cert_der.clone()),
-                &[],
-                UnixTime::now(),
-            )
-            .expect(
-                "an admin cert issued BEFORE a restart must still pass the server's \
-                 client-cert chain validation AFTER the restart, or every kubectl session \
-                 holding the pre-restart kubeconfig gets 401 Unauthorized with no \
-                 client-side action taken",
-            );
+        assert!(
+            leaf_cert_chain_validates(&tls1.admin_cert_der, &tls2.ca_cert_der),
+            "an admin cert issued BEFORE a restart must still cryptographically \
+             chain-validate against the CA loaded AFTER the restart, using the same rustls \
+             verification the live server runs on every mTLS handshake"
+        );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// Simulates the exact corruption `cert_issuer_matches_ca_subject` exists to catch:
+    /// Simulates the exact corruption `leaf_cert_chain_validates` exists to catch:
     /// admin.key/admin.crt on disk were signed by a CA that is no longer the one loaded
     /// from ca.key/ca.crt (an operator rotating CA files independently, or -- under test
     /// parallelism -- a concurrent process regenerating the CA after this admin cert was
@@ -1191,7 +1183,7 @@ mod tests {
         .expect("load_or_generate_admin_cert must recover, not fail");
 
         assert!(
-            cert_issuer_matches_ca_subject(&admin_cert_der, &real_ca_cert_der),
+            leaf_cert_chain_validates(&admin_cert_der, &real_ca_cert_der),
             "a stale admin cert issued by a DIFFERENT CA must be discarded and replaced \
              with one actually issued by the CA now loaded from disk, or kubectl gets a \
              chain that fails real TLS validation"
