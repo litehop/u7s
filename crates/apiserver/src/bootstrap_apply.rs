@@ -1,9 +1,11 @@
-//! In-process YAML applier for bootstrap addons (e.g. CoreDNS).
+//! In-process YAML applier for bootstrap addons (e.g. CoreDNS) and operator-supplied vendored
+//! manifests (`/etc/u7s/manifests`, see `docs/decisions/well-known-manifest-folder.md`).
 //!
 //! `run()` spawns [`apply_yaml_bundle`] once its own listen socket is bound, authenticating
 //! as the `system:bootstrap-installer` x509 identity (see `tls.rs` / `mayor-1pwxi`) to
-//! Server-Side-Apply a fixed manifest bundle against itself. This is deliberately not a
-//! generic "apply any manifest" API: it understands only the small, fixed set of Kinds a
+//! Server-Side-Apply a fixed manifest bundle against itself, then does the same for every file
+//! in [`WELL_KNOWN_MANIFEST_DIR`] via [`apply_well_known_manifest_dir`]. This is deliberately
+//! not a generic "apply any manifest" API: it understands only the small, fixed set of Kinds a
 //! kubeadm-style addon bundle uses (see [`kind_to_resource`]).
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -20,6 +22,12 @@ const FIELD_MANAGER: &str = "bootstrap-installer";
 /// ConfigMap, Deployment, Service) `run()`'s post-bind hook applies via [`apply_yaml_bundle`].
 /// See `manifests/coredns.yaml` for provenance and the departures from upstream.
 pub const COREDNS_MANIFEST: &[u8] = include_bytes!("../manifests/coredns.yaml");
+
+/// Well-known folder for operator-supplied vendored manifests, scanned and applied at boot
+/// after [`COREDNS_MANIFEST`] so an operator-supplied override here wins — matches kubelet's
+/// own `/etc/kubernetes/manifests/` static-pod convention. See
+/// `docs/decisions/well-known-manifest-folder.md`.
+pub const WELL_KNOWN_MANIFEST_DIR: &str = "/etc/u7s/manifests";
 
 /// Total time budget for retrying transient errors on a single document. The only realistic
 /// cause of a transient error here is this apiserver's own listener having just bound but not
@@ -38,9 +46,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Empty (or whitespace-only) input is a deliberate no-op — kept so callers (and tests) can
 /// exercise the wiring without a real manifest bundle.
 ///
-/// A failure here is logged and counted (`u7s_bootstrap_apply_failures_total`) but never
-/// propagated into a process abort — a missing bootstrap addon is degraded-mode, not
-/// crash-worthy, since the apiserver itself is otherwise healthy.
+/// A failure here is logged and counted (`u7s_bootstrap_apply_failures_total`); whether that
+/// additionally aborts the process is the caller's call, not this function's — the CoreDNS
+/// bundle's own failure is degraded-mode (a missing addon, apiserver otherwise healthy), while
+/// [`apply_well_known_manifest_dir`]'s callers treat the same `Err` as fatal.
 pub async fn apply_yaml_bundle(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> anyhow::Result<()> {
     if yaml_bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(());
@@ -77,6 +86,63 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
         }
         let url = ssa_url(&creds.server, &meta)?;
         apply_document(&client, &url, doc.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Server-side-apply every manifest file directly inside `dir`, in lexicographic filename
+/// order — deterministic, and lets a later file override fields an earlier one set on the same
+/// object (the well-known-folder equivalent of applying [`COREDNS_MANIFEST`] first). Entries
+/// that are themselves directories are skipped, not recursed into.
+///
+/// A missing `dir` is treated as an empty one — logged at info level, nothing applied — since an
+/// operator using an alternate `--manifest-output-dir` legitimately leaves this well-known
+/// folder absent (`docs/decisions/well-known-manifest-folder.md`). Any other failure (a file
+/// that can't be read, isn't valid YAML, is missing required fields, or that the apiserver
+/// itself rejects) stops the scan immediately and is wrapped with the offending file's path, so
+/// a caller that treats this as fatal can name exactly which file an operator needs to fix.
+pub async fn apply_well_known_manifest_dir(
+    kubeconfig_path: &Path,
+    dir: &Path,
+) -> anyhow::Result<()> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                "well-known manifest directory {} does not exist; applying nothing",
+                dir.display()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("reading well-known manifest directory {}", dir.display())
+            })
+        }
+    };
+
+    let mut paths = Vec::new();
+    for entry in read_dir {
+        let entry = entry.with_context(|| {
+            format!(
+                "reading an entry of well-known manifest directory {}",
+                dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+
+    for path in &paths {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading manifest file {}", path.display()))?;
+        apply_yaml_bundle(kubeconfig_path, &bytes)
+            .await
+            .with_context(|| format!("applying manifest file {}", path.display()))?;
     }
     Ok(())
 }
@@ -808,6 +874,90 @@ mod tests {
             body["data"]["foo"], "bar",
             "re-applying the same manifest must leave data unchanged, not corrupt or drop it"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_well_known_manifest_dir — the /etc/u7s/manifests scan (see
+    // docs/decisions/well-known-manifest-folder.md). The generic per-document apply mechanics
+    // above (idempotency, SSA upsert) already cover a single manifest's correctness; these tests
+    // cover the folder-scanning behavior itself: a missing directory is not fatal, files apply
+    // in deterministic lexicographic order, and a bad file fails the whole scan naming itself.
+    // -----------------------------------------------------------------------
+
+    /// A missing well-known-manifest directory must not fail startup — an operator who points
+    /// `--manifest-output-dir` elsewhere (mayor-94sz3) legitimately leaves this folder absent,
+    /// and treating "absent" as fatal would break every install that redirects it.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_missing_directory_is_not_fatal() {
+        let base = test_temp_dir("missing-dir");
+        let dir = base.join("does-not-exist");
+        // The scan must return before ever touching the kubeconfig, so a path that doesn't
+        // exist on disk is fine here -- if this test needed a real kubeconfig, that alone would
+        // prove the implementation touches the network on the "directory absent" path, which is
+        // exactly the bug this test guards against.
+        let unused_kubeconfig = base.join("unused-kubeconfig");
+
+        apply_well_known_manifest_dir(&unused_kubeconfig, &dir)
+            .await
+            .expect("a missing well-known manifest directory must be treated as empty, not fatal");
+    }
+
+    /// A directory that exists but has no files in it must behave identically to a missing one
+    /// (docs/decisions/well-known-manifest-folder.md is explicit that these two cases are
+    /// equivalent) -- a fresh install with an empty /etc/u7s/manifests must not fail to boot.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_empty_directory_applies_nothing() {
+        let dir = test_temp_dir("empty-dir");
+        let unused_kubeconfig = dir.join("unused-kubeconfig");
+
+        apply_well_known_manifest_dir(&unused_kubeconfig, &dir)
+            .await
+            .expect("an empty well-known manifest directory must be a no-op, not fatal");
+    }
+
+    /// Two files, applied against a live apiserver: the well-formed one must land before the
+    /// scan hits the malformed one (proving lexicographic order, not directory-listing order),
+    /// and the malformed one must fail the whole scan with its own filename named in the error
+    /// -- the acceptance bar from docs/decisions/well-known-manifest-folder.md is "the error
+    /// message must name the offending file", not just "startup fails".
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_applies_in_order_and_names_the_offending_file_on_failure(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("well-known-order");
+        std::fs::write(
+            dir.join("00-good.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: well-known-good\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-good.yaml");
+        std::fs::write(dir.join("01-bad.yaml"), "this: is: not: valid: yaml: [\n")
+            .expect("write 01-bad.yaml");
+
+        let result = apply_well_known_manifest_dir(&server.kubeconfig_path, &dir).await;
+
+        let err = result.expect_err(
+            "a malformed manifest file must fail the whole scan -- an operator who dropped a \
+             broken file into /etc/u7s/manifests needs the apiserver to refuse to start, not \
+             silently skip the bad file and boot half-configured",
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("01-bad.yaml"),
+            "the error must name the offending file so an operator can actually find and fix \
+             it; got: {message}"
+        );
+
+        let key = crate::keys::object_key("configmaps", "kube-system", "well-known-good");
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "00-good.yaml sorts before 01-bad.yaml, so it must already be applied by the \
+                 time the scan reaches the malformed file -- this is what proves files are \
+                 applied in lexicographic filename order, not e.g. directory-listing order",
+            );
     }
 
     // -----------------------------------------------------------------------
