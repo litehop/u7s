@@ -28,7 +28,13 @@ fi
 #                       as one base64(JSON) join artifact.
 #   --join <url>        On a fresh node with --token <artifact>: submit a
 #                       client CSR, wait for it to be signed, and join as a
-#                       kubelet with its own x509 identity.
+#                       kubelet with its own x509 identity. One-shot: refuses
+#                       to run against a node already classified as an
+#                       existing joined worker (bootstrap tokens are
+#                       single-use, and re-running would silently rotate the
+#                       node's client identity). Re-running install.sh with
+#                       no flags against such a node upgrades kubelet alone,
+#                       leaving kubeconfig/kubelet-client.* untouched.
 #
 # Usage:
 #   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
@@ -463,6 +469,36 @@ if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
   echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
 fi
 
+# EXISTING_WORKER narrows EXISTING_INSTALL to specifically the worker half of
+# that detection (kubeconfig present, no local CA key): this node already
+# completed join_cluster() at least once.
+EXISTING_WORKER=0
+if [ "$EXISTING_INSTALL" -eq 1 ] && [ ! -f "$STATE_DIR/ca.key" ]; then
+  EXISTING_WORKER=1
+fi
+
+# join_cluster() is one-shot: it submits a fresh CSR against a single-use
+# bootstrap token and unconditionally overwrites kubeconfig/kubelet-client.*.
+# Re-running it here (an operator re-passing --join/--token out of habit
+# while upgrading) would silently rotate this node's client identity and
+# likely fail outright anyway, since the token was already consumed --
+# refuse loudly instead of attempting it.
+if [ "$JOIN_MODE" -eq 1 ] && [ "$EXISTING_WORKER" -eq 1 ]; then
+  echo "error: this node already joined a cluster ($STATE_DIR/kubeconfig exists with no local CA key) -- refusing to re-run the join CSR flow, which would submit a fresh CSR and overwrite this node's existing kubelet-client.crt/.key and kubeconfig. Bootstrap tokens are single-use, so this would likely fail outright anyway. To upgrade this worker, re-run install.sh with no --join/--token flags. To force a genuine re-join, stop kubelet, rm -rf $STATE_DIR, and re-run install.sh --join <url> --token <artifact>." >&2
+  exit 1
+fi
+
+# WORKER_MODE covers both a fresh --join and an upgrade re-run against an
+# already-joined worker: both stage kubelet alone and, further down, touch
+# only kubelet.service -- never the control-plane services or manifests
+# (docs/decisions/well-known-manifest-folder.md), and never
+# kubeconfig/kubelet-client.* on the already-joined-worker path (join_cluster
+# runs only when JOIN_MODE=1, guarded above to exclude EXISTING_WORKER=1).
+WORKER_MODE=0
+if [ "$JOIN_MODE" -eq 1 ] || [ "$EXISTING_WORKER" -eq 1 ]; then
+  WORKER_MODE=1
+fi
+
 if [ -z "$TARBALL" ] && [ -z "$TARBALL_URL" ]; then
   # Only a checkout copy reaches this: a released one always has a baked URL,
   # so name that case rather than repeating usage's "one of these is required".
@@ -598,7 +634,7 @@ trap 'rm -rf "$STAGE_DIR" ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
 tar -xzf "$TARBALL" -C "$STAGE_DIR"
 
 install -d -m 0755 "$BIN_DIR"
-if [ "$JOIN_MODE" -eq 1 ]; then
+if [ "$WORKER_MODE" -eq 1 ]; then
   stage_binaries kubelet
 else
   stage_binaries u7s-apiserver u7s-scheduler kubelet kube-controller-manager
@@ -612,11 +648,12 @@ fi
 # boot-time auto-apply scan, or an operator-chosen alternate path for GitOps
 # to manage instead -- nothing is ever written into the well-known folder in
 # that case, so apiserver's scan finds it empty. Only relevant to a
-# control-plane node: --join installs kubelet alone, with no apiserver to
-# apply anything. A checkout's tarball may not carry a manifests/ dir at all
-# yet (the release-pipeline vendoring step lands separately); that is
-# equivalent to an empty set, not an error.
-if [ "$JOIN_MODE" -eq 0 ]; then
+# control-plane node: a worker (fresh --join or an already-joined worker's
+# upgrade re-run) installs kubelet alone, with no apiserver to apply
+# anything. A checkout's tarball may not carry a manifests/ dir at all yet
+# (the release-pipeline vendoring step lands separately); that is equivalent
+# to an empty set, not an error.
+if [ "$WORKER_MODE" -eq 0 ]; then
   TARBALL_MANIFEST_DIR="$(find "$STAGE_DIR" -type d -name manifests | head -n1)"
   if [ -n "$TARBALL_MANIFEST_DIR" ] && [ -n "$(find "$TARBALL_MANIFEST_DIR" -maxdepth 1 -name '*.yaml')" ]; then
     install -d -m 0755 "$MANIFEST_OUTPUT_DIR"
@@ -656,9 +693,15 @@ install -d -m 0755 /etc/u7s/static-pods
 
 write_kubelet_config_yaml
 
-if [ "$JOIN_MODE" -eq 1 ]; then
-  # --- Join an existing cluster via the CSR API ------------------------------
-  join_cluster
+if [ "$WORKER_MODE" -eq 1 ]; then
+  # --- Join an existing cluster via the CSR API, or upgrade an
+  # already-joined worker in place (kubelet binary + kubelet.service only,
+  # kubeconfig/kubelet-client.* untouched) -------------------------------
+  if [ "$JOIN_MODE" -eq 1 ]; then
+    join_cluster
+  else
+    echo "Existing worker node detected -- upgrading kubelet only; kubeconfig and kubelet-client.crt/.key are left untouched."
+  fi
 
   cat > /etc/systemd/system/kubelet.service <<EOF
 [Unit]
@@ -683,7 +726,11 @@ EOF
   systemctl restart kubelet.service
 
   echo ""
-  echo "u7s join complete. Verify from the control-plane node:"
+  if [ "$JOIN_MODE" -eq 1 ]; then
+    echo "u7s join complete. Verify from the control-plane node:"
+  else
+    echo "u7s worker upgrade complete. Verify from the control-plane node:"
+  fi
   echo "  kubectl get nodes"
   exit 0
 fi
