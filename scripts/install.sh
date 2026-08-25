@@ -428,6 +428,27 @@ if [ -n "$JOIN_SERVER" ]; then
   JOIN_MODE=1
 fi
 
+# --- Existing-install detection -----------------------------------------------
+#
+# Control-plane node: $STATE_DIR/ca.key exists only once apiserver's own
+# load_or_generate_ca has actually run and succeeded (tls.rs) -- not the
+# u7s-apiserver.service unit file written below, which install.sh writes
+# unconditionally even on a first attempt that never got that far. Worker
+# node: ca.key never exists there at all (join_cluster writes only the CA
+# cert, never its key), so an existing $STATE_DIR/kubeconfig with no ca.key
+# means an already-joined node re-running install.sh.
+#
+# Nothing downstream wipes $STATE_DIR on either path -- CA persistence is
+# apiserver's own job, and the config/unit writes below are already
+# idempotent (mayor-gtjmv's restart fix) -- so this only decides what to tell
+# the operator, so a re-run reads as an upgrade rather than a silent no-op or
+# a fresh install starting from nothing.
+EXISTING_INSTALL=0
+if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
+  EXISTING_INSTALL=1
+  echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+fi
+
 if [ -z "$TARBALL" ] && [ -z "$TARBALL_URL" ]; then
   # Only a checkout copy reaches this: a released one always has a baked URL,
   # so name that case rather than repeating usage's "one of these is required".
@@ -480,7 +501,11 @@ if [ -z "$IFACE_IP" ]; then
   exit 1
 fi
 
-echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+if [ "$EXISTING_INSTALL" -eq 1 ]; then
+  echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+else
+  echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+fi
 
 # --- CRI-O + crun via apt -----------------------------------------------------
 #

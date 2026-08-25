@@ -360,6 +360,54 @@ bash_out="$(bash "$INSTALL" --help 2>&1)" && bash_status=0 || bash_status=$?
 assert "running install.sh under bash (a real invocation) is unaffected by the guard and proceeds past it" \
   "$([ "$bash_status" -eq 0 ] && printf '%s' "$bash_out" | grep -q '^Usage:' && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-ixfff. A re-run of install.sh against an existing
+# node used to look identical to a fresh install in its own output, giving
+# the operator no signal that CA/cluster state was being preserved rather
+# than built from scratch. Extracted verbatim from install.sh's own source
+# (the same "exercise the real logic, not a hand-copy" approach as
+# test-install-checksum.sh's fetch_tarball extraction), so this fails if the
+# shipped heuristic regresses, not just a copy of it kept here.
+# ---------------------------------------------------------------------------
+write_detection_runner() {
+  local install_script="$1" runner="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"'
+    awk '/^EXISTING_INSTALL=0$/,/^fi$/' "$install_script"
+    echo 'echo "EXISTING_INSTALL=$EXISTING_INSTALL"'
+  } > "$runner"
+}
+
+DETECT_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK"' EXIT
+DETECT_RUNNER="$DETECT_WORK/detect.sh"
+write_detection_runner "$INSTALL" "$DETECT_RUNNER"
+
+fresh_dir="$DETECT_WORK/fresh"
+mkdir -p "$fresh_dir"
+fresh_out="$(bash "$DETECT_RUNNER" "$fresh_dir" 2>&1)"
+assert "a genuinely fresh node (no ca.key, no kubeconfig on disk yet) is NOT flagged as an existing install -- a false positive here would print a confusing 'upgrading' message on someone's very first run" \
+  "$(printf '%s' "$fresh_out" | grep -q '^EXISTING_INSTALL=0$' && ! printf '%s' "$fresh_out" | grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
+
+cp_dir="$DETECT_WORK/control-plane"
+mkdir -p "$cp_dir"
+touch "$cp_dir/ca.key"
+cp_out="$(bash "$DETECT_RUNNER" "$cp_dir" 2>&1)"
+assert "a control-plane node with an existing ca.key IS detected as an existing install -- ca.key only exists once apiserver's own load_or_generate_ca has actually run and succeeded, unlike the systemd unit file which install.sh writes even on a failed first attempt" \
+  "$(printf '%s' "$cp_out" | grep -q '^EXISTING_INSTALL=1$' && printf '%s' "$cp_out" | grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
+
+worker_dir="$DETECT_WORK/worker"
+mkdir -p "$worker_dir"
+touch "$worker_dir/kubeconfig"
+worker_out="$(bash "$DETECT_RUNNER" "$worker_dir" 2>&1)"
+assert "an already-joined worker node (kubeconfig present, ca.key absent -- join_cluster never writes a CA key on a worker) IS detected as an existing install" \
+  "$(printf '%s' "$worker_out" | grep -q '^EXISTING_INSTALL=1$' && printf '%s' "$worker_out" | grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
+
+assert_false "(regression guard) the detection message does not reference a --force-reinstall flag, which does not exist in this bead's shipped scope -- mentioning it would send operators looking for a flag install.sh would reject as unknown" \
+  grep -qF -- '--force-reinstall' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
