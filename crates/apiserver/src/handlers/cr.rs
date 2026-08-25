@@ -878,6 +878,7 @@ fn evaluate_cel_rule(
     })?;
 
     let mut cel_ctx = cel::Context::default();
+    register_cel_string_extensions(&mut cel_ctx);
     cel_ctx
         .add_variable("self", self_value)
         .map_err(|e| Status::internal(format!("CEL: failed to bind self: {e}")))?;
@@ -969,6 +970,7 @@ fn evaluate_message_expression(
 ) -> Option<String> {
     let program = cel::Program::compile(expr).ok()?;
     let mut cel_ctx = cel::Context::default();
+    register_cel_string_extensions(&mut cel_ctx);
     cel_ctx.add_variable("self", self_value).ok()?;
     if let Some(old) = old_self_value {
         cel_ctx.add_variable("oldSelf", old).ok()?;
@@ -980,6 +982,98 @@ fn evaluate_message_expression(
         }
         _ => None,
     }
+}
+
+/// Registers CEL string-extension functions the vendored `cel` crate's stdlib doesn't
+/// implement but real-world CRDs rely on. Kubernetes' own CEL library adds `.split()`,
+/// `.lowerAscii()`, `.upperAscii()`, `.replace()`, and `.join()` as the `strings` extension;
+/// the `cel` crate's `Env::stdlib()` only covers the base spec's `contains`/`startsWith`/
+/// `endsWith`/`matches`/`size`. Without these, e.g. Gateway API's annotation-key-prefix rule
+/// (`self.split("/")[0].size() < 253`, `gateway.networking.k8s.io_gateways.yaml` L262) or
+/// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
+/// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
+fn register_cel_string_extensions(ctx: &mut cel::Context) {
+    ctx.add_function("split", cel_split);
+    ctx.add_function("lowerAscii", cel_lower_ascii);
+    ctx.add_function("upperAscii", cel_upper_ascii);
+    ctx.add_function("replace", cel_replace);
+    ctx.add_function("join", cel_join);
+}
+
+fn cel_split(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+    sep: std::sync::Arc<String>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::List(std::sync::Arc::new(
+        this.split(sep.as_str())
+            .map(|part| cel::Value::String(std::sync::Arc::new(part.to_string())))
+            .collect(),
+    )))
+}
+
+fn cel_lower_ascii(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::String(std::sync::Arc::new(
+        this.to_ascii_lowercase(),
+    )))
+}
+
+fn cel_upper_ascii(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::String(std::sync::Arc::new(
+        this.to_ascii_uppercase(),
+    )))
+}
+
+fn cel_replace(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+    old: std::sync::Arc<String>,
+    new: std::sync::Arc<String>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::String(std::sync::Arc::new(
+        this.replace(old.as_str(), new.as_str()),
+    )))
+}
+
+/// `self.join()` concatenates a list of strings with no separator; `self.join(sep)` joins
+/// with `sep` — Kubernetes' CEL library exposes these as two overloads of the same name,
+/// collapsed here into one function since `Context::add_function` registers a single
+/// implementation per name and dispatches by receiver type, not by argument count.
+fn cel_join(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+    cel::extractors::Arguments(args): cel::extractors::Arguments,
+) -> Result<cel::Value, cel::ExecutionError> {
+    let cel::Value::List(items) = this else {
+        return Err(cel::ExecutionError::function_error(
+            "join",
+            "target is not a list",
+        ));
+    };
+    let sep = match args.first() {
+        None => String::new(),
+        Some(cel::Value::String(s)) => s.as_str().to_string(),
+        Some(_) => {
+            return Err(cel::ExecutionError::function_error(
+                "join",
+                "separator must be a string",
+            ));
+        }
+    };
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        match item {
+            cel::Value::String(s) => parts.push(s.as_str().to_string()),
+            other => {
+                return Err(cel::ExecutionError::function_error(
+                    "join",
+                    format!("list element is not a string: {other:?}"),
+                ));
+            }
+        }
+    }
+    Ok(cel::Value::String(std::sync::Arc::new(parts.join(&sep))))
 }
 
 /// Depth-first search for an `enum` keyword violation in a boon validation-error tree,
@@ -7959,6 +8053,80 @@ mod tests {
             err.1.message.contains("protocol must be HTTP or HTTPS"),
             "a protocol outside the allowed list must be rejected (got: {})",
             err.1.message
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CEL string-extension overloads (split/lowerAscii/upperAscii/replace/join)
+    //
+    // The vendored `cel` crate's stdlib doesn't implement these (only base-spec
+    // contains/startsWith/endsWith/matches/size), but real CRDs use them, e.g.
+    // Gateway API's `self.split("/")[0].size() < 253` annotation-key-prefix rule and
+    // Crossplane's `self.plural == self.plural.lowerAscii()`. Without the overloads
+    // registered, evaluating such a rule fails with an "undeclared reference" CEL
+    // error on every CR write instead of the rule ever actually running.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: compile and evaluate a boolean CEL expression with the string-extension
+    /// overloads registered, same as `evaluate_cel_rule` does for every CRD rule.
+    fn eval_cel_bool(expr: &str) -> bool {
+        let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let mut ctx = cel::Context::default();
+        register_cel_string_extensions(&mut ctx);
+        match program.execute(&ctx) {
+            Ok(cel::Value::Bool(b)) => b,
+            other => panic!("{expr} did not evaluate to a bool: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cel_split_overload_evaluates_gateway_annotation_key_prefix_rule() {
+        assert!(
+            eval_cel_bool(r#"'example.com/name'.split('/')[0] == 'example.com'"#),
+            "split() must break a string on every separator occurrence, matching the \
+             Gateway API annotation-key-prefix rule this overload exists for"
+        );
+    }
+
+    #[test]
+    fn cel_lower_ascii_overload_evaluates_crossplane_plural_rule() {
+        assert!(
+            eval_cel_bool("'Widgets'.lowerAscii() == 'widgets'"),
+            "lowerAscii() must lowercase ASCII letters, matching Crossplane's \
+             `self.plural == self.plural.lowerAscii()` CompositeResourceDefinition rule"
+        );
+    }
+
+    #[test]
+    fn cel_upper_ascii_overload_uppercases_ascii_letters() {
+        assert!(
+            eval_cel_bool("'Widgets'.upperAscii() == 'WIDGETS'"),
+            "upperAscii() must uppercase ASCII letters"
+        );
+    }
+
+    #[test]
+    fn cel_replace_overload_replaces_every_occurrence() {
+        assert!(
+            eval_cel_bool("'a-b-c'.replace('-', '_') == 'a_b_c'"),
+            "replace() must replace every occurrence of the old substring, not just the first"
+        );
+    }
+
+    #[test]
+    fn cel_join_overload_with_separator_joins_list_elements() {
+        assert!(
+            eval_cel_bool("['a', 'b', 'c'].join('-') == 'a-b-c'"),
+            "join(separator) must concatenate list elements with the given separator"
+        );
+    }
+
+    #[test]
+    fn cel_join_overload_without_separator_concatenates_with_no_delimiter() {
+        assert!(
+            eval_cel_bool("['a', 'b', 'c'].join() == 'abc'"),
+            "join() with no argument must concatenate list elements with no delimiter, \
+             matching Kubernetes' CEL strings library's zero-arg join overload"
         );
     }
 
