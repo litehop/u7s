@@ -93,7 +93,9 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
 /// Server-side-apply every manifest file directly inside `dir`, in lexicographic filename
 /// order — deterministic, and lets a later file override fields an earlier one set on the same
 /// object (the well-known-folder equivalent of applying [`COREDNS_MANIFEST`] first). Entries
-/// that are themselves directories are skipped, not recursed into.
+/// that are themselves directories, or whose extension isn't `.yaml`/`.yml` (case-insensitive),
+/// are skipped, not applied — a `.DS_Store`, editor swap file, or stray `README.md` an operator
+/// drops into this folder is not a Kubernetes resource and must not fatal-fail boot.
 ///
 /// A missing `dir` is treated as an empty one — logged at info level, nothing applied — since an
 /// operator using an alternate `--manifest-output-dir` legitimately leaves this well-known
@@ -131,6 +133,13 @@ pub async fn apply_well_known_manifest_dir(
         })?;
         let path = entry.path();
         if path.is_dir() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase);
+        if !matches!(ext.as_deref(), Some("yaml") | Some("yml")) {
             continue;
         }
         paths.push(path);
@@ -254,17 +263,20 @@ fn extract_doc_meta(doc: &str) -> anyhow::Result<DocMeta> {
 
 /// Maps a bootstrap manifest's `kind` to its REST resource plural + whether it's namespaced.
 ///
-/// Deliberately a fixed, small table (the exact Kinds `mayor-1pwxi`'s RBAC role grants:
-/// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, Service) rather than
-/// a general kind-pluralization scheme — this applier is bootstrap-only, not a generic "apply
-/// any manifest" client, so an unknown Kind is a configuration error worth failing loudly on
-/// rather than guessing a plural that might be wrong.
+/// Deliberately a fixed, small table (the exact Kinds `system:bootstrap-installer`'s RBAC role grants:
+/// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, DaemonSet, Service)
+/// rather than a general kind-pluralization scheme — this applier is bootstrap-only, not a
+/// generic "apply any manifest" client, so an unknown Kind is a configuration error worth
+/// failing loudly on rather than guessing a plural that might be wrong. DaemonSet (apps/v1,
+/// namespaced, mirroring Deployment) is here for kube-proxy and Flannel, which both ship as
+/// DaemonSets once they migrate onto this well-known-folder mechanism.
 fn kind_to_resource(kind: &str) -> anyhow::Result<(&'static str, bool)> {
     Ok(match kind {
         "ConfigMap" => ("configmaps", true),
         "Service" => ("services", true),
         "ServiceAccount" => ("serviceaccounts", true),
         "Deployment" => ("deployments", true),
+        "DaemonSet" => ("daemonsets", true),
         "ClusterRole" => ("clusterroles", false),
         "ClusterRoleBinding" => ("clusterrolebindings", false),
         other => anyhow::bail!(
@@ -464,6 +476,21 @@ mod tests {
     #[test]
     fn kind_to_resource_rejects_unknown_kind() {
         assert!(kind_to_resource("Widget").is_err());
+    }
+
+    /// kube-proxy and Flannel both ship as DaemonSets upstream; once either migrates its
+    /// manifest onto the well-known-folder mechanism, a missing DaemonSet entry here would hit
+    /// the fallback branch above and fatally abort apiserver boot instead of resolving the
+    /// resource.
+    #[test]
+    fn kind_to_resource_supports_daemonset_so_kube_proxy_flannel_well_known_folder_migration_doesnt_fatal_boot(
+    ) {
+        assert_eq!(
+            kind_to_resource("DaemonSet").expect("DaemonSet must be a known kind"),
+            ("daemonsets", true),
+            "DaemonSet must resolve to the namespaced 'daemonsets' resource, matching Deployment's \
+             apps/v1 shape"
+        );
     }
 
     #[test]
@@ -958,6 +985,116 @@ mod tests {
                  time the scan reaches the malformed file -- this is what proves files are \
                  applied in lexicographic filename order, not e.g. directory-listing order",
             );
+    }
+
+    /// A non-YAML file (e.g. a `.DS_Store` an operator's Finder drops, or a stray `README.md`)
+    /// sitting alongside a genuine manifest must be skipped, not fatal-parsed as "not valid
+    /// YAML" — an operator debugging the folder shouldn't be able to break apiserver boot by
+    /// leaving a non-resource file behind. The real manifest must still land, proving the filter
+    /// doesn't also swallow genuine `.yaml` files.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_skips_non_yaml_files_so_operator_debugging_artifacts_dont_break_boot(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("non-yaml-filter");
+        std::fs::write(dir.join(".DS_Store"), b"not yaml at all\x00\x01\x02")
+            .expect("write .DS_Store");
+        std::fs::write(dir.join("README.md"), "# not a manifest\n").expect("write README.md");
+        std::fs::write(
+            dir.join("00-test.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: non-yaml-filter-test\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-test.yaml");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect(
+                "non-YAML files in the well-known manifest folder must be skipped, not treated \
+                 as a fatal parse error — a .DS_Store is not a Kubernetes resource",
+            );
+
+        let key = crate::keys::object_key("configmaps", "kube-system", "non-yaml-filter-test");
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "00-test.yaml must still be applied even though .DS_Store and README.md sort \
+                 before it lexicographically — the extension filter must skip non-YAML files, \
+                 not accidentally skip real manifests too",
+            );
+    }
+
+    /// An uppercase `.YAML`/`.YML` extension must be accepted, not silently skipped — the
+    /// extension filter's case-insensitivity is only real if a test actually exercises a
+    /// non-lowercase extension; without this, reverting the `.to_ascii_lowercase()` call in the
+    /// walker would still pass every other test in this suite.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_treats_uppercase_yaml_extension_same_as_lowercase_because_operator_case_shouldnt_break_boot(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("uppercase-ext");
+        std::fs::write(
+            dir.join("00-test.YAML"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: uppercase-ext-test\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-test.YAML");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect("a file with an uppercase .YAML extension must be applied, not skipped");
+
+        let key = crate::keys::object_key("configmaps", "kube-system", "uppercase-ext-test");
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "00-test.YAML must be applied even though its extension is uppercase — the \
+                 filter's case-insensitivity claim is only real if a test actually exercises a \
+                 non-lowercase extension",
+            );
+    }
+
+    /// A DaemonSet manifest applied through the well-known-folder mechanism must actually
+    /// install, not just resolve a REST path — `kind_to_resource` knowing about "daemonsets" is
+    /// useless if `system:bootstrap-installer`'s RBAC role doesn't grant that resource, since the
+    /// PATCH would 403 and, per this applier's fail-fast semantics, still fatal-boot the
+    /// apiserver. This is the exact bug kube-proxy/Flannel's future well-known-folder migration
+    /// would hit if the RBAC grant regressed.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_applies_daemonset_because_bootstrap_installer_rbac_grants_it(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("daemonset");
+        std::fs::write(
+            dir.join("00-daemonset.yaml"),
+            "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: bootstrap-apply-daemonset-test\n  namespace: kube-system\nspec:\n  selector:\n    matchLabels:\n      app: bootstrap-apply-daemonset-test\n  template:\n    metadata:\n      labels:\n        app: bootstrap-apply-daemonset-test\n    spec:\n      containers:\n      - name: c\n        image: nginx\n",
+        )
+        .expect("write 00-daemonset.yaml");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect(
+                "a DaemonSet manifest must apply successfully -- kind_to_resource resolving \
+                 \"daemonsets\" is not enough if the bootstrap-installer RBAC role doesn't also \
+                 grant that resource, since the PATCH would then 403 and fatal-boot the apiserver",
+            );
+
+        let key = crate::keys::group_object_key(
+            "apps",
+            "daemonsets",
+            Some("kube-system"),
+            "bootstrap-apply-daemonset-test",
+        );
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect("the DaemonSet must exist in the store after apply_well_known_manifest_dir");
     }
 
     // -----------------------------------------------------------------------
