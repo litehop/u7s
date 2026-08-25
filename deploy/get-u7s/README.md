@@ -13,7 +13,7 @@ Releases here are immutable -- assets freeze on publish and a used tag name can 
 
 `/install.sh` rides GitHub's own `latest`: the newest release that is neither draft nor prerelease. It is a release *asset*, not a repo file, so script and tarball ship from one release and cannot skew.
 
-`/<tag>/<asset>` reaches pre-release builds, which `latest` skips. It also serves `install.sh`, so `curl -sfL https://<host>/<tag>/install.sh | sh` is the pinned one-liner, and the script re-enters this route for its tarball. Tag and asset are forwarded verbatim; their patterns are deliberately narrow, since anything looser makes this an open `github.com` relay.
+`/<tag>/<asset>` reaches pre-release builds, which `latest` skips. It also serves `install.sh`, so `curl -sfL https://<host>/<tag>/install.sh | bash` is the pinned one-liner, and the script re-enters this route for its tarball. Tag and asset are forwarded verbatim; their patterns are deliberately narrow, since anything looser makes this an open `github.com` relay.
 
 ## Redirect chasing
 
