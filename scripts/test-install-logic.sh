@@ -268,7 +268,7 @@ assert "the tarball is downloaded before apt installs anything, so an unreachabl
   "$([ -n "$fetch_line" ] && [ -n "$apt_line" ] && [ "$fetch_line" -lt "$apt_line" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# Regression guard: mayor-ua9gg. KCM disabled node-ipam-controller with no
+# Regression guard: KCM disabled node-ipam-controller with no
 # --cluster-cidr, so Node.spec.podCIDR was never allocated and every node's
 # CRI-O bridge plugin picked the same uncoordinated default subnet -- a
 # cross-node ClusterIP Service was unreachable. Confirmed live on two Lima
@@ -282,7 +282,7 @@ assert_true "u7s-kcm.service's ExecStart allocates per-node pod CIDRs (--allocat
   grep -qF -- '--allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR' "$INSTALL"
 
 # ---------------------------------------------------------------------------
-# Regression guard: mayor-ua9gg's other half -- fixing IPAM allocation alone
+# Regression guard: the other half -- fixing IPAM allocation alone
 # does not fix cross-node routing, since CRI-O's stock bridge plugin never
 # consumes Node.spec.podCIDR for cross-node routing at all. Flannel is the
 # actual CNI closing that gap; losing this deployment step (or the
@@ -311,7 +311,7 @@ assert_true "br_netfilter is persisted via modules-load.d so it survives a reboo
   grep -qF '/etc/modules-load.d/u7s-br-netfilter.conf' "$INSTALL"
 
 # ---------------------------------------------------------------------------
-# Regression guard: mayor-gtjmv. 'systemctl enable --now UNIT' is enable+
+# Regression guard: 'systemctl enable --now UNIT' is enable+
 # start; start on an already-active unit is a no-op, so a re-run of
 # install.sh staged new binaries into place but the running process never
 # re-exec'd against them -- an "upgrade" that silently kept the old binary
@@ -324,7 +324,7 @@ assert_true "the apiserver restart step fails loud with a systemctl status/journ
   grep -qF 'error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)' "$INSTALL"
 
 # ---------------------------------------------------------------------------
-# Regression guard: mayor-ecmt4. kube-proxy's own kubeconfig pointed at the
+# Regression guard: kube-proxy's own kubeconfig pointed at the
 # "kubernetes" Service's ClusterIP (10.96.0.1:443) -- reachable only via
 # iptables DNAT rules that kube-proxy itself is responsible for installing,
 # a bootstrap deadlock that left every ClusterIP unreachable cluster-wide.

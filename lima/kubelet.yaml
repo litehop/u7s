@@ -18,12 +18,12 @@ cpus: 8
 # 4GiB was the original default but proved too small for real conformance load:
 # kubelet+CRI-O+CoreDNS+metrics-server+kube-proxy plus ~15-20+ concurrent e2e
 # test pods plus the sonobuoy aggregator/e2e-job pods repeatedly drove the
-# kernel OOM-killer to kill sonobuoy/agnhost/coredns (mayor-5vffw, --focus
-# 'Simple'; mayor-2492x, sig-network Services family at --procs=16, memory
+# kernel OOM-killer to kill sonobuoy/agnhost/coredns (--focus
+# 'Simple'; sig-network Services family at --procs=16, memory
 # usage measured at 3663/3894MB used with a real OOM-kill logged in kubelet's
 # own oom_watcher). A curated 15-spec csi-hostpath focus even OOM'd within 6s
-# at 4GiB (mayor-bfq6l), and the sonobuoy aggregator itself still OOM'd at
-# 4GiB during a full-suite run (mayor-fgh2b), which needed a manual bump to
+# at 4GiB, and the sonobuoy aggregator itself still OOM'd at
+# 4GiB during a full-suite run, which needed a manual bump to
 # 6GiB to complete — 8GiB below adds documented margin beyond that observed
 # floor (session findings archived 2026-08-18 under ai/findings/).
 memory: 8GiB
@@ -219,7 +219,7 @@ provision:
       # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
       mkdir -p /etc/systemd/system/kubelet.service.d
       # serializeImagePulls/maxParallelImagePulls: HTTP/2 removed the pod-admission pacing that used to hide
-      # the upstream-default single-worker image-pull queue's cost under 16-way conformance load (mayor-w98yt).
+      # the upstream-default single-worker image-pull queue's cost under 16-way conformance load.
       # NOTE: maxParallelImagePulls has no CLI flag equivalent — it must be set here, not via kubelet ExecStart.
       #
       # registryPullQPS: a csi-hostpath --focus run deploys ~15-16 concurrent CSI driver
@@ -235,11 +235,11 @@ provision:
       # maxParallelImagePulls: 10 above remains the real concurrency bound.
       #
       # ClusterTrustBundle(Projection): Beta-since-1.33; PodCertificateRequest: Beta-since-1.35
-      # (mayor-moejy) but default-OFF (`kubelet --help` lists all three as
+      # but default-OFF (`kubelet --help` lists all three as
       # "BETA - default=false"), so the real kubelet silently skips the
       # `clusterTrustBundle`/`podCertificate` projected-volume sources on a Pod spec
       # without these gates — the mounttest container never sees its expected file and
-      # the pod hangs waiting for Ready instead of erroring loudly (mayor-17kra). u7s's
+      # the pod hangs waiting for Ready instead of erroring loudly. u7s's
       # apiserver already serves certificates.k8s.io/v1beta1 ClusterTrustBundle +
       # PodCertificateRequest CRUD (PR #1195); these gates are what make the real
       # kubelet actually act on them. ClusterTrustBundle itself (not just its
