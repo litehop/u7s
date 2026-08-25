@@ -267,6 +267,49 @@ apt_line="$(grep -n '^apt-get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
 assert "the tarball is downloaded before apt installs anything, so an unreachable or wrong URL aborts with the host untouched instead of half-configured with CRI-O running" \
   "$([ -n "$fetch_line" ] && [ -n "$apt_line" ] && [ "$fetch_line" -lt "$apt_line" ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-ua9gg. KCM disabled node-ipam-controller with no
+# --cluster-cidr, so Node.spec.podCIDR was never allocated and every node's
+# CRI-O bridge plugin picked the same uncoordinated default subnet -- a
+# cross-node ClusterIP Service was unreachable. Confirmed live on two Lima
+# VMs; this is what stops a silent revert from reintroducing that without
+# another full 2-node VM run to catch it again.
+# ---------------------------------------------------------------------------
+assert_false "(regression guard) node-ipam-controller is not in u7s-kcm.service's --controllers disable-list -- disabling it (with no --cluster-cidr) is exactly what left Node.spec.podCIDR unallocated and broke cross-node Service routing" \
+  grep -qF -- '-node-ipam-controller' "$INSTALL"
+
+assert_true "u7s-kcm.service's ExecStart allocates per-node pod CIDRs (--allocate-node-cidrs=true --cluster-cidr=...), which node-ipam-controller needs to stamp Node.spec.podCIDR at all" \
+  grep -qF -- '--allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR' "$INSTALL"
+
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-ua9gg's other half -- fixing IPAM allocation alone
+# does not fix cross-node routing, since CRI-O's stock bridge plugin never
+# consumes Node.spec.podCIDR for cross-node routing at all. Flannel is the
+# actual CNI closing that gap; losing this deployment step (or the
+# crio-bridge-disable pairing below) silently reintroduces the original
+# unreachable-cross-node-Service symptom even with podCIDR correctly
+# allocated.
+# ---------------------------------------------------------------------------
+assert_true "install.sh deploys Flannel's DaemonSet (kube-flannel-ds) as the real CNI, not just relying on CRI-O's default bridge plugin" \
+  grep -qF 'name: kube-flannel-ds' "$INSTALL"
+
+assert_true "install.sh disables CRI-O's own default bridge CNI conflist(s) once Flannel supplies the real one -- CRI-O picks whichever CNI config file sorts first alphabetically, so leaving 10-crio-bridge.conflist active would silently keep winning over Flannel's 10-flannel.conflist" \
+  grep -qF 'mv "$CNI_DIR/$f" "$CNI_DIR/$f.disabled"' "$INSTALL"
+
+# ---------------------------------------------------------------------------
+# Regression guard: Flannel's vxlan backend hard-fails at startup ("Failed to
+# check br_netfilter: stat /proc/sys/net/bridge/bridge-nf-call-iptables: no
+# such file or directory") on a fresh Ubuntu cloud image, which does not load
+# br_netfilter by default -- confirmed live. Losing this would leave every
+# Flannel pod crash-looping on any host that has not already loaded the
+# module some other way.
+# ---------------------------------------------------------------------------
+assert_true "install.sh loads br_netfilter, a hard prerequisite for Flannel's vxlan backend that a fresh Ubuntu cloud image doesn't enable by default" \
+  grep -qF 'modprobe br_netfilter' "$INSTALL"
+
+assert_true "br_netfilter is persisted via modules-load.d so it survives a reboot, not just the install run" \
+  grep -qF '/etc/modules-load.d/u7s-br-netfilter.conf' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
