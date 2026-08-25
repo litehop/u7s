@@ -571,21 +571,42 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     //     LISTEN_BACKLOG's doc comment for why the OS default isn't enough headroom.
     let listener = bind_listener(&args.listen)?;
 
-    // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound.
-    // It authenticates as system:bootstrap-installer (mayor-1pwxi) and SSA-upserts the vendored
-    // CoreDNS addon bundle against this same apiserver. Runs concurrently with request-serving
-    // below; failure is already logged and counted inside apply_yaml_bundle, so it's discarded
-    // here rather than re-logged — a missing addon is degraded-mode, never a reason to abort the
-    // apiserver itself.
+    // 12a. Kick off the in-process bootstrap YAML appliers now that the listen socket is bound,
+    // authenticating as system:bootstrap-installer (mayor-1pwxi). Two steps, run in order so any
+    // operator-supplied override in the well-known folder wins:
+    //   1. SSA-upsert the vendored CoreDNS addon bundle. Its own failure is already logged and
+    //      counted inside apply_yaml_bundle and discarded here — a missing addon is
+    //      degraded-mode, never a reason to abort the apiserver itself.
+    //   2. SSA-apply every manifest under bootstrap_apply::WELL_KNOWN_MANIFEST_DIR
+    //      (docs/decisions/well-known-manifest-folder.md). Unlike CoreDNS, a bad manifest here
+    //      IS fatal — an operator who dropped a broken manifest needs the apiserver to refuse to
+    //      start, not run half-configured — so its result is threaded back via
+    //      well_known_manifest_rx and raced against serve_tls below instead of being discarded.
+    let (well_known_manifest_tx, well_known_manifest_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _ = bootstrap_apply::apply_yaml_bundle(
             &bootstrap_installer_kubeconfig_path,
             bootstrap_apply::COREDNS_MANIFEST,
         )
         .await;
+        let result = bootstrap_apply::apply_well_known_manifest_dir(
+            &bootstrap_installer_kubeconfig_path,
+            std::path::Path::new(bootstrap_apply::WELL_KNOWN_MANIFEST_DIR),
+        )
+        .await;
+        let _ = well_known_manifest_tx.send(result);
     });
 
-    serve_tls(listener, app, tls_material.server_config).await?;
+    tokio::select! {
+        result = serve_tls(listener, app, tls_material.server_config) => result?,
+        Ok(Err(e)) = well_known_manifest_rx => {
+            tracing::error!(
+                "fatal: boot-time apply of {} failed: {e:#}",
+                bootstrap_apply::WELL_KNOWN_MANIFEST_DIR
+            );
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
