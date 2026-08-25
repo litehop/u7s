@@ -99,8 +99,7 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 - 60m — reread this file + siblings; reassert posture to operator
 - 60m — worktree hygiene (worker worktrees, origin orphan branches, stale tracking refs, orphaned host processes — see body below)
 - 30m — cluster review (3+ same-surface beads → one PR; 8–12 sweet spot)
-- 5m — merge PRs (green only; no --admin; serialize update-branch under
-  strict-mode without Merge Queue — see body below)
+- 5m — merge PRs (green only; no --admin; queue-native workflow — see body below)
 - 15m — bead dispatch pass (filter out decisions/EPICs/release-coupled/v1.x/hot-zone)
 - 10m — dashboard refresh (REPLACE stale content, don't append — see the
   Dashboard section's snapshot/≤40-line rules; the loop body must say "rewrite
@@ -109,22 +108,24 @@ of a drain; the binding rule is hot-zone parallelism, not strict same-surface.
 The canonical loop bodies live in `dispatch-prompt-template.md` and prior
 session output; paste verbatim or adapt as needed.
 
-**Merge PR loop body — serialization under strict-mode without Merge Queue.**
+**Merge PR loop body — GitHub Merge Queue is active on this repo.**
 The main-branch ruleset (18156794) requires up-to-date branches
-(`strict_required_status_checks_policy: true`). GitHub's Merge Queue would
-satisfy that automatically, but it's an org-only feature this repo can't use,
-so the only way to bring a BEHIND PR up to date is `gh pr update-branch`.
-Triggering it on every BEHIND PR at once is a trap: only the first PR to
-land keeps its CI run valid — the instant it merges, every other in-flight
-update-branch's CI cycle is invalidated against the new main and has to
-re-run. Serialize instead: never more than one FRESH CI cycle (checks
-running against the current main) in flight. That is NOT the same as "wait
-whenever any pending checks exist" — a BEHIND PR's pending checks are
-running against a stale base and are already moot: the moment
-`update-branch` swaps in the new base those checks get invalidated and
-re-triggered anyway, so waiting for them first buys nothing. Only a
-BLOCKED PR's pending checks (running against the CURRENT base, i.e. a
-fresh post-update-branch cycle already in flight) are worth waiting on.
+(`strict_required_status_checks_policy: true`), and the queue satisfies
+that automatically (MERGE method, all-green grouping, min 1 / max 5,
+`allow_auto_merge=true`, verified end-to-end since PR #1347). The queue
+runs its own CI cycle against a synthetic merge commit and lands the PR
+when green. Two consequences for the mayor:
+
+- **Use bare `gh pr merge <N>`.** `--merge` is rejected ("merge strategy
+  is set by the queue"); `--delete-branch` is rejected ("cannot use
+  `--delete-branch` when merge queue enabled" — the queue deletes the
+  remote branch itself post-merge).
+- **Never run `gh pr update-branch`.** A BEHIND PR is the queue's
+  problem — queue it with `gh pr merge <N>` and the queue will rebase
+  it as part of its own cycle. A manual `update-branch` triggers a
+  redundant CI cycle whose results the queue-cycle will invalidate
+  anyway (triple CI: push + update-branch + queue-synthetic). The
+  serialization-guard logic that used to live here (pre-queue) is moot.
 
 0. **Drain the review queue (mayor-oec8e).** For each file in
    `.claude/review-queue/*.md` (oldest `queued_at` first; cap 5 per tick so a
@@ -189,28 +190,14 @@ fresh post-update-branch cycle already in flight) are worth waiting on.
    When it happens: invoke the critical-reviewer directly for that PR in the
    SAME tick (same as if a queue file existed) rather than waiting on a
    queue file that will never arrive.
-   Once gated: `gh pr merge <N> --merge --delete-branch` for any CLEAN PR
-   (checks_pending=0 AND checks_failed=0 AND mergeStateStatus=CLEAN). NEVER
-   `--admin`. After each successful merge: `git pull --ff-only` + `git remote
-   prune origin`, then remove the merged worker's worktree (and its branch,
-   if it survived `--delete-branch`).
-3. Serialization guard: if ANY open PR is BLOCKED with pending checks
-   (mergeStateStatus=BLOCKED, checks still running against its CURRENT
-   base) — a fresh CI cycle is already in flight — STOP; another
-   update-branch trigger would only get invalidated. Otherwise, pending
-   checks belong only to BEHIND PRs and are moot (stale base), so pick the
-   lowest-numbered BEHIND PR and run `gh pr update-branch <N>`
-   immediately — do not wait for that PR's own stale-base checks to finish
-   first. Trigger at most ONE update-branch per tick — never in parallel.
-
-The load-bearing invariant: at most one FRESH CI cycle (checks against the
-current main) in flight across all open PRs at any given time — not "zero
-pending checks anywhere." BEHIND-with-pending is never a reason to wait.
-
-2026-08-17: #1205 sat BEHIND for 15 min (across the 09:13Z/09:18Z/09:23Z
-merge ticks) because the guard waited on its own stale-base pending
-checks; corrected to trigger `update-branch` immediately when the only
-open PR needing it is BEHIND, since stale-base pending checks are moot.
+   Once gated: `gh pr merge <N>` (bare) for any CLEAN PR (checks_pending=0
+   AND checks_failed=0 AND mergeStateStatus=CLEAN). This enables auto-merge
+   if not immediately mergeable; the queue lands it once its own CI cycle
+   is green. NEVER `--admin`; the queue is the gate. Queue any BEHIND PR
+   the same way — it's the queue's job to rebase, not the mayor's. After
+   the queue lands a PR: `git pull --ff-only` + `git remote prune origin`
+   (the queue auto-deletes the remote branch), then remove the merged
+   worker's worktree and its local branch (`git branch -D` if it survives).
 
 **Inline sync after every task-notification — transport-conditional (mayor-t79kb).**
 Standing cron loops fire reliably on the terminal CLI (Claude Code invoked as
@@ -229,7 +216,7 @@ this session is on): after EVERY task-notification received while 1+ workers
 are still active, inline the following before either dispatching the next
 worker or ending the turn:
 1. `gh pr list --state open --json number,title,mergeStateStatus` — merge
-   any CLEAN PR with `gh pr merge <N> --merge`.
+   any CLEAN PR with bare `gh pr merge <N>` (queue-native — see main body).
 2. Refresh `ai/dashboard.md` with a fresh `date -u` timestamp.
 3. If a PR merged, `git remote prune origin` to clear the stale tracking ref.
 4. Verify the returning worker's worktree is cleaned up and its bead is

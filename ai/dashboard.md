@@ -1,33 +1,62 @@
 # Dashboard
-2026-08-23T15:56Z — `mayor-te5y0` in flight; `mayor-xm2zp` blocked (see decision point); queue idle. Resume: `bd prime` → this file.
+2026-08-25T18:20Z — Session wrap-up. Resume: `bd prime` → this file.
 
-Stance: pre-alpha/greenfield, no backward compatibility, break freely, merge-on-green.
+Stance: pre-alpha/greenfield, no backward compatibility, break freely, merge-on-green (auto).
 
-## 🆕 Session-scope change (2026-08-23)
-Repo moved from `valerauko/u7s` → **`litehop/u7s`** (organization). Main-branch ruleset ACTIVE (18156794) with strict status checks + Merge Queue (MERGE method, all-green grouping, min 1 / max 5). `allow_auto_merge=true` confirmed working end-to-end — all 4 PRs this session merged cleanly via `gh pr merge <N>` (bare, no flags) → queue.
+## Session summary
 
-## ▶ In-flight workers (0)
-None. `mayor-xm2zp` still blocked (see decision point) — worktree left as-is, may resume once direction is picked.
+Deep CNI/Service-LB/manifest-packaging investigation, ending in 3 formalized
+ADRs and a real merged fix. Full detail: `ai/findings/cni-svclb-landscape-2026-08-25.md`
+(gitignored — the exploratory research trail), `docs/decisions/flannel-for-cni.md`,
+`docs/decisions/well-known-manifest-folder.md`, `docs/decisions/network-policy-engine.md`
+(amended). Also: `ai/extended-context/lima-gvisor-cri-o-pull-defect-postmortem-2026-08-25.md`
+(new Lima dev-tooling defect, dev-only, does not affect production).
 
-## 🌊 Open PRs (1)
-- **#1356** — `mayor-te5y0` checksum verification. Rigorous test verification: extracts real `install.sh` function at test time (not a reimplemented copy), bit-flip corruption test + a mutation test proving the test suite itself catches a broken implementation. Reviewed (not modified) `deploy/get-u7s/`'s routes, claims `.sha256` passes through unmodified. Critical-reviewer dispatched; CI running.
+## ✅ Merged this session
+`#1358` checksum verification, `#1360` per-location error_page, `#1361` deploy
+tweaks, `#1362` resolver, `#1363` admin-cert-survives-restart (`mayor-lgayh`),
+`#1364` k8s version bump, `#1365` Flannel + node-ipam-controller cross-node fix
+(`mayor-ua9gg`, two review rounds, both LGTM).
 
-## 🎯 DECISION POINT
-- **`mayor-xm2zp` BLOCKED — floating `dev` release tag is impossible as designed.** GitHub's immutable-release policy applies repo-wide (confirmed even on the real `v0.2.0-alpha.1`) — published release assets can never be overwritten, and deleting a release doesn't free its tag name (permanently burned). Worker's live testing confirmed this and, as an unavoidable side effect of testing, permanently burned the `dev` tag name on `litehop/u7s` (disclosed, test artifacts cleaned up). This retroactively affects `mayor-7kkhi`'s merged proxy (#1353), which assumes `releases/download/dev/<asset>` is a stable URL — it is not, and can't be recreated under that name. 3 options: (1) check if an org owner can disable immutable releases via GitHub's web UI — cheapest if it exists, unverified; (2) revert to live Releases-API querying for dev (mayor's original pre-simplification design, sidesteps immutability entirely, costs re-adding njs logic to the already-merged #1353); (3) host the rolling dev artifact outside GitHub Releases (proxy caches from a direct CI push instead) — cleanest long-term, biggest lift. Awaiting operator call.
+## 🎯 Decisions made, not yet implemented (ready to dispatch, sequenced)
+Manifest-packaging chain (`docs/decisions/well-known-manifest-folder.md`):
+```
+mayor-tgvxq (apply mechanism, /etc/u7s/manifests, fatal-on-bad-manifest)  ← READY
+├─ mayor-bh36n (SIGHUP reload, P3 follow-on)
+├─ mayor-cfkix (test-harness reuse, P3)
+└─ mayor-94sz3 (installer --manifest-output-dir flag)
+   └─ mayor-liiv1 (vendor YAMLs in-repo, bundle into release tarball —
+     NOT install-time fetch, GitHub has no IPv6 and some target nodes are
+     IPv4-only)
+     ├─ mayor-fiq79 (migrate CoreDNS off include_bytes!, bump stale v1.11.1)
+     ├─ mayor-73lqh (migrate kube-proxy, watch the $KUBE_VERSION templating)
+     └─ mayor-fptqu (migrate Flannel off its PR #1365 heredoc)
+```
+CNI decision (`docs/decisions/flannel-for-cni.md`): Flannel bundled as default,
+already implemented via PR #1365. Service LB decision still pending its own
+ADR — leading design is a forked/reimplemented klipper-lb (MASQUERADE bug
+fixed), loxilb disqualified (crashes on 1GB RAM, confirmed live).
 
-## 📥 Handoff queue
-- **mayor-ua9gg** (P2) — multi-node pod network has no CIDR coordination; needs a design decision (CIDR-coordination fix vs. CNI overlay) before dispatch.
-- **mayor-72kil / mayor-lrpi2 / mayor-gkgg9 / mayor-po8qf / mayor-0fdes / mayor-tnzdi** — held pending operator nod.
-- **mayor-fbxcy** (P3, CEL admission gap) — deferred by context; safe to dispatch as audit later.
-- **mayor-o61zz** (P1, Lima ARP) — upstream-blocked; Phase A+B mitigations live.
-- **Operator-held**: `mayor-u6ju` (EPIC), `mayor-t8ucq` (P4).
-- **Not yet a bead**: tiny #1349 follow-on cleanup (bead-ID-in-comment + fail-loud-on-corrupt-token, both MED); #1354's 2 bead-ID-in-comment leaks (LOW) — worth batching into one small cleanup bead.
+## 📥 Ready backlog (18 issues, `bd ready`)
+P1: `mayor-ecmt4` (kube-proxy kubeconfig bootstrap deadlock — real, confirmed
+live, blast radius is "every install.sh deployment," not conformance-visible),
+`mayor-gtjmv` (install.sh enable→restart for upgrades to take effect),
+`mayor-o61zz` (Lima ARP defect, upstream-blocked, has a documented workaround).
+P2: `mayor-tgvxq` (see chain above), `mayor-6hog8` (CoreDNS RBAC SERVFAIL),
+`mayor-biirm` (install.sh needs bash not sh), `mayor-72kil`, `mayor-lrpi2`,
+`mayor-po8qf`, `mayor-0fdes` — held pending operator nod per prior sessions.
+P3/P4: `mayor-gkgg9`, `mayor-tnzdi`, `mayor-fbxcy`, `mayor-9xsn3`, `mayor-u6ju`
+(deferred SSA epic), `mayor-3g7fg`, `mayor-t8ucq` — operator-held.
 
-## ✅ Merged this session (9 PRs)
-#1347 (portability), #1348 (CI release-tarball, x86_64), #1349 (kubeconfig-survives-restart fix), #1350 (real front-proxy headers, removed `admin_bearer_token`), #1351 (CSR spec-stamping security fix + RBAC seed), #1352 (front-proxy headers for discovery), #1353 (distribution reverse-proxy), #1354 (install.sh CSR-based join/rotation — Gate 6 multi-node milestone), #1355 (distribution-hosting ADR).
+## 🌲 Worktrees / branches
+None outstanding — all worker worktrees and local branches cleaned up this
+session; `git worktree list` shows only the mayor's own checkout.
 
-## 🔁 Cron loops (6, durable)
-5m merge · 10m dashboard · 15m dispatch · 30m cluster-review · 60m hygiene · 60m reread. Persisted to `.claude/scheduled_tasks.json`.
+## 🔁 Cron loops — NOT REGISTERED
+Not set up this session (conversational/research-heavy, not a dispatch-drain
+session). Next mayor should register the standard loops if resuming
+dispatch-heavy work.
 
 ## Repo state
-Main @ `a0187adb`. Ruleset 18156794 ACTIVE, merge queue live and proven across 9 merges.
+Main @ `2a6b974d`. Ruleset 18156794 ACTIVE, merge queue live, proven across 7
+merges this session. No open PRs. No pending review-queue entries.
