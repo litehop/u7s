@@ -264,16 +264,19 @@ fn extract_doc_meta(doc: &str) -> anyhow::Result<DocMeta> {
 /// Maps a bootstrap manifest's `kind` to its REST resource plural + whether it's namespaced.
 ///
 /// Deliberately a fixed, small table (the exact Kinds `mayor-1pwxi`'s RBAC role grants:
-/// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, Service) rather than
-/// a general kind-pluralization scheme — this applier is bootstrap-only, not a generic "apply
-/// any manifest" client, so an unknown Kind is a configuration error worth failing loudly on
-/// rather than guessing a plural that might be wrong.
+/// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, DaemonSet, Service)
+/// rather than a general kind-pluralization scheme — this applier is bootstrap-only, not a
+/// generic "apply any manifest" client, so an unknown Kind is a configuration error worth
+/// failing loudly on rather than guessing a plural that might be wrong. DaemonSet (apps/v1,
+/// namespaced, mirroring Deployment) is here for kube-proxy and Flannel, which both ship as
+/// DaemonSets once they migrate onto this well-known-folder mechanism.
 fn kind_to_resource(kind: &str) -> anyhow::Result<(&'static str, bool)> {
     Ok(match kind {
         "ConfigMap" => ("configmaps", true),
         "Service" => ("services", true),
         "ServiceAccount" => ("serviceaccounts", true),
         "Deployment" => ("deployments", true),
+        "DaemonSet" => ("daemonsets", true),
         "ClusterRole" => ("clusterroles", false),
         "ClusterRoleBinding" => ("clusterrolebindings", false),
         other => anyhow::bail!(
@@ -473,6 +476,21 @@ mod tests {
     #[test]
     fn kind_to_resource_rejects_unknown_kind() {
         assert!(kind_to_resource("Widget").is_err());
+    }
+
+    /// kube-proxy and Flannel both ship as DaemonSets upstream; once either migrates its
+    /// manifest onto the well-known-folder mechanism, a missing DaemonSet entry here would hit
+    /// the fallback branch above and fatally abort apiserver boot instead of resolving the
+    /// resource.
+    #[test]
+    fn kind_to_resource_supports_daemonset_so_kube_proxy_flannel_well_known_folder_migration_doesnt_fatal_boot(
+    ) {
+        assert_eq!(
+            kind_to_resource("DaemonSet").expect("DaemonSet must be a known kind"),
+            ("daemonsets", true),
+            "DaemonSet must resolve to the namespaced 'daemonsets' resource, matching Deployment's \
+             apps/v1 shape"
+        );
     }
 
     #[test]
