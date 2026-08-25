@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for the kubelet feature-gate config in lima/kubelet.yaml
-# (mayor-17kra).
+# Regression test for the kubelet feature-gate config in lima/kubelet.yaml.
 #
 # ClusterTrustBundle and ClusterTrustBundleProjection are Beta-since-1.33,
 # PodCertificateRequest is Beta-since-1.35, but all three are default-OFF in
@@ -9,7 +8,7 @@
 # kubelet silently ignores the `clusterTrustBundle`/`podCertificate`
 # projected-volume sources on a Pod spec instead of erroring — a pod using
 # either source just hangs waiting for Ready with no file ever written, which
-# is exactly the symptom mayor-moejy's e2e run observed. If a future edit drops
+# is exactly the symptom an e2e run observed. If a future edit drops
 # any gate from the generated KubeletConfiguration, this test must fail —
 # kubectl-level verification alone would not catch a regression until the next
 # full conformance run.
