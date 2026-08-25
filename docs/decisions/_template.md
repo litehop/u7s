@@ -36,3 +36,6 @@ consequence.
 lines — reflowing does nothing). The ADRs worth copying sit well under it:
 `crio-over-containerd.md` 225, `webhook-tls-via-konnectivity.md` 235,
 `sqlite-over-lmdb.md` 263. Replace this footer along with the guidance above.
+
+**Status** values: Proposed, Accepted, Superseded, Deprecated. A Superseded
+ADR links forward to the ADR that replaced it; the superseding ADR links back.
