@@ -1,4 +1,4 @@
-# Install script UX: zero-argument default, two configurable knobs
+# Install script UX: zero-argument default, three configurable knobs
 
 **Status:** Accepted  
 **Date:** 2026-08-21
@@ -19,11 +19,15 @@ The install script is invoked as a single `curl | bash`-style command
 a single-node cluster: node name defaults to the hostname, and the cluster
 network interface defaults to the first non-loopback interface.
 
-Node identity and interface selection are the **only** two knobs beyond that
-default path — a `--node-name` and an `--iface` flag, each with an env-var
-equivalent, for cases where cluster traffic must route over something like a
-WireGuard mesh. A version-pin flag (default: latest stable) exists but is not
-part of the zero-argument path. No other configuration surface exists.
+Node identity, interface selection, and manifest output location are the
+**only** three knobs beyond that default path — a `--node-name` and an
+`--iface` flag, each with an env-var equivalent, for cases where cluster
+traffic must route over something like a WireGuard mesh, and a
+`--manifest-output-dir` / `U7S_MANIFEST_OUTPUT_DIR` flag for redirecting
+vendored manifests away from the well-known auto-applied folder (see
+`docs/decisions/well-known-manifest-folder.md`). A version-pin flag (default:
+latest stable) exists but is not part of the zero-argument path. No other
+configuration surface exists.
 
 ## Rationale
 
@@ -33,6 +37,13 @@ from k3s — the north star's objection to k3s is its configuration surface and
 defaults, not its invocation shape. Restricting the knobs to node identity
 and interface is that philosophy applied directly rather than a fresh
 judgment call.
+
+The third knob, `--manifest-output-dir`, is a narrower case decided
+separately in `docs/decisions/well-known-manifest-folder.md`: the apiserver
+auto-applies whatever lands in the well-known `/etc/u7s/manifests` folder, so
+an installer-level override is how an operator opts into GitOps management
+instead — an explicit escape hatch for that folder, not a config surface
+added for its own sake.
 
 ## Consequences
 
