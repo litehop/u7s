@@ -336,7 +336,7 @@ assert_true "kube-proxy's kubeconfig points at the real advertised apiserver add
   grep -qF 'server: https://$IFACE_IP:6443' "$INSTALL"
 
 # ---------------------------------------------------------------------------
-# Regression guard: mayor-biirm. `sh install.sh` on Ubuntu (where /bin/sh is
+# Regression guard: `sh install.sh` on Ubuntu (where /bin/sh is
 # dash) used to die on the `set -euo pipefail` line with a bare "Illegal
 # option -o pipefail", exit 2, before ever reaching fetch_tarball's checksum
 # verification -- undermining the "always require a passing checksum" policy
@@ -361,7 +361,7 @@ assert "running install.sh under bash (a real invocation) is unaffected by the g
   "$([ "$bash_status" -eq 0 ] && printf '%s' "$bash_out" | grep -q '^Usage:' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# Regression guard: mayor-ixfff. A re-run of install.sh against an existing
+# Regression guard: A re-run of install.sh against an existing
 # node used to look identical to a fresh install in its own output, giving
 # the operator no signal that CA/cluster state was being preserved rather
 # than built from scratch. Extracted verbatim from install.sh's own source
