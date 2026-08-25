@@ -3,7 +3,7 @@
 # (mayor-17kra).
 #
 # ClusterTrustBundle, ClusterTrustBundleProjection and PodCertificateRequest are
-# Beta-since-1.36.4 but default-OFF in the real kubelet binary (`kubelet --help`
+# Beta-since-1.36 but default-OFF in the real kubelet binary (`kubelet --help`
 # lists all three as "BETA - default=false"). Without all three gates set,
 # kubelet silently ignores the `clusterTrustBundle`/`podCertificate`
 # projected-volume sources on a Pod spec instead of erroring — a pod using
