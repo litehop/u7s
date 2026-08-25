@@ -529,7 +529,10 @@ done
 
 # crio.service is owned and enabled by the apt package
 # (docs/decisions/systemd-install-contract.md); this only starts it.
-systemctl enable --now crio
+# restart rather than start: on a re-run against an already-active unit,
+# start is a no-op, so a re-run would never pick up a package upgrade.
+systemctl enable crio
+systemctl restart crio
 
 # --- Stage binaries from the tarball ------------------------------------------
 #
@@ -606,7 +609,8 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now kubelet.service
+  systemctl enable kubelet.service
+  systemctl restart kubelet.service
 
   echo ""
   echo "u7s join complete. Verify from the control-plane node:"
@@ -729,10 +733,21 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now u7s-apiserver.service
-systemctl enable --now u7s-scheduler.service
-systemctl enable --now u7s-kcm.service
-systemctl enable --now kubelet.service
+# restart rather than start: on a re-run against an already-active unit,
+# start is a no-op, so the running process would never re-exec against the
+# binary just staged above. restart on an enabled-but-inactive unit (fresh
+# install) behaves exactly like start.
+systemctl enable u7s-apiserver.service
+if ! systemctl restart u7s-apiserver.service; then
+  echo "error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
+  exit 1
+fi
+systemctl enable u7s-scheduler.service
+systemctl restart u7s-scheduler.service
+systemctl enable u7s-kcm.service
+systemctl restart u7s-kcm.service
+systemctl enable kubelet.service
+systemctl restart kubelet.service
 
 # --- In-cluster bootstrap: kube-proxy DaemonSet -------------------------------
 #
@@ -744,10 +759,12 @@ systemctl enable --now kubelet.service
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
 wait_for_apiserver "$KUBECONFIG_PATH"
 
-# server: the "kubernetes" Service's fixed ClusterIP, hardcoded rather than
-# kubeadm's ${KUBERNETES_SERVICE_HOST} env form -- same reasoning as
-# coredns.yaml pinning kube-dns's ClusterIP, a known-good address over a
-# Pod-env-var substitution path this project has not verified.
+# server: the real advertised apiserver address ($IFACE_IP:6443, matching
+# --advertise-address above), NOT the "kubernetes" Service's ClusterIP.
+# That ClusterIP is only reachable via iptables DNAT rules that kube-proxy
+# itself is responsible for installing -- pointing kube-proxy's own
+# kubeconfig at it is a bootstrap deadlock (informer never syncs, so the
+# DNAT rules that would make the ClusterIP reachable never get programmed).
 echo "Applying kube-proxy DaemonSet manifest..."
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
 apiVersion: v1
@@ -787,7 +804,7 @@ data:
     clusters:
     - cluster:
         certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        server: https://10.96.0.1:443
+        server: https://$IFACE_IP:6443
       name: default
     contexts:
     - context:

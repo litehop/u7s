@@ -310,6 +310,31 @@ assert_true "install.sh loads br_netfilter, a hard prerequisite for Flannel's vx
 assert_true "br_netfilter is persisted via modules-load.d so it survives a reboot, not just the install run" \
   grep -qF '/etc/modules-load.d/u7s-br-netfilter.conf' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-gtjmv. 'systemctl enable --now UNIT' is enable+
+# start; start on an already-active unit is a no-op, so a re-run of
+# install.sh staged new binaries into place but the running process never
+# re-exec'd against them -- an "upgrade" that silently kept the old binary
+# running until a manual restart or reboot.
+# ---------------------------------------------------------------------------
+assert_false "(regression guard) install.sh no longer uses 'systemctl enable --now', which silently no-ops a re-run against an already-active unit instead of restarting it onto the newly staged binary" \
+  grep -qF 'enable --now' "$INSTALL"
+
+assert_true "the apiserver restart step fails loud with a systemctl status/journalctl pointer on failure, instead of a bare set -e trace" \
+  grep -qF 'error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)' "$INSTALL"
+
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-ecmt4. kube-proxy's own kubeconfig pointed at the
+# "kubernetes" Service's ClusterIP (10.96.0.1:443) -- reachable only via
+# iptables DNAT rules that kube-proxy itself is responsible for installing,
+# a bootstrap deadlock that left every ClusterIP unreachable cluster-wide.
+# ---------------------------------------------------------------------------
+assert_false "(regression guard) kube-proxy's kubeconfig no longer points at the kubernetes Service's ClusterIP (10.96.0.1:443), which is only reachable via DNAT rules kube-proxy itself has not yet installed at bootstrap" \
+  grep -qF '10.96.0.1:443' "$INSTALL"
+
+assert_true "kube-proxy's kubeconfig points at the real advertised apiserver address (\$IFACE_IP:6443), reachable without depending on kube-proxy's own DNAT rules" \
+  grep -qF 'server: https://$IFACE_IP:6443' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
