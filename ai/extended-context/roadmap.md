@@ -158,14 +158,31 @@ individual ADRs:
   initial scope) — settled, see
   `docs/decisions/systemd-install-contract.md`.
 - Binary distribution/tarball shape (what exactly the release tarball
-  contains and how large it is) — still needs-data, tracked in
-  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §2.
+  contains and how large it is) — still needs-data. A planning sketch
+  recommends one release tarball (u7s binary/binaries + vendored
+  kubelet/KCM/CoreDNS, all pinned together, no first-run network fetch)
+  served from u7s's own origin rather than GitHub Releases (GitHub has no
+  IPv6, ruling it out as the critical-path origin — see
+  distribution-hosting-shape.md). Open: whether kube-proxy belongs in the
+  tarball at all, or ships as an in-cluster DaemonSet manifest like CoreDNS
+  instead (consistent with the settled kube-proxy-placement decision
+  above). Tarball size itself is deliberately deferred, not measured, until
+  there's a real build to measure.
 - Multi-node scale-out shape (join token mechanics, CA-trust bootstrap and
-  rotation on a long-lived cluster) — join-token shape is settled but the
-  underlying trust/rotation mechanics are still needs-data, tracked in
-  `ai/findings/mayor-233bh-packaging-distribution-sketch-2026-08-20.md` §5
-  and its companion
-  `ai/findings/mayor-xk0pa-ca-trust-bootstrap-and-rotation-2026-08-20.md`.
+  rotation on a long-lived cluster) — join-token shape is settled (node
+  address + a shared token, no manual CA-bundle copy, k3s-style UX). The
+  underlying trust/rotation mechanics are still needs-data: three options
+  were researched — (A) k3s-style hash-pinned join token + a `rotate-ca`
+  subcommand; (B) native Kubernetes bootstrap-token + CSR flow, reusing
+  KCM's already-live-but-unused `csrsigning` foundation, which also retires
+  kubelet's shared-admin-kubeconfig shim; (C) minimal CA-bytes-in-token
+  join (k0s-style) + kubeadm's own documented manual dual-trust rotation
+  runbook. Option C is ranked first — least new surface, and it matches
+  the ecosystem's own honest maturity level (none of k3s, k0s, or kubeadm
+  fully automates CA rotation either). Every option needs `tls.rs`'s
+  single-CA `RootCertStore` to grow multi-CA-bundle support, and none is
+  free of a real (if brief) apiserver outage during rotation without an HA
+  control plane, which u7s does not have.
 - Distribution hosting (where the install script and release tarball are
   actually served from) — settled, see
   `docs/decisions/distribution-hosting-shape.md`.
