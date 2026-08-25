@@ -495,16 +495,37 @@ apt-get install -y cri-o crun conmon
 # already sets the correct path.
 mkdir -p /etc/crio/crio.conf.d
 
-# The cri-o package ships both 10-crio-bridge.conf (old 0.4.0 single-plugin
-# format, fails with crun 1.26+) and 10-crio-bridge.conflist (1.0.0, correct).
-# Swap to the conflist.
+# br_netfilter isn't loaded by default on a fresh Ubuntu cloud image, and
+# Flannel's vxlan backend hard-fails at startup without it (fatal "Failed to
+# check br_netfilter: stat /proc/sys/net/bridge/bridge-nf-call-iptables: no
+# such file or directory" -- confirmed live). Standard Kubernetes node prep
+# (the same "letting iptables see bridged traffic" step kubeadm's own docs
+# call out); persisted via modules-load.d/sysctl.d so it survives a reboot,
+# not just this run.
+modprobe br_netfilter
+echo br_netfilter > /etc/modules-load.d/u7s-br-netfilter.conf
+cat > /etc/sysctl.d/u7s-br-netfilter.conf <<'SYSCTL_EOF'
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+SYSCTL_EOF
+sysctl --system >/dev/null
+
+# The cri-o package ships a default 10-crio-bridge.conf(list) that gives every
+# node its own independent, uncoordinated subnet with no cross-node routing at
+# all. Flannel supplies the real CNI config further down (10-flannel.conflist,
+# once the apiserver is up and node-ipam-controller can hand out podCIDRs) and
+# must be the only conflist present, since CRI-O picks whichever file sorts
+# first alphabetically in this directory -- leaving crio-bridge's active would
+# silently keep winning that sort ("10-crio-bridge" < "10-flannel"). Disabling
+# both possible bridge config forms up front means kubelet reports
+# NetworkPluginNotReady until Flannel's DaemonSet lands, which is expected and
+# self-heals, rather than silently keeping the broken bridge default.
 CNI_DIR=/etc/cni/net.d
-if [ -f "$CNI_DIR/10-crio-bridge.conf" ]; then
-  mv "$CNI_DIR/10-crio-bridge.conf" "$CNI_DIR/10-crio-bridge.conf.disabled" || true
-fi
-if [ -f "$CNI_DIR/10-crio-bridge.conflist.disabled" ]; then
-  mv "$CNI_DIR/10-crio-bridge.conflist.disabled" "$CNI_DIR/10-crio-bridge.conflist" || true
-fi
+for f in 10-crio-bridge.conf 10-crio-bridge.conflist; do
+  if [ -f "$CNI_DIR/$f" ]; then
+    mv "$CNI_DIR/$f" "$CNI_DIR/$f.disabled" || true
+  fi
+done
 
 # crio.service is owned and enabled by the apt package
 # (docs/decisions/systemd-install-contract.md); this only starts it.
@@ -604,6 +625,14 @@ fi
 # writes finished -- so each dependent unit's first ExecStart can legitimately
 # fail. Restart=always absorbs that race, so no wait-loop is needed.
 
+# Pod CIDR for node-ipam-controller (below) and Flannel's net-conf.json
+# (applied further down) -- one variable so the two can never drift apart.
+# 10.244.0.0/16 is Flannel's own net-conf.json default, and disjoint from the
+# apiserver's fixed 10.96.0.0/12 --service-cluster-ip-range default (install.sh
+# passes no override, so that default always holds).
+POD_CLUSTER_CIDR="10.244.0.0/16"
+POD_NODE_CIDR_MASK_SIZE=24
+
 # --token-auth-file is always passed so a later --mint-join-token needs no unit
 # edit plus extra restart to enable it. An empty file is a valid token map
 # (auth::load_token_file skips blank lines), so the default path is unchanged
@@ -660,7 +689,7 @@ WorkingDirectory=$STATE_DIR
 # literal argv entry: systemd's own line-splitting never globs, but a real
 # shell would expand that "*" against WorkingDirectory's contents.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-node-ipam-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --service-account-private-key-file=$STATE_DIR/sa.key --root-ca-file=$STATE_DIR/ca.pem --controllers=*,-cloud-node-lifecycle-controller,-node-route-controller,-service-lb-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
@@ -824,6 +853,258 @@ spec:
       - name: lib-modules
         hostPath:
           path: /lib/modules
+EOF
+
+# --- In-cluster bootstrap: Flannel CNI (cross-node pod networking) ----------
+#
+# node-ipam-controller (enabled above via --cluster-cidr=$POD_CLUSTER_CIDR)
+# only stamps Node.spec.podCIDR -- something still has to route pod traffic
+# between nodes using it. CRI-O's default bridge plugin (disabled above) has
+# no cross-node concept at all: every node would otherwise pick the same
+# uncoordinated default subnet with zero routing between hosts, so a
+# ClusterIP Service backed by a pod on a different node is unreachable.
+# Flannel's vxlan backend closes that gap.
+#
+# Inlined here rather than a vendored file kubectl -f reads from disk, and
+# NOT include_bytes!'d into a Rust binary either: install.sh is published and
+# run standalone (curl | sh, see deploy/get-u7s/README.md) with no sibling
+# files on disk once fetched -- the same reason kube-proxy's DaemonSet above
+# is inline rather than a vendored path.
+#
+# Adapted from flannel-io/flannel's official kube-flannel.yml (v0.28.9):
+#   - net-conf.json's Network is $POD_CLUSTER_CIDR, not a hardcoded literal,
+#     so it can never drift from node-ipam-controller's --cluster-cidr above
+#     (they already agree today: 10.244.0.0/16 is upstream's own default too).
+#   - flanneld gets both --iface and --iface-regex, matching install.sh's own
+#     $IFACE resolution rather than flannel's normal "default route" guess.
+#     --iface=$IFACE is the literal interface install.sh picked on this node;
+#     --iface-regex reuses install.sh's own physical-NIC whitelist regex
+#     (used for --iface auto-detection above) as flannel's fallback, since
+#     this one DaemonSet spec runs on every node and this project's own Lima
+#     fleet has observed non-uniform physical interface naming across
+#     otherwise-identical VMs (a literal --iface from one node's resolution
+#     can genuinely not exist on another). An operator who instead points
+#     --iface at a uniformly-named VPN-mesh interface (e.g. a WireGuard/
+#     Tailscale link used for cluster traffic across clouds) gets an exact
+#     --iface match on every node instead of falling through to the regex.
+echo "Applying Flannel CNI manifest..."
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    k8s-app: flannel
+    pod-security.kubernetes.io/enforce: privileged
+  name: kube-flannel
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+  namespace: kube-flannel
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes/status
+  verbs:
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: flannel
+subjects:
+- kind: ServiceAccount
+  name: flannel
+  namespace: kube-flannel
+---
+apiVersion: v1
+data:
+  cni-conf.json: |
+    {
+      "name": "cbr0",
+      "cniVersion": "0.3.1",
+      "plugins": [
+        {
+          "type": "flannel",
+          "delegate": {
+            "hairpinMode": true,
+            "isDefaultGateway": true
+          }
+        },
+        {
+          "type": "portmap",
+          "capabilities": {
+            "portMappings": true
+          }
+        }
+      ]
+    }
+  net-conf.json: |
+    {
+      "Network": "$POD_CLUSTER_CIDR",
+      "EnableNFTables": false,
+      "Backend": {
+        "Type": "vxlan"
+      }
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app: flannel
+    k8s-app: flannel
+    tier: node
+  name: kube-flannel-cfg
+  namespace: kube-flannel
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: flannel
+    k8s-app: flannel
+    tier: node
+  name: kube-flannel-ds
+  namespace: kube-flannel
+spec:
+  selector:
+    matchLabels:
+      app: flannel
+      k8s-app: flannel
+  template:
+    metadata:
+      labels:
+        app: flannel
+        k8s-app: flannel
+        tier: node
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values:
+                - linux
+      containers:
+      - args:
+        - --ip-masq
+        - --kube-subnet-mgr
+        - --iface=$IFACE
+        - --iface-regex=^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$
+        command:
+        - /opt/bin/flanneld
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: EVENT_QUEUE_DEPTH
+          value: "5000"
+        - name: CONT_WHEN_CACHE_NOT_READY
+          value: "false"
+        image: ghcr.io/flannel-io/flannel:v0.28.9
+        name: kube-flannel
+        resources:
+          requests:
+            cpu: 100m
+            memory: 50Mi
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+            - NET_RAW
+          privileged: false
+        volumeMounts:
+        - mountPath: /run/flannel
+          name: run
+        - mountPath: /etc/kube-flannel/
+          name: flannel-cfg
+        - mountPath: /run/xtables.lock
+          name: xtables-lock
+      hostNetwork: true
+      initContainers:
+      - args:
+        - -f
+        - /flannel
+        - /opt/cni/bin/flannel
+        command:
+        - cp
+        image: ghcr.io/flannel-io/flannel-cni-plugin:v1.9.1-flannel3
+        name: install-cni-plugin
+        volumeMounts:
+        - mountPath: /opt/cni/bin
+          name: cni-plugin
+      - args:
+        - -f
+        - /etc/kube-flannel/cni-conf.json
+        - /etc/cni/net.d/10-flannel.conflist
+        command:
+        - cp
+        image: ghcr.io/flannel-io/flannel:v0.28.9
+        name: install-cni
+        volumeMounts:
+        - mountPath: /etc/cni/net.d
+          name: cni
+        - mountPath: /etc/kube-flannel/
+          name: flannel-cfg
+      priorityClassName: system-node-critical
+      serviceAccountName: flannel
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      volumes:
+      - hostPath:
+          path: /run/flannel
+        name: run
+      - hostPath:
+          path: /opt/cni/bin
+        name: cni-plugin
+      - hostPath:
+          path: /etc/cni/net.d
+        name: cni
+      - configMap:
+          name: kube-flannel-cfg
+        name: flannel-cfg
+      - hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+        name: xtables-lock
 EOF
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
