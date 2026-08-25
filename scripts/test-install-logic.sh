@@ -408,6 +408,91 @@ assert "an already-joined worker node (kubeconfig present, ca.key absent -- join
 assert_false "(regression guard) the detection message does not reference a --force-reinstall flag, which does not exist in this bead's shipped scope -- mentioning it would send operators looking for a flag install.sh would reject as unknown" \
   grep -qF -- '--force-reinstall' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# --manifest-output-dir: default value, flag parsing, and env-var fallback
+# must match the existing --iface/U7S_IFACE convention -- an operator relying
+# on that convention for --iface would reasonably expect the same shape here.
+# ---------------------------------------------------------------------------
+assert_true "MANIFEST_OUTPUT_DIR defaults to /etc/u7s/manifests (the apiserver's well-known auto-applied folder) when neither the flag nor U7S_MANIFEST_OUTPUT_DIR is set" \
+  grep -qF 'MANIFEST_OUTPUT_DIR="${U7S_MANIFEST_OUTPUT_DIR:-/etc/u7s/manifests}"' "$INSTALL"
+
+assert_true "--manifest-output-dir is parsed as a flag, overriding the default/env-var value" \
+  grep -qF -- '--manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;' "$INSTALL"
+
+# ---------------------------------------------------------------------------
+# Vendored-manifest copy step: extracted verbatim from install.sh's own
+# source (same approach as fetch_tarball's extraction in
+# test-install-checksum.sh), so these assertions fail if the shipped logic
+# regresses, not just a hand-copy kept here.
+# ---------------------------------------------------------------------------
+write_manifest_copy_runner() {
+  local install_script="$1" runner="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STAGE_DIR="$1"'
+    echo 'MANIFEST_OUTPUT_DIR="$2"'
+    echo 'JOIN_MODE="$3"'
+    awk '/^if \[ "\$JOIN_MODE" -eq 0 \]; then$/,/^fi$/' "$install_script"
+  } > "$runner"
+}
+
+MANIFEST_WORK="$(mktemp -d)"
+# Replaces the DETECT_WORK-only trap above (only the latest EXIT trap fires),
+# so it must still cover DETECT_WORK too.
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK"' EXIT
+MANIFEST_RUNNER="$MANIFEST_WORK/manifest-copy.sh"
+write_manifest_copy_runner "$INSTALL" "$MANIFEST_RUNNER"
+
+# Case 1: tarball carries manifests/*.yaml, default well-known destination --
+# the common case once the release-pipeline vendoring bead lands. Files must
+# actually reach the folder apiserver's own boot-time scan reads.
+stage1="$MANIFEST_WORK/stage1"
+mkdir -p "$stage1/manifests"
+echo 'kind: ConfigMap' > "$stage1/manifests/coredns.yaml"
+dest1="$MANIFEST_WORK/dest1"
+bash "$MANIFEST_RUNNER" "$stage1" "$dest1" 0
+assert_true "a manifests/*.yaml file found in the extracted tarball is copied into the (default well-known) output directory" \
+  test -f "$dest1/coredns.yaml"
+
+# Case 2: operator points --manifest-output-dir elsewhere (GitOps entry
+# point) -- the well-known folder must end up with NOTHING, not a partial
+# copy, or apiserver's boot-time scan would auto-apply files the operator
+# meant to manage themselves.
+stage2="$MANIFEST_WORK/stage2"
+mkdir -p "$stage2/manifests"
+echo 'kind: ConfigMap' > "$stage2/manifests/kube-proxy.yaml"
+wellknown2="$MANIFEST_WORK/wellknown2"
+altdest2="$MANIFEST_WORK/altdest2"
+mkdir -p "$wellknown2"
+bash "$MANIFEST_RUNNER" "$stage2" "$altdest2" 0
+assert_true "an alternate --manifest-output-dir receives the vendored manifest file" \
+  test -f "$altdest2/kube-proxy.yaml"
+assert "an alternate --manifest-output-dir leaves the well-known folder untouched (empty) -- the GitOps contract this bead exists for: apiserver's own scan of the well-known folder must find nothing to auto-apply" \
+  "$([ -z "$(ls -A "$wellknown2" 2>/dev/null)" ] && echo 1 || echo 0)"
+
+# Case 3: JOIN_MODE=1 (a --join worker install, no apiserver to apply
+# anything) must skip the copy entirely, even if the tarball happens to
+# carry a manifests/ dir.
+stage3="$MANIFEST_WORK/stage3"
+mkdir -p "$stage3/manifests"
+echo 'kind: ConfigMap' > "$stage3/manifests/flannel.yaml"
+dest3="$MANIFEST_WORK/dest3"
+bash "$MANIFEST_RUNNER" "$stage3" "$dest3" 1
+assert_false "--join (JOIN_MODE=1) skips the manifest copy step entirely -- a worker node runs no apiserver, so there is nothing to auto-apply" \
+  test -e "$dest3"
+
+# Case 4: a checkout's tarball with no manifests/ dir at all (true until the
+# release-pipeline vendoring bead lands separately) must be a silent no-op,
+# not a fatal error that breaks every install in the meantime.
+stage4="$MANIFEST_WORK/stage4"
+mkdir -p "$stage4"
+dest4="$MANIFEST_WORK/dest4"
+copy_status=0
+bash "$MANIFEST_RUNNER" "$stage4" "$dest4" 0 || copy_status=$?
+assert "a tarball with no manifests/ dir at all is treated as an empty set, not an error -- required until the release-pipeline vendoring bead (mayor-liiv1) actually lands manifests into the tarball" \
+  "$([ "$copy_status" -eq 0 ] && echo 1 || echo 0)"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

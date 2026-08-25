@@ -31,15 +31,21 @@ fi
 #                       kubelet with its own x509 identity.
 #
 # Usage:
-#   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+#   sudo scripts/install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
 #   sudo scripts/install.sh --mint-join-token --node-name <name> --node-ip <ip>
 #   sudo scripts/install.sh --join <url> --token <artifact> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 #
-# Knobs on the zero-argument path are exactly two, both env-settable
+# Knobs on the zero-argument path are env-settable
 # (docs/decisions/install-script-ux.md):
 #   --node-name / U7S_NODE_NAME   Node identity (default: hostname).
 #   --iface     / U7S_IFACE       Cluster-traffic interface (default: first
 #                                 physical non-loopback interface).
+#   --manifest-output-dir / U7S_MANIFEST_OUTPUT_DIR
+#                                 Where vendored manifest YAMLs from the
+#                                 tarball land (default: /etc/u7s/manifests,
+#                                 the apiserver's well-known auto-applied
+#                                 folder -- docs/decisions/
+#                                 well-known-manifest-folder.md).
 #
 # The default and --join modes need a tarball, from --tarball <path>,
 # --tarball-url <url>, or DEFAULT_TARBALL_URL below. It must contain the
@@ -51,7 +57,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
   install.sh --mint-join-token --node-name <name> --node-ip <ip>
   install.sh --join <url> --token <artifact> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
@@ -63,6 +69,12 @@ Usage:
                          this is the NAME OF THE JOINING NODE, not this host.
   --iface <iface>       Network interface used for cluster traffic
                          (default: first non-loopback interface).
+  --manifest-output-dir <path>
+                         Where vendored manifest YAMLs from the tarball land
+                         (default: /etc/u7s/manifests, the apiserver's
+                         well-known auto-applied folder). An alternate path
+                         leaves the well-known folder empty, for GitOps to
+                         manage instead.
   --mint-join-token     Run on an existing control-plane node: mint a join
                          artifact for a new node (requires --node-name, --node-ip).
   --node-ip <ip>        IP address of the joining node (--mint-join-token only).
@@ -81,6 +93,7 @@ DEFAULT_TARBALL_URL=""
 
 NODE_NAME="${U7S_NODE_NAME:-}"
 IFACE="${U7S_IFACE:-}"
+MANIFEST_OUTPUT_DIR="${U7S_MANIFEST_OUTPUT_DIR:-/etc/u7s/manifests}"
 TARBALL=""
 TARBALL_URL="$DEFAULT_TARBALL_URL"
 # Only an operator-passed --tarball-url conflicts with --tarball; a released
@@ -97,6 +110,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --node-name) NODE_NAME="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
+    --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
@@ -588,6 +602,26 @@ if [ "$JOIN_MODE" -eq 1 ]; then
   stage_binaries kubelet
 else
   stage_binaries u7s-apiserver u7s-scheduler kubelet kube-controller-manager
+fi
+
+# --- Vendored manifests from the tarball -------------------------------------
+#
+# manifests/*.yaml ships in the release tarball alongside the binaries above
+# (docs/decisions/well-known-manifest-folder.md). --manifest-output-dir picks
+# the destination: the well-known folder (default) for apiserver's own
+# boot-time auto-apply scan, or an operator-chosen alternate path for GitOps
+# to manage instead -- nothing is ever written into the well-known folder in
+# that case, so apiserver's scan finds it empty. Only relevant to a
+# control-plane node: --join installs kubelet alone, with no apiserver to
+# apply anything. A checkout's tarball may not carry a manifests/ dir at all
+# yet (the release-pipeline vendoring step lands separately); that is
+# equivalent to an empty set, not an error.
+if [ "$JOIN_MODE" -eq 0 ]; then
+  TARBALL_MANIFEST_DIR="$(find "$STAGE_DIR" -type d -name manifests | head -n1)"
+  if [ -n "$TARBALL_MANIFEST_DIR" ] && [ -n "$(find "$TARBALL_MANIFEST_DIR" -maxdepth 1 -name '*.yaml')" ]; then
+    install -d -m 0755 "$MANIFEST_OUTPUT_DIR"
+    cp "$TARBALL_MANIFEST_DIR"/*.yaml "$MANIFEST_OUTPUT_DIR/"
+  fi
 fi
 
 # --- kubectl + CNI plugin binaries (apt, pinned to kubelet's own version) ----
