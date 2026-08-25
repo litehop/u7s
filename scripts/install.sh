@@ -759,10 +759,12 @@ systemctl restart kubelet.service
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
 wait_for_apiserver "$KUBECONFIG_PATH"
 
-# server: the "kubernetes" Service's fixed ClusterIP, hardcoded rather than
-# kubeadm's ${KUBERNETES_SERVICE_HOST} env form -- same reasoning as
-# coredns.yaml pinning kube-dns's ClusterIP, a known-good address over a
-# Pod-env-var substitution path this project has not verified.
+# server: the real advertised apiserver address ($IFACE_IP:6443, matching
+# --advertise-address above), NOT the "kubernetes" Service's ClusterIP.
+# That ClusterIP is only reachable via iptables DNAT rules that kube-proxy
+# itself is responsible for installing -- pointing kube-proxy's own
+# kubeconfig at it is a bootstrap deadlock (informer never syncs, so the
+# DNAT rules that would make the ClusterIP reachable never get programmed).
 echo "Applying kube-proxy DaemonSet manifest..."
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
 apiVersion: v1
@@ -802,7 +804,7 @@ data:
     clusters:
     - cluster:
         certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        server: https://10.96.0.1:443
+        server: https://$IFACE_IP:6443
       name: default
     contexts:
     - context:

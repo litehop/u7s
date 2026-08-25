@@ -323,6 +323,18 @@ assert_false "(regression guard) install.sh no longer uses 'systemctl enable --n
 assert_true "the apiserver restart step fails loud with a systemctl status/journalctl pointer on failure, instead of a bare set -e trace" \
   grep -qF 'error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-ecmt4. kube-proxy's own kubeconfig pointed at the
+# "kubernetes" Service's ClusterIP (10.96.0.1:443) -- reachable only via
+# iptables DNAT rules that kube-proxy itself is responsible for installing,
+# a bootstrap deadlock that left every ClusterIP unreachable cluster-wide.
+# ---------------------------------------------------------------------------
+assert_false "(regression guard) kube-proxy's kubeconfig no longer points at the kubernetes Service's ClusterIP (10.96.0.1:443), which is only reachable via DNAT rules kube-proxy itself has not yet installed at bootstrap" \
+  grep -qF '10.96.0.1:443' "$INSTALL"
+
+assert_true "kube-proxy's kubeconfig points at the real advertised apiserver address (\$IFACE_IP:6443), reachable without depending on kube-proxy's own DNAT rules" \
+  grep -qF 'server: https://$IFACE_IP:6443' "$INSTALL"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
