@@ -809,7 +809,9 @@ fn validate_cr_schema(
 /// shape — mirrors `apply_crd_schema_defaults`'s recursion (`properties` for objects,
 /// `items` for arrays) rather than `walk_schema_dos_bounds`'s schema-only walk, because
 /// a CEL rule's `self`/`oldSelf` bindings need the *data* at each schema node, not just
-/// the schema node itself.
+/// the schema node itself. Also recurses into `oneOf`/`anyOf`/`allOf` branches — a rule
+/// reachable only through one of these combinators (e.g. cert-manager's Issuer
+/// backend union, Gateway API's filter-type union) previously never fired at all.
 ///
 /// A rule under a property that is absent from `obj` is not evaluated — matches
 /// upstream: `self` must exist for a rule to run at all.
@@ -829,32 +831,91 @@ fn validate_cel_rules(
     }
 
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-        let Some(map) = obj.as_object() else {
-            return Ok(());
-        };
-        for (key, sub_schema) in props {
-            if let Some(child) = map.get(key) {
-                let child_old = old_node.and_then(|o| o.get(key));
-                validate_cel_rules(
-                    sub_schema,
-                    child,
-                    child_old,
-                    &join_cr_field_path(field_path, key),
-                )?;
+        if let Some(map) = obj.as_object() {
+            for (key, sub_schema) in props {
+                if let Some(child) = map.get(key) {
+                    let child_old = old_node.and_then(|o| o.get(key));
+                    validate_cel_rules(
+                        sub_schema,
+                        child,
+                        child_old,
+                        &join_cr_field_path(field_path, key),
+                    )?;
+                }
             }
         }
-        return Ok(());
+    } else if let Some(items_schema) = schema.get("items") {
+        if let Some(arr) = obj.as_array() {
+            for (i, item) in arr.iter().enumerate() {
+                let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
+                validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+            }
+        }
     }
-    if let Some(items_schema) = schema.get("items") {
-        let Some(arr) = obj.as_array() else {
-            return Ok(());
-        };
-        for (i, item) in arr.iter().enumerate() {
-            let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
-            validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+
+    // `allOf` branches must all hold simultaneously, so every branch's rules apply
+    // unconditionally. `oneOf`/`anyOf` branches are alternatives — boon has already
+    // confirmed `obj` satisfies the combinator as a whole (exactly one branch for
+    // `oneOf`, at least one for `anyOf`) by the time this runs, so only the branch(es)
+    // `obj` actually conforms to are evaluated; running a rule against a branch it
+    // doesn't match would misfire on fields the branch assumes exist but don't (e.g. a
+    // "no such key" CEL error), not produce a meaningful pass/fail.
+    if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for branch in branches {
+            validate_cel_rules(branch, obj, old_node, field_path)?;
+        }
+    }
+    for combinator in ["oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
+            for branch in branches {
+                if schema_branch_structurally_matches(branch, obj) {
+                    validate_cel_rules(branch, obj, old_node, field_path)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Best-effort check for whether `obj` conforms to `branch`, used to pick which
+/// `oneOf`/`anyOf` branch(es) a CEL rule should evaluate against. This deliberately
+/// does not re-implement full JSON Schema validation — boon already did that for the
+/// whole document before `validate_cel_rules` ever runs — it only checks the
+/// constraints real CRDs use to discriminate between branches (`type`, `required`,
+/// `enum`), e.g. cert-manager's Issuer backend union or Gateway API's filter-type union.
+fn schema_branch_structurally_matches(branch: &serde_json::Value, obj: &serde_json::Value) -> bool {
+    if let Some(want_type) = branch.get("type").and_then(|v| v.as_str()) {
+        let matches = match want_type {
+            "object" => obj.is_object(),
+            "array" => obj.is_array(),
+            "string" => obj.is_string(),
+            "boolean" => obj.is_boolean(),
+            "integer" => obj.is_i64() || obj.is_u64(),
+            "number" => obj.is_number(),
+            "null" => obj.is_null(),
+            _ => true,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    if let Some(required) = branch.get("required").and_then(|v| v.as_array()) {
+        let Some(map) = obj.as_object() else {
+            return false;
+        };
+        let all_present = required
+            .iter()
+            .all(|k| k.as_str().is_some_and(|k| map.contains_key(k)));
+        if !all_present {
+            return false;
+        }
+    }
+    if let Some(allowed) = branch.get("enum").and_then(|v| v.as_array()) {
+        if !allowed.contains(obj) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
@@ -878,6 +939,7 @@ fn evaluate_cel_rule(
     })?;
 
     let mut cel_ctx = cel::Context::default();
+    register_cel_string_extensions(&mut cel_ctx);
     cel_ctx
         .add_variable("self", self_value)
         .map_err(|e| Status::internal(format!("CEL: failed to bind self: {e}")))?;
@@ -969,6 +1031,7 @@ fn evaluate_message_expression(
 ) -> Option<String> {
     let program = cel::Program::compile(expr).ok()?;
     let mut cel_ctx = cel::Context::default();
+    register_cel_string_extensions(&mut cel_ctx);
     cel_ctx.add_variable("self", self_value).ok()?;
     if let Some(old) = old_self_value {
         cel_ctx.add_variable("oldSelf", old).ok()?;
@@ -980,6 +1043,98 @@ fn evaluate_message_expression(
         }
         _ => None,
     }
+}
+
+/// Registers CEL string-extension functions the vendored `cel` crate's stdlib doesn't
+/// implement but real-world CRDs rely on. Kubernetes' own CEL library adds `.split()`,
+/// `.lowerAscii()`, `.upperAscii()`, `.replace()`, and `.join()` as the `strings` extension;
+/// the `cel` crate's `Env::stdlib()` only covers the base spec's `contains`/`startsWith`/
+/// `endsWith`/`matches`/`size`. Without these, e.g. Gateway API's annotation-key-prefix rule
+/// (`self.split("/")[0].size() < 253`, `gateway.networking.k8s.io_gateways.yaml` L262) or
+/// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
+/// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
+fn register_cel_string_extensions(ctx: &mut cel::Context) {
+    ctx.add_function("split", cel_split);
+    ctx.add_function("lowerAscii", cel_lower_ascii);
+    ctx.add_function("upperAscii", cel_upper_ascii);
+    ctx.add_function("replace", cel_replace);
+    ctx.add_function("join", cel_join);
+}
+
+fn cel_split(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+    sep: std::sync::Arc<String>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::List(std::sync::Arc::new(
+        this.split(sep.as_str())
+            .map(|part| cel::Value::String(std::sync::Arc::new(part.to_string())))
+            .collect(),
+    )))
+}
+
+fn cel_lower_ascii(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::String(std::sync::Arc::new(
+        this.to_ascii_lowercase(),
+    )))
+}
+
+fn cel_upper_ascii(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::String(std::sync::Arc::new(
+        this.to_ascii_uppercase(),
+    )))
+}
+
+fn cel_replace(
+    cel::extractors::This(this): cel::extractors::This<std::sync::Arc<String>>,
+    old: std::sync::Arc<String>,
+    new: std::sync::Arc<String>,
+) -> Result<cel::Value, cel::ExecutionError> {
+    Ok(cel::Value::String(std::sync::Arc::new(
+        this.replace(old.as_str(), new.as_str()),
+    )))
+}
+
+/// `self.join()` concatenates a list of strings with no separator; `self.join(sep)` joins
+/// with `sep` — Kubernetes' CEL library exposes these as two overloads of the same name,
+/// collapsed here into one function since `Context::add_function` registers a single
+/// implementation per name and dispatches by receiver type, not by argument count.
+fn cel_join(
+    cel::extractors::This(this): cel::extractors::This<cel::Value>,
+    cel::extractors::Arguments(args): cel::extractors::Arguments,
+) -> Result<cel::Value, cel::ExecutionError> {
+    let cel::Value::List(items) = this else {
+        return Err(cel::ExecutionError::function_error(
+            "join",
+            "target is not a list",
+        ));
+    };
+    let sep = match args.first() {
+        None => String::new(),
+        Some(cel::Value::String(s)) => s.as_str().to_string(),
+        Some(_) => {
+            return Err(cel::ExecutionError::function_error(
+                "join",
+                "separator must be a string",
+            ));
+        }
+    };
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        match item {
+            cel::Value::String(s) => parts.push(s.as_str().to_string()),
+            other => {
+                return Err(cel::ExecutionError::function_error(
+                    "join",
+                    format!("list element is not a string: {other:?}"),
+                ));
+            }
+        }
+    }
+    Ok(cel::Value::String(std::sync::Arc::new(parts.join(&sep))))
 }
 
 /// Depth-first search for an `enum` keyword violation in a boon validation-error tree,
@@ -7958,6 +8113,604 @@ mod tests {
         assert!(
             err.1.message.contains("protocol must be HTTP or HTTPS"),
             "a protocol outside the allowed list must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CEL string-extension overloads (split/lowerAscii/upperAscii/replace/join)
+    //
+    // The vendored `cel` crate's stdlib doesn't implement these (only base-spec
+    // contains/startsWith/endsWith/matches/size), but real CRDs use them, e.g.
+    // Gateway API's `self.split("/")[0].size() < 253` annotation-key-prefix rule and
+    // Crossplane's `self.plural == self.plural.lowerAscii()`. Without the overloads
+    // registered, evaluating such a rule fails with an "undeclared reference" CEL
+    // error on every CR write instead of the rule ever actually running.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: compile and evaluate a boolean CEL expression with the string-extension
+    /// overloads registered, same as `evaluate_cel_rule` does for every CRD rule.
+    fn eval_cel_bool(expr: &str) -> bool {
+        let program = cel::Program::compile(expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let mut ctx = cel::Context::default();
+        register_cel_string_extensions(&mut ctx);
+        match program.execute(&ctx) {
+            Ok(cel::Value::Bool(b)) => b,
+            other => panic!("{expr} did not evaluate to a bool: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cel_split_overload_evaluates_gateway_annotation_key_prefix_rule() {
+        assert!(
+            eval_cel_bool(r#"'example.com/name'.split('/')[0] == 'example.com'"#),
+            "split() must break a string on every separator occurrence, matching the \
+             Gateway API annotation-key-prefix rule this overload exists for"
+        );
+    }
+
+    #[test]
+    fn cel_lower_ascii_overload_evaluates_crossplane_plural_rule() {
+        assert!(
+            eval_cel_bool("'Widgets'.lowerAscii() == 'widgets'"),
+            "lowerAscii() must lowercase ASCII letters, matching Crossplane's \
+             `self.plural == self.plural.lowerAscii()` CompositeResourceDefinition rule"
+        );
+    }
+
+    #[test]
+    fn cel_upper_ascii_overload_uppercases_ascii_letters() {
+        assert!(
+            eval_cel_bool("'Widgets'.upperAscii() == 'WIDGETS'"),
+            "upperAscii() must uppercase ASCII letters"
+        );
+    }
+
+    #[test]
+    fn cel_replace_overload_replaces_every_occurrence() {
+        assert!(
+            eval_cel_bool("'a-b-c'.replace('-', '_') == 'a_b_c'"),
+            "replace() must replace every occurrence of the old substring, not just the first"
+        );
+    }
+
+    #[test]
+    fn cel_join_overload_with_separator_joins_list_elements() {
+        assert!(
+            eval_cel_bool("['a', 'b', 'c'].join('-') == 'a-b-c'"),
+            "join(separator) must concatenate list elements with the given separator"
+        );
+    }
+
+    #[test]
+    fn cel_join_overload_without_separator_concatenates_with_no_delimiter() {
+        assert!(
+            eval_cel_bool("['a', 'b', 'c'].join() == 'abc'"),
+            "join() with no argument must concatenate list elements with no delimiter, \
+             matching Kubernetes' CEL strings library's zero-arg join overload"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression fixtures: real-world CRD CEL rules from the mayor-fbxcy audit
+    // (ai/findings/cel-cr-admission-audit-2026-08-25.md), verifying enforcement
+    // against the workloads that actually motivated it, not just synthetic rules.
+    //
+    // cert-manager ClusterIssuer's has()+ternary exactly-one-of rule and
+    // prometheus-operator ScrapeConfig's filter()+size() rule are already covered
+    // verbatim by `cel_has_macro_*`/`cel_filter_macro_*` above (mayor-olvm0's landed
+    // suite) — not duplicated here.
+    // ---------------------------------------------------------------------------
+
+    // HTTPRoute CORS rules (audit L495-498/557-560/635-638): the wildcard '*' must not
+    // be combined with any other entry. Exercises the `in` operator together with
+    // size() in one rule, on a list rather than a single scalar.
+    #[test]
+    fn cel_in_operator_and_size_rejects_wildcard_combined_with_other_origins() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "allowOrigins": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "x-kubernetes-validations": [{
+                        "rule": "!('*' in self && self.size() > 1)",
+                        "message": "wildcard '*' must not be combined with other allowOrigins entries"
+                    }]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "allowOrigins": ["*"] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "wildcard alone must be accepted"
+        );
+        assert!(
+            check_schema(
+                &serde_json::json!({ "allowOrigins": ["https://a.example", "https://b.example"] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "multiple non-wildcard origins must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "allowOrigins": ["*", "https://a.example"] }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("wildcard '*' must not be combined with other allowOrigins entries"),
+            "combining '*' with another origin must be rejected with the CRD's message \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // HTTPRoute has() mutual exclusivity (audit L1039): percent and fraction are
+    // alternate ways to express the same weight and must not both be set. Distinct
+    // from the ClusterIssuer has()-count fixture above: this is a plain boolean
+    // mutual-exclusivity check, not a "sum to exactly one" arithmetic rule.
+    #[test]
+    fn cel_has_macro_rejects_both_percent_and_fraction_set() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "weight": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "!(has(self.percent) && has(self.fraction))",
+                        "message": "percent and fraction are mutually exclusive"
+                    }],
+                    "properties": {
+                        "percent": { "type": "integer" },
+                        "fraction": { "type": "object" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "weight": { "percent": 50 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "setting only percent must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "weight": { "percent": 50, "fraction": {} } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("percent and fraction are mutually exclusive"),
+            "setting both percent and fraction must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // HTTPRoute baseline cross-field rule (audit L1020): plain `self.a`/`self.b`
+    // comparison with no macros involved — this should pass even without any CEL
+    // macro support, so a regression here means the basic `self` binding itself broke.
+    #[test]
+    fn cel_baseline_cross_field_rule_rejects_numerator_exceeding_denominator() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.numerator <= self.denominator",
+                        "message": "numerator must not exceed denominator"
+                    }],
+                    "properties": {
+                        "numerator": { "type": "integer" },
+                        "denominator": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "numerator": 1, "denominator": 2 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "numerator <= denominator must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "numerator": 3, "denominator": 2 } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("numerator must not exceed denominator"),
+            "numerator exceeding denominator must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // Gateway listener-name uniqueness (audit L901-918): a genuinely 2-variable
+    // comprehension over a single list — `l1`/`l2` both range over `self`. Two
+    // listeners sharing a name means `exists_one` finds two matches for that name,
+    // not one, so `all()` must fail on the first offending element.
+    #[test]
+    fn cel_two_variable_all_exists_one_rejects_duplicate_listener_names() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "listeners": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } }
+                    },
+                    "x-kubernetes-validations": [{
+                        "rule": "self.all(l1, self.exists_one(l2, l1.name == l2.name))",
+                        "message": "listener names must be unique"
+                    }]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "listeners": [{ "name": "http" }, { "name": "https" }] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "distinct listener names must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "listeners": [{ "name": "http" }, { "name": "http" }] }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.message.contains("listener names must be unique"),
+            "duplicate listener names must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // A different shape of 2-variable comprehension than the Gateway fixture above:
+    // the two variables range over two *different* collections
+    // (`self.foo.all(x, self.bar.all(y, ...))`), not the same list twice. Flagged
+    // by critical-reviewer as missing from mayor-olvm0's landed suite.
+    #[test]
+    fn cel_two_variable_nested_comprehension_across_two_collections_rejects_overlap() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.reservedPorts.all(x, self.dynamicPorts.all(y, x < y))",
+                        "message": "every reserved port must be lower than every dynamic port"
+                    }],
+                    "properties": {
+                        "reservedPorts": { "type": "array", "items": { "type": "integer" } },
+                        "dynamicPorts": { "type": "array", "items": { "type": "integer" } }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({
+                    "spec": { "reservedPorts": [80, 443], "dynamicPorts": [30000, 30001] }
+                }),
+                schema.clone()
+            )
+            .is_ok(),
+            "reserved ports strictly below every dynamic port must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({
+                "spec": { "reservedPorts": [80, 30000], "dynamicPorts": [30000, 30001] }
+            }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("every reserved port must be lower than every dynamic port"),
+            "a reserved port overlapping the dynamic range must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // Gateway API annotation-key-prefix rule (audit L262, `gateway.networking.k8s.io_\
+    // gateways.yaml`): `self.split("/")[0].size() < 253`. This is the exact rule
+    // mayor-u1d01 registered `.split()` for — without that overload this rule would
+    // fail every evaluation with an "undeclared reference" CEL error, not evaluate the
+    // length check at all.
+    #[test]
+    fn cel_split_function_enforces_gateway_annotation_key_prefix_length() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "annotations": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "x-kubernetes-validations": [{
+                        "rule": "self.all(key, key.split('/')[0].size() < 253)",
+                        "message": "annotation key prefix must be under 253 characters"
+                    }]
+                }
+            }
+        });
+        let mut ok = serde_json::json!({ "annotations": {} });
+        ok["annotations"]["example.com/name"] = serde_json::json!("widget");
+        assert!(
+            check_schema(&ok, schema.clone()).is_ok(),
+            "an annotation key with a short prefix must be accepted"
+        );
+
+        let long_prefix = "a".repeat(253);
+        let mut bad = serde_json::json!({ "annotations": {} });
+        bad["annotations"][format!("{long_prefix}/name")] = serde_json::json!("widget");
+        let err = check_schema(&bad, schema).unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("annotation key prefix must be under 253 characters"),
+            "a 253+ byte annotation-key prefix must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // messageExpression path: the CRD author builds a formatted error string from the
+    // failing values instead of a static `message`. The rendered string, not a generic
+    // CEL error or the raw rule text, must reach the client in the 422 body.
+    #[test]
+    fn cel_message_expression_builds_formatted_error_surfaced_in_422_body() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.replicas <= self.maxReplicas",
+                        "messageExpression": "'replicas (' + string(self.replicas) + \
+                            ') must not exceed maxReplicas (' + string(self.maxReplicas) + ')'"
+                    }],
+                    "properties": {
+                        "replicas": { "type": "integer" },
+                        "maxReplicas": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "replicas": 2, "maxReplicas": 5 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "replicas within the max must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "replicas": 10, "maxReplicas": 5 } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("replicas (10) must not exceed maxReplicas (5)"),
+            "the messageExpression-rendered string (built from the actual failing values) \
+             must reach the client, not a generic CEL failure or the raw rule text \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // CEL error branches must all fail closed (reject the CR), matching mayor-olvm0's
+    // stated design intent — a rule the interpreter can't safely evaluate is not the
+    // same as a rule that evaluated to "no violation".
+    //
+    // Runtime failure: division by zero. This differs from a compile error (below) —
+    // the rule parses and type-checks, it only fails while executing against this
+    // specific CR body.
+    #[test]
+    fn cel_division_by_zero_runtime_error_fails_closed_instead_of_silently_accepting() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.numerator / self.denominator > 0",
+                        "message": "ratio must be positive"
+                    }],
+                    "properties": {
+                        "numerator": { "type": "integer" },
+                        "denominator": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "numerator": 4, "denominator": 2 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "a rule that evaluates cleanly to true must still be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "numerator": 4, "denominator": 0 } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.message.contains("failed to evaluate"),
+            "division by zero mid-rule must reject the CR (fail closed), not silently \
+             accept it as if the rule had passed (got: {})",
+            err.1.message
+        );
+    }
+
+    // A rule that evaluates successfully but to a non-bool value is an authoring bug
+    // in the CRD, not a "no violation" signal — every input must be rejected, since
+    // there is no CR body for which this rule could ever mean "passed".
+    #[test]
+    fn cel_non_bool_result_rule_fails_closed_instead_of_silently_accepting() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.numerator",
+                        "message": "malformed rule"
+                    }],
+                    "properties": { "numerator": { "type": "integer" } }
+                }
+            }
+        });
+        let err =
+            check_schema(&serde_json::json!({ "spec": { "numerator": 1 } }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("must evaluate to a bool"),
+            "a rule returning a non-bool value must reject every CR body, not accept it \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // A rule that fails to even compile (malformed CEL syntax) must reject the CR at
+    // admission time, not be silently skipped — the CRD author has a broken rule, and
+    // the operator writing the CR needs to know their write was rejected, not that it
+    // silently bypassed validation.
+    #[test]
+    fn cel_malformed_rule_fails_to_compile_and_rejects_instead_of_silently_accepting() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.foo((",
+                        "message": "malformed rule"
+                    }]
+                }
+            }
+        });
+        let err = check_schema(&serde_json::json!({ "spec": {} }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("does not compile"),
+            "malformed CEL must reject the CR with a compile-error message, not silently \
+             accept it (got: {})",
+            err.1.message
+        );
+    }
+
+    // Before this fix, validate_cel_rules only recursed via `properties`/`items`, so a
+    // rule reachable only through a `oneOf` branch never fired — a CR that violated it
+    // was silently accepted. Modeled on cert-manager Issuer's real-world pattern of
+    // using `oneOf` to discriminate between backend types (tpp vs cloud), with the CEL
+    // rule nested one level further inside the matching branch (`oneOf` itself nested
+    // under `properties.spec`, not at the schema root).
+    #[test]
+    fn cel_rule_under_oneof_branch_is_evaluated_instead_of_silently_skipped() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "oneOf": [
+                        {
+                            "required": ["tpp"],
+                            "properties": {
+                                "tpp": {
+                                    "type": "object",
+                                    "properties": { "url": { "type": "string" } },
+                                    "x-kubernetes-validations": [{
+                                        "rule": "self.url.startsWith('https://')",
+                                        "message": "tpp.url must use https"
+                                    }]
+                                }
+                            }
+                        },
+                        {
+                            "required": ["cloud"],
+                            "properties": { "cloud": { "type": "object" } }
+                        }
+                    ]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "tpp": { "url": "https://secure.example" } } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "an https tpp.url must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "tpp": { "url": "http://insecure.example" } } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.message.contains("tpp.url must use https"),
+            "a rule nested under a oneOf branch must be evaluated and reject a violating \
+             CR — before this fix it was never reached, so this body was silently \
+             accepted (got: {})",
+            err.1.message
+        );
+    }
+
+    // `allOf` branches all apply simultaneously (unlike `oneOf`'s pick-one semantics),
+    // so a rule on any `allOf` branch must fire unconditionally.
+    #[test]
+    fn cel_rule_under_allof_branch_is_evaluated_unconditionally() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "allOf": [
+                        {
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "x-kubernetes-validations": [{
+                                        "rule": "self.size() > 0",
+                                        "message": "name must not be empty"
+                                    }]
+                                }
+                            }
+                        }
+                    ],
+                    "properties": { "name": { "type": "string" } }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "name": "widget" } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "a non-empty name must be accepted"
+        );
+        let err = check_schema(&serde_json::json!({ "spec": { "name": "" } }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("name must not be empty"),
+            "a rule nested under an allOf branch must be evaluated and reject a \
+             violating CR (got: {})",
             err.1.message
         );
     }
