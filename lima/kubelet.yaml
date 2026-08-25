@@ -234,7 +234,7 @@ provision:
       # ("If 0, unlimited", per `kubelet --help`'s --registry-qps doc), not a magic number;
       # maxParallelImagePulls: 10 above remains the real concurrency bound.
       #
-      # ClusterTrustBundle(Projection)/PodCertificateRequest: Beta-since-1.36
+      # ClusterTrustBundle(Projection): Beta-since-1.33; PodCertificateRequest: Beta-since-1.35
       # (mayor-moejy) but default-OFF (`kubelet --help` lists all three as
       # "BETA - default=false"), so the real kubelet silently skips the
       # `clusterTrustBundle`/`podCertificate` projected-volume sources on a Pod spec

@@ -2,8 +2,9 @@
 # Regression test for the kubelet feature-gate config in lima/kubelet.yaml
 # (mayor-17kra).
 #
-# ClusterTrustBundle, ClusterTrustBundleProjection and PodCertificateRequest are
-# Beta-since-1.36 but default-OFF in the real kubelet binary (`kubelet --help`
+# ClusterTrustBundle and ClusterTrustBundleProjection are Beta-since-1.33,
+# PodCertificateRequest is Beta-since-1.35, but all three are default-OFF in
+# the real kubelet binary (`kubelet --help`
 # lists all three as "BETA - default=false"). Without all three gates set,
 # kubelet silently ignores the `clusterTrustBundle`/`podCertificate`
 # projected-volume sources on a Pod spec instead of erroring — a pod using
