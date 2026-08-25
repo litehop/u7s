@@ -529,7 +529,10 @@ done
 
 # crio.service is owned and enabled by the apt package
 # (docs/decisions/systemd-install-contract.md); this only starts it.
-systemctl enable --now crio
+# restart rather than start: on a re-run against an already-active unit,
+# start is a no-op, so a re-run would never pick up a package upgrade.
+systemctl enable crio
+systemctl restart crio
 
 # --- Stage binaries from the tarball ------------------------------------------
 #
@@ -606,7 +609,8 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now kubelet.service
+  systemctl enable kubelet.service
+  systemctl restart kubelet.service
 
   echo ""
   echo "u7s join complete. Verify from the control-plane node:"
@@ -729,10 +733,21 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now u7s-apiserver.service
-systemctl enable --now u7s-scheduler.service
-systemctl enable --now u7s-kcm.service
-systemctl enable --now kubelet.service
+# restart rather than start: on a re-run against an already-active unit,
+# start is a no-op, so the running process would never re-exec against the
+# binary just staged above. restart on an enabled-but-inactive unit (fresh
+# install) behaves exactly like start.
+systemctl enable u7s-apiserver.service
+if ! systemctl restart u7s-apiserver.service; then
+  echo "error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
+  exit 1
+fi
+systemctl enable u7s-scheduler.service
+systemctl restart u7s-scheduler.service
+systemctl enable u7s-kcm.service
+systemctl restart u7s-kcm.service
+systemctl enable kubelet.service
+systemctl restart kubelet.service
 
 # --- In-cluster bootstrap: kube-proxy DaemonSet -------------------------------
 #
