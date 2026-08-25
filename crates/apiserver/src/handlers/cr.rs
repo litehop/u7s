@@ -809,7 +809,9 @@ fn validate_cr_schema(
 /// shape — mirrors `apply_crd_schema_defaults`'s recursion (`properties` for objects,
 /// `items` for arrays) rather than `walk_schema_dos_bounds`'s schema-only walk, because
 /// a CEL rule's `self`/`oldSelf` bindings need the *data* at each schema node, not just
-/// the schema node itself.
+/// the schema node itself. Also recurses into `oneOf`/`anyOf`/`allOf` branches — a rule
+/// reachable only through one of these combinators (e.g. cert-manager's Issuer
+/// backend union, Gateway API's filter-type union) previously never fired at all.
 ///
 /// A rule under a property that is absent from `obj` is not evaluated — matches
 /// upstream: `self` must exist for a rule to run at all.
@@ -829,32 +831,91 @@ fn validate_cel_rules(
     }
 
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-        let Some(map) = obj.as_object() else {
-            return Ok(());
-        };
-        for (key, sub_schema) in props {
-            if let Some(child) = map.get(key) {
-                let child_old = old_node.and_then(|o| o.get(key));
-                validate_cel_rules(
-                    sub_schema,
-                    child,
-                    child_old,
-                    &join_cr_field_path(field_path, key),
-                )?;
+        if let Some(map) = obj.as_object() {
+            for (key, sub_schema) in props {
+                if let Some(child) = map.get(key) {
+                    let child_old = old_node.and_then(|o| o.get(key));
+                    validate_cel_rules(
+                        sub_schema,
+                        child,
+                        child_old,
+                        &join_cr_field_path(field_path, key),
+                    )?;
+                }
             }
         }
-        return Ok(());
+    } else if let Some(items_schema) = schema.get("items") {
+        if let Some(arr) = obj.as_array() {
+            for (i, item) in arr.iter().enumerate() {
+                let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
+                validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+            }
+        }
     }
-    if let Some(items_schema) = schema.get("items") {
-        let Some(arr) = obj.as_array() else {
-            return Ok(());
-        };
-        for (i, item) in arr.iter().enumerate() {
-            let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
-            validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+
+    // `allOf` branches must all hold simultaneously, so every branch's rules apply
+    // unconditionally. `oneOf`/`anyOf` branches are alternatives — boon has already
+    // confirmed `obj` satisfies the combinator as a whole (exactly one branch for
+    // `oneOf`, at least one for `anyOf`) by the time this runs, so only the branch(es)
+    // `obj` actually conforms to are evaluated; running a rule against a branch it
+    // doesn't match would misfire on fields the branch assumes exist but don't (e.g. a
+    // "no such key" CEL error), not produce a meaningful pass/fail.
+    if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for branch in branches {
+            validate_cel_rules(branch, obj, old_node, field_path)?;
+        }
+    }
+    for combinator in ["oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
+            for branch in branches {
+                if schema_branch_structurally_matches(branch, obj) {
+                    validate_cel_rules(branch, obj, old_node, field_path)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Best-effort check for whether `obj` conforms to `branch`, used to pick which
+/// `oneOf`/`anyOf` branch(es) a CEL rule should evaluate against. This deliberately
+/// does not re-implement full JSON Schema validation — boon already did that for the
+/// whole document before `validate_cel_rules` ever runs — it only checks the
+/// constraints real CRDs use to discriminate between branches (`type`, `required`,
+/// `enum`), e.g. cert-manager's Issuer backend union or Gateway API's filter-type union.
+fn schema_branch_structurally_matches(branch: &serde_json::Value, obj: &serde_json::Value) -> bool {
+    if let Some(want_type) = branch.get("type").and_then(|v| v.as_str()) {
+        let matches = match want_type {
+            "object" => obj.is_object(),
+            "array" => obj.is_array(),
+            "string" => obj.is_string(),
+            "boolean" => obj.is_boolean(),
+            "integer" => obj.is_i64() || obj.is_u64(),
+            "number" => obj.is_number(),
+            "null" => obj.is_null(),
+            _ => true,
+        };
+        if !matches {
+            return false;
+        }
+    }
+    if let Some(required) = branch.get("required").and_then(|v| v.as_array()) {
+        let Some(map) = obj.as_object() else {
+            return false;
+        };
+        let all_present = required
+            .iter()
+            .all(|k| k.as_str().is_some_and(|k| map.contains_key(k)));
+        if !all_present {
+            return false;
+        }
+    }
+    if let Some(allowed) = branch.get("enum").and_then(|v| v.as_array()) {
+        if !allowed.contains(obj) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
@@ -8550,6 +8611,106 @@ mod tests {
             err.1.message.contains("does not compile"),
             "malformed CEL must reject the CR with a compile-error message, not silently \
              accept it (got: {})",
+            err.1.message
+        );
+    }
+
+    // Before this fix, validate_cel_rules only recursed via `properties`/`items`, so a
+    // rule reachable only through a `oneOf` branch never fired — a CR that violated it
+    // was silently accepted. Modeled on cert-manager Issuer's real-world pattern of
+    // using `oneOf` to discriminate between backend types (tpp vs cloud), with the CEL
+    // rule nested one level further inside the matching branch (`oneOf` itself nested
+    // under `properties.spec`, not at the schema root).
+    #[test]
+    fn cel_rule_under_oneof_branch_is_evaluated_instead_of_silently_skipped() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "oneOf": [
+                        {
+                            "required": ["tpp"],
+                            "properties": {
+                                "tpp": {
+                                    "type": "object",
+                                    "properties": { "url": { "type": "string" } },
+                                    "x-kubernetes-validations": [{
+                                        "rule": "self.url.startsWith('https://')",
+                                        "message": "tpp.url must use https"
+                                    }]
+                                }
+                            }
+                        },
+                        {
+                            "required": ["cloud"],
+                            "properties": { "cloud": { "type": "object" } }
+                        }
+                    ]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "tpp": { "url": "https://secure.example" } } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "an https tpp.url must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "tpp": { "url": "http://insecure.example" } } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.message.contains("tpp.url must use https"),
+            "a rule nested under a oneOf branch must be evaluated and reject a violating \
+             CR — before this fix it was never reached, so this body was silently \
+             accepted (got: {})",
+            err.1.message
+        );
+    }
+
+    // `allOf` branches all apply simultaneously (unlike `oneOf`'s pick-one semantics),
+    // so a rule on any `allOf` branch must fire unconditionally.
+    #[test]
+    fn cel_rule_under_allof_branch_is_evaluated_unconditionally() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "allOf": [
+                        {
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "x-kubernetes-validations": [{
+                                        "rule": "self.size() > 0",
+                                        "message": "name must not be empty"
+                                    }]
+                                }
+                            }
+                        }
+                    ],
+                    "properties": { "name": { "type": "string" } }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "name": "widget" } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "a non-empty name must be accepted"
+        );
+        let err = check_schema(&serde_json::json!({ "spec": { "name": "" } }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("name must not be empty"),
+            "a rule nested under an allOf branch must be evaluated and reject a \
+             violating CR (got: {})",
             err.1.message
         );
     }
