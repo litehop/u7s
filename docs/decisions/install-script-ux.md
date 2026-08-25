@@ -14,8 +14,8 @@ concrete shape of the script's own interface.
 
 ## Decision
 
-The install script is invoked as a single `curl | sh`-style command
-(`curl -sfL <install-script-url> | sh -`). With zero arguments it bootstraps
+The install script is invoked as a single `curl | bash`-style command
+(`curl -sfL <install-script-url> | bash`). With zero arguments it bootstraps
 a single-node cluster: node name defaults to the hostname, and the cluster
 network interface defaults to the first non-loopback interface.
 
