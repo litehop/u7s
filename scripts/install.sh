@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+# Reject non-bash invocation (e.g. `sh install.sh`, where Ubuntu's /bin/sh is
+# dash) before anything else runs: dash doesn't support `set -o pipefail`
+# below and dies with "Illegal option -o pipefail" mid-script, well before
+# fetch_tarball's checksum verification -- a confusing crash instead of a
+# clear error. This check is plain POSIX so dash can parse it far enough to
+# print the message and exit.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf 'install.sh requires bash (not sh/dash). Re-run with: sudo bash install.sh %s\n' "$*" >&2
+  exit 1
+fi
+
 # u7s host-level install bootstrap.
 #
 # Takes a fresh Ubuntu LTS box to a running control plane + kubelet: installs

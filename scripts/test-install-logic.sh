@@ -335,6 +335,31 @@ assert_false "(regression guard) kube-proxy's kubeconfig no longer points at the
 assert_true "kube-proxy's kubeconfig points at the real advertised apiserver address (\$IFACE_IP:6443), reachable without depending on kube-proxy's own DNAT rules" \
   grep -qF 'server: https://$IFACE_IP:6443' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# Regression guard: mayor-biirm. `sh install.sh` on Ubuntu (where /bin/sh is
+# dash) used to die on the `set -euo pipefail` line with a bare "Illegal
+# option -o pipefail", exit 2, before ever reaching fetch_tarball's checksum
+# verification -- undermining the "always require a passing checksum" policy
+# on the exact invocation deploy/get-u7s/README.md documents. The guard must
+# sit before that `set` line so dash lives long enough to print it.
+# ---------------------------------------------------------------------------
+bash_version_line="$(grep -n 'BASH_VERSION' "$INSTALL" | head -n1 | cut -d: -f1)"
+pipefail_line="$(grep -n '^set -euo pipefail' "$INSTALL" | head -n1 | cut -d: -f1)"
+assert "the bash-required guard appears before the 'set -euo pipefail' line dash cannot parse, so dash survives long enough to print it instead of dying first" \
+  "$([ -n "$bash_version_line" ] && [ -n "$pipefail_line" ] && [ "$bash_version_line" -lt "$pipefail_line" ] && echo 1 || echo 0)"
+
+if command -v dash >/dev/null 2>&1; then
+  dash_out="$(dash "$INSTALL" --help 2>&1)" && dash_status=0 || dash_status=$?
+  assert "running install.sh under dash (Ubuntu's /bin/sh) exits non-zero with a clear bash-required message, instead of dash's bare 'Illegal option -o pipefail' parse crash" \
+    "$([ "$dash_status" -ne 0 ] && printf '%s' "$dash_out" | grep -qi 'requires bash' && echo 1 || echo 0)"
+else
+  echo "SKIP: dash not installed on this runner -- cannot exercise the dash-rejection path directly"
+fi
+
+bash_out="$(bash "$INSTALL" --help 2>&1)" && bash_status=0 || bash_status=$?
+assert "running install.sh under bash (a real invocation) is unaffected by the guard and proceeds past it" \
+  "$([ "$bash_status" -eq 0 ] && printf '%s' "$bash_out" | grep -q '^Usage:' && echo 1 || echo 0)"
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
