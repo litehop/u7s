@@ -746,12 +746,17 @@ fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::st
 
 /// Validate `obj` against the CRD schema in `ctx`, if a schema is present.
 /// Uses boon for full openAPIV3Schema keyword coverage (enum, pattern, minimum,
-/// maximum, format, items, oneOf, allOf, etc.).
+/// maximum, format, items, oneOf, allOf, etc.), then evaluates any
+/// `x-kubernetes-validations` CEL rules the schema declares.
+///
+/// `old_object` is the previously-stored object on UPDATE (for binding `oldSelf` in CEL
+/// rules), or `None` on CREATE — upstream only makes `oldSelf` available on UPDATE.
 /// Returns `Err(StatusError)` with HTTP 422 if validation fails.
 fn validate_cr_schema(
     obj: &serde_json::Value,
     ctx: &CrContext,
     cache: &crate::state::CrSchemaCache,
+    old_object: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
     let Some(schema) = &ctx.schema else {
         return Ok(());
@@ -780,14 +785,201 @@ fn validate_cr_schema(
         }
     };
 
-    compiled.schemas.validate(obj, compiled.index).map_err(|e| {
+    compiled
+        .schemas
+        .validate(obj, compiled.index)
+        .map_err(|e| {
+            Status::unprocessable_entity(format!(
+                "CR schema validation failed: {}",
+                enum_violation_message(&e, obj)
+                    .or_else(|| required_violation_message(&e))
+                    .unwrap_or_else(|| e.to_string())
+            ))
+        })?;
+
+    // Only run CEL rules once the object is already structurally valid — evaluating a
+    // rule like `self.foo > 0` against a body that doesn't even have `foo` typed as a
+    // number yet produces confusing CEL runtime errors instead of the clearer boon
+    // "wrong type" error above.
+    validate_cel_rules(schema, obj, old_object, "")
+}
+
+/// Recursively evaluate `x-kubernetes-validations` CEL rules declared anywhere in
+/// `schema`, walking `obj` (and `old_node`, when present) in lockstep with the schema
+/// shape — mirrors `apply_crd_schema_defaults`'s recursion (`properties` for objects,
+/// `items` for arrays) rather than `walk_schema_dos_bounds`'s schema-only walk, because
+/// a CEL rule's `self`/`oldSelf` bindings need the *data* at each schema node, not just
+/// the schema node itself.
+///
+/// A rule under a property that is absent from `obj` is not evaluated — matches
+/// upstream: `self` must exist for a rule to run at all.
+fn validate_cel_rules(
+    schema: &serde_json::Value,
+    obj: &serde_json::Value,
+    old_node: Option<&serde_json::Value>,
+    field_path: &str,
+) -> Result<(), crate::status::StatusError> {
+    if let Some(rules) = schema
+        .get("x-kubernetes-validations")
+        .and_then(|v| v.as_array())
+    {
+        for rule in rules {
+            evaluate_cel_rule(rule, obj, old_node, field_path)?;
+        }
+    }
+
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        let Some(map) = obj.as_object() else {
+            return Ok(());
+        };
+        for (key, sub_schema) in props {
+            if let Some(child) = map.get(key) {
+                let child_old = old_node.and_then(|o| o.get(key));
+                validate_cel_rules(
+                    sub_schema,
+                    child,
+                    child_old,
+                    &join_cr_field_path(field_path, key),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    if let Some(items_schema) = schema.get("items") {
+        let Some(arr) = obj.as_array() else {
+            return Ok(());
+        };
+        for (i, item) in arr.iter().enumerate() {
+            let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
+            validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
+/// messageExpression, reason, fieldPath, optionalOldSelf}`, per the CRD-storage
+/// round-trip in `apiextensions_gen_adapter.rs`) against `self_value`, optionally
+/// binding `oldSelf` to `old_self_value`.
+fn evaluate_cel_rule(
+    rule: &serde_json::Value,
+    self_value: &serde_json::Value,
+    old_self_value: Option<&serde_json::Value>,
+    field_path: &str,
+) -> Result<(), crate::status::StatusError> {
+    let Some(rule_text) = rule.get("rule").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+
+    let program = cel::Program::compile(rule_text).map_err(|e| {
         Status::unprocessable_entity(format!(
-            "CR schema validation failed: {}",
-            enum_violation_message(&e, obj)
-                .or_else(|| required_violation_message(&e))
-                .unwrap_or_else(|| e.to_string())
+            "{field_path}: x-kubernetes-validations rule does not compile: {e} (rule: {rule_text})"
         ))
-    })
+    })?;
+
+    let mut cel_ctx = cel::Context::default();
+    cel_ctx
+        .add_variable("self", self_value)
+        .map_err(|e| Status::internal(format!("CEL: failed to bind self: {e}")))?;
+    if let Some(old) = old_self_value {
+        cel_ctx
+            .add_variable("oldSelf", old)
+            .map_err(|e| Status::internal(format!("CEL: failed to bind oldSelf: {e}")))?;
+    }
+
+    let result = match program.execute(&cel_ctx) {
+        Ok(v) => v,
+        // `oldSelf` is only meaningful on UPDATE, when the field being validated also
+        // existed in the previous object — upstream skips (does not fail) a rule that
+        // references `oldSelf` in every other case, e.g. CREATE, or a newly-added field.
+        // We don't bind `oldSelf` in those cases, so the interpreter reports it as an
+        // undeclared reference; that specific error means "not applicable here", not
+        // "the rule failed".
+        Err(cel::ExecutionError::UndeclaredReference(ref name))
+            if old_self_value.is_none() && name.as_str() == "oldSelf" =>
+        {
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(Status::unprocessable_entity(format!(
+                "{field_path}: x-kubernetes-validations rule failed to evaluate: {e} (rule: {rule_text})"
+            )));
+        }
+    };
+
+    let passed = match result {
+        cel::Value::Bool(b) => b,
+        other => {
+            return Err(Status::unprocessable_entity(format!(
+                "{field_path}: x-kubernetes-validations rule must evaluate to a bool \
+                 (rule: {rule_text}, got: {other:?})"
+            )));
+        }
+    };
+    if passed {
+        return Ok(());
+    }
+
+    let detail = cel_rule_failure_detail(rule, rule_text, self_value, old_self_value);
+    let value_prefix = match self_value {
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => String::new(),
+        other => format!("\"{}\": ", json_value_as_display_string(other)),
+    };
+    Err(Status::unprocessable_entity(format!(
+        "{field_path}: Invalid value: {value_prefix}{detail}"
+    )))
+}
+
+/// The message to report for a failed CEL rule: the CRD-declared `message`, or the
+/// result of evaluating `messageExpression` if that's what the CRD author supplied
+/// instead, or `"failed rule: <rule>"` as upstream's own default
+/// (`ruleMessageOrDefault` in apiextensions-apiserver's cel/validation.go).
+fn cel_rule_failure_detail(
+    rule: &serde_json::Value,
+    rule_text: &str,
+    self_value: &serde_json::Value,
+    old_self_value: Option<&serde_json::Value>,
+) -> String {
+    if let Some(msg) = rule
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return msg.to_string();
+    }
+    if let Some(expr) = rule.get("messageExpression").and_then(|v| v.as_str()) {
+        if let Some(rendered) = evaluate_message_expression(expr, self_value, old_self_value) {
+            return rendered;
+        }
+    }
+    format!("failed rule: {rule_text}")
+}
+
+/// Evaluates a `messageExpression` CEL string against the same `self`/`oldSelf`
+/// bindings as the rule it belongs to. Returns `None` (falling back to the CRD's
+/// `message` or the default "failed rule: ..." text) on any compile/runtime error, or
+/// if the result isn't a non-empty single-line string — matches upstream's requirement
+/// that a `messageExpression` "should evaluate to a non-empty string" with "no line
+/// breaks".
+fn evaluate_message_expression(
+    expr: &str,
+    self_value: &serde_json::Value,
+    old_self_value: Option<&serde_json::Value>,
+) -> Option<String> {
+    let program = cel::Program::compile(expr).ok()?;
+    let mut cel_ctx = cel::Context::default();
+    cel_ctx.add_variable("self", self_value).ok()?;
+    if let Some(old) = old_self_value {
+        cel_ctx.add_variable("oldSelf", old).ok()?;
+    }
+    match program.execute(&cel_ctx).ok()? {
+        cel::Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty() && !s.contains('\n')).then(|| s.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Depth-first search for an `enum` keyword violation in a boon validation-error tree,
@@ -1598,7 +1790,7 @@ pub async fn create_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
 
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
@@ -1697,7 +1889,7 @@ pub async fn replace_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -2419,7 +2611,7 @@ pub async fn create_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
 
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -2540,7 +2732,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
 
     let admission_ctx = AdmissionContext {
         group: &group,
@@ -2861,7 +3053,7 @@ pub async fn patch_cr<S: Store>(
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
         let admission_ctx = AdmissionContext {
             group: &group,
             version: &version,
@@ -2957,7 +3149,7 @@ pub async fn patch_cr<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
 
     // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
     // controller completes an Orphan-marked delete_cr: it strips ownerReferences from every
@@ -3068,7 +3260,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         if let Some(schema) = ctx.schema.as_ref() {
             apply_crd_schema_defaults(schema, &mut obj);
         }
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, None)?;
         let admission_ctx = AdmissionContext {
             group: &group,
             version: &version,
@@ -3179,7 +3371,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         apply_crd_schema_defaults(schema, &mut obj);
     }
 
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache)?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
 
     // A patch whose body has deletionTimestamp set and finalizers now empty is how KCM's GC
     // controller completes an Orphan-marked delete_cr_namespaced: it strips ownerReferences
@@ -6988,10 +7180,21 @@ mod tests {
     // openAPIV3Schema validation tests (boon-based)
     // ---------------------------------------------------------------------------
 
-    /// Helper: call validate_cr_schema with an inline schema value.
+    /// Helper: call validate_cr_schema with an inline schema value, as a CREATE (no
+    /// previous object — `oldSelf` is unavailable, same as every real CREATE request).
     fn check_schema(
         obj: &serde_json::Value,
         schema: serde_json::Value,
+    ) -> Result<(), crate::status::StatusError> {
+        check_schema_with_old(obj, schema, None)
+    }
+
+    /// Helper: call validate_cr_schema with an inline schema value and an optional
+    /// previous object, for tests that exercise `oldSelf` (UPDATE-only CEL rules).
+    fn check_schema_with_old(
+        obj: &serde_json::Value,
+        schema: serde_json::Value,
+        old_object: Option<&serde_json::Value>,
     ) -> Result<(), crate::status::StatusError> {
         let ctx = CrContext {
             kind: "Test".into(),
@@ -7007,7 +7210,7 @@ mod tests {
         // every call here uses the same fixed schema_cache_key — sharing one cache across
         // calls with different schemas would return the wrong compiled schema.
         let cache = crate::state::CrSchemaCache::new();
-        validate_cr_schema(obj, &ctx, &cache)
+        validate_cr_schema(obj, &ctx, &cache, old_object)
     }
 
     // type:object with valid object passes.
@@ -7144,11 +7347,11 @@ mod tests {
         let value = serde_json::json!({ "spec": {} });
 
         assert!(
-            validate_cr_schema(&value, &ctx, &cache).is_ok(),
+            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
             "first write must validate"
         );
         assert!(
-            validate_cr_schema(&value, &ctx, &cache).is_ok(),
+            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
             "second write must validate"
         );
 
@@ -7184,8 +7387,8 @@ mod tests {
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });
 
-        assert!(validate_cr_schema(&value, &make_ctx("1"), &cache).is_ok());
-        assert!(validate_cr_schema(&value, &make_ctx("2"), &cache).is_ok());
+        assert!(validate_cr_schema(&value, &make_ctx("1"), &cache, None).is_ok());
+        assert!(validate_cr_schema(&value, &make_ctx("2"), &cache, None).is_ok());
 
         assert_eq!(
             cache.compile_count(),
@@ -7256,6 +7459,7 @@ mod tests {
             &serde_json::json!({ "spec": {} }),
             &ctx,
             &state.cr_schema_cache,
+            None,
         )
         .expect("CR body must validate against the installed schema");
         assert!(
@@ -7411,6 +7615,350 @@ mod tests {
         assert!(
             check_schema(&value, schema).is_err(),
             "pattern violation must be rejected by boon"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // x-kubernetes-validations (CEL) tests
+    //
+    // Before this bead, boon-only structural validation meant x-kubernetes-validations
+    // rules were stored and round-tripped but never evaluated: a CR that violated every
+    // CEL rule its CRD declared was still accepted. Fixtures below are drawn from the
+    // real-world CEL surface the mayor-fbxcy audit sampled (Gateway API, cert-manager,
+    // prometheus-operator) to check the crate actually covers what production CRDs use.
+    // ---------------------------------------------------------------------------
+
+    // Real fixture: cert-manager's ClusterIssuer requires exactly one of tpp/cloud/ngts
+    // to be set, via has()+ternary+arithmetic. A CR that honors this must not be
+    // rejected — otherwise wiring CEL enforcement would break every valid ClusterIssuer.
+    fn cluster_issuer_style_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "(has(self.tpp) ? 1 : 0) + (has(self.cloud) ? 1 : 0) + (has(self.ngts) ? 1 : 0) == 1",
+                        "message": "exactly one of tpp, cloud, or ngts must be set"
+                    }],
+                    "properties": {
+                        "tpp": { "type": "object" },
+                        "cloud": { "type": "object" },
+                        "ngts": { "type": "object" }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn cel_has_macro_accepts_cr_with_exactly_one_alternative_set() {
+        let value = serde_json::json!({ "spec": { "cloud": {} } });
+        assert!(
+            check_schema(&value, cluster_issuer_style_schema()).is_ok(),
+            "a CR that sets exactly one issuer backend must pass the has()-based rule — a \
+             false positive here would reject every valid ClusterIssuer once CEL is enforced"
+        );
+    }
+
+    // Setting zero alternatives must be rejected, and the client must see the CRD
+    // author's own message (not a generic CEL error) — kubectl surfaces this message
+    // verbatim to the operator who wrote the bad manifest.
+    #[test]
+    fn cel_has_macro_rejects_cr_with_no_alternative_set_and_reports_crd_message() {
+        let value = serde_json::json!({ "spec": {} });
+        let err = check_schema(&value, cluster_issuer_style_schema()).unwrap_err();
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "a CEL rule violation must be a 422 Unprocessable Entity, matching the boon \
+             structural-validation failures this file already reports"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("exactly one of tpp, cloud, or ngts must be set"),
+            "the CRD author's declared `message` must reach the client verbatim, not a \
+             generic CEL evaluation error (got: {json})"
+        );
+    }
+
+    // Setting more than one alternative must also be rejected — the arithmetic sum
+    // exceeds 1, not just falls short of it.
+    #[test]
+    fn cel_has_macro_rejects_cr_with_two_alternatives_set() {
+        let value = serde_json::json!({ "spec": { "cloud": {}, "ngts": {} } });
+        assert!(
+            check_schema(&value, cluster_issuer_style_schema()).is_err(),
+            "setting two issuer backends at once must be rejected, same as upstream \
+             kube-apiserver would reject it"
+        );
+    }
+
+    // self == oldSelf is the standard CEL immutability idiom (used extensively by e.g.
+    // Crossplane's CompositeResourceDefinition). On UPDATE, a changed value must be
+    // rejected — without oldSelf wired up, u7s would silently accept any change to a
+    // field the CRD author declared immutable.
+    fn immutable_field_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "immutableField": {
+                            "type": "string",
+                            "x-kubernetes-validations": [{
+                                "rule": "self == oldSelf",
+                                "message": "immutableField is immutable"
+                            }]
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn cel_old_self_immutability_rule_rejects_update_that_changes_the_field() {
+        let old = serde_json::json!({ "spec": { "immutableField": "a" } });
+        let new = serde_json::json!({ "spec": { "immutableField": "b" } });
+        let err = check_schema_with_old(&new, immutable_field_schema(), Some(&old)).unwrap_err();
+        let msg = &err.1.message;
+        assert!(
+            msg.contains("immutableField is immutable"),
+            "changing an immutable field on UPDATE must be rejected with the CRD's own \
+             message (got: {msg})"
+        );
+    }
+
+    // On CREATE there is no old object to compare against — upstream skips (does not
+    // fail) a rule that references oldSelf in this case, since "immutable" only has
+    // meaning relative to a previous value. If u7s instead errored (or worse, always
+    // passed a null oldSelf), CREATE would behave differently from real kube-apiserver.
+    #[test]
+    fn cel_old_self_referencing_rule_is_skipped_on_create_since_there_is_no_old_object() {
+        let new = serde_json::json!({ "spec": { "immutableField": "b" } });
+        assert!(
+            check_schema(&new, immutable_field_schema()).is_ok(),
+            "a rule that references oldSelf must be skipped (not evaluated, not failed) \
+             on CREATE, matching upstream's UPDATE-only oldSelf semantics"
+        );
+    }
+
+    // .all(): every element of a list must satisfy the predicate. Real CRDs use this for
+    // per-element cross-field checks (e.g. Gateway API's listener validation); this
+    // isolates the macro itself with a minimal predicate.
+    #[test]
+    fn cel_all_macro_rejects_cr_with_one_bad_element_so_operator_gets_specific_message() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "counts": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "x-kubernetes-validations": [{
+                        "rule": "self.all(x, x > 0)",
+                        "message": "all counts must be positive"
+                    }]
+                }
+            }
+        });
+        let value = serde_json::json!({ "counts": [1, 2, -1] });
+        let err = check_schema(&value, schema).unwrap_err();
+        assert!(
+            err.1.message.contains("all counts must be positive"),
+            "a single negative element must fail the all() rule with the CRD's message \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // .exists_one(): exactly one element must satisfy the predicate — used by e.g.
+    // HTTPRoute/Gateway for cross-element uniqueness checks (L328-330, L133-139 in the
+    // audit). Two matching elements must fail just as surely as zero.
+    #[test]
+    fn cel_exists_one_macro_rejects_list_with_two_matching_elements() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "x-kubernetes-validations": [{
+                        "rule": "self.exists_one(x, x == 1)",
+                        "message": "exactly one id must equal 1"
+                    }]
+                }
+            }
+        });
+        assert!(
+            check_schema(&serde_json::json!({ "ids": [1, 2, 3] }), schema.clone()).is_ok(),
+            "exactly one matching element must pass exists_one()"
+        );
+        assert!(
+            check_schema(&serde_json::json!({ "ids": [1, 1, 3] }), schema).is_err(),
+            "two matching elements must fail exists_one() — it means \"exactly one\", not \
+             \"at least one\""
+        );
+    }
+
+    // .filter(): real fixture from prometheus-operator's ScrapeConfig (audit L12826-12827)
+    // — at most one of several optional auth methods may be configured. This exercises
+    // filter() together with has() and size(), the exact combination the real rule uses.
+    #[test]
+    fn cel_filter_macro_rejects_cr_with_more_than_one_optional_auth_method_set() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "[has(self.basicAuth), has(self.authorization), has(self.oauth2)]\
+                                 .filter(x, x).size() <= 1",
+                        "message": "at most one auth method may be configured"
+                    }],
+                    "properties": {
+                        "basicAuth": { "type": "object" },
+                        "authorization": { "type": "object" },
+                        "oauth2": { "type": "object" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "basicAuth": {} } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "a single configured auth method must pass the filter()-based rule"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "basicAuth": {}, "oauth2": {} } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("at most one auth method may be configured"),
+            "configuring two auth methods at once must be rejected with the CRD's message \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // size(): CRD authors use this to forbid blank strings that a JSON-Schema `pattern`
+    // alone can't express cleanly (HTTPRoute audit L995 uses size() the same way).
+    #[test]
+    fn cel_size_function_rejects_empty_string_field() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "x-kubernetes-validations": [{
+                        "rule": "size(self) > 0",
+                        "message": "name must not be empty"
+                    }]
+                }
+            }
+        });
+        assert!(check_schema(&serde_json::json!({ "name": "widget" }), schema.clone()).is_ok());
+        let err = check_schema(&serde_json::json!({ "name": "" }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("name must not be empty"),
+            "an empty string must fail the size() rule (got: {})",
+            err.1.message
+        );
+    }
+
+    // .matches(): regex checks CRD authors express in CEL rather than JSON-Schema
+    // `pattern` when the constraint depends on other fields (HTTPRoute audit L3003-3006).
+    #[test]
+    fn cel_matches_function_rejects_string_not_matching_regex() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.matches('^[a-z]+$')",
+                        "message": "slug must be lowercase letters only"
+                    }]
+                }
+            }
+        });
+        assert!(check_schema(&serde_json::json!({ "slug": "widget" }), schema.clone()).is_ok());
+        let err = check_schema(&serde_json::json!({ "slug": "Widget1" }), schema).unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("slug must be lowercase letters only"),
+            "an uppercase/digit slug must fail the matches() rule (got: {})",
+            err.1.message
+        );
+    }
+
+    // duration(): HTTPRoute (audit L3145-3146) compares two duration-typed fields to
+    // enforce that a per-attempt timeout doesn't exceed the overall request timeout.
+    #[test]
+    fn cel_duration_function_rejects_backend_request_timeout_exceeding_overall_timeout() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "duration(self.backendRequest) <= duration(self.request)",
+                        "message": "backendRequest timeout must not exceed request timeout"
+                    }],
+                    "properties": {
+                        "request": { "type": "string" },
+                        "backendRequest": { "type": "string" }
+                    }
+                }
+            }
+        });
+        let ok = serde_json::json!({ "spec": { "request": "30s", "backendRequest": "10s" } });
+        assert!(check_schema(&ok, schema.clone()).is_ok());
+        let bad = serde_json::json!({ "spec": { "request": "10s", "backendRequest": "30s" } });
+        let err = check_schema(&bad, schema).unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("backendRequest timeout must not exceed request timeout"),
+            "a backendRequest timeout longer than the overall request timeout must be \
+             rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // `in`: CRDs enumerate allowed values via `self in [...]` when a plain JSON-Schema
+    // `enum` isn't expressive enough (e.g. combined with other conditions) — HTTPRoute
+    // audit L3003-3006 uses this pattern.
+    #[test]
+    fn cel_in_operator_rejects_value_outside_allowed_list() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "protocol": {
+                    "type": "string",
+                    "x-kubernetes-validations": [{
+                        "rule": "self in ['HTTP', 'HTTPS']",
+                        "message": "protocol must be HTTP or HTTPS"
+                    }]
+                }
+            }
+        });
+        assert!(check_schema(&serde_json::json!({ "protocol": "HTTP" }), schema.clone()).is_ok());
+        let err = check_schema(&serde_json::json!({ "protocol": "FTP" }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("protocol must be HTTP or HTTPS"),
+            "a protocol outside the allowed list must be rejected (got: {})",
+            err.1.message
         );
     }
 
@@ -7773,6 +8321,134 @@ mod tests {
             "second CR must be denied once count/applications.argoproj.io=1 is already \
              claimed — without ResourceQuota admission wired into create_cr_namespaced, \
              CR creation is never checked against quota at all"
+        );
+    }
+
+    // validate_cr_schema's `old_object` parameter is threaded by hand through 8 call
+    // sites across create/replace/patch handlers; a single site accidentally left as
+    // `None` would silently disable oldSelf immutability checks for that verb only. This
+    // exercises the full replace_cr handler (not just validate_cr_schema directly) so a
+    // regression in the *wiring*, not just the CEL evaluation logic, would be caught.
+    #[tokio::test]
+    async fn replace_cr_end_to_end_enforces_immutability_cel_rule_from_installed_crd() {
+        let state = make_state();
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": {
+                                        "type": "object",
+                                        "properties": {
+                                            "color": {
+                                                "type": "string",
+                                                "x-kubernetes-validations": [{
+                                                    "rule": "self == oldSelf",
+                                                    "message": "color is immutable"
+                                                }]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD with immutability CEL rule"
+        );
+
+        let name = "my-widget".to_string();
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "example.io/v1",
+                        "kind": "Widget",
+                        "metadata": { "name": &name },
+                        "spec": { "color": "blue" }
+                    })
+                    .to_string()
+                ),
+            )
+            .await
+            .is_ok(),
+            "create with an initial color must succeed (no oldSelf on CREATE)"
+        );
+
+        let err = expect_err_status(
+            replace_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    name.clone(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "example.io/v1",
+                        "kind": "Widget",
+                        "metadata": { "name": &name },
+                        "spec": { "color": "red" }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            "changing an immutable field through the real replace_cr handler must be \
+             rejected — a wiring bug (e.g. old_object left as None) would instead let \
+             this update through",
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the rejection must be a 422 Unprocessable Entity, matching the boon \
+             structural-validation failures this file already reports"
+        );
+        assert!(
+            err.1.message.contains("color is immutable"),
+            "the rejection must carry the CRD's own message (got: {})",
+            err.1.message
         );
     }
 
