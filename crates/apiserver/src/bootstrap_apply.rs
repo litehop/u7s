@@ -263,7 +263,7 @@ fn extract_doc_meta(doc: &str) -> anyhow::Result<DocMeta> {
 
 /// Maps a bootstrap manifest's `kind` to its REST resource plural + whether it's namespaced.
 ///
-/// Deliberately a fixed, small table (the exact Kinds `mayor-1pwxi`'s RBAC role grants:
+/// Deliberately a fixed, small table (the exact Kinds `system:bootstrap-installer`'s RBAC role grants:
 /// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, DaemonSet, Service)
 /// rather than a general kind-pluralization scheme — this applier is bootstrap-only, not a
 /// generic "apply any manifest" client, so an unknown Kind is a configuration error worth
@@ -1024,6 +1024,77 @@ mod tests {
                  before it lexicographically — the extension filter must skip non-YAML files, \
                  not accidentally skip real manifests too",
             );
+    }
+
+    /// An uppercase `.YAML`/`.YML` extension must be accepted, not silently skipped — the
+    /// extension filter's case-insensitivity is only real if a test actually exercises a
+    /// non-lowercase extension; without this, reverting the `.to_ascii_lowercase()` call in the
+    /// walker would still pass every other test in this suite.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_treats_uppercase_yaml_extension_same_as_lowercase_because_operator_case_shouldnt_break_boot(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("uppercase-ext");
+        std::fs::write(
+            dir.join("00-test.YAML"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: uppercase-ext-test\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-test.YAML");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect("a file with an uppercase .YAML extension must be applied, not skipped");
+
+        let key = crate::keys::object_key("configmaps", "kube-system", "uppercase-ext-test");
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "00-test.YAML must be applied even though its extension is uppercase — the \
+                 filter's case-insensitivity claim is only real if a test actually exercises a \
+                 non-lowercase extension",
+            );
+    }
+
+    /// A DaemonSet manifest applied through the well-known-folder mechanism must actually
+    /// install, not just resolve a REST path — `kind_to_resource` knowing about "daemonsets" is
+    /// useless if `system:bootstrap-installer`'s RBAC role doesn't grant that resource, since the
+    /// PATCH would 403 and, per this applier's fail-fast semantics, still fatal-boot the
+    /// apiserver. This is the exact bug kube-proxy/Flannel's future well-known-folder migration
+    /// would hit if the RBAC grant regressed.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_applies_daemonset_because_bootstrap_installer_rbac_grants_it(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("daemonset");
+        std::fs::write(
+            dir.join("00-daemonset.yaml"),
+            "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: bootstrap-apply-daemonset-test\n  namespace: kube-system\nspec:\n  selector:\n    matchLabels:\n      app: bootstrap-apply-daemonset-test\n  template:\n    metadata:\n      labels:\n        app: bootstrap-apply-daemonset-test\n    spec:\n      containers:\n      - name: c\n        image: nginx\n",
+        )
+        .expect("write 00-daemonset.yaml");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect(
+                "a DaemonSet manifest must apply successfully -- kind_to_resource resolving \
+                 \"daemonsets\" is not enough if the bootstrap-installer RBAC role doesn't also \
+                 grant that resource, since the PATCH would then 403 and fatal-boot the apiserver",
+            );
+
+        let key = crate::keys::group_object_key(
+            "apps",
+            "daemonsets",
+            Some("kube-system"),
+            "bootstrap-apply-daemonset-test",
+        );
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect("the DaemonSet must exist in the store after apply_well_known_manifest_dir");
     }
 
     // -----------------------------------------------------------------------

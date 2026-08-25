@@ -1497,7 +1497,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update"] },
             { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services"], "verbs": ["get","create","patch","update"] },
-            { "apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get","create","patch","update"] }
+            { "apiGroups": ["apps"], "resources": ["deployments","daemonsets"], "verbs": ["get","create","patch","update"] }
         ]
     });
     put!(key, body, "system:bootstrap-installer", "ClusterRole");
