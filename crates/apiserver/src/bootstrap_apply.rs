@@ -93,7 +93,9 @@ async fn apply_yaml_bundle_inner(kubeconfig_path: &Path, yaml_bytes: &[u8]) -> a
 /// Server-side-apply every manifest file directly inside `dir`, in lexicographic filename
 /// order — deterministic, and lets a later file override fields an earlier one set on the same
 /// object (the well-known-folder equivalent of applying [`COREDNS_MANIFEST`] first). Entries
-/// that are themselves directories are skipped, not recursed into.
+/// that are themselves directories, or whose extension isn't `.yaml`/`.yml` (case-insensitive),
+/// are skipped, not applied — a `.DS_Store`, editor swap file, or stray `README.md` an operator
+/// drops into this folder is not a Kubernetes resource and must not fatal-fail boot.
 ///
 /// A missing `dir` is treated as an empty one — logged at info level, nothing applied — since an
 /// operator using an alternate `--manifest-output-dir` legitimately leaves this well-known
@@ -131,6 +133,13 @@ pub async fn apply_well_known_manifest_dir(
         })?;
         let path = entry.path();
         if path.is_dir() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase);
+        if !matches!(ext.as_deref(), Some("yaml") | Some("yml")) {
             continue;
         }
         paths.push(path);
@@ -957,6 +966,45 @@ mod tests {
                 "00-good.yaml sorts before 01-bad.yaml, so it must already be applied by the \
                  time the scan reaches the malformed file -- this is what proves files are \
                  applied in lexicographic filename order, not e.g. directory-listing order",
+            );
+    }
+
+    /// A non-YAML file (e.g. a `.DS_Store` an operator's Finder drops, or a stray `README.md`)
+    /// sitting alongside a genuine manifest must be skipped, not fatal-parsed as "not valid
+    /// YAML" — an operator debugging the folder shouldn't be able to break apiserver boot by
+    /// leaving a non-resource file behind. The real manifest must still land, proving the filter
+    /// doesn't also swallow genuine `.yaml` files.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_skips_non_yaml_files_so_operator_debugging_artifacts_dont_break_boot(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("non-yaml-filter");
+        std::fs::write(dir.join(".DS_Store"), b"not yaml at all\x00\x01\x02")
+            .expect("write .DS_Store");
+        std::fs::write(dir.join("README.md"), "# not a manifest\n").expect("write README.md");
+        std::fs::write(
+            dir.join("00-test.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: non-yaml-filter-test\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-test.yaml");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect(
+                "non-YAML files in the well-known manifest folder must be skipped, not treated \
+                 as a fatal parse error — a .DS_Store is not a Kubernetes resource",
+            );
+
+        let key = crate::keys::object_key("configmaps", "kube-system", "non-yaml-filter-test");
+        server
+            .store
+            .get(&key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "00-test.yaml must still be applied even though .DS_Store and README.md sort \
+                 before it lexicographically — the extension filter must skip non-YAML files, \
+                 not accidentally skip real manifests too",
             );
     }
 
