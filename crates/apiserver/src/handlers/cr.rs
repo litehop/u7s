@@ -8130,6 +8130,430 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Regression fixtures: real-world CRD CEL rules from the mayor-fbxcy audit
+    // (ai/findings/cel-cr-admission-audit-2026-08-25.md), verifying enforcement
+    // against the workloads that actually motivated it, not just synthetic rules.
+    //
+    // cert-manager ClusterIssuer's has()+ternary exactly-one-of rule and
+    // prometheus-operator ScrapeConfig's filter()+size() rule are already covered
+    // verbatim by `cel_has_macro_*`/`cel_filter_macro_*` above (mayor-olvm0's landed
+    // suite) — not duplicated here.
+    // ---------------------------------------------------------------------------
+
+    // HTTPRoute CORS rules (audit L495-498/557-560/635-638): the wildcard '*' must not
+    // be combined with any other entry. Exercises the `in` operator together with
+    // size() in one rule, on a list rather than a single scalar.
+    #[test]
+    fn cel_in_operator_and_size_rejects_wildcard_combined_with_other_origins() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "allowOrigins": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "x-kubernetes-validations": [{
+                        "rule": "!('*' in self && self.size() > 1)",
+                        "message": "wildcard '*' must not be combined with other allowOrigins entries"
+                    }]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "allowOrigins": ["*"] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "wildcard alone must be accepted"
+        );
+        assert!(
+            check_schema(
+                &serde_json::json!({ "allowOrigins": ["https://a.example", "https://b.example"] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "multiple non-wildcard origins must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "allowOrigins": ["*", "https://a.example"] }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("wildcard '*' must not be combined with other allowOrigins entries"),
+            "combining '*' with another origin must be rejected with the CRD's message \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // HTTPRoute has() mutual exclusivity (audit L1039): percent and fraction are
+    // alternate ways to express the same weight and must not both be set. Distinct
+    // from the ClusterIssuer has()-count fixture above: this is a plain boolean
+    // mutual-exclusivity check, not a "sum to exactly one" arithmetic rule.
+    #[test]
+    fn cel_has_macro_rejects_both_percent_and_fraction_set() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "weight": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "!(has(self.percent) && has(self.fraction))",
+                        "message": "percent and fraction are mutually exclusive"
+                    }],
+                    "properties": {
+                        "percent": { "type": "integer" },
+                        "fraction": { "type": "object" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "weight": { "percent": 50 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "setting only percent must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "weight": { "percent": 50, "fraction": {} } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("percent and fraction are mutually exclusive"),
+            "setting both percent and fraction must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // HTTPRoute baseline cross-field rule (audit L1020): plain `self.a`/`self.b`
+    // comparison with no macros involved — this should pass even without any CEL
+    // macro support, so a regression here means the basic `self` binding itself broke.
+    #[test]
+    fn cel_baseline_cross_field_rule_rejects_numerator_exceeding_denominator() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.numerator <= self.denominator",
+                        "message": "numerator must not exceed denominator"
+                    }],
+                    "properties": {
+                        "numerator": { "type": "integer" },
+                        "denominator": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "numerator": 1, "denominator": 2 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "numerator <= denominator must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "numerator": 3, "denominator": 2 } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("numerator must not exceed denominator"),
+            "numerator exceeding denominator must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // Gateway listener-name uniqueness (audit L901-918): a genuinely 2-variable
+    // comprehension over a single list — `l1`/`l2` both range over `self`. Two
+    // listeners sharing a name means `exists_one` finds two matches for that name,
+    // not one, so `all()` must fail on the first offending element.
+    #[test]
+    fn cel_two_variable_all_exists_one_rejects_duplicate_listener_names() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "listeners": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } }
+                    },
+                    "x-kubernetes-validations": [{
+                        "rule": "self.all(l1, self.exists_one(l2, l1.name == l2.name))",
+                        "message": "listener names must be unique"
+                    }]
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "listeners": [{ "name": "http" }, { "name": "https" }] }),
+                schema.clone()
+            )
+            .is_ok(),
+            "distinct listener names must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "listeners": [{ "name": "http" }, { "name": "http" }] }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.message.contains("listener names must be unique"),
+            "duplicate listener names must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // A different shape of 2-variable comprehension than the Gateway fixture above:
+    // the two variables range over two *different* collections
+    // (`self.foo.all(x, self.bar.all(y, ...))`), not the same list twice. Flagged
+    // by critical-reviewer as missing from mayor-olvm0's landed suite.
+    #[test]
+    fn cel_two_variable_nested_comprehension_across_two_collections_rejects_overlap() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.reservedPorts.all(x, self.dynamicPorts.all(y, x < y))",
+                        "message": "every reserved port must be lower than every dynamic port"
+                    }],
+                    "properties": {
+                        "reservedPorts": { "type": "array", "items": { "type": "integer" } },
+                        "dynamicPorts": { "type": "array", "items": { "type": "integer" } }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({
+                    "spec": { "reservedPorts": [80, 443], "dynamicPorts": [30000, 30001] }
+                }),
+                schema.clone()
+            )
+            .is_ok(),
+            "reserved ports strictly below every dynamic port must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({
+                "spec": { "reservedPorts": [80, 30000], "dynamicPorts": [30000, 30001] }
+            }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("every reserved port must be lower than every dynamic port"),
+            "a reserved port overlapping the dynamic range must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // Gateway API annotation-key-prefix rule (audit L262, `gateway.networking.k8s.io_\
+    // gateways.yaml`): `self.split("/")[0].size() < 253`. This is the exact rule
+    // mayor-u1d01 registered `.split()` for — without that overload this rule would
+    // fail every evaluation with an "undeclared reference" CEL error, not evaluate the
+    // length check at all.
+    #[test]
+    fn cel_split_function_enforces_gateway_annotation_key_prefix_length() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "annotations": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "x-kubernetes-validations": [{
+                        "rule": "self.all(key, key.split('/')[0].size() < 253)",
+                        "message": "annotation key prefix must be under 253 characters"
+                    }]
+                }
+            }
+        });
+        let mut ok = serde_json::json!({ "annotations": {} });
+        ok["annotations"]["example.com/name"] = serde_json::json!("widget");
+        assert!(
+            check_schema(&ok, schema.clone()).is_ok(),
+            "an annotation key with a short prefix must be accepted"
+        );
+
+        let long_prefix = "a".repeat(253);
+        let mut bad = serde_json::json!({ "annotations": {} });
+        bad["annotations"][format!("{long_prefix}/name")] = serde_json::json!("widget");
+        let err = check_schema(&bad, schema).unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("annotation key prefix must be under 253 characters"),
+            "a 253+ byte annotation-key prefix must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // messageExpression path: the CRD author builds a formatted error string from the
+    // failing values instead of a static `message`. The rendered string, not a generic
+    // CEL error or the raw rule text, must reach the client in the 422 body.
+    #[test]
+    fn cel_message_expression_builds_formatted_error_surfaced_in_422_body() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.replicas <= self.maxReplicas",
+                        "messageExpression": "'replicas (' + string(self.replicas) + \
+                            ') must not exceed maxReplicas (' + string(self.maxReplicas) + ')'"
+                    }],
+                    "properties": {
+                        "replicas": { "type": "integer" },
+                        "maxReplicas": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "replicas": 2, "maxReplicas": 5 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "replicas within the max must be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "replicas": 10, "maxReplicas": 5 } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("replicas (10) must not exceed maxReplicas (5)"),
+            "the messageExpression-rendered string (built from the actual failing values) \
+             must reach the client, not a generic CEL failure or the raw rule text \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // CEL error branches must all fail closed (reject the CR), matching mayor-olvm0's
+    // stated design intent — a rule the interpreter can't safely evaluate is not the
+    // same as a rule that evaluated to "no violation".
+    //
+    // Runtime failure: division by zero. This differs from a compile error (below) —
+    // the rule parses and type-checks, it only fails while executing against this
+    // specific CR body.
+    #[test]
+    fn cel_division_by_zero_runtime_error_fails_closed_instead_of_silently_accepting() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.numerator / self.denominator > 0",
+                        "message": "ratio must be positive"
+                    }],
+                    "properties": {
+                        "numerator": { "type": "integer" },
+                        "denominator": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        assert!(
+            check_schema(
+                &serde_json::json!({ "spec": { "numerator": 4, "denominator": 2 } }),
+                schema.clone()
+            )
+            .is_ok(),
+            "a rule that evaluates cleanly to true must still be accepted"
+        );
+        let err = check_schema(
+            &serde_json::json!({ "spec": { "numerator": 4, "denominator": 0 } }),
+            schema,
+        )
+        .unwrap_err();
+        assert!(
+            err.1.message.contains("failed to evaluate"),
+            "division by zero mid-rule must reject the CR (fail closed), not silently \
+             accept it as if the rule had passed (got: {})",
+            err.1.message
+        );
+    }
+
+    // A rule that evaluates successfully but to a non-bool value is an authoring bug
+    // in the CRD, not a "no violation" signal — every input must be rejected, since
+    // there is no CR body for which this rule could ever mean "passed".
+    #[test]
+    fn cel_non_bool_result_rule_fails_closed_instead_of_silently_accepting() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.numerator",
+                        "message": "malformed rule"
+                    }],
+                    "properties": { "numerator": { "type": "integer" } }
+                }
+            }
+        });
+        let err =
+            check_schema(&serde_json::json!({ "spec": { "numerator": 1 } }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("must evaluate to a bool"),
+            "a rule returning a non-bool value must reject every CR body, not accept it \
+             (got: {})",
+            err.1.message
+        );
+    }
+
+    // A rule that fails to even compile (malformed CEL syntax) must reject the CR at
+    // admission time, not be silently skipped — the CRD author has a broken rule, and
+    // the operator writing the CR needs to know their write was rejected, not that it
+    // silently bypassed validation.
+    #[test]
+    fn cel_malformed_rule_fails_to_compile_and_rejects_instead_of_silently_accepting() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "x-kubernetes-validations": [{
+                        "rule": "self.foo((",
+                        "message": "malformed rule"
+                    }]
+                }
+            }
+        });
+        let err = check_schema(&serde_json::json!({ "spec": {} }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("does not compile"),
+            "malformed CEL must reject the CR with a compile-error message, not silently \
+             accept it (got: {})",
+            err.1.message
+        );
+    }
+
     // CRD with schema: valid CR body accepted by create_cr_namespaced.
     // This is the integration path: schema extracted from CRD, CR body validated.
     #[tokio::test]
