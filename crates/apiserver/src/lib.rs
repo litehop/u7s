@@ -577,12 +577,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     //   1. SSA-upsert the vendored CoreDNS addon bundle. Its own failure is already logged and
     //      counted inside apply_yaml_bundle and discarded here — a missing addon is
     //      degraded-mode, never a reason to abort the apiserver itself.
-    //   2. SSA-apply every manifest under bootstrap_apply::WELL_KNOWN_MANIFEST_DIR
-    //      (docs/decisions/well-known-manifest-folder.md). Unlike CoreDNS, a bad manifest here
-    //      IS fatal — an operator who dropped a broken manifest needs the apiserver to refuse to
-    //      start, not run half-configured — so its result is threaded back via
+    //   2. SSA-apply every manifest under args.manifest_dir (default `/etc/u7s/manifests`,
+    //      see `docs/decisions/well-known-manifest-folder.md`). Unlike CoreDNS, a bad manifest
+    //      here IS fatal — an operator who dropped a broken manifest needs the apiserver to
+    //      refuse to start, not run half-configured — so its result is threaded back via
     //      well_known_manifest_rx and raced against serve_tls below instead of being discarded.
     let (well_known_manifest_tx, well_known_manifest_rx) = tokio::sync::oneshot::channel();
+    let well_known_manifest_dir = args.manifest_dir.clone();
     tokio::spawn(async move {
         let _ = bootstrap_apply::apply_yaml_bundle(
             &bootstrap_installer_kubeconfig_path,
@@ -591,7 +592,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .await;
         let result = bootstrap_apply::apply_well_known_manifest_dir(
             &bootstrap_installer_kubeconfig_path,
-            std::path::Path::new(bootstrap_apply::WELL_KNOWN_MANIFEST_DIR),
+            std::path::Path::new(&well_known_manifest_dir),
         )
         .await;
         let _ = well_known_manifest_tx.send(result);
@@ -602,7 +603,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Ok(Err(e)) = well_known_manifest_rx => {
             tracing::error!(
                 "fatal: boot-time apply of {} failed: {e:#}",
-                bootstrap_apply::WELL_KNOWN_MANIFEST_DIR
+                args.manifest_dir
             );
             return Err(e);
         }
@@ -10171,6 +10172,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
         let tls = crate::tls::generate_tls(&args).expect("generate_tls must succeed");
 

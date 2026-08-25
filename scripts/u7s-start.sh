@@ -5,6 +5,12 @@
 # across restarts so the CA and kubelet trust relationship survive a server
 # restart without re-provisioning the VM.
 #
+# The apiserver's well-known manifest folder (--manifest-dir) is passed as
+# $WORKDIR/manifests, not its production default of /etc/u7s/manifests -- that
+# path is root-owned on the host Mac and would be shared (and collided on)
+# across every worktree's dev-loop, since the apiserver runs natively on the
+# host here, not inside the VM.
+#
 # Usage:
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]
 #                        [--node-kubelet-port <name>=<N>]
@@ -102,6 +108,12 @@ mkdir -p "$WORKDIR"
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 BINARY="${U7S_BINARY:-$REPO/target/release/u7s-apiserver}"
 HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
+# Well-known manifest folder, scoped to this worktree's WORKDIR rather than the
+# apiserver's production default (/etc/u7s/manifests) -- that path is root-owned on
+# the host Mac and would be shared (and collided on) across every worktree's
+# dev-loop, since the apiserver runs natively on the host here, not inside the VM.
+MANIFEST_DIR="$WORKDIR/manifests"
+mkdir -p "$MANIFEST_DIR"
 
 if [ ! -f "$BINARY" ]; then
   echo "error: binary not found — run: cargo build --release -p u7s-apiserver" >&2
@@ -259,6 +271,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --kubelet-port "$KUBELET_PORT" \
     $NODE_KUBELET_PORT_ARG \
     --service-cluster-ip-range "10.96.0.0/12" \
+    --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
     > "$LOG" 2>&1 &
@@ -280,6 +293,7 @@ else
     --kubelet-port "$KUBELET_PORT" \
     $NODE_KUBELET_PORT_ARG \
     --service-cluster-ip-range "10.96.0.0/12" \
+    --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
     &
@@ -389,6 +403,7 @@ EXTEOF
       --kubelet-port "$KUBELET_PORT" \
       $NODE_KUBELET_PORT_ARG \
       --service-cluster-ip-range "10.96.0.0/12" \
+      --manifest-dir "$MANIFEST_DIR" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
       $ADVERTISE_ARG \
       > "$LOG" 2>&1 &

@@ -5,6 +5,10 @@
 #   - Port-already-in-use detection (warns and reuses)
 #   - Backgrounding with log redirection and disown
 #   - Port readiness wait
+#   - Well-known manifest folder scoped to $WORKDIR/manifests (not the apiserver's
+#     production default of /etc/u7s/manifests, which is root-owned on the host and
+#     would collide across every worktree since the apiserver runs natively on the
+#     host Mac here, not inside the VM)
 #
 # This script is source'd by run-all.sh so KUBECONFIG propagates.
 #
