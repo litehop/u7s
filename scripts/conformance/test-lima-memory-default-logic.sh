@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Regression test for the lima VM's default memory allocation in lima/kubelet.yaml
-# (mayor-5vffw, mayor-2492x).
+# Regression test for the lima VM's default memory allocation in lima/kubelet.yaml.
 #
 # 4GiB repeatedly proved too small for real conformance load: the kernel
 # OOM-killer killed the sonobuoy aggregator process, agnhost test pods, and
-# CoreDNS during --focus 'Simple' runs (mayor-5vffw), a curated 15-spec
-# csi-hostpath focus OOM'd within 6s (mayor-bfq6l), the sig-network Services
+# CoreDNS during --focus 'Simple' runs, a curated 15-spec
+# csi-hostpath focus OOM'd within 6s, the sig-network Services
 # family at --procs=16 drove memory to 3663/3894MB used with a logged
-# oom_watcher kill (mayor-2492x), and even a full-suite sonobuoy aggregator
-# run OOM'd at 4GiB and needed a manual 6GiB bump to complete (mayor-fgh2b).
+# oom_watcher kill, and even a full-suite sonobuoy aggregator
+# run OOM'd at 4GiB and needed a manual 6GiB bump to complete.
 # If a future edit shrinks this back down, conformance runs silently start
 # failing with misleading "pod has status Failed" / "could not retrieve
 # sonobuoy pod" errors instead of an obvious memory-sizing message — this

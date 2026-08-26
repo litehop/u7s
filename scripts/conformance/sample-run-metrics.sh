@@ -4,7 +4,7 @@
 # Before this script existed, RSS/ring/metrics data for a conformance run was
 # an operator-run-by-hand bash loop living outside the repo: uncommitted, so
 # its cadence and columns were whatever happened to be running that day, and
-# absent entirely on any run the operator forgot to babysit (see mayor-zpvp2).
+# absent entirely on any run the operator forgot to babysit.
 # This script folds that loop into the repo and into run-all.sh's own
 # lifecycle so every run gets the same three artifacts with no operator
 # action:
@@ -26,8 +26,8 @@
 #                 counter, not `pcpu`/`%cpu`, whose value is that same
 #                 cumulative time divided by wall-clock process age, i.e. a
 #                 LIFETIME AVERAGE that can never show a spike or a recent
-#                 idle period once a process has run for a while (mayor-jnk90
-#                 measured this directly: it is the only reason every "CPU"
+#                 idle period once a process has run for a while (this was
+#                 measured directly: it is the only reason every "CPU"
 #                 number in that findings doc was a single misleading
 #                 snapshot). A real instantaneous rate for the interval
 #                 between two ticks is (cpu_seconds_cumulative[N] -

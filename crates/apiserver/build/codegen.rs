@@ -879,7 +879,7 @@ fn generate_message_codec(
 
 /// Generates the `gen_container_to_json`/`json_to_container_proto` pair that fully replaces the
 /// hand-rolled functions of the same name — the first of the four "incident cluster" types
-/// (mayor-13y4a) this codegen closes.
+/// this codegen closes.
 pub fn generate_container(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)
         .expect("descriptor set emitted by build.rs must decode");
@@ -982,7 +982,7 @@ fn container_delegated_field(field_name: &str) -> Option<(&'static str, &'static
 const EPHEMERAL_CONTAINER_COMMON: &str = ".k8s.io.api.core.v1.EphemeralContainerCommon";
 
 /// Generates the `gen_ephemeral_container_to_json`/`json_to_ephemeral_container_proto` pair,
-/// replacing the hand-written functions of the same name (mayor-nxr7j) — the previous hand-rolled
+/// replacing the hand-written functions of the same name — the previous hand-rolled
 /// `gen_ephemeral_container_to_json` had drifted to cover only 9 of `EphemeralContainerCommon`'s 24
 /// fields, silently dropping `stdin`/`stdinOnce`/`tty` (and 14 others) from every protobuf-encoded
 /// `kubectl debug -it` ephemeral-container update.
@@ -1230,8 +1230,8 @@ fn pod_spec_delegated_field(field_name: &str) -> Option<(&'static str, &'static 
         // wire even when the caller never touched them, so without this true-only guard a
         // metadata-only PUT resubmitted through a protobuf client fabricates "hostPID: false"/
         // "hostIPC: false" on a pod that never had the key, which validate_pod_spec_immutable's
-        // whole-spec deep-equal then rejects as a spec change that never happened (mayor-swxjj,
-        // 3rd recurrence of the RC/Job label-only-PUT immutability regression, mayor-y6gtg).
+        // whole-spec deep-equal then rejects as a spec change that never happened (3rd
+        // recurrence of the RC/Job label-only-PUT immutability regression).
         "hostPID" => Some((
             "    if let Some(true) = spec.host_pid {\n        spec_map.insert(\"hostPID\".to_string(), serde_json::Value::Bool(true));\n    }\n",
             "jbool(v, \"hostPID\")",
@@ -2082,7 +2082,7 @@ pub fn generate_node_spec(descriptor_bytes: &[u8]) -> String {
 /// capitalised field name) — `json_key`'s own lowercasing rule (`proto_exceptions.rs`) already
 /// normalises it to `port` at whatever recursion depth the mechanical walker reaches it, and the
 /// walker's insert-only-if-non-empty rule at every level already matches this field's own "only
-/// present once kubeletEndpoint.port is set" semantics (the mayor-j3p0n fix surface — see
+/// present once kubeletEndpoint.port is set" semantics (the fix surface — see
 /// `core_gen_adapter.rs`'s old `gen_node_status_to_json` doc, retired by this migration).
 /// `capacity`/`allocatable`/`phase`/`volumesInUse`/`runtimeHandlers`/`features`/`declaredFeatures`
 /// need no entry either: two `map<string, Quantity>`s, a plain optional string, two `repeated
@@ -2120,12 +2120,12 @@ fn node_status_delegated_field(field_name: &str) -> Option<(&'static str, &'stat
 
 /// Generates the `gen_node_status_to_json`/`json_to_node_status_proto` pair, replacing the
 /// `status` assembly block of the hand-rolled `decode_node_proto_gen`/`json_to_node_proto` this
-/// migration retires — including the mayor-j3p0n `daemonEndpoints` fix (see
+/// migration retires — including the `daemonEndpoints` fix (see
 /// `node_status_delegated_field`'s doc) and, as a natural consequence of `generate_message_codec`
 /// requiring every field to have a decode expression, completing `json_to_node_status_proto`'s own
 /// previously-partial coverage (`images`/`volumesInUse`/`volumesAttached`/`config`/
 /// `runtimeHandlers`/`features`/`declaredFeatures` were silently dropped on the JSON->proto
-/// direction via a trailing `..Default::default()`) — the same class of fix mayor-36gtx's `Event`
+/// direction via a trailing `..Default::default()`) — the same class of fix the `Event`
 /// migration made for several previously-dropped fields.
 pub fn generate_node_status(descriptor_bytes: &[u8]) -> String {
     let set = FileDescriptorSet::decode(descriptor_bytes)

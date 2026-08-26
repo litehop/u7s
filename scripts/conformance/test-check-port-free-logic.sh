@@ -13,7 +13,7 @@
 # common case on a fresh --reset, since nothing has bound the derived
 # konnectivity ports yet), run-all.sh died silently mid-script with no error
 # message, right after "Waiting for server to accept connections ...".
-# Confirmed live 2026-08-07 (mayor-07zb7 scout): a fresh `run-all.sh --reset
+# Confirmed live 2026-08-07: a fresh `run-all.sh --reset
 # --stack-only` failed deterministically on this exact line.
 #
 # Exercises the REAL check_port_free() function against a REAL free TCP port

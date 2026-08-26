@@ -18,7 +18,7 @@ see `docs/decisions/upstream-component-shipping-shape.md` -- and lives at
 themselves).
 
 CoreDNS (`coredns.yaml`), moved off its former `include_bytes!` compile-time
-embed (mayor-fiq79), joins `flannel.yaml` (`__IFACE__`,
+embed, joins `flannel.yaml` (`__IFACE__`,
 `__POD_CLUSTER_CIDR__`) and `kube-proxy.yaml` (`__KUBE_VERSION__`,
 `__IFACE_IP__`) here. The latter two each carry install-time placeholders
 `scripts/install.sh` substitutes before writing them to

@@ -172,7 +172,7 @@ CONFIG_FILE="$STATE_DIR/config"
 # fatal and tears the process down via that same tokio::select!, so /healthz
 # never flips to 200 in that case and this loop times out instead of
 # reporting success on a since-crashed apiserver. No settle-and-recheck is
-# needed: the first 200 already means boot is fully done (mayor-ajgaj).
+# needed: the first 200 already means boot is fully done.
 wait_for_apiserver() {
   local kubeconfig_path="$1"
   echo "Waiting for u7s-apiserver to become reachable..."
@@ -471,7 +471,7 @@ fi
 #
 # Nothing downstream wipes $STATE_DIR on either path -- CA persistence is
 # apiserver's own job, and the config/unit writes below are already
-# idempotent (mayor-gtjmv's restart fix) -- so this only decides what to tell
+# idempotent (the restart fix) -- so this only decides what to tell
 # the operator, so a re-run reads as an upgrade rather than a silent no-op or
 # a fresh install starting from nothing.
 EXISTING_INSTALL=0
@@ -851,6 +851,10 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$STATE_DIR
 ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --token-auth-file $STATE_DIR/token-auth-file
+# SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
+# reports success the instant the signal is delivered, so a failed reload is only visible via
+# 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=2
 

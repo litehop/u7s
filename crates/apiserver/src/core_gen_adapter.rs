@@ -4453,10 +4453,10 @@ mod tests {
 
     /// decode_persistentvolume_proto_gen must survive PersistentVolume::sentinel() producing
     /// exactly the keys the .proto schema defines, not a hand-typed subset that could go stale
-    /// the same way PodStatus's did (mayor-y0pcm).
+    /// the same way PodStatus's did.
     ///
-    /// This reaches zero KNOWN_GAPS only because mayor-hfoid (legacy-volume
-    /// DELIBERATE_OMISSIONS) and mayor-p0dyr (persistentVolumeSource INLINE_EMBEDS) already
+    /// This reaches zero KNOWN_GAPS only because the legacy-volume
+    /// DELIBERATE_OMISSIONS and persistentVolumeSource INLINE_EMBEDS entries already
     /// landed; lastPhaseTransitionTime was PersistentVolume's last real gap.
     #[test]
     fn sentinel_completeness_decode_persistentvolume_proto_gen() {
@@ -6584,7 +6584,7 @@ mod tests {
     }
 
     /// `kubectl debug -it`'s stdin/tty flags must survive protobuf decode of the ephemeral
-    /// container spec (mayor-nxr7j). Before this fix, `gen_ephemeral_container_to_json` was a
+    /// container spec. Before this fix, `gen_ephemeral_container_to_json` was a
     /// hand-written function that never emitted `stdin`/`stdinOnce`/`tty` at all, so `PUT
     /// .../ephemeralcontainers` (client-go's `UpdateEphemeralContainers`, which negotiates
     /// protobuf by default) silently stripped the interactive-terminal request before it ever
@@ -6644,7 +6644,7 @@ mod tests {
     }
 
     /// An ephemeral container's probes must survive protobuf decode, same as a regular
-    /// container's (mayor-nxr7j: the hand-written `gen_ephemeral_container_to_json` dropped
+    /// container's (the hand-written `gen_ephemeral_container_to_json` dropped
     /// `livenessProbe`/`readinessProbe`/`startupProbe`/`lifecycle` entirely, even though the
     /// underlying `EphemeralContainerCommon` proto message carries them).
     #[test]
@@ -6699,7 +6699,7 @@ mod tests {
     }
 
     /// An ephemeral container's `workingDir` (a plain string field) and `resources` (a nested
-    /// message field) must also survive decode (mayor-nxr7j) — these are two of the 17 fields
+    /// message field) must also survive decode — these are two of the 17 fields
     /// the previous hand-written encoder silently dropped, alongside stdin/tty and the probes
     /// covered by the two tests above.
     #[test]
@@ -6759,7 +6759,7 @@ mod tests {
 
     /// Sentinel completeness for `gen_ephemeral_container_to_json`, gated against the schema
     /// itself the same way `sentinel_completeness_gen_container_to_json` gates `Container` —
-    /// `EphemeralContainerCommon` declares the exact same field set as `Container` (mayor-nxr7j).
+    /// `EphemeralContainerCommon` declares the exact same field set as `Container`.
     /// Before this bead's fix, the hand-written encoder covered only 9 of these 24 fields; this
     /// test pins all of them so any future regression on any one of them fails loudly instead of
     /// hiding behind whichever fields still happened to survive.
@@ -6883,7 +6883,7 @@ mod tests {
     }
 
     /// hostPID/hostIPC are the same plain (non-pointer), gogoproto-`nullable=false` bool class
-    /// as hostNetwork just above, and — until mayor-swxjj — were the one pair in that class
+    /// as hostNetwork just above, and — until this fix — were the one pair in that class
     /// still missing the true-only guard. A real client-go protobuf write (e.g. the
     /// controller-manager's ReplicationController controller resubmitting a pod after only
     /// changing its labels) always puts an explicit `false` for both on the wire even when the
@@ -6892,7 +6892,7 @@ mod tests {
     /// `"hostPID": false`/`"hostIPC": false` on a pod stored without either key, and
     /// `validate_pod_spec_immutable`'s whole-spec deep-equal (crates/apiserver/src/handlers/
     /// pods.rs) rejects it as a spec change that never happened — this was the 3rd recurrence
-    /// of the RC/Job label-only-PUT immutability regression (mayor-y6gtg / mayor-swxjj).
+    /// of the RC/Job label-only-PUT immutability regression.
     #[test]
     fn generated_pod_spec_omits_host_pid_and_host_ipc_when_wire_carries_the_zero_value() {
         let untouched_pod = core_v1::Pod {
@@ -6969,7 +6969,7 @@ mod tests {
 
     /// Container.stdin/stdinOnce/tty are the same plain (non-pointer), gogoproto-
     /// `nullable=false` bool class as PodSpec.hostNetwork/hostPID/hostIPC, and were also
-    /// missing the true-only guard until mayor-swxjj. `kubectl attach`/`kubectl run -it`
+    /// missing the true-only guard until this fix. `kubectl attach`/`kubectl run -it`
     /// aside, the practical consequence mirrors the PodSpec-level fields: any real protobuf
     /// PUT of a container that never touched these fields fabricates an explicit `false`,
     /// which a stored pod created without them (e.g. via a JSON-writing client) then compares
@@ -8225,7 +8225,7 @@ mod tests {
 
     /// decode_persistentvolumeclaim_proto_gen must survive PersistentVolumeClaim::sentinel()
     /// producing exactly the keys the .proto schema defines, not a hand-typed subset that could
-    /// go stale the same way PodStatus's did (mayor-y0pcm).
+    /// go stale the same way PodStatus's did.
     #[test]
     fn sentinel_completeness_decode_persistentvolumeclaim_proto_gen() {
         let pvc = core_v1::PersistentVolumeClaim::sentinel();
@@ -8664,7 +8664,7 @@ mod tests {
 
     /// decode_serviceaccount_proto_gen must survive ServiceAccount::sentinel() producing exactly
     /// the keys the .proto schema defines, not a hand-typed subset that could go stale the same
-    /// way PodStatus's did (mayor-y0pcm).
+    /// way PodStatus's did.
     #[test]
     fn sentinel_completeness_decode_serviceaccount_proto_gen() {
         let sa = core_v1::ServiceAccount::sentinel();
@@ -9627,7 +9627,7 @@ mod tests {
     }
 
     /// Byte-identical audit for the Phase 3.5 Pod/PodTemplate/ServiceAccount codegen migration
-    /// (mayor-s2nk5): reconstructs the pre-migration hand-written top-level assembly functions
+    /// reconstructs the pre-migration hand-written top-level assembly functions
     /// verbatim from git history (they called the exact same `gen_object_meta_to_json`/
     /// `gen_pod_spec_to_json`/`gen_pod_status_to_json`/`json_to_object_meta_proto`/
     /// `json_to_pod_spec_proto`/`json_to_pod_status_proto`/`gen_object_reference_to_json`

@@ -173,14 +173,17 @@ fn backlog_clamp_warning(requested: i32, ceiling: Option<i32>) -> Option<String>
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
-    // 2. Init tracing.
-    tracing_subscriber::fmt()
+    // 2. Init tracing. try_init() rather than init(): idempotent if a global subscriber is
+    // already installed (e.g. this crate's own test_utils::tracing_capture, shared by several
+    // tests in this binary) instead of panicking — the shipped main.rs binary only ever calls
+    // run() once, so this never masks a real double-init bug in production.
+    let _ = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .init();
+        .try_init();
 
     // Raise the FD limit before opening the DB, generating TLS certs, or
     // binding the listener socket below — see raise_fd_limit's doc comment.
@@ -575,19 +578,23 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let listener = bind_listener(&args.listen)?;
 
     // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound,
-    // authenticating as system:bootstrap-installer (mayor-1pwxi): SSA-apply every manifest under
+    // authenticating as system:bootstrap-installer: SSA-apply every manifest under
     // args.manifest_dir (default `/etc/u7s/manifests`, see
-    // `docs/decisions/well-known-manifest-folder.md`) — including the vendored CoreDNS manifest
-    // (mayor-fiq79), which ships as a real file there like any other vendored or
+    // `docs/decisions/well-known-manifest-folder.md`) — including the vendored CoreDNS manifest,
+    // which ships as a real file there like any other vendored or
     // operator-supplied manifest, no bespoke code path. A bad manifest here is fatal — an
     // operator who dropped a broken manifest needs the apiserver to refuse to start, not run
     // half-configured — so its result is threaded back via well_known_manifest_rx and raced
     // against serve_tls below instead of being discarded. On success it also flips
     // `state.boot_ready` so `/healthz` starts reporting 200 (see the field's doc) — on failure
     // it stays `false` forever, since the `tokio::select!` below tears the process down anyway.
+    // This fatal-at-boot behavior is unchanged by the SIGHUP-triggered reload spawned right
+    // below, which reuses the same manifest directory but with log-and-skip semantics instead.
     let (well_known_manifest_tx, well_known_manifest_rx) = tokio::sync::oneshot::channel();
     let well_known_manifest_dir = args.manifest_dir.clone();
     let boot_ready = Arc::clone(&state.boot_ready);
+    let reload_kubeconfig_path = bootstrap_installer_kubeconfig_path.clone();
+    let reload_manifest_dir = well_known_manifest_dir.clone();
     tokio::spawn(async move {
         let result = bootstrap_apply::apply_well_known_manifest_dir(
             &bootstrap_installer_kubeconfig_path,
@@ -596,6 +603,50 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .await;
         record_manifest_apply_outcome(&boot_ready, &result);
         let _ = well_known_manifest_tx.send(result);
+    });
+
+    // 12b. SIGHUP triggers a re-scan of the same well-known manifest directory in this same
+    // process — no restart, no dropped connections — mirroring the universal `kill -HUP`
+    // reload convention (nginx, sshd, systemd's own daemon-reload). `scripts/install.sh` wires
+    // `ExecReload=/bin/kill -HUP $MAINPID` into u7s-apiserver.service so `systemctl reload
+    // u7s-apiserver` delivers this signal. Runs as its own long-lived task, entirely
+    // independent of the boot-time select! below: a SIGHUP never touches the listener or any
+    // in-flight request, it only re-invokes the same apply routine boot used. Unlike that
+    // boot-time apply, a bad manifest hit during a SIGHUP reload is logged and skipped rather
+    // than fatal (bootstrap_apply::reload_well_known_manifest_dir — operator decision on
+    // 2026-08-26) — crashing an already-serving apiserver over a bad manifest edit
+    // is a far bigger blast radius than at cold boot, where fatal-and-refuse-to-start remains
+    // correct. Because `kill -HUP` reports success to systemd the moment the signal is
+    // delivered, regardless of what this async re-scan finds, reload failure is visible only
+    // through apiserver's own logs (`journalctl -u u7s-apiserver`) — never through systemctl's
+    // reload exit status.
+    tokio::spawn(async move {
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(sighup) => sighup,
+            Err(e) => {
+                tracing::error!(
+                    "failed to install SIGHUP handler: {e:#} — \
+                         'systemctl reload u7s-apiserver' will not work"
+                );
+                return;
+            }
+        };
+        while sighup.recv().await.is_some() {
+            tracing::info!(
+                "SIGHUP received; re-applying well-known manifest directory {reload_manifest_dir}"
+            );
+            let kubeconfig_path = reload_kubeconfig_path.clone();
+            let manifest_dir = reload_manifest_dir.clone();
+            run_supervised_reload(async move {
+                bootstrap_apply::reload_well_known_manifest_dir(
+                    &kubeconfig_path,
+                    std::path::Path::new(&manifest_dir),
+                )
+                .await;
+            })
+            .await;
+        }
     });
 
     tokio::select! {
@@ -609,6 +660,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Runs one SIGHUP-triggered reload attempt on a fresh `tokio::spawn`ed task so a panic inside
+/// `reload` (a bug in a future change to `reload_well_known_manifest_dir`'s internals, or an
+/// unexpected I/O panic) is caught by that task's own unwind boundary instead of unwinding the
+/// long-lived SIGHUP-listening loop above. Without this, one panicking reload would silently and
+/// permanently kill every future `systemctl reload u7s-apiserver` for the rest of the process's
+/// life — `ExecReload=/bin/kill -HUP $MAINPID` always reports success to systemd regardless, so
+/// nothing else would ever surface the loss. Pulled out to a pure function (Rule 14) since the
+/// real call site is inside a `tokio::spawn`ed task racing `serve_tls` and isn't independently
+/// testable there — see `run_supervised_reload_survives_a_panicking_reload` below.
+async fn run_supervised_reload<F>(reload: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = tokio::spawn(reload).await {
+        tracing::error!(
+            "SIGHUP reload: reload task panicked ({e}); the next SIGHUP will still be handled"
+        );
+    }
 }
 
 /// Flips `boot_ready` to ready only when the boot-time manifest apply actually succeeded.
@@ -5046,7 +5117,7 @@ mod tests {
 
         // A kubelet in system:nodes must be able to LIST services -- kubelet's own service
         // informer needs this to populate Service-discovery env vars in every pod's
-        // containers. A real joined node (mayor-yocic) authenticates as this exact identity,
+        // containers. A real joined node authenticates as this exact identity,
         // unlike a single-node install's kubelet which shares the admin/system:masters
         // kubeconfig and never exercises this rule at all.
         let service_list = rbac::AuthzRequest {
@@ -6332,7 +6403,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-omwgo): with --use-service-account-credentials=false, the
+    /// Regression test: with --use-service-account-credentials=false, the
     /// attach-detach controller also runs as system:kube-controller-manager and must be able
     /// to CREATE and DELETE VolumeAttachments to drive CSI attach/detach. Without `create`
     /// here, a real kube-controller-manager process live-logged "system:kube-controller-manager
@@ -7672,7 +7743,7 @@ mod tests {
     }
 
     /// `/healthz` must distinguish "boot-time manifest apply still running" from "boot
-    /// complete" (mayor-ajgaj) — unlike `/livez`/`/readyz`, which stay unconditional "ok".
+    /// complete" — unlike `/livez`/`/readyz`, which stay unconditional "ok".
     /// Before this gate, `/healthz` answered 200 the instant the listener came up, racing the
     /// boot-time `apply_well_known_manifest_dir` task; `scripts/install.sh`'s
     /// `wait_for_apiserver` could only paper over that with a fixed sleep-and-recheck. If this
@@ -7731,6 +7802,34 @@ mod tests {
             body.as_ref(),
             b"ok",
             "/healthz body must be 'ok' once ready"
+        );
+    }
+
+    /// A panic partway through one SIGHUP-triggered reload (e.g. a future bug in
+    /// `reload_well_known_manifest_dir`'s internals) must not take the long-lived
+    /// SIGHUP-listening loop in `run()` down with it — otherwise `systemctl reload
+    /// u7s-apiserver` keeps reporting success forever (per `ExecReload`'s `kill -HUP` semantics)
+    /// while every reload after the first panicking one silently does nothing, with no signal to
+    /// the operator (critical-reviewer finding on PR #1398). Proven here by driving
+    /// `run_supervised_reload` directly with a panicking future — a real panic can't be forced
+    /// out of `reload_well_known_manifest_dir` itself, which never panics by design — and then
+    /// asserting the *next* call still runs to completion, standing in for the next SIGHUP.
+    #[tokio::test]
+    async fn run_supervised_reload_survives_a_panicking_reload() {
+        run_supervised_reload(async { panic!("simulated bug in a reload attempt") }).await;
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        run_supervised_reload(async move {
+            ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a subsequent SIGHUP-triggered reload must still execute after a prior one \
+             panicked — a bare `.await` on the reload future (no panic isolation) would instead \
+             let the panic unwind out of run_supervised_reload and never reach this second call"
         );
     }
 
@@ -10777,6 +10876,270 @@ mod tests {
             reconcile_count.load(Ordering::Relaxed),
             "quota reconciler must not run another cycle after shutdown — \
              without select! the sleeping task cannot be cancelled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SIGHUP-triggered manifest reload. Unlike every other test in this file,
+    // this one drives the real, unmodified `run()` end-to-end (live TLS listener,
+    // mTLS-authenticated requests) — that's the only way to prove the signal-handler wiring
+    // inside `run()` itself reacts to a real OS SIGHUP without a process restart, rather than
+    // just exercising `bootstrap_apply::reload_well_known_manifest_dir` in isolation (already
+    // covered by `bootstrap_apply.rs`'s own tests).
+    // -----------------------------------------------------------------------
+
+    /// Minimal duplicate of `bootstrap_apply.rs`'s own `read_kubeconfig_creds` field
+    /// extraction (same reasoning given there: this test needs the fixed shape
+    /// `tls::write_kubeconfig` writes, not a general YAML parser).
+    fn sighup_test_extract_kubeconfig_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(key).map(str::trim))
+    }
+
+    /// Build an mTLS `reqwest::Client` + base server URL from a kubeconfig `run()` wrote to
+    /// disk (the admin/`system:masters` identity), so the test can make real,
+    /// RBAC-authenticated requests against the real listener the same way kubectl would.
+    fn sighup_test_client_from_kubeconfig(raw: &str) -> (reqwest::Client, String) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let server = sighup_test_extract_kubeconfig_field(raw, "server:")
+            .expect("kubeconfig missing server")
+            .to_owned();
+        let ca_pem = b64
+            .decode(
+                sighup_test_extract_kubeconfig_field(raw, "certificate-authority-data:")
+                    .expect("kubeconfig missing certificate-authority-data")
+                    .trim(),
+            )
+            .expect("decode CA cert");
+        let mut identity_pem = b64
+            .decode(
+                sighup_test_extract_kubeconfig_field(raw, "client-certificate-data:")
+                    .expect("kubeconfig missing client-certificate-data")
+                    .trim(),
+            )
+            .expect("decode client cert");
+        identity_pem.extend(
+            b64.decode(
+                sighup_test_extract_kubeconfig_field(raw, "client-key-data:")
+                    .expect("kubeconfig missing client-key-data")
+                    .trim(),
+            )
+            .expect("decode client key"),
+        );
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_certs_only([reqwest::Certificate::from_pem(&ca_pem).expect("parse CA cert")])
+            .identity(reqwest::Identity::from_pem(&identity_pem).expect("build mTLS identity"))
+            .build()
+            .expect("build reqwest client");
+        (client, server)
+    }
+
+    async fn sighup_test_wait_for_file(path: &std::path::Path) -> String {
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("{} never appeared within 5s", path.display());
+    }
+
+    /// Regression test: SIGHUP must re-scan and re-apply the well-known
+    /// manifest directory in the SAME process — no restart, no dropped listener — and a bad
+    /// manifest hit during that reload must be logged and skipped rather than crashing the
+    /// apiserver, unlike a bad manifest at cold boot (which stays fatal, unchanged by this
+    /// bead). If the SIGHUP handler were ever removed from `run()`, or reload reverted to
+    /// boot's fatal-on-first-bad-file behavior, this test fails: the post-SIGHUP manifest would
+    /// never apply, or the process would stop answering requests entirely.
+    #[tokio::test]
+    async fn sighup_reloads_manifests_without_restart_and_skips_a_bad_file_without_crashing() {
+        let dir = std::env::temp_dir().join(format!(
+            "u7s-sighup-reload-test-{}-{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
+            std::thread::current().id()
+        ));
+        let manifest_dir = dir.join("manifests");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+
+        // Bind-then-drop to find a free port: run() binds its own listener internally with no
+        // injection point for a test-owned one, so this is the only way to learn the port
+        // before spawning it.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let args = Args {
+            db: dir.join("state.db").to_string_lossy().into_owned(),
+            listen: format!("127.0.0.1:{port}"),
+            kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
+            token_auth_file: None,
+            sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
+            sa_pub: dir.join("sa.pub").to_string_lossy().into_owned(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            proxy_client_ca_key: dir
+                .join("proxy-client-ca.key")
+                .to_string_lossy()
+                .into_owned(),
+            proxy_client_ca_cert: dir
+                .join("proxy-client-ca.crt")
+                .to_string_lossy()
+                .into_owned(),
+            advertise_address: Some(format!("https://127.0.0.1:{port}")),
+            service_cluster_ip_range: "10.96.0.0/12".into(),
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            node_kubelet_port: vec![],
+            konnectivity_proxy_addr: None,
+            sa_sig_cache_size: None,
+            manifest_dir: manifest_dir.to_string_lossy().into_owned(),
+        };
+        let kubeconfig_path = std::path::PathBuf::from(&args.kubeconfig);
+
+        tokio::spawn(run(args));
+
+        let raw_kubeconfig = sighup_test_wait_for_file(&kubeconfig_path).await;
+        let (client, server) = sighup_test_client_from_kubeconfig(&raw_kubeconfig);
+        let cm_url =
+            |name: &str| format!("{server}/api/v1/namespaces/kube-system/configmaps/{name}");
+
+        // Poll until the listener is actually accepting connections — the kubeconfig is
+        // written well before the TLS listener binds and the boot-time manifest scan runs.
+        let mut healthy = false;
+        for _ in 0..200 {
+            if client
+                .get(format!("{server}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                healthy = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            healthy,
+            "apiserver must become reachable within 5s of run() starting"
+        );
+
+        // Sanity check: this manifest is written AFTER boot, so it must not already be
+        // applied — otherwise the assertions below wouldn't actually be proving SIGHUP did
+        // anything.
+        std::fs::write(
+            manifest_dir.join("00-after-boot.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: sighup-reload-test\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write post-boot manifest");
+        let precheck_status = client
+            .get(cm_url("sighup-reload-test"))
+            .send()
+            .await
+            .expect("GET must not fail transport-wise")
+            .status();
+        assert_eq!(
+            precheck_status, 404,
+            "a manifest written after boot must not already be applied by anything other than \
+             SIGHUP — otherwise this test would prove nothing"
+        );
+
+        let send_sighup = || {
+            let status = std::process::Command::new("kill")
+                .arg("-HUP")
+                .arg(std::process::id().to_string())
+                .status()
+                .expect("run kill(1) against our own pid");
+            assert!(
+                status.success(),
+                "kill -HUP must succeed against our own pid"
+            );
+        };
+
+        send_sighup();
+
+        let mut applied = false;
+        for _ in 0..200 {
+            if client
+                .get(cm_url("sighup-reload-test"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            applied,
+            "SIGHUP must re-scan and re-apply the well-known manifest directory in place — a \
+             manifest written after boot must land without a process restart"
+        );
+
+        // Now prove the log-and-skip side: a bad file alongside a new good one, in the SAME
+        // reload pass, must not stop the good one from applying or take the process down.
+        std::fs::write(
+            manifest_dir.join("01-bad.yaml"),
+            "this: is: not: valid: yaml: [\n",
+        )
+        .expect("write bad manifest");
+        std::fs::write(
+            manifest_dir.join("02-after-bad.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: sighup-reload-after-bad\n  namespace: kube-system\ndata:\n  foo: bar\n",
+        )
+        .expect("write second post-boot manifest");
+
+        send_sighup();
+
+        let mut applied_after_bad = false;
+        for _ in 0..200 {
+            if client
+                .get(cm_url("sighup-reload-after-bad"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                applied_after_bad = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            applied_after_bad,
+            "a bad manifest file must not stop OTHER files in the same reload pass from \
+             applying — this is the entire point of log-and-skip over the boot path's \
+             fatal-and-abort"
+        );
+
+        let healthz_after = client.get(format!("{server}/healthz")).send().await.expect(
+            "apiserver must still be reachable after a SIGHUP hit a bad manifest — a bad \
+                 reload must never crash the process",
+        );
+        assert!(
+            healthz_after.status().is_success(),
+            "a bad manifest during SIGHUP reload must never crash the process — it must still \
+             be serving /healthz"
+        );
+
+        let previous_still_present = client
+            .get(cm_url("sighup-reload-test"))
+            .send()
+            .await
+            .expect("GET must not fail transport-wise")
+            .status();
+        assert!(
+            previous_still_present.is_success(),
+            "state applied by the FIRST successful reload must survive a later reload that \
+             hits a bad manifest — a bad edit must not roll back or disturb already-applied \
+             state"
         );
     }
 }

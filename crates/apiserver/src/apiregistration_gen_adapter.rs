@@ -244,7 +244,7 @@ mod tests {
         assert_fields_present(&paths, &expected);
     }
 
-    /// Byte-identical audit for the APIService codegen migration (mayor-bgmro): reconstructs the
+    /// Byte-identical audit for the APIService codegen migration: reconstructs the
     /// pre-migration hand-rolled `decode_apiservice_proto_gen` verbatim from git history and
     /// diffs its output against the generated `gen_apiservice_to_json` this migration installed,
     /// using `Sentinel::sentinel()` to exercise every field (including `spec.service`,

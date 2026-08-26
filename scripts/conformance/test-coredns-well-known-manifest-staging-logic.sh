@@ -3,7 +3,7 @@
 # reaches the well-known manifest folder in the two harnesses that start
 # u7s-apiserver directly, bypassing scripts/install.sh's release-tarball path.
 #
-# Bug (mayor-fiq79 CI fix): the CoreDNS migration off its compiled-in
+# Bug (CI fix): the CoreDNS migration off its compiled-in
 # `include_bytes!` bundle onto bootstrap_apply::apply_well_known_manifest_dir
 # only taught scripts/install.sh (production) to copy manifests/*.yaml into
 # --manifest-dir. scripts/u7s-start.sh (local dev-loop + every

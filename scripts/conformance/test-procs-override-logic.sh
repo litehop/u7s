@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Unit test for the --procs override in run-all.sh / 06-run-sonobuoy.sh.
 #
-# Bug (mayor-bfq6l scout finding): 06-run-sonobuoy.sh's build_filter_args
+# Bug (scout finding): 06-run-sonobuoy.sh's build_filter_args
 # hard-coded --plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=16 for BOTH the
 # --focus and --all-e2e/certified-conformance branches, with no CLI flag on
 # run-all.sh to override it. Under concurrent-load scouting (multiple workers
 # each running their own sonobuoy invocation against the same 4GiB lima VM
-# class), 16 ginkgo processes per worker OOMs the VM — the dispatch brief for
-# mayor-bfq6l explicitly asked for --procs=4, but the only available control
+# class), 16 ginkgo processes per worker OOMs the VM — the dispatch brief
+# explicitly asked for --procs=4, but the only available control
 # was a narrow --focus regex whose matched-spec-count happens to cap actual
 # parallelism below 16, which is a weaker and less precise lever than a real
 # --procs flag.
@@ -68,7 +68,7 @@ assert "default (apply=0, --unsafe-focus path) emits --procs=16" \
   "$(printf '%s' "$DEFAULT_APPLY0" | grep -q -- '--procs=16' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 2. Explicit --procs 4 (the value mayor-bfq6l's dispatch brief actually
+# 2. Explicit --procs 4 (the value the dispatch brief actually
 #    asked for to avoid OOMing a 4GiB VM under concurrent load): both argv
 #    shapes must carry --procs=4, not the old hardcoded 16.
 # ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ assert "--procs 4 (apply=0 path) emits --procs=4" \
   "$(printf '%s' "$PROCS4_APPLY0" | grep -q -- '--procs=4' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
-# 3. Explicit --procs 1 (serial -- the other option mayor-bfq6l's dispatch
+# 3. Explicit --procs 1 (serial -- the other option the dispatch
 #    brief floated): proves the substitution isn't accidentally hardwired to
 #    any single non-default value either.
 # ---------------------------------------------------------------------------

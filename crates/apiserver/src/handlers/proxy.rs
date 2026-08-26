@@ -820,7 +820,7 @@ const EXEC_KUBELET_SUBPROTOCOL: &str = "v5.channel.k8s.io";
 
 /// Fallback exec subprotocol for kubelet versions that predate
 /// `ExtendWebSocketsToKubelet` (kubelet < 1.36 — see `EXEC_KUBELET_SUBPROTOCOL`).
-/// Confirmed live against kubelet 1.34.9 (mayor-oxllp): dialing with v5 gets
+/// Confirmed live against kubelet 1.34.9: dialing with v5 gets
 /// `kubelet exec connect failed: HTTP error: 403 Forbidden`; v4 succeeds.
 const EXEC_KUBELET_FALLBACK_SUBPROTOCOL: &str = "v4.channel.k8s.io";
 
@@ -1188,7 +1188,7 @@ async fn dial_kubelet_exec(
 /// `run_attach_proxy` failing, or the exec/attach URL itself being malformed) drops
 /// `inbound` — already a live, fully upgraded connection from kubectl's point of
 /// view — with no close handshake at all. kubectl's websocket client reports that as
-/// "close 1006 (abnormal closure): unexpected EOF" (mayor-oxllp), which looks like a
+/// "close 1006 (abnormal closure): unexpected EOF", which looks like a
 /// network glitch and hides the real cause (`reason`, already logged by the caller).
 async fn close_inbound_on_dial_failure(mut inbound: WebSocket, reason: &str) {
     use axum::extract::ws::{CloseFrame, Message};
@@ -5986,7 +5986,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // exec_status_frame_is_success: content-based decision, not just channel byte
     //
-    // mayor-n74cf: bd2b58cc's fix dropped every channel-3/4 frame unconditionally,
+    // bd2b58cc's fix dropped every channel-3/4 frame unconditionally,
     // regardless of payload, so kubelet's NonZeroExitCode failure frame was
     // silently discarded along with genuine success frames. client-go's
     // remotecommand.StreamExecutor never saw the failure, so `kubectl exec` of any
@@ -6005,8 +6005,8 @@ mod tests {
     }
 
     /// A `NonZeroExitCode` failure frame must NOT be classified as success — this is
-    /// the exact frame that bd2b58cc's blanket filter (and the bug in mayor-n74cf)
-    /// discarded, causing `kubectl exec` to report exit 0 for every failing command.
+    /// the exact frame that bd2b58cc's blanket filter discarded, causing `kubectl
+    /// exec` to report exit 0 for every failing command.
     #[test]
     fn exec_status_frame_is_success_false_for_failure_nonzero_exit() {
         let frame = bytes::Bytes::from(
@@ -6016,7 +6016,7 @@ mod tests {
             !exec_status_frame_is_success(&frame),
             "a NonZeroExitCode failure frame must never be treated as success — doing \
              so would absorb it and hide the real exit code from kubectl, reproducing \
-             mayor-n74cf"
+             the bug"
         );
     }
 
@@ -6035,7 +6035,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // run_exec_proxy end-to-end: kubelet status-frame content must control
-    // whether kubectl sees it (mayor-n74cf)
+    // whether kubectl sees it
     //
     // These tests drive the real relay (not just the pure predicate) through a
     // mock TLS kubelet and a real axum server, exactly like the
@@ -6189,8 +6189,8 @@ mod tests {
     /// `remotecommand.StreamExecutor` (`errorDecoderV4.decode`) turns into
     /// `exec.CodeExitError`. Before this fix, `run_exec_proxy` dropped every
     /// channel-3/4 frame unconditionally (bd2b58cc's overcorrection), so this frame
-    /// never reached kubectl and every nonzero exec exit looked like exit 0
-    /// (mayor-n74cf). This test fails if that unconditional drop is restored.
+    /// never reached kubectl and every nonzero exec exit looked like exit 0.
+    /// This test fails if that unconditional drop is restored.
     #[tokio::test]
     async fn exec_proxy_forwards_channel_4_failure_frame_nonzero_exit() {
         let failure = b"{\"status\":\"Failure\",\"reason\":\"NonZeroExitCode\",\"details\":{\"causes\":[{\"reason\":\"ExitCode\",\"message\":\"1\"}]}}".to_vec();
@@ -6235,8 +6235,8 @@ mod tests {
     /// data at all — indistinguishable from a successful, silent exec. This
     /// simulates a command that exits nonzero with no stdout/stderr output at all
     /// (e.g. `sh -c 'exit 2'`) and asserts the client actually receives the failure
-    /// frame before close, not just a bare close: the exact symptom mayor-n74cf
-    /// reports, where every nonzero exec looked like exit 0 because there was no
+    /// frame before close, not just a bare close: the exact symptom this exists
+    /// to catch, where every nonzero exec looked like exit 0 because there was no
     /// in-band failure signal at all.
     #[tokio::test]
     async fn exec_proxy_nonzero_exit_status_reaches_client() {
@@ -6256,7 +6256,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v5->v4 exec fallback regression tests (mayor-oxllp)
+    // v5->v4 exec fallback regression tests
     //
     // Real kubelet < 1.36 (no ExtendWebSocketsToKubelet — see
     // EXEC_KUBELET_SUBPROTOCOL) never registers v5.channel.k8s.io on its exec

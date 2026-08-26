@@ -216,7 +216,7 @@ fn present_key_fields(
 ///
 /// This "whichever fields are present" semantics — rather than requiring every field a
 /// composite key declares — is load-bearing for Service.spec.ports' composite `["port",
-/// "protocol"]` key (see mayor-o1w23): a full re-applied ServicePort object carries BOTH
+/// "protocol"]` key: a full re-applied ServicePort object carries BOTH
 /// fields, so it's matched exactly (this is what stops a UDP:53 and TCP:53 entry from
 /// colliding on "port" alone and corrupting the port list into duplicates on re-apply — the
 /// bug this composite key exists to fix). But a real kubectl client's `$patch:delete` and
@@ -596,8 +596,8 @@ fn merge_key_for_path(path: &str, schema: Option<&serde_json::Value>) -> MergeKe
         // diff) actually uses. A single-field "port" key merges a Service's UDP:53 and TCP:53
         // ServicePort entries into ONE slot (both have port=53), so re-applying a manifest
         // with both a UDP:53 and TCP:53 port corrupts the port list into duplicate/dropped
-        // entries every time — exactly the CoreDNS kube-dns Service bug mayor-o1w23 exists to
-        // fix (mayor-60zfu / PR #1165 shipped a GET-then-compare short-circuit workaround for
+        // entries every time — exactly the CoreDNS kube-dns Service bug this composite key
+        // exists to fix (PR #1165 shipped a GET-then-compare short-circuit workaround for
         // CoreDNS specifically; this composite key is the root fix so ANY Service with two
         // protocols on the same port number re-applies correctly, not just CoreDNS's).
         "spec.ports" => MergeKeyKind::Key(vec!["port".to_string(), "protocol".to_string()]),
@@ -1739,7 +1739,7 @@ mod tests {
         );
     }
 
-    /// mayor-o1w23 root-fix regression test: Service.spec.ports' merge key must be the
+    /// Root-fix regression test: Service.spec.ports' merge key must be the
     /// COMPOSITE (port, protocol), not "port" alone. Two ServicePort entries that share the
     /// same port number but differ in protocol (UDP:53 and TCP:53, exactly CoreDNS's kube-dns
     /// Service) are DISTINCT service ports, not duplicates of each other.
@@ -1747,7 +1747,7 @@ mod tests {
     /// Before this fix, "port" alone was the merge key, so re-applying the same two-port
     /// manifest a second time made the second patch element (TCP:53) match the FIRST target
     /// element found by port==53 (whichever ended up there) and clobber it, corrupting the
-    /// port list — mayor-60zfu observed this exact corruption on every re-apply of the
+    /// port list — this exact corruption was observed on every re-apply of the
     /// CoreDNS bundle (which happens on every u7s boot, including the Phase1→Phase2
     /// CA-bootstrap restart within a single run) and shipped a GET-then-compare short-circuit
     /// workaround scoped to CoreDNS (PR #1165). This test locks in the underlying do_patch fix

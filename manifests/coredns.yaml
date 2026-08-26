@@ -1,15 +1,15 @@
 # Vendored from kubeadm's cluster/addons/dns/coredns/coredns.yaml.base (kubernetes/kubernetes
 # v1.36.2). __DNS__DOMAIN__/__DNS__SERVER__ are resolved to u7s's fixed defaults below, and this
 # bundle deliberately departs from upstream in three ways:
-#   - image bumped to v1.14.7 (latest stable CoreDNS release as of the mayor-fiq79 migration off
+#   - image bumped to v1.14.7 (latest stable CoreDNS release as of the migration off
 #     `include_bytes!` onto this real, standalone file) -- future bumps are now a manifest edit
 #     here (Renovate-scannable), not an apiserver rebuild.
-#   - the Deployment has no resources.limits.memory -- mayor-b1gz2 found the prometheus
-#     plugin + memory-limit combination flaky here, so the plugin (mayor-wclvi) stays but
+#   - the Deployment has no resources.limits.memory -- the prometheus
+#     plugin + memory-limit combination was found flaky here, so the plugin stays but
 #     the limit does not.
 #   - no priorityClassName -- u7s seeds no PriorityClass objects.
 #   - no Service port / prometheus.io annotations for :9153 -- this is a pod-direct-scrape
-#     correlation signal (mayor-wclvi), not a ServiceMonitor target.
+#     correlation signal, not a ServiceMonitor target.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

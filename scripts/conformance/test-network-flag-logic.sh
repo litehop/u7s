@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Unit tests for scripts/conformance/run-all.sh's --network flag wire-through
-# (mayor-c4syr).
+# Unit tests for scripts/conformance/run-all.sh's --network flag wire-through.
 #
-# lima-start.sh (mayor-njq7j/PR #1194) accepts --network to isolate a VM onto
+# lima-start.sh (PR #1194) accepts --network to isolate a VM onto
 # its own Lima network -- the current mitigation for the Lima usernet ARP
-# defect (mayor-o61zz), which otherwise lets one VM's daemon flaps take down
+# defect, which otherwise lets one VM's daemon flaps take down
 # every VM sharing its network. run-all.sh never forwarded --network to
 # lima-start.sh at all: any operator or worker running
 # `run-all.sh --vm lima-node --network user-v2-mayor --reset` got silently

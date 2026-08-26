@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Unit test for the sonobuoy aggregator OOM fix (mayor-f0lfr).
+# Unit test for the sonobuoy aggregator OOM fix.
 #
 # Root cause: the sonobuoy AGGREGATOR pod (namespace `sonobuoy`, pod name
 # "sonobuoy" -- distinct from the "sonobuoy-e2e-job-*" worker pod that
 # sonobuoy-plugin-e2e.yaml already bounds) is generated entirely by
 # sonobuoy's own compiled-in Go code, with no CLI flag or plugin-manifest
-# field to set its resources (confirmed at v0.57.3 by mayor-vmye0/
-# mayor-o4fmo). It ships BestEffort (resources: {}), the kernel's
+# field to set its resources (confirmed at v0.57.3 by audit).
+# It ships BestEffort (resources: {}), the kernel's
 # highest-priority global-OOM victim, and was observed OOMKilled ~55s into
 # a csi-hostpath focus run.
 #

@@ -80,8 +80,8 @@ struct SaClaims {
     kubernetes_io: KubernetesIoClaims,
     /// Token expiry, Unix seconds. `jsonwebtoken::decode` already validates this internally
     /// via its own separate deserialization pass (see `jsonwebtoken::validation::validate`),
-    /// so this field exists purely so the SA-signature-verify cache (`sa_sig_cache`,
-    /// mayor-6sbvc) can derive its own TTL bound from the same value — see that module's doc
+    /// so this field exists purely so the SA-signature-verify cache (`sa_sig_cache`)
+    /// can derive its own TTL bound from the same value — see that module's doc
     /// for the "cache entry never outlives the token's real exp" invariant.
     exp: u64,
     /// Intended audiences. u7s's own token minter (`handlers::tokens::create_token`) always
@@ -502,7 +502,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
     // No leeway: reject tokens that are even 1 second past expiry.
     validation.leeway = 0;
 
-    // Signature-verify cache (mayor-6sbvc): skip the RSA modexp when this exact token's
+    // Signature-verify cache: skip the RSA modexp when this exact token's
     // signature bytes were already verified valid and the cached entry hasn't reached the
     // token's real `exp` yet (see `sa_sig_cache` module doc for the full design). A
     // malformed token makes `signature_hash` return `None`, which naturally falls through
@@ -1482,8 +1482,8 @@ mod tests {
         SqliteStore::new(":memory:").expect("open in-memory store")
     }
 
-    /// Fresh, empty signature-verify cache for tests that don't specifically exercise
-    /// mayor-6sbvc's caching behavior — a fresh instance per test (rather than a shared
+    /// Fresh, empty signature-verify cache for tests that don't specifically exercise this
+    /// caching behavior — a fresh instance per test (rather than a shared
     /// static) means every test starts from a guaranteed-cold cache regardless of test
     /// execution order, matching `make_test_store`'s per-test isolation.
     fn make_test_sig_cache() -> SigCache {
@@ -2238,7 +2238,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SA-JWT signature-verify cache (mayor-6sbvc)
+    // SA-JWT signature-verify cache
     // -----------------------------------------------------------------------
     // See `sa_sig_cache` module doc for the full design. These 4 tests are all
     // fail-on-revert per Rule 9: reverting the cache-check in try_verify_sa_jwt to always
@@ -2294,7 +2294,7 @@ mod tests {
     /// Two assertions, each catching a different regression:
     /// - immediately after the first verify (well before `exp`), a second call must still be
     ///   a cache HIT (`verify_count` stays at 1) — this is what actually fails if the cache
-    ///   check is reverted to "always fall through" (mayor-6sbvc's prescribed regression
+    ///   check is reverted to "always fall through" (the prescribed regression
     ///   test), since `jsonwebtoken::decode`'s own exp check would otherwise mask a
     ///   cache-never-consulted bug by independently rejecting the token once truly expired.
     /// - after the token's real `exp` has passed, a third call must be a cache MISS
@@ -2808,7 +2808,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // object_is_live minimal-field deserialize (mayor-e555b)
+    // object_is_live minimal-field deserialize
     // -----------------------------------------------------------------------
     // Replaces the full `serde_json::Value` tree parse in `object_is_live` with the
     // minimal `LivenessCheckFields` struct above — see
@@ -2866,7 +2866,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-e555b: `object_is_live` must not deserialize the stored
+    /// Regression test: `object_is_live` must not deserialize the stored
     /// object's bytes into a `serde_json::Value` tree.
     ///
     /// It used to do so on every SA-JWT-authenticated request (every bound ServiceAccount,
@@ -2876,7 +2876,7 @@ mod tests {
     /// run — the single largest JSON allocation callsite in the apiserver. This test scans
     /// the function's own source for the parse call site rather than instrumenting
     /// allocations, mirroring the pattern used for the sibling
-    /// `content_type::reencode_proto_response` fix (mayor-g7g2m): a purely behavioral test
+    /// `content_type::reencode_proto_response` fix: a purely behavioral test
     /// cannot catch a reintroduction of this dead-weight parse, since the bool
     /// `object_is_live` returns is identical either way.
     #[test]

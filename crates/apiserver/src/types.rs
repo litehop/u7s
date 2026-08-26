@@ -837,7 +837,7 @@ pub struct PodCertificateRequestSpec {
 // handlers/defaults.rs reads or writes; every other field round-trips
 // opaquely via `rest`. This is the same minimal-field pattern as `PodSpec`/
 // `NamespaceStatus` above, applied to the defaulting surface: the direct
-// motivation is PR #1024 (mayor-xv1pk), where a field the apiserver was
+// motivation is PR #1024, where a field the apiserver was
 // supposed to default was missing entirely from a Value-tree-based codebase
 // with no compiler-checked inventory of "which fields does this function
 // reason about" to catch the gap during review.
@@ -1558,8 +1558,8 @@ mod object_meta_tests {
 
     /// A metadata object with two managedFields entries (one fully populated server-side-apply
     /// record with a fieldsV1 tree, one minimal update record with only the required manager/
-    /// operation) must round-trip through ObjectMeta byte-identically. mayor-7p767 depends on
-    /// this: tightening watch/PartialObjectMetadata handling to a full ObjectMeta round-trip is
+    /// operation) must round-trip through ObjectMeta byte-identically. This
+    /// matters: tightening watch/PartialObjectMetadata handling to a full ObjectMeta round-trip is
     /// only safe once managedFields survives it — before this field existed, any object with
     /// server-side-apply history would silently lose its field-ownership record on that path.
     #[test]
@@ -1625,7 +1625,7 @@ mod object_meta_tests {
 
     /// A metadata object with generation and deletionGracePeriodSeconds set (the state of a
     /// workload mid-graceful-termination) must round-trip through ObjectMeta byte-identically.
-    /// mayor-7p767 depends on this: tightening watch/PartialObjectMetadata handling to a full
+    /// This matters: tightening watch/PartialObjectMetadata handling to a full
     /// ObjectMeta round-trip is only safe once these fields survive it — before they existed,
     /// KCM's controllers would see a null generation on the projected object and silently skip
     /// reconciling it, and the kubelet would lose the grace period needed to know when to

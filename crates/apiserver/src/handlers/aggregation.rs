@@ -961,7 +961,7 @@ mod tests {
     }
 
     /// Regression test for the aggregation layer's actual protobuf ingestion path (codegen
-    /// migration of `apiregistration_gen_adapter.rs`, mayor-bgmro): client-go's aggregator
+    /// migration of `apiregistration_gen_adapter.rs`): client-go's aggregator
     /// clientset creates `APIService` objects via native protobuf (see
     /// `apiregistration_gen_adapter::decode_apiservice_proto_gen`'s own doc), and the resulting
     /// JSON is exactly what `reconcile_apiservice_availability`/`backend_base_url` read back out

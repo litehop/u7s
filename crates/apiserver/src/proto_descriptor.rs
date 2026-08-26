@@ -5,7 +5,7 @@
 //! decoder's output against an `expected` array that a human typed by reading the very
 //! `gen_*_to_json` function under test. That makes the oracle a second copy of the same
 //! enumeration — if a field is forgotten in both places the test passes green. `PodStatus` is the
-//! worked example (mayor-y0pcm): `gen_pod_status_to_json` was itself written to fix an earlier
+//! worked example: `gen_pod_status_to_json` was itself written to fix an earlier
 //! drop of the whole `.status` subtree, shipped a regression test asserting `phase`/`podIP`/
 //! `conditions`, and left `containerStatuses` out of both the emitter and the expected list — so a
 //! protobuf `UpdateStatus` deleted it from the stored pod, under a green suite, for as long as the
@@ -14,8 +14,8 @@
 //!
 //! Scope limit worth knowing before trusting a green result: `assert_fields_present` matches a key
 //! against *any* path segment anywhere in the decoded tree, so a nested struct counts as covered
-//! the moment one of its leaves survives (mayor-66qj6). This module fixes the *list*, not the
-//! *matcher* — until 66qj6 lands, counts produced here are lower bounds on what is really missing.
+//! the moment one of its leaves survives. This module fixes the *list*, not the
+//! *matcher* — until that gap closes, counts produced here are lower bounds on what is really missing.
 //!
 //! In this schema the proto field name *is* the JSON key — verified across all 2466 fields of the
 //! vendored protos, `json_name` never differs from `name`. Only two mechanical adjustments and a
@@ -617,7 +617,7 @@ mod tests {
             crate::resource_gen_adapter::decode_resourceslice_proto_gen
         );
 
-        // The 9 groups below (mayor-s1nk9) had never been run through this oracle before —
+        // The 9 groups below had never been run through this oracle before —
         // only core/autoscaling/resource had survey! entries. Each row is one *_gen_adapter.rs
         // decoder; the (label, sentinel type, proto FQN, decoder fn) shape matches the rows
         // above exactly, just pointed at a different crate module per api group.

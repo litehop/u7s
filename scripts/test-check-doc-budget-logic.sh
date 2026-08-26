@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for scripts/check-doc-budget.sh (mayor-9axl7's word-budget ratchet).
+# Unit test for scripts/check-doc-budget.sh's word-budget ratchet.
 #
 # Exercises the REAL script as a subprocess against disposable sandbox git
 # repos (same technique as test-build-provenance-logic.sh /

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for scripts/conformance/aggregate-run-metrics.sh (mayor-c7ws9).
+# Unit test for scripts/conformance/aggregate-run-metrics.sh.
 #
 # sample-run-metrics.sh already writes rss.csv/vm-free.csv/ring-age.csv/
 # metrics-NN-<label>.prom into every conformance run's temp/e2e/<slug>/
@@ -8,7 +8,7 @@
 # run (see the real fixture referenced in aggregate-run-metrics.sh's own
 # design notes), so "eyeball it" meant grepping by hand every time, the exact
 # problem class sample-run-metrics.sh itself was built to remove from the
-# SAMPLING side (mayor-zpvp2).
+# SAMPLING side.
 #
 # This test invokes the REAL script as a subprocess against synthetic
 # fixtures with hand-computed expected numbers baked into the CSV/prom

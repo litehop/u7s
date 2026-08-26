@@ -8,7 +8,7 @@
 # "Re-copy the monitoring artifacts" step) and were only useful if an operator
 # opened rss.csv by hand and eyeballed it — exactly the by-hand-loop problem
 # sample-run-metrics.sh itself was built to remove from the SAMPLING side,
-# just moved one step downstream to the READING side instead (mayor-c7ws9).
+# just moved one step downstream to the READING side instead.
 #
 # Usage:
 #   aggregate-run-metrics.sh <run-dir> [-o <output-file>] [--free-threshold-mb <N>] [--free-threshold-pct <N>]
@@ -20,7 +20,7 @@
 #     straight to sample-run-metrics.sh) that holds the CSVs/.prom files
 #     directly, for investigating a still-running or --stack-only session.
 #
-# Metric-name note: the design this script follows (mayor-c7ws9) was written
+# Metric-name note: the design this script follows was written
 # against aspirational metric names (apiserver_request_duration_seconds,
 # apiserver_longrunning_gauge) that this apiserver has never actually emitted
 # -- it exports apiserver_watch_open_duration_seconds (the one request-latency
