@@ -71,6 +71,28 @@ provision:
       #!/bin/bash
       set -euo pipefail
 
+      # First-boot race: cloud-init always waits for network
+      # here because Lima's generated cloud-config includes a `mounts:` key
+      # (cloud-init treats ANY mounts as potentially network-based). That
+      # wait invokes systemd-networkd-wait-online, which can lose a race
+      # against cloud-init's own MAC-matched interface rename (enp0s1 ->
+      # eth0): "[busy] Error renaming mac=... from enp0s1 to eth0". The
+      # network interface itself is already up (DHCP succeeded under
+      # whichever name won the race) but DNS (resolvectl) only finishes
+      # wiring up a few seconds after this script starts running on a fresh
+      # VM, so an immediate `apt-get update`/`curl` below can fail with
+      # unresolvable-host errors and abort the whole script (set -e), which
+      # is what silently skipped the image pre-pull and sonobuoy install on
+      # first boot. Wait for DNS to actually resolve before touching it.
+      for _ in $(seq 1 60); do
+        getent hosts archive.ubuntu.com >/dev/null 2>&1 && break
+        sleep 2
+      done
+      getent hosts archive.ubuntu.com >/dev/null 2>&1 || {
+        echo "DNS never became available after 120s — aborting provisioning" >&2
+        exit 1
+      }
+
       apt-get update -qq
       apt-get install -y apt-transport-https ca-certificates curl gpg
 
