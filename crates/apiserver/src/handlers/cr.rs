@@ -1012,8 +1012,62 @@ fn schema_branch_structurally_matches(branch: &serde_json::Value, obj: &serde_js
 /// which bounds the equivalent risk for boon schema compilation.
 const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Marker: a CEL evaluation did not finish within `CEL_RULE_EVAL_BUDGET`.
-struct CelEvalOverBudget;
+/// Caps how many `execute_cel_with_budget` threads may be alive at once. Each thread
+/// that outlives `CEL_RULE_EVAL_BUDGET` is abandoned (see below) rather than joined, so
+/// without a cap a flood of concurrent writes carrying a pathological CEL rule could
+/// still exhaust host threads/CPU even though each individual request keeps returning
+/// in ~`CEL_RULE_EVAL_BUDGET`. A legitimate cluster should essentially never hit this —
+/// it only bounds a sustained attempt to spawn many over-budget evaluations at once.
+const MAX_CONCURRENT_CEL_EVAL_THREADS: usize = 24;
+
+/// Bounds how many owners may hold a slot at once, rejecting new acquisitions outright
+/// once the cap is reached instead of letting the count grow without bound. A plain
+/// struct (rather than a bare static counter) so the bounding behavior can be exercised
+/// directly in a test with its own small, local cap — the real, process-wide gate below
+/// is shared by every concurrent request's CEL evaluation, so a test that saturated it
+/// (even briefly) would spuriously reject unrelated evaluations running at the same time.
+struct ConcurrencyGate {
+    in_flight: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl ConcurrencyGate {
+    const fn new(cap: usize) -> Self {
+        Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Reserves a slot and returns `true`, or returns `false` if the cap has already
+    /// been reached. On `false` no slot is held, so the caller must not call `release`.
+    fn try_acquire(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) >= self.cap {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn release(&self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The process-wide gate every `execute_cel_with_budget` call reserves a slot from.
+static CEL_EVAL_THREAD_GATE: ConcurrencyGate =
+    ConcurrencyGate::new(MAX_CONCURRENT_CEL_EVAL_THREADS);
+
+/// Marker: a CEL evaluation was rejected without running to completion — either it did
+/// not finish within `CEL_RULE_EVAL_BUDGET`, or evaluation was refused outright because
+/// `MAX_CONCURRENT_CEL_EVAL_THREADS` other over-budget evaluations are already in flight.
+enum CelEvalOverBudget {
+    TimedOut,
+    TooManyInFlight,
+}
 
 /// Runs `program` against `cel_ctx` on a dedicated thread, bounded by `budget` wall-clock
 /// time, so a CEL expression with unbounded runtime cost cannot hang the request-handling
@@ -1022,18 +1076,30 @@ struct CelEvalOverBudget;
 /// risking undefined behavior from force-killing a thread; every CEL expression is
 /// guaranteed to terminate (the language has no unbounded loops), so an abandoned
 /// over-budget thread still exits on its own eventually — this only bounds how long a
-/// single request waits for it.
+/// single request waits for it. `gate` (production callers always pass
+/// `CEL_EVAL_THREAD_GATE`) separately bounds how many such abandoned threads may
+/// accumulate at once; it's a parameter rather than reaching for that static directly so
+/// tests can inject a small, local gate instead of saturating the real, process-wide one
+/// (which every concurrently-running request's CEL evaluation also relies on).
 fn execute_cel_with_budget(
     program: &std::sync::Arc<cel::Program>,
     cel_ctx: cel::Context<'static>,
     budget: std::time::Duration,
+    gate: &'static ConcurrencyGate,
 ) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
+    if !gate.try_acquire() {
+        return Err(CelEvalOverBudget::TooManyInFlight);
+    }
+
     let program = std::sync::Arc::clone(program);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(program.execute(&cel_ctx));
+        let result = program.execute(&cel_ctx);
+        gate.release();
+        let _ = tx.send(result);
     });
-    rx.recv_timeout(budget).map_err(|_| CelEvalOverBudget)
+    rx.recv_timeout(budget)
+        .map_err(|_| CelEvalOverBudget::TimedOut)
 }
 
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
@@ -1068,12 +1134,24 @@ fn evaluate_cel_rule(
             .map_err(|e| Status::internal(format!("CEL: failed to bind oldSelf: {e}")))?;
     }
 
-    let result = match execute_cel_with_budget(&program, cel_ctx, CEL_RULE_EVAL_BUDGET) {
-        Err(CelEvalOverBudget) => {
+    let result = match execute_cel_with_budget(
+        &program,
+        cel_ctx,
+        CEL_RULE_EVAL_BUDGET,
+        &CEL_EVAL_THREAD_GATE,
+    ) {
+        Err(CelEvalOverBudget::TimedOut) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
                  budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost \
                  (rule: {rule_text})"
+            )));
+        }
+        Err(CelEvalOverBudget::TooManyInFlight) => {
+            return Err(Status::unprocessable_entity(format!(
+                "{field_path}: too many x-kubernetes-validations rules are currently \
+                 exceeding their evaluation time budget — rejecting to bound concurrent CEL \
+                 evaluation cost (rule: {rule_text})"
             )));
         }
         Ok(Ok(v)) => v,
@@ -1166,9 +1244,14 @@ fn evaluate_message_expression(
     if let Some(old) = old_self_value {
         cel_ctx.add_variable("oldSelf", old).ok()?;
     }
-    match execute_cel_with_budget(&program, cel_ctx, CEL_RULE_EVAL_BUDGET)
-        .ok()?
-        .ok()?
+    match execute_cel_with_budget(
+        &program,
+        cel_ctx,
+        CEL_RULE_EVAL_BUDGET,
+        &CEL_EVAL_THREAD_GATE,
+    )
+    .ok()?
+    .ok()?
     {
         cel::Value::String(s) => {
             let s = s.trim();
@@ -8821,7 +8904,7 @@ mod tests {
     }
 
     // A CRD author's rule has no static cost bound (unlike upstream, which rejects an
-    // over-cost rule at CRD admission via a static estimator — see mayor-3ainu). A nested
+    // over-cost rule at CRD admission via a static estimator). A nested
     // list comprehension (`.all()` inside `.all()`) is O(n^2) in the length of a
     // CR-author-controlled list, so any tenant that can write a CR against this CRD could
     // grow that list until the rule takes arbitrarily long to evaluate — without a budget
@@ -8874,6 +8957,98 @@ mod tests {
             "the rejection must identify itself as the CEL cost-budget defense, not a \
              generic validation failure (got: {})",
             err.1.message
+        );
+    }
+
+    // Before this fix, `execute_cel_with_budget` spawned a brand-new OS thread for every
+    // over-budget rule with no cap on how many could be alive at once -- each individual
+    // request still returned in ~CEL_RULE_EVAL_BUDGET, but a flood of concurrent writes
+    // each carrying a pathological CEL rule left one abandoned, CPU-bound thread running
+    // per rejection, unboundedly. `ConcurrencyGate` is what now bounds that. Uses a small
+    // local cap (not the real, process-wide `CEL_EVAL_THREAD_GATE`, which every
+    // concurrently-running request's CEL evaluation -- including every other test in this
+    // file -- also relies on) so this test can't spuriously reject unrelated evaluations.
+    #[test]
+    fn concurrency_gate_bounds_holders_and_rejects_excess_acquires() {
+        use std::sync::Barrier;
+
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(3);
+        const N: usize = 3 + 5; // deliberately oversubscribe the cap by 5
+
+        let barrier = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    GATE.try_acquire()
+                })
+            })
+            .collect();
+        let acquired = handles
+            .into_iter()
+            .map(|h| h.join().expect("racer thread must not panic"))
+            .filter(|ok| *ok)
+            .count();
+
+        assert_eq!(
+            acquired, 3,
+            "{N} concurrent racers against a cap of 3 must result in exactly 3 successful \
+             acquisitions, no more -- if more succeed, the check-then-increment isn't \
+             atomic and the cap is meaningless under real concurrency; if fewer, \
+             legitimate callers under the cap are being turned away for no reason"
+        );
+
+        // A released slot must be available to a later caller -- otherwise the gate would
+        // only ever fill up and eventually reject every future evaluation, not just ones
+        // concurrent with an existing backlog.
+        GATE.release();
+        assert!(
+            GATE.try_acquire(),
+            "releasing a held slot must make the gate accept a new acquisition again"
+        );
+    }
+
+    // `execute_cel_with_budget` is the function the reviewed finding was raised against
+    // directly: it must refuse to spawn another thread once its gate is saturated
+    // (returning `TooManyInFlight` instead of ever calling `std::thread::spawn`), and
+    // must resume normal evaluation as soon as a slot frees up. Exercised with a small,
+    // local gate injected via the `gate` parameter, for the same reason as the test
+    // above: this must not touch the real, process-wide `CEL_EVAL_THREAD_GATE`.
+    #[test]
+    fn execute_cel_with_budget_rejects_outright_once_its_gate_is_saturated() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        let program = std::sync::Arc::new(cel::Program::compile("true").unwrap());
+
+        // Saturate the gate directly -- the gate doesn't care who holds the slot, so
+        // there's no need to actually run a slow CEL rule to occupy it.
+        assert!(GATE.try_acquire(), "gate must start with a free slot");
+
+        let over_budget = execute_cel_with_budget(
+            &program,
+            cel::Context::default(),
+            CEL_RULE_EVAL_BUDGET,
+            &GATE,
+        );
+        assert!(
+            matches!(over_budget, Err(CelEvalOverBudget::TooManyInFlight)),
+            "with the gate already saturated, a new evaluation must be rejected outright \
+             via TooManyInFlight -- this is the whole point of the fix: reject instead of \
+             spawning yet another (potentially abandoned) thread once the cap is reached"
+        );
+
+        GATE.release();
+        let result = execute_cel_with_budget(
+            &program,
+            cel::Context::default(),
+            CEL_RULE_EVAL_BUDGET,
+            &GATE,
+        );
+        assert!(
+            matches!(result, Ok(Ok(cel::Value::Bool(true)))),
+            "once the gate has a free slot again, evaluation must proceed and succeed \
+             exactly as it did before this fix -- the cap must not permanently wedge \
+             evaluation after a burst subsides"
         );
     }
 
