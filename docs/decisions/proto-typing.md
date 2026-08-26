@@ -58,7 +58,7 @@ pass parsing upstream proto `//` comments into the generated types) without
 hand-authoring everything. If deep in-code k8s documentation becomes a priority,
 revisit that as an add-on to A — not as a reason to choose B.
 
-## Key facts (from the research, ai/findings/)
+## Key facts (from prior research)
 - `k8s-proto-schema-churn-1.34-1.36-2026-07-03.md`: upstream GA proto is
   addition-dominated — 55 field additions, 0 breaking changes across 1.34→1.36.
   The one "removal" was an alpha field (`WorkloadReference` #42) that lasted one
