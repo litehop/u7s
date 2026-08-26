@@ -17,7 +17,10 @@ see `docs/decisions/upstream-component-shipping-shape.md` -- and lives at
 `crates/apiserver/manifests/metrics-server.yaml` instead, for users to apply
 themselves).
 
-CoreDNS (`coredns.yaml`) is the first component to land here, moved off its
-former `include_bytes!` compile-time embed (mayor-fiq79). kube-proxy and
-Flannel are still `install.sh` heredocs; migrating each onto this mechanism
-is separate follow-on work (mayor-73lqh, mayor-fptqu).
+CoreDNS (`coredns.yaml`), moved off its former `include_bytes!` compile-time
+embed (mayor-fiq79), joins `flannel.yaml` (`__IFACE__`,
+`__POD_CLUSTER_CIDR__`) and `kube-proxy.yaml` (`__KUBE_VERSION__`,
+`__IFACE_IP__`) here. The latter two each carry install-time placeholders
+`scripts/install.sh` substitutes before writing them to
+`--manifest-output-dir` -- see each file's own header comment for what every
+placeholder substitutes to.

@@ -1490,7 +1490,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "metadata": { "name": "system:bootstrap-installer", "uid": "00000000-0000-0000-0000-000000000079", "creationTimestamp": TS },
         "rules": [
             { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles","clusterrolebindings"], "verbs": ["get","create","patch","update"] },
-            { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services"], "verbs": ["get","create","patch","update"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts","configmaps","services","namespaces"], "verbs": ["get","create","patch","update"] },
             { "apiGroups": ["apps"], "resources": ["deployments","daemonsets"], "verbs": ["get","create","patch","update"] }
         ]
     });

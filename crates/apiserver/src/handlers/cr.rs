@@ -779,7 +779,15 @@ fn validate_cr_schema(
             let index = compiler
                 .compile("schema.json", &mut schemas)
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let compiled = std::sync::Arc::new(crate::state::CompiledCrSchema { schemas, index });
+            let mut cel_programs = std::collections::HashMap::new();
+            collect_cel_programs(schema, &mut cel_programs);
+            #[cfg(test)]
+            cache.record_cel_compiles(cel_programs.len());
+            let compiled = std::sync::Arc::new(crate::state::CompiledCrSchema {
+                schemas,
+                index,
+                cel_programs,
+            });
             cache.insert(ctx.schema_cache_key.clone(), compiled.clone());
             compiled
         }
@@ -801,7 +809,74 @@ fn validate_cr_schema(
     // rule like `self.foo > 0` against a body that doesn't even have `foo` typed as a
     // number yet produces confusing CEL runtime errors instead of the clearer boon
     // "wrong type" error above.
-    validate_cel_rules(schema, obj, old_object, "")
+    validate_cel_rules(schema, obj, old_object, "", &compiled.cel_programs)
+}
+
+/// Walks `schema` collecting a pre-compiled `cel::Program` for every unique
+/// `x-kubernetes-validations` `rule`/`messageExpression` CEL source string reachable from
+/// it, so `validate_cel_rules`'s per-request walk never needs to call
+/// `cel::Program::compile` for a schema whose CRD generation is already cached — see
+/// `CrSchemaCache`/`CompiledCrSchema::cel_programs`. Compiling is a pure function of the
+/// source text, so two rules with identical text (anywhere in the schema, including
+/// across different `oneOf`/`anyOf` branches) share one compiled program.
+///
+/// Unlike `validate_cel_rules`'s data-driven walk (which only follows the `oneOf`/`anyOf`
+/// branch(es) a given object actually matches), this walks every branch of every
+/// combinator unconditionally — it has no object to test against, and a request against a
+/// different branch later must still hit a warm cache. A source string that fails to
+/// compile is simply omitted here; `evaluate_cel_rule`/`evaluate_message_expression`
+/// re-attempt (and re-fail with the same message) on the resulting cache miss, so error
+/// behavior is unaffected by this being a best-effort prewarm.
+fn collect_cel_programs(
+    schema: &serde_json::Value,
+    out: &mut std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+) {
+    if let Some(rules) = schema
+        .get("x-kubernetes-validations")
+        .and_then(|v| v.as_array())
+    {
+        for rule in rules {
+            for key in ["rule", "messageExpression"] {
+                if let Some(text) = rule.get(key).and_then(|v| v.as_str()) {
+                    if !out.contains_key(text) {
+                        if let Ok(program) = cel::Program::compile(text) {
+                            out.insert(text.to_string(), std::sync::Arc::new(program));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for sub_schema in props.values() {
+            collect_cel_programs(sub_schema, out);
+        }
+    }
+    if let Some(items_schema) = schema.get("items") {
+        collect_cel_programs(items_schema, out);
+    }
+    for combinator in ["allOf", "oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
+            for branch in branches {
+                collect_cel_programs(branch, out);
+            }
+        }
+    }
+}
+
+/// Returns the pre-compiled program for `text` from `programs` — the common case once a
+/// CRD generation's schema is cached, see `collect_cel_programs` — or compiles it fresh.
+/// The fallback only runs on a genuine cache miss, or when `text` failed to compile during
+/// the schema walk (in which case the same compile error is reproduced here rather than
+/// silently swallowed).
+fn resolve_cel_program(
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    text: &str,
+) -> Result<std::sync::Arc<cel::Program>, cel::ParseErrors> {
+    if let Some(program) = programs.get(text) {
+        return Ok(std::sync::Arc::clone(program));
+    }
+    cel::Program::compile(text).map(std::sync::Arc::new)
 }
 
 /// Recursively evaluate `x-kubernetes-validations` CEL rules declared anywhere in
@@ -820,13 +895,14 @@ fn validate_cel_rules(
     obj: &serde_json::Value,
     old_node: Option<&serde_json::Value>,
     field_path: &str,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Result<(), crate::status::StatusError> {
     if let Some(rules) = schema
         .get("x-kubernetes-validations")
         .and_then(|v| v.as_array())
     {
         for rule in rules {
-            evaluate_cel_rule(rule, obj, old_node, field_path)?;
+            evaluate_cel_rule(rule, obj, old_node, field_path, programs)?;
         }
     }
 
@@ -840,6 +916,7 @@ fn validate_cel_rules(
                         child,
                         child_old,
                         &join_cr_field_path(field_path, key),
+                        programs,
                     )?;
                 }
             }
@@ -848,7 +925,13 @@ fn validate_cel_rules(
         if let Some(arr) = obj.as_array() {
             for (i, item) in arr.iter().enumerate() {
                 let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
-                validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+                validate_cel_rules(
+                    items_schema,
+                    item,
+                    item_old,
+                    &format!("{field_path}[{i}]"),
+                    programs,
+                )?;
             }
         }
     }
@@ -862,14 +945,14 @@ fn validate_cel_rules(
     // "no such key" CEL error), not produce a meaningful pass/fail.
     if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
         for branch in branches {
-            validate_cel_rules(branch, obj, old_node, field_path)?;
+            validate_cel_rules(branch, obj, old_node, field_path, programs)?;
         }
     }
     for combinator in ["oneOf", "anyOf"] {
         if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
             for branch in branches {
                 if schema_branch_structurally_matches(branch, obj) {
-                    validate_cel_rules(branch, obj, old_node, field_path)?;
+                    validate_cel_rules(branch, obj, old_node, field_path, programs)?;
                 }
             }
         }
@@ -918,6 +1001,124 @@ fn schema_branch_structurally_matches(branch: &serde_json::Value, obj: &serde_js
     true
 }
 
+/// Wall-clock budget for evaluating a single CEL rule or `messageExpression`. Upstream
+/// kube-apiserver rejects over-budget CEL rules at CRD admission time via a static
+/// per-rule "estimated cost" analysis (k8s.io/apiserver/pkg/cel cost estimation); u7s has
+/// no equivalent static cost estimator, so this bounds the same risk — a CRD-author-
+/// supplied rule with unbounded runtime cost (e.g. a `.matches()` call against a
+/// pathological regex, or a nested `.all()`/`.filter()` comprehension over a large
+/// CR-author-controlled list) — at the point it actually runs, on every CR write, rather
+/// than trying to predict its cost statically. Mirrors `walk_schema_dos_bounds` (crd.rs),
+/// which bounds the equivalent risk for boon schema compilation.
+const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Caps how many `execute_cel_with_budget` threads may be alive at once. Each thread
+/// that outlives `CEL_RULE_EVAL_BUDGET` is abandoned (see below) rather than joined, so
+/// without a cap a flood of concurrent writes carrying a pathological CEL rule could
+/// still exhaust host threads/CPU even though each individual request keeps returning
+/// in ~`CEL_RULE_EVAL_BUDGET`. A legitimate cluster should essentially never hit this —
+/// it only bounds a sustained attempt to spawn many over-budget evaluations at once.
+const MAX_CONCURRENT_CEL_EVAL_THREADS: usize = 24;
+
+/// Bounds how many owners may hold a slot at once, rejecting new acquisitions outright
+/// once the cap is reached instead of letting the count grow without bound. A plain
+/// struct (rather than a bare static counter) so the bounding behavior can be exercised
+/// directly in a test with its own small, local cap — the real, process-wide gate below
+/// is shared by every concurrent request's CEL evaluation, so a test that saturated it
+/// (even briefly) would spuriously reject unrelated evaluations running at the same time.
+struct ConcurrencyGate {
+    in_flight: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl ConcurrencyGate {
+    const fn new(cap: usize) -> Self {
+        Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Reserves a slot and returns `true`, or returns `false` if the cap has already
+    /// been reached. On `false` no slot is held, so the caller must not call `release`.
+    fn try_acquire(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) >= self.cap {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn release(&self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The process-wide gate every `execute_cel_with_budget` call reserves a slot from.
+static CEL_EVAL_THREAD_GATE: ConcurrencyGate =
+    ConcurrencyGate::new(MAX_CONCURRENT_CEL_EVAL_THREADS);
+
+/// Releases a `ConcurrencyGate` slot on `Drop`, so the slot is freed whether the guarded
+/// scope returns normally or unwinds from a panic. `execute_cel_with_budget`'s spawned
+/// thread runs an untrusted, CRD-author-supplied CEL rule via `cel::Program::execute`,
+/// which has reachable `panic!` sites in the `cel` crate's evaluator (e.g. cel 0.14.3
+/// `objects.rs:1546`, `:1467`). A manually-placed `gate.release()` call *after*
+/// `execute()` would be skipped by such a panic, permanently leaking the slot -- enough
+/// leaked panics wedge `CEL_EVAL_THREAD_GATE` for every future CR write's CEL
+/// validation, the exact DoS this file exists to prevent, just triggered by malformed
+/// input instead of slow input.
+struct GateGuard<'a>(&'a ConcurrencyGate);
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Marker: a CEL evaluation was rejected without running to completion — either it did
+/// not finish within `CEL_RULE_EVAL_BUDGET`, or evaluation was refused outright because
+/// `MAX_CONCURRENT_CEL_EVAL_THREADS` other over-budget evaluations are already in flight.
+enum CelEvalOverBudget {
+    TimedOut,
+    TooManyInFlight,
+}
+
+/// Runs `program` against `cel_ctx` on a dedicated thread, bounded by `budget` wall-clock
+/// time, so a CEL expression with unbounded runtime cost cannot hang the request-handling
+/// thread indefinitely (see `CEL_RULE_EVAL_BUDGET`). The `cel` crate's interpreter has no
+/// cooperative cancellation hook, so this is the only way to bound wall-clock time without
+/// risking undefined behavior from force-killing a thread; every CEL expression is
+/// guaranteed to terminate (the language has no unbounded loops), so an abandoned
+/// over-budget thread still exits on its own eventually — this only bounds how long a
+/// single request waits for it. `gate` (production callers always pass
+/// `CEL_EVAL_THREAD_GATE`) separately bounds how many such abandoned threads may
+/// accumulate at once; it's a parameter rather than reaching for that static directly so
+/// tests can inject a small, local gate instead of saturating the real, process-wide one
+/// (which every concurrently-running request's CEL evaluation also relies on).
+fn execute_cel_with_budget(
+    program: &std::sync::Arc<cel::Program>,
+    cel_ctx: cel::Context<'static>,
+    budget: std::time::Duration,
+    gate: &'static ConcurrencyGate,
+) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
+    if !gate.try_acquire() {
+        return Err(CelEvalOverBudget::TooManyInFlight);
+    }
+
+    let program = std::sync::Arc::clone(program);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _guard = GateGuard(gate);
+        let result = program.execute(&cel_ctx);
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(budget)
+        .map_err(|_| CelEvalOverBudget::TimedOut)
+}
+
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
 /// messageExpression, reason, fieldPath, optionalOldSelf}`, per the CRD-storage
 /// round-trip in `apiextensions_gen_adapter.rs`) against `self_value`, optionally
@@ -927,12 +1128,13 @@ fn evaluate_cel_rule(
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
     field_path: &str,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Result<(), crate::status::StatusError> {
     let Some(rule_text) = rule.get("rule").and_then(|v| v.as_str()) else {
         return Ok(());
     };
 
-    let program = cel::Program::compile(rule_text).map_err(|e| {
+    let program = resolve_cel_program(programs, rule_text).map_err(|e| {
         Status::unprocessable_entity(format!(
             "{field_path}: x-kubernetes-validations rule does not compile: {e} (rule: {rule_text})"
         ))
@@ -949,20 +1151,39 @@ fn evaluate_cel_rule(
             .map_err(|e| Status::internal(format!("CEL: failed to bind oldSelf: {e}")))?;
     }
 
-    let result = match program.execute(&cel_ctx) {
-        Ok(v) => v,
+    let result = match execute_cel_with_budget(
+        &program,
+        cel_ctx,
+        CEL_RULE_EVAL_BUDGET,
+        &CEL_EVAL_THREAD_GATE,
+    ) {
+        Err(CelEvalOverBudget::TimedOut) => {
+            return Err(Status::unprocessable_entity(format!(
+                "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
+                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost \
+                 (rule: {rule_text})"
+            )));
+        }
+        Err(CelEvalOverBudget::TooManyInFlight) => {
+            return Err(Status::unprocessable_entity(format!(
+                "{field_path}: too many x-kubernetes-validations rules are currently \
+                 exceeding their evaluation time budget — rejecting to bound concurrent CEL \
+                 evaluation cost (rule: {rule_text})"
+            )));
+        }
+        Ok(Ok(v)) => v,
         // `oldSelf` is only meaningful on UPDATE, when the field being validated also
         // existed in the previous object — upstream skips (does not fail) a rule that
         // references `oldSelf` in every other case, e.g. CREATE, or a newly-added field.
         // We don't bind `oldSelf` in those cases, so the interpreter reports it as an
         // undeclared reference; that specific error means "not applicable here", not
         // "the rule failed".
-        Err(cel::ExecutionError::UndeclaredReference(ref name))
+        Ok(Err(cel::ExecutionError::UndeclaredReference(ref name)))
             if old_self_value.is_none() && name.as_str() == "oldSelf" =>
         {
             return Ok(());
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule failed to evaluate: {e} (rule: {rule_text})"
             )));
@@ -982,7 +1203,7 @@ fn evaluate_cel_rule(
         return Ok(());
     }
 
-    let detail = cel_rule_failure_detail(rule, rule_text, self_value, old_self_value);
+    let detail = cel_rule_failure_detail(rule, rule_text, self_value, old_self_value, programs);
     let value_prefix = match self_value {
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => String::new(),
         other => format!("\"{}\": ", json_value_as_display_string(other)),
@@ -1001,6 +1222,7 @@ fn cel_rule_failure_detail(
     rule_text: &str,
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> String {
     if let Some(msg) = rule
         .get("message")
@@ -1011,7 +1233,9 @@ fn cel_rule_failure_detail(
         return msg.to_string();
     }
     if let Some(expr) = rule.get("messageExpression").and_then(|v| v.as_str()) {
-        if let Some(rendered) = evaluate_message_expression(expr, self_value, old_self_value) {
+        if let Some(rendered) =
+            evaluate_message_expression(expr, self_value, old_self_value, programs)
+        {
             return rendered;
         }
     }
@@ -1028,15 +1252,24 @@ fn evaluate_message_expression(
     expr: &str,
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Option<String> {
-    let program = cel::Program::compile(expr).ok()?;
+    let program = resolve_cel_program(programs, expr).ok()?;
     let mut cel_ctx = cel::Context::default();
     register_cel_string_extensions(&mut cel_ctx);
     cel_ctx.add_variable("self", self_value).ok()?;
     if let Some(old) = old_self_value {
         cel_ctx.add_variable("oldSelf", old).ok()?;
     }
-    match program.execute(&cel_ctx).ok()? {
+    match execute_cel_with_budget(
+        &program,
+        cel_ctx,
+        CEL_RULE_EVAL_BUDGET,
+        &CEL_EVAL_THREAD_GATE,
+    )
+    .ok()?
+    .ok()?
+    {
         cel::Value::String(s) => {
             let s = s.trim();
             (!s.is_empty() && !s.contains('\n')).then(|| s.to_string())
@@ -7518,6 +7751,78 @@ mod tests {
         );
     }
 
+    // The same amplification risk applies to x-kubernetes-validations CEL rules: without
+    // caching the pre-parsed cel::Program, a CRD with even a handful of CEL rules would
+    // re-run cel::Program::compile (and the schema walk that finds every rule) on every
+    // single CR create/update/patch, forever, even though the CRD's schema never changed.
+    // A dedicated CEL compile counter (not the boon one above, and not timing — a real CEL
+    // parse is fast enough that a timing assertion would be flaky) so a regression that
+    // moves CEL compilation back onto the per-request path is caught even if it doesn't
+    // touch boon compilation at all.
+    #[test]
+    fn cr_schema_cache_avoids_cel_reparse_on_repeated_writes_against_same_crd_version() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": { "type": "object" } },
+            "x-kubernetes-validations": [
+                { "rule": "self.spec == self.spec" }
+            ]
+        });
+        let ctx = CrContext {
+            kind: "Test".into(),
+            namespaced: false,
+            has_status_subresource: false,
+            schema: Some(schema),
+            conversion_webhook_client_config: None,
+            selectable_fields: vec![],
+            schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
+            scale: None,
+        };
+        let cache = crate::state::CrSchemaCache::new();
+        let value = serde_json::json!({ "spec": {} });
+
+        assert!(
+            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            "first write must validate"
+        );
+        assert!(
+            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            "second write must validate"
+        );
+
+        assert_eq!(
+            cache.cel_compile_count(),
+            1,
+            "a second CR write against the same CRD generation must reuse the CEL program \
+             pre-parsed during the first write's schema walk, not call cel::Program::compile \
+             again for every rule on every write"
+        );
+    }
+
+    // `resolve_cel_program` is the single choke point every rule/messageExpression
+    // evaluation goes through to obtain a `cel::Program` (see `evaluate_cel_rule`,
+    // `evaluate_message_expression`). This unit-tests that choke point directly: given a
+    // pre-parsed entry, it must hand back that SAME `Arc` rather than silently parsing a
+    // lookalike — `Arc::ptr_eq`, not just value equality (`cel::Program` has no
+    // `PartialEq`), is the only way to observe "no fresh compile happened" here.
+    #[test]
+    fn resolve_cel_program_reuses_cached_arc_instead_of_reparsing() {
+        let text = "self == self";
+        let cached = std::sync::Arc::new(cel::Program::compile(text).unwrap());
+        let mut programs = std::collections::HashMap::new();
+        programs.insert(text.to_string(), std::sync::Arc::clone(&cached));
+
+        let resolved = resolve_cel_program(&programs, text)
+            .expect("a cache-hit lookup for already-compiled text must not fail");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&cached, &resolved),
+            "a cache hit must return the exact Arc<cel::Program> collected during the schema \
+             walk, not a freshly re-parsed one — otherwise every CR write would still pay \
+             cel::Program::compile's cost despite CompiledCrSchema::cel_programs existing"
+        );
+    }
+
     // If the cache ever failed to distinguish CRD generations (e.g. keyed on group+version
     // only, ignoring resourceVersion), a CR write following a legitimate CRD schema update
     // would silently validate against the OLD schema forever — a correctness bug, not just a
@@ -8612,6 +8917,193 @@ mod tests {
             "malformed CEL must reject the CR with a compile-error message, not silently \
              accept it (got: {})",
             err.1.message
+        );
+    }
+
+    // A CRD author's rule has no static cost bound (unlike upstream, which rejects an
+    // over-cost rule at CRD admission via a static estimator). A nested
+    // list comprehension (`.all()` inside `.all()`) is O(n^2) in the length of a
+    // CR-author-controlled list, so any tenant that can write a CR against this CRD could
+    // grow that list until the rule takes arbitrarily long to evaluate — without a budget
+    // this would hang the request-handling thread indefinitely instead of ever responding.
+    // This proves the write is REJECTED once evaluation exceeds CEL_RULE_EVAL_BUDGET,
+    // mirroring `validate_cr_schema_defense_in_depth_rejects_oversized_pattern...` above
+    // for the equivalent boon-schema risk. The hard wall-clock cap on the assertion below
+    // is what makes this a safe regression test: the list is sized so the full O(n^2)
+    // comparison would take single-digit seconds if ever finished (calibrated separately),
+    // but the budget must abandon it and return within CEL_RULE_EVAL_BUDGET, so the test
+    // itself finishes in a small fraction of a second — a test that took as long as the
+    // full computation would defeat the point of having a budget at all.
+    #[test]
+    fn cel_rule_exceeding_evaluation_budget_is_rejected_not_left_to_hang() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "x-kubernetes-validations": [
+                        { "rule": "self.all(x, self.all(y, x + y >= 0))" }
+                    ]
+                }
+            }
+        });
+        // Calibrated to take ~4s to run to completion uninstrumented (n=2000, 4,000,000
+        // comprehension steps) — comfortably over CEL_RULE_EVAL_BUDGET (250ms) even on
+        // slower CI hardware, while the abandoned evaluation thread never blocks this test.
+        let items: Vec<i64> = (0..2000).collect();
+        let value = serde_json::json!({ "items": items });
+
+        let start = std::time::Instant::now();
+        let err = check_schema(&value, schema).expect_err(
+            "a CEL rule whose cost scales with a CR-author-controlled list must be rejected \
+             once it exceeds the evaluation time budget, not accepted after silently running \
+             unbounded work",
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the whole point of the budget is to bound how long a single request waits for a \
+             runaway CEL rule — this took {elapsed:?}, which means the timeout mechanism \
+             itself did not fire (it should reject in ~CEL_RULE_EVAL_BUDGET, not run the full \
+             O(n^2) comprehension to completion)"
+        );
+        assert!(
+            err.1.message.contains("evaluation time budget"),
+            "the rejection must identify itself as the CEL cost-budget defense, not a \
+             generic validation failure (got: {})",
+            err.1.message
+        );
+    }
+
+    // Before this fix, `execute_cel_with_budget` spawned a brand-new OS thread for every
+    // over-budget rule with no cap on how many could be alive at once -- each individual
+    // request still returned in ~CEL_RULE_EVAL_BUDGET, but a flood of concurrent writes
+    // each carrying a pathological CEL rule left one abandoned, CPU-bound thread running
+    // per rejection, unboundedly. `ConcurrencyGate` is what now bounds that. Uses a small
+    // local cap (not the real, process-wide `CEL_EVAL_THREAD_GATE`, which every
+    // concurrently-running request's CEL evaluation -- including every other test in this
+    // file -- also relies on) so this test can't spuriously reject unrelated evaluations.
+    #[test]
+    fn concurrency_gate_bounds_holders_and_rejects_excess_acquires() {
+        use std::sync::Barrier;
+
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(3);
+        const N: usize = 3 + 5; // deliberately oversubscribe the cap by 5
+
+        let barrier = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    GATE.try_acquire()
+                })
+            })
+            .collect();
+        let acquired = handles
+            .into_iter()
+            .map(|h| h.join().expect("racer thread must not panic"))
+            .filter(|ok| *ok)
+            .count();
+
+        assert_eq!(
+            acquired, 3,
+            "{N} concurrent racers against a cap of 3 must result in exactly 3 successful \
+             acquisitions, no more -- if more succeed, the check-then-increment isn't \
+             atomic and the cap is meaningless under real concurrency; if fewer, \
+             legitimate callers under the cap are being turned away for no reason"
+        );
+
+        // A released slot must be available to a later caller -- otherwise the gate would
+        // only ever fill up and eventually reject every future evaluation, not just ones
+        // concurrent with an existing backlog.
+        GATE.release();
+        assert!(
+            GATE.try_acquire(),
+            "releasing a held slot must make the gate accept a new acquisition again"
+        );
+    }
+
+    // `execute_cel_with_budget` is the function the reviewed finding was raised against
+    // directly: it must refuse to spawn another thread once its gate is saturated
+    // (returning `TooManyInFlight` instead of ever calling `std::thread::spawn`), and
+    // must resume normal evaluation as soon as a slot frees up. Exercised with a small,
+    // local gate injected via the `gate` parameter, for the same reason as the test
+    // above: this must not touch the real, process-wide `CEL_EVAL_THREAD_GATE`.
+    #[test]
+    fn execute_cel_with_budget_rejects_outright_once_its_gate_is_saturated() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        let program = std::sync::Arc::new(cel::Program::compile("true").unwrap());
+
+        // Saturate the gate directly -- the gate doesn't care who holds the slot, so
+        // there's no need to actually run a slow CEL rule to occupy it.
+        assert!(GATE.try_acquire(), "gate must start with a free slot");
+
+        let over_budget = execute_cel_with_budget(
+            &program,
+            cel::Context::default(),
+            CEL_RULE_EVAL_BUDGET,
+            &GATE,
+        );
+        assert!(
+            matches!(over_budget, Err(CelEvalOverBudget::TooManyInFlight)),
+            "with the gate already saturated, a new evaluation must be rejected outright \
+             via TooManyInFlight -- this is the whole point of the fix: reject instead of \
+             spawning yet another (potentially abandoned) thread once the cap is reached"
+        );
+
+        GATE.release();
+        let result = execute_cel_with_budget(
+            &program,
+            cel::Context::default(),
+            CEL_RULE_EVAL_BUDGET,
+            &GATE,
+        );
+        assert!(
+            matches!(result, Ok(Ok(cel::Value::Bool(true)))),
+            "once the gate has a free slot again, evaluation must proceed and succeed \
+             exactly as it did before this fix -- the cap must not permanently wedge \
+             evaluation after a burst subsides"
+        );
+    }
+
+    // Before this fix, `execute_cel_with_budget`'s spawned thread called `gate.release()`
+    // manually *after* `program.execute()` returned. The `cel` crate has reachable
+    // `panic!` sites in its evaluator (e.g. cel 0.14.3 objects.rs:1546, :1467), and a
+    // panic there would unwind straight past that manual release call, leaking the slot
+    // permanently. Enough leaked panics (up to `MAX_CONCURRENT_CEL_EVAL_THREADS`) would
+    // wedge `CEL_EVAL_THREAD_GATE` for every future CR write's CEL validation
+    // cluster-wide -- the exact DoS this file exists to prevent, just triggered by
+    // malformed/panicking CEL input instead of slow input. `GateGuard` fixes this by
+    // releasing on `Drop`, which Rust's unwind machinery runs even when the guarded
+    // scope panics (this workspace does not set `panic = "abort"`). Exercises
+    // `GateGuard` directly against a small local gate, mirroring the exact shape of the
+    // real spawned-thread body, rather than relying on the `cel` crate's internal panic
+    // sites to actually fire.
+    #[test]
+    fn gate_guard_releases_slot_even_when_guarded_scope_panics() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        assert!(GATE.try_acquire(), "gate must start with a free slot");
+
+        let panicked = std::thread::spawn(|| {
+            let _guard = GateGuard(&GATE);
+            panic!("simulated cel::Program::execute panic, e.g. cel 0.14.3 objects.rs:1546");
+        })
+        .join();
+
+        assert!(
+            panicked.is_err(),
+            "test setup bug: the spawned thread must actually panic to exercise the \
+             unwind path this test is checking"
+        );
+        assert!(
+            GATE.try_acquire(),
+            "a slot leaked across a panic inside the guarded region -- GateGuard's Drop \
+             must run gate.release() during unwinding, not only on normal return, or a \
+             handful of panicking CEL rules permanently wedges the process-wide gate and \
+             blocks every future CR write's CEL validation"
         );
     }
 
