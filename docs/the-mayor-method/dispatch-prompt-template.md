@@ -233,9 +233,8 @@ minutes per iteration:
 
 **Warm vs. cold cache — this is the number that actually matters for Bash
 timeouts.** As-of measurements (12-core Apple Silicon Mac, mayor-ektcp audit,
-2026-08-17 — full breakdown in `ai/findings/cargo-test-perf-audit-2026-08-17.md`,
-gitignored, not in the committed tree; expect drift as the workspace grows or
-on different hardware — treat as a range, not a promise):
+2026-08-17; expect drift as the workspace grows or on different hardware —
+treat as a range, not a promise):
 
 - **Warm cache** (target/ already built by a prior `cargo test`/`cargo build`
   in the SAME worktree, e.g. your own step-3 run below): `cargo test
