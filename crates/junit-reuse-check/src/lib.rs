@@ -27,9 +27,19 @@ pub struct JunitSummary {
     pub focus_strings: String,
     pub failures: u64,
     pub errors: u64,
-    /// The `<testsuite timestamp="...">` attribute, forwarded verbatim (not
-    /// reparsed) to `git log --since=<timestamp>` by callers -- see
-    /// `GitFreshnessCheck`.
+    /// The `<testsuite timestamp="...">` attribute, e.g.
+    /// `"2026-08-26T04:32:14"` -- ginkgo/sonobuoy emit this with NO UTC
+    /// offset. It is forwarded to `git log --since=<timestamp>` by
+    /// `GitFreshnessCheck`, which appends an explicit `+00:00` before doing
+    /// so (see `git_log_since_is_empty`): the sonobuoy e2e pod runs with no
+    /// TZ override on a stock Ubuntu-cloud-image Lima VM (both default to
+    /// UTC -- see lima/kubelet.yaml and scripts/conformance/04-start-kcm.sh's
+    /// own explicit `TZ=UTC`), so this value denotes UTC wall-clock time.
+    /// Treating it as bare/local would make `git --since` resolve it in
+    /// whatever timezone the machine RUNNING THE HOOK happens to be
+    /// configured for -- which is the HOST, not the VM that generated the
+    /// timestamp -- silently shifting the freshness cutoff by the host/VM
+    /// offset on any host not itself set to UTC.
     pub timestamp: String,
 }
 
@@ -184,52 +194,82 @@ pub trait FreshnessCheck {
 /// Real `FreshnessCheck` backed by the actual git repository at `repo_root`.
 pub struct GitFreshnessCheck {
     pub repo_root: PathBuf,
+    /// The actual ref/SHA being pushed (git pre-push hook protocol's
+    /// `<local sha1>`), e.g. as read by `.githooks/pre-push`'s `while read
+    /// local_ref local_oid remote_ref remote_oid` loop. Deliberately NOT
+    /// derived from implicit `HEAD`: `HEAD` is whatever the checkout
+    /// happens to have out right now, which is NOT necessarily what's being
+    /// pushed -- e.g. `git push origin feature-b:main` while `main` is
+    /// checked out locally. Using implicit HEAD here would walk the WRONG
+    /// branch's history, making a real regression on the pushed branch
+    /// invisible to this freshness check.
+    pub pushed_ref: String,
 }
 
 impl FreshnessCheck for GitFreshnessCheck {
     fn is_fresh(&self, file: &str, since_timestamp: &str) -> Result<bool, String> {
-        if !git_diff_quiet(&self.repo_root, file)? {
+        if !git_diff_quiet(&self.repo_root, &self.pushed_ref, file)? {
             return Ok(false);
         }
-        git_log_since_is_empty(&self.repo_root, file, since_timestamp)
+        git_log_since_is_empty(&self.repo_root, &self.pushed_ref, file, since_timestamp)
     }
 }
 
-/// Runs `git diff --quiet HEAD -- <file>`. Ok(true) = no uncommitted changes
-/// to `file`. Any exit code other than 0/1 (git itself failing, e.g. not a
-/// repo) is an error, not a guess.
-fn git_diff_quiet(repo_root: &Path, file: &str) -> Result<bool, String> {
+/// Runs `git diff --quiet <pushed_ref> -- <file>`. Ok(true) = the working
+/// tree's current copy of `file` is identical to what's in `pushed_ref`'s
+/// tree for that path -- i.e. nothing about `file` has diverged from the
+/// commit actually being pushed. Any exit code other than 0/1 (git itself
+/// failing, e.g. not a repo or an unresolvable ref) is an error, not a
+/// guess.
+fn git_diff_quiet(repo_root: &Path, pushed_ref: &str, file: &str) -> Result<bool, String> {
     let status = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["diff", "--quiet", "HEAD", "--", file])
+        .args(["diff", "--quiet", pushed_ref, "--", file])
         .status()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
     match status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
         other => Err(format!(
-            "git diff --quiet HEAD -- {file} exited with unexpected code {other:?}"
+            "git diff --quiet {pushed_ref} -- {file} exited with unexpected code {other:?}"
         )),
     }
 }
 
-/// Runs `git log --since=<since_timestamp> --oneline -- <file>`. Ok(true) =
-/// no commit touching `file` landed on/after `since_timestamp` (the literal
-/// junit `timestamp` attribute, passed through verbatim -- see this module's
-/// doc comment on `JunitSummary::timestamp`).
+/// Runs `git log --since=<since_timestamp UTC> --oneline <pushed_ref> --
+/// <file>`. Ok(true) = no commit reachable from `pushed_ref` touched `file`
+/// on/after `since_timestamp`.
+///
+/// `since_timestamp` (the literal junit `timestamp` attribute -- see this
+/// module's doc comment on `JunitSummary::timestamp`) has no UTC offset, so
+/// an explicit `+00:00` is appended before handing it to git: `--since`
+/// resolves an offset-less string in the CALLING PROCESS's own local
+/// timezone, which is the host running this hook, not the VM that generated
+/// the timestamp. Without the explicit offset, a host not itself configured
+/// for UTC would silently shift the effective cutoff by the host/VM
+/// timezone difference -- in the worst case shifting it LATER, which can
+/// make a genuinely-stale result (a regression committed after the real
+/// cutoff) look fresh.
+///
+/// The revision is `pushed_ref`, not implicit `HEAD` -- see
+/// `GitFreshnessCheck::pushed_ref` doc comment for why that distinction is
+/// safety-critical here.
 fn git_log_since_is_empty(
     repo_root: &Path,
+    pushed_ref: &str,
     file: &str,
     since_timestamp: &str,
 ) -> Result<bool, String> {
+    let since_utc = format!("{since_timestamp}+00:00");
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .args([
             "log",
-            &format!("--since={since_timestamp}"),
+            &format!("--since={since_utc}"),
             "--oneline",
+            pushed_ref,
             "--",
             file,
         ])
@@ -237,7 +277,7 @@ fn git_log_since_is_empty(
         .map_err(|e| format!("failed to run git log: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "git log --since={since_timestamp} -- {file} exited with status {:?}: {}",
+            "git log --since={since_utc} {pushed_ref} -- {file} exited with status {:?}: {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -562,6 +602,284 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(find_junit_candidates(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- GitFreshnessCheck: real git subprocess -----------------------------
+    //
+    // Everything above drives select_reusable/is_clean_pass through the
+    // FakeFreshness stub. The tests below instead exercise the REAL
+    // GitFreshnessCheck against disposable sandbox git repos, because both
+    // bugs fixed here (wrong ref, wrong timezone) live entirely in exactly
+    // how git_diff_quiet/git_log_since_is_empty invoke `git` -- a fake would
+    // trivially "pass" either bug.
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "u7s-junit-reuse-check-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"))
+    }
+
+    fn init_repo(dir: &Path) {
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(dir)
+            .status()
+            .unwrap()
+            .success());
+        assert!(git(dir, &["config", "user.email", "test@example.com"])
+            .status
+            .success());
+        assert!(git(dir, &["config", "user.name", "Test"]).status.success());
+    }
+
+    /// Writes `file` with `contents` and commits it with the given
+    /// ISO-8601-with-offset author/committer date -- an explicit offset so
+    /// these fixture commit times are themselves immune to the ambient host
+    /// timezone, keeping every test below deterministic regardless of which
+    /// machine (or CI runner) it executes on.
+    fn commit_file(dir: &Path, file: &str, contents: &str, date_with_offset: &str, msg: &str) {
+        let path = dir.join(file);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        assert!(git(dir, &["add", file]).status.success());
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-q", "-m", msg])
+            .env("GIT_AUTHOR_DATE", date_with_offset)
+            .env("GIT_COMMITTER_DATE", date_with_offset)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn create_branch(dir: &Path, name: &str) {
+        assert!(git(dir, &["checkout", "-q", "-b", name]).status.success());
+    }
+
+    fn checkout(dir: &Path, ref_name: &str) {
+        assert!(git(dir, &["checkout", "-q", ref_name]).status.success());
+    }
+
+    fn rev_parse(dir: &Path, ref_name: &str) -> String {
+        let out = git(dir, &["rev-parse", ref_name]);
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn git_freshness_check_walks_pushed_ref_not_whatever_is_checked_out() {
+        // Reproduces the review's exact finding (PR #1408 review):
+        // `git push origin feature-b:some-remote-ref` while `main` is
+        // checked out locally must still see a regression committed to
+        // feature-b after the recorded junit run. A caller that (as this
+        // code used to) checks implicit HEAD instead of the actually-pushed
+        // ref would walk `main` -- which never got the regression commit --
+        // and wrongly report a stale result as reusable.
+        let dir = scratch_dir("wrong-ref");
+        init_repo(&dir);
+        let file = "sensitive.rs";
+        commit_file(&dir, file, "v1", "2026-08-26T04:00:00+00:00", "base");
+        create_branch(&dir, "feature-b");
+        // Regression: lands on feature-b only, after the recorded run.
+        commit_file(
+            &dir,
+            file,
+            "v2 -- regression",
+            "2026-08-26T05:00:00+00:00",
+            "regression",
+        );
+        let pushed_sha = rev_parse(&dir, "feature-b");
+        // The checked-out branch is NOT the one being pushed -- the exact
+        // divergence the review reproduced.
+        checkout(&dir, "main");
+
+        let recorded_at = "2026-08-26T04:30:00"; // between base and regression
+
+        let real = GitFreshnessCheck {
+            repo_root: dir.clone(),
+            pushed_ref: pushed_sha,
+        };
+        assert_eq!(
+            real.is_fresh(file, recorded_at),
+            Ok(false),
+            "a regression committed to the ref actually being pushed, after \
+             the recorded run, must never be reported fresh just because a \
+             different branch happens to be checked out"
+        );
+
+        // Sanity check proving this is genuinely the wrong-ref bug and not
+        // some other cause: implicit HEAD (main) truly has no such commit,
+        // which is exactly what made the bug invisible before this fix.
+        let buggy_via_head = GitFreshnessCheck {
+            repo_root: dir.clone(),
+            pushed_ref: "HEAD".to_string(),
+        };
+        assert_eq!(
+            buggy_via_head.is_fresh(file, recorded_at),
+            Ok(true),
+            "sanity check: HEAD (main) has no commit after the timestamp -- \
+             confirms checking HEAD instead of the pushed ref is what hid \
+             the regression"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_log_since_is_empty_walks_pushed_ref_history_even_when_working_tree_matches_head() {
+        // Isolates the git-log half of the wrong-ref bug from the git-diff
+        // half: feature-b's file content nets back to the SAME bytes as
+        // main's (so a plain content comparison can't tell the branches
+        // apart), but feature-b's own history still has a commit to `file`
+        // landing after the recorded timestamp. Only walking the PUSHED
+        // ref's log (not HEAD's) can catch this.
+        let dir = scratch_dir("log-ref");
+        init_repo(&dir);
+        let file = "sensitive.rs";
+        commit_file(&dir, file, "v1", "2026-08-26T04:00:00+00:00", "base");
+        create_branch(&dir, "feature-b");
+        commit_file(&dir, file, "v2", "2026-08-26T05:00:00+00:00", "touch-1");
+        commit_file(
+            &dir,
+            file,
+            "v1",
+            "2026-08-26T05:30:00+00:00",
+            "touch-2-reverts-to-v1",
+        );
+        let pushed_sha = rev_parse(&dir, "feature-b");
+        checkout(&dir, "main"); // main's tree for `file` is also "v1"
+
+        let recorded_at = "2026-08-26T04:30:00";
+
+        assert_eq!(
+            git_log_since_is_empty(&dir, &pushed_sha, file, recorded_at),
+            Ok(false),
+            "two commits on the pushed ref touched `file` after the \
+             recorded run -- the pushed ref's own history is not covered \
+             by that run even though its net file content happens to match \
+             HEAD's"
+        );
+        assert_eq!(
+            git_log_since_is_empty(&dir, "HEAD", file, recorded_at),
+            Ok(true),
+            "sanity check: HEAD (main) has no such commits in its own \
+             history -- confirms walking the wrong ref is what would have \
+             hidden this"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restores a possibly-unset `TZ` env var on drop, so the process-wide
+    /// mutation the timezone test below needs can never leak into later
+    /// tests even on assertion panic. Safe to mutate process-wide `TZ` here
+    /// specifically because every OTHER test in this file that spawns real
+    /// git either never calls `--since` at all, or (after this fix) always
+    /// passes an explicit `+00:00`-suffixed timestamp and explicit-offset
+    /// commit dates -- none of them depend on the ambient timezone, so a
+    /// concurrently-running test can't be perturbed by this one flipping it.
+    struct TzGuard(Option<String>);
+    impl TzGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("TZ").ok();
+            std::env::set_var("TZ", value);
+            Self(prev)
+        }
+    }
+    impl Drop for TzGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("TZ", v),
+                None => std::env::remove_var("TZ"),
+            }
+        }
+    }
+
+    #[test]
+    fn git_log_since_is_empty_treats_bare_timestamp_as_utc_not_host_local() {
+        // Reproduces the review's second finding: a bare junit timestamp
+        // (no UTC offset) handed straight to `git --since` is resolved in
+        // the CALLING PROCESS's local timezone. Ginkgo/sonobuoy generate it
+        // inside the Lima VM (UTC, see JunitSummary::timestamp doc), but
+        // this check runs on the host -- a host set 8 hours west of UTC
+        // shifts the effective cutoff 8 hours LATER, which can hide a
+        // regression that landed strictly after the real cutoff but before
+        // the miscalculated one: exactly the dangerous "stale looks fresh"
+        // direction the review called out.
+        //
+        // TZ="XXX8" is a POSIX (not IANA) zone spec -- no zoneinfo database
+        // lookup needed, so this is deterministic on any machine running
+        // this test, matching the review's own "reproduced under a
+        // JST-vs-UTC mismatch" methodology without depending on the actual
+        // host's real configured zone.
+        let _tz_guard = TzGuard::set("XXX8");
+
+        let dir = scratch_dir("tz");
+        init_repo(&dir);
+        let file = "sensitive.rs";
+        commit_file(&dir, file, "v1", "2026-08-26T04:00:00+00:00", "base");
+        // Regression lands 4 real-world hours after the recorded run below --
+        // a fresh-run-required case under ANY correct timezone handling.
+        commit_file(
+            &dir,
+            file,
+            "v2 -- regression",
+            "2026-08-26T08:00:00+00:00",
+            "regression",
+        );
+
+        // The literal, offset-less string ginkgo would have written.
+        let recorded_at = "2026-08-26T04:00:00";
+
+        assert_eq!(
+            git_log_since_is_empty(&dir, "HEAD", file, recorded_at),
+            Ok(false),
+            "the fix (appending +00:00 before calling git) must find the \
+             regression regardless of the host's local timezone -- if this \
+             fails, the UTC offset is no longer being applied"
+        );
+
+        // Empirically prove the bug this guards against, the same way the
+        // review did: the SAME bare timestamp, under the SAME host
+        // timezone, run through the pre-fix invocation shape (no appended
+        // offset) directly against real git.
+        let buggy = git(
+            &dir,
+            &[
+                "log",
+                &format!("--since={recorded_at}"),
+                "--oneline",
+                "--",
+                file,
+            ],
+        );
+        assert!(buggy.status.success());
+        assert!(
+            buggy.stdout.iter().all(u8::is_ascii_whitespace),
+            "sanity check: the pre-fix bare-timestamp invocation finds \
+             NEITHER commit under TZ=XXX8 (the bug: --since is pushed 8h \
+             later than intended, hiding a regression that landed only 4h \
+             after the real cutoff) -- confirms this is genuinely the \
+             timezone bug, not something else"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,7 +4,11 @@
 ///
 /// Usage:
 ///   u7s-junit-reuse-check --repo-root <path> --focus <string> \
-///       --file <path> [--file <path> ...]
+///       --ref <sha> --file <path> [--file <path> ...]
+///
+/// `--ref` must be the actual ref/SHA being pushed (git pre-push hook
+/// protocol's `<local sha1>`), never a caller-side stand-in for "whatever is
+/// checked out" -- see GitFreshnessCheck::pushed_ref in the lib for why.
 ///
 /// On success (a reusable result was found): prints its path to stdout on
 /// its own line, everything else to stderr, exits 0.
@@ -21,12 +25,13 @@ use u7s_junit_reuse_check::{
 };
 
 fn usage() -> &'static str {
-    "usage: u7s-junit-reuse-check --repo-root <path> --focus <string> --file <path> [--file <path> ...]"
+    "usage: u7s-junit-reuse-check --repo-root <path> --focus <string> --ref <sha> --file <path> [--file <path> ...]"
 }
 
 fn main() -> ExitCode {
     let mut repo_root: Option<PathBuf> = None;
     let mut focus: Option<String> = None;
+    let mut pushed_ref: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -46,6 +51,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--ref" => match args.next() {
+                Some(v) => pushed_ref = Some(v),
+                None => {
+                    eprintln!("error: --ref requires a value\n{}", usage());
+                    return ExitCode::FAILURE;
+                }
+            },
             "--file" => match args.next() {
                 Some(v) => files.push(v),
                 None => {
@@ -60,8 +72,11 @@ fn main() -> ExitCode {
         }
     }
 
-    let (Some(repo_root), Some(focus)) = (repo_root, focus) else {
-        eprintln!("error: --repo-root and --focus are required\n{}", usage());
+    let (Some(repo_root), Some(focus), Some(pushed_ref)) = (repo_root, focus, pushed_ref) else {
+        eprintln!(
+            "error: --repo-root, --focus, and --ref are required\n{}",
+            usage()
+        );
         return ExitCode::FAILURE;
     };
     if files.is_empty() {
@@ -118,6 +133,7 @@ fn main() -> ExitCode {
 
     let checker = GitFreshnessCheck {
         repo_root: repo_root.clone(),
+        pushed_ref,
     };
     match select_reusable(&candidates, &focus, &files, &checker) {
         Some(chosen) => {

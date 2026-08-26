@@ -35,6 +35,17 @@
 #      PATH when difft is installed (this dev machine); when difft is
 #      genuinely absent (e.g. a CI runner) this exercises the exact same
 #      code path with no simulation needed.
+#   F. A regression lands on the ref actually being pushed, but a DIFFERENT
+#      branch happens to be checked out locally (e.g. `git push
+#      origin main:some-ref` while a decoy branch is checked out) -> still
+#      rejected as non-reusable. This is an end-to-end check that this
+#      SCRIPT threads the real pushed SHA into u7s-junit-reuse-check's
+#      `--ref` (not the Rust crate's own unit tests, which can't catch a
+#      wiring mistake here -- e.g. forgetting to pass `--ref` at all would
+#      make u7s-junit-reuse-check silently fall back to checking out
+#      whatever HEAD happens to be, hiding this exact regression). Same
+#      cargo requirement/skip as C/D. See PR #1408 review for the original
+#      wrong-ref finding.
 #
 # Exits 0 if every scenario that could run PASSED (skips are reported but do
 # not fail the run); exits 1 on any assertion failure.
@@ -82,6 +93,20 @@ write_and_commit() {
   git -C "$dir" commit -q -m "$msg"
 }
 
+# Same as write_and_commit, but at an explicit author/committer date
+# (ISO-8601 WITH a UTC offset, so the fixture's own ordering is immune to
+# ambient host timezone) -- only scenario F needs precise control over
+# commit timing relative to a recorded junit timestamp; every other scenario
+# uses real wall-clock commit times.
+write_and_commit_at() {
+  local dir="$1" body="$2" msg="$3" date_with_offset="$4"
+  mkdir -p "$dir/$(dirname "$SENSITIVE_FILE")"
+  printf '%s' "$body" > "$dir/$SENSITIVE_FILE"
+  git -C "$dir" add -A
+  GIT_AUTHOR_DATE="$date_with_offset" GIT_COMMITTER_DATE="$date_with_offset" \
+    git -C "$dir" commit -q -m "$msg"
+}
+
 # Stages a junit_01.xml fixture under the layout
 # scripts/conformance/06-run-sonobuoy.sh writes real results to.
 write_junit_fixture() {
@@ -101,14 +126,20 @@ write_junit_fixture() {
   } > "$results_dir/junit_01.xml"
 }
 
-# Portable epoch->local-time-ISO conversion (no trailing offset -- matches
-# both a real ginkgo junit timestamp and what `git log --since=` expects for
-# a bare string: local time, not UTC). Same try-GNU-then-BSD-date fallback
-# idiom as scripts/conformance/test-watchdog-logic.sh.
-epoch_to_local_iso() {
+# Portable epoch->UTC-ISO conversion, no trailing offset -- matches a real
+# ginkgo junit timestamp (see u7s_junit_reuse_check::JunitSummary::timestamp
+# doc comment: the sonobuoy e2e pod and its Lima VM both default to UTC with
+# no TZ override, so this bare string denotes UTC wall-clock time). MUST be
+# UTC, not this machine's local time: u7s-junit-reuse-check appends an
+# explicit `+00:00` to this exact string before handing it to `git
+# --since=`, so a host-local timestamp here would make these fixtures
+# silently wrong on any non-UTC test-running machine. Same
+# try-GNU-then-BSD-date fallback idiom as
+# scripts/conformance/test-watchdog-logic.sh.
+epoch_to_utc_iso() {
   local epoch="$1"
-  date -d "@${epoch}" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null || \
-    date -j -r "${epoch}" "+%Y-%m-%dT%H:%M:%S"
+  date -u -d "@${epoch}" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null || \
+    date -u -r "${epoch}" "+%Y-%m-%dT%H:%M:%S"
 }
 
 # Current PATH with difft's own directory removed -- the portable way to
@@ -236,7 +267,7 @@ if have_cargo; then
   # Junit recorded an hour BEFORE this test run started -- the "new" commit
   # made just above necessarily lands after it, exactly the commit-then-push
   # staleness case this reuse mechanism must catch.
-  STALE_TS=$(epoch_to_local_iso $(( NOW - 3600 )))
+  STALE_TS=$(epoch_to_utc_iso $(( NOW - 3600 )))
   write_junit_fixture "$SC" "$STALE_TS" 0 0 "$REQUIRED_FOCUS"
   run_gate "$SC" "$OLD_SHA..$NEW_SHA"
   assert "stale junit result (commit landed after its timestamp) is rejected" \
@@ -270,7 +301,7 @@ if have_cargo; then
   NEW_SHA=$(git -C "$SD" rev-parse HEAD)
   # Junit recorded an hour AFTER this test run started -- necessarily after
   # the "new" commit above, so no commit could have landed later.
-  FRESH_TS=$(epoch_to_local_iso $(( NOW + 3600 )))
+  FRESH_TS=$(epoch_to_utc_iso $(( NOW + 3600 )))
   write_junit_fixture "$SD" "$FRESH_TS" 0 0 "$REQUIRED_FOCUS"
   run_gate "$SD" "$OLD_SHA..$NEW_SHA"
   assert "fresh matching clean junit result is reused, skipping the sonobuoy run" \
@@ -311,6 +342,54 @@ assert "...falls back because difft is reported missing, not for an unrelated re
   "$(printf '%s' "$OUT" | grep -q 'difft not installed' && echo 1 || echo 0)"
 assert "...never prints the comment-only-skip marker when difft could not run" \
   "$(! printf '%s' "$OUT" | grep -q "$SENSITIVE_FILE: comment/whitespace-only diff" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# F. A regression on the pushed ref is caught even when a DIFFERENT branch is
+#    checked out locally -- end-to-end proof that THIS SCRIPT (not just
+#    u7s-junit-reuse-check's own unit tests) threads the actually-pushed SHA
+#    through, not the sandbox's checked-out HEAD.
+# ---------------------------------------------------------------------------
+if have_cargo; then
+  SFF="$SANDBOX_ROOT/f-wrong-ref"
+  new_sandbox "$SFF"
+  # Explicit commit dates (not real wall-clock time, unlike every other
+  # scenario) so the recorded junit timestamp below can be placed PRECISELY
+  # between the base and regression commits -- this is what makes scenario F
+  # a genuine isolation of the wrong-ref bug rather than just another stale-
+  # junit case: base lands BEFORE the recording, regression lands AFTER it,
+  # so only walking the actually-pushed ref's own history (not a decoy
+  # HEAD's) can see the regression at all.
+  write_and_commit_at "$SFF" \
+    'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
+    a + b
+}
+' old "2026-08-26T04:00:00+00:00"
+  OLD_SHA=$(git -C "$SFF" rev-parse HEAD)
+  write_and_commit_at "$SFF" \
+    'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
+    a + b + 1
+}
+' new "2026-08-26T05:00:00+00:00"
+  NEW_SHA=$(git -C "$SFF" rev-parse HEAD)
+  # Check out a DECOY branch pointing at the OLD commit -- simulates `git
+  # push origin main:some-ref` (an explicit-refspec push) while a different
+  # branch is checked out locally. $OLD_SHA..$NEW_SHA is still the range
+  # being pushed; nothing about that range changes just because the sandbox
+  # repo's own working copy is sitting elsewhere. Walking the decoy's own
+  # history would only ever see the OLD commit, never the regression.
+  git -C "$SFF" checkout -q -b decoy "$OLD_SHA"
+  # Recorded between the two commits -- the literal, offset-less string
+  # ginkgo would have written.
+  RECORDED_AT="2026-08-26T04:30:00"
+  write_junit_fixture "$SFF" "$RECORDED_AT" 0 0 "$REQUIRED_FOCUS"
+  run_gate "$SFF" "$OLD_SHA..$NEW_SHA"
+  assert "regression on the pushed ref is caught even when a different branch is checked out locally" \
+    "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
+  assert "...junit-reuse-check itself reports no reusable result, not a build failure" \
+    "$(printf '%s' "$OUT" | grep -q 'no reusable prior result' && echo 1 || echo 0)"
+else
+  skip "regression on pushed ref is caught despite a different checked-out branch" "cargo not installed -- cannot build u7s-junit-reuse-check"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

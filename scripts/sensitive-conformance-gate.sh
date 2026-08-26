@@ -216,7 +216,12 @@ check_sensitive_conformance_gate() {
     rm -f "$build_out"
   else
     rm -f "$build_out"
-    tool_args=(--repo-root "$TARGET_ROOT" --focus "$focus")
+    # --ref is the actual pushed SHA (new_ref, derived from $RANGE below), NOT
+    # the target repo's checked-out HEAD -- see u7s-junit-reuse-check's own
+    # doc comment / GitFreshnessCheck::pushed_ref for why walking implicit
+    # HEAD here would silently mis-scope the freshness check to whatever
+    # branch happens to be checked out rather than what's being pushed.
+    tool_args=(--repo-root "$TARGET_ROOT" --focus "$focus" --ref "$new_ref")
     while IFS= read -r f; do
       [ -z "$f" ] && continue
       tool_args+=(--file "$f")
