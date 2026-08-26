@@ -115,6 +115,22 @@ pub struct Args {
     /// root-owned folder shared across every worktree.
     #[arg(long, default_value = "/etc/u7s/manifests")]
     pub(crate) manifest_dir: String,
+
+    /// Run u7s-scheduler's watch/schedule loop as a supervised background task inside
+    /// this process instead of relying on a separately launched `u7s-scheduler` binary --
+    /// eliminates a second OS process paying its own tokio-runtime/TLS-stack baseline for
+    /// a dependency graph already a strict subset of this one.
+    /// Default false: existing deployments (production install.sh's own
+    /// u7s-scheduler.service, scripts/conformance/05-start-scheduler.sh) already start
+    /// the standalone binary, and enabling this too would double-schedule every pod.
+    /// Opt in with `--embedded-scheduler true` when nothing else starts `u7s-scheduler`
+    /// for this apiserver's kubeconfig. Trade-off: bundled, an apiserver restart also
+    /// interrupts scheduling (today they restart independently) -- the scheduler's own
+    /// resync/retry design re-drives in-flight decisions safely from scratch on
+    /// reconnect, so the blast radius is small, but this is a real behavior change, not
+    /// a free lunch.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) embedded_scheduler: bool,
 }
 
 #[cfg(test)]
@@ -151,6 +167,38 @@ mod tests {
         assert_eq!(
             args.manifest_dir, "/etc/u7s/manifests",
             "omitting --manifest-dir must preserve the production default install.sh relies on"
+        );
+    }
+
+    /// Existing deployments (production `install.sh`'s own `u7s-scheduler.service`,
+    /// `scripts/conformance/05-start-scheduler.sh`) already start the standalone
+    /// `u7s-scheduler` binary against this apiserver's kubeconfig — if this default ever
+    /// flipped to `true` silently, every one of them would double-schedule every pod without
+    /// any change on their end to notice.
+    #[test]
+    fn embedded_scheduler_defaults_to_false() {
+        let args =
+            Args::try_parse_from(["u7s-apiserver"]).expect("Args must parse with no flags set");
+        assert!(
+            !args.embedded_scheduler,
+            "omitting --embedded-scheduler must leave scheduling to whatever already starts \
+             the standalone binary, not silently start a second, redundant scheduler loop \
+             inside this apiserver too"
+        );
+    }
+
+    /// `run()` gates its `tokio::spawn` of the embedded scheduler task directly on
+    /// `args.embedded_scheduler` — if `--embedded-scheduler true` failed to parse into this
+    /// field, an operator relying on it to consolidate the two processes would silently get
+    /// no scheduler at all.
+    #[test]
+    fn embedded_scheduler_flag_can_be_explicitly_enabled() {
+        let args = Args::try_parse_from(["u7s-apiserver", "--embedded-scheduler", "true"])
+            .expect("--embedded-scheduler true must be a recognized flag value");
+        assert!(
+            args.embedded_scheduler,
+            "the parsed flag value must reach args.embedded_scheduler unchanged — this is the \
+             exact field lib.rs::run() checks before spawning the embedded scheduler task"
         );
     }
 }

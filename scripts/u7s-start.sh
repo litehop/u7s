@@ -22,6 +22,7 @@
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]
 #                        [--node-kubelet-port <name>=<N>]
 #                        [--konnectivity-server-port <N>]
+#                        [--embedded-scheduler <true|false>]
 #
 #   --reset       Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
 #                 to be re-joined via scripts/conformance/lima-start.sh after this).
@@ -41,6 +42,13 @@
 #                 server_port-3, server_port-2, server_port-1 respectively.
 #                 Per-slot scheme: slot N uses 8135+N*100 (slot1→8235, slot2→8335, …)
 #                 so slots never collide with each other or the mayor's 8135 default.
+#   --embedded-scheduler  Passthrough to u7s-apiserver's own --embedded-scheduler flag:
+#                 run u7s-scheduler's watch/schedule loop as a supervised
+#                 task inside this apiserver process instead of a separate binary. Omit
+#                 to leave the apiserver's own default (false) untouched — this dev-loop
+#                 script never starts scheduling itself either way, so passing
+#                 `--embedded-scheduler true` is the easiest way to get a scheduled pod
+#                 here without also running scripts/conformance/05-start-scheduler.sh.
 #
 # Environment variables:
 #   U7S_HOST_IP   IP to bind and advertise (default: 127.0.0.1).
@@ -80,6 +88,7 @@ _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
 _NODE_KUBELET_PORT_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
+_EMBEDDED_SCHEDULER_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
@@ -92,6 +101,7 @@ while [[ $# -gt 0 ]]; do
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --node-kubelet-port) _NODE_KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
+    --embedded-scheduler) _EMBEDDED_SCHEDULER_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -99,6 +109,8 @@ PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 NODE_KUBELET_PORT_ARG=""
 [ -n "$_NODE_KUBELET_PORT_OVERRIDE" ] && NODE_KUBELET_PORT_ARG="--node-kubelet-port $_NODE_KUBELET_PORT_OVERRIDE"
+EMBEDDED_SCHEDULER_ARG=""
+[ -n "$_EMBEDDED_SCHEDULER_OVERRIDE" ] && EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $_EMBEDDED_SCHEDULER_OVERRIDE"
 
 # Derive WORKDIR and runtime vars after arg parsing so flags override env.
 _VM="${U7S_VM_NAME:-lima-node}"
@@ -292,6 +304,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
+    $EMBEDDED_SCHEDULER_ARG \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
   disown "$SERVER_PID"
@@ -314,6 +327,7 @@ else
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
+    $EMBEDDED_SCHEDULER_ARG \
     &
   SERVER_PID=$!
 fi
@@ -424,6 +438,7 @@ EXTEOF
       --manifest-dir "$MANIFEST_DIR" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
       $ADVERTISE_ARG \
+      $EMBEDDED_SCHEDULER_ARG \
       > "$LOG" 2>&1 &
     SERVER_PID=$!
     disown "$SERVER_PID"
