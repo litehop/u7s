@@ -362,13 +362,13 @@ actual total lands.
 ## Limitations (explicit, not silently absorbed into the headline numbers)
 
 1. u7s's own current actual absolute RSS total (as opposed to its Gate-4
-   target) was not re-measured here — it lives in
-   `ai/findings/upstream-component-rss-cpu-baseline-2026-08-12.md`
-   (`mayor-jnk90`) plus whatever perf-PR deltas have landed since (the
-   roadmap notes these "change with nearly every perf PR"). The ratio
-   against u7s above is therefore computed against the Gate-4 *target*
-   (134.2MB), not u7s's current actual figure. This is a conservative
-   floor, not the final word.
+   target) was not re-measured here — it lives in `mayor-jnk90`'s
+   per-process baseline (see `ai/extended-context/roadmap.md`'s Gate 2)
+   plus whatever perf-PR deltas have landed since (the roadmap notes these
+   "change with nearly every perf PR"). The ratio against u7s above is
+   therefore computed against the Gate-4 *target* (134.2MB), not u7s's
+   current actual figure. This is a conservative floor, not the final
+   word.
 2. The 2-node leg's cross-node pod networking/log-fetch could not be
    validated (Deviation 2) — RSS numbers for both nodes are real, but no
    genuine multi-node workload distribution was exercised on k3s.

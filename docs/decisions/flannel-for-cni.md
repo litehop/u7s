@@ -22,7 +22,7 @@ CNI choice needs anyway.
 ## Rationale
 
 Candidates compared: Flannel, Calico (VXLAN-only, BGP disabled), Cilium,
-kube-router, Patu (`ai/findings/cni-svclb-landscape-2026-08-25.md`). Flannel
+kube-router, Patu. Flannel
 measured ~50–80MB per node, the lightest of any viable candidate, with no
 forced kube-proxy replacement. Calico runs ~120–220MB with no supported way
 to shed its NetworkPolicy engine's overhead even when unwanted. Cilium's

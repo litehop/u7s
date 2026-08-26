@@ -5,7 +5,7 @@
 
 ## Context
 
-u7s runs upstream kube-proxy in IPVS mode and uses CRI-O's stock `bridge` CNI plugin. Neither implements NetworkPolicy enforcement. An August 2026 audit (`ai/findings/oqr64-networkpolicy-current-state-2026-08-14.md`) confirmed the apiserver stored, listed, and watched NetworkPolicy objects correctly but nothing acted on them — a `default-deny-all-ingress` policy in place, a probe from `eve` to `bob` succeeded. Every deny rule was silently unenforced.
+u7s runs upstream kube-proxy in IPVS mode and uses CRI-O's stock `bridge` CNI plugin. Neither implements NetworkPolicy enforcement. An August 2026 audit (grep-verified, live-tested) confirmed the apiserver stored, listed, and watched NetworkPolicy objects correctly but nothing acted on them — a `default-deny-all-ingress` policy in place, a probe from `eve` to `bob` succeeded. Every deny rule was silently unenforced.
 
 ## Decision
 
@@ -15,7 +15,7 @@ Use `kubernetes-sigs/kube-network-policies` as u7s's tested and recommended Netw
 
 ## Rationale
 
-The candidates compared (`ai/findings/jj1vz-cni-comparison-2026-08-14.md`): Calico, Flannel, Cilium, kube-network-policies, Antrea, kube-router. Calico and Antrea replace the CNI outright; Cilium's own recommended request is 512Mi RSS (5–10× the top pick); Flannel does not implement NetworkPolicy at all.
+The candidates compared: Calico, Flannel, Cilium, kube-network-policies, Antrea, kube-router. Calico/Antrea replace the CNI outright; Cilium wants 512Mi RSS (5–10× the top pick); Flannel skips NetworkPolicy entirely; kube-router's 250Mi figure covers a heavier mode.
 
 kube-network-policies is a NetworkPolicy-only enforcer designed to layer onto any CNI. It hooks the data path via NFQUEUE + nftables + NRI — no CNI swap, no BGP or overlay, no CRDs, no write-RBAC for the standard flavor. Its published request is 50Mi/100m. It supports both ingress and egress natively. The same engine is embedded in `kindnet` (KIND's default CNI), so the code path has broad production-adjacent exposure. Integration into the test harness was trivial (134 lines total) and a six-scenario empirical PoC confirmed all denies enforce correctly.
 
