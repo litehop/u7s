@@ -2,6 +2,7 @@
 name    = "u7s-sentinel"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [dependencies]
 u7s-sentinel-derive = { path = "../sentinel-derive" }

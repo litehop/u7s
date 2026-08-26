@@ -2,6 +2,7 @@
 name    = "u7s-proto-generated"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [lib]
 # prost carries the vendored .proto files' own doc comments onto the generated structs verbatim,
