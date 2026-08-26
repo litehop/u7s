@@ -38,9 +38,11 @@ and kube-controller-manager, and writes a systemd unit for each.
 
 u7s implements the Kubernetes REST API surface natively rather than
 wrapping or proxying `kube-apiserver`, and reuses unmodified upstream
-components (kubelet, kube-controller-manager) where rewriting them buys no
-memory saving. See `docs/decisions/` for the reasoning behind these and
-other component choices, one Architecture Decision Record per decision.
+components (kubelet, kube-controller-manager) for now. Measurements show
+these two are the largest memory consumers in the stack; an upstream
+config-tuning audit is next, and a native rewrite of either remains an open
+question. See `docs/decisions/` for the reasoning behind these and other
+component choices, one Architecture Decision Record per decision.
 
 ## Contributing
 
