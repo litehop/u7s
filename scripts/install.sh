@@ -155,6 +155,9 @@ fi
 
 BIN_DIR=/opt/u7s/bin
 STATE_DIR=/var/lib/u7s
+# Flat sibling of state.db/ca.*/kubeconfig, not a subdirectory -- deleting it
+# (the mismatch-refusal escape hatch below) touches no cluster data.
+CONFIG_FILE="$STATE_DIR/config"
 
 # --- Shared helpers (used by more than one mode) -----------------------------
 
@@ -523,6 +526,50 @@ if [ -z "$TARBALL" ]; then
   fetch_tarball "$TARBALL_URL"
 fi
 
+# --- Persisted install config ($STATE_DIR/config) ----------------------------
+#
+# IFACE/NODE_NAME feed into --advertise-address (below), which the apiserver
+# embeds into every kubeconfig it rewrites (tls.rs). A --iface that resolves
+# to a different IP on a re-run would silently change that address, breaking
+# any kubeconfig already distributed off-box (e.g. scp'd to an operator's
+# laptop) -- a connection failure that reads as a network problem, not an
+# upgrade-changed-the-endpoint one. Persisted as plain KEY=value (not JSON) so
+# it can be read back without pulling in jq, which is only installed
+# conditionally today (for --mint-join-token/--join).
+PERSISTED_NODE_NAME=""
+PERSISTED_IFACE=""
+if [ -f "$CONFIG_FILE" ]; then
+  # Sourced inside a subshell, not the main shell, so this cannot clobber the
+  # NODE_NAME/IFACE already resolved from flags/env above.
+  # shellcheck disable=SC1090 # dynamic path: this project's own prior-run file
+  PERSISTED_NODE_NAME="$(. "$CONFIG_FILE"; printf '%s' "${NODE_NAME:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_IFACE="$(. "$CONFIG_FILE"; printf '%s' "${IFACE:-}")"
+fi
+
+# On an upgrade, an unset --iface/--node-name defaults to what was persisted
+# at install time. An explicit value that disagrees refuses loudly instead of
+# silently rebaking a different node identity / advertise-address into a live
+# cluster -- deleting $CONFIG_FILE and re-running install.sh is the only
+# escape hatch, by design (no separate override flag).
+if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_NODE_NAME" ]; then
+  if [ -z "$NODE_NAME" ]; then
+    NODE_NAME="$PERSISTED_NODE_NAME"
+  elif [ "$NODE_NAME" != "$PERSISTED_NODE_NAME" ]; then
+    echo "error: --node-name $NODE_NAME conflicts with the node name persisted at install time ($PERSISTED_NODE_NAME, recorded in $CONFIG_FILE). Changing it would rebake a different node identity into kubelet's --hostname-override on a live cluster. To proceed anyway: delete $CONFIG_FILE (a flat sibling file next to state.db/CA/kubeconfig -- this touches no cluster data) and re-run install.sh." >&2
+    exit 1
+  fi
+fi
+
+if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_IFACE" ]; then
+  if [ -z "$IFACE" ]; then
+    IFACE="$PERSISTED_IFACE"
+  elif [ "$IFACE" != "$PERSISTED_IFACE" ]; then
+    echo "error: --iface $IFACE conflicts with the interface persisted at install time ($PERSISTED_IFACE, recorded in $CONFIG_FILE). Changing it would rebake a different --advertise-address into every kubeconfig the apiserver rewrites, silently breaking any copy already distributed off this box. To proceed anyway: delete $CONFIG_FILE (a flat sibling file next to state.db/CA/kubeconfig -- this touches no cluster data) and re-run install.sh." >&2
+    exit 1
+  fi
+fi
+
 # --- Defaults: node name, network interface ----------------------------------
 
 if [ -z "$NODE_NAME" ]; then
@@ -690,6 +737,15 @@ apt-get install -y kubectl kubernetes-cni
 # because it holds the CA and service-account signing keys.
 install -d -m 0700 "$STATE_DIR"
 install -d -m 0755 /etc/u7s/static-pods
+
+# Persist the resolved node-name/iface for the next run (read back and
+# enforced above), so a bare re-run reuses them and an explicit, disagreeing
+# flag is caught rather than silently changing this node's advertised
+# identity.
+cat > "$CONFIG_FILE" <<EOF
+NODE_NAME="$NODE_NAME"
+IFACE="$IFACE"
+EOF
 
 write_kubelet_config_yaml
 
