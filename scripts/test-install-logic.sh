@@ -101,8 +101,8 @@ assert_true "u7s-apiserver.service declares ExecReload=/bin/kill -HUP \$MAINPID 
 # comment claiming the race applies uniformly to all three dependents.
 # ---------------------------------------------------------------------------
 requires_apiserver_count="$(grep -cE '^Requires=.*u7s-apiserver\.service' "$INSTALL")"
-assert "all three apiserver-dependent units (u7s-scheduler, u7s-kcm, kubelet) declare Requires=u7s-apiserver.service, matching the script's own stated bootstrap-race reasoning" \
-  "$([ "$requires_apiserver_count" = "3" ] && echo 1 || echo 0)"
+assert "both apiserver-dependent units (u7s-kcm, kubelet) declare Requires=u7s-apiserver.service, matching the script's own stated bootstrap-race reasoning -- u7s-scheduler is no longer a separate unit at all" \
+  "$([ "$requires_apiserver_count" = "2" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Binary staging must fail loud on a non-executable match instead of
@@ -347,6 +347,111 @@ assert_false "(regression guard) install.sh no longer uses 'systemctl enable --n
 
 assert_true "the apiserver restart step fails loud with a systemctl status/journalctl pointer on failure, instead of a bare set -e trace" \
   grep -qF 'error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)' "$INSTALL"
+
+# ---------------------------------------------------------------------------
+# Production defaults to the embedded scheduler instead of a standalone
+# u7s-scheduler.service. The double-preemption risk (embedded + standalone
+# both running against the same cluster keep independent, uncoordinated
+# preemption dedup state) means this is not just a process-count cleanup --
+# a fresh install must never provision the standalone unit at all, and an
+# in-place upgrade of a host that has one from before this change must have
+# it stopped and removed, not left running alongside the newly embedded
+# scheduler.
+# ---------------------------------------------------------------------------
+assert_true "u7s-apiserver.service's ExecStart passes --embedded-scheduler true -- production now schedules inside this process instead of relying on a separate u7s-scheduler binary" \
+  grep -qF -- '--embedded-scheduler true' "$INSTALL"
+
+assert_false "(regression guard) install.sh no longer writes a u7s-scheduler.service unit file -- running the embedded scheduler AND a standalone u7s-scheduler against the same cluster risks double-preemption, so a fresh install must not provision the standalone unit at all" \
+  grep -qF 'cat > /etc/systemd/system/u7s-scheduler.service' "$INSTALL"
+
+assert_false "(regression guard) install.sh no longer enables the standalone u7s-scheduler.service" \
+  grep -qF 'systemctl enable u7s-scheduler.service' "$INSTALL"
+
+assert_false "(regression guard) install.sh no longer restarts the standalone u7s-scheduler.service" \
+  grep -qF 'systemctl restart u7s-scheduler.service' "$INSTALL"
+
+# Upgrade-path cleanup: extracted verbatim from install.sh's own source (same
+# "exercise the real logic" approach as the other extractions in this file).
+# SCHEDULER_UNIT_FILE is a variable in install.sh specifically so this test
+# can point it at a scratch path instead of the real /etc/systemd/system,
+# and systemctl is shimmed via PATH so the real command is never invoked.
+write_scheduler_retirement_runner() {
+  local install_script="$1" runner="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'SCHEDULER_UNIT_FILE="$1"'
+    awk '/^if \[ -f "\$SCHEDULER_UNIT_FILE" \]; then$/,/^fi$/' "$install_script"
+  } > "$runner"
+}
+
+SCHED_WORK="$(mktemp -d)"
+# Replaces the earlier EXIT traps above (only the latest fires), so it must
+# still cover every dir those relied on cleaning up.
+trap 'rm -rf "$DETECT_WORK" "$WORKER_MODE_WORK" "$MANIFEST_WORK" "$PERSIST_WORK" "$SCHED_WORK"' EXIT
+SCHED_RUNNER="$SCHED_WORK/retire-scheduler.sh"
+write_scheduler_retirement_runner "$INSTALL" "$SCHED_RUNNER"
+
+SCHED_FAKE_BIN="$SCHED_WORK/fakebin"
+mkdir -p "$SCHED_FAKE_BIN"
+SCHED_SYSTEMCTL_LOG="$SCHED_WORK/systemctl.log"
+: > "$SCHED_SYSTEMCTL_LOG"
+cat > "$SCHED_FAKE_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$SCHED_SYSTEMCTL_LOG"
+exit 0
+EOF
+chmod +x "$SCHED_FAKE_BIN/systemctl"
+
+# Case 1: the realistic accidental-double-run scenario -- a host installed
+# before this change has u7s-scheduler.service on disk.
+# Re-running install.sh (an in-place upgrade) must stop, disable, and remove
+# it, and reload systemd, so the standalone scheduler cannot still be active
+# once the apiserver restarts into embedded mode.
+sched_existing="$SCHED_WORK/existing/u7s-scheduler.service"
+mkdir -p "$(dirname "$sched_existing")"
+echo '[Unit]' > "$sched_existing"
+sched_out="$(PATH="$SCHED_FAKE_BIN:$PATH" bash "$SCHED_RUNNER" "$sched_existing" 2>&1)"
+assert_false "an upgrade of a host with a pre-existing u7s-scheduler.service removes the unit file, so it cannot linger and run alongside the newly embedded scheduler" \
+  test -f "$sched_existing"
+assert "an upgrade with a pre-existing u7s-scheduler.service stops it via systemctl before removing it, closing the window where both the old standalone and new embedded scheduler could be active at once" \
+  "$(grep -qF 'stop u7s-scheduler.service' "$SCHED_SYSTEMCTL_LOG" && echo 1 || echo 0)"
+assert "an upgrade with a pre-existing u7s-scheduler.service disables it via systemctl, so it cannot come back on the next reboot" \
+  "$(grep -qF 'disable u7s-scheduler.service' "$SCHED_SYSTEMCTL_LOG" && echo 1 || echo 0)"
+assert "an upgrade with a pre-existing u7s-scheduler.service reloads the systemd unit cache after removing the unit file" \
+  "$(grep -qF 'daemon-reload' "$SCHED_SYSTEMCTL_LOG" && echo 1 || echo 0)"
+assert "the retirement step tells the operator why -- scheduling moved into the embedded apiserver task" \
+  "$(printf '%s' "$sched_out" | grep -qi 'retiring' && echo 1 || echo 0)"
+
+# Case 2: a genuinely fresh install (no prior u7s-scheduler.service on disk)
+# must be a silent no-op -- no systemctl calls, no "retiring" message. A
+# false positive here would print a confusing message about retiring
+# something that was never installed.
+: > "$SCHED_SYSTEMCTL_LOG"
+sched_fresh_missing="$SCHED_WORK/fresh/u7s-scheduler.service"
+fresh_sched_out="$(PATH="$SCHED_FAKE_BIN:$PATH" bash "$SCHED_RUNNER" "$sched_fresh_missing" 2>&1)"
+assert "a fresh install (no pre-existing u7s-scheduler.service) makes no systemctl calls at all -- this step must be a true no-op, not merely idempotent" \
+  "$([ ! -s "$SCHED_SYSTEMCTL_LOG" ] && echo 1 || echo 0)"
+assert "a fresh install prints no 'retiring' message, since there is nothing to retire" \
+  "$(printf '%s' "$fresh_sched_out" | grep -qi 'retiring' && echo 0 || echo 1)"
+
+# Mutation self-check (CLAUDE.md rule 14): prove Case 1 above would actually
+# catch a reverted/skipped cleanup, not just document today's behavior.
+MUTATED_SCHED_INSTALL="$SCHED_WORK/install-mutated.sh"
+sed 's/if \[ -f "\$SCHEDULER_UNIT_FILE" \]; then/if false; then/' "$INSTALL" > "$MUTATED_SCHED_INSTALL"
+if diff -q "$INSTALL" "$MUTATED_SCHED_INSTALL" > /dev/null 2>&1; then
+  assert "mutation self-check: the scheduler-retirement guard's condition line exists in install.sh to mutate (if this fails, the line was renamed/reshaped and this suite no longer exercises it)" 0
+else
+  MUTATED_SCHED_RUNNER="$SCHED_WORK/retire-scheduler-mutated.sh"
+  write_scheduler_retirement_runner "$MUTATED_SCHED_INSTALL" "$MUTATED_SCHED_RUNNER"
+  sched_mutated_existing="$SCHED_WORK/existing-mutated/u7s-scheduler.service"
+  mkdir -p "$(dirname "$sched_mutated_existing")"
+  echo '[Unit]' > "$sched_mutated_existing"
+  : > "$SCHED_SYSTEMCTL_LOG"
+  PATH="$SCHED_FAKE_BIN:$PATH" bash "$MUTATED_SCHED_RUNNER" "$sched_mutated_existing" >/dev/null 2>&1 || true
+  assert "mutation self-check: with the retirement guard bypassed, a pre-existing u7s-scheduler.service is wrongly left in place -- proving Case 1 above would fail if this upgrade-path cleanup were ever reverted, silently reintroducing the realistic double-run risk" \
+    "$([ -f "$sched_mutated_existing" ] && echo 1 || echo 0)"
+fi
 
 # ---------------------------------------------------------------------------
 # Regression guard: kube-proxy's own kubeconfig pointed at the

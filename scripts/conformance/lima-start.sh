@@ -107,7 +107,17 @@ NETWORK="${_NETWORK_OVERRIDE:-$_DEFAULT_NETWORK}"
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
 # serving cert) so a 2nd node can join the same cluster without colliding with — or,
 # for the Pod's immutable spec.nodeName, 403'ing against — node 1's.
-NODE_SUFFIX="${_NODE_SUFFIX_OVERRIDE:-}"
+#
+# Auto-derive from VM_NAME for the numbered slots (lima-node-2..5) instead of
+# defaulting to "" unconditionally: a bare `--vm lima-node-3` reprovision (e.g.
+# after `limactl delete lima-node-3` to pick up a new network default) bypasses
+# add-node.sh — the other place that sets --node-suffix — so without this it
+# silently fell back to "", re-applying the Pod named plain "konnectivity-agent"
+# that already belongs to whichever OTHER node in this stack was started
+# without a suffix, and 422'd on spec.nodeName immutability. node_suffix_for()
+# (_lib.sh) is shared with add-node.sh so both scripts always compute the same
+# suffix for the same VM_NAME.
+NODE_SUFFIX=$(node_suffix_for "$VM_NAME" "$_NODE_SUFFIX_OVERRIDE")
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_SERVER_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
 else
@@ -246,10 +256,14 @@ fi
 # routes added near the end of this script). Skip the crio restart + IPAM-lease
 # wipe when the subnet is already correct so a plain reconnect never risks
 # recycling an IP a live pod still holds.
-if [ -z "$NODE_SUFFIX" ]; then
-  POD_SUBNET_OCTET=0
-else
+# node_suffix_for() (_lib.sh) now also derives non-numeric suffixes (e.g.
+# lima-node-smoke -> "-smoke") to keep resource names collision-free -- but
+# arithmetic on a non-numeric suffix would abort this script under `set -u`,
+# so treat any non-numeric NODE_SUFFIX the same as the empty (primary) case.
+if [[ "$NODE_SUFFIX" =~ ^-[0-9]+$ ]]; then
   POD_SUBNET_OCTET=$(( ${NODE_SUFFIX#-} - 1 ))
+else
+  POD_SUBNET_OCTET=0
 fi
 POD_SUBNET="10.85.${POD_SUBNET_OCTET}.0/24"
 # `|| true` here is safe: a failure to read the current subnet (e.g. a transient

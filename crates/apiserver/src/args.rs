@@ -120,15 +120,20 @@ pub struct Args {
     /// this process instead of relying on a separately launched `u7s-scheduler` binary --
     /// eliminates a second OS process paying its own tokio-runtime/TLS-stack baseline for
     /// a dependency graph already a strict subset of this one.
-    /// Default false: existing deployments (production install.sh's own
-    /// u7s-scheduler.service, scripts/conformance/05-start-scheduler.sh) already start
-    /// the standalone binary, and enabling this too would double-schedule every pod.
-    /// Opt in with `--embedded-scheduler true` when nothing else starts `u7s-scheduler`
-    /// for this apiserver's kubeconfig. Trade-off: bundled, an apiserver restart also
-    /// interrupts scheduling (today they restart independently) -- the scheduler's own
-    /// resync/retry design re-drives in-flight decisions safely from scratch on
-    /// reconnect, so the blast radius is small, but this is a real behavior change, not
-    /// a free lunch.
+    /// Default false here (the flag's own default), so an ad-hoc/dev/conformance
+    /// invocation that omits this flag never silently starts scheduling twice against
+    /// whatever standalone `u7s-scheduler` it may already have running. Production's
+    /// scripts/install.sh passes `--embedded-scheduler true` explicitly and stopped
+    /// provisioning u7s-scheduler.service entirely, so the flag's default is not what
+    /// production actually runs with. Never run the embedded scheduler and a standalone
+    /// `u7s-scheduler` against the same cluster at the same time: each keeps its own
+    /// independent per-process preemption dedup state (NodeTally/in_flight in
+    /// crates/scheduler/src/lib.rs) with no shared coordination, so both can decide to
+    /// preempt the same node's pods -- actual double-preemption, not just wasted work.
+    /// Trade-off of bundling: an apiserver restart also interrupts
+    /// scheduling (today they restart independently) -- the scheduler's own resync/retry
+    /// design re-drives in-flight decisions safely from scratch on reconnect, so the
+    /// blast radius is small, but this is a real behavior change, not a free lunch.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) embedded_scheduler: bool,
 }

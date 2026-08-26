@@ -36,3 +36,28 @@ check_port_free() {
     exit 1
   fi
 }
+
+# Derives the per-node resource suffix (konnectivity-agent Pod/Secret, kubelet
+# serving cert) for a VM_NAME. Single source of truth for BOTH lima-start.sh
+# (the primary/direct-start path) and add-node.sh (the --extra-node join path)
+# so the two can never independently drift back out of sync — that drift once
+# had add-node.sh hardcode "-2" regardless of which VM it was actually joining,
+# colliding with a primary that itself auto-derives a different numbered
+# suffix from its own name.
+# Only the bare "lima-node" primary keeps the empty default. Every other
+# lima-node-* name (numbered slots AND non-numbered ones like lima-node-smoke)
+# derives its suffix from whatever follows "lima-node-" in its own name, so
+# lima-node-smoke gets "-smoke" instead of falling back to the same empty
+# suffix as the primary -- an empty catch-all here made lima-node-smoke
+# collide with lima-node's konnectivity-agent Pod/Secret and kubelet serving
+# cert names whenever the two are paired via --extra-node. lima-start.sh's
+# POD_SUBNET_OCTET can't parse a non-numeric suffix, so it treats any
+# non-numeric NODE_SUFFIX (including "-smoke") the same as the empty case.
+node_suffix_for() {
+  local vm_name="$1" override="${2:-}"
+  case "$vm_name" in
+    lima-node) echo "${override:-}" ;;
+    lima-node-*) echo "${override:-"-${vm_name#lima-node-}"}" ;;
+    *) echo "${override:-}" ;;
+  esac
+}

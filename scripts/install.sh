@@ -15,8 +15,12 @@ fi
 # Takes a fresh Ubuntu LTS box to a running control plane + kubelet: installs
 # CRI-O + crun via apt, stages u7s-apiserver/u7s-scheduler plus the vendored
 # kubelet and kube-controller-manager from a release tarball, and writes
-# systemd units for all four. Also installs kubectl and applies vendored
-# component manifests.
+# systemd units for u7s-apiserver, u7s-kcm, and kubelet. u7s-apiserver runs
+# with --embedded-scheduler true, so u7s-scheduler gets no unit of its own --
+# never run it standalone against the same cluster, since it keeps
+# independent preemption dedup state with no coordination against the
+# embedded scheduler. Also installs kubectl and applies vendored component
+# manifests.
 #
 # Multi-node join goes through the real certificates.k8s.io CSR API: u7s's
 # kube-controller-manager is unmodified upstream, so its builtin
@@ -158,6 +162,12 @@ STATE_DIR=/var/lib/u7s
 # Flat sibling of state.db/ca.*/kubeconfig, not a subdirectory -- deleting it
 # (the mismatch-refusal escape hatch below) touches no cluster data.
 CONFIG_FILE="$STATE_DIR/config"
+# Unit file for the standalone scheduler this script retires below in favor
+# of --embedded-scheduler true -- a variable (not a literal inline at each
+# use) so scripts/test-install-logic.sh can override it and exercise the
+# retirement logic against a scratch path instead of the real
+# /etc/systemd/system.
+SCHEDULER_UNIT_FILE=/etc/systemd/system/u7s-scheduler.service
 
 # --- Shared helpers (used by more than one mode) -----------------------------
 
@@ -778,6 +788,33 @@ EOF
   exit 0
 fi
 
+# --- Retire the standalone u7s-scheduler.service, if present -----------------
+#
+# u7s-apiserver now runs its own embedded scheduler (--embedded-scheduler true,
+# below) instead of a separately launched u7s-scheduler binary+unit. The two
+# must never run at once against the same cluster: each keeps its own
+# independent per-process preemption dedup state (NodeTally/in_flight in
+# crates/scheduler/src/lib.rs), with no shared coordination, so two
+# uncoordinated schedulers can each decide to preempt the same node's pods --
+# actual double-preemption, not just wasted scheduling work.
+#
+# A host installed before this change has u7s-scheduler.service enabled and
+# running; stop and remove it here, before the apiserver restart below brings
+# up the embedded scheduler, so an in-place upgrade never runs both at once.
+# A no-op on a genuinely fresh install, where the unit file never existed.
+# stop/disable are NOT swallowed with `|| true`: the unit file's existence
+# means a prior install.sh run loaded it via daemon-reload, so both should
+# always succeed on a healthy host, and silently pressing on past a failed
+# stop here is exactly how the standalone scheduler could keep running
+# alongside the embedded one this script is about to start.
+if [ -f "$SCHEDULER_UNIT_FILE" ]; then
+  echo "Retiring standalone u7s-scheduler.service -- scheduling now runs embedded in u7s-apiserver (--embedded-scheduler true)."
+  systemctl stop u7s-scheduler.service
+  systemctl disable u7s-scheduler.service
+  rm -f "$SCHEDULER_UNIT_FILE"
+  systemctl daemon-reload
+fi
+
 # --- systemd units -------------------------------------------------------------
 #
 # One unit per host binary, Restart=always, boot-enabled
@@ -850,28 +887,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$STATE_DIR
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --token-auth-file $STATE_DIR/token-auth-file
+# --embedded-scheduler true: production runs scheduling as a task inside this
+# process rather than a separate u7s-scheduler binary+unit -- never also
+# start u7s-scheduler against this same cluster (see the retirement
+# block above this section for why: uncoordinated double-preemption).
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --token-auth-file $STATE_DIR/token-auth-file --embedded-scheduler true
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
 ExecReload=/bin/kill -HUP \$MAINPID
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/u7s-scheduler.service <<EOF
-[Unit]
-Description=u7s scheduler
-After=u7s-apiserver.service
-Requires=u7s-apiserver.service
-
-[Service]
-Type=simple
-WorkingDirectory=$STATE_DIR
-ExecStart=$BIN_DIR/u7s-scheduler --kubeconfig $STATE_DIR/kubeconfig-scheduler
 Restart=always
 RestartSec=2
 
@@ -943,8 +967,6 @@ if ! systemctl restart u7s-apiserver.service; then
   echo "error: failed to restart u7s-apiserver.service (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
   exit 1
 fi
-systemctl enable u7s-scheduler.service
-systemctl restart u7s-scheduler.service
 systemctl enable u7s-kcm.service
 systemctl restart u7s-kcm.service
 systemctl enable kubelet.service
