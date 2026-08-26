@@ -165,6 +165,14 @@ CONFIG_FILE="$STATE_DIR/config"
 # rather than assuming: apiserver's first-run bootstrap (and the restart that
 # picks up a new token-auth-file entry) races its own listener bind, so
 # neither the kubeconfig nor a live listener exists when systemctl returns.
+#
+# /healthz itself only returns 200 once the boot-time bootstrap manifest apply
+# (crates/apiserver/src/bootstrap_apply.rs, raced against the listener via
+# tokio::select! in run()) has resolved successfully -- a bad manifest is
+# fatal and tears the process down via that same tokio::select!, so /healthz
+# never flips to 200 in that case and this loop times out instead of
+# reporting success on a since-crashed apiserver. No settle-and-recheck is
+# needed: the first 200 already means boot is fully done (mayor-ajgaj).
 wait_for_apiserver() {
   local kubeconfig_path="$1"
   echo "Waiting for u7s-apiserver to become reachable..."
@@ -178,18 +186,6 @@ wait_for_apiserver() {
   done
   if [ "$ready" -ne 1 ]; then
     echo "error: u7s-apiserver did not become reachable within 120s (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
-    exit 1
-  fi
-  # /healthz only proves the HTTP listener is accepting connections -- it says
-  # nothing about the boot-time bootstrap manifest apply racing it in the same
-  # process (crates/apiserver/src/bootstrap_apply.rs). A bad manifest fatally
-  # aborts the apiserver via tokio::select! *after* that listener is already
-  # answering /healthz, so a brief settle-and-recheck catches a crash that
-  # raced past the poll loop above instead of silently reporting success
-  # right before the process dies.
-  sleep 3
-  if ! systemctl is-active --quiet u7s-apiserver.service; then
-    echo "error: u7s-apiserver.service became reachable then exited -- likely a fatal error applying a boot-time manifest (check: journalctl -u u7s-apiserver)" >&2
     exit 1
   fi
 }
@@ -969,10 +965,8 @@ systemctl restart kubelet.service
 #
 # wait_for_apiserver here confirms that boot-time apply actually succeeded --
 # a bad manifest is a fatal startup error for u7s-apiserver itself
-# (bootstrap_apply.rs), applied by a task racing the same process's own
-# /healthz listener via tokio::select!, so /healthz can briefly report ready
-# before that race resolves. wait_for_apiserver's own settle-and-recheck
-# catches the fatal exit that follows, so a broken kube-proxy/Flannel
+# (bootstrap_apply.rs), and /healthz doesn't report ready until that apply
+# resolves (see wait_for_apiserver's own doc), so a broken kube-proxy/Flannel
 # manifest still surfaces as an install failure, not as a separate
 # kubectl-apply failure the way it used to.
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
