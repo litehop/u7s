@@ -852,6 +852,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: dir.join("manifests").to_string_lossy().into_owned(),
         }
     }
 
@@ -1063,6 +1064,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
 
         // First call: generates and writes CA files.
@@ -1404,6 +1406,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
 
         let tls = generate_tls(&args).expect("generate_tls must succeed");
@@ -1543,6 +1546,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
         let result = generate_tls(&args);
         assert!(
@@ -1596,6 +1600,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         let server_url = "https://127.0.0.1:6443";
@@ -1699,6 +1704,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
@@ -1744,6 +1750,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
 
@@ -1810,6 +1817,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             sa_sig_cache_size: None,
+            manifest_dir: "/etc/u7s/manifests".into(),
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
 

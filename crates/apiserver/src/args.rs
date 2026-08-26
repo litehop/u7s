@@ -104,4 +104,53 @@ pub struct Args {
     /// U7S_SA_SIG_CACHE_SIZE env var, then 512, when unset — see `sa_sig_cache` module doc.
     #[arg(long)]
     pub(crate) sa_sig_cache_size: Option<usize>,
+
+    /// Directory scanned at boot for operator-supplied vendored manifest files, each
+    /// server-side-applied via `bootstrap_apply::apply_well_known_manifest_dir` — see
+    /// `docs/decisions/well-known-manifest-folder.md`. Defaults to `/etc/u7s/manifests`,
+    /// matching kubelet's own `/etc/kubernetes/manifests/` static-pod convention; the
+    /// production install.sh systemd unit relies on this default and never passes the flag.
+    /// Override for local dev-loop use, where the apiserver runs natively on the host Mac
+    /// (not inside the target VM, see `scripts/u7s-start.sh`) and the default path is a
+    /// root-owned folder shared across every worktree.
+    #[arg(long, default_value = "/etc/u7s/manifests")]
+    pub(crate) manifest_dir: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    /// `run()` passes `args.manifest_dir` straight through to
+    /// `bootstrap_apply::apply_well_known_manifest_dir` as the directory it scans — if the
+    /// flag failed to parse into this field, an operator's `--manifest-dir` override would be
+    /// silently ignored and the apiserver would keep scanning the hardcoded production path.
+    #[test]
+    fn manifest_dir_flag_sets_the_scanner_path() {
+        let args = Args::try_parse_from([
+            "u7s-apiserver",
+            "--manifest-dir",
+            "/tmp/some-worktree/manifests",
+        ])
+        .expect("--manifest-dir must be a recognized flag");
+        assert_eq!(
+            args.manifest_dir, "/tmp/some-worktree/manifests",
+            "the parsed flag value must reach args.manifest_dir unchanged — this is the exact \
+             path lib.rs::run() hands to the well-known-manifest-folder scanner"
+        );
+    }
+
+    /// The production `install.sh` systemd unit never passes `--manifest-dir`, so the default
+    /// must stay `/etc/u7s/manifests` — changing it here would silently stop every production
+    /// install from applying its vendored manifests without any install.sh change to notice.
+    #[test]
+    fn manifest_dir_defaults_to_the_production_well_known_path_when_flag_is_omitted() {
+        let args =
+            Args::try_parse_from(["u7s-apiserver"]).expect("Args must parse with no flags set");
+        assert_eq!(
+            args.manifest_dir, "/etc/u7s/manifests",
+            "omitting --manifest-dir must preserve the production default install.sh relies on"
+        );
+    }
 }
