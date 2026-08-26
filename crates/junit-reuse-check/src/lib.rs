@@ -215,6 +215,32 @@ impl FreshnessCheck for GitFreshnessCheck {
     }
 }
 
+/// `GIT_*` environment variables that, if inherited from an enclosing git
+/// process, silently override `-C <dir>` and redirect git's chosen
+/// repository/working-tree elsewhere -- most notably `GIT_DIR`, which per
+/// git's own docs takes precedence over the `-C`-selected directory's
+/// discovered `.git`. This binary runs from INSIDE a git hook
+/// (`.githooks/pre-push` -> scripts/sensitive-conformance-gate.sh ->
+/// u7s-junit-reuse-check), which git itself may export these into, so every
+/// `git` subprocess spawned below clears them first -- otherwise `repo_root`
+/// (the explicit argument this whole safety story depends on) could be
+/// silently ignored in favor of whatever the enclosing hook invocation's
+/// environment happens to point at.
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Runs `git diff --quiet <pushed_ref> -- <file>`. Ok(true) = the working
 /// tree's current copy of `file` is identical to what's in `pushed_ref`'s
 /// tree for that path -- i.e. nothing about `file` has diverged from the
@@ -222,7 +248,7 @@ impl FreshnessCheck for GitFreshnessCheck {
 /// failing, e.g. not a repo or an unresolvable ref) is an error, not a
 /// guess.
 fn git_diff_quiet(repo_root: &Path, pushed_ref: &str, file: &str) -> Result<bool, String> {
-    let status = Command::new("git")
+    let status = git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["diff", "--quiet", pushed_ref, "--", file])
@@ -262,7 +288,7 @@ fn git_log_since_is_empty(
     since_timestamp: &str,
 ) -> Result<bool, String> {
     let since_utc = format!("{since_timestamp}+00:00");
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo_root)
         .args([
@@ -624,8 +650,17 @@ mod tests {
         dir
     }
 
+    // Every git subprocess below goes through `git_command()` (see its doc
+    // comment), never a bare `Command::new("git")` -- learned the hard way:
+    // an earlier version of these tests used `Command::new("git")` directly
+    // and, when this crate's own `cargo test` ran as part of `.githooks/
+    // pre-push`'s pre-push verification (i.e. testing a push that touches
+    // THIS file), inherited that hook's `GIT_DIR` and committed these tests'
+    // throwaway fixtures into the real u7s repository instead of the
+    // intended sandbox.
+
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-        Command::new("git")
+        git_command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -634,7 +669,10 @@ mod tests {
     }
 
     fn init_repo(dir: &Path) {
-        assert!(Command::new("git")
+        // `git init <dir>` alone is not enough: per git's own docs, an
+        // inherited GIT_DIR takes precedence over the positional target
+        // directory too, not just over `-C`.
+        assert!(git_command()
             .args(["init", "-q", "-b", "main"])
             .arg(dir)
             .status()
@@ -658,7 +696,7 @@ mod tests {
         }
         std::fs::write(&path, contents).unwrap();
         assert!(git(dir, &["add", file]).status.success());
-        let status = Command::new("git")
+        let status = git_command()
             .arg("-C")
             .arg(dir)
             .args(["commit", "-q", "-m", msg])
