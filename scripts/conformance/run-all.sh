@@ -88,8 +88,11 @@
 #             same VM. Allows multiple workers to run in parallel against their
 #             own isolated VMs. Also settable via U7S_VM_NAME env var.
 #   --network Lima network to provision the VM's `networks:` stanza with (default:
-#             unset -- lima-start.sh itself falls back to user-v2). Forwarded
-#             verbatim to lima-start.sh (Step 3) and, if --extra-node is also
+#             unset -- lima-start.sh itself falls back to a per-VM-name default,
+#             e.g. lima-node-2/3/4 -> user-v2-workers-a, splitting worker VMs
+#             across separate networks to reduce shared-usernet-daemon load; see
+#             lima-start.sh's own VM_NAME case statement for the full mapping).
+#             Forwarded verbatim to lima-start.sh (Step 3) and, if --extra-node is also
 #             given, to that node's add-node.sh/lima-start.sh too, so both nodes
 #             of a 2-node stack land on the same isolated network instead of a
 #             primary on its own network and a peer silently defaulting back to

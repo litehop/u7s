@@ -78,7 +78,32 @@ KUBE_PROXY_V=2
 [ "$VERBOSE" -eq 1 ] && KUBE_PROXY_V=5
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
-NETWORK="${_NETWORK_OVERRIDE:-user-v2}"
+
+# For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
+# instead — it skips VM provisioning and just reconnects the kubelet.
+VM_NAME="${U7S_VM_NAME:-lima-node}"
+
+# No --network override: default to this VM's slot in the Phase-B worker-network
+# split instead of the single shared `user-v2` -- the shared `limactl usernet`
+# daemon backing one network intermittently stops
+# answering ARP under concurrent-VM load (confirmed upstream gvisor-tap-vsock
+# defect, not backported), and splitting workers across separate per-network
+# daemons reduces that shared contention. lima-node keeps its own Phase-A
+# isolated network (PR #1194); lima-node-2/3/4 and lima-node-5/-smoke split
+# 3-2 across the two worker networks rather than 1-4, since -2/-3 are the pair
+# most commonly joined via --extra-node for 2-node topologies (dispatch-prompt-
+# template.md) and a 3-way network still covers that pairing. Mirrors the
+# Network column in the dispatch-prompt-template.md doc's Lima VM protocol
+# table -- keep both in sync. Any VM name outside this known set (a one-off
+# scratch VM) falls back to the original flat "user-v2" default.
+case "$VM_NAME" in
+  lima-node) _DEFAULT_NETWORK="user-v2-mayor" ;;
+  lima-node-2|lima-node-3|lima-node-4) _DEFAULT_NETWORK="user-v2-workers-a" ;;
+  lima-node-5|lima-node-smoke) _DEFAULT_NETWORK="user-v2-workers-b" ;;
+  *) _DEFAULT_NETWORK="user-v2" ;;
+esac
+NETWORK="${_NETWORK_OVERRIDE:-$_DEFAULT_NETWORK}"
+
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
 # serving cert) so a 2nd node can join the same cluster without colliding with — or,
 # for the Pod's immutable spec.nodeName, 403'ing against — node 1's.
@@ -91,10 +116,6 @@ else
 fi
 # Agent port: server_port-3 (matches the layout 8135/8132 and slot offsets 8235/8232, etc.)
 KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_SERVER_PORT - 3 ))
-
-# For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
-# instead — it skips VM provisioning and just reconnects the kubelet.
-VM_NAME="${U7S_VM_NAME:-lima-node}"
 
 # When a non-default kubelet port is requested, write a patched yaml with the
 # correct hostPort into the worktree temp dir so each worker VM uses its own
