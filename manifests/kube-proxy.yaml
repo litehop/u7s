@@ -1,6 +1,6 @@
 # kube-proxy's ServiceAccount/ConfigMap/DaemonSet, applied via the well-known-manifest-folder
-# mechanism (docs/decisions/well-known-manifest-folder.md) instead of an install.sh heredoc
-# (mayor-73lqh). Its ClusterRole (system:node-proxier) is already seeded by the apiserver itself
+# mechanism (docs/decisions/well-known-manifest-folder.md) instead of an install.sh heredoc.
+# Its ClusterRole (system:node-proxier) is already seeded by the apiserver itself
 # (crates/apiserver/src/lib.rs seed_rbac) -- only the ServiceAccount binding, config and
 # DaemonSet below are new.
 #
@@ -17,7 +17,7 @@
 #                         iptables DNAT rules kube-proxy itself is responsible for installing --
 #                         pointing kube-proxy's own kubeconfig at it is a bootstrap deadlock
 #                         (informer never syncs, so the DNAT rules that would make the ClusterIP
-#                         reachable never get programmed; mayor-ecmt4).
+#                         reachable never get programmed).
 #
 # --hostname-override=$(NODE_NAME) is Kubernetes' own container-command env-var substitution
 # syntax (references the NODE_NAME env var set via fieldRef below), not a shell expansion -- as a

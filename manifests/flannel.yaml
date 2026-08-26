@@ -1,6 +1,6 @@
 # Vendored from flannel-io/flannel's official kube-flannel.yml (v0.28.9), applied via the
 # well-known-manifest-folder mechanism (docs/decisions/well-known-manifest-folder.md) instead
-# of an install.sh heredoc (mayor-fptqu) -- kube-proxy's DaemonSet gets the same treatment
+# of an install.sh heredoc -- kube-proxy's DaemonSet gets the same treatment
 # (manifests/kube-proxy.yaml).
 #
 # Two install-time placeholders scripts/install.sh substitutes before writing this file into

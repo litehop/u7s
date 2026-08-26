@@ -180,6 +180,18 @@ wait_for_apiserver() {
     echo "error: u7s-apiserver did not become reachable within 120s (check: systemctl status u7s-apiserver, journalctl -u u7s-apiserver)" >&2
     exit 1
   fi
+  # /healthz only proves the HTTP listener is accepting connections -- it says
+  # nothing about the boot-time bootstrap manifest apply racing it in the same
+  # process (crates/apiserver/src/bootstrap_apply.rs). A bad manifest fatally
+  # aborts the apiserver via tokio::select! *after* that listener is already
+  # answering /healthz, so a brief settle-and-recheck catches a crash that
+  # raced past the poll loop above instead of silently reporting success
+  # right before the process dies.
+  sleep 3
+  if ! systemctl is-active --quiet u7s-apiserver.service; then
+    echo "error: u7s-apiserver.service became reachable then exited -- likely a fatal error applying a boot-time manifest (check: journalctl -u u7s-apiserver)" >&2
+    exit 1
+  fi
 }
 
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
@@ -953,9 +965,12 @@ systemctl restart kubelet.service
 #
 # wait_for_apiserver here confirms that boot-time apply actually succeeded --
 # a bad manifest is a fatal startup error for u7s-apiserver itself
-# (bootstrap_apply.rs), so a broken kube-proxy/Flannel manifest now surfaces
-# as apiserver never becoming healthy, not as a separate kubectl-apply
-# failure the way it used to.
+# (bootstrap_apply.rs), applied by a task racing the same process's own
+# /healthz listener via tokio::select!, so /healthz can briefly report ready
+# before that race resolves. wait_for_apiserver's own settle-and-recheck
+# catches the fatal exit that follows, so a broken kube-proxy/Flannel
+# manifest still surfaces as an install failure, not as a separate
+# kubectl-apply failure the way it used to.
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
 wait_for_apiserver "$KUBECONFIG_PATH"
 
