@@ -44,8 +44,13 @@
 #      wiring mistake here -- e.g. forgetting to pass `--ref` at all would
 #      make u7s-junit-reuse-check silently fall back to checking out
 #      whatever HEAD happens to be, hiding this exact regression). Same
-#      cargo requirement/skip as C/D. See PR #1408 review for the original
-#      wrong-ref finding.
+#      cargo requirement/skip as C/D.
+#   G. GIT_DIR/GIT_WORK_TREE exported into this test's OWN shell (simulating
+#      .githooks/pre-push's ambient environment) must not redirect the
+#      sandbox-repo helpers' or the gate script's own git subprocesses into
+#      a disposable "victim" repo -- the exact mechanism (see run_git()
+#      below) that corrupted the mayor's real repository twice before this
+#      scenario existed. Always runs (no cargo/difft dependency).
 #
 # Exits 0 if every scenario that could run PASSED (skips are reported but do
 # not fail the run); exits 1 on any assertion failure.
@@ -77,11 +82,32 @@ skip() {
   SKIP=$(( SKIP + 1 ))
 }
 
+# GIT_* variables that redirect git's chosen repository/working-tree/index/
+# object-store location if inherited from an enclosing process (see `git
+# help git`, "THE GIT REPOSITORY" section for the full set) -- most notably
+# GIT_DIR, which per git's own docs takes precedence over both an explicit
+# `-C <dir>` and a `git init <dir>` positional argument. This test suite runs
+# from inside the SAME .githooks/pre-push context that, via exactly this
+# leakage, once corrupted the mayor's real repository (a sandbox fixture's
+# `git commit` inherited that hook's ambient GIT_DIR and landed in the real
+# repo instead of a disposable sandbox). Every git subprocess the
+# sandbox-repo helpers below spawn goes through run_git() to strip these
+# first -- see scripts/sensitive-conformance-gate.sh's own run_git() (same
+# variable set) for why an incomplete list here is a false sense of safety,
+# not a real one.
+run_git() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_NAMESPACE -u GIT_INDEX_FILE \
+    -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -u GIT_COMMON_DIR -u GIT_CEILING_DIRECTORIES \
+    -u GIT_DISCOVERY_ACROSS_FILESYSTEM \
+    git "$@"
+}
+
 new_sandbox() {
   local dir="$1"
-  git init -q -b main "$dir"
-  git -C "$dir" config user.email test@example.com
-  git -C "$dir" config user.name "Test"
+  run_git init -q -b main "$dir"
+  run_git -C "$dir" config user.email test@example.com
+  run_git -C "$dir" config user.name "Test"
 }
 
 # Writes $SENSITIVE_FILE with the given body and commits it.
@@ -89,8 +115,8 @@ write_and_commit() {
   local dir="$1" body="$2" msg="$3"
   mkdir -p "$dir/$(dirname "$SENSITIVE_FILE")"
   printf '%s' "$body" > "$dir/$SENSITIVE_FILE"
-  git -C "$dir" add -A
-  git -C "$dir" commit -q -m "$msg"
+  run_git -C "$dir" add -A
+  run_git -C "$dir" commit -q -m "$msg"
 }
 
 # Same as write_and_commit, but at an explicit author/committer date
@@ -102,9 +128,9 @@ write_and_commit_at() {
   local dir="$1" body="$2" msg="$3" date_with_offset="$4"
   mkdir -p "$dir/$(dirname "$SENSITIVE_FILE")"
   printf '%s' "$body" > "$dir/$SENSITIVE_FILE"
-  git -C "$dir" add -A
+  run_git -C "$dir" add -A
   GIT_AUTHOR_DATE="$date_with_offset" GIT_COMMITTER_DATE="$date_with_offset" \
-    git -C "$dir" commit -q -m "$msg"
+    run_git -C "$dir" commit -q -m "$msg"
 }
 
 # Stages a junit_01.xml fixture under the layout
@@ -199,14 +225,14 @@ if have_difft; then
     a + b
 }
 ' old
-  OLD_SHA=$(git -C "$SA" rev-parse HEAD)
+  OLD_SHA=$(run_git -C "$SA" rev-parse HEAD)
   write_and_commit "$SA" \
     'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
     // an entirely different comment, same code
     a + b
 }
 ' new
-  NEW_SHA=$(git -C "$SA" rev-parse HEAD)
+  NEW_SHA=$(run_git -C "$SA" rev-parse HEAD)
   run_gate "$SA" "$OLD_SHA..$NEW_SHA"
   # Why this matters: this is the whole point of this fast path -- a pure
   # comment/typo fix to a sensitive file must not pay for a multi-minute
@@ -232,13 +258,13 @@ write_and_commit "$SB" \
     a + b
 }
 ' old
-OLD_SHA=$(git -C "$SB" rev-parse HEAD)
+OLD_SHA=$(run_git -C "$SB" rev-parse HEAD)
 write_and_commit "$SB" \
   'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
     a + b + 1
 }
 ' new
-NEW_SHA=$(git -C "$SB" rev-parse HEAD)
+NEW_SHA=$(run_git -C "$SB" rev-parse HEAD)
 run_gate "$SB" "$OLD_SHA..$NEW_SHA"
 assert "genuine functional diff to a sensitive file is NOT skipped" \
   "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
@@ -257,13 +283,13 @@ if have_cargo; then
     a + b
 }
 ' old
-  OLD_SHA=$(git -C "$SC" rev-parse HEAD)
+  OLD_SHA=$(run_git -C "$SC" rev-parse HEAD)
   write_and_commit "$SC" \
     'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
     a + b + 1
 }
 ' new
-  NEW_SHA=$(git -C "$SC" rev-parse HEAD)
+  NEW_SHA=$(run_git -C "$SC" rev-parse HEAD)
   # Junit recorded an hour BEFORE this test run started -- the "new" commit
   # made just above necessarily lands after it, exactly the commit-then-push
   # staleness case this reuse mechanism must catch.
@@ -292,13 +318,13 @@ if have_cargo; then
     a + b
 }
 ' old
-  OLD_SHA=$(git -C "$SD" rev-parse HEAD)
+  OLD_SHA=$(run_git -C "$SD" rev-parse HEAD)
   write_and_commit "$SD" \
     'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
     a + b + 1
 }
 ' new
-  NEW_SHA=$(git -C "$SD" rev-parse HEAD)
+  NEW_SHA=$(run_git -C "$SD" rev-parse HEAD)
   # Junit recorded an hour AFTER this test run started -- necessarily after
   # the "new" commit above, so no commit could have landed later.
   FRESH_TS=$(epoch_to_utc_iso $(( NOW + 3600 )))
@@ -326,14 +352,14 @@ write_and_commit "$SE" \
     a + b
 }
 ' old
-OLD_SHA=$(git -C "$SE" rev-parse HEAD)
+OLD_SHA=$(run_git -C "$SE" rev-parse HEAD)
 write_and_commit "$SE" \
   'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
     // an entirely different comment, same code
     a + b
 }
 ' new
-NEW_SHA=$(git -C "$SE" rev-parse HEAD)
+NEW_SHA=$(run_git -C "$SE" rev-parse HEAD)
 NO_DIFFT_PATH=$(path_without_difft)
 run_gate "$SE" "$OLD_SHA..$NEW_SHA" "$NO_DIFFT_PATH"
 assert "missing difft never silently skips a comment-only-looking diff" \
@@ -364,20 +390,20 @@ if have_cargo; then
     a + b
 }
 ' old "2026-08-26T04:00:00+00:00"
-  OLD_SHA=$(git -C "$SFF" rev-parse HEAD)
+  OLD_SHA=$(run_git -C "$SFF" rev-parse HEAD)
   write_and_commit_at "$SFF" \
     'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
     a + b + 1
 }
 ' new "2026-08-26T05:00:00+00:00"
-  NEW_SHA=$(git -C "$SFF" rev-parse HEAD)
+  NEW_SHA=$(run_git -C "$SFF" rev-parse HEAD)
   # Check out a DECOY branch pointing at the OLD commit -- simulates `git
   # push origin main:some-ref` (an explicit-refspec push) while a different
   # branch is checked out locally. $OLD_SHA..$NEW_SHA is still the range
   # being pushed; nothing about that range changes just because the sandbox
   # repo's own working copy is sitting elsewhere. Walking the decoy's own
   # history would only ever see the OLD commit, never the regression.
-  git -C "$SFF" checkout -q -b decoy "$OLD_SHA"
+  run_git -C "$SFF" checkout -q -b decoy "$OLD_SHA"
   # Recorded between the two commits -- the literal, offset-less string
   # ginkgo would have written.
   RECORDED_AT="2026-08-26T04:30:00"
@@ -390,6 +416,74 @@ if have_cargo; then
 else
   skip "regression on pushed ref is caught despite a different checked-out branch" "cargo not installed -- cannot build u7s-junit-reuse-check"
 fi
+
+# ---------------------------------------------------------------------------
+# G. Ambient GIT_DIR/GIT_WORK_TREE leakage into the sandbox-repo helpers AND
+#    the real gate script -- the ACTUAL mechanism that corrupted the mayor's
+#    real repository (twice): a `git init`/`git commit` in this test's own
+#    helpers, or a `git diff`/`git show` in the gate script, silently
+#    honoring an inherited GIT_DIR/GIT_WORK_TREE instead of its own
+#    -C/positional target. Exports GIT_DIR/GIT_WORK_TREE pointed at a
+#    disposable "victim" sandbox repo (never the real u7s repo or a
+#    worktree of it) for the duration of this scenario, then asserts the
+#    victim's HEAD, full commit log, and core.bare setting are
+#    byte-identical before and after -- core.bare specifically because that
+#    is the exact field the first real corruption flipped to true on the
+#    mayor's shared .git/config.
+# ---------------------------------------------------------------------------
+SG_VICTIM="$SANDBOX_ROOT/g-ambient-victim"
+new_sandbox "$SG_VICTIM"
+write_and_commit "$SG_VICTIM" 'victim contents' "victim commit"
+VICTIM_HEAD_BEFORE=$(run_git -C "$SG_VICTIM" rev-parse HEAD)
+VICTIM_LOG_BEFORE=$(run_git -C "$SG_VICTIM" log --oneline --all)
+VICTIM_BARE_BEFORE=$(run_git -C "$SG_VICTIM" config --local --get core.bare || echo unset)
+
+SG_TARGET="$SANDBOX_ROOT/g-ambient-target"
+G_SHAS="$SANDBOX_ROOT/g-shas"
+G_HELPER_RC=0
+(
+  export GIT_DIR="$SG_VICTIM/.git"
+  export GIT_WORK_TREE="$SG_VICTIM"
+  new_sandbox "$SG_TARGET"
+  write_and_commit "$SG_TARGET" \
+    'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
+    a + b
+}
+' old
+  write_and_commit "$SG_TARGET" \
+    'fn validate_pod_spec_immutable(a: i32, b: i32) -> i32 {
+    a + b + 1
+}
+' new
+  run_git -C "$SG_TARGET" log --format=%H --reverse > "$G_SHAS"
+) || G_HELPER_RC=$?
+
+VICTIM_HEAD_AFTER=$(run_git -C "$SG_VICTIM" rev-parse HEAD)
+VICTIM_LOG_AFTER=$(run_git -C "$SG_VICTIM" log --oneline --all)
+VICTIM_BARE_AFTER=$(run_git -C "$SG_VICTIM" config --local --get core.bare || echo unset)
+
+assert "ambient GIT_DIR/GIT_WORK_TREE never redirects the sandbox-repo helpers' git calls into the victim repo (HEAD unchanged)" \
+  "$([ "$VICTIM_HEAD_BEFORE" = "$VICTIM_HEAD_AFTER" ] && echo 1 || echo 0)"
+assert "...victim's commit history gains no foreign commits (the actual corruption mechanism: fixture commits landing in the wrong repo)" \
+  "$([ "$VICTIM_LOG_BEFORE" = "$VICTIM_LOG_AFTER" ] && echo 1 || echo 0)"
+assert "...victim's core.bare is untouched (the exact field the first real corruption flipped to true)" \
+  "$([ "$VICTIM_BARE_BEFORE" = "$VICTIM_BARE_AFTER" ] && echo 1 || echo 0)"
+assert "...and the sandbox-repo helpers still function correctly on the INTENDED target despite the ambient leak (not just 'fails safe by erroring')" \
+  "$([ "$G_HELPER_RC" -eq 0 ] && [ -s "$G_SHAS" ] && [ "$(wc -l < "$G_SHAS" | tr -d ' ')" = "2" ] && echo 1 || echo 0)"
+
+if [ "$G_HELPER_RC" -eq 0 ] && [ -s "$G_SHAS" ]; then
+  G_OLD_SHA=$(sed -n '1p' "$G_SHAS")
+  G_NEW_SHA=$(sed -n '2p' "$G_SHAS")
+  GIT_DIR="$SG_VICTIM/.git" GIT_WORK_TREE="$SG_VICTIM" run_gate "$SG_TARGET" "$G_OLD_SHA..$G_NEW_SHA"
+  assert "the real gate script, run with the same ambient GIT_DIR/GIT_WORK_TREE leak, still gates the INTENDED target (falls through to the fresh-run requirement for this genuine functional diff)" \
+    "$([ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'U7S_CONFORMANCE_GATE_VM' && echo 1 || echo 0)"
+else
+  assert "the real gate script step could run against a valid target sandbox" "0"
+fi
+
+VICTIM_HEAD_AFTER2=$(run_git -C "$SG_VICTIM" rev-parse HEAD)
+assert "...running the gate script itself under the same ambient leak still leaves the victim repo's HEAD untouched" \
+  "$([ "$VICTIM_HEAD_BEFORE" = "$VICTIM_HEAD_AFTER2" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

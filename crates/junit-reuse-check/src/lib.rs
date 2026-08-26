@@ -217,24 +217,31 @@ impl FreshnessCheck for GitFreshnessCheck {
 
 /// `GIT_*` environment variables that, if inherited from an enclosing git
 /// process, silently override `-C <dir>` and redirect git's chosen
-/// repository/working-tree elsewhere -- most notably `GIT_DIR`, which per
-/// git's own docs takes precedence over the `-C`-selected directory's
-/// discovered `.git`. This binary runs from INSIDE a git hook
+/// repository/working-tree/index/object-store location elsewhere -- most
+/// notably `GIT_DIR`, which per git's own docs (`git help git`, "THE GIT
+/// REPOSITORY" section) takes precedence over the `-C`-selected directory's
+/// discovered `.git`. This is the complete such set documented there, not
+/// just `GIT_DIR`/`GIT_WORK_TREE`. This binary runs from INSIDE a git hook
 /// (`.githooks/pre-push` -> scripts/sensitive-conformance-gate.sh ->
 /// u7s-junit-reuse-check), which git itself may export these into, so every
 /// `git` subprocess spawned below clears them first -- otherwise `repo_root`
 /// (the explicit argument this whole safety story depends on) could be
 /// silently ignored in favor of whatever the enclosing hook invocation's
-/// environment happens to point at.
+/// environment happens to point at. Same variable set as
+/// scripts/sensitive-conformance-gate.sh's `run_git()` and
+/// scripts/test-sensitive-conformance-gate-logic.sh's `run_git()`.
 fn git_command() -> Command {
     let mut cmd = Command::new("git");
     for var in [
         "GIT_DIR",
         "GIT_WORK_TREE",
+        "GIT_NAMESPACE",
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
     ] {
         cmd.env_remove(var);
     }
@@ -723,7 +730,7 @@ mod tests {
 
     #[test]
     fn git_freshness_check_walks_pushed_ref_not_whatever_is_checked_out() {
-        // Reproduces the review's exact finding (PR #1408 review):
+        // Reproduces a wrong-ref bug found in code review:
         // `git push origin feature-b:some-remote-ref` while `main` is
         // checked out locally must still see a regression committed to
         // feature-b after the recorded junit run. A caller that (as this
