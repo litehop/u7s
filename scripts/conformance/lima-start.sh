@@ -398,10 +398,14 @@ limactl shell "$VM_NAME" sudo systemctl restart logrotate.timer
 # LAST 1h54m of an 11h run (measured directly off that node's timestamps,
 # 20:08-22:02) under 16-way load — losing the 09:33-09:35 DiskPressure incident
 # entirely. 6G buys a fresh run roughly 5-6x that headroom at the same growth
-# rate; going further eats into the 20GiB VM disk conformance tests themselves
-# need (~14G free observed with only base images pulled — DiskPressure
-# investigations already show that margin gets tight mid-run), so 6G is a
-# deliberate compromise, not full 11h coverage.
+# rate; going further eats into the VM disk conformance tests themselves need.
+# That margin was the original constraint: at the 20GiB disk ceiling this
+# drop-in was written against, only ~14G was free with base images pulled —
+# tight enough that it's part of what tripped the DiskPressure storm above.
+# The disk ceiling (lima/kubelet.yaml) has since doubled to 40GiB specifically
+# to fix that trigger (~33G free now observed with only base images pulled),
+# so 6G stays a deliberate compromise against overall journal disk usage, not
+# one forced by a tight VM-disk margin anymore.
 limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
 [Journal]
 RateLimitBurst=100000

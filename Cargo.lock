@@ -3749,6 +3749,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "u7s-proto-generated",
+ "u7s-scheduler",
  "u7s-sentinel",
  "u7s-store",
  "uuid",

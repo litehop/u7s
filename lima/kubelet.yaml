@@ -27,7 +27,26 @@ cpus: 8
 # 6GiB to complete — 8GiB below adds documented margin beyond that observed
 # floor (session findings archived 2026-08-18 under ai/findings/).
 memory: 8GiB
-disk: 20GiB
+# 20GiB was the original disk default. lima-start.sh's own journald-retention
+# comment already documented the margin as tight ("~14G free observed with
+# only base images pulled"), and a 2026-08-18 --all-e2e DiskPressure audit
+# (session findings archived under ai/findings/) observed a 237-pod/108s
+# ReplicaSet-replacement storm during a transient DiskPressure condition
+# under concurrent-namespace image pulls at --procs=16 -- real, correct
+# kube-controller-manager behavior, but the exact trigger (oscillation vs.
+# sustained-true DiskPressure) was left an open question by that audit's own
+# findings (the original run's raw logs are gone). Doubling the ceiling is a
+# cheap, plausible mitigation for a disk-headroom-related trigger, NOT a
+# confirmed fix against that exact mechanism: a separate, deliberate live
+# repro confirmed sustained-true DiskPressure behavior in general, and a
+# csi-hostpath focus run showed flat/healthy disk usage under this ceiling,
+# but a full --all-e2e before/after was declined as disproportionate for
+# this rare discovery-only run (a follow-on tracks revisiting this if a
+# routinely-run e2e subset ever hits similar behavior). This is a vz sparse
+# disk image (host usage tracks actual bytes written, confirmed via `du`
+# showing ~5.5GiB actual for a 20GiB nominal file already at 29% used), so
+# doubling the ceiling costs no real host disk until a run actually needs it.
+disk: 40GiB
 
 # Shared unprivileged switch so multiple VMs can reach each other directly (needed
 # for cross-node pod routing — see scripts/conformance/lima-start.sh). Unlike
