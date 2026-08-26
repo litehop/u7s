@@ -7310,7 +7310,7 @@ mod generation_tests {
     ///
     /// increment_pod_generation_if_spec_changed used to strip this field from both sides
     /// of the comparison under a false "proto decoder skips it" premise,
-    /// mirroring the fix to validate_pod_spec_immutable). Guards against that
+    /// mirroring the fix to validate_pod_spec_immutable. Guards against that
     /// strip being reintroduced, which would silently hide this field's changes from
     /// generation tracking.
     #[test]
