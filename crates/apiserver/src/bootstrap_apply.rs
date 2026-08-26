@@ -259,12 +259,15 @@ fn extract_doc_meta(doc: &str) -> anyhow::Result<DocMeta> {
 /// Maps a bootstrap manifest's `kind` to its REST resource plural + whether it's namespaced.
 ///
 /// Deliberately a fixed, small table (the exact Kinds `system:bootstrap-installer`'s RBAC role grants:
-/// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, DaemonSet, Service)
-/// rather than a general kind-pluralization scheme — this applier is bootstrap-only, not a
-/// generic "apply any manifest" client, so an unknown Kind is a configuration error worth
+/// ClusterRole, ClusterRoleBinding, ServiceAccount, ConfigMap, Deployment, DaemonSet, Service,
+/// Namespace) rather than a general kind-pluralization scheme — this applier is bootstrap-only,
+/// not a generic "apply any manifest" client, so an unknown Kind is a configuration error worth
 /// failing loudly on rather than guessing a plural that might be wrong. DaemonSet (apps/v1,
 /// namespaced, mirroring Deployment) is here for kube-proxy and Flannel, which both ship as
-/// DaemonSets once they migrate onto this well-known-folder mechanism.
+/// DaemonSets once they migrate onto this well-known-folder mechanism. Namespace (cluster-scoped,
+/// like ClusterRole) is here because Flannel's vendored manifest creates its own `kube-flannel`
+/// namespace as the first document in the bundle — without this arm, every boot with that
+/// manifest present in the well-known folder would fatal-crash on an unknown-Kind error.
 fn kind_to_resource(kind: &str) -> anyhow::Result<(&'static str, bool)> {
     Ok(match kind {
         "ConfigMap" => ("configmaps", true),
@@ -274,6 +277,7 @@ fn kind_to_resource(kind: &str) -> anyhow::Result<(&'static str, bool)> {
         "DaemonSet" => ("daemonsets", true),
         "ClusterRole" => ("clusterroles", false),
         "ClusterRoleBinding" => ("clusterrolebindings", false),
+        "Namespace" => ("namespaces", false),
         other => anyhow::bail!(
             "bootstrap applier does not know the REST resource for kind {other:?} — it only \
              understands the fixed set of Kinds bootstrap manifest bundles use"
@@ -485,6 +489,21 @@ mod tests {
             ("daemonsets", true),
             "DaemonSet must resolve to the namespaced 'daemonsets' resource, matching Deployment's \
              apps/v1 shape"
+        );
+    }
+
+    /// `manifests/flannel.yaml` ships a `kind: Namespace` object (creating `kube-flannel`)
+    /// as the first document in its bundle. Without this arm, `kind_to_resource` hits the
+    /// fallback error branch, `apply_well_known_manifest_dir` returns `Err`, and — per
+    /// `lib.rs`'s `tokio::select!` wiring — that `Err` fatal-crashes the apiserver on every
+    /// boot that has this vendored manifest in the well-known folder.
+    #[test]
+    fn kind_to_resource_supports_namespace_so_flannels_kube_flannel_namespace_doesnt_fatal_boot() {
+        assert_eq!(
+            kind_to_resource("Namespace").expect("Namespace must be a known kind"),
+            ("namespaces", false),
+            "Namespace must resolve to the cluster-scoped 'namespaces' resource, matching \
+             ClusterRole's non-namespaced shape"
         );
     }
 
@@ -1091,6 +1110,63 @@ mod tests {
             .await
             .expect("store get must not fail")
             .expect("the DaemonSet must exist in the store after apply_well_known_manifest_dir");
+    }
+
+    /// `manifests/flannel.yaml` ships a `kind: Namespace` document (creating `kube-flannel`)
+    /// followed by objects that live inside it — the exact shape this test reproduces. Before
+    /// `kind_to_resource` grew a `Namespace` arm, this whole scan returned `Err` on the unknown
+    /// Kind, and `apply_well_known_manifest_dir`'s callers treat that `Err` as fatal
+    /// (`lib.rs`'s `tokio::select!`), so every boot with Flannel's vendored manifest in the
+    /// well-known folder would crash the apiserver outright. This proves the fix end-to-end —
+    /// through the real folder scan and a live apiserver, not just `kind_to_resource` in
+    /// isolation — and that the namespace-scoped ConfigMap that follows it in the same file
+    /// lands too, since it depends on the Namespace document having already been applied.
+    #[tokio::test]
+    async fn apply_well_known_manifest_dir_applies_namespace_then_object_within_it_because_flannel_yaml_ships_its_own_namespace(
+    ) {
+        let server = start_test_apiserver().await;
+        let dir = test_temp_dir("namespace");
+        std::fs::write(
+            dir.join("00-namespace-bundle.yaml"),
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: bootstrap-apply-ns-test\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bootstrap-apply-ns-test-cm\n  namespace: bootstrap-apply-ns-test\ndata:\n  foo: bar\n",
+        )
+        .expect("write 00-namespace-bundle.yaml");
+
+        apply_well_known_manifest_dir(&server.kubeconfig_path, &dir)
+            .await
+            .expect(
+                "a manifest that creates its own Namespace, then an object inside it, must \
+                 apply successfully -- this is exactly what manifests/flannel.yaml does, and a \
+                 regression here fatal-crashes apiserver boot on every install that vendors it",
+            );
+
+        let ns_key = crate::keys::cluster_object_key("namespaces", "bootstrap-apply-ns-test");
+        server
+            .store
+            .get(&ns_key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "the Namespace must exist in the store after apply_well_known_manifest_dir -- \
+                 without kind_to_resource's Namespace arm, this document would abort the scan \
+                 before ever reaching the store",
+            );
+
+        let cm_key = crate::keys::object_key(
+            "configmaps",
+            "bootstrap-apply-ns-test",
+            "bootstrap-apply-ns-test-cm",
+        );
+        server
+            .store
+            .get(&cm_key)
+            .await
+            .expect("store get must not fail")
+            .expect(
+                "the ConfigMap inside the newly-created namespace must also exist -- proving the \
+             Namespace document was applied before the ConfigMap that depends on it, matching \
+             flannel.yaml's own document order",
+            );
     }
 
     // -----------------------------------------------------------------------
