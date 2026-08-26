@@ -16,17 +16,23 @@
 #   scripts/conformance/add-node.sh <vm-name> <kubelet-port> [--port <N>] [--workdir <path>]
 #                                    [--network <name>] [--verbose]
 #
-# Delegates to lima-start.sh --node-suffix "-2" so the joining node's per-node
-# resources (konnectivity-agent Pod/Secret, kubelet serving cert, pod CIDR) don't
-# collide with the primary node's. --network is forwarded to that same
-# lima-start.sh call (not defaulted here) so a 2-node stack whose primary was
-# isolated onto its own network (PR #1194) can put the 2nd node on
-# the SAME network instead of silently defaulting to lima-start.sh's own
-# user-v2 fallback, which would leave the two nodes with no route to each
-# other.
+# Delegates to lima-start.sh --node-suffix <derived>, computed from THIS node's
+# own $VM_NAME via the same node_suffix_for() (_lib.sh) that lima-start.sh's
+# direct-start path uses — so the joining node's per-node resources
+# (konnectivity-agent Pod/Secret, kubelet serving cert, pod CIDR) never collide
+# with the primary's regardless of which numbered slot either one is. A prior
+# version hardcoded "-2" here regardless of $VM_NAME, which collided with a
+# `lima-node-2` primary auto-deriving that same "-2" for itself.
+# --network is forwarded to that same lima-start.sh call (not defaulted here)
+# so a 2-node stack whose primary was isolated onto its own network (PR #1194)
+# can put the 2nd node on the SAME network instead of silently defaulting to
+# lima-start.sh's own user-v2 fallback, which would leave the two nodes with no
+# route to each other.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/conformance/_lib.sh
+source "$DIR/_lib.sh"
 
 if [ $# -lt 2 ]; then
   echo "usage: $0 <vm-name> <kubelet-port> [--port <N>] [--workdir <path>] [--network <name>] [--verbose]" >&2
@@ -72,5 +78,7 @@ _WORKDIR_ARG=""
 _NETWORK_ARG=""
 [ -n "$_NETWORK_OVERRIDE" ] && _NETWORK_ARG="--network $_NETWORK_OVERRIDE"
 
+NODE_SUFFIX=$(node_suffix_for "$VM_NAME")
+
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "-2" ${_VERBOSE_ARG}
+bash "$DIR/lima-start.sh" --vm "$VM_NAME" --kubelet-port "$KUBELET_PORT" --port "$PORT" ${_WORKDIR_ARG} ${_NETWORK_ARG} --node-suffix "$NODE_SUFFIX" ${_VERBOSE_ARG}
