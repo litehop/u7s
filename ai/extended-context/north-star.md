@@ -36,7 +36,7 @@ it include the container runtime? in-cluster addons like DNS?) and the same
 load profile on both sides. Until that measurement exists, don't cite a
 specific ratio as fact.
 
-A simple, opinionated packaging and installation story (`curl | sh`-style)
+A simple, opinionated packaging and installation story (`curl | bash`-style)
 is a real end-goal, not an afterthought — see Packaging below. Running real
 in-cluster workloads (including GitOps tooling like Argo CD) is valuable as
 a way to exercise u7s against realistic usage, not as a milestone in itself.

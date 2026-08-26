@@ -70,7 +70,7 @@ jobs:
           sha256sum "$1" | cut -d' ' -f1 > "$1.sha256"
 
       - name: Bake the release tarball URL into install.sh
-        # A script piped into `sh` cannot discover the URL it was fetched from,
+        # A script piped into `bash` cannot discover the URL it was fetched from,
         # so the published copy carries it as a literal. Baked here because the
         # distribution host is a deployment concern, not a build input
         env:

@@ -1057,7 +1057,7 @@ EOF
 #
 # Inlined here rather than a vendored file kubectl -f reads from disk, and
 # NOT include_bytes!'d into a Rust binary either: install.sh is published and
-# run standalone (curl | sh, see deploy/get-u7s/README.md) with no sibling
+# run standalone (curl | bash, see deploy/get-u7s/README.md) with no sibling
 # files on disk once fetched -- the same reason kube-proxy's DaemonSet above
 # is inline rather than a vendored path.
 #
