@@ -1001,6 +1001,41 @@ fn schema_branch_structurally_matches(branch: &serde_json::Value, obj: &serde_js
     true
 }
 
+/// Wall-clock budget for evaluating a single CEL rule or `messageExpression`. Upstream
+/// kube-apiserver rejects over-budget CEL rules at CRD admission time via a static
+/// per-rule "estimated cost" analysis (k8s.io/apiserver/pkg/cel cost estimation); u7s has
+/// no equivalent static cost estimator, so this bounds the same risk — a CRD-author-
+/// supplied rule with unbounded runtime cost (e.g. a `.matches()` call against a
+/// pathological regex, or a nested `.all()`/`.filter()` comprehension over a large
+/// CR-author-controlled list) — at the point it actually runs, on every CR write, rather
+/// than trying to predict its cost statically. Mirrors `walk_schema_dos_bounds` (crd.rs),
+/// which bounds the equivalent risk for boon schema compilation.
+const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Marker: a CEL evaluation did not finish within `CEL_RULE_EVAL_BUDGET`.
+struct CelEvalOverBudget;
+
+/// Runs `program` against `cel_ctx` on a dedicated thread, bounded by `budget` wall-clock
+/// time, so a CEL expression with unbounded runtime cost cannot hang the request-handling
+/// thread indefinitely (see `CEL_RULE_EVAL_BUDGET`). The `cel` crate's interpreter has no
+/// cooperative cancellation hook, so this is the only way to bound wall-clock time without
+/// risking undefined behavior from force-killing a thread; every CEL expression is
+/// guaranteed to terminate (the language has no unbounded loops), so an abandoned
+/// over-budget thread still exits on its own eventually — this only bounds how long a
+/// single request waits for it.
+fn execute_cel_with_budget(
+    program: &std::sync::Arc<cel::Program>,
+    cel_ctx: cel::Context<'static>,
+    budget: std::time::Duration,
+) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
+    let program = std::sync::Arc::clone(program);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(program.execute(&cel_ctx));
+    });
+    rx.recv_timeout(budget).map_err(|_| CelEvalOverBudget)
+}
+
 /// Evaluate a single `x-kubernetes-validations` entry (`{rule, message,
 /// messageExpression, reason, fieldPath, optionalOldSelf}`, per the CRD-storage
 /// round-trip in `apiextensions_gen_adapter.rs`) against `self_value`, optionally
@@ -1033,20 +1068,27 @@ fn evaluate_cel_rule(
             .map_err(|e| Status::internal(format!("CEL: failed to bind oldSelf: {e}")))?;
     }
 
-    let result = match program.execute(&cel_ctx) {
-        Ok(v) => v,
+    let result = match execute_cel_with_budget(&program, cel_ctx, CEL_RULE_EVAL_BUDGET) {
+        Err(CelEvalOverBudget) => {
+            return Err(Status::unprocessable_entity(format!(
+                "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
+                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost \
+                 (rule: {rule_text})"
+            )));
+        }
+        Ok(Ok(v)) => v,
         // `oldSelf` is only meaningful on UPDATE, when the field being validated also
         // existed in the previous object — upstream skips (does not fail) a rule that
         // references `oldSelf` in every other case, e.g. CREATE, or a newly-added field.
         // We don't bind `oldSelf` in those cases, so the interpreter reports it as an
         // undeclared reference; that specific error means "not applicable here", not
         // "the rule failed".
-        Err(cel::ExecutionError::UndeclaredReference(ref name))
+        Ok(Err(cel::ExecutionError::UndeclaredReference(ref name)))
             if old_self_value.is_none() && name.as_str() == "oldSelf" =>
         {
             return Ok(());
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             return Err(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule failed to evaluate: {e} (rule: {rule_text})"
             )));
@@ -1124,7 +1166,10 @@ fn evaluate_message_expression(
     if let Some(old) = old_self_value {
         cel_ctx.add_variable("oldSelf", old).ok()?;
     }
-    match program.execute(&cel_ctx).ok()? {
+    match execute_cel_with_budget(&program, cel_ctx, CEL_RULE_EVAL_BUDGET)
+        .ok()?
+        .ok()?
+    {
         cel::Value::String(s) => {
             let s = s.trim();
             (!s.is_empty() && !s.contains('\n')).then(|| s.to_string())
@@ -8771,6 +8816,63 @@ mod tests {
             err.1.message.contains("does not compile"),
             "malformed CEL must reject the CR with a compile-error message, not silently \
              accept it (got: {})",
+            err.1.message
+        );
+    }
+
+    // A CRD author's rule has no static cost bound (unlike upstream, which rejects an
+    // over-cost rule at CRD admission via a static estimator — see mayor-3ainu). A nested
+    // list comprehension (`.all()` inside `.all()`) is O(n^2) in the length of a
+    // CR-author-controlled list, so any tenant that can write a CR against this CRD could
+    // grow that list until the rule takes arbitrarily long to evaluate — without a budget
+    // this would hang the request-handling thread indefinitely instead of ever responding.
+    // This proves the write is REJECTED once evaluation exceeds CEL_RULE_EVAL_BUDGET,
+    // mirroring `validate_cr_schema_defense_in_depth_rejects_oversized_pattern...` above
+    // for the equivalent boon-schema risk. The hard wall-clock cap on the assertion below
+    // is what makes this a safe regression test: the list is sized so the full O(n^2)
+    // comparison would take single-digit seconds if ever finished (calibrated separately),
+    // but the budget must abandon it and return within CEL_RULE_EVAL_BUDGET, so the test
+    // itself finishes in a small fraction of a second — a test that took as long as the
+    // full computation would defeat the point of having a budget at all.
+    #[test]
+    fn cel_rule_exceeding_evaluation_budget_is_rejected_not_left_to_hang() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "x-kubernetes-validations": [
+                        { "rule": "self.all(x, self.all(y, x + y >= 0))" }
+                    ]
+                }
+            }
+        });
+        // Calibrated to take ~4s to run to completion uninstrumented (n=2000, 4,000,000
+        // comprehension steps) — comfortably over CEL_RULE_EVAL_BUDGET (250ms) even on
+        // slower CI hardware, while the abandoned evaluation thread never blocks this test.
+        let items: Vec<i64> = (0..2000).collect();
+        let value = serde_json::json!({ "items": items });
+
+        let start = std::time::Instant::now();
+        let err = check_schema(&value, schema).expect_err(
+            "a CEL rule whose cost scales with a CR-author-controlled list must be rejected \
+             once it exceeds the evaluation time budget, not accepted after silently running \
+             unbounded work",
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the whole point of the budget is to bound how long a single request waits for a \
+             runaway CEL rule — this took {elapsed:?}, which means the timeout mechanism \
+             itself did not fire (it should reject in ~CEL_RULE_EVAL_BUDGET, not run the full \
+             O(n^2) comprehension to completion)"
+        );
+        assert!(
+            err.1.message.contains("evaluation time budget"),
+            "the rejection must identify itself as the CEL cost-budget defense, not a \
+             generic validation failure (got: {})",
             err.1.message
         );
     }
