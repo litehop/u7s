@@ -803,10 +803,9 @@ POD_NODE_CIDR_MASK_SIZE=24
 # (the release-pipeline vendoring step lands separately); that is equivalent
 # to an empty set, not an error. Placed here (after $POD_CLUSTER_CIDR is
 # resolved, before the systemd units below start anything) because
-# flannel.yaml carries an install-time __POD_CLUSTER_CIDR__/__IFACE__
-# placeholder a byte-for-byte copy would ship unresolved -- see that file's
-# own header for what each substitutes to. Every other manifest copies
-# verbatim.
+# flannel.yaml and kube-proxy.yaml each carry install-time placeholders a
+# byte-for-byte copy would ship unresolved -- see each file's own header for
+# what it substitutes to. Every other manifest copies verbatim.
 if [ "$WORKER_MODE" -eq 0 ]; then
   TARBALL_MANIFEST_DIR="$(find "$STAGE_DIR" -type d -name manifests | head -n1)"
   if [ -n "$TARBALL_MANIFEST_DIR" ] && [ -n "$(find "$TARBALL_MANIFEST_DIR" -maxdepth 1 -name '*.yaml')" ]; then
@@ -818,6 +817,11 @@ if [ "$WORKER_MODE" -eq 0 ]; then
       sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
         "$MANIFEST_OUTPUT_DIR/flannel.yaml" > "$MANIFEST_OUTPUT_DIR/flannel.yaml.tmp"
       mv "$MANIFEST_OUTPUT_DIR/flannel.yaml.tmp" "$MANIFEST_OUTPUT_DIR/flannel.yaml"
+    fi
+    if [ -f "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml" ]; then
+      sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" \
+        "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml" > "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml.tmp"
+      mv "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml.tmp" "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml"
     fi
   fi
 fi
@@ -934,145 +938,26 @@ systemctl restart u7s-kcm.service
 systemctl enable kubelet.service
 systemctl restart kubelet.service
 
-# --- In-cluster bootstrap: kube-proxy DaemonSet -------------------------------
+# --- In-cluster bootstrap: kube-proxy + Flannel CNI --------------------------
 #
-# CoreDNS needs nothing here -- the apiserver server-side-applies its own
-# vendored manifest in-process on every boot (bootstrap_apply.rs) -- but
-# kube-proxy has no equivalent path, so it is applied once the apiserver is
-# reachable. Its ClusterRole is already seeded by the apiserver; only the
-# ServiceAccount binding, config and DaemonSet are new.
+# Both ship as manifests/*.yaml, applied via the well-known-manifest-folder
+# mechanism (docs/decisions/well-known-manifest-folder.md) rather than an
+# install.sh heredoc: the apiserver SSA-applies every file there in-process
+# at every boot, the same way it already applies its own compiled-in CoreDNS
+# bundle (bootstrap_apply.rs). The vendored-manifest copy step above already
+# templated each file's install-time placeholders (kube-proxy's
+# __KUBE_VERSION__/__IFACE_IP__, Flannel's __IFACE__/__POD_CLUSTER_CIDR__)
+# into $MANIFEST_OUTPUT_DIR -- see manifests/kube-proxy.yaml and
+# manifests/flannel.yaml for what each substitutes to and their departures
+# from upstream.
+#
+# wait_for_apiserver here confirms that boot-time apply actually succeeded --
+# a bad manifest is a fatal startup error for u7s-apiserver itself
+# (bootstrap_apply.rs), so a broken kube-proxy/Flannel manifest now surfaces
+# as apiserver never becoming healthy, not as a separate kubectl-apply
+# failure the way it used to.
 KUBECONFIG_PATH="$STATE_DIR/kubeconfig"
 wait_for_apiserver "$KUBECONFIG_PATH"
-
-# server: the real advertised apiserver address ($IFACE_IP:6443, matching
-# --advertise-address above), NOT the "kubernetes" Service's ClusterIP.
-# That ClusterIP is only reachable via iptables DNAT rules that kube-proxy
-# itself is responsible for installing -- pointing kube-proxy's own
-# kubeconfig at it is a bootstrap deadlock (informer never syncs, so the
-# DNAT rules that would make the ClusterIP reachable never get programmed).
-echo "Applying kube-proxy DaemonSet manifest..."
-kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: kube-proxy
-  namespace: kube-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kubeadm:node-proxier
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:node-proxier
-subjects:
-- kind: ServiceAccount
-  name: kube-proxy
-  namespace: kube-system
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: kube-proxy
-  namespace: kube-system
-data:
-  config.conf: |
-    apiVersion: kubeproxy.config.k8s.io/v1alpha1
-    kind: KubeProxyConfiguration
-    mode: "iptables"
-    clientConnection:
-      kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
-  kubeconfig.conf: |
-    apiVersion: v1
-    kind: Config
-    clusters:
-    - cluster:
-        certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        server: https://$IFACE_IP:6443
-      name: default
-    contexts:
-    - context:
-        cluster: default
-        user: default
-      name: default
-    current-context: default
-    users:
-    - name: default
-      user:
-        tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
----
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: kube-proxy
-  namespace: kube-system
-  labels:
-    k8s-app: kube-proxy
-spec:
-  selector:
-    matchLabels:
-      k8s-app: kube-proxy
-  template:
-    metadata:
-      labels:
-        k8s-app: kube-proxy
-    spec:
-      serviceAccountName: kube-proxy
-      hostNetwork: true
-      tolerations:
-      - operator: Exists
-      containers:
-      - name: kube-proxy
-        image: registry.k8s.io/kube-proxy:v${KUBE_VERSION}
-        command:
-        - /usr/local/bin/kube-proxy
-        - --config=/var/lib/kube-proxy/config.conf
-        - --hostname-override=\$(NODE_NAME)
-        securityContext:
-          privileged: true
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        volumeMounts:
-        - name: kube-proxy
-          mountPath: /var/lib/kube-proxy
-        - name: xtables-lock
-          mountPath: /run/xtables.lock
-        - name: lib-modules
-          mountPath: /lib/modules
-          readOnly: true
-      volumes:
-      - name: kube-proxy
-        configMap:
-          name: kube-proxy
-      - name: xtables-lock
-        hostPath:
-          path: /run/xtables.lock
-          type: FileOrCreate
-      - name: lib-modules
-        hostPath:
-          path: /lib/modules
-EOF
-
-# --- In-cluster bootstrap: Flannel CNI (cross-node pod networking) ----------
-#
-# node-ipam-controller (enabled above via --cluster-cidr=$POD_CLUSTER_CIDR)
-# only stamps Node.spec.podCIDR -- something still has to route pod traffic
-# between nodes using it. CRI-O's default bridge plugin (disabled above) has
-# no cross-node concept at all: every node would otherwise pick the same
-# uncoordinated default subnet with zero routing between hosts, so a
-# ClusterIP Service backed by a pod on a different node is unreachable.
-# Flannel's vxlan backend closes that gap.
-#
-# Applied via manifests/flannel.yaml through the well-known-manifest-folder
-# mechanism (docs/decisions/well-known-manifest-folder.md), not an inline
-# heredoc -- apiserver SSA-applies it in-process at every boot, once the
-# vendored-manifest copy step above has templated its __IFACE__/
-# __POD_CLUSTER_CIDR__ placeholders into $MANIFEST_OUTPUT_DIR. See that
-# file's own header for the departures from upstream flannel-io/flannel.
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"

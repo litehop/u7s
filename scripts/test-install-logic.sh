@@ -34,6 +34,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL="$DIR/install.sh"
 ROOT_DIR="$(cd "$DIR/.." && pwd)"
 FLANNEL_MANIFEST="$ROOT_DIR/manifests/flannel.yaml"
+KUBE_PROXY_MANIFEST="$ROOT_DIR/manifests/kube-proxy.yaml"
 
 PASS=0
 FAIL=0
@@ -344,12 +345,24 @@ assert_true "the apiserver restart step fails loud with a systemctl status/journ
 # "kubernetes" Service's ClusterIP (10.96.0.1:443) -- reachable only via
 # iptables DNAT rules that kube-proxy itself is responsible for installing,
 # a bootstrap deadlock that left every ClusterIP unreachable cluster-wide.
+# kube-proxy's DaemonSet moved from an install.sh heredoc to
+# manifests/kube-proxy.yaml (mayor-73lqh) -- assert both halves: install.sh
+# no longer embeds it, and the vendored file still avoids the ClusterIP.
 # ---------------------------------------------------------------------------
-assert_false "(regression guard) kube-proxy's kubeconfig no longer points at the kubernetes Service's ClusterIP (10.96.0.1:443), which is only reachable via DNAT rules kube-proxy itself has not yet installed at bootstrap" \
-  grep -qF '10.96.0.1:443' "$INSTALL"
+assert_false "(regression guard, mayor-73lqh) install.sh no longer embeds kube-proxy's DaemonSet as an inline heredoc -- it now lives in manifests/kube-proxy.yaml, applied via the well-known-manifest-folder mechanism" \
+  grep -qF 'name: kube-proxy' "$INSTALL"
 
-assert_true "kube-proxy's kubeconfig points at the real advertised apiserver address (\$IFACE_IP:6443), reachable without depending on kube-proxy's own DNAT rules" \
-  grep -qF 'server: https://$IFACE_IP:6443' "$INSTALL"
+assert_true "manifests/kube-proxy.yaml exists -- the vendored source-of-truth kube-proxy's DaemonSet moved into" \
+  test -f "$KUBE_PROXY_MANIFEST"
+
+assert_false "(regression guard) kube-proxy's kubeconfig no longer points at the kubernetes Service's ClusterIP (10.96.0.1:443), which is only reachable via DNAT rules kube-proxy itself has not yet installed at bootstrap" \
+  grep -qF '10.96.0.1:443' "$KUBE_PROXY_MANIFEST"
+
+assert_true "manifests/kube-proxy.yaml's kubeconfig server is a __IFACE_IP__ placeholder scripts/install.sh substitutes with the real advertised apiserver address, reachable without depending on kube-proxy's own DNAT rules" \
+  grep -qF 'server: https://__IFACE_IP__:6443' "$KUBE_PROXY_MANIFEST"
+
+assert_true "manifests/kube-proxy.yaml's image tag is a __KUBE_VERSION__ placeholder scripts/install.sh substitutes with the bundled kubelet's own version, not a fixed tag Renovate/Dependabot could bump independently and out of lockstep with it" \
+  grep -qF 'image: registry.k8s.io/kube-proxy:v__KUBE_VERSION__' "$KUBE_PROXY_MANIFEST"
 
 # ---------------------------------------------------------------------------
 # Regression guard: `sh install.sh` on Ubuntu (where /bin/sh is
@@ -544,11 +557,14 @@ write_manifest_copy_runner() {
     echo 'STAGE_DIR="$1"'
     echo 'MANIFEST_OUTPUT_DIR="$2"'
     echo 'WORKER_MODE="$3"'
-    # $4/$5 (IFACE/POD_CLUSTER_CIDR) are only read by flannel.yaml's own
-    # substitution branch below -- defaulted so existing callers that don't
-    # pass them (no flannel.yaml fixture in play) aren't forced to.
+    # $4/$5 (IFACE/POD_CLUSTER_CIDR) and $6/$7 (KUBE_VERSION/IFACE_IP) are
+    # only read by flannel.yaml's/kube-proxy.yaml's own substitution branches
+    # below -- defaulted so existing callers that don't pass them (no
+    # flannel.yaml/kube-proxy.yaml fixture in play) aren't forced to.
     echo 'IFACE="${4:-eth0}"'
     echo 'POD_CLUSTER_CIDR="${5:-10.244.0.0/16}"'
+    echo 'KUBE_VERSION="${6:-1.36.4}"'
+    echo 'IFACE_IP="${7:-10.0.0.1}"'
     awk '/^if \[ "\$WORKER_MODE" -eq 0 \]; then$/,/^fi$/' "$install_script"
   } > "$runner"
 }
@@ -644,6 +660,52 @@ else
   assert "mutation self-check: with flannel.yaml's substitution step bypassed, __IFACE__ ships unresolved -- proving the resolved-value assertions above would fail if this substitution were ever reverted" \
     "$(grep -qF '__IFACE__' "$mutated_dest5/flannel.yaml" && echo 1 || echo 0)"
 fi
+
+# Case 6 (mayor-73lqh): kube-proxy.yaml's __KUBE_VERSION__/__IFACE_IP__
+# placeholders must be resolved to install.sh's own real values on the way
+# into the well-known folder -- a plain byte-for-byte copy (correct for every
+# other manifest) would ship these tokens unresolved, and kube-proxy would
+# pull a nonexistent image tag and point its kubeconfig at a bogus host.
+stage6="$MANIFEST_WORK/stage6"
+mkdir -p "$stage6/manifests"
+printf '        image: registry.k8s.io/kube-proxy:v__KUBE_VERSION__\n        server: https://__IFACE_IP__:6443\n' \
+  > "$stage6/manifests/kube-proxy.yaml"
+dest6="$MANIFEST_WORK/dest6"
+bash "$MANIFEST_RUNNER" "$stage6" "$dest6" 0 "eth0" "10.244.0.0/16" "1.99.9" "192.0.2.5"
+assert_true "kube-proxy.yaml's __KUBE_VERSION__ placeholder is substituted with the bundled kubelet's own resolved version on the way into the well-known folder" \
+  grep -qF 'image: registry.k8s.io/kube-proxy:v1.99.9' "$dest6/kube-proxy.yaml"
+assert_true "kube-proxy.yaml's __IFACE_IP__ placeholder is substituted with the real advertised apiserver address on the way into the well-known folder" \
+  grep -qF 'server: https://192.0.2.5:6443' "$dest6/kube-proxy.yaml"
+assert_false "kube-proxy.yaml carries no unresolved __KUBE_VERSION__/__IFACE_IP__ token once it reaches the well-known folder apiserver auto-applies at boot" \
+  grep -qE '__KUBE_VERSION__|__IFACE_IP__' "$dest6/kube-proxy.yaml"
+
+# Mutation self-check (CLAUDE.md rule 14): prove the three assertions above
+# would actually catch a reverted substitution step, not just document
+# today's behavior.
+MUTATED_KUBE_PROXY_SUB_INSTALL="$MANIFEST_WORK/install-mutated-kube-proxy-sub.sh"
+sed 's/if \[ -f "\$MANIFEST_OUTPUT_DIR\/kube-proxy.yaml" \]; then/if false; then/' "$INSTALL" \
+  > "$MUTATED_KUBE_PROXY_SUB_INSTALL"
+if diff -q "$INSTALL" "$MUTATED_KUBE_PROXY_SUB_INSTALL" > /dev/null 2>&1; then
+  assert "mutation self-check: kube-proxy.yaml's substitution guard exists in install.sh to mutate (if this fails, the line was renamed/reshaped and this suite no longer exercises it)" 0
+else
+  MUTATED_KUBE_PROXY_SUB_RUNNER="$MANIFEST_WORK/manifest-copy-mutated-kube-proxy-sub.sh"
+  write_manifest_copy_runner "$MUTATED_KUBE_PROXY_SUB_INSTALL" "$MUTATED_KUBE_PROXY_SUB_RUNNER"
+  mutated_dest6="$MANIFEST_WORK/dest6-mutated"
+  bash "$MUTATED_KUBE_PROXY_SUB_RUNNER" "$stage6" "$mutated_dest6" 0 "eth0" "10.244.0.0/16" "1.99.9" "192.0.2.5"
+  assert "mutation self-check: with kube-proxy.yaml's substitution step bypassed, __KUBE_VERSION__ ships unresolved -- proving the resolved-value assertions above would fail if this substitution were ever reverted" \
+    "$(grep -qF '__KUBE_VERSION__' "$mutated_dest6/kube-proxy.yaml" && echo 1 || echo 0)"
+fi
+
+# ---------------------------------------------------------------------------
+# Regression guard (mayor-fptqu, mayor-73lqh): both migrations remove
+# install.sh's own kubectl-apply heredocs entirely -- CoreDNS never had one
+# (bootstrap_apply.rs applies its compiled-in bundle), and kube-proxy/Flannel
+# now go through the same well-known-manifest-folder mechanism. If a future
+# addon reintroduces this shape, that's a sign it should be a manifests/*.yaml
+# file instead.
+# ---------------------------------------------------------------------------
+assert_false "(regression guard) install.sh no longer applies any manifest via an inline 'kubectl apply -f - <<EOF' heredoc" \
+  grep -qF 'apply -f - <<EOF' "$INSTALL"
 
 # ---------------------------------------------------------------------------
 # Persisted install config ($STATE_DIR/config): IFACE/NODE_NAME feed into

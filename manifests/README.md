@@ -17,11 +17,10 @@ see `docs/decisions/upstream-component-shipping-shape.md` -- and lives at
 `crates/apiserver/manifests/metrics-server.yaml` instead, for users to apply
 themselves).
 
-`flannel.yaml` carries two install-time placeholders (`__IFACE__`,
-`__POD_CLUSTER_CIDR__`) `scripts/install.sh` substitutes before writing it to
-`--manifest-output-dir` -- see that file's own header comment. kube-proxy is
-still an `install.sh` heredoc, and CoreDNS is still compiled into the
-apiserver via `include_bytes!` (`crates/apiserver/manifests/coredns.yaml`).
-Migrating each onto this mechanism is separate follow-on work (mayor-73lqh,
-mayor-fiq79) -- this directory and the tarball/install-time plumbing around
-it exist first so those migrations have somewhere real to land.
+`flannel.yaml` (`__IFACE__`, `__POD_CLUSTER_CIDR__`) and `kube-proxy.yaml`
+(`__KUBE_VERSION__`, `__IFACE_IP__`) each carry install-time placeholders
+`scripts/install.sh` substitutes before writing them to
+`--manifest-output-dir` -- see each file's own header comment for what every
+placeholder substitutes to. CoreDNS is still compiled into the apiserver via
+`include_bytes!` (`crates/apiserver/manifests/coredns.yaml`); migrating it
+onto this mechanism is separate follow-on work (mayor-fiq79).

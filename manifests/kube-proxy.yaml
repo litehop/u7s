@@ -1,0 +1,128 @@
+# kube-proxy's ServiceAccount/ConfigMap/DaemonSet, applied via the well-known-manifest-folder
+# mechanism (docs/decisions/well-known-manifest-folder.md) instead of an install.sh heredoc
+# (mayor-73lqh). Its ClusterRole (system:node-proxier) is already seeded by the apiserver itself
+# (crates/apiserver/src/lib.rs seed_rbac) -- only the ServiceAccount binding, config and
+# DaemonSet below are new.
+#
+# Two install-time placeholders scripts/install.sh substitutes before writing this file into
+# --manifest-output-dir:
+#   __KUBE_VERSION__    kubelet's own --version output (install.sh's $KUBE_VERSION) -- kube-proxy
+#                        must track whichever kubelet a given release actually bundles, not a
+#                        fixed tag Renovate/Dependabot would otherwise bump independently and out
+#                        of lockstep with it. Left as a placeholder, not a real tag, precisely so
+#                        Renovate does NOT try to manage this one.
+#   __IFACE_IP__         the real advertised apiserver address (install.sh's $IFACE_IP:6443,
+#                         matching u7s-apiserver.service's own --advertise-address), NOT the
+#                         "kubernetes" Service's ClusterIP. That ClusterIP is only reachable via
+#                         iptables DNAT rules kube-proxy itself is responsible for installing --
+#                         pointing kube-proxy's own kubeconfig at it is a bootstrap deadlock
+#                         (informer never syncs, so the DNAT rules that would make the ClusterIP
+#                         reachable never get programmed; mayor-ecmt4).
+#
+# --hostname-override=$(NODE_NAME) is Kubernetes' own container-command env-var substitution
+# syntax (references the NODE_NAME env var set via fieldRef below), not a shell expansion -- as a
+# real standalone YAML file (unlike the install.sh heredoc this replaced) it needs no backslash
+# escaping to protect it from bash's own command substitution.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeadm:node-proxier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-proxier
+subjects:
+- kind: ServiceAccount
+  name: kube-proxy
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    mode: "iptables"
+    clientConnection:
+      kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
+  kubeconfig.conf: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - cluster:
+        certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        server: https://__IFACE_IP__:6443
+      name: default
+    contexts:
+    - context:
+        cluster: default
+        user: default
+      name: default
+    current-context: default
+    users:
+    - name: default
+      user:
+        tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+  labels:
+    k8s-app: kube-proxy
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-proxy
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-proxy
+    spec:
+      serviceAccountName: kube-proxy
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: kube-proxy
+        image: registry.k8s.io/kube-proxy:v__KUBE_VERSION__
+        command:
+        - /usr/local/bin/kube-proxy
+        - --config=/var/lib/kube-proxy/config.conf
+        - --hostname-override=$(NODE_NAME)
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: kube-proxy
+          mountPath: /var/lib/kube-proxy
+        - name: xtables-lock
+          mountPath: /run/xtables.lock
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: kube-proxy
+        configMap:
+          name: kube-proxy
+      - name: xtables-lock
+        hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
