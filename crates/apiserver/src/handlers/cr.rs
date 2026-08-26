@@ -779,7 +779,15 @@ fn validate_cr_schema(
             let index = compiler
                 .compile("schema.json", &mut schemas)
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let compiled = std::sync::Arc::new(crate::state::CompiledCrSchema { schemas, index });
+            let mut cel_programs = std::collections::HashMap::new();
+            collect_cel_programs(schema, &mut cel_programs);
+            #[cfg(test)]
+            cache.record_cel_compiles(cel_programs.len());
+            let compiled = std::sync::Arc::new(crate::state::CompiledCrSchema {
+                schemas,
+                index,
+                cel_programs,
+            });
             cache.insert(ctx.schema_cache_key.clone(), compiled.clone());
             compiled
         }
@@ -801,7 +809,74 @@ fn validate_cr_schema(
     // rule like `self.foo > 0` against a body that doesn't even have `foo` typed as a
     // number yet produces confusing CEL runtime errors instead of the clearer boon
     // "wrong type" error above.
-    validate_cel_rules(schema, obj, old_object, "")
+    validate_cel_rules(schema, obj, old_object, "", &compiled.cel_programs)
+}
+
+/// Walks `schema` collecting a pre-compiled `cel::Program` for every unique
+/// `x-kubernetes-validations` `rule`/`messageExpression` CEL source string reachable from
+/// it, so `validate_cel_rules`'s per-request walk never needs to call
+/// `cel::Program::compile` for a schema whose CRD generation is already cached — see
+/// `CrSchemaCache`/`CompiledCrSchema::cel_programs`. Compiling is a pure function of the
+/// source text, so two rules with identical text (anywhere in the schema, including
+/// across different `oneOf`/`anyOf` branches) share one compiled program.
+///
+/// Unlike `validate_cel_rules`'s data-driven walk (which only follows the `oneOf`/`anyOf`
+/// branch(es) a given object actually matches), this walks every branch of every
+/// combinator unconditionally — it has no object to test against, and a request against a
+/// different branch later must still hit a warm cache. A source string that fails to
+/// compile is simply omitted here; `evaluate_cel_rule`/`evaluate_message_expression`
+/// re-attempt (and re-fail with the same message) on the resulting cache miss, so error
+/// behavior is unaffected by this being a best-effort prewarm.
+fn collect_cel_programs(
+    schema: &serde_json::Value,
+    out: &mut std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+) {
+    if let Some(rules) = schema
+        .get("x-kubernetes-validations")
+        .and_then(|v| v.as_array())
+    {
+        for rule in rules {
+            for key in ["rule", "messageExpression"] {
+                if let Some(text) = rule.get(key).and_then(|v| v.as_str()) {
+                    if !out.contains_key(text) {
+                        if let Ok(program) = cel::Program::compile(text) {
+                            out.insert(text.to_string(), std::sync::Arc::new(program));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for sub_schema in props.values() {
+            collect_cel_programs(sub_schema, out);
+        }
+    }
+    if let Some(items_schema) = schema.get("items") {
+        collect_cel_programs(items_schema, out);
+    }
+    for combinator in ["allOf", "oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
+            for branch in branches {
+                collect_cel_programs(branch, out);
+            }
+        }
+    }
+}
+
+/// Returns the pre-compiled program for `text` from `programs` — the common case once a
+/// CRD generation's schema is cached, see `collect_cel_programs` — or compiles it fresh.
+/// The fallback only runs on a genuine cache miss, or when `text` failed to compile during
+/// the schema walk (in which case the same compile error is reproduced here rather than
+/// silently swallowed).
+fn resolve_cel_program(
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    text: &str,
+) -> Result<std::sync::Arc<cel::Program>, cel::ParseErrors> {
+    if let Some(program) = programs.get(text) {
+        return Ok(std::sync::Arc::clone(program));
+    }
+    cel::Program::compile(text).map(std::sync::Arc::new)
 }
 
 /// Recursively evaluate `x-kubernetes-validations` CEL rules declared anywhere in
@@ -820,13 +895,14 @@ fn validate_cel_rules(
     obj: &serde_json::Value,
     old_node: Option<&serde_json::Value>,
     field_path: &str,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Result<(), crate::status::StatusError> {
     if let Some(rules) = schema
         .get("x-kubernetes-validations")
         .and_then(|v| v.as_array())
     {
         for rule in rules {
-            evaluate_cel_rule(rule, obj, old_node, field_path)?;
+            evaluate_cel_rule(rule, obj, old_node, field_path, programs)?;
         }
     }
 
@@ -840,6 +916,7 @@ fn validate_cel_rules(
                         child,
                         child_old,
                         &join_cr_field_path(field_path, key),
+                        programs,
                     )?;
                 }
             }
@@ -848,7 +925,13 @@ fn validate_cel_rules(
         if let Some(arr) = obj.as_array() {
             for (i, item) in arr.iter().enumerate() {
                 let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
-                validate_cel_rules(items_schema, item, item_old, &format!("{field_path}[{i}]"))?;
+                validate_cel_rules(
+                    items_schema,
+                    item,
+                    item_old,
+                    &format!("{field_path}[{i}]"),
+                    programs,
+                )?;
             }
         }
     }
@@ -862,14 +945,14 @@ fn validate_cel_rules(
     // "no such key" CEL error), not produce a meaningful pass/fail.
     if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
         for branch in branches {
-            validate_cel_rules(branch, obj, old_node, field_path)?;
+            validate_cel_rules(branch, obj, old_node, field_path, programs)?;
         }
     }
     for combinator in ["oneOf", "anyOf"] {
         if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
             for branch in branches {
                 if schema_branch_structurally_matches(branch, obj) {
-                    validate_cel_rules(branch, obj, old_node, field_path)?;
+                    validate_cel_rules(branch, obj, old_node, field_path, programs)?;
                 }
             }
         }
@@ -927,12 +1010,13 @@ fn evaluate_cel_rule(
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
     field_path: &str,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Result<(), crate::status::StatusError> {
     let Some(rule_text) = rule.get("rule").and_then(|v| v.as_str()) else {
         return Ok(());
     };
 
-    let program = cel::Program::compile(rule_text).map_err(|e| {
+    let program = resolve_cel_program(programs, rule_text).map_err(|e| {
         Status::unprocessable_entity(format!(
             "{field_path}: x-kubernetes-validations rule does not compile: {e} (rule: {rule_text})"
         ))
@@ -982,7 +1066,7 @@ fn evaluate_cel_rule(
         return Ok(());
     }
 
-    let detail = cel_rule_failure_detail(rule, rule_text, self_value, old_self_value);
+    let detail = cel_rule_failure_detail(rule, rule_text, self_value, old_self_value, programs);
     let value_prefix = match self_value {
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => String::new(),
         other => format!("\"{}\": ", json_value_as_display_string(other)),
@@ -1001,6 +1085,7 @@ fn cel_rule_failure_detail(
     rule_text: &str,
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> String {
     if let Some(msg) = rule
         .get("message")
@@ -1011,7 +1096,9 @@ fn cel_rule_failure_detail(
         return msg.to_string();
     }
     if let Some(expr) = rule.get("messageExpression").and_then(|v| v.as_str()) {
-        if let Some(rendered) = evaluate_message_expression(expr, self_value, old_self_value) {
+        if let Some(rendered) =
+            evaluate_message_expression(expr, self_value, old_self_value, programs)
+        {
             return rendered;
         }
     }
@@ -1028,8 +1115,9 @@ fn evaluate_message_expression(
     expr: &str,
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
+    programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
 ) -> Option<String> {
-    let program = cel::Program::compile(expr).ok()?;
+    let program = resolve_cel_program(programs, expr).ok()?;
     let mut cel_ctx = cel::Context::default();
     register_cel_string_extensions(&mut cel_ctx);
     cel_ctx.add_variable("self", self_value).ok()?;
@@ -7515,6 +7603,78 @@ mod tests {
             1,
             "a second CR write against the same CRD generation (same group/version/resourceVersion) \
              must reuse the cached compiled schema, not pay boon::Compiler::compile's cost again"
+        );
+    }
+
+    // The same amplification risk applies to x-kubernetes-validations CEL rules: without
+    // caching the pre-parsed cel::Program, a CRD with even a handful of CEL rules would
+    // re-run cel::Program::compile (and the schema walk that finds every rule) on every
+    // single CR create/update/patch, forever, even though the CRD's schema never changed.
+    // A dedicated CEL compile counter (not the boon one above, and not timing — a real CEL
+    // parse is fast enough that a timing assertion would be flaky) so a regression that
+    // moves CEL compilation back onto the per-request path is caught even if it doesn't
+    // touch boon compilation at all.
+    #[test]
+    fn cr_schema_cache_avoids_cel_reparse_on_repeated_writes_against_same_crd_version() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": { "type": "object" } },
+            "x-kubernetes-validations": [
+                { "rule": "self.spec == self.spec" }
+            ]
+        });
+        let ctx = CrContext {
+            kind: "Test".into(),
+            namespaced: false,
+            has_status_subresource: false,
+            schema: Some(schema),
+            conversion_webhook_client_config: None,
+            selectable_fields: vec![],
+            schema_cache_key: ("group.example.com".into(), "v1".into(), "1".into()),
+            scale: None,
+        };
+        let cache = crate::state::CrSchemaCache::new();
+        let value = serde_json::json!({ "spec": {} });
+
+        assert!(
+            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            "first write must validate"
+        );
+        assert!(
+            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            "second write must validate"
+        );
+
+        assert_eq!(
+            cache.cel_compile_count(),
+            1,
+            "a second CR write against the same CRD generation must reuse the CEL program \
+             pre-parsed during the first write's schema walk, not call cel::Program::compile \
+             again for every rule on every write"
+        );
+    }
+
+    // `resolve_cel_program` is the single choke point every rule/messageExpression
+    // evaluation goes through to obtain a `cel::Program` (see `evaluate_cel_rule`,
+    // `evaluate_message_expression`). This unit-tests that choke point directly: given a
+    // pre-parsed entry, it must hand back that SAME `Arc` rather than silently parsing a
+    // lookalike — `Arc::ptr_eq`, not just value equality (`cel::Program` has no
+    // `PartialEq`), is the only way to observe "no fresh compile happened" here.
+    #[test]
+    fn resolve_cel_program_reuses_cached_arc_instead_of_reparsing() {
+        let text = "self == self";
+        let cached = std::sync::Arc::new(cel::Program::compile(text).unwrap());
+        let mut programs = std::collections::HashMap::new();
+        programs.insert(text.to_string(), std::sync::Arc::clone(&cached));
+
+        let resolved = resolve_cel_program(&programs, text)
+            .expect("a cache-hit lookup for already-compiled text must not fail");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&cached, &resolved),
+            "a cache hit must return the exact Arc<cel::Program> collected during the schema \
+             walk, not a freshly re-parsed one — otherwise every CR write would still pay \
+             cel::Program::compile's cost despite CompiledCrSchema::cel_programs existing"
         );
     }
 
