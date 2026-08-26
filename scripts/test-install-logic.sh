@@ -589,6 +589,158 @@ bash "$MANIFEST_RUNNER" "$stage4" "$dest4" 0 || copy_status=$?
 assert "a tarball with no manifests/ dir at all is treated as an empty set, not an error -- required until the release-pipeline vendoring bead (mayor-liiv1) actually lands manifests into the tarball" \
   "$([ "$copy_status" -eq 0 ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Persisted install config ($STATE_DIR/config): IFACE/NODE_NAME feed into
+# --advertise-address, which the apiserver embeds into every kubeconfig it
+# rewrites (tls.rs). Regression this guards: a re-run with a different
+# --iface used to silently rebake a different address into a live cluster,
+# breaking any kubeconfig already distributed off-box (mayor-htnrs). Operator
+# decision (2026-08-26): refuse loudly on a mismatch rather than silently
+# override or auto-wipe state -- deleting $CONFIG_FILE is the only escape
+# hatch. Both the write step and the read-back+refusal logic are extracted
+# verbatim from install.sh's own source, same approach as the other
+# extractions in this file.
+# ---------------------------------------------------------------------------
+
+write_persist_config_write_runner() {
+  local install_script="$1" runner="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"'
+    echo 'CONFIG_FILE="$STATE_DIR/config"'
+    echo 'NODE_NAME="$2"'
+    echo 'IFACE="$3"'
+    grep -A3 -F 'cat > "$CONFIG_FILE" <<EOF' "$install_script"
+  } > "$runner"
+}
+
+write_persist_config_check_runner() {
+  local install_script="$1" runner="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo 'STATE_DIR="$1"'
+    echo 'CONFIG_FILE="$STATE_DIR/config"'
+    echo 'EXISTING_INSTALL="$2"'
+    echo 'NODE_NAME="$3"'
+    echo 'IFACE="$4"'
+    awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Defaults: node name, network interface/ { if ($0 !~ /^# --- Defaults: node name, network interface/) print }' "$install_script"
+    echo 'echo "NODE_NAME=$NODE_NAME"'
+    echo 'echo "IFACE=$IFACE"'
+  } > "$runner"
+}
+
+PERSIST_WORK="$(mktemp -d)"
+# Replaces the earlier EXIT traps above (only the latest fires), so it must
+# still cover every dir those relied on cleaning up.
+trap 'rm -rf "$DETECT_WORK" "$WORKER_MODE_WORK" "$MANIFEST_WORK" "$PERSIST_WORK"' EXIT
+PERSIST_WRITE_RUNNER="$PERSIST_WORK/persist-write.sh"
+PERSIST_CHECK_RUNNER="$PERSIST_WORK/persist-check.sh"
+write_persist_config_write_runner "$INSTALL" "$PERSIST_WRITE_RUNNER"
+write_persist_config_check_runner "$INSTALL" "$PERSIST_CHECK_RUNNER"
+
+# Case 1: a fresh install writes the resolved node-name/iface to
+# $STATE_DIR/config -- the write half of the contract; nothing to read back
+# on the very next run without this.
+fresh_write_dir="$PERSIST_WORK/fresh-write"
+mkdir -p "$fresh_write_dir"
+bash "$PERSIST_WRITE_RUNNER" "$fresh_write_dir" "node-a" "eth0"
+assert_true "a fresh install persists the resolved node-name to \$STATE_DIR/config" \
+  grep -qF 'NODE_NAME="node-a"' "$fresh_write_dir/config"
+assert_true "a fresh install persists the resolved iface to \$STATE_DIR/config" \
+  grep -qF 'IFACE="eth0"' "$fresh_write_dir/config"
+
+# Case 2: an upgrade re-run with no --iface/--node-name flags (NODE_NAME/IFACE
+# arrive empty, exactly as install.sh's own flag-parsing leaves them unset)
+# must default to what a prior install persisted, not fall through to
+# hostname/auto-detection as if this were a fresh box.
+upgrade_no_flags_dir="$PERSIST_WORK/upgrade-no-flags"
+mkdir -p "$upgrade_no_flags_dir"
+{
+  echo 'NODE_NAME="old-node"'
+  echo 'IFACE="eth0"'
+} > "$upgrade_no_flags_dir/config"
+no_flags_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_no_flags_dir" 1 "" "" 2>&1)"
+assert "an upgrade re-run with no --iface/--node-name defaults both to the values persisted at install time, instead of recomputing a fresh hostname/auto-detected interface" \
+  "$(printf '%s' "$no_flags_out" | grep -q '^NODE_NAME=old-node$' && printf '%s' "$no_flags_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
+
+# Case 3: an upgrade re-run with an explicit --iface that DISAGREES with the
+# persisted value must refuse loudly and exit non-zero, naming $CONFIG_FILE
+# as the file to delete -- the acceptance criterion this bead exists for.
+# Silently overriding here is exactly what would rebake a different
+# --advertise-address into a live cluster, breaking any kubeconfig already
+# distributed off-box.
+upgrade_mismatch_dir="$PERSIST_WORK/upgrade-mismatch"
+mkdir -p "$upgrade_mismatch_dir"
+{
+  echo 'NODE_NAME="node-a"'
+  echo 'IFACE="eth0"'
+} > "$upgrade_mismatch_dir/config"
+mismatch_status=0
+mismatch_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_mismatch_dir" 1 "node-a" "eth1" 2>&1)" || mismatch_status=$?
+assert "an upgrade with a --iface that disagrees with the persisted value is refused loudly (non-zero exit, mentions the persisted 'eth0'), instead of silently rebaking a new --advertise-address into a live cluster" \
+  "$([ "$mismatch_status" -ne 0 ] && printf '%s' "$mismatch_out" | grep -qi 'conflicts' && printf '%s' "$mismatch_out" | grep -q 'eth0' && echo 1 || echo 0)"
+assert "the --iface mismatch refusal names the exact file to delete (\$STATE_DIR/config), per the operator's decision that this is the only escape hatch (no override flag)" \
+  "$(printf '%s' "$mismatch_out" | grep -qF "$upgrade_mismatch_dir/config" && echo 1 || echo 0)"
+
+# Case 3b: the same guard on --node-name -- a distinct if-block in
+# install.sh, not exercised by the --iface case above.
+upgrade_name_mismatch_dir="$PERSIST_WORK/upgrade-name-mismatch"
+mkdir -p "$upgrade_name_mismatch_dir"
+{
+  echo 'NODE_NAME="node-a"'
+  echo 'IFACE="eth0"'
+} > "$upgrade_name_mismatch_dir/config"
+name_mismatch_status=0
+name_mismatch_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_name_mismatch_dir" 1 "node-b" "eth0" 2>&1)" || name_mismatch_status=$?
+assert "an upgrade with a --node-name that disagrees with the persisted value is refused loudly (non-zero exit, mentions the persisted 'node-a'), instead of silently rebaking a new kubelet --hostname-override into a live cluster" \
+  "$([ "$name_mismatch_status" -ne 0 ] && printf '%s' "$name_mismatch_out" | grep -qi 'conflicts' && printf '%s' "$name_mismatch_out" | grep -q 'node-a' && echo 1 || echo 0)"
+
+# Case 4: an upgrade re-run with an explicit --iface that MATCHES the
+# persisted value is not a real mismatch -- it must proceed normally, or
+# every upgrade script that always passes --iface explicitly (rather than
+# relying on the env-var/no-flags convention) would be refused every time.
+upgrade_match_dir="$PERSIST_WORK/upgrade-match"
+mkdir -p "$upgrade_match_dir"
+{
+  echo 'NODE_NAME="node-a"'
+  echo 'IFACE="eth0"'
+} > "$upgrade_match_dir/config"
+match_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_match_dir" 1 "node-a" "eth0" 2>&1)"
+assert "an upgrade with an explicit --iface/--node-name that MATCHES the persisted value proceeds normally -- the guard only fires on a genuine mismatch, not on any explicit flag" \
+  "$(printf '%s' "$match_out" | grep -q '^NODE_NAME=node-a$' && printf '%s' "$match_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
+
+# Case 5: a genuinely fresh install (EXISTING_INSTALL=0, no persisted config
+# file at all) must never trigger the mismatch guard, even with explicit
+# flags passed -- this guard is upgrade-only.
+fresh_install_dir="$PERSIST_WORK/fresh-install"
+mkdir -p "$fresh_install_dir"
+fresh_install_out="$(bash "$PERSIST_CHECK_RUNNER" "$fresh_install_dir" 0 "node-a" "eth0" 2>&1)"
+assert "a genuinely fresh install (no persisted config, EXISTING_INSTALL=0) never trips the mismatch guard, even with explicit --iface/--node-name flags -- the guard is upgrade-only" \
+  "$(printf '%s' "$fresh_install_out" | grep -q '^NODE_NAME=node-a$' && printf '%s' "$fresh_install_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# Mutation self-check (CLAUDE.md rule 14): prove the --iface refusal assertion
+# above would actually catch a reverted fix. Bypass the guard in a scratch
+# copy of install.sh and rerun the exact mismatch scenario -- if the guard is
+# gone, the mismatched --iface must instead win silently (IFACE=eth1 printed,
+# no refusal), which is precisely the silent-override behavior the operator
+# rejected in favor of refuse-loud.
+# ---------------------------------------------------------------------------
+MUTATED_PERSIST_INSTALL="$PERSIST_WORK/install-mutated.sh"
+sed 's/elif \[ "\$IFACE" != "\$PERSISTED_IFACE" \]; then/elif false; then/' "$INSTALL" > "$MUTATED_PERSIST_INSTALL"
+if diff -q "$INSTALL" "$MUTATED_PERSIST_INSTALL" > /dev/null 2>&1; then
+  assert "mutation self-check: the --iface mismatch guard's condition line exists in install.sh to mutate (if this fails, the line was renamed/reshaped and this suite no longer exercises it)" 0
+else
+  MUTATED_PERSIST_RUNNER="$PERSIST_WORK/persist-check-mutated.sh"
+  write_persist_config_check_runner "$MUTATED_PERSIST_INSTALL" "$MUTATED_PERSIST_RUNNER"
+  mutated_persist_status=0
+  mutated_persist_out="$(bash "$MUTATED_PERSIST_RUNNER" "$upgrade_mismatch_dir" 1 "node-a" "eth1" 2>&1)" || mutated_persist_status=$?
+  assert "mutation self-check: with the --iface mismatch guard bypassed, a disagreeing --iface is wrongly allowed to silently win -- proving the refusal test above would fail if this fix were ever reverted" \
+    "$([ "$mutated_persist_status" -eq 0 ] && printf '%s' "$mutated_persist_out" | grep -q '^IFACE=eth1$' && echo 1 || echo 0)"
+fi
+
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
