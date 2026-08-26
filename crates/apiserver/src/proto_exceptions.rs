@@ -189,21 +189,21 @@ const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
         "NOT marked `Deprecated:` upstream (plain `optional Time deletionTimestamp = 9`) — \
          omitted for a compensating-control reason, not deprecation: restored from the \
          stored object by replace_resource/replace_namespaced_resource and listed in \
-         handlers::status::merge_incoming_metadata's PROTECTED set (mayor-2mi3e, #888)",
+         handlers::status::merge_incoming_metadata's PROTECTED set (#888)",
     ),
     (
         ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
         "deletionGracePeriodSeconds",
         "NOT marked `Deprecated:` upstream — omitted for the same compensating-control \
          reason as deletionTimestamp: restored from the stored object alongside it \
-         (mayor-2mi3e, #888)",
+         (#888)",
     ),
     (
         ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta",
         "managedFields",
         "NOT marked `Deprecated:` upstream — omitted for a compensating-control reason, not \
          deprecation: stripped/synthesized server-side on every path, so a client-supplied \
-         value is never honoured (mayor-2mi3e); revisit if full Server-Side Apply lands \
+         value is never honoured; revisit if full Server-Side Apply lands \
          (mayor-u6ju)",
     ),
     (
@@ -401,8 +401,8 @@ const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// Real drops that are tolerated so this oracle can be adopted without turning the suite red in
-/// the same change. Every entry here is a live bug with a bead. Empty today: the rollout in
-/// mayor-j430l is expected to fill it as the ~110 surveyed candidates are triaged, and each entry
+/// the same change. Every entry here is a live bug with a bead. Empty today: the rollout is
+/// expected to fill it as the ~110 surveyed candidates are triaged, and each entry
 /// should leave with a fix rather than be edited to stay.
 const KNOWN_GAPS: &[(&str, &str, &str)] = &[];
 

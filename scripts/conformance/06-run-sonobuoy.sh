@@ -177,7 +177,7 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-# mayor-f0lfr: pre-seed the sonobuoy namespace + a LimitRange (see
+# Pre-seed the sonobuoy namespace + a LimitRange (see
 # sonobuoy-namespace-limitrange.yaml for the full rationale) so u7s's own
 # LimitRange admission promotes the aggregator pod out of BestEffort QoS --
 # sonobuoy's own plugin schema has no override point for the aggregator's
@@ -253,7 +253,7 @@ build_filter_args() {
   fi
 }
 
-# mayor-f0lfr: --skip-preflight=existingnamespace skips ONLY sonobuoy's own
+# --skip-preflight=existingnamespace skips ONLY sonobuoy's own
 # "existingnamespace" preflight check (cmd/sonobuoy/app/args.go's
 # AddSkipPreflightFlag / pkg/client/preflight.go's preflightExistingNamespace)
 # -- required because the pre-seed step above deliberately creates the
@@ -510,7 +510,7 @@ echo "Host logs: $HOST_LOGS_DIR"
 # running here) into this run's own directory, same idea as host-logs above:
 # a run whose operator forgot to babysit it still gets memory data. This is
 # the "post-run" /metrics snapshot — taken here, before run-all.sh's own
-# --profile branch (if any) stops the apiserver, per mayor-zpvp2 — and a copy
+# --profile branch (if any) stops the apiserver — and a copy
 # of the RSS/ring-gauge CSVs as they stand right now (they keep growing after
 # this copy since the sampler is still running; a --profile run re-copies the
 # final state once it reaps the sampler for real).

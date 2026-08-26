@@ -2986,7 +2986,7 @@ mod tests {
     // client-go's scale.Client resolves a CRD-backed resource's scale GroupVersionResource via
     // NewDiscoveryScaleKindResolver.ScaleForResource(), which scans ServerPreferredResources()
     // for a "<resource>/scale" entry and returns ScaleKindNotFoundError *before* ever issuing
-    // the HTTP request if that entry is absent -- even though mayor-vjnqa's /scale route works
+    // the HTTP request if that entry is absent -- even though the /scale route works
     // and answers real GETs. This proves classic /apis/{group}/{version} discovery advertises
     // "<plural>/status" and "<plural>/scale" whenever the matched CRD version declares them.
     #[tokio::test]
@@ -5767,10 +5767,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // build_aggregated_discovery — typed-struct migration (mayor-ohh8o)
+    // build_aggregated_discovery — typed-struct migration
     // ---------------------------------------------------------------------------
 
-    /// Regression test for mayor-ohh8o: `build_aggregated_discovery` must serialize to the
+    /// Regression test: `build_aggregated_discovery` must serialize to the
     /// exact same bytes it did before migrating its `serde_json::json!`-built `Value` tree to
     /// the typed `APIGroupDiscoveryList`/`APIResourceDiscovery` family in `types.rs`. client-go's
     /// discovery cache stores this response verbatim and diffs it byte-for-byte on the next
@@ -5811,11 +5811,11 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-ohh8o, and the actual fail-on-revert half of the pair above:
+    /// Regression test, and the actual fail-on-revert half of the pair above:
     /// `build_aggregated_discovery`'s own body must not construct its output via
     /// `serde_json::json!`/`serde_json::Value`. Mirrors the source-scan pattern used for the
-    /// sibling perf fixes `content_type::reencode_proto_response` (mayor-g7g2m) and
-    /// `auth::object_is_live` (mayor-e555b): a purely byte-equality test cannot catch a
+    /// sibling perf fixes `content_type::reencode_proto_response` and
+    /// `auth::object_is_live`: a purely byte-equality test cannot catch a
     /// reintroduction of the untyped `Value`-tree-building path here, because
     /// `serde_json::Value`'s `Map` sorts keys the same way a hand-declared, alphabetically
     /// ordered struct does (see the test above) -- so the old and new code paths are
@@ -5844,7 +5844,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // DiscoveryCache — bytes-cache for the STATIC_GROUPS + CRD portion (mayor-a9kc1)
+    // DiscoveryCache — bytes-cache for the STATIC_GROUPS + CRD portion
     // ---------------------------------------------------------------------------
 
     /// A cache-warm request and a cache-forced-cold request (the store's only source of

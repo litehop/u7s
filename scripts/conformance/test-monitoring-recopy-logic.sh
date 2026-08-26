@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit test for the final monitoring-artifact re-copy gate in run-all.sh.
 #
-# Bug (mayor-xzkqw): the "Re-copy the monitoring artifacts now that they
+# Bug: the "Re-copy the monitoring artifacts now that they
 # cover the whole run" block (which picks up metrics-03-pre-teardown.prom
 # and any rss.csv/ring-age.csv growth since 06-run-sonobuoy.sh's own
 # post-run copy) lived INSIDE `if [ "$PROFILE" -eq 1 ]`. Any plain
@@ -81,7 +81,7 @@ echo "pre-teardown-metrics" > "$WORKDIR_T/metrics-03-pre-teardown.prom"
 # ---------------------------------------------------------------------------
 # 1. A PLAIN (non --profile) run: the fixed gate must still fire, so the
 #    pre-teardown snapshot reaches the permanent RUN_DIR/monitoring/ dir --
-#    this is the exact case that was broken before mayor-xzkqw.
+#    this is the exact case that was broken before this fix.
 # ---------------------------------------------------------------------------
 if [ "$(should_recopy_monitoring "$RUN_DIR_T")" = "1" ]; then
   recopy_monitoring "$WORKDIR_T" "$RUN_DIR_T"

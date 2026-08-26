@@ -1241,7 +1241,7 @@ mod tests {
     /// response (correct Content-Type header + k8s magic-prefix bytes) when the client asks
     /// for it. A kind missing from this list (or whose encoder panics/returns garbage) is
     /// exactly the "silently substitutes JSON instead of honoring Accept: protobuf" spec-
-    /// compliance gap mayor-re0a5 exists to close.
+    /// compliance gap this test exists to close.
     #[tokio::test]
     async fn negotiated_response_returns_protobuf_for_every_registered_hot_path_kind() {
         for (kind, api_version) in [

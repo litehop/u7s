@@ -475,7 +475,7 @@ fi
 #
 # Nothing downstream wipes $STATE_DIR on either path -- CA persistence is
 # apiserver's own job, and the config/unit writes below are already
-# idempotent (mayor-gtjmv's restart fix) -- so this only decides what to tell
+# idempotent (the restart fix) -- so this only decides what to tell
 # the operator, so a re-run reads as an upgrade rather than a silent no-op or
 # a fresh install starting from nothing.
 EXISTING_INSTALL=0

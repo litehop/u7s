@@ -3,14 +3,14 @@
 //! exponentiation (`num_bigint_dig::biguint::monty::montgomery`, 4.4% of apiserver
 //! self-time per the 2026-08-06 samply triage), even when the exact same token is
 //! presented hundreds of times per minute by the same client (see
-//! `ai/findings/jwt-signature-verify-cache-scoping-2026-08-06.md`, mayor-32uy1).
+//! `ai/findings/jwt-signature-verify-cache-scoping-2026-08-06.md`).
 //!
 //! # What is cached
 //!
 //! ONLY the boolean outcome of the cryptographic signature check, keyed by
 //! `SHA-256(raw signature bytes)`. Nothing else — not the decoded claims, not the
 //! audience/issuer decision, not the bound-object liveness check (`auth::object_is_live`
-//! stays fully per-request by design, mayor-504t7). RS256/PKCS#1v1.5 signing is
+//! stays fully per-request by design). RS256/PKCS#1v1.5 signing is
 //! deterministic for a fixed (message, key) pair, so an identical signature is only
 //! producible from an identical `header.payload` — the cache key therefore uniquely
 //! (cryptographically) identifies the exact token that produced it. Keying on the
@@ -68,7 +68,7 @@ use sha2::{Digest, Sha256};
 const MAX_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Default cache capacity — 512 entries. 5x headroom over the 9-unique-ServiceAccount
-/// cardinality observed in the 0806-0917 conformance baseline (see mayor-6sbvc). Override
+/// cardinality observed in the 0806-0917 conformance baseline. Override
 /// via `--sa-sig-cache-size` or `U7S_SA_SIG_CACHE_SIZE`.
 pub const DEFAULT_CAPACITY: usize = 512;
 
@@ -79,8 +79,8 @@ struct Entry {
     signature_valid: bool,
     /// Reserved for a future SA-key-rotation scheme keyed by JWT `kid`. Always `None` today:
     /// u7s has exactly one `sa_decoding_key` (`state.rs`) and never sets a `kid` header
-    /// (`oidc.rs`), so there is nothing to key rotation-invalidation on yet (mayor-32uy1
-    /// finding #6). Not read anywhere today — kept only so adding rotation later doesn't
+    /// (`oidc.rs`), so there is nothing to key rotation-invalidation on yet (finding #6
+    /// in the cache-scoping doc above). Not read anywhere today — kept only so adding rotation later doesn't
     /// require an `Entry` shape change.
     #[allow(dead_code)]
     kid: Option<String>,

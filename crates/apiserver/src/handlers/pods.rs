@@ -6836,7 +6836,7 @@ mod create_defaults_tests {
     /// `switch pullPolicy` with NO default case: an empty policy falls through to the
     /// same unconditional-repull path as PullAlways, so u7s re-pulls the same image on
     /// every container start regardless of local cache state — verified 29x for a single
-    /// digest in the mayor-xv1pk 0806-0217 csi-hostpath run, versus exactly once for a
+    /// digest in a 0806-0217 csi-hostpath run, versus exactly once for a
     /// sibling container that had an explicit IfNotPresent.
     #[test]
     fn container_without_image_pull_policy_and_non_latest_tag_defaults_to_if_not_present() {
@@ -7309,8 +7309,8 @@ mod generation_tests {
     /// A changed automountServiceAccountToken must still bump generation.
     ///
     /// increment_pod_generation_if_spec_changed used to strip this field from both sides
-    /// of the comparison under a false "proto decoder skips it" premise (mayor-6hw91,
-    /// mirroring mayor-cxnj0's fix to validate_pod_spec_immutable). Guards against that
+    /// of the comparison under a false "proto decoder skips it" premise,
+    /// mirroring the fix to validate_pod_spec_immutable. Guards against that
     /// strip being reintroduced, which would silently hide this field's changes from
     /// generation tracking.
     #[test]
@@ -9655,7 +9655,7 @@ mod handler_tests {
     /// would run less confined than the client believed it configured — with no error
     /// anywhere. Asserting on the object fetched back out of the store (not just the CREATE
     /// response) rules out a whole-subtree-replace elsewhere silently discarding fields that
-    /// did survive decode, the same failure shape mayor-y0pcm found in the /status path.
+    /// did survive decode, the same failure shape found in the /status path.
     #[tokio::test]
     async fn create_pod_preserves_securitycontext_hardening_fields_from_protobuf_body_or_container_runs_less_confined_than_requested(
     ) {
@@ -11962,7 +11962,7 @@ mod handler_tests {
     /// after create. `validate_pod_spec_immutable` used to strip this field from both
     /// sides of its comparison before diffing (on the mistaken belief the field was
     /// never decoded from protobuf; `core_gen_adapter.rs`'s round-trip tests show it
-    /// is), so this PATCH used to silently succeed — mayor-cxnj0.
+    /// is), so this PATCH used to silently succeed.
     #[tokio::test]
     async fn patch_pod_merge_patch_cannot_change_automount_service_account_token() {
         let (state, store) = make_state();
@@ -12199,7 +12199,7 @@ mod handler_tests {
     /// upstream once a pod exists; letting it change post-creation could silently move a
     /// running pod between hostNetwork-DNS and cluster-DNS resolution, which the kubelet
     /// only wires up at sandbox-creation time. Not previously checked by name in the
-    /// blocklist — this is one of the fields mayor-cxnj0 flagged, now frozen automatically
+    /// blocklist — this is one of the fields flagged, now frozen automatically
     /// by the trailing whole-spec deep-equal instead of needing its own dedicated check.
     #[tokio::test]
     async fn patch_pod_merge_patch_cannot_change_dns_policy() {
@@ -17759,7 +17759,7 @@ mod admission_tests {
     /// (e.g. a bound-service-account-token's node-name claim) into VAP CEL evaluation via
     /// `request.userInfo.extra` — not just username/uid/groups. Without this, a VAP that
     /// gates on `request.userInfo.extra` (like upstream's by-node node-restriction
-    /// pattern, mayor-k685m) silently sees an empty map and denies every request
+    /// pattern) silently sees an empty map and denies every request
     /// regardless of the caller's real claims.
     ///
     /// Goes through the real `create_pod` handler (not a hand-constructed

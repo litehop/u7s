@@ -7,8 +7,8 @@
 #   - no --verbose + drop-in present -> disable (remove config + restart crio)
 #   - no --verbose + drop-in absent  -> no-op (already disabled)
 #
-# These four cases are exactly the idempotency + undo requirements from
-# mayor-tfggx: running --reset --verbose twice must not layer up extra
+# These four cases are exactly the idempotency + undo requirements:
+# running --reset --verbose twice must not layer up extra
 # restarts, and a later non-verbose run must always clear a stale drop-in
 # rather than leaving debug logging on forever.
 #

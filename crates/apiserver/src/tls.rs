@@ -1629,7 +1629,7 @@ mod tests {
     /// forward to aggregated backends on kubectl/KCM's cert-only requests; that token
     /// forced `authenticate()` into a bearer-token-wins-over-cert precedence rule, which is
     /// exactly what broke every previously-issued kubeconfig on apiserver restart (the token
-    /// was originally minted fresh on every restart with no persistence — mayor-1oj4d). The
+    /// was originally minted fresh on every restart with no persistence). The
     /// aggregation proxy now asserts the caller's already-resolved identity via
     /// X-Remote-User/-Group headers instead (see `handlers::aggregation::proxy_to_backend`),
     /// so no caller — cert-only or bearer-token — ever needs a second credential embedded

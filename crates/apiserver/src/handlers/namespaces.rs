@@ -404,8 +404,7 @@ pub(crate) async fn replace_namespace<S: Store>(
     // legitimate update — allowing it would let a client forge a match against a stale/foreign
     // ownerReference (corrupting owner_ref_is_live's cascade-GC decision) or defeat
     // controllers' "same name, different uid ⇒ different object" recreate-detection. Namespace
-    // routes around the generic path entirely (bespoke handler), so it never got 2pzru's fix —
-    // see mayor-mhgms.
+    // routes around the generic path entirely (bespoke handler), so it never got 2pzru's fix.
     let stored_uid = stored_obj.as_ref().map(|v| v["metadata"]["uid"].clone());
     let incoming_uid_blank = obj.body["metadata"]["uid"]
         .as_str()
@@ -536,7 +535,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     // branch applies the merge-patch directly to the full stored object body (including
     // metadata.uid) with no other uid handling, so without this a caller holding only
     // ordinary namespace `patch` rights could forge uid to match a stale/foreign
-    // ownerReference and corrupt owner_ref_is_live's cascade-GC decision — see mayor-mhgms.
+    // ownerReference and corrupt owner_ref_is_live's cascade-GC decision.
     let stored_uid = current.body["metadata"]["uid"].clone();
 
     crate::patch::merge_patch(&mut current.body, &patch);

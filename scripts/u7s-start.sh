@@ -16,7 +16,7 @@
 # irrelevant here (Lima's kubelet runs its own kube-proxy systemd service and
 # needs no CNI on a single-node dev-loop). CoreDNS itself moved off its
 # compiled-in `include_bytes!` bundle onto this well-known-folder mechanism
-# (mayor-fiq79) -- without staging it, CoreDNS silently stops being applied.
+# -- without staging it, CoreDNS silently stops being applied.
 #
 # Usage:
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]

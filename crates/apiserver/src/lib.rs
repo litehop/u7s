@@ -572,10 +572,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let listener = bind_listener(&args.listen)?;
 
     // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound,
-    // authenticating as system:bootstrap-installer (mayor-1pwxi): SSA-apply every manifest under
+    // authenticating as system:bootstrap-installer: SSA-apply every manifest under
     // args.manifest_dir (default `/etc/u7s/manifests`, see
-    // `docs/decisions/well-known-manifest-folder.md`) — including the vendored CoreDNS manifest
-    // (mayor-fiq79), which ships as a real file there like any other vendored or
+    // `docs/decisions/well-known-manifest-folder.md`) — including the vendored CoreDNS manifest,
+    // which ships as a real file there like any other vendored or
     // operator-supplied manifest, no bespoke code path. A bad manifest here is fatal — an
     // operator who dropped a broken manifest needs the apiserver to refuse to start, not run
     // half-configured — so its result is threaded back via well_known_manifest_rx and raced
@@ -5000,7 +5000,7 @@ mod tests {
 
         // A kubelet in system:nodes must be able to LIST services -- kubelet's own service
         // informer needs this to populate Service-discovery env vars in every pod's
-        // containers. A real joined node (mayor-yocic) authenticates as this exact identity,
+        // containers. A real joined node authenticates as this exact identity,
         // unlike a single-node install's kubelet which shares the admin/system:masters
         // kubeconfig and never exercises this rule at all.
         let service_list = rbac::AuthzRequest {
@@ -6286,7 +6286,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-omwgo): with --use-service-account-credentials=false, the
+    /// Regression test: with --use-service-account-credentials=false, the
     /// attach-detach controller also runs as system:kube-controller-manager and must be able
     /// to CREATE and DELETE VolumeAttachments to drive CSI attach/detach. Without `create`
     /// here, a real kube-controller-manager process live-logged "system:kube-controller-manager

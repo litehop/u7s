@@ -4648,7 +4648,7 @@ mod tests {
     /// the only reading a `RING_CAPACITY` sizing decision can safely be made against, and it is
     /// exactly what an external Prometheus poller reliably misses.
     ///
-    /// Why it matters (mayor-ukbhp): a hot shard's per-push span oscillates between a long
+    /// Why it matters: a hot shard's per-push span oscillates between a long
     /// steady-state value and brief near-zero dips whenever the ring fully turns over — measured
     /// in production as ~2s dips lasting a single push, surrounded by spans of 10s-500s. The
     /// PRE-FIX gauge was `.set()` on every push and read by a poller sampling every 30s: at
@@ -4796,7 +4796,7 @@ mod tests {
     /// all of them. A watch on a quiet type whose ring still held every event it ever saw would be
     /// told "too old resource version". The client relists and re-watches; if the busy type is
     /// still churning the horizon has moved again by then, so it can fail to ever re-establish —
-    /// a relist loop that looks like controllers falling behind (mayor-nlkyd) while the resource
+    /// a relist loop that looks like controllers falling behind while the resource
     /// being watched is entirely intact.
     ///
     /// Fails on revert: restoring the global read makes the quiet watch yield
@@ -5009,7 +5009,7 @@ mod tests {
 
     // --- Ring shard lifecycle: create-on-first-watch, idle-GC after RING_SHARD_IDLE_GRACE ---
     //
-    // mayor-v2218: a shard now exists only because a watch is or recently was open on its
+    // A shard now exists only because a watch is or recently was open on its
     // resource type, not because something was written to it (see push_event_locked's and
     // SqliteStore::watch's doc comments). The five tests below guard each half of that
     // lifecycle plus the two races the design has to survive.
@@ -5052,8 +5052,8 @@ mod tests {
     /// A write to a resource type nobody is watching must NOT create a shard — but must still
     /// be fully durable via sqlite.
     ///
-    /// Why it matters: this is the entire memory-frugality point of the redesign (mayor-v2218's
-    /// SIGNAL) — every ephemeral CRD type ever written otherwise ratchets the shard count up for
+    /// Why it matters: this is the entire memory-frugality point of the redesign
+    /// — every ephemeral CRD type ever written otherwise ratchets the shard count up for
     /// the rest of the process's life, even though nothing is or will be watching most of them.
     /// If a write started creating shards again, that regression would be invisible from a
     /// client's point of view (reads still work) and would only show up as unbounded memory
@@ -5322,7 +5322,7 @@ mod tests {
     /// panic and must never lose the write — sqlite persistence, not ring survival, is the
     /// correctness bar.
     ///
-    /// Why it matters: this is the write-vs-teardown race mayor-v2218's correctness analysis
+    /// Why it matters: this is the write-vs-teardown race the redesign's correctness analysis
     /// depends on being safe — teardown removes a shard under `shards`' write lock, while a
     /// concurrent write reads `shards` to find shards to fan out to. If those two operations
     /// were not mutually exclusive (e.g. a write read a shard reference, teardown dropped the

@@ -5703,7 +5703,7 @@ mod tests {
     // spec.unschedulable (kubectl cordon): the scheduler must not bind an
     // untolerating pod to a cordoned node. Before this fix, NodeSpec never
     // deserialized `unschedulable` at all, so `kubectl cordon` had zero effect
-    // on new scheduling decisions (see mayor-3vko3 / the 0806-1102 conformance
+    // on new scheduling decisions (see the 0806-1102 conformance
     // flake investigation for the deterministic failure this caused).
     // ---------------------------------------------------------------------------
 
@@ -7181,7 +7181,7 @@ mod tests {
     }
 
     /// Live-reproduced against a 3-filler/3-preemptor extended-resource
-    /// scenario once mayor-efhom's nominatedNodeName PATCH lengthened the
+    /// scenario once the nominatedNodeName PATCH lengthened the
     /// window before eviction: unlike
     /// `verify_and_reserve_preemption_never_double_books_shared_victims`
     /// (which hands every contender the SAME pre-computed victim list), each
@@ -7456,15 +7456,15 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // find_preemption_candidate + TopologySpreadContext (mayor-s7zxr): the
-    // Filter-phase fix (mayor-dnjnh) taught select_node_with_capacity to
+    // find_preemption_candidate + TopologySpreadContext: the
+    // Filter-phase fix taught select_node_with_capacity to
     // reject a node that would violate a pod's topologySpreadConstraints,
     // but find_preemption_plan's separate candidate search kept using only
     // node_qualifies_for_pod + InterPodAffinityContext — so a topology-
     // constrained pod could still trigger preemption onto a node its own
     // maxSkew forbids, exactly the placement direct scheduling now refuses.
     //
-    // mayor-82iqj then taught that same candidate search to discount a
+    // A follow-on fix then taught that same candidate search to discount a
     // node's own selected preemption victims before judging its topology/
     // affinity qualification (mirrors upstream's `selectVictimsOnNode`
     // calling `RemovePod` on each plugin's cycle state per victim) — a node
@@ -7482,7 +7482,7 @@ mod tests {
     /// preemptable candidates, not a case where zone-b would already win via
     /// direct scheduling) but carries none of the pod's matching siblings,
     /// so if the fix were absent zone-b would incorrectly look like the only
-    /// legal choice. Before mayor-82iqj's fix, `TopologySpreadContext`
+    /// legal choice. Before that fix, `TopologySpreadContext`
     /// judged every candidate against the CURRENT tally — never discounting
     /// a node's own about-to-be-evicted occupant — so this exact node-a was
     /// rejected outright even though evicting its own victim makes it fully

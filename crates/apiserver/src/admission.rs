@@ -327,7 +327,7 @@ pub(crate) fn label_selector_matches(
 /// `fetch_namespace_labels` actually observed, and the selector fields they were evaluated
 /// against.
 ///
-/// Exists so a recurrence of mayor-z1p1u (a namespaceSelector that inexplicably never matched a
+/// Exists so a recurrence of the bug (a namespaceSelector that inexplicably never matched a
 /// namespace label patched after namespace creation) is self-diagnosing from logs alone --
 /// without this, a skip log line cannot distinguish "labels genuinely didn't match" from "fetch
 /// returned stale/wrong/empty labels", the exact ambiguity that stalled both the original
@@ -5836,7 +5836,7 @@ mod tests {
 
     // -- namespace_selector_skip_context unit tests --
 
-    /// mayor-z1p1u was a one-time conformance sighting (namespaceSelector never matched a
+    /// This was a one-time conformance sighting (namespaceSelector never matched a
     /// namespace label patched after namespace creation) that could not be reproduced by a
     /// follow-up 8-way parallel repro campaign, because the original apiserver.log had already
     /// rotated out and only recorded the webhook name and namespace string -- not what labels

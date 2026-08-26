@@ -7,7 +7,7 @@
 # (PR #729, #772, #1213) while `cargo test --workspace` + clippy stayed
 # green the whole time -- unit tests alone don't exercise the real
 # kubelet+KCM+apiserver interaction the upstream spec does. See bd memory
-# `conformance-pr-merge-gate` and the mayor-fdc5z postmortem for the full
+# `conformance-pr-merge-gate` and the postmortem for the full
 # history this registry operationalizes.
 #
 # Parsed by .githooks/pre-push with grep/awk, NOT a YAML library -- a git

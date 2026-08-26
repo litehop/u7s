@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for scripts/conformance/sample-run-metrics.sh (mayor-zpvp2).
+# Unit test for scripts/conformance/sample-run-metrics.sh.
 #
 # Exercises the REAL script as subprocesses (start/stop/snapshot), not a
 # copied-out fragment of its logic — unlike reset.sh's teardown_vm(), this

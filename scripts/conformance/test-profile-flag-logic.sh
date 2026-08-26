@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for scripts/conformance/run-all.sh's --profile flag logic.
 #
-# --profile (mayor-2pio7) is supposed to make the whole dhat capture workflow
+# --profile is supposed to make the whole dhat capture workflow
 # atomic: rebuild with --features dhat, SIGTERM the apiserver once sonobuoy
 # retrieval + log evacuation finish (so dhat's Drop-based flush, main.rs:29-33,
 # actually runs), and relocate the resulting heap JSON into THIS run's own
@@ -79,7 +79,7 @@ assert_false "--binary alone (no --profile) is not rejected" \
 # also requires sonobuoy to have actually run -- --stack-only intentionally
 # leaves the whole stack up for kubectl exploration, so the auto-SIGTERM must
 # not undermine that. This guards against the "accidentally always-on"
-# footgun mayor-2pio7 explicitly calls out as a required regression check.
+# footgun this test exists to catch as a required regression check.
 # ---------------------------------------------------------------------------
 should_build_dhat() {
   local profile="$1"
@@ -107,7 +107,7 @@ assert_false "--profile --stack-only skips post-run SIGTERM + relocation (stack 
 # filename derivation exactly (basename | cut -d- -f1,2 for the timestamp,
 # then dhat-heap-apiserver-<TIMESTAMP>.json under that same directory). This
 # is the piece that actually lands the heap file "with the run results"
-# instead of under --workdir or /tmp -- mayor-2pio7's acceptance criterion #3
+# instead of under --workdir or /tmp -- the acceptance criterion #3
 # and the exact naming convention from the operator's manual run 0806-1102.
 # ---------------------------------------------------------------------------
 resolve_dhat_dest() {

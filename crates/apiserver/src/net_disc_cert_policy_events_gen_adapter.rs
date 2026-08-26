@@ -1488,7 +1488,7 @@ mod tests {
             "hints.forZones.name",
             "hints.forNodes.name",
             // "ports.name" (rather than the bare, ObjectMeta-collision-prone "name") pins this
-            // check to EndpointPort.name specifically — the field mayor-mb9ed's decoder bug
+            // check to EndpointPort.name specifically — the field a decoder bug
             // dropped whenever it was present-but-empty. The sentinel value here is non-empty
             // so this alone can't catch that regression (see
             // decode_endpointslice_proto_gen_preserves_present_but_empty_port_name for that);

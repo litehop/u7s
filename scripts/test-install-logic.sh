@@ -292,10 +292,10 @@ assert_true "u7s-kcm.service's ExecStart allocates per-node pod CIDRs (--allocat
 # crio-bridge-disable pairing below) silently reintroduces the original
 # unreachable-cross-node-Service symptom even with podCIDR correctly
 # allocated. Flannel's DaemonSet moved from an install.sh heredoc to
-# manifests/flannel.yaml (mayor-fptqu) -- assert both halves: install.sh no
+# manifests/flannel.yaml -- assert both halves: install.sh no
 # longer embeds it, and the vendored file still deploys it.
 # ---------------------------------------------------------------------------
-assert_false "(regression guard, mayor-fptqu) install.sh no longer embeds Flannel's DaemonSet as an inline heredoc -- it now lives in manifests/flannel.yaml, applied via the well-known-manifest-folder mechanism" \
+assert_false "(regression guard) install.sh no longer embeds Flannel's DaemonSet as an inline heredoc -- it now lives in manifests/flannel.yaml, applied via the well-known-manifest-folder mechanism" \
   grep -qF 'name: kube-flannel-ds' "$INSTALL"
 
 assert_true "manifests/flannel.yaml exists -- the vendored source-of-truth Flannel's DaemonSet moved into" \
@@ -346,10 +346,10 @@ assert_true "the apiserver restart step fails loud with a systemctl status/journ
 # iptables DNAT rules that kube-proxy itself is responsible for installing,
 # a bootstrap deadlock that left every ClusterIP unreachable cluster-wide.
 # kube-proxy's DaemonSet moved from an install.sh heredoc to
-# manifests/kube-proxy.yaml (mayor-73lqh) -- assert both halves: install.sh
+# manifests/kube-proxy.yaml -- assert both halves: install.sh
 # no longer embeds it, and the vendored file still avoids the ClusterIP.
 # ---------------------------------------------------------------------------
-assert_false "(regression guard, mayor-73lqh) install.sh no longer embeds kube-proxy's DaemonSet as an inline heredoc -- it now lives in manifests/kube-proxy.yaml, applied via the well-known-manifest-folder mechanism" \
+assert_false "(regression guard) install.sh no longer embeds kube-proxy's DaemonSet as an inline heredoc -- it now lives in manifests/kube-proxy.yaml, applied via the well-known-manifest-folder mechanism" \
   grep -qF 'name: kube-proxy' "$INSTALL"
 
 assert_true "manifests/kube-proxy.yaml exists -- the vendored source-of-truth kube-proxy's DaemonSet moved into" \
@@ -623,10 +623,10 @@ mkdir -p "$stage4"
 dest4="$MANIFEST_WORK/dest4"
 copy_status=0
 bash "$MANIFEST_RUNNER" "$stage4" "$dest4" 0 || copy_status=$?
-assert "a tarball with no manifests/ dir at all is treated as an empty set, not an error -- required until the release-pipeline vendoring bead (mayor-liiv1) actually lands manifests into the tarball" \
+assert "a tarball with no manifests/ dir at all is treated as an empty set, not an error -- required until the release-pipeline vendoring bead actually lands manifests into the tarball" \
   "$([ "$copy_status" -eq 0 ] && echo 1 || echo 0)"
 
-# Case 5 (mayor-fptqu): flannel.yaml's __IFACE__/__POD_CLUSTER_CIDR__
+# Case 5: flannel.yaml's __IFACE__/__POD_CLUSTER_CIDR__
 # placeholders must be resolved to install.sh's own real values on the way
 # into the well-known folder -- a plain byte-for-byte copy (correct for every
 # other manifest) would ship these tokens unresolved, and flanneld would
@@ -661,7 +661,7 @@ else
     "$(grep -qF '__IFACE__' "$mutated_dest5/flannel.yaml" && echo 1 || echo 0)"
 fi
 
-# Case 6 (mayor-73lqh): kube-proxy.yaml's __KUBE_VERSION__/__IFACE_IP__
+# Case 6: kube-proxy.yaml's __KUBE_VERSION__/__IFACE_IP__
 # placeholders must be resolved to install.sh's own real values on the way
 # into the well-known folder -- a plain byte-for-byte copy (correct for every
 # other manifest) would ship these tokens unresolved, and kube-proxy would
@@ -697,7 +697,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Regression guard (mayor-fptqu, mayor-73lqh): both migrations remove
+# Regression guard: both migrations remove
 # install.sh's own kubectl-apply heredocs entirely -- CoreDNS never had one
 # (bootstrap_apply.rs applies its compiled-in bundle), and kube-proxy/Flannel
 # now go through the same well-known-manifest-folder mechanism. If a future
@@ -712,7 +712,7 @@ assert_false "(regression guard) install.sh no longer applies any manifest via a
 # --advertise-address, which the apiserver embeds into every kubeconfig it
 # rewrites (tls.rs). Regression this guards: a re-run with a different
 # --iface used to silently rebake a different address into a live cluster,
-# breaking any kubeconfig already distributed off-box (mayor-htnrs). Operator
+# breaking any kubeconfig already distributed off-box. Operator
 # decision (2026-08-26): refuse loudly on a mismatch rather than silently
 # override or auto-wipe state -- deleting $CONFIG_FILE is the only escape
 # hatch. Both the write step and the read-back+refusal logic are extracted

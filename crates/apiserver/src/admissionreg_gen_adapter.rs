@@ -792,7 +792,7 @@ mod tests {
         );
     }
 
-    // ---- Byte-identical audit: codegen migration (mayor-sljuy) ----
+    // ---- Byte-identical audit: codegen migration ----
     //
     // Each `old_*` function below is a verbatim copy (only renamed, to avoid clashing with the
     // codegen-generated function of the same name now spliced into this module) of the

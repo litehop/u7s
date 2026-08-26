@@ -101,7 +101,7 @@ fn bench_without_cache(c: &mut Criterion) {
 /// This bead's fix: the first caller's conversion is cached under (source
 /// resourceVersion, target apiVersion); every later caller observing the identical write
 /// hits the cache instead of re-invoking the webhook — "one call amortized across N
-/// watchers" (mayor-n8bkc). Models N successive callers, matching
+/// watchers". Models N successive callers, matching
 /// `convert_cr_list_items`'s cache-check-before-webhook path.
 ///
 /// NOT modeled: N callers racing the SAME cold key perfectly concurrently (a thundering
