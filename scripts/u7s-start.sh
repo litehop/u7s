@@ -148,7 +148,12 @@ if [ "$RESET" -eq 1 ]; then
   rm -rf "$WORKDIR"
 fi
 
-mkdir -p "$WORKDIR"
+# $MANIFEST_DIR is a subdirectory of $WORKDIR, so the rm -rf above (when --reset
+# is given) wipes it too -- recreate both here, not just $WORKDIR, or
+# apply_well_known_manifest_dir treats the missing dir as "nothing to apply"
+# (bootstrap_apply.rs) and every --reset silently drops the well-known-folder
+# feature entirely.
+mkdir -p "$WORKDIR" "$MANIFEST_DIR"
 
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_PROXY_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
