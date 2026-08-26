@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Unit test for sonobuoy-plugin-e2e.yaml's podSpec hardening against
-# transient node NotReady (mayor-vmye0).
+# transient node NotReady.
 #
-# Root cause (mayor-jhtxe scout, findings:
-# ai/findings/mayor-jhtxe-clusterip-latency-2026-08-18.md): under real
+# Root cause (findings doc archived 2026-08-18): under real
 # full-suite-scale churn, the lima VM's memory exhaustion gapped kubelet's
 # NodeLease heartbeat 87.1s -- past node-controller's 40s default
 # node-monitor-grace-period -- tripping the node.kubernetes.io/not-ready
@@ -26,7 +25,7 @@
 # against both the pinned v0.57.3 and the latest v0.57.5) exposing no
 # toleration or priorityClass flag/config field for it. That gap is an
 # upstream limitation, not something a YAML template edit can reach; see
-# mayor-vmye0's PR description for the follow-on.
+# the PR description for the follow-on.
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail

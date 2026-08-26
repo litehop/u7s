@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit test for the Phase-1/Phase-2 dhat heap-file diversion in u7s-start.sh.
 #
-# Bug (mayor-vnun4): scripts/u7s-start.sh's --reset flow launches the
+# Bug: scripts/u7s-start.sh's --reset flow launches the
 # apiserver TWICE on a fresh workdir -- Phase 1 (no --konnectivity-proxy-addr,
 # while ca.crt doesn't exist yet) and Phase 2 (killed + restarted once
 # konnectivity-server is up). Both phases inherited the SAME

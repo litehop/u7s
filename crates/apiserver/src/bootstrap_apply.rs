@@ -4,8 +4,8 @@
 //! the repo-root `manifests/` directory.
 //!
 //! `run()` spawns [`apply_well_known_manifest_dir`] once its own listen socket is bound,
-//! authenticating as the `system:bootstrap-installer` x509 identity (see `tls.rs` /
-//! `mayor-1pwxi`) to Server-Side-Apply every file in that directory (`--manifest-dir`,
+//! authenticating as the `system:bootstrap-installer` x509 identity (see `tls.rs`)
+//! to Server-Side-Apply every file in that directory (`--manifest-dir`,
 //! defaulting to `/etc/u7s/manifests`), which in turn drives [`apply_yaml_bundle`] per file.
 //! This is deliberately not a generic "apply any manifest" API: it understands only the small,
 //! fixed set of Kinds a kubeadm-style addon bundle uses (see [`kind_to_resource`]).
@@ -92,7 +92,7 @@ enum OnBadManifest {
     /// over one bad manifest edit is a much bigger blast radius than skipping that file —
     /// matches the universal Unix reload convention (nginx/sshd/systemd-reload all
     /// validate-then-log-and-keep-running on a bad reload config). Operator decision recorded on
-    /// mayor-bh36n, 2026-08-26.
+    /// 2026-08-26.
     LogAndSkip,
 }
 
@@ -984,7 +984,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A missing well-known-manifest directory must not fail startup — an operator who points
-    /// `--manifest-output-dir` elsewhere (mayor-94sz3) legitimately leaves this folder absent,
+    /// `--manifest-output-dir` elsewhere legitimately leaves this folder absent,
     /// and treating "absent" as fatal would break every install that redirects it.
     #[tokio::test]
     async fn apply_well_known_manifest_dir_missing_directory_is_not_fatal() {
@@ -1227,13 +1227,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reload_well_known_manifest_dir (mayor-bh36n) — the SIGHUP-triggered reload path. Shares
+    // reload_well_known_manifest_dir — the SIGHUP-triggered reload path. Shares
     // the folder-scanning mechanics covered above; these tests cover only what's different from
     // apply_well_known_manifest_dir: a bad file is logged and skipped instead of aborting the
     // whole scan, and the function itself never returns an error the caller could propagate.
     // -----------------------------------------------------------------------
 
-    /// The entire reason mayor-bh36n exists: a bad manifest hit during a SIGHUP-triggered
+    /// The entire reason this reload path exists: a bad manifest hit during a SIGHUP-triggered
     /// reload must not stop the rest of the folder from applying. If this regressed to the
     /// boot path's fatal-on-first-error behavior, `02-more.yaml` would never be reached and
     /// this test would fail exactly like
@@ -1332,7 +1332,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // coredns_manifest_installs_every_kind / coredns_manifest_reapply_does_not_corrupt —
-    // CoreDNS ships as a real file, repo-root `manifests/coredns.yaml` (mayor-fiq79), applied
+    // CoreDNS ships as a real file, repo-root `manifests/coredns.yaml`, applied
     // through the exact same apply_well_known_manifest_dir path any other vendored or
     // operator-supplied manifest uses — no CoreDNS-specific code path remains. These tests read
     // that real file off disk (not include_bytes!'d, so a version bump needs no rebuild to be
@@ -1460,7 +1460,7 @@ mod tests {
                 .any(|p| p["containerPort"] == 9153 && p["name"] == "metrics"),
             "CoreDNS container must expose containerPort 9153 (named \"metrics\") — without it \
              the prometheus plugin's listener is unreachable even though it's bound inside the \
-             pod (mayor-wclvi), got {container_ports:?}"
+             pod, got {container_ports:?}"
         );
 
         let configmap_key = crate::keys::object_key("configmaps", "kube-system", "coredns");
@@ -1481,7 +1481,7 @@ mod tests {
             corefile.contains("prometheus 0.0.0.0:9153"),
             "Corefile must load the prometheus plugin on :9153 — this is the only DNS-side \
              observability signal (query rate, cache hit/miss, plugin errors) available to \
-             correlate against future CoreDNS RSS spikes (mayor-b1gz2); losing this line \
+             correlate against future CoreDNS RSS spikes; losing this line \
              silently regresses that diagnosis path. Corefile was:\n{corefile}"
         );
 
@@ -1505,7 +1505,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-6hog8: CoreDNS's "kubernetes" plugin logs "is not allowed to
+    /// Regression test: CoreDNS's "kubernetes" plugin logs "is not allowed to
     /// list services/endpointslices/namespaces" and every cluster.local lookup returns SERVFAIL
     /// if `system:serviceaccount:kube-system:coredns` can't actually list/watch those resources
     /// cluster-wide. `coredns_manifest_installs_every_kind_at_its_expected_key` above only checks
@@ -1559,7 +1559,7 @@ mod tests {
                     "{coredns_sa} must be allowed to {verb} {resource} (apiGroup {api_group:?}) \
                      cluster-wide after the CoreDNS bundle applies — without this, CoreDNS's \
                      \"kubernetes\" plugin never syncs and every cluster.local lookup returns \
-                     SERVFAIL (mayor-6hog8)"
+                     SERVFAIL"
                 );
             }
         }

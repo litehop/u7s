@@ -1486,7 +1486,7 @@ mod tests {
 
     /// A pod with a podAntiAffinity term that has NEITHER `namespaces` NOR
     /// `namespaceSelector` (single-namespace anti-affinity) must NOT match
-    /// CrossNamespacePodAffinity. This is the exact bug reported by mayor-5vxfn: before
+    /// CrossNamespacePodAffinity. This is the exact bug reported: before
     /// this fix, `object_matches_scope`'s `_ => true` fall-through counted every pod with
     /// ANY affinity/anti-affinity rule against a CrossNamespacePodAffinity-scoped quota,
     /// so `status.used.pods` incremented for a pod that upstream's conformance test
@@ -1516,7 +1516,7 @@ mod tests {
             "a podAntiAffinity term scoped to topologyKey only (no `namespaces` or \
              `namespaceSelector`) stays within its own namespace and must NOT match \
              CrossNamespacePodAffinity — else every anti-affinity pod wrongly consumes a \
-             CrossNamespacePodAffinity-scoped quota's hard limit (mayor-5vxfn)"
+             CrossNamespacePodAffinity-scoped quota's hard limit"
         );
     }
 

@@ -8084,7 +8084,7 @@ mod tests {
     // Before this bead, boon-only structural validation meant x-kubernetes-validations
     // rules were stored and round-tripped but never evaluated: a CR that violated every
     // CEL rule its CRD declared was still accepted. Fixtures below are drawn from the
-    // real-world CEL surface the mayor-fbxcy audit sampled (Gateway API, cert-manager,
+    // real-world CEL surface an audit sampled (Gateway API, cert-manager,
     // prometheus-operator) to check the crate actually covers what production CRDs use.
     // ---------------------------------------------------------------------------
 
@@ -8497,13 +8497,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression fixtures: real-world CRD CEL rules from the mayor-fbxcy audit
+    // Regression fixtures: real-world CRD CEL rules from the audit
     // (ai/findings/cel-cr-admission-audit-2026-08-25.md), verifying enforcement
     // against the workloads that actually motivated it, not just synthetic rules.
     //
     // cert-manager ClusterIssuer's has()+ternary exactly-one-of rule and
     // prometheus-operator ScrapeConfig's filter()+size() rule are already covered
-    // verbatim by `cel_has_macro_*`/`cel_filter_macro_*` above (mayor-olvm0's landed
+    // verbatim by `cel_has_macro_*`/`cel_filter_macro_*` above (the landed
     // suite) — not duplicated here.
     // ---------------------------------------------------------------------------
 
@@ -8688,7 +8688,7 @@ mod tests {
     // A different shape of 2-variable comprehension than the Gateway fixture above:
     // the two variables range over two *different* collections
     // (`self.foo.all(x, self.bar.all(y, ...))`), not the same list twice. Flagged
-    // by critical-reviewer as missing from mayor-olvm0's landed suite.
+    // by critical-reviewer as missing from the landed suite.
     #[test]
     fn cel_two_variable_nested_comprehension_across_two_collections_rejects_overlap() {
         let schema = serde_json::json!({
@@ -8735,7 +8735,7 @@ mod tests {
 
     // Gateway API annotation-key-prefix rule (audit L262, `gateway.networking.k8s.io_\
     // gateways.yaml`): `self.split("/")[0].size() < 253`. This is the exact rule
-    // mayor-u1d01 registered `.split()` for — without that overload this rule would
+    // `.split()` was registered for — without that overload this rule would
     // fail every evaluation with an "undeclared reference" CEL error, not evaluate the
     // length check at all.
     #[test]
@@ -8819,7 +8819,7 @@ mod tests {
         );
     }
 
-    // CEL error branches must all fail closed (reject the CR), matching mayor-olvm0's
+    // CEL error branches must all fail closed (reject the CR), matching the
     // stated design intent — a rule the interpreter can't safely evaluate is not the
     // same as a rule that evaluated to "no violation".
     //
@@ -12417,7 +12417,7 @@ mod tests {
 
     /// N concurrent callers racing the identical cold (rv, target version) key must produce
     /// exactly ONE webhook call, not N. This is the thundering-herd pathology
-    /// mayor-k7b4w's bench measured empirically (100% herd: N callers -> N calls, at every
+    /// this benchmark measured empirically (100% herd: N callers -> N calls, at every
     /// N and delay tested, zero exceptions) — a plain `RwLock<HashMap>` cache like
     /// `CrConversionCache`'s eliminates redundant calls for STAGGERED callers (see the test
     /// above) but does nothing for callers that all miss before any of them has inserted.

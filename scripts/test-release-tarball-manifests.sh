@@ -2,10 +2,10 @@
 # Regression test for scripts/build-release-tarball.sh's manifests/ staging
 # step: vendored in-cluster manifest YAMLs committed at manifests/ (repo
 # root) must actually land inside the packaged tarball, since install.sh
-# (mayor-94sz3) copies them from there into --manifest-output-dir at install
+# copies them from there into --manifest-output-dir at install
 # time -- the whole point of vendoring these files in-repo rather than having
 # install.sh fetch them from GitHub, which fails outright on target nodes
-# with no IPv4/GitHub connectivity at all (mayor-liiv1).
+# with no IPv4/GitHub connectivity at all.
 #
 # The full build (cargo cross-compile + dl.k8s.io fetch) isn't practical to
 # run in a lightweight test, so this extracts the staging-and-package tail of
@@ -78,10 +78,10 @@ RUNNER="$WORK/runner.sh"
 write_stage_and_package_runner "$SCRIPT" "$RUNNER"
 
 # ---------------------------------------------------------------------------
-# Acceptance criterion this bead (mayor-liiv1) exists for: manifests/*.yaml
+# Acceptance criterion this bead exists for: manifests/*.yaml
 # committed at the repo root must end up inside the packaged tarball's own
 # manifests/ directory, at the path install.sh's find-by-name manifest-copy
-# step (mayor-94sz3) expects.
+# step expects.
 # ---------------------------------------------------------------------------
 status=0
 ROOT_DIR="$ROOT_DIR_FIXTURE" OUT_DIR="$OUT_DIR" STAGE_NAME="$STAGE_NAME" \
@@ -101,7 +101,7 @@ assert "the packaged tarball's manifests/ directory does NOT include manifests/R
 # The repo's real manifests/ directory is empty today (kube-proxy/Flannel/
 # CoreDNS migrate onto this mechanism via separate follow-on beads) -- the
 # staging step must not fail or skip creating manifests/ in that case, since
-# install.sh's own copy step (mayor-94sz3) still needs a manifests/ directory
+# install.sh's own copy step still needs a manifests/ directory
 # to find (even an empty one) rather than treating a missing directory
 # differently from a real, currently-empty one.
 # ---------------------------------------------------------------------------

@@ -23,6 +23,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --tests --no-deps -- -D warnings
 
+      # Untrusted-hook-bypass defense for .githooks/pre-commit's own bead-ID
+      # check: a pusher can skip local hooks, so CI is the backstop that
+      # actually enforces it.
+      - name: Bead-ID references
+        run: scripts/check-bead-id-refs.sh
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 5

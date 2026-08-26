@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit test for $MANIFEST_DIR surviving a u7s-start.sh --reset cycle.
 #
-# Bug (mayor-xyij7 review fix, PR #1376): $MANIFEST_DIR is a subdirectory of
+# Bug (review fix, PR #1376): $MANIFEST_DIR is a subdirectory of
 # $WORKDIR ($WORKDIR/manifests), so --reset's `rm -rf "$WORKDIR"` wipes it
 # too. Only $WORKDIR itself was recreated afterward (`mkdir -p "$WORKDIR"`),
 # leaving $MANIFEST_DIR missing when the apiserver launches with

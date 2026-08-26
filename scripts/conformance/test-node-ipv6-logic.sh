@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Unit tests for lima-start.sh's dual-stack node-IP derivation (mayor-dqd2y).
+# Unit tests for lima-start.sh's dual-stack node-IP derivation.
 #
 # Root cause: lima's user-v2 network never assigns eth0 a global-scope IPv6
 # address (DHCP-assigned IPv4 only, verified live: eth0 carries just a
 # link-local fe80:: address). Without a 2nd-family address, kubelet only ever
 # reports a single IPv4 node address, and upstream's [Feature:IPv6DualStack]
 # "should have at least one dual-stack node" e2e (dual_stack.go) fails on
-# every run — see bd mayor-dqd2y / scout mayor-j0g9u.
+# every run.
 #
 # The fix assigns a per-node ULA (fd85:<octet>::1) to eth0 and passes it to
 # kubelet via --node-ip alongside the existing IPv4. This test proves the

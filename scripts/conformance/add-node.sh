@@ -20,10 +20,10 @@
 # resources (konnectivity-agent Pod/Secret, kubelet serving cert, pod CIDR) don't
 # collide with the primary node's. --network is forwarded to that same
 # lima-start.sh call (not defaulted here) so a 2-node stack whose primary was
-# isolated onto its own network (mayor-njq7j/PR #1194) can put the 2nd node on
+# isolated onto its own network (PR #1194) can put the 2nd node on
 # the SAME network instead of silently defaulting to lima-start.sh's own
 # user-v2 fallback, which would leave the two nodes with no route to each
-# other (mayor-c4syr).
+# other.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"

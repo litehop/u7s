@@ -269,7 +269,7 @@ fn validate_crd_schema(
 /// comment), so changing spec.group or spec.names.plural on an existing CRD orphans every
 /// already-stored CR under the old key prefix — permanently unreachable through the CRD's new
 /// identity, not merely a validation gap. Changing spec.scope would likewise desync
-/// namespaced-vs-cluster-scoped storage key shape for existing objects. See mayor-fu462.
+/// namespaced-vs-cluster-scoped storage key shape for existing objects.
 fn reject_structural_field_change(
     existing: &serde_json::Value,
     new_spec: &CustomResourceDefinitionSpec,
@@ -676,7 +676,7 @@ pub async fn replace_crd<S: Store>(
     // stale/foreign ownerReference (corrupting owner_ref_is_live's cascade-GC decision) or
     // defeat controllers' "same name, different uid ⇒ different object" recreate-detection.
     // CustomResourceDefinition routes around the generic path entirely (bespoke handler), so
-    // it never got 2pzru's fix — see mayor-mhgms.
+    // it never got 2pzru's fix.
     let existing_uid = existing["metadata"]["uid"].as_str().unwrap_or("");
     if crd.metadata.uid.is_empty() {
         if !existing_uid.is_empty() {
@@ -989,7 +989,7 @@ pub async fn patch_crd<S: Store>(
     // CustomResourceDefinition routes around the generic PATCH path entirely and previously
     // had no uid handling at all. Without this, a caller holding only ordinary CRD `patch`
     // rights could forge uid to match a stale/foreign ownerReference and corrupt
-    // owner_ref_is_live's cascade-GC decision — see mayor-mhgms.
+    // owner_ref_is_live's cascade-GC decision.
     crd.metadata.uid = existing["metadata"]["uid"]
         .as_str()
         .unwrap_or("")

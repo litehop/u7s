@@ -438,7 +438,7 @@ pub(crate) async fn create_resource<S: Store>(
 /// something else has since mutated gets whichever of those checks trips first: a
 /// permanent-looking 422 instead of the retryable 409 kube-apiserver would give. This is
 /// exactly what sustained a 1035-request HTTP 422 storm against KCM's persistent-volume-
-/// binder and pv-protection-controller (mayor-nw9hj): the binder's informer hadn't yet
+/// binder and pv-protection-controller: the binder's informer hadn't yet
 /// observed the watch event for its own prior successful bind, so its next reconcile PUT
 /// still carried the pre-bind `spec.volumeName` — genuinely stale by resourceVersion, but
 /// u7s validated it against the post-bind stored spec first and rejected it as an
@@ -560,7 +560,7 @@ pub(crate) async fn replace_resource<S: Store>(
 
         // Stale-resourceVersion PUTs must 409, not fall through into the immutability
         // checks below using the (by-then-moved-on) freshly-read `parsed` — see
-        // check_replace_resource_version_precondition's doc comment (mayor-nw9hj).
+        // check_replace_resource_version_precondition's doc comment.
         check_replace_resource_version_precondition(expected_revision, &parsed, &name, &meta.kind)?;
 
         // Immutability check: PriorityClass.value drives scheduling/preemption ordering
@@ -836,7 +836,7 @@ pub(crate) async fn delete_resource<S: Store>(
     // after create) — if one of those writes lands between our read and our soft-delete write,
     // re-read the fresh object and redo the delete decision rather than returning a 409 the
     // client never asked to guard against. Mirrors delete_pod's retry-on-RevisionMismatch loop,
-    // added for the same race class (see mayor-jhna0).
+    // added for the same race class.
     loop {
         // Fetch current to check finalizers.
         let stored = state
@@ -1610,13 +1610,13 @@ async fn reject_disallowed_pvc_resize<S: Store>(
 /// `accessModes`, `dataSource`, `dataSourceRef`, `volumeMode`, `selector`, and any other
 /// spec field are frozen at creation time.
 ///
-/// This is the same allowlist shape `validate_pod_spec_immutable` uses (mayor-j1zls, PR
+/// This is the same allowlist shape `validate_pod_spec_immutable` uses (PR
 /// #1213): munge the upstream-permitted mutable fields out of a clone of `new_spec` using
 /// `old_spec`'s value, then require the rest to deep-equal `old_spec`. Any field not
 /// explicitly munged is frozen by construction, so a PVC spec field added upstream tomorrow
 /// is immutable by default here instead of silently allowed until someone remembers to add
 /// a dedicated check for it — which is exactly how `volumeName`/`storageClassName`/
-/// `accessModes` went unchecked before this function existed (mayor-7kuzu).
+/// `accessModes` went unchecked before this function existed.
 ///
 /// `spec.volumeName` gets the same one-time-transition treatment upstream gives it
 /// (`ValidatePersistentVolumeClaimUpdate`, validation.go: `if len(oldPvc.Spec.VolumeName)
@@ -1626,7 +1626,7 @@ async fn reject_disallowed_pvc_resize<S: Store>(
 /// is created with it unset and only the binder ever populates it. Without this exception,
 /// this allowlist blanket-froze volumeName from creation — including its very first,
 /// legitimate transition from empty to the bound PV's name — so no dynamically-provisioned
-/// PVC could ever reach `Bound` via a normal PUT/PATCH at all (mayor-nw9hj: this is what
+/// PVC could ever reach `Bound` via a normal PUT/PATCH at all (this is what
 /// actually sustained the reported HTTP 422 storm against KCM's persistent-volume-binder,
 /// not merely a transient stale-retry race). Once `volumeName` is non-empty, it goes back
 /// to being frozen exactly like every other field here — a caller can't redirect an
@@ -2691,7 +2691,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
 
         // Stale-resourceVersion PUTs must 409, not fall through into the immutability
         // checks below using the (by-then-moved-on) freshly-read `parsed` — see
-        // check_replace_resource_version_precondition's doc comment (mayor-nw9hj).
+        // check_replace_resource_version_precondition's doc comment.
         check_replace_resource_version_precondition(expected_revision, &parsed, &name, &meta.kind)?;
 
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
@@ -3090,7 +3090,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
     // after create) — if one of those writes lands between our read and our soft-delete write,
     // re-read the fresh object and redo the delete decision rather than returning a 409 the
     // client never asked to guard against. Mirrors delete_pod's retry-on-RevisionMismatch loop,
-    // added for the same race class (see mayor-jhna0).
+    // added for the same race class.
     let owner_uid;
     let cluster_ip;
     loop {
@@ -11228,7 +11228,7 @@ mod tests {
         let key = "/registry/storage.k8s.io/storageclasses/blind-put-sc";
         let original_uid = "b3e1f6a0-1c2d-4e3f-9a5b-6d7c8e9f0a1b";
         // reclaimPolicy/volumeBindingMode are included here (matching what
-        // default_storageclass would have stamped at create time) since mayor-0shuc's
+        // default_storageclass would have stamped at create time) since the
         // StorageClass immutability check compares this seed against the PUT body below —
         // this test's own concern is UID restoration, not those fields, so both sides must
         // agree on them.
@@ -15225,8 +15225,8 @@ mod tests {
     /// early check (the old shape) can observe Active, then run the whole admission pipeline
     /// (webhooks, LimitRange, quota) — during which a concurrent `delete_namespace` can flip
     /// the namespace to Terminating — and finally persist the object anyway, having never
-    /// re-checked. That's exactly the mechanism mayor-74j3.6 fixed for the cascade's own LIST
-    /// snapshot; this closes the same class of bug for every namespaced create path.
+    /// re-checked. That's exactly the same class of bug already fixed for the cascade's
+    /// own LIST snapshot; this closes it for every namespaced create path too.
     ///
     /// Runs 50 times (fresh state each iteration) because the fix must hold unconditionally,
     /// not just on lucky scheduling — every iteration must reject with 403 and must never
@@ -15318,7 +15318,7 @@ mod tests {
                 Ok(_) => panic!(
                     "iteration {i}: create must be rejected once its own atomic check observes \
                      Terminating — succeeding here means a create can slip through the exact \
-                     window mayor-74j3.6/74j3.7 close, wedging namespace deletion"
+                     window closed elsewhere, wedging namespace deletion"
                 ),
             }
 
@@ -18260,7 +18260,7 @@ mod tests {
     /// doc comment) — client-go's optimistic-concurrency retry logic treats 409 as "re-GET
     /// and reapply" but treats 422 as a terminal validation failure, so getting 422 here
     /// instead of 409 is exactly the mechanism that sustained the 1035-request HTTP 422
-    /// storm against KCM's persistent-volume-binder (mayor-nw9hj), which permanently blocked
+    /// storm against KCM's persistent-volume-binder, which permanently blocked
     /// every csi-hostpath PVC from ever reaching Bound.
     #[tokio::test]
     async fn replace_namespaced_resource_returns_409_not_422_for_stale_pvc_bind_retry() {
@@ -18481,7 +18481,7 @@ mod tests {
     /// fix, `validate_pvc_spec_immutable`'s allowlist treated volumeName as frozen from
     /// creation with no exception, so this very first, legitimate bind PUT was rejected
     /// with 422 just like any other spec change — meaning no dynamically-provisioned PVC
-    /// could ever reach `Bound` at all (mayor-nw9hj).
+    /// could ever reach `Bound` at all.
     #[tokio::test]
     async fn replace_namespaced_resource_allows_pvc_first_bind_then_freezes_volume_name() {
         use axum::extract::{Path, Query, State};
@@ -18593,7 +18593,7 @@ mod tests {
 
     /// PATCH changing `spec.volumeName` on an already-bound PVC must return 422.
     ///
-    /// Before the mayor-7kuzu allowlist rewrite, `validate_pvc_spec_immutable` didn't exist
+    /// Before the allowlist rewrite, `validate_pvc_spec_immutable` didn't exist
     /// and nothing checked this field at all: a caller holding only ordinary `patch pvc`
     /// rights could silently repoint a bound claim at an unrelated PersistentVolume,
     /// misdirecting a workload's storage — potentially exposing another tenant's volume
@@ -18819,7 +18819,7 @@ mod tests {
     }
 
     /// PATCH increasing `spec.resources.requests.storage` must still succeed when the bound
-    /// StorageClass allows expansion — the mayor-7kuzu allowlist rewrite must not regress
+    /// StorageClass allows expansion — the allowlist rewrite must not regress
     /// `reject_disallowed_pvc_resize`'s existing "grow is fine when the StorageClass opts in"
     /// path while freezing every other field.
     #[tokio::test]
@@ -20553,7 +20553,7 @@ mod tests {
     /// onto a PVC moments after creation — if that write lands between
     /// `delete_namespaced_resource`'s internal read and its internal soft-delete `put`, the
     /// delete must retry against the fresh object rather than reject the client's DELETE with
-    /// a concurrency error it never asked to guard against (mayor-jhna0: this exact race
+    /// a concurrency error it never asked to guard against (this exact race
     /// failed the sig-storage PV/PVC lifecycle conformance test — a client-observable 409 for
     /// a request the client-go DELETE call gave the server zero precondition information for).
     #[tokio::test]
@@ -21957,7 +21957,7 @@ mod tests {
         );
     }
 
-    // -- mayor-0shuc: generic-path immutability for Deployment/DaemonSet/StatefulSet
+    // -- generic-path immutability for Deployment/DaemonSet/StatefulSet
     // selector/spec, PersistentVolume, StorageClass, and Node --
 
     fn deployment_body(
@@ -22029,7 +22029,7 @@ mod tests {
                 err.0,
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 "PUT changing Deployment.spec.selector must return 422 — the generic replace \
-                 path had no immutability enforcement for this field before mayor-0shuc"
+                 path had no immutability enforcement for this field before this fix"
             ),
             Ok(_) => panic!(
                 "PUT changing Deployment.spec.selector must be rejected — accepting it lets a \
@@ -22089,7 +22089,7 @@ mod tests {
             ),
             Ok(_) => panic!(
                 "PATCH changing Deployment.spec.selector must be rejected — do_patch had no \
-                 immutability enforcement for this field before mayor-0shuc"
+                 immutability enforcement for this field before this fix"
             ),
         }
     }
@@ -22253,7 +22253,7 @@ mod tests {
             ),
             Ok(_) => panic!(
                 "PATCH changing DaemonSet.spec.selector must be rejected — do_patch had no \
-                 immutability enforcement for this field before mayor-0shuc"
+                 immutability enforcement for this field before this fix"
             ),
         }
     }
@@ -22384,7 +22384,7 @@ mod tests {
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 "PATCH changing StatefulSet.spec.serviceName must return 422 — the generic \
                  patch path had zero field-immutability enforcement for StatefulSet before \
-                 mayor-0shuc"
+                 this fix"
             ),
             Ok(_) => panic!(
                 "PATCH changing StatefulSet.spec.serviceName must be rejected — accepting it \

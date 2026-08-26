@@ -578,10 +578,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let listener = bind_listener(&args.listen)?;
 
     // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound,
-    // authenticating as system:bootstrap-installer (mayor-1pwxi): SSA-apply every manifest under
+    // authenticating as system:bootstrap-installer: SSA-apply every manifest under
     // args.manifest_dir (default `/etc/u7s/manifests`, see
-    // `docs/decisions/well-known-manifest-folder.md`) — including the vendored CoreDNS manifest
-    // (mayor-fiq79), which ships as a real file there like any other vendored or
+    // `docs/decisions/well-known-manifest-folder.md`) — including the vendored CoreDNS manifest,
+    // which ships as a real file there like any other vendored or
     // operator-supplied manifest, no bespoke code path. A bad manifest here is fatal — an
     // operator who dropped a broken manifest needs the apiserver to refuse to start, not run
     // half-configured — so its result is threaded back via well_known_manifest_rx and raced
@@ -589,8 +589,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // `state.boot_ready` so `/healthz` starts reporting 200 (see the field's doc) — on failure
     // it stays `false` forever, since the `tokio::select!` below tears the process down anyway.
     // This fatal-at-boot behavior is unchanged by the SIGHUP-triggered reload spawned right
-    // below, which reuses the same manifest directory but with log-and-skip semantics instead
-    // (mayor-bh36n).
+    // below, which reuses the same manifest directory but with log-and-skip semantics instead.
     let (well_known_manifest_tx, well_known_manifest_rx) = tokio::sync::oneshot::channel();
     let well_known_manifest_dir = args.manifest_dir.clone();
     let boot_ready = Arc::clone(&state.boot_ready);
@@ -615,7 +614,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // in-flight request, it only re-invokes the same apply routine boot used. Unlike that
     // boot-time apply, a bad manifest hit during a SIGHUP reload is logged and skipped rather
     // than fatal (bootstrap_apply::reload_well_known_manifest_dir — operator decision on
-    // mayor-bh36n, 2026-08-26) — crashing an already-serving apiserver over a bad manifest edit
+    // 2026-08-26) — crashing an already-serving apiserver over a bad manifest edit
     // is a far bigger blast radius than at cold boot, where fatal-and-refuse-to-start remains
     // correct. Because `kill -HUP` reports success to systemd the moment the signal is
     // delivered, regardless of what this async re-scan finds, reload failure is visible only
@@ -5118,7 +5117,7 @@ mod tests {
 
         // A kubelet in system:nodes must be able to LIST services -- kubelet's own service
         // informer needs this to populate Service-discovery env vars in every pod's
-        // containers. A real joined node (mayor-yocic) authenticates as this exact identity,
+        // containers. A real joined node authenticates as this exact identity,
         // unlike a single-node install's kubelet which shares the admin/system:masters
         // kubeconfig and never exercises this rule at all.
         let service_list = rbac::AuthzRequest {
@@ -6404,7 +6403,7 @@ mod tests {
         );
     }
 
-    /// Regression test (mayor-omwgo): with --use-service-account-credentials=false, the
+    /// Regression test: with --use-service-account-credentials=false, the
     /// attach-detach controller also runs as system:kube-controller-manager and must be able
     /// to CREATE and DELETE VolumeAttachments to drive CSI attach/detach. Without `create`
     /// here, a real kube-controller-manager process live-logged "system:kube-controller-manager
@@ -7744,7 +7743,7 @@ mod tests {
     }
 
     /// `/healthz` must distinguish "boot-time manifest apply still running" from "boot
-    /// complete" (mayor-ajgaj) — unlike `/livez`/`/readyz`, which stay unconditional "ok".
+    /// complete" — unlike `/livez`/`/readyz`, which stay unconditional "ok".
     /// Before this gate, `/healthz` answered 200 the instant the listener came up, racing the
     /// boot-time `apply_well_known_manifest_dir` task; `scripts/install.sh`'s
     /// `wait_for_apiserver` could only paper over that with a fixed sleep-and-recheck. If this
@@ -7811,7 +7810,7 @@ mod tests {
     /// SIGHUP-listening loop in `run()` down with it — otherwise `systemctl reload
     /// u7s-apiserver` keeps reporting success forever (per `ExecReload`'s `kill -HUP` semantics)
     /// while every reload after the first panicking one silently does nothing, with no signal to
-    /// the operator (critical-reviewer finding on PR #1398, mayor-bh36n). Proven here by driving
+    /// the operator (critical-reviewer finding on PR #1398). Proven here by driving
     /// `run_supervised_reload` directly with a panicking future — a real panic can't be forced
     /// out of `reload_well_known_manifest_dir` itself, which never panics by design — and then
     /// asserting the *next* call still runs to completion, standing in for the next SIGHUP.
@@ -10881,7 +10880,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SIGHUP-triggered manifest reload (mayor-bh36n). Unlike every other test in this file,
+    // SIGHUP-triggered manifest reload. Unlike every other test in this file,
     // this one drives the real, unmodified `run()` end-to-end (live TLS listener,
     // mTLS-authenticated requests) — that's the only way to prove the signal-handler wiring
     // inside `run()` itself reacts to a real OS SIGHUP without a process restart, rather than
@@ -10949,7 +10948,7 @@ mod tests {
         panic!("{} never appeared within 5s", path.display());
     }
 
-    /// Regression test for mayor-bh36n: SIGHUP must re-scan and re-apply the well-known
+    /// Regression test: SIGHUP must re-scan and re-apply the well-known
     /// manifest directory in the SAME process — no restart, no dropped listener — and a bad
     /// manifest hit during that reload must be logged and skipped rather than crashing the
     /// apiserver, unlike a bad manifest at cold boot (which stays fatal, unchanged by this

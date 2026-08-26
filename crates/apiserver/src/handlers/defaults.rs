@@ -5240,12 +5240,12 @@ mod tests {
     }
 }
 
-/// Regression tests for the typed-struct migration itself (mayor-ds8hb).
+/// Regression tests for the typed-struct migration itself.
 ///
 /// These tests exist independently of the behavioral tests above: they exist to
 /// verify the *migration's own safety property* — that fields a `default_X`
 /// function does not know about survive a defaulting pass unchanged (the
-/// `rest: Value` catch-all). PR #1024 (mayor-xv1pk) shipped because a
+/// `rest: Value` catch-all). PR #1024 shipped because a
 /// Value-tree-based defaulting path had no structural guarantee that an
 /// unlisted-but-real field would survive; a struct with a named field for
 /// every reasoned-about value and `rest` for everything else makes that class

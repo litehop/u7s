@@ -94,10 +94,10 @@
 #             of a 2-node stack land on the same isolated network instead of a
 #             primary on its own network and a peer silently defaulting back to
 #             the shared user-v2 (no route between them). See lima-start.sh's own
-#             --network for the ARP-flap isolation this exists for (mayor-njq7j/
-#             PR #1194). Omitting this on a --reset of a VM previously isolated
+#             --network for the ARP-flap isolation this exists for (PR #1194).
+#             Omitting this on a --reset of a VM previously isolated
 #             onto its own network (e.g. lima-node -> user-v2-mayor) silently
-#             reprovisions it back onto the shared default network (mayor-c4syr).
+#             reprovisions it back onto the shared default network.
 #   --ip      Host IP for the apiserver and konnectivity-server to bind to
 #             (default: 127.0.0.1). Set to a loopback alias (e.g. 127.0.0.2) to
 #             run multiple workers in parallel without port collisions. Exports
@@ -468,8 +468,8 @@ echo "kube-network-policies DaemonSet Ready (${READY}/${DESIRED})."
 
 # Start the run-metrics sampler (host+VM RSS, ring-gauge trajectory, an
 # initial /metrics snapshot) now that the final node topology is known — see
-# sample-run-metrics.sh for the three artifacts it produces and mayor-zpvp2
-# for why this replaced an operator-run-by-hand monitoring loop. Reaped
+# sample-run-metrics.sh for the three artifacts it produces and for why
+# this replaced an operator-run-by-hand monitoring loop. Reaped
 # below: right before the apiserver is torn down under --profile, or at the
 # very end of this script otherwise (the apiserver is never stopped by a
 # plain or --stack-only run, so neither is the sampler — same lifecycle).
@@ -532,7 +532,7 @@ else
     # memory, until an operator noticed and killed it by hand).
     # Snapshot /metrics and reap the sampler BEFORE the apiserver is signalled
     # below — a snapshot taken after would just get the graceful-empty case
-    # (apiserver already down), the exact ordering mistake mayor-zpvp2 exists
+    # (apiserver already down), the exact ordering mistake this exists
     # to prevent. 06-run-sonobuoy.sh already copied an earlier "post-run"
     # snapshot + the rss/ring CSVs-so-far into this run's temp/e2e/ dir; this
     # is the FINAL snapshot, taken right at the point dhat's own heap capture
@@ -655,7 +655,7 @@ fi
 # there yet either. This re-copy must run for EVERY invocation that produced
 # a $RUN_DIR (i.e. ran sonobuoy) -- NOT scoped to --profile, even though it
 # sits right next to the dhat-heap handling above and looks like it belongs
-# to that block. Scoping it to --profile is exactly the bug mayor-xzkqw
+# to that block. Scoping it to --profile is exactly the bug that was
 # fixed: a plain conformance run never stops the apiserver here, so it never
 # went through the --profile branch above, and metrics-03-pre-teardown.prom
 # (plus any sampler growth since the sonobuoy-retrieve copy) stayed trapped

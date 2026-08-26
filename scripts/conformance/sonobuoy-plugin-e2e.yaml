@@ -18,7 +18,7 @@ podSpec:
     operator: Exists
   - key: kubernetes.io/e2e-evict-taint-key
     operator: Exists
-  # mayor-vmye0: a memory-pressure spike under real full-suite churn can gap
+  # A memory-pressure spike under real full-suite churn can gap
   # kubelet's NodeLease heartbeat past node-controller's node-monitor-grace-
   # period (observed 87.1s gap vs. the 40s default), tripping the
   # node.kubernetes.io/not-ready:NoExecute taint. Without this toleration,
@@ -26,7 +26,7 @@ podSpec:
   # on a BRIEF flap, silently losing the whole run's results. 120s is longer
   # than the observed flap but still bounded -- a genuinely dead node still
   # gets its pod evicted and rescheduled, just not one that recovers in time.
-  # See ai/findings/mayor-jhtxe-clusterip-latency-2026-08-18.md for the full
+  # See the archived clusterip-latency findings doc (2026-08-18) for the full
   # DELETE/eviction timeline.
   - effect: NoExecute
     key: node.kubernetes.io/not-ready

@@ -262,7 +262,7 @@ fn watch_replay_depth_buckets() -> Vec<f64> {
 /// "compacted"}` against 0, before trusting a percentile from this.
 ///
 /// Doubles as a watch-open latency signal: replay depth is what drives the O(shard-occupancy)
-/// scan that mayor-nlkyd measured at 61x scaling from 1k to 100k.
+/// scan measured at 61x scaling from 1k to 100k.
 ///
 /// Labeled by `prefix_bucket`, not the raw watch prefix — see `prefix_bucket`'s own doc for why.
 pub static WATCH_REPLAY_DEPTH: LazyLock<HistogramVec> = LazyLock::new(|| {

@@ -245,7 +245,7 @@ pub static DISCOVERY_BUILD_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 /// Counter of failed `bootstrap_apply::apply_yaml_bundle` calls — every vendored or
-/// operator-supplied manifest under `/etc/u7s/manifests` (including CoreDNS's, mayor-fiq79) is
+/// operator-supplied manifest under `/etc/u7s/manifests` (including CoreDNS's) is
 /// installed via Server-Side Apply against this apiserver's own just-bound listener at boot,
 /// and a failure there is fatal (see `bootstrap_apply::apply_well_known_manifest_dir`). This
 /// counter is a signal an operator has that an install failed.

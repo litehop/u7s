@@ -1,13 +1,13 @@
-# mayor-f0lfr: the sonobuoy AGGREGATOR pod (namespace `sonobuoy`, pod name
+# The sonobuoy AGGREGATOR pod (namespace `sonobuoy`, pod name
 # "sonobuoy" -- distinct from the "sonobuoy-e2e-job-*" worker pod that
 # sonobuoy-plugin-e2e.yaml already bounds) is generated entirely by
 # sonobuoy's own compiled-in Go code (cmd/sonobuoy/app, pkg/plugin/
 # aggregation). There is no CLI flag or plugin-manifest field to set its
-# resources -- confirmed at v0.57.3 source by mayor-vmye0/mayor-o4fmo's
-# audits. It therefore ships BestEffort (resources: {}), which the kernel's
+# resources -- confirmed at v0.57.3 source by audit. It therefore ships
+# BestEffort (resources: {}), which the kernel's
 # global OOM killer treats as its highest-priority (first) victim under any
 # node memory pressure: observed OOMKilled ~55s into a csi-hostpath focus
-# run once kubelet's registryPullQPS gate (mayor-5v9gl) stopped incidentally
+# run once kubelet's registryPullQPS gate stopped incidentally
 # throttling how fast the run's early event/log volume could spike.
 #
 # Since sonobuoy's own schema has no override point for the aggregator, this
