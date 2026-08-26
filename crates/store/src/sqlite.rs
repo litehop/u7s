@@ -3787,7 +3787,7 @@ mod tests {
     /// `create_if_namespace_active` must reject a create whose namespace is ALREADY
     /// Terminating at commit time — the base case the transactional guard exists for. Without
     /// it, a controller can keep injecting objects into a namespace mid-deletion, which is
-    /// exactly the orphaned-content bug mayor-74j3.6/74j3.7 fix.
+    /// exactly the orphaned-content bug the transactional guard fixes.
     #[tokio::test]
     async fn create_if_namespace_active_rejects_terminating_namespace() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");

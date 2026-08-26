@@ -5440,7 +5440,7 @@ mod tests {
     /// `delete_namespace` logs a warning and proceeds to hard-delete for this case; treating it
     /// as `FinalizerPending` instead would make the namespace wait forever for a finalizer
     /// removal that will never come, wedging it in Terminating exactly like the bug
-    /// mayor-74j3.6 fixed.
+    /// fixed here.
     ///
     /// Fails on revert: reverting to the old `bool` return makes this indistinguishable from
     /// `cascade_returns_finalizer_pending_for_real_finalizer` above — both were the same `true`.

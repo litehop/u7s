@@ -12,26 +12,36 @@
 #   docs/    -- same.
 #   .github/ -- workflow configs may reference bead IDs in commit-adjacent context.
 #   CONTRIBUTING.md -- "the mayor method" is a real phrase (docs/the-mayor-method/),
-#     not a bead ID; mayor-[a-z0-9]{5} happens to also match its first 5 letters
+#     not a bead ID; mayor-[a-z0-9]{3,5} happens to also match its first letters
 #     ("mayor-metho"). git grep's -E engine has no \b support to disambiguate,
 #     so the file is excluded outright rather than false-positiving forever.
 #   scripts/test-critical-reviewer-hook.sh -- its "mayor-abc12" fixture exercises
 #     critical-reviewer-dispatch.sh's own hardcoded `bd close (mayor-[a-z0-9]+)`
 #     regex; it is synthetic test input, not a reference to a real, closeable bead.
-#   this file -- documenting the two exclusions above requires spelling out
+#   scripts/test-check-bead-id-refs-logic.sh -- this guard's own regression test;
+#     its fixtures are synthetic bead-ID-shaped strings (one per real length,
+#     3/4/5-char plus dotted sub-ID) that must trip the regex to prove it works,
+#     not references to real, closeable beads.
+#   this file -- documenting the exclusions above requires spelling out
 #     the exact strings that trip the regex.
 #   crates/apiserver/src/handlers/pods.rs -- registered in
 #     .githooks/sensitive-conformance-focus.yaml; ANY push touching it
 #     (comment-only or not) is blocked by .githooks/pre-push without a fresh
 #     sonobuoy PASS on an owned VM slot. Tracked in mayor-e49sl -- remove this
-#     exclusion once that bead lands the remaining 6 refs.
+#     exclusion once that bead lands the remaining 7 refs (5 distinct IDs).
+#
+# Bead IDs are `mayor-` + a 3-5 char alphanumeric suffix (bd's ID generator;
+# see .beads/issues.jsonl for the observed range), optionally followed by a
+# dotted sub-ID suffix (e.g. `mayor-a1b2.6`). A fixed `{5}` here would silently
+# skip most real IDs -- most are 3 or 4 characters, not 5.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-matches=$(git grep -n -E 'mayor-[a-z0-9]{5}' -- . \
+matches=$(git grep -n -E 'mayor-[a-z0-9]{3,5}(\.[0-9]+)?' -- . \
   ':!.beads' ':!ai' ':!docs' ':!.github' \
   ':!CONTRIBUTING.md' ':!scripts/test-critical-reviewer-hook.sh' \
+  ':!scripts/test-check-bead-id-refs-logic.sh' \
   ':!scripts/check-bead-id-refs.sh' \
   ':!crates/apiserver/src/handlers/pods.rs' \
   2>/dev/null || true)

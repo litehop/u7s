@@ -172,7 +172,7 @@ CONFIG_FILE="$STATE_DIR/config"
 # fatal and tears the process down via that same tokio::select!, so /healthz
 # never flips to 200 in that case and this loop times out instead of
 # reporting success on a since-crashed apiserver. No settle-and-recheck is
-# needed: the first 200 already means boot is fully done (mayor-ajgaj).
+# needed: the first 200 already means boot is fully done.
 wait_for_apiserver() {
   local kubeconfig_path="$1"
   echo "Waiting for u7s-apiserver to become reachable..."

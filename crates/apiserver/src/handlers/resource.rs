@@ -15225,8 +15225,8 @@ mod tests {
     /// early check (the old shape) can observe Active, then run the whole admission pipeline
     /// (webhooks, LimitRange, quota) — during which a concurrent `delete_namespace` can flip
     /// the namespace to Terminating — and finally persist the object anyway, having never
-    /// re-checked. That's exactly the mechanism mayor-74j3.6 fixed for the cascade's own LIST
-    /// snapshot; this closes the same class of bug for every namespaced create path.
+    /// re-checked. That's exactly the same class of bug already fixed for the cascade's
+    /// own LIST snapshot; this closes it for every namespaced create path too.
     ///
     /// Runs 50 times (fresh state each iteration) because the fix must hold unconditionally,
     /// not just on lucky scheduling — every iteration must reject with 403 and must never
@@ -15318,7 +15318,7 @@ mod tests {
                 Ok(_) => panic!(
                     "iteration {i}: create must be rejected once its own atomic check observes \
                      Terminating — succeeding here means a create can slip through the exact \
-                     window mayor-74j3.6/74j3.7 close, wedging namespace deletion"
+                     window closed elsewhere, wedging namespace deletion"
                 ),
             }
 

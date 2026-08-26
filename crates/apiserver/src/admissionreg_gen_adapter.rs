@@ -1449,7 +1449,7 @@ mod tests {
 
     // ---- CEL expression round-trip: the real correctness dependency this migration must not
     // regress. `admission.rs`'s hand-rolled CEL evaluator (`eval_cel_bool_expr`/
-    // `eval_cel_vap_value`, mayor-sz59/PR #481) reads `spec.validations[].expression` and
+    // `eval_cel_vap_value`, PR #481) reads `spec.validations[].expression` and
     // `spec.matchConditions[].expression` directly off the JSON this file decodes — if the
     // migration mis-escaped, truncated, or altered the expression string in any way, VAP policy
     // enforcement would silently evaluate the wrong CEL expression (or fail to compile one that

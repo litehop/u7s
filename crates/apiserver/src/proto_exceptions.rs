@@ -203,8 +203,7 @@ const DELIBERATE_OMISSIONS: &[(&str, &str, &str)] = &[
         "managedFields",
         "NOT marked `Deprecated:` upstream — omitted for a compensating-control reason, not \
          deprecation: stripped/synthesized server-side on every path, so a client-supplied \
-         value is never honoured; revisit if full Server-Side Apply lands \
-         (mayor-u6ju)",
+         value is never honoured; revisit if full Server-Side Apply lands",
     ),
     (
         ".k8s.io.api.core.v1.VolumeSource",

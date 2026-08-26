@@ -7672,7 +7672,7 @@ mod tests {
     }
 
     /// `/healthz` must distinguish "boot-time manifest apply still running" from "boot
-    /// complete" (mayor-ajgaj) — unlike `/livez`/`/readyz`, which stay unconditional "ok".
+    /// complete" — unlike `/livez`/`/readyz`, which stay unconditional "ok".
     /// Before this gate, `/healthz` answered 200 the instant the listener came up, racing the
     /// boot-time `apply_well_known_manifest_dir` task; `scripts/install.sh`'s
     /// `wait_for_apiserver` could only paper over that with a fixed sleep-and-recheck. If this
