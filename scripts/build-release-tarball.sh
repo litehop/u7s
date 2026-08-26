@@ -71,6 +71,24 @@ chmod +x "$STAGE_DIR/u7s-apiserver" "$STAGE_DIR/u7s-scheduler"
 # the unmodified kubelet/kube-controller-manager binaries fetched above.
 cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$STAGE_DIR/"
 
+# manifests/*.yaml (repo root, see manifests/README.md) is the well-known-
+# folder vendoring location (docs/decisions/well-known-manifest-folder.md)
+# install.sh copies into --manifest-output-dir at install time -- no
+# install-time network fetch, since some target nodes have no GitHub
+# connectivity at all. Staged even when empty (true until the per-component
+# migration beads land real files here) so the tarball layout install.sh
+# already expects is never missing.
+echo "==> Staging vendored in-cluster manifests" >&2
+mkdir -p "$STAGE_DIR/manifests"
+if [ -d "$ROOT_DIR/manifests" ]; then
+  shopt -s nullglob
+  manifest_files=("$ROOT_DIR"/manifests/*.yaml)
+  shopt -u nullglob
+  if [ "${#manifest_files[@]}" -gt 0 ]; then
+    cp "${manifest_files[@]}" "$STAGE_DIR/manifests/"
+  fi
+fi
+
 TARBALL="$OUT_DIR/${STAGE_NAME}.tar.gz"
 tar -czf "$TARBALL" -C "$WORK_DIR" "$STAGE_NAME"
 

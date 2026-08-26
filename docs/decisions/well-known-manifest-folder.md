@@ -18,7 +18,12 @@ answer upgrade-time drift fully, but it's a deferred, multi-week epic
 `/etc/kubernetes/manifests/` static-pod convention. An installer flag
 controls where they land — default this folder (auto-applied), or
 elsewhere for the operator to manage (GitOps; the apiserver checks the
-default folder either way, finds it empty). The apiserver unconditionally
+default folder either way, finds it empty). Source-of-truth for these files
+is `manifests/` at the repo root (real, standalone `.yaml`, scannable by
+Renovate/Dependabot for image-tag bumps) — `scripts/build-release-tarball.sh`
+bundles it into the release tarball, and `install.sh` copies from there at
+install time rather than fetching over the network, since some target nodes
+have no GitHub connectivity at all. The apiserver unconditionally
 re-applies every manifest at boot via its existing SSA-shaped
 `?fieldManager=` path; a bad manifest is a fatal startup error naming the
 offending file. SIGHUP reload is a follow-on, not required here. No
