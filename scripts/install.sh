@@ -687,27 +687,6 @@ else
   stage_binaries u7s-apiserver u7s-scheduler kubelet kube-controller-manager
 fi
 
-# --- Vendored manifests from the tarball -------------------------------------
-#
-# manifests/*.yaml ships in the release tarball alongside the binaries above
-# (docs/decisions/well-known-manifest-folder.md). --manifest-output-dir picks
-# the destination: the well-known folder (default) for apiserver's own
-# boot-time auto-apply scan, or an operator-chosen alternate path for GitOps
-# to manage instead -- nothing is ever written into the well-known folder in
-# that case, so apiserver's scan finds it empty. Only relevant to a
-# control-plane node: a worker (fresh --join or an already-joined worker's
-# upgrade re-run) installs kubelet alone, with no apiserver to apply
-# anything. A checkout's tarball may not carry a manifests/ dir at all yet
-# (the release-pipeline vendoring step lands separately); that is equivalent
-# to an empty set, not an error.
-if [ "$WORKER_MODE" -eq 0 ]; then
-  TARBALL_MANIFEST_DIR="$(find "$STAGE_DIR" -type d -name manifests | head -n1)"
-  if [ -n "$TARBALL_MANIFEST_DIR" ] && [ -n "$(find "$TARBALL_MANIFEST_DIR" -maxdepth 1 -name '*.yaml')" ]; then
-    install -d -m 0755 "$MANIFEST_OUTPUT_DIR"
-    cp "$TARBALL_MANIFEST_DIR"/*.yaml "$MANIFEST_OUTPUT_DIR/"
-  fi
-fi
-
 # --- kubectl + CNI plugin binaries (apt, pinned to kubelet's own version) ----
 #
 # kubectl is not in the release tarball, but a zero-argument install has to
@@ -809,6 +788,39 @@ fi
 # passes no override, so that default always holds).
 POD_CLUSTER_CIDR="10.244.0.0/16"
 POD_NODE_CIDR_MASK_SIZE=24
+
+# --- Vendored manifests from the tarball -------------------------------------
+#
+# manifests/*.yaml ships in the release tarball alongside the binaries above
+# (docs/decisions/well-known-manifest-folder.md). --manifest-output-dir picks
+# the destination: the well-known folder (default) for apiserver's own
+# boot-time auto-apply scan, or an operator-chosen alternate path for GitOps
+# to manage instead -- nothing is ever written into the well-known folder in
+# that case, so apiserver's scan finds it empty. Only relevant to a
+# control-plane node: a worker (fresh --join or an already-joined worker's
+# upgrade re-run) installs kubelet alone, with no apiserver to apply
+# anything. A checkout's tarball may not carry a manifests/ dir at all yet
+# (the release-pipeline vendoring step lands separately); that is equivalent
+# to an empty set, not an error. Placed here (after $POD_CLUSTER_CIDR is
+# resolved, before the systemd units below start anything) because
+# flannel.yaml carries an install-time __POD_CLUSTER_CIDR__/__IFACE__
+# placeholder a byte-for-byte copy would ship unresolved -- see that file's
+# own header for what each substitutes to. Every other manifest copies
+# verbatim.
+if [ "$WORKER_MODE" -eq 0 ]; then
+  TARBALL_MANIFEST_DIR="$(find "$STAGE_DIR" -type d -name manifests | head -n1)"
+  if [ -n "$TARBALL_MANIFEST_DIR" ] && [ -n "$(find "$TARBALL_MANIFEST_DIR" -maxdepth 1 -name '*.yaml')" ]; then
+    install -d -m 0755 "$MANIFEST_OUTPUT_DIR"
+    cp "$TARBALL_MANIFEST_DIR"/*.yaml "$MANIFEST_OUTPUT_DIR/"
+    if [ -f "$MANIFEST_OUTPUT_DIR/flannel.yaml" ]; then
+      # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
+      # BSD sed, and this redirect-and-replace form works identically on both.
+      sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+        "$MANIFEST_OUTPUT_DIR/flannel.yaml" > "$MANIFEST_OUTPUT_DIR/flannel.yaml.tmp"
+      mv "$MANIFEST_OUTPUT_DIR/flannel.yaml.tmp" "$MANIFEST_OUTPUT_DIR/flannel.yaml"
+    fi
+  fi
+fi
 
 # --token-auth-file is always passed so a later --mint-join-token needs no unit
 # edit plus extra restart to enable it. An empty file is a valid token map
@@ -1055,247 +1067,12 @@ EOF
 # ClusterIP Service backed by a pod on a different node is unreachable.
 # Flannel's vxlan backend closes that gap.
 #
-# Inlined here rather than a vendored file kubectl -f reads from disk, and
-# NOT include_bytes!'d into a Rust binary either: install.sh is published and
-# run standalone (curl | sh, see deploy/get-u7s/README.md) with no sibling
-# files on disk once fetched -- the same reason kube-proxy's DaemonSet above
-# is inline rather than a vendored path.
-#
-# Adapted from flannel-io/flannel's official kube-flannel.yml (v0.28.9):
-#   - net-conf.json's Network is $POD_CLUSTER_CIDR, not a hardcoded literal,
-#     so it can never drift from node-ipam-controller's --cluster-cidr above
-#     (they already agree today: 10.244.0.0/16 is upstream's own default too).
-#   - flanneld gets both --iface and --iface-regex, matching install.sh's own
-#     $IFACE resolution rather than flannel's normal "default route" guess.
-#     --iface=$IFACE is the literal interface install.sh picked on this node;
-#     --iface-regex reuses install.sh's own physical-NIC whitelist regex
-#     (used for --iface auto-detection above) as flannel's fallback, since
-#     this one DaemonSet spec runs on every node and this project's own Lima
-#     fleet has observed non-uniform physical interface naming across
-#     otherwise-identical VMs (a literal --iface from one node's resolution
-#     can genuinely not exist on another). An operator who instead points
-#     --iface at a uniformly-named VPN-mesh interface (e.g. a WireGuard/
-#     Tailscale link used for cluster traffic across clouds) gets an exact
-#     --iface match on every node instead of falling through to the regex.
-echo "Applying Flannel CNI manifest..."
-kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  labels:
-    k8s-app: flannel
-    pod-security.kubernetes.io/enforce: privileged
-  name: kube-flannel
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  labels:
-    k8s-app: flannel
-  name: flannel
-  namespace: kube-flannel
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  labels:
-    k8s-app: flannel
-  name: flannel
-rules:
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  verbs:
-  - get
-- apiGroups:
-  - ""
-  resources:
-  - nodes
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - nodes/status
-  verbs:
-  - patch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  labels:
-    k8s-app: flannel
-  name: flannel
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: flannel
-subjects:
-- kind: ServiceAccount
-  name: flannel
-  namespace: kube-flannel
----
-apiVersion: v1
-data:
-  cni-conf.json: |
-    {
-      "name": "cbr0",
-      "cniVersion": "0.3.1",
-      "plugins": [
-        {
-          "type": "flannel",
-          "delegate": {
-            "hairpinMode": true,
-            "isDefaultGateway": true
-          }
-        },
-        {
-          "type": "portmap",
-          "capabilities": {
-            "portMappings": true
-          }
-        }
-      ]
-    }
-  net-conf.json: |
-    {
-      "Network": "$POD_CLUSTER_CIDR",
-      "EnableNFTables": false,
-      "Backend": {
-        "Type": "vxlan"
-      }
-    }
-kind: ConfigMap
-metadata:
-  labels:
-    app: flannel
-    k8s-app: flannel
-    tier: node
-  name: kube-flannel-cfg
-  namespace: kube-flannel
----
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  labels:
-    app: flannel
-    k8s-app: flannel
-    tier: node
-  name: kube-flannel-ds
-  namespace: kube-flannel
-spec:
-  selector:
-    matchLabels:
-      app: flannel
-      k8s-app: flannel
-  template:
-    metadata:
-      labels:
-        app: flannel
-        k8s-app: flannel
-        tier: node
-    spec:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/os
-                operator: In
-                values:
-                - linux
-      containers:
-      - args:
-        - --ip-masq
-        - --kube-subnet-mgr
-        - --iface=$IFACE
-        - --iface-regex=^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$
-        command:
-        - /opt/bin/flanneld
-        env:
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: POD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: EVENT_QUEUE_DEPTH
-          value: "5000"
-        - name: CONT_WHEN_CACHE_NOT_READY
-          value: "false"
-        image: ghcr.io/flannel-io/flannel:v0.28.9
-        name: kube-flannel
-        resources:
-          requests:
-            cpu: 100m
-            memory: 50Mi
-        securityContext:
-          capabilities:
-            add:
-            - NET_ADMIN
-            - NET_RAW
-          privileged: false
-        volumeMounts:
-        - mountPath: /run/flannel
-          name: run
-        - mountPath: /etc/kube-flannel/
-          name: flannel-cfg
-        - mountPath: /run/xtables.lock
-          name: xtables-lock
-      hostNetwork: true
-      initContainers:
-      - args:
-        - -f
-        - /flannel
-        - /opt/cni/bin/flannel
-        command:
-        - cp
-        image: ghcr.io/flannel-io/flannel-cni-plugin:v1.9.1-flannel3
-        name: install-cni-plugin
-        volumeMounts:
-        - mountPath: /opt/cni/bin
-          name: cni-plugin
-      - args:
-        - -f
-        - /etc/kube-flannel/cni-conf.json
-        - /etc/cni/net.d/10-flannel.conflist
-        command:
-        - cp
-        image: ghcr.io/flannel-io/flannel:v0.28.9
-        name: install-cni
-        volumeMounts:
-        - mountPath: /etc/cni/net.d
-          name: cni
-        - mountPath: /etc/kube-flannel/
-          name: flannel-cfg
-      priorityClassName: system-node-critical
-      serviceAccountName: flannel
-      tolerations:
-      - effect: NoSchedule
-        operator: Exists
-      volumes:
-      - hostPath:
-          path: /run/flannel
-        name: run
-      - hostPath:
-          path: /opt/cni/bin
-        name: cni-plugin
-      - hostPath:
-          path: /etc/cni/net.d
-        name: cni
-      - configMap:
-          name: kube-flannel-cfg
-        name: flannel-cfg
-      - hostPath:
-          path: /run/xtables.lock
-          type: FileOrCreate
-        name: xtables-lock
-EOF
+# Applied via manifests/flannel.yaml through the well-known-manifest-folder
+# mechanism (docs/decisions/well-known-manifest-folder.md), not an inline
+# heredoc -- apiserver SSA-applies it in-process at every boot, once the
+# vendored-manifest copy step above has templated its __IFACE__/
+# __POD_CLUSTER_CIDR__ placeholders into $MANIFEST_OUTPUT_DIR. See that
+# file's own header for the departures from upstream flannel-io/flannel.
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"

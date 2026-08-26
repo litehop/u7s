@@ -1,0 +1,243 @@
+# Vendored from flannel-io/flannel's official kube-flannel.yml (v0.28.9), applied via the
+# well-known-manifest-folder mechanism (docs/decisions/well-known-manifest-folder.md) instead
+# of an install.sh heredoc (mayor-fptqu) -- kube-proxy's DaemonSet gets the same treatment
+# (manifests/kube-proxy.yaml).
+#
+# Two install-time placeholders scripts/install.sh substitutes before writing this file into
+# --manifest-output-dir (kept as literal tokens here, not real values, since this is the
+# source-of-truth copy Renovate/Dependabot scans for the *fixed* image tags below -- a
+# per-node value has no business being a committed default):
+#   __IFACE__              install.sh's own resolved --iface value for this node. Varies per
+#                           host: this project's own Lima fleet has observed non-uniform
+#                           physical interface naming across otherwise-identical VMs.
+#   __POD_CLUSTER_CIDR__    matches kube-controller-manager's own --cluster-cidr
+#                           (install.sh's $POD_CLUSTER_CIDR), so node-ipam-controller's
+#                           allocated Node.spec.podCIDR ranges and flanneld's own subnet can
+#                           never drift apart (they agree today: 10.244.0.0/16 is also
+#                           flannel's and this project's own default).
+#
+# Departures from upstream:
+#   - flanneld gets both --iface and --iface-regex, matching install.sh's own $IFACE
+#     resolution rather than flannel's normal "default route" guess. --iface-regex reuses
+#     install.sh's own physical-NIC whitelist regex as a fallback: this one DaemonSet spec
+#     runs on every node, and an operator who instead points --iface at a uniformly-named
+#     VPN-mesh interface (e.g. a WireGuard/Tailscale link for cluster traffic across clouds,
+#     docs/decisions/flannel-for-cni.md) gets an exact --iface match on every node instead of
+#     falling through to the regex.
+#   - net-conf.json's Network is templated, not upstream's hardcoded literal.
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    k8s-app: flannel
+    pod-security.kubernetes.io/enforce: privileged
+  name: kube-flannel
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+  namespace: kube-flannel
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes/status
+  verbs:
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    k8s-app: flannel
+  name: flannel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: flannel
+subjects:
+- kind: ServiceAccount
+  name: flannel
+  namespace: kube-flannel
+---
+apiVersion: v1
+data:
+  cni-conf.json: |
+    {
+      "name": "cbr0",
+      "cniVersion": "0.3.1",
+      "plugins": [
+        {
+          "type": "flannel",
+          "delegate": {
+            "hairpinMode": true,
+            "isDefaultGateway": true
+          }
+        },
+        {
+          "type": "portmap",
+          "capabilities": {
+            "portMappings": true
+          }
+        }
+      ]
+    }
+  net-conf.json: |
+    {
+      "Network": "__POD_CLUSTER_CIDR__",
+      "EnableNFTables": false,
+      "Backend": {
+        "Type": "vxlan"
+      }
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app: flannel
+    k8s-app: flannel
+    tier: node
+  name: kube-flannel-cfg
+  namespace: kube-flannel
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: flannel
+    k8s-app: flannel
+    tier: node
+  name: kube-flannel-ds
+  namespace: kube-flannel
+spec:
+  selector:
+    matchLabels:
+      app: flannel
+      k8s-app: flannel
+  template:
+    metadata:
+      labels:
+        app: flannel
+        k8s-app: flannel
+        tier: node
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values:
+                - linux
+      containers:
+      - args:
+        - --ip-masq
+        - --kube-subnet-mgr
+        - --iface=__IFACE__
+        - --iface-regex=^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$
+        command:
+        - /opt/bin/flanneld
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: EVENT_QUEUE_DEPTH
+          value: "5000"
+        - name: CONT_WHEN_CACHE_NOT_READY
+          value: "false"
+        image: ghcr.io/flannel-io/flannel:v0.28.9
+        name: kube-flannel
+        resources:
+          requests:
+            cpu: 100m
+            memory: 50Mi
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+            - NET_RAW
+          privileged: false
+        volumeMounts:
+        - mountPath: /run/flannel
+          name: run
+        - mountPath: /etc/kube-flannel/
+          name: flannel-cfg
+        - mountPath: /run/xtables.lock
+          name: xtables-lock
+      hostNetwork: true
+      initContainers:
+      - args:
+        - -f
+        - /flannel
+        - /opt/cni/bin/flannel
+        command:
+        - cp
+        image: ghcr.io/flannel-io/flannel-cni-plugin:v1.9.1-flannel3
+        name: install-cni-plugin
+        volumeMounts:
+        - mountPath: /opt/cni/bin
+          name: cni-plugin
+      - args:
+        - -f
+        - /etc/kube-flannel/cni-conf.json
+        - /etc/cni/net.d/10-flannel.conflist
+        command:
+        - cp
+        image: ghcr.io/flannel-io/flannel:v0.28.9
+        name: install-cni
+        volumeMounts:
+        - mountPath: /etc/cni/net.d
+          name: cni
+        - mountPath: /etc/kube-flannel/
+          name: flannel-cfg
+      priorityClassName: system-node-critical
+      serviceAccountName: flannel
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      volumes:
+      - hostPath:
+          path: /run/flannel
+        name: run
+      - hostPath:
+          path: /opt/cni/bin
+        name: cni-plugin
+      - hostPath:
+          path: /etc/cni/net.d
+        name: cni
+      - configMap:
+          name: kube-flannel-cfg
+        name: flannel-cfg
+      - hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+        name: xtables-lock
