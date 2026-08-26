@@ -360,10 +360,15 @@ impl DiscoveryCache {
 }
 
 /// A compiled CRD `openAPIV3Schema`: the `boon::Schemas` set plus the root schema's
-/// index within it (both are required to call `Schemas::validate`).
+/// index within it (both are required to call `Schemas::validate`), plus every
+/// `x-kubernetes-validations` CEL rule/`messageExpression` string reachable from the
+/// schema, pre-parsed into a `cel::Program` — see `handlers/cr.rs::collect_cel_programs`.
+/// Keying by the CEL source text itself (rather than by field path) means two rules with
+/// identical text anywhere in the schema share one compiled program.
 pub struct CompiledCrSchema {
     pub schemas: boon::Schemas,
     pub index: boon::SchemaIndex,
+    pub cel_programs: HashMap<String, Arc<cel::Program>>,
 }
 
 /// (CRD `spec.group`, served version name, CRD's own `metadata.resourceVersion`) —
@@ -387,6 +392,13 @@ pub struct CrSchemaCache {
     /// `cargo test` runs them concurrently in the same process.
     #[cfg(test)]
     compile_count: std::sync::atomic::AtomicUsize,
+    /// Counts `cel::Program::compile` calls made while building a `CompiledCrSchema`'s
+    /// `cel_programs` (i.e. CEL parses that happened on a boon-schema cache miss, not
+    /// reused from a cached entry). Separate from `compile_count` so a regression that
+    /// moves CEL parsing back onto the per-request hot path is caught even though it
+    /// wouldn't touch the boon compile count at all.
+    #[cfg(test)]
+    cel_compile_count: std::sync::atomic::AtomicUsize,
 }
 
 impl CrSchemaCache {
@@ -395,6 +407,8 @@ impl CrSchemaCache {
             inner: RwLock::new(HashMap::new()),
             #[cfg(test)]
             compile_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            cel_compile_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -421,6 +435,21 @@ impl CrSchemaCache {
     #[cfg(test)]
     pub(crate) fn compile_count(&self) -> usize {
         self.compile_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records that `n` CEL programs were freshly parsed while building a
+    /// `CompiledCrSchema` (called once per boon-schema cache miss — see
+    /// `handlers/cr.rs::validate_cr_schema`).
+    #[cfg(test)]
+    pub(crate) fn record_cel_compiles(&self, n: usize) {
+        self.cel_compile_count
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cel_compile_count(&self) -> usize {
+        self.cel_compile_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
