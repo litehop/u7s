@@ -226,7 +226,7 @@ assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the cl
 
 # ---------------------------------------------------------------------------
 # Tarball sourcing: --tarball (local path) / --tarball-url / the URL baked in
-# at release time. A script piped into `sh` cannot discover the URL it came
+# at release time. A script piped into `bash` cannot discover the URL it came
 # from, so the published copy carries it as a literal that
 # .github/workflows/release-tarball.yaml substitutes in -- these assertions
 # pin the two halves of that contract together.
